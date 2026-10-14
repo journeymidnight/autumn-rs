@@ -50,6 +50,8 @@ pub struct AuthzInner {
     /// `GetAuthzConfigResp.namespaces`). Layer-A's data source: `check_layer_a`
     /// admits a put-class write only if its key `starts_with` one of these.
     pub namespaces: Vec<Vec<u8>>,
+    /// `refresh_signal::mono_ms` when this config was installed (0 = none yet).
+    pub installed_at_ms: u64,
 }
 
 impl AuthzInner {
@@ -60,6 +62,7 @@ impl AuthzInner {
             clock_skew_secs: 60,
             cluster_id: String::new(),
             namespaces: Vec::new(),
+            installed_at_ms: 0,
         }
     }
 }
@@ -79,6 +82,11 @@ pub struct AuthzState {
     /// brick writes.
     layer_a_enabled: AtomicBool,
     inner: RwLock<Arc<AuthzInner>>,
+    /// Asks the poll loop for an early fetch (`request_refresh`).
+    refresh: autumn_common::refresh_signal::RefreshSignal,
+    /// Unknown namespaces met, so a retry is judged against a config fetched
+    /// after the first miss.
+    misses: autumn_common::refresh_signal::MissLedger,
 }
 
 impl Default for AuthzState {
@@ -93,7 +101,37 @@ impl AuthzState {
             enabled: AtomicBool::new(false),
             layer_a_enabled: AtomicBool::new(false),
             inner: RwLock::new(Arc::new(AuthzInner::empty())),
+            refresh: autumn_common::refresh_signal::RefreshSignal::default(),
+            misses: Default::default(),
         }
+    }
+
+    /// A namespace (or other name) the snapshot `checked` does not know: is
+    /// that final, or may it just be newer than that config? Asks for a fetch
+    /// when it may. Judged against the snapshot the request was checked with,
+    /// not whatever was installed since.
+    pub fn on_miss(&self, name: u64, checked: &AuthzInner) -> autumn_common::refresh_signal::Miss {
+        let verdict = self.misses.on_miss(name, checked.installed_at_ms);
+        if verdict == autumn_common::refresh_signal::Miss::Retry {
+            self.refresh.request();
+        }
+        verdict
+    }
+
+    /// Has any config been installed yet?
+    pub fn installed(&self) -> bool {
+        self.snapshot().installed_at_ms != 0
+    }
+
+    /// Ask the poll loop to fetch now (a namespace or kid this config does not
+    /// know may just be newer than it).
+    pub fn request_refresh(&self) {
+        self.refresh.request();
+    }
+
+    /// Resolves once `request_refresh` was called (consumes the request).
+    pub async fn refresh_requested(&self) {
+        self.refresh.wait().await
     }
 
     /// Hot-path gate. `false` ⇒ no Layer-B enforcement (single relaxed load).
@@ -134,6 +172,7 @@ impl AuthzState {
             cluster_id: resp.cluster_id.clone(),
             // D7: the registered-namespace list — Layer-A's data source.
             namespaces: resp.namespaces.clone(),
+            installed_at_ms: autumn_common::refresh_signal::mono_ms(),
         });
         // D7: Layer-A is on iff the registry is non-empty (independent
         // of the signing key). Compute BEFORE the swap so the flag matches the
@@ -363,14 +402,15 @@ pub fn authz_check(
 ///   create unowned data; read isolation is Layer-B's job).
 /// - Runs whenever the registry is non-empty (the caller gates on
 ///   `layer_a_enabled`), INDEPENDENT of the signing key.
-/// Returns `Some((code, msg))` to REJECT, `None` to admit. A frame that fails to
-/// decode returns `None` (the real handler rejects it) — same safety argument as
-/// `authz_check`.
+/// Returns `Some((code, msg, name))` to REJECT, `None` to admit; `name` hashes
+/// the unknown namespace segment (`refresh_signal::name_hash`). A frame that
+/// fails to decode returns `None` (the real handler rejects it) — same safety
+/// argument as `authz_check`.
 pub fn check_layer_a(
     msg_type: u8,
     payload: &[u8],
     inner: &AuthzInner,
-) -> Option<(StatusCode, String)> {
+) -> Option<(StatusCode, String, u64)> {
     // The wire key is `{ns}/…`, so a registered namespace (`{name}/`, e.g. `fs/`) is the FIRST
     // `/`-delimited segment. Extract `{ns}/` (the bytes up to and including the
     // first `/`) and require an EXACT match against a registered namespace. `{ns}`
@@ -383,13 +423,18 @@ pub fn check_layer_a(
         let ns_with_slash = &key[..=s1]; // `{ns}/`
         namespaces.iter().any(|ns| ns.as_slice() == ns_with_slash)
     }
-    fn reject(key: &[u8]) -> Option<(StatusCode, String)> {
+    fn reject(key: &[u8]) -> Option<(StatusCode, String, u64)> {
+        let ns = key
+            .iter()
+            .position(|&b| b == b'/')
+            .map_or(key, |s1| &key[..=s1]);
         Some((
             StatusCode::NamespaceUnknown,
             format!(
                 "write to unregistered namespace: key {:?} is under no registered namespace prefix",
                 String::from_utf8_lossy(&key[..key.len().min(64)])
             ),
+            autumn_common::refresh_signal::name_hash(ns),
         ))
     }
     match msg_type {
@@ -443,6 +488,35 @@ pub fn check_layer_a(
 
 #[cfg(test)]
 mod tests {
+
+    /// A namespace's retry is judged against the config the request was
+    /// checked with: a newer install that landed after the snapshot was taken
+    /// does not make an answer from the old one final.
+    #[test]
+    fn a_miss_is_judged_against_the_checked_snapshot() {
+        use autumn_common::refresh_signal::{name_hash, Miss};
+        let resp = |ns: Vec<Vec<u8>>| GetAuthzConfigResp {
+            code: 0,
+            message: String::new(),
+            enabled: false,
+            public_keys: vec![],
+            namespaces: ns,
+            token_ttl_secs: 0,
+            clock_skew_secs: 0,
+            cluster_id: String::new(),
+        };
+        let st = AuthzState::new();
+        st.install(&resp(vec![b"kvc/".to_vec()]));
+        let old = st.snapshot();
+        let fresh = name_hash(b"fresh/");
+        assert_eq!(st.on_miss(fresh, &old), Miss::Retry);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        st.install(&resp(vec![b"kvc/".to_vec(), b"fresh/".to_vec()]));
+        // Checked against the snapshot from before the install: still a retry.
+        assert_eq!(st.on_miss(fresh, &old), Miss::Retry);
+        // Against a config installed after the first miss: final.
+        assert_eq!(st.on_miss(fresh, &st.snapshot()), Miss::Final);
+    }
     use super::*;
     use autumn_rpc::cap_token::{sign_claims, CapClaims, CAP_TYP, CAP_VER};
     use autumn_rpc::manager_rpc::AuthzPublicKey;
@@ -459,6 +533,7 @@ mod tests {
             clock_skew_secs: 60,
             cluster_id: String::new(),
             namespaces: Vec::new(),
+            installed_at_ms: 0,
         }
     }
 
@@ -627,6 +702,7 @@ mod tests {
             clock_skew_secs: 60,
             cluster_id: "cluster-x".to_string(),
             namespaces: Vec::new(),
+            installed_at_ms: 0,
         };
         let now = 1_000_000;
         let mk = |aud: &str| CapClaims {
@@ -652,6 +728,7 @@ mod tests {
             clock_skew_secs: 60,
             cluster_id: "cluster-x".to_string(),
             namespaces: Vec::new(),
+            installed_at_ms: 0,
         };
         assert!(verify_client_auth(&token, &inner2, now).is_err());
         // wrong audience (token minted for a DIFFERENT cluster) → reject (coco P1)
@@ -669,6 +746,7 @@ mod tests {
             clock_skew_secs: 60,
             cluster_id: String::new(),
             namespaces: Vec::new(),
+            installed_at_ms: 0,
         };
         let p = acme(); // kid 1
         assert!(check_key(b"mem/acme/fact/1", Some(&p), &inner_disabled, 999_000).is_some());
@@ -748,7 +826,7 @@ mod tests {
         let mine = request(b"mem/acme/object");
         let other = request(b"scratch/acme/object");
         assert!(check_layer_a(MSG_COMPARE_PUT, &mine, &inner).is_none());
-        assert!(matches!(check_layer_a(MSG_COMPARE_PUT, &other, &inner), Some((StatusCode::NamespaceUnknown, _))));
+        assert!(matches!(check_layer_a(MSG_COMPARE_PUT, &other, &inner), Some((StatusCode::NamespaceUnknown, _, _))));
         inner.enabled = true;
         assert!(authz_check(MSG_COMPARE_PUT, &mine, Some(&principal), &inner, 999_000).is_none());
         assert!(authz_check(MSG_COMPARE_PUT, &other, Some(&principal), &inner, 999_000).is_some());
@@ -766,7 +844,7 @@ mod tests {
         let mine = request(b"mem/acme/object");
         let other = request(b"scratch/acme/object");
         assert!(check_layer_a(MSG_COMPARE_WRITE, &mine, &inner).is_none());
-        assert!(matches!(check_layer_a(MSG_COMPARE_WRITE, &other, &inner), Some((StatusCode::NamespaceUnknown, _))));
+        assert!(matches!(check_layer_a(MSG_COMPARE_WRITE, &other, &inner), Some((StatusCode::NamespaceUnknown, _, _))));
         inner.enabled = true;
         assert!(authz_check(MSG_COMPARE_WRITE, &mine, Some(&principal), &inner, 999_000).is_none());
         assert!(authz_check(MSG_COMPARE_WRITE, &other, Some(&principal), &inner, 999_000).is_some());
@@ -778,10 +856,10 @@ mod tests {
         let inner = inner_with_namespaces(vec![b"kvc/".to_vec()]);
         // UNregistered 1st-segment namespace → reject.
         let d = check_layer_a(MSG_PUT, &put_payload(b"scratch/x"), &inner);
-        assert!(matches!(d, Some((StatusCode::NamespaceUnknown, _))), "{d:?}");
+        assert!(matches!(d, Some((StatusCode::NamespaceUnknown, _, _))), "{d:?}");
         // A raw key with no `{ns}/` structure is rejected too.
         let d = check_layer_a(MSG_PUT, &put_payload(b"\x01\x00\x00\x00"), &inner);
-        assert!(matches!(d, Some((StatusCode::NamespaceUnknown, _))));
+        assert!(matches!(d, Some((StatusCode::NamespaceUnknown, _, _))));
     }
 
     #[test]
@@ -831,7 +909,7 @@ mod tests {
         assert!(check_layer_a(MSG_BATCH_PUT_BULK, &mk(b"kvc/2"), &inner).is_none());
         assert!(matches!(
             check_layer_a(MSG_BATCH_PUT_BULK, &mk(b"scratch/2"), &inner),
-            Some((StatusCode::NamespaceUnknown, _))
+            Some((StatusCode::NamespaceUnknown, _, _))
         ));
     }
 
@@ -859,7 +937,7 @@ mod tests {
         .to_vec();
         assert!(matches!(
             check_layer_a(MSG_BATCH_PUT, &bad, &inner),
-            Some((StatusCode::NamespaceUnknown, _))
+            Some((StatusCode::NamespaceUnknown, _, _))
         ));
     }
 

@@ -2325,7 +2325,7 @@ built-ins; the non-empty guard is CLIENT-SIDE in `autumn-op` (range-scan, `--for
 overrides) because the manager has no KV data-plane client.
 
 `MSG_NAMESPACE_LIST` (`0x59`, leader-gated read-only) returns the rich rows
-(`Vec<MgrNamespace>`, sorted). The 5 s authz-config poll stays lean (prefixes only).
+(`Vec<MgrNamespace>`, sorted). The authz-config poll (PS/EN `--config-poll-secs`, 30 s) stays lean (prefixes only).
 
 **Authz config (`handle_get_authz_config`):** publishes the public keys plus
 `namespaces` = every registered prefix (the Layer-A data source the PS consumes).

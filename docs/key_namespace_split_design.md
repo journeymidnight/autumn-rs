@@ -137,9 +137,10 @@ autumn-op namespace-list [--json]        # 只读
 
 ### 2.3 传播窗口
 
-PS 通过 5 s 的 `MSG_GET_AUTHZ_CONFIG` poll 拿到全量 namespace 前缀清单
-（`GetAuthzConfigResp.namespaces`）。所以 `namespace-create` 之后最长 5 s 内，
-往新 ns 的写可能被 Layer-A 拒 —— 这是已知且接受的失败模式（create 低频）。
+PS 每 `--config-poll-secs`（30 s）通过 `MSG_GET_AUTHZ_CONFIG` 拿到全量 namespace
+前缀清单（`GetAuthzConfigResp.namespaces`）。`namespace-create` 之后往新 ns 的第一次写
+遇到旧清单时，PS 立即补拉并回 `Unavailable`，SDK 重试时已被放行；只有对补拉之后的清单
+仍不存在的 ns 才回终态 `NamespaceUnknown`。
 
 ---
 

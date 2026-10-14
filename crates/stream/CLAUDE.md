@@ -366,9 +366,14 @@ prove the secret never reaches `APPEND` / `DELETE_EXTENT` / `FENCE_EXTENT` or an
 other member opcode. A Client connection may send only `READ_BYTES`,
 `READ_BYTES_BULK` and `CLIENT_AUTH` (`check_opcode`).
 
-**Direct reads under authz (`ClientAuthz`).** Each shard polls
-`MSG_GET_AUTHZ_CONFIG` every 5 s (`spawn_client_authz_poll_loop`; a failed poll
-keeps the last answer). `Unknown` until the first answer — reads and
+**Direct reads under authz (`ClientAuthz`).** One config per process
+(`SharedAuthz`, handed to every shard by the binary; shard 0 fetches it):
+`MSG_GET_AUTHZ_CONFIG` every `--config-poll-secs` (30 s), every 5 s while there is
+none yet (`spawn_client_authz_poll_loop`; a failed poll keeps the last answer). A
+token whose kid the config does not know asks for an early fetch (at most once a
+second) and is answered `Unavailable` (the client falls back to the PS) until a
+config installed after that token's first refusal still lacks the key; then
+`PermissionDenied` (`SharedAuthz::on_unknown_kid`, `MissLedger`). `Unknown` until the first answer — reads and
 `CLIENT_AUTH` refused `Unavailable` (not a verdict on the token, so the SDK does
 not mistake it for one), never served unchecked; `Off` (authz off, or no manager) — no
 token needed; `On` — `client_gate` answers `CLIENT_AUTH` itself (verify with

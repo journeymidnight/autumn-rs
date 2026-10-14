@@ -116,9 +116,18 @@ PS 轮询 manager `MSG_GET_AUTHZ_CONFIG` → `GetAuthzConfigResp{enabled,
 public_keys:[{kid, ed25519_pub, disabled}], namespaces, token_ttl_secs,
 clock_skew_secs, cluster_id, …}` → 本地缓存
 （`AuthzState::install`，`RwLock<Arc<AuthzInner>>` 整体换页）。
-首次同步取在 `finish_connect`（强制在第一条连接前就已武装），此后 5 s 一次
-（`authz_config_poll_loop`）。manager 宕机 → 用缓存继续强制（只有轮换 / 新公钥
-需要 manager 在线）。
+首次同步取在 `finish_connect`（强制在第一条连接前就已武装），此后每
+`--config-poll-secs`（默认 30 s）一次（`authz_config_poll_loop`）。遇到配置里没有的
+namespace（Layer-A）或 kid（CLIENT_AUTH）时立即补拉一次（每秒最多一次），Layer-A
+拒绝先回 `Unavailable`（SDK 刷新后重试，此时新建的 namespace 已在配置里）。manager 宕机
+→ 用缓存继续强制（只有轮换 / 新公钥需要 manager 在线）；此时补拉失败，未知 namespace
+的写一直回 `Unavailable`，SDK 重试预算耗尽后报连接错误。“回终态”按 namespace（EN 按 kid）记账：
+第一次被拒时记下时间，只有对在那之后装上的配置（请求检查时用的那份快照）仍不存在才回
+`NamespaceUnknown`（单纯“刚拉过”不算，否则刚好在周期拉取之后新建的 namespace 会被误判）。
+账本最多记 1024 个名字、60 s 过期；记满时直接回终态、不补拉（退化为按周期生效）。没有补拉触发、
+最长要等一个周期（30 s）才生效的变化：删除 namespace（旧 ns 的写仍放行）、禁用 kid
+（已绑定的连接仍可用）、manager 开启或关闭 authz（PS / EN 在下一次拉取前保持原状态）。
+PS 尚未装上任何配置时（首次拉取失败）每 5 s 重试。
 
 ## 6. 强制细节
 
@@ -211,11 +220,12 @@ descriptor 前做 `check_key`，但 EN 收到的只是坐标，不知道它属�
   SDK 不换副本、不回落 PS proxy，直接返回 `AutumnError::PermissionDenied`，由调用方
   决定怎么办：同一份凭证在每个 EN 上的判定都相同，换地方重试只会把拒绝藏起来。
   其他直读失败（节点不可达、超时、布局过期）照旧换副本再回落 proxy。
-  “每个 EN 判定相同”有一个窗口：EN 与 PS 每 5 s 才取一次配置，签名密钥增删后的
-  几秒内，用新 kid 签的 token 可能在某个 EN 上被拒，这个拒绝同样直接返回调用方。
+  新 kid 例外：EN 上未知 kid 的第一次拒绝回 `Unavailable` 并立即补拉（SDK 回落
+  proxy），对补拉之后的配置仍未知才回 `PermissionDenied`。
 - **EN 不验范围**：一个合法 principal 仍可凭猜中的坐标读到它 grant 之外的 extent。
   要堵这一点需要 PS 为每个 descriptor 签名、EN 验签，未做。
-- **EN 取配置**：每个 shard 每 5 s 轮询 `MSG_GET_AUTHZ_CONFIG`（`ClientAuthz`）。
+- **EN 取配置**：每个进程一份（`SharedAuthz`，shard 0 拉取，所有 shard 共用），每
+  `--config-poll-secs`（默认 30 s）轮询 `MSG_GET_AUTHZ_CONFIG`，遇未知 kid 补拉。
   配置到手之前（`Unknown`）拒绝直读和 CLIENT_AUTH，都回 `Unavailable`（暂时的，
   不是对凭证的判定，SDK 照常回落 proxy），不在不知道是否开启 authz 的状态下放行；
   manager 不可达时沿用上一次的结果。

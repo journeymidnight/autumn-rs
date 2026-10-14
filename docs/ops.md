@@ -120,6 +120,13 @@ cargo test -p autumn-fuse --test param_flags
 cargo test -p gallery --test param_flags
 ```
 
+The PS and EN fetch the authz config every `--config-poll-secs` (30 s). A write to a
+namespace created since the last fetch is not held back for that long: the PS answers
+the first attempt `Unavailable`, fetches at once, and the SDK's retry is admitted.
+Check it with `cargo test -p autumn-manager --test system_namespace_layer_a --
+--include-ignored` (`a_namespace_created_after_the_ps_started_is_writable_at_once`
+runs the PS at a one-hour poll).
+
 Removed PS flags are refused by name (exit 2): `--fg-qps-quota`,
 `--gc-debt-high-bytes`, `--compact-pending-high-bytes`, `--gc-cooldown-secs`,
 `--compact-cooldown-secs` (they were never read; the advisory thresholds are the
@@ -4674,7 +4681,7 @@ autumn-op --manager $M --cluster-secret-file /secrets/cluster.secret \
 # 3. ARM: manager gets --auth-signing-key-file (or env
 #    AUTUMN_AUTH_SIGNING_KEY_FILE via entrypoint). PROTECT-EVERYTHING: the signing
 #    key alone arms enforcement of EVERY keyed op — there is no
-#    protected-prefix list. Restart manager; PS picks it up via 5s authz poll.
+#    protected-prefix list. Restart manager; the PS and EN pick it up at their next authz fetch (`--config-poll-secs`, 30 s) — until then they do not enforce.
 
 # 4. Verify mint works. Minting is signed with that key, so before step 3 it
 #    is refused ("authz not enabled / no signing key on this manager").

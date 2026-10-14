@@ -809,6 +809,8 @@ fn main() -> Result<()> {
     // opened its disks and passed the O_DIRECT check). The node is ready only
     // when all of them did; a shard that fails first exits the process.
     let (bound_tx, bound_rx) = std::sync::mpsc::channel::<()>();
+    // One authz config for the whole process, fetched by shard 0.
+    let shared_authz = autumn_stream::SharedAuthz::new(args.manager.is_some());
     for shard_idx in 0..shards {
         let data_dirs = args.data_dirs.clone();
         let manager = args.manager.clone();
@@ -831,6 +833,7 @@ fn main() -> Result<()> {
         let reg_transport = args.transport;
         let reg_metrics_addr = metrics_reach.clone();
         let direct_io = args.direct_io;
+        let authz = shared_authz.clone();
         let bound_tx = bound_tx.clone();
         // Fail-stop: any shard exit (Err / panic / unexpected clean return)
         // calls `std::process::exit(1)` directly. The join loop below is
@@ -916,7 +919,9 @@ fn main() -> Result<()> {
                         if let Some(mgr) = manager {
                             cfg = cfg.with_manager_endpoint(mgr);
                         }
-                        cfg = cfg.with_shard(shard_idx, shards_for_thread, siblings);
+                        cfg = cfg
+                            .with_shard(shard_idx, shards_for_thread, siblings)
+                            .with_shared_authz(authz);
                         if let Some((nu, adv, ports)) = reg_for_cfg {
                             cfg = cfg.with_registration(nu, adv, ports);
                         }

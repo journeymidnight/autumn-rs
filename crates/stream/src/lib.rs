@@ -17,4 +17,4 @@ pub use client::{
     CopySource, RangeCopies, RangeCopy, StaleVpOffset, StreamClient,
 };
 pub use conn_pool::{normalize_endpoint, shard_addr_for_extent, ConnPool};
-pub use extent_node::{en_params, render_en_metrics, ExtentNode, ExtentNodeConfig};
+pub use extent_node::{en_params, render_en_metrics, ExtentNode, ExtentNodeConfig, SharedAuthz};

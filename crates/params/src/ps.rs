@@ -120,6 +120,10 @@ crate::params! {
         open_backoff_max_secs: u64 = 30, [1, 3600];
         /// Log bytes read per replay request when a partition opens.
         replay_chunk_bytes: u64 = 64 * MIB, [MIB, 4 * GIB];
+        /// Period of the authz config fetch from the manager. A write to a
+        /// namespace or a token with a key this PS does not know triggers an
+        /// early fetch (at most once a second).
+        config_poll_secs: u64 = 30, [1, 3600];
         /// Period of the region sync with the manager (partition assignment).
         region_sync_interval_secs: u64 = 2, [1, 60];
         /// The PS exits after failing to reach any manager for this long.

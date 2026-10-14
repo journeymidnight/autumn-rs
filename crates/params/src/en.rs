@@ -42,6 +42,10 @@ crate::params! {
         disk_full_resume_free_percent: u64 = 5, [1, 100];
         /// Deadline of the write + fsync probe that decides a disk is faulted.
         disk_probe_timeout_ms: u64 = 2000, [100, 600_000];
+        /// Period of the authz config fetch from the manager (one per process).
+        /// A token with a key this node does not know triggers an early fetch
+        /// (at most once a second).
+        config_poll_secs: u64 = 30, [1, 3600];
         /// Period of the sweep for extent files no stream references.
         reconcile_sweep_interval_secs: u64 = 300, [10, 86_400];
 

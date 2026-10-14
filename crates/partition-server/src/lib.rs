@@ -3848,15 +3848,32 @@ impl PartitionServer {
         Ok(())
     }
 
-    /// periodic authz-config refresh (mirrors `region_sync_loop`).
-    /// The config rarely changes (key rotation / namespace edits), so a
-    /// 5 s cadence is ample; the initial load happens synchronously in
-    /// `finish_connect` so enforcement is armed before the first connection.
+    /// Fetch the authz config every `--config-poll-secs`, and at once when a
+    /// connection met a namespace or key the installed config does not know
+    /// (`AuthzState::request_refresh`) — at most once a second. The initial
+    /// load happens in `finish_connect`, so enforcement is armed before the
+    /// first connection.
     async fn authz_config_poll_loop(&self) {
-        let mut ticker = compio::time::interval(Duration::from_secs(5));
-        ticker.tick().await;
+        use futures::future::{select, Either};
+        let mut last_fetch = Instant::now();
         loop {
-            ticker.tick().await;
+            let mut every = Duration::from_secs(params().config_poll_secs.get());
+            // Nothing installed yet (the first fetch failed): no request can
+            // carry a miss, so keep trying every 5 s.
+            if !self.authz.installed() {
+                every = every.min(Duration::from_secs(5));
+            }
+            let due = last_fetch + every;
+            let timer = std::pin::pin!(compio::time::sleep_until(due));
+            let asked = std::pin::pin!(self.authz.refresh_requested());
+            if let Either::Right(_) = select(timer, asked).await {
+                // Coalesce a burst of misses into one fetch a second.
+                let earliest = last_fetch + Duration::from_secs(1);
+                if Instant::now() < earliest {
+                    compio::time::sleep_until(earliest).await;
+                }
+            }
+            last_fetch = Instant::now();
             if let Err(e) = self.fetch_authz_config_once().await {
                 tracing::debug!("PS {} authz config poll failed: {e:#}", self.ps_id);
             }
@@ -4735,7 +4752,7 @@ impl PartitionServer {
         });
 
         // refresh the data-plane authz config from the manager (key
-        // rotation / namespace edits) on a 5 s cadence.
+        // rotation / namespace edits) every `--config-poll-secs`.
         let s_authz = self.clone();
         spawn_supervised("ps_authz_config", move || {
             let s = s_authz.clone();
@@ -5334,10 +5351,17 @@ fn authz_gate(
                         message: String::new(),
                     }
                 }
-                Err(reason) => ClientAuthResp {
-                    code: StatusCode::PermissionDenied as u8,
-                    message: reason,
-                },
+                Err(reason) => {
+                    // A kid minted after our last fetch: fetch now, so the
+                    // client's retry binds.
+                    if reason == autumn_rpc::cap_token::AuthReject::UnknownKid.label() {
+                        authz.request_refresh();
+                    }
+                    ClientAuthResp {
+                        code: StatusCode::PermissionDenied as u8,
+                        message: reason,
+                    }
+                }
             },
             Err(e) => ClientAuthResp {
                 code: StatusCode::InvalidArgument as u8,
@@ -5364,7 +5388,16 @@ fn authz_gate(
     // signing key) — an anonymous connection is checked too. Derived from the
     // snapshot's own namespace list so the check is self-consistent.
     if !snap.namespaces.is_empty() {
-        if let Some((code, msg)) = crate::authz::check_layer_a(msg_type, payload, &snap) {
+        if let Some((mut code, mut msg, name)) =
+            crate::authz::check_layer_a(msg_type, payload, &snap)
+        {
+            // The namespace may be newer than this config (created since the
+            // last fetch): fetch now and let the client retry; the retry is
+            // final only against a config fetched after this first miss.
+            if authz.on_miss(name, &snap) == autumn_common::refresh_signal::Miss::Retry {
+                code = StatusCode::Unavailable;
+                msg = format!("{msg} (namespace registry being refreshed; retry)");
+            }
             return Some(
                 Frame::error(
                     req_id,

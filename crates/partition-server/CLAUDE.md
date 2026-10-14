@@ -2134,7 +2134,15 @@ included) runs, the heartbeat task waits for it and sends no beat.
 
 The PS is the KV-layer enforcement point for principal grants. It holds
 ONLY the manager's PUBLIC keys (fetched via `MSG_GET_AUTHZ_CONFIG`, cached in
-`PartitionServer.authz: Arc<AuthzState>`, refreshed by `authz_config_poll_loop`, 5 s).
+`PartitionServer.authz: Arc<AuthzState>`, refreshed by `authz_config_poll_loop` every
+`--config-poll-secs`, 30 s). A write to a namespace the config does not know, or a
+CLIENT_AUTH with an unknown kid, asks for an early fetch (at most once a second). A
+namespace's first miss is answered `Unavailable` (the SDK retries and a just-created
+namespace is admitted); it becomes the terminal `NamespaceUnknown` only against a config
+installed after that first miss (`AuthzState::on_miss`, `MissLedger` — "fetched
+recently" is not enough). An unknown-kid CLIENT_AUTH is still refused (PermissionDenied);
+the SDK's retry binds once the fetch landed. Until the first config is installed the
+loop retries every 5 s.
 It verifies a capability token ONCE per connection and enforces a byte prefix + `exp`
 check per request — it NEVER calls the manager to enforce.
 

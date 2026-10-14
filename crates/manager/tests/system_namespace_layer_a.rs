@@ -117,6 +117,59 @@ fn layer_a_rejects_unregistered_namespace_put() {
     });
 }
 
+/// A namespace created after the PS last fetched its registry is writable at
+/// once: the PS answers its first write `Unavailable`, fetches the registry
+/// early, and the client's retry is admitted — no waiting out
+/// `--config-poll-secs` (an hour here). A namespace that really does not exist
+/// still ends in `NamespaceUnknown`.
+#[test]
+#[ignore] // needs EN binaries + a real PS
+fn a_namespace_created_after_the_ps_started_is_writable_at_once() {
+    // Process-wide: the other tests of this binary create no namespace after
+    // their PS started, so the long poll does not touch them.
+    autumn_partition_server::params().config_poll_secs.set(3600);
+    let mgr_addr = pick_addr();
+    start_memory_manager(mgr_addr);
+    let n1_dir = tempfile::tempdir().expect("n1");
+    let n2_dir = tempfile::tempdir().expect("n2");
+    let n1_addr = pick_addr();
+    let n2_addr = pick_addr();
+    start_extent_node(n1_addr, n1_dir.path().to_path_buf(), 150);
+    start_extent_node(n2_addr, n2_dir.path().to_path_buf(), 151);
+
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::version_hello::Role::Admin, None).await.unwrap();
+        register_two_nodes(&mgr, n1_addr, n2_addr, 150).await;
+        let (log, row, meta) = create_three_streams(&mgr).await;
+        upsert_partition(&mgr, 15001, log, row, meta, b"", b"\xff\xff\xff\xff").await;
+        // A non-empty registry at the PS's first fetch, so Layer-A is on.
+        ns_create(&mgr, "bench").await;
+        let ps_addr = pick_addr();
+        start_partition_server(150, mgr_addr, ps_addr);
+        compio::time::sleep(Duration::from_millis(1800)).await;
+
+        ns_create(&mgr, "fresh").await;
+        let scoped = ClusterClient::connect(&mgr_addr.to_string(), "fresh")
+            .await
+            .expect("scoped connect");
+        scoped.set_rpc_timeout(Duration::from_secs(15));
+        let t0 = std::time::Instant::now();
+        scoped.put(b"k", b"v").await.expect("put in a just-created namespace");
+        assert!(t0.elapsed() < Duration::from_secs(10), "took {:?}", t0.elapsed());
+        assert_eq!(scoped.get(b"k").await.unwrap().as_deref(), Some(&b"v"[..]));
+
+        let raw = ClusterClient::connect_raw(&mgr_addr.to_string())
+            .await
+            .expect("raw connect");
+        raw.set_rpc_timeout(Duration::from_secs(15));
+        let err = raw.put(b"nosuch/x", b"nope").await.unwrap_err();
+        assert!(
+            matches!(err, AutumnError::NamespaceUnknown(_)),
+            "put to an unregistered namespace must still be NamespaceUnknown, got {err:?}"
+        );
+    });
+}
+
 #[test]
 #[ignore] // needs EN binaries + a real PS
 fn putstream_chunks_land_in_scope_range() {

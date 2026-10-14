@@ -960,6 +960,9 @@ pub struct ExtentNodeConfig {
     /// including one built with `ExtentNodeConfig::new`, which reads no
     /// `disk_id`, so a caller turning this on there must write one.
     pub direct_io: bool,
+    /// Shared by every shard of one process (`with_shared_authz`); `None` = this
+    /// node fetches its own.
+    shared_authz: Option<std::sync::Arc<SharedAuthz>>,
 }
 
 impl ExtentNodeConfig {
@@ -973,6 +976,7 @@ impl ExtentNodeConfig {
             sibling_addrs: Vec::new(),
             registration: None,
             direct_io: false,
+            shared_authz: None,
         }
     }
 
@@ -987,6 +991,7 @@ impl ExtentNodeConfig {
             sibling_addrs: Vec::new(),
             registration: None,
             direct_io: false,
+            shared_authz: None,
         }
     }
 
@@ -1021,8 +1026,12 @@ impl ExtentNodeConfig {
         self
     }
 
-    /// See the field docs: reporting is the default; this turns it into a
-    /// refusal, which is how the fleet-wide precondition is established.
+    /// Share one authz config with the process's other shards; shard 0 fetches it.
+    pub fn with_shared_authz(mut self, authz: std::sync::Arc<SharedAuthz>) -> Self {
+        self.shared_authz = Some(authz);
+        self
+    }
+
     pub fn with_manager_endpoint(mut self, endpoint: impl Into<String>) -> Self {
         self.manager_endpoint = Some(endpoint.into());
         self
@@ -1735,6 +1744,57 @@ enum ClientAuthz {
     },
 }
 
+/// The node's `ClientAuthz`, shared by every shard of the process (one fetch
+/// per process, by shard 0), with when it was installed and a way to ask for an
+/// early fetch.
+pub struct SharedAuthz {
+    state: parking_lot::RwLock<ClientAuthz>,
+    /// `refresh_signal::mono_ms` of the last install (0 = never).
+    installed_at_ms: std::sync::atomic::AtomicU64,
+    refresh: autumn_common::refresh_signal::RefreshSignal,
+    /// Unknown kids met, so a retry is judged against a config fetched after
+    /// the first refusal.
+    misses: autumn_common::refresh_signal::MissLedger,
+}
+
+impl SharedAuthz {
+    /// `Unknown` until the first fetch when a manager is configured, else `Off`.
+    pub fn new(has_manager: bool) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            state: parking_lot::RwLock::new(if has_manager {
+                ClientAuthz::Unknown
+            } else {
+                ClientAuthz::Off
+            }),
+            installed_at_ms: std::sync::atomic::AtomicU64::new(0),
+            refresh: Default::default(),
+            misses: Default::default(),
+        })
+    }
+
+    fn install(&self, resp: &manager_rpc::GetAuthzConfigResp) {
+        self.state.write().install(resp);
+        self.installed_at_ms.store(
+            autumn_common::refresh_signal::mono_ms(),
+            std::sync::atomic::Ordering::Release,
+        );
+    }
+
+    /// A token naming a key this config does not know: final, or may the key
+    /// be newer than the config? Asks for a fetch when it may. Keyed by the
+    /// kid, so every client presenting a new key shares one entry.
+    fn on_unknown_kid(&self, token: &[u8]) -> autumn_common::refresh_signal::Miss {
+        let installed = self.installed_at_ms.load(std::sync::atomic::Ordering::Acquire);
+        let kid = autumn_rpc::cap_token::token_kid(token).unwrap_or(u32::MAX);
+        let name = autumn_common::refresh_signal::name_hash(&kid.to_le_bytes());
+        let verdict = self.misses.on_miss(name, installed);
+        if verdict == autumn_common::refresh_signal::Miss::Retry {
+            self.refresh.request();
+        }
+        verdict
+    }
+}
+
 impl ClientAuthz {
     fn install(&mut self, resp: &manager_rpc::GetAuthzConfigResp) {
         *self = if resp.enabled {
@@ -1808,8 +1868,10 @@ pub struct ExtentNode {
     manager_endpoint: Option<String>,
     /// ConnPool for manager RPC calls (nodes_info, extent_info, etc.)
     manager_pool: Rc<crate::ConnPool>,
-    /// See `ClientAuthz`; refreshed by `spawn_client_authz_poll_loop`.
-    client_authz: Rc<RefCell<ClientAuthz>>,
+    /// See `ClientAuthz`; refreshed by `spawn_client_authz_poll_loop` on the
+    /// shard that owns the fetch (`polls_authz`).
+    client_authz: std::sync::Arc<SharedAuthz>,
+    polls_authz: bool,
     /// Shared across every shard of this process — see `DoneQueues`.
     done: DoneQueues,
     recovery_inflight: Rc<DashMap<u64, crate::extent_rpc::RecoveryTask>>,
@@ -1929,6 +1991,7 @@ impl Clone for ExtentNode {
             manager_endpoint: self.manager_endpoint.clone(),
             manager_pool: self.manager_pool.clone(),
             client_authz: self.client_authz.clone(),
+            polls_authz: self.polls_authz,
             done: self.done.clone(),
             recovery_inflight: self.recovery_inflight.clone(),
             recovery_attempts: self.recovery_attempts.clone(),
@@ -3684,11 +3747,11 @@ impl ExtentNode {
             extents,
             fd_lru,
             disks: Rc::new(disk_map),
-            client_authz: Rc::new(RefCell::new(if config.manager_endpoint.is_some() {
-                ClientAuthz::Unknown
-            } else {
-                ClientAuthz::Off
-            })),
+            polls_authz: config.shared_authz.is_none() || config.shard_idx == 0,
+            client_authz: config
+                .shared_authz
+                .clone()
+                .unwrap_or_else(|| SharedAuthz::new(config.manager_endpoint.is_some())),
             manager_endpoint: config.manager_endpoint,
             manager_pool: Rc::new(crate::ConnPool::new()),
             done,
@@ -3768,10 +3831,14 @@ impl ExtentNode {
         Ok(node)
     }
 
-    /// Keeps `client_authz` current. 5 s, like the PS's poll: the config
-    /// changes on key rotation or when authz is switched on. A failed poll
-    /// keeps the last answer, so a manager outage does not stop direct reads.
+    /// Keeps `client_authz` current: every `--config-poll-secs`, and at once
+    /// (at most once a second) when a token names a key the installed config
+    /// does not know. A failed poll keeps the last answer, so a manager outage
+    /// does not stop direct reads; while there is none yet it retries every 5 s.
     fn spawn_client_authz_poll_loop(&self) {
+        if !self.polls_authz {
+            return;
+        }
         let Some(mgr) = self.manager_endpoint.clone() else {
             return;
         };
@@ -3781,18 +3848,32 @@ impl ExtentNode {
             let node = node.clone();
             let mgr = mgr.clone();
             async move {
+                use futures::future::{select, Either};
                 loop {
-                    if let Err(e) = node.poll_client_authz(&mgr).await {
-                        // Loud while the EN still refuses every direct read for
-                        // want of an answer; quiet once it has one to keep using.
-                        if matches!(*node.client_authz.borrow(), ClientAuthz::Unknown) {
-                            tracing::warn!(error = %e, manager = %mgr,
-                                "EN authz config poll failed; direct reads are refused until it succeeds");
-                        } else {
-                            tracing::debug!(error = %e, "EN authz config poll failed");
+                    let last_fetch = Instant::now();
+                    let failed = match node.poll_client_authz(&mgr).await {
+                        Ok(()) => false,
+                        Err(e) => {
+                            // Loud while the EN still refuses every direct read
+                            // for want of an answer; quiet once it has one.
+                            if matches!(*node.client_authz.state.read(), ClientAuthz::Unknown) {
+                                tracing::warn!(error = %e, manager = %mgr,
+                                    "EN authz config poll failed; direct reads are refused until it succeeds");
+                            } else {
+                                tracing::debug!(error = %e, "EN authz config poll failed");
+                            }
+                            true
                         }
+                    };
+                    let mut every = Duration::from_secs(en_params().config_poll_secs.get());
+                    if failed && matches!(*node.client_authz.state.read(), ClientAuthz::Unknown) {
+                        every = every.min(Duration::from_secs(5));
                     }
-                    compio::time::sleep(Duration::from_secs(5)).await;
+                    let timer = std::pin::pin!(compio::time::sleep_until(last_fetch + every));
+                    let asked = std::pin::pin!(node.client_authz.refresh.wait());
+                    if let Either::Right(_) = select(timer, asked).await {
+                        compio::time::sleep_until(last_fetch + Duration::from_secs(1)).await;
+                    }
                 }
             }
         });
@@ -3813,10 +3894,14 @@ impl ExtentNode {
         if resp.code != manager_rpc::CODE_OK {
             anyhow::bail!("get_authz_config: {}", resp.message);
         }
-        let mut authz = self.client_authz.borrow_mut();
-        let was_on = matches!(*authz, ClientAuthz::On { .. });
-        let was_unknown = matches!(*authz, ClientAuthz::Unknown);
-        authz.install(&resp);
+        let (was_on, was_unknown) = {
+            let authz = self.client_authz.state.read();
+            (
+                matches!(*authz, ClientAuthz::On { .. }),
+                matches!(*authz, ClientAuthz::Unknown),
+            )
+        };
+        self.client_authz.install(&resp);
         if was_unknown || was_on != resp.enabled {
             tracing::info!(
                 shard = self.shard_idx,
@@ -3842,7 +3927,7 @@ impl ExtentNode {
             return None;
         }
         let now = *now.get_or_insert_with(autumn_rpc::cap_token::now_secs);
-        let authz = self.client_authz.borrow();
+        let authz = self.client_authz.state.read();
         if frame.msg_type != MSG_CLIENT_AUTH {
             return authz
                 .admit_read(principal.as_ref(), now)
@@ -3858,6 +3943,16 @@ impl ExtentNode {
                     Ok(bound) => {
                         *principal = bound;
                         (StatusCode::Ok, String::new())
+                    }
+                    // A key minted after our last fetch: fetch now. Until then
+                    // the refusal says nothing about the token, so the client
+                    // falls back to the PS instead of failing the read.
+                    Err((StatusCode::PermissionDenied, reason))
+                        if reason == autumn_rpc::cap_token::AuthReject::UnknownKid.label()
+                            && self.client_authz.on_unknown_kid(&req.token)
+                                == autumn_common::refresh_signal::Miss::Retry =>
+                    {
+                        (StatusCode::Unavailable, format!("{reason}; authz config being refreshed"))
                     }
                     Err(refusal) => refusal,
                 },
@@ -14669,11 +14764,44 @@ mod client_direct_read_auth_tests {
         assert_eq!(&read(&pool, &addr).await.unwrap()[..], PAYLOAD);
     }
 
+    /// A key the installed config does not know may just be newer than it: the
+    /// first refusal asks for a fetch and answers `Unavailable` (the client
+    /// falls back to the PS); the same token against a config installed after
+    /// that is refused.
+    #[compio::test]
+    async fn an_unknown_kid_asks_for_a_fetch_before_it_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let (node, addr) = served_node(dir.path()).await;
+        *node.client_authz.state.write() = ClientAuthz::On {
+            keys: autumn_rpc::cap_token::Keyring::new(),
+            cluster_id: CLUSTER.to_string(),
+            clock_skew_secs: 0,
+        };
+        let far = autumn_rpc::cap_token::now_secs() + 3600;
+
+        let stale = crate::ConnPool::with_role(Role::Client);
+        stale.set_auth_token(Some(token(SEED, far)));
+        let e = read(&stale, &addr).await.expect_err("unknown kid admitted");
+        assert_eq!(status(&e), Some(StatusCode::Unavailable), "{e:#}");
+        compio::time::timeout(Duration::from_secs(1), node.client_authz.refresh.wait())
+            .await
+            .expect("an early fetch was asked for");
+
+        node.client_authz.installed_at_ms.store(
+            autumn_common::refresh_signal::mono_ms() + 1,
+            std::sync::atomic::Ordering::Release,
+        );
+        let fresh = crate::ConnPool::with_role(Role::Client);
+        fresh.set_auth_token(Some(token(SEED, far)));
+        let e = read(&fresh, &addr).await.expect_err("unknown kid admitted");
+        assert_eq!(status(&e), Some(StatusCode::PermissionDenied), "{e:#}");
+    }
+
     #[compio::test]
     async fn authz_on_refuses_a_connection_without_a_valid_token() {
         let dir = tempfile::tempdir().unwrap();
         let (node, addr) = served_node(dir.path()).await;
-        *node.client_authz.borrow_mut() = authz_on();
+        *node.client_authz.state.write() = authz_on();
         let far = autumn_rpc::cap_token::now_secs() + 3600;
 
         // No CLIENT_AUTH at all: refused a read, but its keepalive is answered.
@@ -14703,7 +14831,7 @@ mod client_direct_read_auth_tests {
         assert_eq!(&read(&member, &addr).await.unwrap()[..], PAYLOAD);
 
         // Disabling the kid revokes the bound connection on its next read.
-        *node.client_authz.borrow_mut() = ClientAuthz::On {
+        *node.client_authz.state.write() = ClientAuthz::On {
             keys: autumn_rpc::cap_token::Keyring::new(),
             cluster_id: CLUSTER.to_string(),
             clock_skew_secs: 0,
@@ -14716,7 +14844,7 @@ mod client_direct_read_auth_tests {
     async fn an_en_that_has_not_heard_from_the_manager_refuses_reads() {
         let dir = tempfile::tempdir().unwrap();
         let (node, addr) = served_node(dir.path()).await;
-        *node.client_authz.borrow_mut() = ClientAuthz::Unknown;
+        *node.client_authz.state.write() = ClientAuthz::Unknown;
         let pool = crate::ConnPool::with_role(Role::Client);
         let e = read(&pool, &addr).await.expect_err("served before authz was known");
         assert_eq!(status(&e), Some(StatusCode::Unavailable), "{e:#}");
@@ -14731,7 +14859,7 @@ mod client_direct_read_auth_tests {
     async fn a_member_connection_needs_no_token() {
         let dir = tempfile::tempdir().unwrap();
         let (node, addr) = served_node(dir.path()).await;
-        *node.client_authz.borrow_mut() = authz_on();
+        *node.client_authz.state.write() = authz_on();
         let peer = crate::ConnPool::new();
         assert_eq!(&read(&peer, &addr).await.unwrap()[..], PAYLOAD);
     }
@@ -14783,7 +14911,7 @@ mod client_direct_read_auth_tests {
     async fn an_unbound_read_and_a_forged_token_are_refused() {
         let dir = tempfile::tempdir().unwrap();
         let (node, addr) = served_node(dir.path()).await;
-        *node.client_authz.borrow_mut() = authz_on();
+        *node.client_authz.state.write() = authz_on();
 
         let anonymous = crate::ConnPool::with_role(Role::Client);
         let e = read(&anonymous, &addr).await.expect_err("anonymous read served");

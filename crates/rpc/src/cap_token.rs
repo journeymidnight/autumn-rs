@@ -160,6 +160,16 @@ pub fn sign_claims(sk: &SigningKey, claims: &CapClaims) -> Result<Vec<u8>, Strin
     Ok(token)
 }
 
+/// The `kid` a token names, read WITHOUT verifying it (for bookkeeping about an
+/// unknown key only — never for a decision to admit). `None` for a token that
+/// does not decode.
+pub fn token_kid(token: &[u8]) -> Option<u32> {
+    if token.len() <= SIG_LEN || token.len() > MAX_CAP_TOKEN_LEN {
+        return None;
+    }
+    decode_claims(&token[..token.len() - SIG_LEN]).ok().map(|c| c.kid)
+}
+
 /// Verify + decode a wire token. `resolve_key(kid)` returns the enabled public
 /// key for that kid, or `None` if the kid is unknown / disabled. `now` is unix
 /// seconds; `skew` is the clock-skew leeway (seconds) applied to `nbf`/`exp`.
