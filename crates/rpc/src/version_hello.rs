@@ -432,6 +432,7 @@ fn known_manager_opcode(opcode: u8) -> bool {
             | MSG_EXTENT_INFO
             | MSG_NODES_INFO
             | MSG_CHECK_COMMIT_LENGTH
+            | MSG_SEAL_TAIL
             | MSG_STREAM_ALLOC_EXTENT
             | MSG_STREAM_PUNCH_HOLES
             | MSG_TRUNCATE

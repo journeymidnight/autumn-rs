@@ -95,8 +95,9 @@ fn split_source_forcegc_reclaims_shared_tail_no_stale_open_cache() {
             .await
             .expect("connect sc");
         let log_info = sc.get_stream_info(log).await.expect("log info");
-        let shared_log_extent = log_info.extent_ids[0];
-        // Precondition: single log extent, refs 1 pre-split.
+        // The tail holding the values (the partition's open sealed the first
+        // extent empty). Precondition: refs 1 pre-split.
+        let shared_log_extent = *log_info.extent_ids.last().expect("log tail");
         let pre = sc.get_extent_info(shared_log_extent).await.expect("pre info");
         assert_eq!(pre.refs, 1, "shared extent refs should be 1 pre-split");
 
@@ -111,6 +112,14 @@ fn split_source_forcegc_reclaims_shared_tail_no_stale_open_cache() {
         let sr: partition_rpc::SplitPartResp = partition_rpc::rkyv_decode(&resp).expect("decode");
         assert_eq!(sr.code, partition_rpc::CODE_OK, "split failed: {}", sr.message);
         compio::time::sleep(Duration::from_millis(6000)).await;
+        sc.invalidate_extent_cache(shared_log_extent);
+        let sealed_info = sc.get_extent_info(shared_log_extent).await.expect("post-split info");
+        assert!(
+            sealed_info.sealed && sealed_info.sealed_length > 0,
+            "the split must seal the shared tail holding the values: sealed={} len={}",
+            sealed_info.sealed,
+            sealed_info.sealed_length
+        );
 
         // Write a small IN-RANGE key to the SOURCE. This allocates a fresh tail
         // (the sealed shared tail becomes a non-tail GC candidate) AND — the crux
@@ -134,7 +143,7 @@ fn split_source_forcegc_reclaims_shared_tail_no_stale_open_cache() {
         // Force-GC the source's sealed log extents (incl. the shared tail).
         let src_log = sc.get_stream_info(log).await.expect("src log info");
         assert!(
-            src_log.extent_ids.len() >= 2,
+            src_log.extent_ids.last() != Some(&shared_log_extent),
             "source should have a fresh tail beyond the sealed shared extent, got {:?}",
             src_log.extent_ids
         );

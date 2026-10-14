@@ -125,14 +125,8 @@ async fn check_takeover_fence() {
     assert!(get_regions(&client).await.part_addrs.is_empty());
     let old_epoch = old_owner.owner_epoch;
 
-    refuse_fence.set(false);
-    compio::time::sleep(Duration::from_millis(1100)).await;
-    server.sync_regions_once().await.expect("retry takeover");
-    assert!(get_regions(&client)
-        .await
-        .part_addrs
-        .iter()
-        .any(|(id, _)| *id == 901));
+    // The tail as the old owner knows it: the takeover seals it before replay
+    // and raises its eversion, which the old owner never learns.
     let stream = StreamClient::connect(
         &manager_addr.to_string(),
         "fence-probe".to_string(),
@@ -143,6 +137,15 @@ async fn check_takeover_fence() {
     .unwrap();
     let tail_id = stream.get_stream_info(log).await.unwrap().extent_ids[0];
     let tail = stream.get_extent_info(tail_id).await.unwrap();
+
+    refuse_fence.set(false);
+    compio::time::sleep(Duration::from_millis(1100)).await;
+    server.sync_regions_once().await.expect("retry takeover");
+    assert!(get_regions(&client)
+        .await
+        .part_addrs
+        .iter()
+        .any(|(id, _)| *id == 901));
     let backend = RpcClient::connect(node_addr).await.unwrap();
     let stale = backend
         .call(

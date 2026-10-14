@@ -164,8 +164,10 @@ fn vp_freed_after_both_children_compact_and_gc() {
         )
         .await
         .expect("connect sc");
+        // The tail holding the values: the partition's open sealed the first
+        // extent empty.
         let log_info = sc.get_stream_info(log).await.expect("log stream info");
-        let shared_log_extent = log_info.extent_ids[0];
+        let shared_log_extent = *log_info.extent_ids.last().expect("log tail");
 
         // Split
         let resp = ps
@@ -183,6 +185,13 @@ fn vp_freed_after_both_children_compact_and_gc() {
             sr.message
         );
         compio::time::sleep(Duration::from_millis(1000)).await;
+        let shared_info = sc.get_extent_info(shared_log_extent).await.expect("shared info");
+        assert!(
+            shared_info.sealed && shared_info.sealed_length > 0,
+            "the split must seal the shared log extent holding the values: sealed={} len={}",
+            shared_info.sealed,
+            shared_info.sealed_length
+        );
 
         let regions = get_regions(&mgr).await;
         let left_rg = regions

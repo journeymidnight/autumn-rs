@@ -163,7 +163,9 @@ fn compaction_drops_only_unreferenced_row_extents() {
         // compaction that takes all three.
         put_flush(&ps, 0).await;
         put_flush(&ps, 1).await;
-        let r1 = row_extents(&sc, row).await[0];
+        let r1 = *row_extents(&sc, row).await.last().unwrap();
+        let in_r1 = checkpoint(&sc, meta).await.locs.iter().filter(|l| l.extent_id == r1).count();
+        assert_eq!(in_r1, 2, "R1 must hold the first two SSTs");
         roll_row(&ps, &sc, row).await;
         put_flush(&ps, 2).await;
 

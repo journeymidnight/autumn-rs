@@ -556,7 +556,7 @@ overflows the frame.
 
 ## Wire version, and the two checks over it
 
-`WIRE_VERSION` (currently **70**) is the schema this binary speaks.
+`WIRE_VERSION` (currently **71**) is the schema this binary speaks.
 `MIN_CLIENT_WIRE_VERSION` (**43**) is the oldest CLIENT it serves. Both are maintained
 **BY HAND**. There is no schema fingerprint — hashing the sources byte for byte cost
 more than it caught (a translated comment once split a rolling cluster, and each false
@@ -901,6 +901,18 @@ and new bytes. PutResp CODE_PRECONDITION means comparison failed; region/ownersh
 errors retain frame-level status for routing refresh. Both values are capped at
 64 KiB; extract_part_id and both PS namespace/authz gates decode the new request.
 Every service and embedded client must be rebuilt together for wire 44.
+
+## Seal a tail on partition open (wire 71)
+
+`MSG_SEAL_TAIL` (0x69, manager, peer, leader-gated): `CheckCommitLengthReq`
+→ `CheckCommitLengthResp`, `end` = the sealed length, `last_ex_info` = the
+sealed tail. Seals the stream's open tail at the probe-seal length (the min over
+the replicas that answer) without allocating a new one; a sealed tail is
+returned unchanged. A PS opening a partition calls it for all three streams
+after its takeover fence and before replay (docs/seal_length_design.md §2).
+No new types. Bumped because a peer sends it: a PS paired with a manager that
+predates it could not open any partition. Not on the client surface; the
+ceiling rises to [43, 71], the floor stays.
 
 ## Runtime parameter overrides (wire 70)
 

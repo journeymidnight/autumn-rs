@@ -61,8 +61,10 @@ fn split_ref_counting_shared_extents_freed_after_both_gc() {
         .await
         .expect("connect sc");
 
+        // The tail holding the SST: the partition's open sealed the first
+        // extent empty.
         let row_info = sc.get_stream_info(row).await.expect("row stream info");
-        let shared_extent_id = row_info.extent_ids[0];
+        let shared_extent_id = *row_info.extent_ids.last().expect("row tail");
 
         // Check extent refs before split
         let ext_info = sc
@@ -100,6 +102,12 @@ fn split_ref_counting_shared_extents_freed_after_both_gc() {
         assert_eq!(
             ext_info.refs, 2,
             "shared extent should have refs=2 after split (left + right)"
+        );
+        assert!(
+            ext_info.sealed && ext_info.sealed_length > 0,
+            "the split must seal the shared extent holding the SST: sealed={} len={}",
+            ext_info.sealed,
+            ext_info.sealed_length
         );
 
         // Get the right partition id

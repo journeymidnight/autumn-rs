@@ -6012,9 +6012,9 @@ async fn partition_thread_main(
     // replica (`SstReader::reread_block`) can report it for isolation.
     part_sc.set_reporter_row_stream(row_stream_id);
 
-    // Check commit length on all streams before recovery (Go: checkCommitLength).
-    // This ensures the last extent of each stream has consistent commit length
-    // across all replicas before we start reading from it.
+    // Wait until every stream's tail answers a commit-length probe (an extent
+    // node may still be starting after a full restart); the fence below gives
+    // up after a few tries.
     for (label, sid) in [
         ("logStream", log_stream_id),
         ("rowStream", row_stream_id),
@@ -6088,6 +6088,36 @@ async fn partition_thread_main(
                         "partition {part_id} {label} stream {sid}: takeover fence failed after retries; refusing to open at epoch {owner_epoch}"
                     )
                 });
+            }
+        }
+    }
+
+    // Seal every tail before replay, where the replicas that answer agree.
+    // Replay then reads exactly the sealed length, and no later append can cut
+    // or extend what was replayed: the first write allocates a fresh tail
+    // (docs/seal_length_design.md §2). After the fence, so the previous owner
+    // cannot append past the seal.
+    for (label, sid) in [
+        ("logStream", log_stream_id),
+        ("rowStream", row_stream_id),
+        ("metaStream", meta_stream_id),
+    ] {
+        loop {
+            match part_sc.seal_tail(sid).await {
+                Ok(end) => {
+                    tracing::info!(part_id, stream_id = sid, end, "{} tail sealed for replay", label);
+                    break;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        part_id,
+                        stream_id = sid,
+                        error = %e,
+                        "{} tail seal failed, retrying in 5s",
+                        label,
+                    );
+                    compio::time::sleep(std::time::Duration::from_secs(5)).await;
+                }
             }
         }
     }

@@ -202,7 +202,7 @@ async fn write_and_seal(
             ps_flush(&ps, part).await;
         }
     }
-    let extent = *stream_extents(mgr, row).await.first().expect("row extent");
+    let extent = *stream_extents(mgr, row).await.last().expect("row extent");
     roll_tail(&ps, part, row, extent).await;
     wait_layout(mgr, extent, "the row extent never sealed", |e| e.sealed).await;
     (ps, extent)

@@ -149,7 +149,8 @@ fn truncation_proceeds_while_a_flush_is_queued() {
         ps_put(&ps, PART, b"c0", b"vc0").await;
         ps_flush(&ps, PART).await;
         let before = row_extents(&sc, row).await;
-        assert_eq!(before.len(), 3, "precondition: three row extents {before:?}");
+        // Three extents of SSTs after the empty first tail the open sealed.
+        assert_eq!(before.len(), 4, "precondition: empty first tail + three SST extents {before:?}");
 
         // Freeze an imm and keep its flush from starting.
         autumn_partition_server::set_flush_test_pause(true);

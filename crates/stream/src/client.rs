@@ -3966,6 +3966,30 @@ impl StreamClient {
         Ok(end)
     }
 
+    /// Seal the stream's open tail where the replicas that answer agree (the
+    /// manager's probe seal), without allocating a new tail; a sealed tail is
+    /// left as it is. Returns the sealed length. A partition calls this on open,
+    /// after its takeover fence and before replay (docs/seal_length_design.md §2).
+    pub async fn seal_tail(&self, stream_id: u64) -> Result<u64> {
+        let req = manager_rpc::rkyv_encode(&CheckCommitLengthReq {
+            stream_id,
+            owner_key: self.owner_key.clone(),
+            owner_epoch: self.owner_epoch,
+        });
+        // 15 s, as `check_commit`: the manager probes every replica first.
+        let resp_data = self
+            .manager_call(MSG_SEAL_TAIL, req, Duration::from_secs(15))
+            .await?;
+        let resp: CheckCommitLengthResp =
+            manager_rpc::rkyv_decode(&resp_data).map_err(|e| anyhow!("{e}"))?;
+        self.check_manager_resp(resp.code, &resp.message, "seal_tail")?;
+        // A cached copy from before the seal still reads as open.
+        if let Some(ex) = &resp.last_ex_info {
+            self.invalidate_extent_cache(ex.extent_id);
+        }
+        Ok(resp.end)
+    }
+
     /// Like `commit_length`, but ALSO returns the id of the tail extent the
     /// value was measured on. Split captures use this so the manager can
     /// verify at commit time that each tail is still the one the length was

@@ -1,7 +1,7 @@
 //! BUG2 — end-to-end data-safety of the GC replay-floor
 //! raise to the DURABLY-ACKed checkpoint vp (`gc_floor_raise_to_durable_ckpt`).
 //!
-//! Reproduce-first + discriminating: we force-GC the FIRST log extent E0, which
+//! Reproduce-first + discriminating: we force-GC the first data log extent E0, which
 //! holds the OLDEST live SST's vp_head — i.e. E0 sits AT the over-conservative
 //! MIN-over-SST-vps floor. The `gc_extent_punchable` strictly-before rule means
 //! E0 is punchable ONLY when the floor is RAISED past it (BUG2). So:
@@ -125,7 +125,9 @@ fn gc_floor_raise_reclaims_min_extent_and_loses_nothing() {
         }
         ps_flush(&ps, 940).await;
 
-        let e0 = log_extent_ids(&sc, log).await[0];
+        // E0 = the tail the cold values went to. The partition's open sealed
+        // the stream's first extent empty, so E0 is not `extent_ids[0]`.
+        let e0 = *log_extent_ids(&sc, log).await.last().expect("log tail");
 
         // 2) HOT churn — overwrite 8 hot keys with 8 MiB values until the log
         //    ROLLS (E0 sealed + a fresh tail). Every hot version that lands in E0
@@ -139,7 +141,7 @@ fn gc_floor_raise_reclaims_min_extent_and_loses_nothing() {
                 wrote += 1;
             }
             ps_flush(&ps, 940).await;
-            if log_extent_ids(&sc, log).await.len() >= 2 {
+            if log_extent_ids(&sc, log).await.last() != Some(&e0) {
                 break;
             }
             assert!(
@@ -160,11 +162,19 @@ fn gc_floor_raise_reclaims_min_extent_and_loses_nothing() {
         ps_put(&ps, 940, b"h0", &hot_final[0]).await; // nudge the active into the tail
         ps_flush(&ps, 940).await;
 
-        // E0 must still be the FIRST log extent and there must be a later one
-        // (log_stream never truncates-from-head; it only appends fresh extents).
+        // E0 must still be in the log, before a later extent, and hold the
+        // rolled-over ~1 GiB.
         let ext = log_extent_ids(&sc, log).await;
-        assert!(ext.len() >= 2, "need >=2 log extents; got {ext:?}");
-        assert_eq!(ext[0], e0, "E0 must still be extent_ids[0]");
+        let pos = ext.iter().position(|&e| e == e0).expect("E0 still in the log");
+        assert!(pos + 1 < ext.len(), "need a log extent after E0; got {ext:?}");
+        sc.invalidate_extent_cache(e0);
+        let e0_info = sc.get_extent_info(e0).await.expect("E0 info");
+        assert!(
+            e0_info.sealed && e0_info.sealed_length >= 512 * 1024 * 1024,
+            "E0 must be sealed holding the churn: sealed={} len={}",
+            e0_info.sealed,
+            e0_info.sealed_length
+        );
 
         // Pre-GC sanity: everything reads correctly (nothing lost before GC).
         for i in 0..4u8 {
@@ -173,7 +183,7 @@ fn gc_floor_raise_reclaims_min_extent_and_loses_nothing() {
         }
 
         // 4) FORCE-GC E0. Under the BUG2 raise the floor is at the durable
-        //    checkpoint vp (a later extent), so E0 (pos 0 < floor) is PUNCHABLE.
+        //    checkpoint vp (a later extent), so E0 (pos < floor) is PUNCHABLE.
         //    Without the raise the floor == MIN sits AT E0 → E0 is protected →
         //    the reclaim assertion below FAILS (this is the reproduce-first red).
         let _ = ps_forcegc(&ps, 940, vec![e0]).await;

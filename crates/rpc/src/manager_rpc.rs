@@ -1775,6 +1775,14 @@ pub const MSG_GET_RUNTIME_CONFIG: u8 = 0x67;
 /// Leader-gated; admin only.
 pub const MSG_SET_RUNTIME_CONFIG: u8 = 0x68;
 
+/// Seal the stream's open tail where the replicas that answer agree (the
+/// probe seal), without allocating a new tail. A partition opening seals its
+/// tails before replaying them, so what it replays is what every later reader
+/// sees. A tail already sealed is returned as it is. Request:
+/// `CheckCommitLengthReq`; response: `CheckCommitLengthResp` (`end` = the
+/// sealed length, `last_ex_info` = the sealed tail). Leader-gated; a peer call.
+pub const MSG_SEAL_TAIL: u8 = 0x69;
+
 /// One runtime override. `key` = `<role>.<flag>` (`ps.gc-rate-bytes-per-sec`).
 #[derive(Archive, Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
 pub struct RuntimeConfigEntry {

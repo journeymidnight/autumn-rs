@@ -110,7 +110,8 @@ async fn assert_all_readable(ps: &RpcClient, part_id: u64, big: &[u8]) {
 async fn seal_e0(mgr: &RpcClient, ps: &RpcClient, part_id: u64, log: u64, e0: u64) {
     assert_eq!(roll_tails(ps, part_id, vec![(log, e0)]).await, 1, "roll the log tail");
     let ext = log_extents(mgr, log).await;
-    assert_eq!(ext.len(), 2, "E0 sealed plus a fresh tail: {ext:?}");
+    // Before E0: the empty first tail the partition's open sealed.
+    assert_eq!(ext.iter().position(|&e| e == e0), Some(ext.len() - 2), "E0 sealed plus a fresh tail: {ext:?}");
     ps_put(ps, part_id, b"post-roll", b"x").await;
 }
 
@@ -218,9 +219,8 @@ fn gc_reclaims_inline_values_that_came_back_by_wal_replay() {
             ps_put(&ps, PART_REPLAYED, format!("k{i:04}").as_bytes(), &small_value(i)).await;
         }
         let e0 = *log_extents(&mgr, log).await.last().expect("log tail");
-        // E0 is sealed before the crash: a PS that opens with E0 as its open
-        // tail caches it unsealed and GC would not see the seal until another
-        // restart (a separate matter, not what this test is about).
+        // E0 is rolled before the crash, so the inline values come back by
+        // replay from a sealed extent with a fresh tail after it.
         seal_e0(&mgr, &ps, PART_REPLAYED, log, e0).await;
         // No flush: everything above is only in the WAL.
         drop(ps);

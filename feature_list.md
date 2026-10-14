@@ -31,6 +31,7 @@
 - **Scope**: (1) `docs/seal_length_design.md`。(2) 先用 failpoint 复现：append 失败且 `alloc_new_extent` 也失败、+1 留在两个活副本、kill -9 PS 后重开、值出现；再改 PS 回复与 poison。(3) EN `re_avali` 短副本只拷尾部，仍临时文件 + 原子替换语义（不丢已有字节）。(4) SDK 错误类型/文档。
 - **Acceptance**: (2) 复现用例修复前客户端拿到确定失败而值随后出现、修复后拿到"结果未知"，消融变红；(3) 单测/集成测试：短副本只拷尾部字节数、拷贝失败不损原副本；真集群重复本次场景，短副本补齐字节数≈缺口；全量单测与 manager 集成套件通过。
 - `passes: false`
+- **notes** (2026-10-14): 复现时发现第二种顺序（已存在的 bug）：重开分区时回放 open tail 到"连得上的副本最小值"，第一次 append 却按"全体副本最小值"提交，副本回来后已回放、已被读到的记录被截断，再崩溃即丢。用户定按 HBase 先关 WAL 再回放：A 已提交（打开分区时 fence 后 seal 所有 open tail，wire 71）。B/SDK/re_avali 未做。
 
 ### BUG-EN-MULTI-MANAGER-POLL — EN 的 `--manager a,b` 被当成一个地址，authz / runtime config 拉取与 reconcile 永远连不上 manager
 - **Trigger** (2026-10-14 runtime config 实现中发现): EN 二进制把整个 `--manager` 串交给 `ExtentNodeConfig::with_manager_endpoint`；`ConnPool::parse_addr("a,b")` 失败。shard 0 的 authz 拉取（→ authz 开启时直读一直 Unavailable，回退 PS 代理）、runtime config 拉取、startup/周期 reconcile 都用它。cluster.sh 只起一个 manager，所以没暴露。

@@ -1403,8 +1403,10 @@ drops acked data, regardless of which members are down. **The seal MUST stay len
 — you seal precisely because a node went down; requiring every member to respond
 would wedge the seal forever.
 
-Two seal sites — `handle_stream_alloc_extent` failover seal and
-`handle_check_commit_length` — both exclude catching-up members
+Three sites — `handle_stream_alloc_extent` failover seal, `handle_seal_tail`
+(`MSG_SEAL_TAIL`: a PS opening a partition seals each open tail before replay,
+no new tail allocated; etcd value-CAS on the extent plus the owner lock's revision) and
+`handle_check_commit_length` (reports the length, seals nothing) — all exclude catching-up members
 (`recovering_nodes_for_extent`, a re-replication target holds a partial replica and
 must never lower the `min`), probe committed members, and feed the shared pure
 `compute_commit_seal(members, recovering, responses)`. We wish every committed member

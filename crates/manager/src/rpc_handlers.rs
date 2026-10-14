@@ -318,6 +318,7 @@ impl AutumnManager {
             MSG_EXTENT_INFO => self.handle_extent_info(payload).await,
             MSG_NODES_INFO => self.handle_nodes_info().await,
             MSG_CHECK_COMMIT_LENGTH => self.handle_check_commit_length(payload).await,
+            MSG_SEAL_TAIL => self.handle_seal_tail(payload).await,
             MSG_STREAM_ALLOC_EXTENT => self.handle_stream_alloc_extent(payload).await,
             MSG_STREAM_PUNCH_HOLES => self.handle_stream_punch_holes(payload).await,
             MSG_TRUNCATE => self.handle_truncate(payload).await,
@@ -2223,85 +2224,10 @@ impl AutumnManager {
             }));
         }
 
-        // WAS-faithful commit-length read. The append path is
-        // all-replica-ACK (`apply_completion` requires every replica to
-        // ack), so every COMMITTED member holds >= the acked commit
-        // length. We wish every committed member would answer, but even
-        // one is enough: whichever answers holds all the acked data (perhaps
-        // more), so `min` over the answering committed members never drops
-        // acked data, and a member shorter than that min still holds all of
-        // it. Catching-up members (in-flight Recovery, partial replica) are
-        // excluded: they can sit below the acked length. The decision is the
-        // shared pure `compute_commit_seal`.
-        let recovering = self.recovering_nodes_for_extent(ex.extent_id);
-        let members: Vec<(usize, u64)> = ex
-            .replicates
-            .iter()
-            .copied()
-            .chain(ex.parity.iter().copied())
-            .enumerate()
-            .collect();
-        let mut responses: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
-        // probe the replicas CONCURRENTLY, not one-at-a-time.
-        // Each `commit_length_on_node` is bounded at 5 s; a SEQUENTIAL 3-replica
-        // loop takes up to 3×5 s = 15 s when a replica is cold/hiccupping —
-        // exactly the PS-side `CHECK_COMMIT_LENGTH` deadline (client.rs:2507),
-        // so ONE slow replica timed out the whole partition-open probe. Seen
-        // live: after a stop-the-world restart the PS opens all partitions
-        // concurrently, firing 32×3 commit_length checks
-        // at once while the ENs are still loading extents — the sequential
-        // fanout amplified each EN hiccup 3×. Concurrent fanout bounds the
-        // handler to max(5 s) = one replica's timeout. The manager is
-        // single-threaded compio, so this just overlaps the 3 network waits on
-        // one thread; per-EN fence side-effects (owner_epoch bump) are
-        // independent across replicas so ordering doesn't matter.
-        let to_probe: Vec<(u64, String)> = members
-            .iter()
-            .filter(|(_, node_id)| !recovering.contains(node_id))
-            .filter_map(|(_, node_id)| nodes.get(node_id).map(|n| (*node_id, n.address.clone())))
-            .collect();
-        let probe_results =
-            futures::future::join_all(to_probe.into_iter().map(|(node_id, addr)| async move {
-                let r = self
-                    .commit_length_on_node(&addr, ex.extent_id, req.owner_epoch)
-                    .await;
-                (node_id, addr, r)
-            }))
-            .await;
-        for (node_id, addr, r) in probe_results {
-            match r {
-                Ok(v) => {
-                    responses.insert(node_id, v);
-                }
-                // Errors are surfaced at WARN so a silently-routed-to-wrong-
-                // shard misconfiguration (e.g. AUTUMN_EXTENT_SHARDS mismatch →
-                // empty shard_ports → every probe lands on shard 0) shows up in
-                // the manager log instead of only as "0/N members reachable".
-                Err(e) => {
-                    tracing::warn!(
-                        extent_id = ex.extent_id,
-                        node_id,
-                        addr = %addr,
-                        error = %e,
-                        "check_commit_length: commit_length_on_node failed"
-                    );
-                }
-            }
-        }
-        tracing::info!(
-            target: "ccl_trace",
-            stream_id = req.stream_id,
-            extent_id = ex.extent_id,
-            responses = ?responses,
-            recovering = ?recovering,
-            members = ?members,
-            "check_commit_length: probe responses"
-        );
-        let end = match Self::compute_commit_seal(
-            &members,
-            &recovering,
-            &responses,
-        ) {
+        let end = match self
+            .probe_commit_seal(&ex, req.owner_epoch, &nodes, req.stream_id, "check_commit_length")
+            .await
+        {
             Ok((len, _avali)) => len,
             Err(reason) => {
                 let err = AppError::Precondition(format!(
@@ -2323,6 +2249,189 @@ impl AutumnManager {
             stream_info: Some((&stream).into()),
             end,
             last_ex_info: Some((&ex).into()),
+        }))
+    }
+
+    /// Where a probe seal would put the OPEN extent `ex`: `(length, avali)`
+    /// from `compute_commit_seal` over the members that answer, or why not.
+    ///
+    /// The append path is all-replica-ACK, so every committed member holds
+    /// the acked prefix; one answer is enough, and the min over the answers
+    /// never drops acked data. Catching-up members (an in-flight Recovery's
+    /// partial replica) are not asked: they can sit below the acked length.
+    /// The members are probed concurrently, so one slow replica costs one
+    /// probe timeout (5 s), not one per member.
+    async fn probe_commit_seal(
+        &self,
+        ex: &ExtentRecord,
+        owner_epoch: i64,
+        nodes: &HashMap<u64, NodeRecord>,
+        stream_id: u64,
+        site: &'static str,
+    ) -> std::result::Result<(u64, u32), String> {
+        let recovering = self.recovering_nodes_for_extent(ex.extent_id);
+        let members: Vec<(usize, u64)> = ex
+            .replicates
+            .iter()
+            .copied()
+            .chain(ex.parity.iter().copied())
+            .enumerate()
+            .collect();
+        let to_probe: Vec<(u64, String)> = members
+            .iter()
+            .filter(|(_, node_id)| !recovering.contains(node_id))
+            .filter_map(|(_, node_id)| nodes.get(node_id).map(|n| (*node_id, n.address.clone())))
+            .collect();
+        let probe_results =
+            futures::future::join_all(to_probe.into_iter().map(|(node_id, addr)| async move {
+                let r = self.commit_length_on_node(&addr, ex.extent_id, owner_epoch).await;
+                (node_id, addr, r)
+            }))
+            .await;
+        let mut responses: HashMap<u64, u64> = HashMap::new();
+        for (node_id, addr, r) in probe_results {
+            match r {
+                Ok(v) => {
+                    responses.insert(node_id, v);
+                }
+                // At WARN: a probe routed to the wrong shard shows up here
+                // rather than only as "0/N members reachable".
+                Err(e) => tracing::warn!(
+                    extent_id = ex.extent_id,
+                    node_id,
+                    addr = %addr,
+                    error = %e,
+                    "{site}: commit_length_on_node failed"
+                ),
+            }
+        }
+        tracing::info!(
+            target: "ccl_trace",
+            stream_id,
+            extent_id = ex.extent_id,
+            responses = ?responses,
+            recovering = ?recovering,
+            members = ?members,
+            "{site}: probe responses"
+        );
+        Self::compute_commit_seal(&members, &recovering, &responses)
+    }
+
+    /// `MSG_SEAL_TAIL`: seal the stream's OPEN tail before a partition
+    /// replays it, at the probe-seal length (`probe_commit_seal`), without
+    /// allocating a new tail, so the length it replays is the length every
+    /// later reader and writer sees (docs/seal_length_design.md §2). A member
+    /// that did not answer keeps its `avali` bit unset and is caught up by
+    /// `re_avali` when it does. A sealed tail is returned as it is.
+    pub(crate) async fn handle_seal_tail(&self, payload: Bytes) -> HandlerResult {
+        let req: CheckCommitLengthReq =
+            rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+        let reply = |code: u8, message: String| -> HandlerResult {
+            Ok(rkyv_encode(&CheckCommitLengthResp {
+                code,
+                message,
+                stream_info: None,
+                end: 0,
+                last_ex_info: None,
+            }))
+        };
+        if let Err(err) = self.ensure_leader() {
+            return reply(Self::err_to_code(&err), err.to_string());
+        }
+        let (stream, ex, nodes) = {
+            let s = self.store.inner.borrow();
+            if let Err(err) = Self::ensure_owner_epoch(&req.owner_key, req.owner_epoch, &s) {
+                return reply(Self::err_to_code(&err), err.to_string());
+            }
+            let Some(stream) = s.streams.get(&req.stream_id).cloned() else {
+                return reply(CODE_NOT_FOUND, format!("stream {}", req.stream_id));
+            };
+            let Some(tail) = stream.extent_ids.last().copied() else {
+                return reply(CODE_NOT_FOUND, format!("tail extent in stream {}", req.stream_id));
+            };
+            let Some(ex) = s.extents.get(&tail).cloned() else {
+                return reply(CODE_NOT_FOUND, format!("extent {tail}"));
+            };
+            (stream, ex, s.nodes.clone())
+        };
+        if ex.sealed {
+            return Ok(rkyv_encode(&CheckCommitLengthResp {
+                code: CODE_OK,
+                message: String::new(),
+                stream_info: Some((&stream).into()),
+                end: ex.sealed_length,
+                last_ex_info: Some((&ex).into()),
+            }));
+        }
+        let (len, avali) = match self
+            .probe_commit_seal(&ex, req.owner_epoch, &nodes, req.stream_id, "seal_tail")
+            .await
+        {
+            Ok(v) => v,
+            Err(reason) => {
+                return reply(CODE_PRECONDITION, format!("seal extent {}: {reason}", ex.extent_id))
+            }
+        };
+        let baseline = crate::persist::encode(&ex);
+        let mut sealed = ex.clone();
+        sealed.sealed = true;
+        sealed.sealed_length = len;
+        sealed.eversion += 1;
+        sealed.avali = avali;
+        // Verify before the etcd write: the owner, that the extent is still the
+        // stream's tail and unchanged since the probe. A change landing during
+        // the etcd round trip itself is refused by the txn's compares.
+        {
+            let s = self.store.inner.borrow();
+            if let Err(err) = Self::ensure_owner_epoch(&req.owner_key, req.owner_epoch, &s) {
+                return reply(Self::err_to_code(&err), err.to_string());
+            }
+            let still_tail = s
+                .streams
+                .get(&req.stream_id)
+                .and_then(|st| st.extent_ids.last().copied())
+                == Some(ex.extent_id);
+            let unchanged = s
+                .extents
+                .get(&ex.extent_id)
+                .is_some_and(|live| crate::persist::encode(live) == baseline);
+            if !still_tail || !unchanged {
+                return reply(
+                    CODE_PRECONDITION,
+                    format!(
+                        "seal extent {}: the stream's tail changed while it was probed; retry",
+                        ex.extent_id
+                    ),
+                );
+            }
+        }
+        if let Some(etcd) = &self.etcd {
+            let kvs = vec![Self::persist_kv_entry("extents", sealed.extent_id, &sealed)];
+            let mut cmp = vec![autumn_etcd::Cmp::value(format!("extents/{}", ex.extent_id), baseline)];
+            if !req.owner_key.is_empty() {
+                cmp.push(autumn_etcd::Cmp::mod_revision(
+                    format!("ownerLocks/{}", req.owner_key),
+                    req.owner_epoch,
+                ));
+            }
+            if let Err(err) = etcd.put_delete_txn_compare(kvs, vec![], cmp).await {
+                return reply(Self::err_to_code(&err), err.to_string());
+            }
+        }
+        self.store.inner.borrow_mut().extents.insert(sealed.extent_id, sealed.clone());
+        tracing::info!(
+            stream_id = req.stream_id,
+            extent_id = sealed.extent_id,
+            sealed_length = len,
+            avali = format_args!("{avali:#b}"),
+            "seal_tail: sealed the open tail for replay"
+        );
+        Ok(rkyv_encode(&CheckCommitLengthResp {
+            code: CODE_OK,
+            message: String::new(),
+            stream_info: Some((&stream).into()),
+            end: len,
+            last_ex_info: Some((&sealed).into()),
         }))
     }
 

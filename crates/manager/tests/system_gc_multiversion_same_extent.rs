@@ -90,7 +90,8 @@ fn gc_same_key_two_large_versions_same_extent_keeps_newest() {
         let sc = StreamClient::connect(&mgr_addr.to_string(), "test-gc-mv".to_string(), 1 << 20, pool)
             .await
             .expect("connect sc");
-        let x = sc.get_stream_info(log).await.expect("log info").extent_ids[0];
+        // X is the log tail: the partition's open sealed the first extent empty.
+        let x = *sc.get_stream_info(log).await.expect("log info").extent_ids.last().expect("log tail");
 
         // Split seals the shared log extent X (CoW). user_keys = [kaa, kmm,
         // kzz] ⇒ mid_key = "kmm" ⇒ "kmm" lands in the RIGHT child.
@@ -104,6 +105,13 @@ fn gc_same_key_two_large_versions_same_extent_keeps_newest() {
         let sr: partition_rpc::SplitPartResp = partition_rpc::rkyv_decode(&resp).expect("decode");
         assert_eq!(sr.code, partition_rpc::CODE_OK, "split failed: {}", sr.message);
         compio::time::sleep(Duration::from_millis(1000)).await;
+        let x_info = sc.get_extent_info(x).await.expect("X info");
+        assert!(
+            x_info.sealed && x_info.sealed_length > 0,
+            "the split must seal X holding both kmm versions: sealed={} len={}",
+            x_info.sealed,
+            x_info.sealed_length
+        );
 
         let regions = get_regions(&mgr).await;
         let left_rg = regions
@@ -130,8 +138,8 @@ fn gc_same_key_two_large_versions_same_extent_keeps_newest() {
         // Wait for the right child to open.
         compio::time::sleep(Duration::from_millis(6000)).await;
 
-        // Roll a new log tail on the owner: post-split its log_stream is just
-        // [X] (X = the sealed shared extent), so X is the LAST extent and
+        // Roll a new log tail on the owner: post-split its log_stream ends with
+        // X (the sealed shared extent), so X is the LAST extent and
         // `run_gc`'s `sealed_extents = extent_ids[..len-1]` excludes it. A small
         // in-range write allocates a fresh tail → X becomes a non-tail sealed
         // GC candidate. (Mirrors the vp_freed_after_both_children test.)

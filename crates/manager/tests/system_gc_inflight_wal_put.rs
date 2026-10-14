@@ -117,7 +117,7 @@ fn gc_relocation_must_not_shadow_inflight_wal_put() {
         let sc = StreamClient::connect(&mgr_addr.to_string(), "test-gc-inflight".to_string(), 1 << 20, pool)
             .await
             .expect("connect sc");
-        let x = sc.get_stream_info(log).await.expect("log info").extent_ids[0];
+        let x = *sc.get_stream_info(log).await.expect("log info").extent_ids.last().expect("log tail");
 
         // Split at "n": part 901 stays the LEFT child [a, n) and keeps kmm; the
         // split SEALS the shared log tail X (CoW) so it is a GC candidate and so

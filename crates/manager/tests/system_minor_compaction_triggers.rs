@@ -105,7 +105,7 @@ fn flushes_keep_the_table_count_bounded() {
     });
 }
 
-/// One big old table A sits in the row stream's first extent. Small flushes
+/// One big old table A sits in the row stream's first data extent. Small flushes
 /// overwrite the same keys over and over; the minor compactions merge them
 /// (A fails the ratio against them and is never in a window) and the dead
 /// copies pile up in A's extent. Once that extent is sealed, A is under 30%
@@ -125,6 +125,9 @@ fn a_mostly_dead_head_extent_is_reclaimed() {
             ps_put(&c.ps, PART, format!("a{i:04}").as_bytes(), &value).await;
         }
         ps_flush(&c.ps, PART).await;
+        // A's extent: the row tail, after the empty first extent the
+        // partition's open sealed.
+        let head = *row_extents(&sc, c.row).await.last().expect("row tail");
         // 400 flushes of the same keys (four 3 KiB inline values): ~4.8 MiB
         // written before the merges rewrite it, ~12 KiB live.
         let pad = vec![b'p'; 3 * 1024];
@@ -146,7 +149,6 @@ fn a_mostly_dead_head_extent_is_reclaimed() {
             small_flush(round).await;
             round += 1;
         }
-        let head = row_extents(&sc, c.row).await[0];
         let resp = c
             .ps
             .call(
@@ -160,6 +162,13 @@ fn a_mostly_dead_head_extent_is_reclaimed() {
             .expect("roll_tails rpc");
         let r: partition_rpc::RollTailsResp = partition_rpc::rkyv_decode(&resp).expect("decode");
         assert_eq!(r.rolled, 1, "roll_tails: {}", r.message);
+        let head_info = sc.get_extent_info(head).await.expect("head info");
+        assert!(
+            head_info.sealed && head_info.sealed_length > 0,
+            "the head must be sealed holding A: sealed={} len={}",
+            head_info.sealed,
+            head_info.sealed_length
+        );
 
         // The probe runs at most once a minute; keep flushing meanwhile.
         let before = minor_compaction_runs().2;
@@ -210,9 +219,9 @@ fn a_dispatched_gc_runs_under_steady_flushes() {
             }));
         }
         compio::time::sleep(Duration::from_secs(3)).await;
-        // Seal the first log extent; the flushes go on into the new tail and
+        // Seal the log tail the writers fill; the flushes go on into the new tail and
         // move the durable cursor past it, so GC may punch it.
-        let e0 = sc.get_stream_info(c.log).await.expect("log info").extent_ids[0];
+        let e0 = *sc.get_stream_info(c.log).await.expect("log info").extent_ids.last().expect("log tail");
         let resp = c
             .ps
             .call(

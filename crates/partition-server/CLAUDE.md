@@ -2037,8 +2037,20 @@ stay gate-first to match split, else `acquire_compact ↔ maintenance_gate` cycl
 ## Crash Recovery (`open_partition`)
 
 ```
-  0. Check commit_length on all 3 streams (log/row/meta) — infinite retry, 5s backoff
-       (ensures the last extent has consistent commit length across replicas)
+  0. Wait until every stream's tail answers a commit_length probe — infinite retry,
+       5s backoff (an extent node may still be starting); then the takeover fence
+       (`fence_tail`, below); then SEAL every open tail (`StreamClient::seal_tail` →
+       `MSG_SEAL_TAIL`) at the min over the replicas that answer, without a new
+       tail (the first write allocates one). Replay reads exactly the sealed
+       length and no later append can truncate or extend what was replayed
+       (docs/seal_length_design.md §2). With an extent node down, the wait loop
+       and the seal each pay its 5 s probe timeout per stream. Before this, replay read an OPEN tail to
+       the min over the replicas it reached while the next append computed its
+       commit over ALL replicas: a replica missing at open and back by then got
+       a replayed (already read) record truncated off the log — red in
+       `crates/manager/tests/write_outcome_settled.rs` without the seal. The seal
+       comes AFTER the fence: sealed first, the previous owner could still append
+       past the seal and be acknowledged.
   1. Read last TableLocations checkpoint from metaStream (iterate extents backward,
      find first non-empty)
   2. For each location: read SST bytes from rowStream (META TAIL only), open SstReader
@@ -2912,7 +2924,7 @@ Three fixes bound the restart replay window (worst case per partition =
     stays at E_old, and a paused-then-resumed old owner's in-flight append carrying E_old
     PASSES the EN fence (`E_old == stored`), lands in the log extent, and is silently
     ACKed — a lost update the new owner never sees. `partition_thread_main` closes this:
-    right after the initial `commit_length` loop and BEFORE `recover_partition`, it calls
+    right after the initial `commit_length` loop and BEFORE the tail seal and `recover_partition`, it calls
     `part_sc.fence_tail(sid, owner_epoch)` for each of log/row/meta, EAGERLY raising the EN
     floor to E_new via `MSG_FENCE_EXTENT` (a control op, not an append — so routing all
     three through `part_sc` respects the row_stream single-writer rule). Best-effort +

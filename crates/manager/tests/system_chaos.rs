@@ -1846,10 +1846,23 @@ async fn do_ec_convert(ctx: &NemesisCtx) -> Result<String, String> {
         .first()
         .map(|(_, s)| s)
         .ok_or("no stream info")?;
-    if stream.extent_ids.len() < 2 {
-        return Err("no sealed extents".into());
+    // The oldest sealed extent that holds data: a partition opening seals its
+    // tails, empty ones included, and GC punches an empty one rather than
+    // converting it.
+    let mut extent_id = None;
+    for &eid in stream.extent_ids.iter().take(stream.extent_ids.len().saturating_sub(1)) {
+        let Ok(raw) = ctx.mgr.call(MSG_EXTENT_INFO, rkyv_encode(&ExtentInfoReq { extent_id: eid })).await else {
+            continue;
+        };
+        let Ok(ei) = rkyv_decode::<ExtentInfoResp>(&raw) else {
+            continue;
+        };
+        if ei.extent.is_some_and(|ex| ex.sealed && ex.sealed_length > 0) {
+            extent_id = Some(eid);
+            break;
+        }
     }
-    let extent_id = stream.extent_ids[0];
+    let extent_id = extent_id.ok_or("no sealed extent holding data")?;
 
     // Go through the OPERATOR path — submit → ledger → status — not the
     // handler underneath it. `autumn-op force-ec-convert` submits; the nemesis
@@ -4180,7 +4193,18 @@ async fn sealed_extents_naming(etcd_endpoint: &str, node_id: u64) -> usize {
 async fn read_extent_members(
     etcd_endpoint: &str,
 ) -> Result<std::collections::HashMap<u64, Vec<u64>>, String> {
+    read_extent_snapshot(etcd_endpoint).await.map(|(members, _)| members)
+}
+
+/// Every extent's members, and the extents sealed at length 0, from one read.
+/// A partition opening seals its tails, an empty one included; GC punches
+/// those whatever the replay floor, so a reclaim count that includes them
+/// says nothing about whether GC is stuck.
+async fn read_extent_snapshot(
+    etcd_endpoint: &str,
+) -> Result<(std::collections::HashMap<u64, Vec<u64>>, std::collections::HashSet<u64>), String> {
     let mut members = std::collections::HashMap::new();
+    let mut empty = std::collections::HashSet::new();
     let client = autumn_etcd::EtcdClient::connect(etcd_endpoint)
         .await
         .map_err(|error| format!("extent snapshot connect: {error}"))?;
@@ -4192,9 +4216,12 @@ async fn read_extent_members(
             .ok_or_else(|| format!("invalid extent metadata key: {:?}", kv.key))?;
         let extent = support::try_decode_persisted_extent(&kv.value)
             .map_err(|error| format!("extent {extent_id} snapshot decode: {error}"))?;
+        if extent.sealed && extent.sealed_length == 0 {
+            empty.insert(extent_id);
+        }
         members.insert(extent_id, extent.replicates.iter().chain(&extent.parity).copied().collect());
     }
-    Ok(members)
+    Ok((members, empty))
 }
 
 fn extent_id_of_file(path: &Path) -> Option<u64> {
@@ -4453,7 +4480,7 @@ async fn verify_gc_reclaim(
     // reclaim, e.g. a merge-consolidated survivor with ≤1 SST / ≤1 sealed log
     // extent — common under the full nemesis set, false-positive pre-fix).
     let mut any_protected = false;
-    let before = match read_extent_members(etcd_endpoint).await {
+    let (before, empty_before) = match read_extent_snapshot(etcd_endpoint).await {
         Ok(snapshot) => snapshot,
         Err(error) => return (vec![error], 0, 0),
     };
@@ -4493,7 +4520,9 @@ async fn verify_gc_reclaim(
         }
         compio::time::sleep(Duration::from_secs(3)).await;
     }
-    let mid = match read_extent_members(etcd_endpoint).await {
+    // Sealed-empty extents are punched whatever the replay floor; counting
+    // them would hide a stuck floor.
+    let (mid, empty_mid) = match read_extent_snapshot(etcd_endpoint).await {
         Ok(snapshot) => snapshot,
         Err(error) => return (vec![error], 0, 0),
     };
@@ -4576,8 +4605,12 @@ async fn verify_gc_reclaim(
         errors.push(error);
         return (errors, 0, 0);
     }
-    let total_reclaimed = before.keys().filter(|id| !after.contains_key(id)).count();
-    let gc_reclaimed = mid.keys().filter(|id| !after.contains_key(id)).count();
+    let total_reclaimed = before.keys()
+        .filter(|id| !after.contains_key(id) && !empty_before.contains(id) && !empty_mid.contains(id))
+        .count();
+    let gc_reclaimed = mid.keys()
+        .filter(|id| !after.contains_key(id) && !empty_mid.contains(id))
+        .count();
 
     if gc_reclaimed == 0 && any_protected {
         errors.push(format!(

@@ -27,13 +27,29 @@ extent gets no next append, so whatever divergence it had at the seal stays.
 | path | when | `sealed_length` | `avali` bits |
 |---|---|---|---|
 | **authoritative** (`seal_commit = Some(c)`) | the writer that owns the stream seals its own tail: rolling over, or rolling past a failed append (`SealCommit` handshake → `alloc_new_extent`) | exactly `c`, the writer's acknowledged length; no replica is asked | all set: every replica acknowledged `c`, so every replica holds at least `c` |
-| **probe** (`seal_commit = None`) | a new owner takes the tail over without a commit of its own: the partition reopened after its server died, or the open tail's commit cannot be read from every replica (`ensure_tail_initialised`) | the **minimum over the replicas that answer** (`compute_commit_seal`), catching-up replicas excluded; one answer is enough | set for the replicas that answered; a replica that did not answer is left unset |
-
-`handle_check_commit_length` (a partition reopening, before replay) uses the
-same minimum over the replicas that answer to decide where replay ends.
+| **probe** (`seal_commit = None`, `MSG_SEAL_TAIL`) | an owner without a commit of its own: **every partition open** seals its open tails this way, after the takeover fence and before replay; also a roll with no live writer (`seal_and_roll_tail`) and an open tail whose commit cannot be read from every replica (`ensure_tail_initialised`) | the **minimum over the replicas that answer** (`compute_commit_seal`), catching-up replicas excluded; one answer is enough | set for the replicas that answered; a replica that did not answer is left unset |
 
 Both are in `crates/manager/src/rpc_handlers.rs` (`handle_stream_alloc_extent`,
-`compute_commit_seal`, `handle_check_commit_length`).
+`handle_seal_tail`, `probe_commit_seal`, `compute_commit_seal`).
+
+### Why a partition seals its tails when it opens
+
+Replay must read a length that never changes afterwards. An open tail has no
+such length: replay would read up to what the replicas it reaches hold, while
+the next append computes its commit over **all** replicas. A replica missing at
+open and back before the first write then has the extra record truncated off
+the log, after clients may have read it. Sealing first fixes the length in the
+manager; the first write after the open allocates a fresh tail, as rolling over
+does. The seal comes after the takeover fence, so the previous owner cannot
+append past it.
+
+Every open tail is sealed, even when every replica answers with the same
+length. Agreement at the probe proves nothing about the next moment: an append
+from the previous owner that passed an extent node's fence check before the
+fence landed still writes its bytes (only its acknowledgement is refused), so
+a replica can grow right after answering. A sealed length is immune — readers
+clamp to it. The cost is one extent per stream per open after writes; a tail
+left sealed by an earlier open (no writes since) is reused as it is.
 
 ### Why the probe does not wait for every replica
 
