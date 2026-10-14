@@ -631,6 +631,21 @@ Run a perf-check write then read; on the Metrics tab requests/s and value
 bytes/s rise, the block cache hit ratio settles, SST tables grow with flushes,
 and a small `--flush-mem-bytes` shows minor compactions keeping the count down.
 A PS with no endpoint is named on the tab ("no /metrics endpoint reported").
+A scrape that fails names its PS and the error under the scope picker. To check
+an endpoint by hand from the dashboard's host, send each request in two pieces
+back to back (the second lands after the server's first read, as across nodes);
+every reply must come back whole — an endpoint that answers before the end of
+the request head resets most of these with errno 104:
+
+```bash
+python3 - PS_HOST 9801 <<'PY'
+import socket,sys
+for _ in range(8):
+    c=socket.create_connection((sys.argv[1],int(sys.argv[2])))
+    c.sendall(b"GET /metrics HTTP/1.0\r\nHost: "); c.sendall(b"x\r\n\r\n")
+    r=b"".join(iter(lambda:c.recv(65536),b"")); print(r.split(b"\r\n")[0], len(r))
+PY
+```
 
 **Manual check of the two tabs that exist for facts a roll-up cannot carry:**
 

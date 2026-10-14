@@ -356,7 +356,8 @@ fn scrape(addr: &str) -> Result<String> {
     let mut conn = std::net::TcpStream::connect_timeout(&sa, scrape_timeout())?;
     conn.set_read_timeout(Some(scrape_timeout()))?;
     conn.set_write_timeout(Some(scrape_timeout()))?;
-    write!(conn, "GET /metrics HTTP/1.0\r\nHost: {addr}\r\n\r\n")?;
+    // One send: `write!` would issue one per piece of the format string.
+    conn.write_all(format!("GET /metrics HTTP/1.0\r\nHost: {addr}\r\n\r\n").as_bytes())?;
     let mut reply = String::new();
     conn.read_to_string(&mut reply)?;
     let (head, body) = reply

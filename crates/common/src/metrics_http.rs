@@ -51,6 +51,9 @@ pub fn metrics_reach_addr(bind_host: &str, advertise_host: &str, port: u16) -> S
     format!("{host}:{port}")
 }
 
+/// A request head longer than this is dropped unanswered.
+const MAX_REQUEST_HEAD: usize = 8192;
+
 pub type Render = Arc<dyn Fn() -> String + Send + Sync>;
 
 /// Spawn the HTTP listener thread serving `render` at `/metrics`; any other
@@ -112,15 +115,29 @@ async fn serve_one(mut stream: compio::net::TcpStream, render: Render) {
     use compio::buf::BufResult;
     use compio::io::{AsyncRead, AsyncWriteExt};
 
-    let buf = Vec::with_capacity(1024);
-    let head = match compio::time::timeout(Duration::from_secs(2), stream.read(buf)).await {
-        Ok(BufResult(Ok(n), buf)) if n > 0 => buf,
-        Ok(BufResult(Ok(_), _)) => return,
-        Ok(BufResult(Err(e), _)) => {
-            tracing::debug!("metrics read: {e}");
-            return;
+    // Read the whole request head: closing with part of it unread makes the
+    // kernel answer with a reset, which can discard the reply in flight.
+    let read_head = async {
+        let mut head = Vec::with_capacity(1024);
+        while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+            if head.len() >= MAX_REQUEST_HEAD {
+                return None;
+            }
+            let BufResult(r, buf) = stream.read(Vec::with_capacity(1024)).await;
+            match r {
+                Ok(0) => return None,
+                Ok(_) => head.extend_from_slice(&buf),
+                Err(e) => {
+                    tracing::debug!("metrics read: {e}");
+                    return None;
+                }
+            }
         }
-        Err(_) => return,
+        Some(head)
+    };
+    let head = match compio::time::timeout(Duration::from_secs(2), read_head).await {
+        Ok(Some(head)) => head,
+        Ok(None) | Err(_) => return,
     };
     let head = String::from_utf8_lossy(&head);
     let path = head.split_whitespace().nth(1).unwrap_or("/");
@@ -237,6 +254,28 @@ mod tests {
         assert!(ok.ends_with("autumn_up 1\n"), "{ok}");
         let nf = get("/nope");
         assert!(nf.starts_with("HTTP/1.1 404"), "{nf}");
+    }
+
+    #[test]
+    fn a_request_arriving_in_pieces_gets_the_whole_reply() {
+        // The second piece lands after the server's first read, as across
+        // nodes: answering and closing with it unread resets the connection.
+        let body = "autumn_x 1\n".repeat(20_000);
+        let b = body.clone();
+        let render: Render = Arc::new(move || b.clone());
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        spawn_metrics_http("127.0.0.1", port, render).unwrap();
+        let mut c = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        c.write_all(b"GET /metrics HTTP/1.0\r\nHost: ").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        c.write_all(b"10.0.0.1:9801\r\n\r\n").unwrap();
+        let mut out = String::new();
+        c.read_to_string(&mut out).expect("whole reply, no reset");
+        assert!(out.starts_with("HTTP/1.1 200 OK\r\n"), "{}", &out[..out.len().min(80)]);
+        assert!(out.ends_with(&body));
     }
 
     #[test]

@@ -1,3 +1,11 @@
+Date: 2026-10-14 (2)
+TaskStatus: completed
+Task scope: user — on k8s the dashboard Metrics tab showed "PS 1/3: Connection reset by peer (os error 104)"; 1 of 3 PSs scraped.
+Current summary: root cause = the PS/EN /metrics server (common metrics_http serve_one) answered after ONE read and closed; the dashboard's `write!` sends the request as three sends (29/13/4 B, strace), and across nodes the later pieces land after that read, so the close with unread bytes made the kernel send RST (the client's read errors; a large reply is cut). Fix: read the request head up to its blank line (8 KiB cap, same 2 s timeout); the dashboard now sends its request in one write.
+Verification: new unit test (request in two pieces 200 ms apart, 220 KB body) failed with os error 104 before the fix, passes after; common lib 18, dashboard 8; ops.md manual check (8 back-to-back split requests) resets an old-style server and was run against it. Review: opus (no high; ops check with a 0.2 s gap did not go red on a small reply -> back-to-back; dashboard single write). Not run on the k8s cluster itself.
+Main gaps: bytes arriving after the head in a later segment (request body / pipelining) would still reset; no scraper does that for GET.
+Next steps: redeploy PS/EN (the fix is server-side) and the dashboard on k8s and look at the Metrics tab.
+
 Date: 2026-10-14
 TaskStatus: completed
 Task scope: user — reorganise parameters into three kinds: hard-coded, startup flags, runtime overrides through autumn-op (e.g. recovery speed online); no env reads in rs (gallery reads AUTHZ from env); hard-coded knobs become flags unless necessary; list what is runtime-changeable. User decisions: runtime scope = recovery/repair speed (manager, EN) + PS background rate limits; all knobs to flags (servers and clients); definitions in standalone .rs files, not a docs/params.md; PS/EN fetch runtime config with a new MSG_GET_RUNTIME_CONFIG in the authz poll loop, which goes 5 s -> 30 s with a refetch when a namespace / kid is unknown (at most once a second).
