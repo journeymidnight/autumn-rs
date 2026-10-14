@@ -1,3 +1,10 @@
+Date: 2026-10-14 (3)
+TaskStatus: not_completed
+Task scope: user — F-SEAL-LENGTH-AND-WRITE-OUTCOME: core design doc on sealed_length vs replica lengths; a write the client saw fail must not be reported as failed when it can still surface (HBase-style abort + outcome unknown); re_avali fetches only the missing tail; SDK docs say a write error is an unknown outcome.
+Current summary: docs/seal_length_design.md written (two seal paths; a copy can be longer — never read, readers clamp to sealed_length — or shorter — only a member absent from a probe seal, avali unset, caught up by re_avali; why the probe neither waits for every replica nor seals at the header watermark; write outcome). Measured on a 4-EN local cluster: EN restarts with the PS alive -> 0 re_avali (authoritative seals set every bit); EN + PS kill -9 under load -> 10 catch-ups, 9 no copy, 1 short by 132,854 B copied whole (2.57 GB, 9.75 s). Found while preparing the repro: the SDK already maps the PS's Internal write error to a retried ServerError, and while the PS lives its next append seals the tail at the acked commit (dropping the +1); the +1 survives only if the PS dies before its next append on that stream.
+Main gaps: abort + outcome-unknown (step 2) awaiting the user's call given the finding above; re_avali tail-only (step 3) not started; two uncommitted info logs in extent_node.rs handle_re_avali (no copy / whole copy + elapsed) belong to step 3; SDK docs (step 4).
+Next steps: user decision on step 2; then step 3 (tail-only catch-up, keep temp-then-publish semantics), tests + ablation, review, commit.
+
 Date: 2026-10-14 (2)
 TaskStatus: completed
 Task scope: user — on k8s the dashboard Metrics tab showed "PS 1/3: Connection reset by peer (os error 104)"; 1 of 3 PSs scraped.

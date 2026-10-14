@@ -26,6 +26,12 @@
 - **Acceptance**: rs 非测试代码里无 `std::env::var`（RUST_LOG/UCX/jemalloc 库自身除外）；每个 binary 的 `--help` 列出全部参数及默认值；越界与未知参数退出码 2（测试）；新建 namespace 后第一次写在补拉后成功、无需等 30 s（测试）；`autumn-op config set` 恢复速度与 PS 限速在一个拉取周期内生效、`unset` 回到 flag 值、换主后仍在（集成测试 + 真集群）；未知 key 或越界值在 `config set` 时被拒；全量单测与 manager 集成套件通过；热路径改动做 perf A/B。
 - `passes: true`
 
+### F-SEAL-LENGTH-AND-WRITE-OUTCOME — sealed_length 与各副本长度的关系写成核心设计；失败的写结果未知；re_avali 只补缺的尾部
+- **Trigger** (2026-10-14 用户): 讨论 re_avali 是否有用时确认：probe seal（新 owner 接管）对连得上的副本取最小值，倒掉的副本可能比 sealed_length 短（实测 1/10 次短 132,854 字节，re_avali 为此整份拷贝 2.57 GB、9.75 s）；也可能更长（未 ack 的字节）。用户要求：(1) 写成核心设计；(2) 客户端收到失败、之后值又出现——学 HBase：stream client 放弃时（tail 未封）不回"失败"，回"结果未知"并 poison 分区，重开时由 probe seal 一次定下；(3) re_avali 只拉 `[local_len, sealed_length)`；(4) SDK 文档写明写错误 = 结果未知。
+- **Scope**: (1) `docs/seal_length_design.md`。(2) 先用 failpoint 复现：append 失败且 `alloc_new_extent` 也失败、+1 留在两个活副本、kill -9 PS 后重开、值出现；再改 PS 回复与 poison。(3) EN `re_avali` 短副本只拷尾部，仍临时文件 + 原子替换语义（不丢已有字节）。(4) SDK 错误类型/文档。
+- **Acceptance**: (2) 复现用例修复前客户端拿到确定失败而值随后出现、修复后拿到"结果未知"，消融变红；(3) 单测/集成测试：短副本只拷尾部字节数、拷贝失败不损原副本；真集群重复本次场景，短副本补齐字节数≈缺口；全量单测与 manager 集成套件通过。
+- `passes: false`
+
 ### BUG-EN-MULTI-MANAGER-POLL — EN 的 `--manager a,b` 被当成一个地址，authz / runtime config 拉取与 reconcile 永远连不上 manager
 - **Trigger** (2026-10-14 runtime config 实现中发现): EN 二进制把整个 `--manager` 串交给 `ExtentNodeConfig::with_manager_endpoint`；`ConnPool::parse_addr("a,b")` 失败。shard 0 的 authz 拉取（→ authz 开启时直读一直 Unavailable，回退 PS 代理）、runtime config 拉取、startup/周期 reconcile 都用它。cluster.sh 只起一个 manager，所以没暴露。
 - **Scope**: 先在多 manager 集群复现（EN 日志里拉取失败、`config set en.x` 不生效）。坐实后 EN 侧按逗号拆分并在失败 / NOT_LEADER 时轮换（与 PS `rotate_manager` 同形）。
