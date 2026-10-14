@@ -201,7 +201,7 @@ pub const MSG_BATCH_GET_BULK: u8 = 0x5B;
 /// Batched DELETE: N keys for ONE partition in a single frame.
 ///
 /// `delete_many` used to be pure client-side fan-out — one `MSG_DELETE` per
-/// key, capped at `BATCH_PUT_DEFAULT_CONCURRENCY` in flight. That looked like N
+/// key, capped at `--batch-put-concurrency` in flight. That looked like N
 /// concurrent requests and was not: a client holds ONE multiplexed connection
 /// per partition, so keys sharing a partition queue on one connection at its
 /// in-flight limit. The measured keys-per-append figures behind this live in

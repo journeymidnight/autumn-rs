@@ -18,9 +18,16 @@
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+pub mod autumnfs;
+pub mod client;
+pub mod dashboard;
 pub mod en;
+pub mod fs;
+pub mod fuse;
+pub mod gallery;
 pub mod manager;
 pub mod ps;
+pub mod s3;
 
 pub const KIB: u64 = 1024;
 pub const MIB: u64 = 1024 * KIB;
@@ -236,6 +243,41 @@ pub fn take_flag<P: Params>(p: &P, arg: &str, value: Option<&str>) -> Result<Fla
         Some(Err(e)) => Err(format!("{arg} {value}: {e}")),
         None => Ok(Flag::Unknown),
     }
+}
+
+/// Pull every parameter flag out of `args` (for a binary whose own parser,
+/// e.g. clap, runs on what is left). `take` offers one flag and its value to
+/// the binary's parameter structs, usually a chain of `take_flag` calls.
+pub fn split_params(
+    args: Vec<String>,
+    take: impl Fn(&str, Option<&str>) -> Result<Flag, String>,
+) -> Result<Vec<String>, String> {
+    let mut rest = Vec::with_capacity(args.len());
+    let mut i = 0;
+    while i < args.len() {
+        match take(&args[i], args.get(i + 1).map(|s| s.as_str()))? {
+            Flag::Taken => i += 2,
+            Flag::Unknown => {
+                rest.push(args[i].clone());
+                i += 1;
+            }
+        }
+    }
+    Ok(rest)
+}
+
+/// Offer `--flag value` to several parameter structs in turn.
+#[macro_export]
+macro_rules! take_any {
+    ($arg:expr, $value:expr, $($p:expr),+ $(,)?) => {{
+        let mut out: Result<$crate::Flag, String> = Ok($crate::Flag::Unknown);
+        $(
+            if matches!(out, Ok($crate::Flag::Unknown)) {
+                out = $crate::take_flag($p, $arg, $value);
+            }
+        )+
+        out
+    }};
 }
 
 /// The `--help` section listing every parameter of `P`.
@@ -456,6 +498,13 @@ mod tests {
         assert!(take_flag(&t, "--count", None).is_err());
         assert!(matches!(take_flag(&t, "--nope", Some("1")), Ok(Flag::Unknown)));
         assert!(help::<T>().contains("--rate-bytes-per-sec"));
+        let argv: Vec<String> = ["x", "--count", "9", "--mount", "/m", "--ratio", "0.5"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let rest = split_params(argv, |a, v| take_any!(a, v, &t)).unwrap();
+        assert_eq!(rest, ["x", "--mount", "/m"]);
+        assert_eq!((t.count.get(), t.ratio.get()), (9, 0.5));
     }
 
     #[test]

@@ -28,7 +28,7 @@
 //!
 //! ## memlock
 //! Registration pins pages (counts against `RLIMIT_MEMLOCK`). The per-thread
-//! pool is capped (`REGPOOL_CAP_BYTES`); an `acquire` that would exceed the cap
+//! pool is capped (`--ucx-regpool-cap-bytes`); an `acquire` that would exceed the cap
 //! returns an UNREGISTERED buffer (correctness preserved — recv falls back to
 //! copy-out — just not zero-copy), logged once.
 

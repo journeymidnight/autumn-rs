@@ -104,6 +104,22 @@ cargo test -p autumn-server --test param_flags
 `--policy-fast-mode` on the manager sets the short policy windows first, so an
 explicit flag after it still wins (`--policy-fast-mode --gc-cooldown-secs 600`).
 
+The client-side binaries take flags the same way: autumn-fuse, autumnfs and
+autumn-s3 accept their own set plus the file-system layer (`--write-buf-extents`,
+`--lease-heartbeat-secs`, ...) and client SDK sets (`--rpc-timeout-ms`,
+`--batch-get-concurrency`, `--ucx-regpool-cap-bytes`, ...); autumn-client and
+autumn-op accept the client SDK set (autumn-op anywhere on the line); gallery and
+autumn-dashboard their own. autumn-fuse and autumnfs name their lease identity
+with `--host` (default: the machine's host name; `HOSTNAME` is not read).
+
+```sh
+target/release/autumn-fuse --help | tail -40          # fuse + fs + client parameters
+target/release/autumnfs --put-depth 0 ls; echo "exit=$?"      # exit=2
+cargo test -p autumn-server --test param_flags
+cargo test -p autumn-fuse --test param_flags
+cargo test -p gallery --test param_flags
+```
+
 Removed PS flags are refused by name (exit 2): `--fg-qps-quota`,
 `--gc-debt-high-bytes`, `--compact-pending-high-bytes`, `--gc-cooldown-secs`,
 `--compact-cooldown-secs` (they were never read; the advisory thresholds are the
@@ -2772,14 +2788,15 @@ for `fs/`, `kvc/` and `gallery/`:
 ```bash
 AUTUMN_AUTH=1 ./cluster.sh reset 5      # → $DATA_ROOT/authz/{signing.key,fs.cred,kvc.cred,gallery.cred}
 
-# gallery (scope gallery/) — Scoped client, credential via env:
-AUTUMN_CREDENTIAL_FILE=/tmp/autumn-rs/authz/gallery.cred \
-  ./target/release/gallery 127.0.0.1:9001
+# gallery (scope gallery/) — Scoped client, credential via a flag:
+./target/release/gallery --manager 127.0.0.1:9001 \
+  --credential-file /tmp/autumn-rs/authz/gallery.cred
 ```
 
-The example binds its namespace scope and authenticates through
-`AUTUMN_CREDENTIAL_FILE`; the SDK auto-mints short-TTL tokens. Override the
-scope with `AUTUMN_SCOPE` (legacy `AUTUMN_NAMESPACE` still read).
+The example binds its namespace scope (`--scope`, default `gallery`) and
+authenticates with `--credential-file`; the SDK auto-mints short-TTL tokens. It
+reads no environment variable; `gallery --help` lists its listen address
+(`--listen` / `--port`, default 0.0.0.0:5001) and tunables.
 
 ```bash
 # 1) Generate a signing key (LOCAL, no cluster needed):

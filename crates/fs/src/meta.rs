@@ -7,7 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{anyhow, Context, Result};
 
 use crate::key;
-use crate::schema::{self, InodeMeta, INODE_ALLOC_BATCH, ROOT_INO};
+use crate::schema::{self, inode_alloc_batch, InodeMeta, ROOT_INO};
 use crate::state::FsState;
 
 // `libc::S_IF*` widths differ across libc targets — `u16` on some (e.g.
@@ -322,7 +322,7 @@ pub async fn alloc_inode(state: &mut FsState) -> Result<u64> {
     // counter, never rewinds it.
     let base = state
         .client
-        .alloc_inodes(INODE_ALLOC_BATCH as u32, floor)
+        .alloc_inodes(inode_alloc_batch() as u32, floor)
         .await
         .context("alloc_inodes from manager")?;
     // Best-effort: keep the legacy KV cursor roughly current so a disaster
@@ -335,7 +335,7 @@ pub async fn alloc_inode(state: &mut FsState) -> Result<u64> {
     // real etcd-lost recovery must offline-scan max(ino) instead. The
     // manager counter stays authoritative while etcd lives (grants use
     // max(counter, floor), so a stale floor can't rewind it).
-    let new_end = base + INODE_ALLOC_BATCH;
+    let new_end = base + inode_alloc_batch();
     let cur_cursor = match state.kv_get(&k).await {
         Ok(v) if v.len() == 8 => u64::from_be_bytes(v[..8].try_into().unwrap()),
         _ => 0,
@@ -346,7 +346,7 @@ pub async fn alloc_inode(state: &mut FsState) -> Result<u64> {
         }
     }
     state.next_inode = base;
-    state.inode_batch_end = base + INODE_ALLOC_BATCH;
+    state.inode_batch_end = base + inode_alloc_batch();
     let ino = state.next_inode;
     state.next_inode += 1;
     Ok(ino)

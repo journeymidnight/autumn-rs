@@ -207,7 +207,7 @@ pub struct Keepalive {
 impl Keepalive {
     /// A dead peer is found 8–10 s after its last sign of life (TCP; ~10–12 s
     /// without the TCP counters): under the 30 s the
-    /// SDK's `rpc_timeout` and the fuse `REPLY_TIMEOUT` allow a whole request,
+    /// SDK's `rpc_timeout` and the fuse `--reply-timeout-secs` allow a whole request,
     /// so a request stuck on a dead connection fails in time for its caller to
     /// retry elsewhere. Idle healthy connections pay one empty frame each way
     /// every ~4 s.

@@ -46,7 +46,7 @@ tree — `FsState` connects with `scoped("fs")`).
 
 Files: inline ≤ `INLINE_THRESHOLD` = 4 KiB in `InodeMeta.inline_data`; larger →
 variable extents keyed by logical offset (a range-scan of the extent prefix
-yields them in order). `ROOT_INO = 1`, `INODE_ALLOC_BATCH = 1000`,
+yields them in order). `ROOT_INO = 1`, `--inode-alloc-batch = 1000`,
 `SCHEMA_VERSION = 3` (stamped in `[0x04]schema_version`; mismatch fails the
 mount loud).
 
@@ -211,7 +211,7 @@ Inode numbers come from the manager, not from a client-side counter:
   before granting and never rewinds. The fuse mount passes the legacy
   `[0x04]next_inode` value on its first batch; that KV key is advisory-only
   afterwards.
-- Callers refill in `INODE_ALLOC_BATCH` = 1000 batches. `handle_alloc_inodes` is
+- Callers refill in `--inode-alloc-batch` = 1000 batches. `handle_alloc_inodes` is
   leader-gated; a follower refuses with NOT_LEADER.
 - This is deliberately *not* `alloc_ids` (which numbers manager entities
   replayed from etcd prefixes); inode numbers are fs-layer data with their own

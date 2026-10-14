@@ -295,7 +295,7 @@ including none.
   defers to `unlinked_open` instead of reclaiming under it, which matters
   because a client's own EXCLUSIVE is never stopped by its own pin; and the
   release reclaims those deferred inodes. The last request's release waits
-  2 s (`PIN_LINGER`) so the sequential ranged GETs of the streamer and of Lance
+  2 s (`--pin-linger-ms`) so the sequential ranged GETs of the streamer and of Lance
   scans share one manager acquire; a mount writer is refused EBUSY during that
   linger. A writer holding the file makes the GET a 503 `SlowDown`, which SDKs
   retry. A pin the heartbeat finds gone ends the body with an error rather than
@@ -386,7 +386,9 @@ autumn-s3 --manager <host:port> [--listen 0.0.0.0] [--port 9000] [--workers N]
 - Reads go through `autumn-fs` — the same crate the fuse mount and the PyO3
   `autumn.Fs` binding use — so lane striping, EN-direct reads and authz apply
   unchanged. An adapter over the partition layer, not a second data plane.
-- `--workers` (default `min(cores, 8)`) accept threads, each with its own compio
+- Tunables come from `crates/params/src/s3.rs` plus the shared `fs` and `client`
+  sets (`autumn-s3 --help`): `--workers`, `--sweep-interval-secs`, `--pin-linger-ms`.
+- `--workers` (default 0 = `min(cores, 8)`) accept threads, each with its own compio
   runtime, its own `FsState` and an SO_REUSEPORT listener on the same port. One
   thread caps an AWS-CRT client at ~40% of the read path; the knee is at 4.
 - `--host` names the daemon identity each worker registers under (the entrypoint

@@ -209,7 +209,7 @@ async fn prefetch_ahead(state: &mut FsState, pool: &ReadPool, ino: u64, offset: 
     let fetches = pf.detector.borrow_mut().on_read(ino, generation, offset, len, size);
     let mut fetches = fetches.into_iter();
     while let Some(prefetch::Fetch { block, already_read }) = fetches.next() {
-        let want = prefetch::BLOCK.min(size - block);
+        let want = prefetch::block_bytes().min(size - block);
         let plan = match read::prepare(state, ino, block as i64, want as u32).await {
             Ok(plan) => plan,
             Err(e) => {
@@ -317,7 +317,7 @@ pub async fn init_root(state: &mut FsState) -> Result<()> {
     }
     tracing::info!("created root inode");
     // SD-3 (review P1-2): do NOT seed a local inode batch here. The
-    // pre-SD-3 mount seeded `[ROOT_INO+1, ROOT_INO+1+INODE_ALLOC_BATCH)` locally
+    // pre-SD-3 mount seeded `[ROOT_INO+1, ROOT_INO+1+inode_alloc_batch)` locally
     // on a fresh FS — but with per-volume filesystems each volume's fresh mount
     // would seed the SAME low range, and the lease/fence plane keys by BARE ino,
     // so those low inodes would COLLIDE across volumes (cross-volume write-lease
@@ -955,7 +955,7 @@ pub async fn handle_request(
                             // kernel off the dispatcher, so it is also the one
                             // that can leave the kernel waiting forever: every
                             // other op goes through `call_sync`, whose
-                            // REPLY_TIMEOUT ends in `reply.error(EIO)` no matter
+                            // `--reply-timeout-secs` ends in `reply.error(EIO)` no matter
                             // what the cluster does.
                             //
                             // FUSE has no timeout of its own. A read that never
@@ -966,7 +966,7 @@ pub async fn handle_request(
                             // able to start containers. An unreachable manager or
                             // a stalled extent read must degrade to EIO, not to a
                             // wedged node.
-                            match compio::time::timeout(REPLY_TIMEOUT, read::execute(plan)).await {
+                            match compio::time::timeout(reply_timeout(), read::execute(plan)).await {
                                 Ok(Ok(data)) => fuse_reply.data(&data),
                                 Ok(Err(e)) => {
                                     tracing::warn!(error = %e, "fuse read execute failed");
@@ -974,7 +974,7 @@ pub async fn handle_request(
                                 }
                                 Err(_) => {
                                     tracing::warn!(
-                                        timeout_secs = REPLY_TIMEOUT.as_secs(),
+                                        timeout_secs = reply_timeout().as_secs(),
                                         "fuse read timed out — replying EIO"
                                     );
                                     fuse_reply.error(libc::EIO);

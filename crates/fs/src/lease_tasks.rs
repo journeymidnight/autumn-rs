@@ -101,7 +101,8 @@ pub fn spawn_lease_background_tasks(state: &FsState, invalidator: Option<InodeIn
     let held_h = state.held_leases.clone();
     compio::runtime::spawn(async move {
         loop {
-            compio::time::sleep(Duration::from_secs(5)).await;
+            let every = Duration::from_secs(crate::params().lease_heartbeat_secs.get());
+            compio::time::sleep(every).await;
             let inos: Vec<u64> = held_h.borrow().keys().copied().collect();
             if inos.is_empty() {
                 continue;

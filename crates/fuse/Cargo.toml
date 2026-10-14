@@ -19,6 +19,7 @@ ucx = ["autumn-transport/ucx", "autumn-client/ucx"]
 
 [dependencies]
 autumn-rpc = { path = "../rpc" }
+autumn-params = { path = "../params" }
 autumn-client = { path = "../client" }
 autumn-transport = { path = "../transport" }
 autumn-fs = { path = "../fs" }

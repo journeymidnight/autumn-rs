@@ -7,7 +7,9 @@ license.workspace = true
 
 [dependencies]
 autumn-client = { path = "../../crates/client" }
+autumn-params = { path = "../../crates/params" }
 autumn-rpc = { path = "../../crates/rpc" }
+autumn-transport = { path = "../../crates/transport" }
 anyhow.workspace = true
 bytes.workspace = true
 tracing.workspace = true

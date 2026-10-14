@@ -36,7 +36,7 @@ use autumn_rpc::client::RpcClient;
 use autumn_rpc::manager_rpc::{MgrClientId, LEASE_CLIENT_KIND_FUSE, LEASE_MODE_WRITE};
 
 use autumn_fuse::bridge::{self, FsRequest};
-use autumn_fs::schema::WRITE_BUF_CAP;
+use autumn_fs::schema::write_buf_cap;
 use autumn_fs::state::FsState;
 use autumn_fs::{meta, write};
 use autumn_fuse::dispatch;
@@ -86,7 +86,7 @@ fn release_must_not_consume_the_sticky_flush_error() {
 
         // Warm the extent cache with one SUCCESSFUL flush, or the next flush
         // fails while PLANNING (the map scan needs the PS) and none is spawned.
-        let warm = vec![0xCDu8; WRITE_BUF_CAP];
+        let warm = vec![0xCDu8; write_buf_cap()];
         write::write(&mut state, ino, 0, &warm).await.expect("warm write");
         write::flush_inode(&mut state, ino, write::FlushReport::ToApplication)
             .await
@@ -94,8 +94,8 @@ fn release_must_not_consume_the_sticky_flush_error() {
 
         ps.kill();
 
-        let doomed = vec![0xEFu8; WRITE_BUF_CAP];
-        let _ = write::write(&mut state, ino, WRITE_BUF_CAP as i64, &doomed).await;
+        let doomed = vec![0xEFu8; write_buf_cap()];
+        let _ = write::write(&mut state, ino, write_buf_cap() as i64, &doomed).await;
         let drained = write::drain_pending(&mut state, ino).await;
         assert!(
             drained.is_err(),
@@ -251,7 +251,7 @@ fn a_failed_last_writer_flush_keeps_the_write_lease() {
 
         // Warm the extent cache so the doomed flush fails in flight, not while
         // planning (the map scan needs the PS).
-        let warm = vec![0xCDu8; WRITE_BUF_CAP];
+        let warm = vec![0xCDu8; write_buf_cap()];
         write::write(&mut state, ino, 0, &warm).await.expect("warm write");
         write::flush_inode(&mut state, ino, write::FlushReport::ToApplication)
             .await
@@ -259,8 +259,8 @@ fn a_failed_last_writer_flush_keeps_the_write_lease() {
 
         ps.kill();
 
-        let doomed = vec![0xEFu8; WRITE_BUF_CAP];
-        let _ = write::write(&mut state, ino, WRITE_BUF_CAP as i64, &doomed).await;
+        let doomed = vec![0xEFu8; write_buf_cap()];
+        let _ = write::write(&mut state, ino, write_buf_cap() as i64, &doomed).await;
         assert!(
             write::drain_pending(&mut state, ino).await.is_err(),
             "precondition: with the PS dead the spawned flush must fail"

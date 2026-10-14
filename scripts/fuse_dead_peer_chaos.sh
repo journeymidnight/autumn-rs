@@ -14,7 +14,7 @@
 #               is split, so each worker's routing is stale and the next read of
 #               a moved key needs a region refresh from the manager — over the
 #               frozen connection. The refresh used the SDK's full 30 s and so
-#               always lost the race to fuse's 30 s REPLY_TIMEOUT: the call was
+#               always lost the race to fuse's 30 s --reply-timeout-secs: the call was
 #               cancelled before its own timeout could evict the connection, and
 #               every later read met the same dead connection. TCP only (the
 #               relay cannot carry UCX).

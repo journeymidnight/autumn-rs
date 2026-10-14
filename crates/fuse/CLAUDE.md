@@ -94,7 +94,7 @@ compio 没有 work-stealing 调度器 —— 一个 runtime 就是一个线程�
   桥里排队，所以一个连不上的 worker 会卡住整个挂载点的系统调用；而裸 TCP connect 到黑洞
   manager 只受 SYN 重试约束（分钟级）。放弃一个 worker 只损吞吐，不损正确性。
 - **代价**：每线程一个 client ⇒ 每个 mount N 套连接池 + N 条 manager 连接。**更大的一项是
-  每线程的注册缓冲池**——`REGPOOL_CAP_BYTES` 是 **per-thread** 上限（默认 512 MiB），规则是
+  每线程的注册缓冲池**——`--ucx-regpool-cap-bytes` 是 **per-thread** 上限（默认 512 MiB），规则是
   `cap × threads < RLIMIT_MEMLOCK`。默认 4 把带池线程从 1 抬到 5，最坏情况下 mount 常驻的
   缓冲内存跟着抬（TCP 上是普通堆内存，UCX 上是 **pin 住的页**，计入 RLIMIT_MEMLOCK）。
 - ⚠️ **UCX 下未测**。上面全部数字是 loopback TCP。`--transport ucx` 时池子会按线程数多开
@@ -258,7 +258,7 @@ HEAD（direct-io、128 KiB）单核 1 ms 108 MiB/s；8 进程同时加载同一�
 在 Read 臂**先把读请求发出去**，再看它是不是某条顺序前沿的延续、规划前方的块
 （`dispatch.rs::prefetch_ahead` → `read::prepare` 规划每块）；块由读线程取进共享的
 `PrefetchCache`；读请求在读线程上先查缓存，命中就从内存答，块还在取就等它（`Lookup::Wait`，
-整个应答仍在 `REPLY_TIMEOUT` 里）。
+整个应答仍在 `--reply-timeout-secs` 里）。
 
 **判定与窗口**（`Detector`）——每条都是实测逼出来的：
 - 前沿按**实际读到的字节**判定：≥3 MiB 且读过的字节不少于所跨范围的一半才预取。按"连续几次"
@@ -308,7 +308,7 @@ generation（`get_inode` 在失效标记后会重读；本挂载写会抬 genera
 
 **生命周期**：被接纳的块由 `Admitted` 持有，`complete` 交出字节；没完成就被丢弃（worker 死了
 带走队列里的任务、没有 worker 接）时析构里释放块、唤醒等待者——否则这块永远"取数中"，每个
-碰到它的读都要等满 30 s `REPLY_TIMEOUT` 再 EIO（评审发现；单测去掉析构里的释放即红）。被预算
+碰到它的读都要等满 30 s `--reply-timeout-secs` 再 EIO（评审发现；单测去掉析构里的释放即红）。被预算
 拒绝或规划失败的块从 `issued` 撤回（`Detector::unissue`），预算空出后还能再要。
 
 **会变差的**（默认开是用户的决定，按 JuiceFS / mountpoint-s3 的惯例；低延迟或这类负载用
@@ -436,12 +436,29 @@ inode 的每一个缓存页（`invalidate_inode_pages2_range`）。预读中的�
 
 ## 配置（CLI）
 
-`autumn-fuse` 参数：`--manager`（default `127.0.0.1:9001`）、`--mountpoint`、
+`autumn-fuse` 自己的参数（clap）：`--manager`（default `127.0.0.1:9001`）、`--mountpoint`、
 `--credential-file`（authz 保护 `fs/` 时必需；`<principal>\n<hex>`，覆盖不到 `fs/`
 则 fail-fast）、`--allow-other`（default false）、`--transport`（`tcp`/`ucx`，须与
-cluster 一致）、`--direct-read`（default true）、`--read-io-threads`（default 4；
-`0` = 全部读留在派发线程，即池子之前的行为）、`--prefetch-mem-mb`（default 1024；`0` = 关掉守护进程预读；需要读线程池）。内核缓存 `attr_timeout` /
-`entry_timeout` = 30s、`negative_timeout` = 5s；周期脏 inode sync 间隔 30s（`main.rs`）。
+cluster 一致）、`--direct-read`（default true）、`--host`（租约身份，默认本机 `gethostname`，
+不读 `HOSTNAME` 环境变量）。
+
+可调参数来自 `crates/params/src/{fuse,fs,client}.rs`：`main.rs` 在 clap 之前用
+`autumn_params::split_params` 把它们从 argv 摘出（`--help` 末尾列出全部），越界或缺值
+exit 2。fuse 自己的一组（进程级 `autumn_fuse::params()`）：`--read-io-threads`（4；`0` =
+全部读留在派发线程）、`--prefetch-mem-mb`（1024；`0` = 关预读，需要读线程池）、预读的
+`--prefetch-block-bytes` / `-window-bytes` / `-front-tolerance-bytes` / `-min-run-bytes` /
+`-max-fronts` / `-idle-secs`（4 MiB / 64 MiB / 2 MiB / 3 MiB / 16 / 5 s）、`--attr-ttl-secs`
+（内核 `attr_timeout` / `entry_timeout`，30 s；`negative_timeout` 5 s 不可调）、
+`--max-background`（64，拥塞阈值取其 3/4）、`--reply-timeout-secs`（bridge 应答超时 30 s）、
+`--dirty-sync-secs`（周期脏 inode sync，30 s）、`--cluster-ready-timeout-secs`（60 s）。
+预读块大小只在启动时定：块号 = 偏移 / 块大小，运行中改会让已发出的块错位，故不是
+runtime 参数。
+
+`--read-io-threads` 的依据（原 clap 注释）：派发线程是单线程，四个以上并发读时它满核
+成了天花板；0 / 2 / 4 线程时 8 个并发读 2211 → 3705 → 4763 MiB/s（8 个独立 CLI 进程同
+文件 5466），4 线程约 87-99%，更高未测。每个线程有自己的注册缓冲池（每线程上限
+`--ucx-regpool-cap-bytes`，默认 512 MiB），线程越多最坏驻留越大，UCX 下计入
+RLIMIT_MEMLOCK。
 
 ## 关键依赖文件
 
@@ -487,4 +504,4 @@ cluster 一致）、`--direct-read`（default true）、`--read-io-threads`（de
   CONSEQUENCE：`fuse_chaos.sh` / `fuse_en_restart_chaos.sh` 跑 3 EN，验的是 EN-restart
   INTEGRITY（EN 很快重生、读全程可用），**不**测 EN-down 期间持续写（那只会撞 RF=3
   capacity wedge）。要测 EN 丢失下的写可用性须配 >RF 台 EN。单线程 fuse dispatcher +
-  30s bridge `REPLY_TIMEOUT` 只把 stall 放大成 EIO，非成因；无需改 stream 层超时。
+  30s bridge `--reply-timeout-secs` 只把 stall 放大成 EIO，非成因；无需改 stream 层超时。

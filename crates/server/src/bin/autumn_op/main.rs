@@ -22,7 +22,7 @@ use std::io::Write;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
-use autumn_client::{decode_err, ClusterClient, DEFAULT_RPC_TIMEOUT};
+use autumn_client::{decode_err, default_rpc_timeout, ClusterClient};
 use autumn_manager::dashboard_compose::{
     fleet_state_str, health_json, slot_state_str, status_json,
 };
@@ -395,6 +395,9 @@ async fn run(args: Args) -> Result<()> {
     }
     // Select the process-global transport before connecting. Without this an
     // autumn-op invoked against a UCX manager would default to TCP and hang.
+    if !autumn_transport::set_regpool_cap_bytes(autumn_client::params().ucx_regpool_cap_bytes.get()) {
+        eprintln!("warning: regpool cap already set (ignored — first-call-wins)");
+    }
     let _ = autumn_transport::init_with(args.transport);
     let client = ClusterClient::connect_admin(&args.manager).await?;
     // The cluster secret authorizes CONTROL-plane RPCs; it does not satisfy a
@@ -3521,7 +3524,7 @@ async fn probe_extent_len(pool: &autumn_stream::ConnPool, node: &MgrNodeInfo, ex
     let req = ExtProbeExtentReq { extent_id };
     let addr = autumn_stream::shard_addr_for_extent(&node.address, &node.shard_ports, extent_id);
     let resp = pool
-        .call_timeout(&addr, EXT_MSG_PROBE_EXTENT, req.encode(), DEFAULT_RPC_TIMEOUT)
+        .call_timeout(&addr, EXT_MSG_PROBE_EXTENT, req.encode(), default_rpc_timeout())
         .await
         .ok()?;
     ExtProbeExtentResp::decode(resp)
@@ -3694,7 +3697,7 @@ async fn run_partition_info(client: &ClusterClient, json_out: bool, pid: u64) ->
                 .call_timeout(
                     MSG_DIAG_PARTITION_VP,
                     rkyv_encode(&DiagPartitionVpReq { part_id: pid }),
-                    DEFAULT_RPC_TIMEOUT,
+                    default_rpc_timeout(),
                 )
                 .await
             {
@@ -4002,7 +4005,7 @@ async fn run_info(
         let req_bytes = rkyv_encode(&GetDiscardsReq { part_id: *pid });
         match client.get_ps_client(ps_addr).await {
             Ok(ps_client) => match ps_client
-                .call_timeout(MSG_GET_DISCARDS, req_bytes, DEFAULT_RPC_TIMEOUT)
+                .call_timeout(MSG_GET_DISCARDS, req_bytes, default_rpc_timeout())
                 .await
             {
                 Ok(resp_bytes) => match rkyv_decode::<GetDiscardsResp>(&resp_bytes) {

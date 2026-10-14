@@ -5,6 +5,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
+use autumn_params::client::ClientParams;
 use autumn_rpc::client::RpcClient;
 use autumn_rpc::manager_rpc::*;
 use autumn_rpc::partition_rpc::{self, *};
@@ -709,14 +710,24 @@ mod stale_layout_refusal_tests {
     }
 }
 
-/// default in-flight concurrency for `get_many_into` (sliding-window pipeline
-/// over the per-partition multiplexed connections). Mirrors the stream worker's
-/// inflight cap; modest to dodge the UCX rendezvous cliff on large batches.
-pub const BATCH_GET_DEFAULT_CONCURRENCY: usize = 32;
+/// Every client SDK tunable (`autumn_params::client`), one per process: the
+/// binary that embeds the client sets the flags before connecting.
+pub fn params() -> &'static ClientParams {
+    static PARAMS: std::sync::LazyLock<ClientParams> = std::sync::LazyLock::new(ClientParams::default);
+    &PARAMS
+}
 
-/// default in-flight concurrency for `put_many` (write sibling of
-/// `BATCH_GET_DEFAULT_CONCURRENCY`).
-pub const BATCH_PUT_DEFAULT_CONCURRENCY: usize = 32;
+/// In-flight concurrency for `get_many_into` (sliding-window pipeline over the
+/// per-partition multiplexed connections; `--batch-get-concurrency`). Modest to
+/// dodge the UCX rendezvous cliff on large batches.
+fn batch_get_concurrency() -> usize {
+    params().batch_get_concurrency.get()
+}
+
+/// In-flight concurrency for `put_many` (`--batch-put-concurrency`).
+fn batch_put_concurrency() -> usize {
+    params().batch_put_concurrency.get()
+}
 
 /// the streaming fan-out primitive — the ONE concurrency base under every
 /// batch API. Drives `futs` with bounded `concurrency` (sliding window) and
@@ -869,10 +880,6 @@ pub struct GetManyItem<'a> {
 /// the routing caches and `Cell` for the manager round-robin index.
 /// Borrows are deliberately scoped: every `borrow()` / `borrow_mut()` is
 /// released before any `.await`.
-/// re-mint a token when it has less than this many seconds of life
-/// left, so connections are (re-)bound to a fresh token before the current one
-/// expires — the PS never sees an expired token in normal operation.
-const TOKEN_RENEW_MARGIN_SECS: u64 = 300;
 
 /// current unix seconds.
 fn client_now_secs() -> u64 {
@@ -920,7 +927,7 @@ pub struct ClusterClient {
     part_addrs: RefCell<HashMap<u64, String>>,
     /// Per-call timeout for ALL cluster RPCs (PS-bound AND manager-bound).
     ///
-    /// Default = `Some(DEFAULT_RPC_TIMEOUT)` — never wait forever. The
+    /// Default = `Some(default_rpc_timeout())` — never wait forever. The
     /// principle is "an unbounded RPC is a bug": a paged-out / hung peer
     /// must surface as `ConnectionError` so the caller's
     /// `refresh_regions` + retry path (or the user's own timeout) can
@@ -946,7 +953,7 @@ pub struct ClusterClient {
     rpc_timeout: Cell<Option<Duration>>,
     /// Bug #2 fix (2026-06-06) — first-attempt timeout for
     /// `call_ps_for_key` / `call_ps_for_part`. See
-    /// `DEFAULT_FIRST_ATTEMPT_TIMEOUT` for the rationale. `None`
+    /// `default_first_attempt_timeout()` for the rationale. `None`
     /// disables fast-fail (every attempt uses the full `rpc_timeout`).
     first_attempt_timeout: Cell<Option<Duration>>,
     /// optional principal credential + cached token. `None` = anonymous
@@ -985,22 +992,25 @@ pub struct ClusterClient {
     binding: NamespaceBinding,
 }
 
-/// Default per-call timeout for cluster RPCs. Generous enough to cover
-/// realistic slow-disk + 3-replica fanout + a couple of retries inside
-/// the server, tight enough to prevent open-ended hangs from a
-/// paged-out / dead peer.
-pub const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_secs(30);
+/// Default per-call timeout for cluster RPCs (`--rpc-timeout-ms`, 30 s).
+/// Generous enough to cover realistic slow-disk + 3-replica fanout + a couple
+/// of retries inside the server, tight enough to prevent open-ended hangs from
+/// a paged-out / dead peer.
+pub fn default_rpc_timeout() -> Duration {
+    Duration::from_millis(params().rpc_timeout_ms.get())
+}
 
 /// Bug #2 fix (2026-06-06) — short timeout used ONLY for the first
-/// attempt of `call_ps_for_key` / `call_ps_for_part`. Subsequent
-/// retries fall back to the full `DEFAULT_RPC_TIMEOUT`.
+/// attempt of `call_ps_for_key` / `call_ps_for_part`
+/// (`--first-attempt-timeout-ms`, 5 s). Subsequent retries fall back to the
+/// full rpc timeout.
 ///
 /// **Why this exists:** when a PS process is killed and restarted
 /// (or the manager evicts + reassigns a partition between PS instances),
 /// the SDK's cached `ps_conns[ps_addr]` points at the dead listener.
 /// The next call against that conn hangs until TCP RST (which can take
 /// minutes on a `kill -9` of the listener) OR the 30 s
-/// `DEFAULT_RPC_TIMEOUT` — whichever wins. Either way, every key
+/// `default_rpc_timeout()` — whichever wins. Either way, every key
 /// touching that PS pays a 30 s penalty before the retry loop can
 /// drop the conn + reconnect.
 ///
@@ -1016,9 +1026,11 @@ pub const DEFAULT_RPC_TIMEOUT: Duration = Duration::from_secs(30);
 ///     trade-off and avoidable via `set_rpc_timeout` for callers that
 ///     know they need it.
 ///
-/// Tunable via `set_first_attempt_timeout`; `None` disables the
+/// Per client via `set_first_attempt_timeout`; `None` disables the
 /// fast-fail (every attempt uses the full `rpc_timeout`).
-pub const DEFAULT_FIRST_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
+fn default_first_attempt_timeout() -> Duration {
+    Duration::from_millis(params().first_attempt_timeout_ms.get())
+}
 
 /// Which DATA SHARDS an EC extent's byte range covers, and where inside each.
 ///
@@ -1149,7 +1161,7 @@ impl ClusterClient {
     /// Call the current manager. Transport errors and local deadlines reconnect;
     /// a peer status refusal leaves the connection usable.
     ///
-    /// Honors `rpc_timeout` (default `DEFAULT_RPC_TIMEOUT`). A timeout
+    /// Honors `rpc_timeout` (default `default_rpc_timeout()`). A timeout
     /// surfaces as a transport error; `mgr_call_retry`'s
     /// `rotate_manager` walks to the next manager address on the next
     /// attempt.
@@ -1673,8 +1685,8 @@ impl ClusterClient {
             regions: RefCell::new(Vec::new()),
             ps_details: RefCell::new(HashMap::new()),
             part_addrs: RefCell::new(HashMap::new()),
-            rpc_timeout: Cell::new(Some(DEFAULT_RPC_TIMEOUT)),
-            first_attempt_timeout: Cell::new(Some(DEFAULT_FIRST_ATTEMPT_TIMEOUT)),
+            rpc_timeout: Cell::new(Some(default_rpc_timeout())),
+            first_attempt_timeout: Cell::new(Some(default_first_attempt_timeout())),
             auth: RefCell::new(None),
             auth_gen: Cell::new(0),
             wire_refused: RefCell::new(None),
@@ -2026,7 +2038,8 @@ impl ClusterClient {
 
     /// return a currently-valid token, minting/renewing via
     /// `MSG_MINT_TOKEN` when there is none or it's within
-    /// `TOKEN_RENEW_MARGIN_SECS` of expiry. On a renewal (a prior token existed),
+    /// `--token-renew-margin-secs` of expiry (so connections are re-bound to a
+    /// fresh token before the current one expires). On a renewal (a prior token existed),
     /// drops cached PS connections so they rebind under the fresh token.
     async fn ensure_token(&self) -> Result<Vec<u8>> {
         // Fast path: a cached token with comfortable life left.
@@ -2036,7 +2049,7 @@ impl ClusterClient {
                 .as_ref()
                 .ok_or_else(|| anyhow!("no principal credential set"))?;
             if let Some(t) = &a.token {
-                if t.exp > client_now_secs().saturating_add(TOKEN_RENEW_MARGIN_SECS) {
+                if t.exp > client_now_secs().saturating_add(params().token_renew_margin_secs.get()) {
                     return Ok(t.bytes.clone());
                 }
             }
@@ -2163,7 +2176,7 @@ impl ClusterClient {
     /// Call a PS. Transport errors and local timeouts evict the connection;
     /// peer status errors leave it pooled while routing/retry handles the refusal.
     ///
-    /// Honors `rpc_timeout` (default `DEFAULT_RPC_TIMEOUT`); see the
+    /// Honors `rpc_timeout` (default `default_rpc_timeout()`); see the
     /// field docstring for the partition-handle-drop hang this guards
     /// against.
     pub async fn ps_call(&self, ps_addr: &str, msg_type: u8, payload: Bytes) -> Result<Bytes> {
@@ -2248,7 +2261,7 @@ impl ClusterClient {
     }
 
     /// Override the per-call timeout for ALL cluster RPCs (PS + manager).
-    /// Default is `DEFAULT_RPC_TIMEOUT` (30 s). Recommended in
+    /// Default is `default_rpc_timeout()` (30 s). Recommended in
     /// production: 2-5 s for read-heavy loads, 30+ s for bulk uploads.
     /// Tests that drive split/merge typically use 2 s.
     pub fn set_rpc_timeout(&self, t: Duration) {
@@ -2256,10 +2269,10 @@ impl ClusterClient {
     }
 
     /// Reset the per-call timeout to the crate default
-    /// (`DEFAULT_RPC_TIMEOUT`). Wait-forever is no longer a supported
+    /// (`default_rpc_timeout()`). Wait-forever is no longer a supported
     /// mode — every RPC must be bounded.
     pub fn clear_rpc_timeout(&self) {
-        self.rpc_timeout.set(Some(DEFAULT_RPC_TIMEOUT));
+        self.rpc_timeout.set(Some(default_rpc_timeout()));
     }
 
     /// Read the current per-call timeout. Mostly for tests.
@@ -2271,7 +2284,7 @@ impl ClusterClient {
 
     /// Bug #2 fix (2026-06-06) — override the first-attempt timeout
     /// for `call_ps_for_key` / `call_ps_for_part`. See
-    /// `DEFAULT_FIRST_ATTEMPT_TIMEOUT` for the rationale.
+    /// `default_first_attempt_timeout()` for the rationale.
     pub fn set_first_attempt_timeout(&self, t: Option<Duration>) {
         self.first_attempt_timeout.set(t);
     }
@@ -3344,7 +3357,7 @@ impl ClusterClient {
             )
             .await
         });
-        let parts = fan_out_collect(futs, BATCH_GET_DEFAULT_CONCURRENCY).await;
+        let parts = fan_out_collect(futs, batch_get_concurrency()).await;
         let mut out = bytes::BytesMut::with_capacity(resp.value_len as usize);
         for (i, r) in parts.into_iter().enumerate() {
             match r {
@@ -3632,7 +3645,7 @@ impl ClusterClient {
     /// Result `i` matches `items[i]`: `Ok(Some(n))` = value len
     /// (`dest[..min(n, dest.len())]` filled), `Ok(None)` = not found, `Err` =
     /// that item's RPC failed. Concurrency is the shared
-    /// `BATCH_GET_DEFAULT_CONCURRENCY` sliding window (`fan_out_collect`).
+    /// `--batch-get-concurrency` sliding window (`fan_out_collect`).
     ///
     /// Same recv shape as the proxy path: the direct EN read lands in a
     /// read_loop-owned pooled buffer (`read_extent_value_direct`,
@@ -3702,7 +3715,7 @@ impl ClusterClient {
                 (idxs, result)
             }
         });
-        for (idxs, result) in fan_out_collect(descriptor_calls, BATCH_GET_DEFAULT_CONCURRENCY).await
+        for (idxs, result) in fan_out_collect(descriptor_calls, batch_get_concurrency()).await
         {
             match result {
                 Ok(resp_bytes) => {
@@ -3731,7 +3744,7 @@ impl ClusterClient {
         // Phase C — fan out: read each item's PRE-RESOLVED descriptor straight
         // from an EN (no per-item PS RTT), or fall back to the per-item proxy
         // path when it has no descriptor (small / resolve-miss / batch failure).
-        let concurrency = BATCH_GET_DEFAULT_CONCURRENCY;
+        let concurrency = batch_get_concurrency();
         let futs = items.iter_mut().zip(descriptors).map(|(it, desc)| {
             let key: &[u8] = it.key;
             let offset = it.offset;
@@ -3981,7 +3994,7 @@ impl ClusterClient {
     /// batch-read callers route through this:
     /// the python `BatchClient` (kvcache), fuse `read::execute`, and the io_uring
     /// daemon. Each item is read concurrently (sliding window of `concurrency` —
-    /// callers pass `BATCH_GET_DEFAULT_CONCURRENCY` or their own tuned cap, e.g.
+    /// callers pass `--batch-get-concurrency` or their own tuned cap, e.g.
     /// python's `per_worker_cap`) over the per-partition multiplexed PS
     /// connections, amortising per-call await latency + letting the writer_task
     /// batch syscalls. Every per-key read is `get_range_into` (`MSG_GET_BULK`,
@@ -4025,7 +4038,7 @@ impl ClusterClient {
             }
             return out;
         }
-        let concurrency = BATCH_GET_DEFAULT_CONCURRENCY;
+        let concurrency = batch_get_concurrency();
         let futs = items.iter_mut().map(|it| {
             let key: &[u8] = it.key;
             let offset = it.offset;
@@ -4464,7 +4477,7 @@ impl ClusterClient {
             }
             out
         });
-        for group_out in fan_out_collect(group_futs, BATCH_PUT_DEFAULT_CONCURRENCY).await {
+        for group_out in fan_out_collect(group_futs, batch_put_concurrency()).await {
             for (idx, r) in group_out {
                 results[idx] = r;
             }
@@ -4634,7 +4647,7 @@ impl ClusterClient {
     ) -> Vec<std::result::Result<KeyMeta, AutumnError>> {
         // head is a read → reuse the read-side concurrency cap.
         let futs = keys.iter().map(|&key| async move { self.head(key).await });
-        fan_out_collect(futs, BATCH_GET_DEFAULT_CONCURRENCY).await
+        fan_out_collect(futs, batch_get_concurrency()).await
     }
 
     /// Delete a key. Returns Ok(()) even if key didn't exist.
@@ -5067,7 +5080,7 @@ impl ClusterClient {
         PutStreamHandle {
             cluster: self,
             user_key: key.to_vec(),
-            chunk_size: STRIPE_CHUNK_SIZE,
+            chunk_size: stripe_chunk_size(),
             next_chunk_index: 0,
             bytes_sent: 0,
             state: PutStreamState::Open,
@@ -5434,8 +5447,11 @@ const META_ENCODED_LEN: usize = 29;
 /// systems (S3 multipart's 5 MiB minimum, Ceph striperados 4 MiB
 /// default). Each chunk is one `MSG_PUT` RPC + one VP entry on the
 /// PS — large enough to amortise per-chunk RPC framing, small enough
-/// that a transient connection error costs only a 4 MiB resend.
-pub const STRIPE_CHUNK_SIZE: u32 = 4 * 1024 * 1024;
+/// that a transient connection error costs only a 4 MiB resend
+/// (`--stripe-chunk-bytes`).
+pub fn stripe_chunk_size() -> u32 {
+    params().stripe_chunk_bytes.get()
+}
 
 /// chunk-key namespace prefix. Starts with `\xff\xfe` so chunks
 /// sort AFTER all normal user keys; range scans within a user prefix

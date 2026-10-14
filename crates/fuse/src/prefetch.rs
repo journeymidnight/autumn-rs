@@ -12,7 +12,7 @@
 //! falls inside fetched blocks is answered from there.
 //!
 //! How far ahead: a front prefetches as far as it has already read in sequence
-//! (at least one [`BLOCK`], at most [`WINDOW`]). A safetensors load first
+//! (at least one [`block_bytes`], at most [`window_bytes`]). A safetensors load first
 //! touches the head of every tensor — 2-4 MiB each, jumping 32-86 MiB — and
 //! only then copies the tensors in order. Fetching a full window ahead of every
 //! head fetched ~1.7x the file (3.3 GB fetched for 1.9 GB, 1.4 GB never read),
@@ -25,7 +25,7 @@
 //! (`--prefetch-mem-mb`); a block that does not fit is not fetched and the READ
 //! goes to the cluster as it would without prefetch: no READ ever waits on the
 //! budget. A block is freed when every byte of it has been served, when it has
-//! sat unread for [`IDLE`], when its file closes, or when the file's content
+//! sat unread for [`idle`], when its file closes, or when the file's content
 //! generation changes. The bytes a front read from the cluster before its first
 //! block existed are credited to that block at admission — otherwise it never
 //! reaches "fully served", and such blocks (measured) held a 1 GiB budget full
@@ -47,27 +47,44 @@ use std::time::{Duration, Instant};
 
 use futures::channel::oneshot;
 
-/// Prefetch unit. Blocks start at multiples of it, so several readers of one
-/// file share them.
-pub const BLOCK: u64 = 4 << 20;
-/// The furthest ahead of a reader's front blocks are kept in flight.
-pub const WINDOW: u64 = 64 << 20;
+/// Prefetch unit (`--prefetch-block-bytes`). Blocks start at multiples of it,
+/// so several readers of one file share them.
+pub fn block_bytes() -> u64 {
+    crate::params().prefetch_block_bytes.get()
+}
+/// The furthest ahead of a reader's front blocks are kept in flight
+/// (`--prefetch-window-bytes`).
+fn window_bytes() -> u64 {
+    crate::params().prefetch_window_bytes.get()
+}
 /// A READ this close to a front continues it: the kernel sends the READs of a
 /// readahead window concurrently, so they arrive slightly out of order. One
 /// kernel window (the 2 MiB `read_ahead_kb` docs/ops.md recommends); 4 MiB
 /// let random 4 KiB reads of a 2 GB file pass as sequential often enough to put their p99 at 24.7 ms —
-/// they waited for a 4 MiB block where a direct read takes 2 ms.
-const FRONT_TOLERANCE: u64 = 2 << 20;
+/// they waited for a 4 MiB block where a direct read takes 2 ms
+/// (`--prefetch-front-tolerance-bytes`).
+fn front_tolerance() -> u64 {
+    crate::params().prefetch_front_tolerance_bytes.get()
+}
 /// Bytes a front must actually have read before it prefetches, and they must
 /// cover at least half of the range it spans. Counting READs instead let a few
 /// random 4 KiB reads that happened to land near each other — each one able to
-/// push `next` almost FRONT_TOLERANCE ahead — pass as a run.
-const MIN_RUN_BYTES: u64 = 3 << 20;
+/// push `next` almost the front tolerance ahead — pass as a run
+/// (`--prefetch-min-run-bytes`).
+fn min_run_bytes() -> u64 {
+    crate::params().prefetch_min_run_bytes.get()
+}
 /// Fronts tracked per file: every thread faulting through a file makes its own,
-/// and one more than the fronts evicts the oldest over and over.
-const MAX_FRONTS: usize = 16;
-/// A fetched block nobody has read for this long is dropped.
-pub const IDLE: Duration = Duration::from_secs(5);
+/// and one more than the fronts evicts the oldest over and over
+/// (`--prefetch-max-fronts`).
+fn max_fronts() -> usize {
+    crate::params().prefetch_max_fronts.get()
+}
+/// A fetched block nobody has read for this long is dropped
+/// (`--prefetch-idle-secs`).
+pub fn idle() -> Duration {
+    Duration::from_secs(crate::params().prefetch_idle_secs.get())
+}
 
 // ---------------------------------------------------------------- detector
 
@@ -109,7 +126,7 @@ struct Front {
 impl Detector {
     /// Record a READ of `[offset, offset + len)` of a `file_size`-byte file and
     /// return the blocks to fetch now: none until the READ continues a dense
-    /// enough run, then those up to `next + clamp(read, BLOCK, WINDOW)` not yet
+    /// enough run, then those up to `next + clamp(read, block, window)` not yet
     /// asked for.
     pub fn on_read(
         &mut self,
@@ -119,7 +136,7 @@ impl Detector {
         len: u64,
         file_size: u64,
     ) -> Vec<Fetch> {
-        if len == 0 || file_size < 2 * BLOCK {
+        if len == 0 || file_size < 2 * block_bytes() {
             return Vec::new();
         }
         let f = self.files.entry(ino).or_insert_with(|| FileFronts {
@@ -136,7 +153,7 @@ impl Detector {
         let clock = f.clock;
         let end = offset + len;
         let continued = f.fronts.iter().position(|fr| {
-            offset + FRONT_TOLERANCE >= fr.next && offset <= fr.next + FRONT_TOLERANCE
+            offset + front_tolerance() >= fr.next && offset <= fr.next + front_tolerance()
         });
         let idx = match continued {
             Some(i) => {
@@ -148,10 +165,10 @@ impl Detector {
                 i
             }
             None => {
-                if f.fronts.len() == MAX_FRONTS {
+                if f.fronts.len() == max_fronts() {
                     let oldest = (0..f.fronts.len())
                         .min_by_key(|&i| f.fronts[i].used)
-                        .expect("MAX_FRONTS > 0");
+                        .expect("max_fronts() > 0");
                     f.fronts.swap_remove(oldest);
                 }
                 f.fronts.push(Front { start: offset, next: end, read: len, used: clock });
@@ -159,20 +176,20 @@ impl Detector {
             }
         };
         let front = &f.fronts[idx];
-        if front.read < MIN_RUN_BYTES || front.read * 2 < front.next - front.start {
+        if front.read < min_run_bytes() || front.read * 2 < front.next - front.start {
             return Vec::new();
         }
         let (start, next) = (front.start, front.next);
-        let ahead = front.read.clamp(BLOCK, WINDOW);
-        let first = next / BLOCK;
-        let last = (next + ahead).min(file_size).div_ceil(BLOCK); // exclusive
+        let ahead = front.read.clamp(block_bytes(), window_bytes());
+        let first = next / block_bytes();
+        let last = (next + ahead).min(file_size).div_ceil(block_bytes()); // exclusive
         (first..last)
             .filter(|b| f.issued.insert(*b))
             .map(|b| {
-                let block = b * BLOCK;
+                let block = b * block_bytes();
                 // Only the block holding `next` lies partly behind it, and of
                 // that only what this run read — from `start` on — was read.
-                let already_read = next.saturating_sub(block.max(start)).min(BLOCK);
+                let already_read = next.saturating_sub(block.max(start)).min(block_bytes());
                 Fetch { block, already_read }
             })
             .collect()
@@ -182,7 +199,7 @@ impl Detector {
     /// planning failed): let a later READ ask for it again.
     pub fn unissue(&mut self, ino: u64, block: u64) {
         if let Some(f) = self.files.get_mut(&ino) {
-            f.issued.remove(&(block / BLOCK));
+            f.issued.remove(&(block / block_bytes()));
         }
     }
 
@@ -445,7 +462,7 @@ impl PrefetchCache {
             return Lookup::Miss;
         }
         let end = offset + len;
-        let first = offset / BLOCK * BLOCK;
+        let first = offset / block_bytes() * block_bytes();
         let mut start = first;
         while start < end {
             let covered = match file.blocks.get_mut(&start) {
@@ -457,14 +474,14 @@ impl PrefetchCache {
                         inner.stats.waits += 1;
                         return Lookup::Wait(rx);
                     }
-                    BlockState::Ready(data) => data.len() as u64 >= end.min(start + BLOCK) - start,
+                    BlockState::Ready(data) => data.len() as u64 >= end.min(start + block_bytes()) - start,
                 },
             };
             if !covered {
                 inner.stats.misses += 1;
                 return Lookup::Miss;
             }
-            start += BLOCK;
+            start += block_bytes();
         }
 
         // Every block is there: take the bytes and charge what was served.
@@ -474,7 +491,7 @@ impl PrefetchCache {
         while start < end {
             let b = file.blocks.get_mut(&start).expect("checked above");
             let from = offset.max(start) - start;
-            let to = end.min(start + BLOCK) - start;
+            let to = end.min(start + block_bytes()) - start;
             let BlockState::Ready(data) = &b.state else { unreachable!("checked above") };
             parts.push((data.clone(), from as usize..to as usize));
             b.served += to - from;
@@ -484,7 +501,7 @@ impl PrefetchCache {
                 file.blocks.remove(&start);
                 inner.used -= len;
             }
-            start += BLOCK;
+            start += block_bytes();
         }
         if file.blocks.is_empty() {
             inner.files.remove(&ino);
@@ -514,7 +531,7 @@ impl PrefetchCache {
         }
     }
 
-    /// Drop fetched blocks nobody has read for [`IDLE`]. Blocks still being
+    /// Drop fetched blocks nobody has read for [`idle`]. Blocks still being
     /// fetched stay: their fetch is bounded and completes or fails.
     pub fn sweep(&self, now: Instant) {
         let mut g = self.lock();
@@ -524,7 +541,7 @@ impl PrefetchCache {
         for file in inner.files.values_mut() {
             file.blocks.retain(|_, b| {
                 let idle = matches!(b.state, BlockState::Ready(_))
-                    && now.duration_since(b.touched) >= IDLE;
+                    && now.duration_since(b.touched) >= idle();
                 if idle {
                     freed += b.len;
                     wasted += b.len.saturating_sub(b.served);
@@ -552,6 +569,9 @@ mod tests {
     use super::*;
 
     const MIB: u64 = 1 << 20;
+    const BLOCK: u64 = 4 << 20;
+    const WINDOW: u64 = 64 << 20;
+    const IDLE: Duration = Duration::from_secs(5);
     const FILE: u64 = 1024 * MIB;
 
     fn blocks(plan: &[Fetch]) -> Vec<u64> {

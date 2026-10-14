@@ -1,8 +1,12 @@
 # autumn-params Crate Guide
 
-Every tunable of every autumn process, declared once. One file per role
-(`manager.rs`, `ps.rs`, `en.rs`, ...); `lib.rs` holds the `params!` macro and the
-helpers built on it.
+Every tunable of every autumn process, declared once. One file per role:
+`manager.rs`, `ps.rs`, `en.rs` (servers), `client.rs` (the SDK, shared by every
+binary that embeds `ClusterClient`), `fs.rs` (the file-system layer, shared by
+autumn-fuse / autumnfs / autumn-s3), `fuse.rs`, `autumnfs.rs`, `s3.rs`,
+`gallery.rs`, `dashboard.rs`. `lib.rs` holds the `params!` macro and the helpers
+built on it. A clap binary pulls its parameters out of argv with `split_params`
+(+ `take_any!` over several structs) before clap sees the rest.
 
 ## Three kinds of parameter
 

@@ -247,10 +247,6 @@ pub async fn delete_pages(client: &ClusterClient, map_id: u64, count: u32, lease
 /// Immutable map pages already fetched, keyed by `(map_id, page)`.
 pub type PageCache = std::collections::HashMap<(u64, u32), Rc<Vec<Segment>>>;
 
-/// Pages kept per cache before it is cleared: 256 pages of up to 1024
-/// segments is about 10 MiB per session. Pages never change, so the only
-/// cost of clearing is a refetch.
-const PAGE_CACHE_CAP: usize = 256;
 
 /// The segments of `map` intersecting `[start, end)`, fetching only the pages
 /// that range touches. A missing page is corruption, never an empty range.
@@ -282,7 +278,8 @@ pub async fn load_range(
         }
     }
     if !missing.is_empty() {
-        if cache.len() + missing.len() > PAGE_CACHE_CAP {
+        // Pages never change, so the only cost of clearing is a refetch.
+        if cache.len() + missing.len() > crate::params().segment_page_cache_cap.get() {
             cache.clear();
         }
         let keys: Vec<Vec<u8>> = missing.iter().map(|&i| key::segment_page_key(map.map_id, i)).collect();
@@ -333,14 +330,14 @@ async fn record(state: &mut FsState, file_ino: u64, id: u64, rec: &SegcRecord, l
 }
 
 /// A data object written as a stream: each unit goes out the moment it
-/// fills, up to [`STREAM_INFLIGHT`] at once, with no barrier between them, so
+/// fills, up to [`stream_inflight()`] at once, with no barrier between them, so
 /// the writes overlap the arrival of the rest of the body and a large body is
 /// never held in memory.
 ///
 /// The record at `record_key` bounds what may exist: no data put is issued
 /// past the length the record durably allows, so whoever undoes or reclaims
 /// the object deletes everything that can be there. The record never allows
-/// more than `STREAM_INFLIGHT` units past the end written, whatever the writer
+/// more than `stream_inflight()` units past the end written, whatever the writer
 /// declares — reclaiming an object walks every key its record allows, so a
 /// record taken from an untrusted length could name billions — and it is
 /// raised again once half that headroom is used (every fifth unit). A
@@ -371,8 +368,10 @@ pub struct ObjectStream {
     crc: u32,
 }
 
-/// Data puts in flight per stream (one unit each).
-const STREAM_INFLIGHT: usize = 8;
+/// Data puts in flight per stream (one unit each; `--segment-stream-inflight`).
+fn stream_inflight() -> usize {
+    crate::params().segment_stream_inflight.get()
+}
 
 fn task_result<T, E: std::fmt::Debug>(r: std::result::Result<Result<T>, E>, what: &str) -> Result<T> {
     r.unwrap_or_else(|e| Err(anyhow!("{what} task: {e:?}")))
@@ -418,7 +417,7 @@ impl ObjectStream {
     /// What to raise the record to for writes up to `end`: the window past
     /// it, but no further than a declared length that covers it.
     fn record_target(&self, end: u64) -> u64 {
-        let window = end + STREAM_INFLIGHT as u64 * self.unit as u64;
+        let window = end + stream_inflight() as u64 * self.unit as u64;
         match self.declared {
             Some(n) if n >= end => n.min(window),
             _ => window,
@@ -449,7 +448,7 @@ impl ObjectStream {
                 }
             }
         }
-        let half = STREAM_INFLIGHT as u64 * self.unit as u64 / 2;
+        let half = stream_inflight() as u64 * self.unit as u64 / 2;
         let to = self.record_target(end);
         if self.raising.is_none() && self.recorded - end < half && to > self.recorded {
             self.raising = Some((to, self.spawn_record(to)));
@@ -511,9 +510,9 @@ impl ObjectStream {
     }
 
     /// Put `chunk` (at most one unit) at the current end, after the oldest
-    /// put when [`STREAM_INFLIGHT`] are already out.
+    /// put when [`stream_inflight()`] are already out.
     async fn issue(&mut self, chunk: Bytes) -> Result<()> {
-        if self.inflight.len() >= STREAM_INFLIGHT {
+        if self.inflight.len() >= stream_inflight() {
             if let Some(Err(e)) = self.settle_oldest().await {
                 return Err(self.fail(e).await);
             }

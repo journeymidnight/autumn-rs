@@ -19,7 +19,7 @@ as before — the redirect stays an optimization, never a correctness dependency
 ## Batched direct-read descriptor concurrency
 
 `get_many_direct` submits partition descriptor requests through `fan_out_collect`
-with `BATCH_GET_DEFAULT_CONCURRENCY`, instead of waiting for each partition in turn.
+with `--batch-get-concurrency`, instead of waiting for each partition in turn.
 The original item indices accompany each result. Per-partition descriptor failures
 retain the existing per-item fallback; data fan-out starts after collection.
 
@@ -170,7 +170,7 @@ bulk decisions go through `bulk_worthwhile`. No `concurrency` arg — internal d
   a relative TTL with `ClusterClient::ttl_to_expires_at(ttl_secs)`. SDK groups by owning
   partition. An item ≥ 64 KiB leaves the batch entirely and goes per-op
   `MSG_PUT_BULK`, fanned out CONCURRENTLY via
-  `fan_out_collect(BATCH_PUT_DEFAULT_CONCURRENCY)`. What remains is sent as ONE frame
+  `fan_out_collect(batch_put_concurrency())`. What remains is sent as ONE frame
   per partition, and which frame depends on the GROUP's total value bytes, not on any
   single item's: ≥ 64 KiB → `MSG_BATCH_PUT_BULK` (keys and `value_len`s in ctrl, the
   values as their own iovecs in the raw tail — `Bytes::clone` is a refcount bump, so no
@@ -238,7 +238,7 @@ bulk decisions go through `bulk_worthwhile`. No `concurrency` arg — internal d
   `{prefix}{prefix}{key}`, and deleting a key that does not exist reports `Ok` — the
   batch would claim success having removed nothing.
 - `head_many(keys) → Vec<Result<KeyMeta>>` — batched metadata, still client-side
-  fan-out at `BATCH_GET_DEFAULT_CONCURRENCY`. Returns `found=false` for a missing key
+  fan-out at `--batch-get-concurrency`. Returns `found=false` for a missing key
   (not `Err`).
 
 **Internal-only (`pub(crate)`):** `batch_put` / `batch_delete` — the server-batched RPC layer for writes,
@@ -492,11 +492,18 @@ Two error channels stay distinct: `rpc_status_to_error` maps frame-level `Status
 (handler returned `Err((StatusCode, msg))`); `code_to_error` maps application-level `CODE_*`
 carried in a successful response body.
 
-## Constants
+## Constants and parameters
 
-- `BULK_MIN_BYTES = 64 KiB` — bulk engage threshold (both directions/transports).
-- `BATCH_PUT_DEFAULT_CONCURRENCY = 32` — put/delete fan-out cap.
-- `BATCH_GET_DEFAULT_CONCURRENCY = 32` — get/head fan-out cap.
+SDK tunables are declared in `crates/params/src/client.rs` (`ClientParams`), one
+process-wide instance (`autumn_client::params()`); every binary that embeds the
+client offers its argv to it, so `--rpc-timeout-ms`, `--first-attempt-timeout-ms`,
+`--batch-get-concurrency` / `--batch-put-concurrency` (32), `--token-renew-margin-secs`
+(300) and `--stripe-chunk-bytes` (4 MiB) are flags of each of them. A client copies
+the two timeouts when it is built (`set_rpc_timeout` still overrides one client);
+the others are read where used.
+
+- `BULK_MIN_BYTES = 64 KiB` — bulk engage threshold (both directions/transports);
+  a protocol choice shared with the PS, not a flag.
 - `MAX_PS_REFRESHES = 10` — routing-refresh retry budget (~9 s), base 100 ms / cap 2000 ms.
 - `MAX_RANGE_REFRESHES = 3` — range refresh cycles per call.
 - `MAX_RANGE_ITERATIONS = 10_000` — range iteration cap.

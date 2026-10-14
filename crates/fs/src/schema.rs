@@ -421,32 +421,38 @@ pub const MAX_EXTENT: usize = 8 * 1024 * 1024;
 /// Small file inline threshold: 4KB (matches VALUE_THROTTLE).
 pub const INLINE_THRESHOLD: usize = 4096;
 
-/// Inode allocation batch size.
-pub const INODE_ALLOC_BATCH: u64 = 1000;
+/// Inode allocation batch size (`--inode-alloc-batch`).
+pub fn inode_alloc_batch() -> u64 {
+    crate::params().inode_alloc_batch.get()
+}
 
-/// Per-inode write buffer capacity in extents. Buffer = WRITE_BUF_EXTENTS *
+/// Per-inode write buffer capacity in extents. Buffer = `--write-buf-extents` *
 /// [`MAX_EXTENT`] bytes (8 × 8 MiB = 64 MiB). The buffer fills with sequential
 /// fuse `write` syscalls and flushes one whole buffer's worth at a time via
-/// `extent::write_region`. With WRITE_BUF_EXTENTS == 1 the flush is a single
+/// `extent::write_region`. With `--write-buf-extents` == 1 the flush is a single
 /// `put` and the cp throughput ceiling is `MAX_EXTENT / RPC_RTT` (~270 MB/s
 /// on local NVMe + TCP loopback + 3 replicas). With > 1, write_region splits
 /// into multiple extents and `put_many` groups them BY WIRE KEY, fanning the
-/// groups out concurrently (`BATCH_PUT_DEFAULT_CONCURRENCY`). A flush's extent
+/// groups out concurrently (`--batch-put-concurrency`). A flush's extent
 /// keys are all distinct, so every extent in it goes out in parallel and the
-/// ceiling scales to `WRITE_BUF_EXTENTS * MAX_EXTENT / RPC_RTT` until the
+/// ceiling scales to `write_buf_extents * MAX_EXTENT / RPC_RTT` until the
 /// EN-side disk + replica fanout saturates. (There is no `APPEND_PIPELINE_
 /// DEPTH` — that constant was removed when `put_many` stopped taking a
 /// `concurrency` argument; see `extent.rs`.)
 ///
-/// Cost: up to `WRITE_BUF_EXTENTS * MAX_EXTENT` (64 MiB) of pre-flush RAM per
+/// Cost: up to `write_buf_extents * MAX_EXTENT` (64 MiB) of pre-flush RAM per
 /// actively-writing inode. For sglang-style model checkpoint cp (a handful
 /// of concurrent multi-GB files) this is negligible; for a workload with
 /// thousands of concurrently-open dirty inodes a smaller value may be
 /// appropriate.
-pub const WRITE_BUF_EXTENTS: usize = 8;
+pub fn write_buf_extents() -> usize {
+    crate::params().write_buf_extents.get()
+}
 
-/// Per-inode write buffer capacity in bytes. See [`WRITE_BUF_EXTENTS`].
-pub const WRITE_BUF_CAP: usize = WRITE_BUF_EXTENTS * MAX_EXTENT;
+/// Per-inode write buffer capacity in bytes. See [`write_buf_extents`].
+pub fn write_buf_cap() -> usize {
+    write_buf_extents() * MAX_EXTENT
+}
 
 /// How many append flushes one inode may have in flight at once.
 ///
@@ -483,14 +489,16 @@ pub const WRITE_BUF_CAP: usize = WRITE_BUF_EXTENTS * MAX_EXTENT;
 ///
 /// Deeper is NOT free and wants its own measurement: `plan_append_only` COPIES
 /// the buffer into the plan (`Bytes::copy_from_slice`), so each slot pins a
-/// live `WRITE_BUF_CAP`. At 2 that is 128 MiB in flight per actively-writing
+/// live `write_buf_cap()`. At 2 that is 128 MiB in flight per actively-writing
 /// inode, on top of the 64 MiB buffer itself — and depth 2 already matches the
 /// CLI's continuous window, the comparator, on that rig.
 ///
 /// `1` is an EXACT revert (at 1, `make_room` waits whenever the queue holds
 /// anything at all, which is precisely what the unconditional drain it
 /// replaced did), and it is what the A/B above ran as the baseline.
-pub const APPEND_INFLIGHT_DEPTH: usize = 2;
+pub fn append_inflight_depth() -> usize {
+    crate::params().append_inflight_depth.get()
+}
 
 /// Root inode number (FUSE_ROOT_ID).
 pub const ROOT_INO: u64 = 1;
@@ -546,7 +554,7 @@ pub struct PendingFlush {
 }
 
 pub struct WriteBuffer {
-    /// Buffer storage, capacity = [`WRITE_BUF_CAP`].
+    /// Buffer storage, capacity = [`write_buf_cap()`].
     pub buf: Vec<u8>,
     /// Starting file offset of buffered data.
     pub offset: i64,
@@ -563,7 +571,7 @@ impl Default for WriteBuffer {
 impl WriteBuffer {
     pub fn new() -> Self {
         Self {
-            buf: Vec::with_capacity(WRITE_BUF_CAP),
+            buf: Vec::with_capacity(write_buf_cap()),
             offset: 0,
             len: 0,
         }
@@ -581,9 +589,9 @@ pub struct InodeState {
     ///
     /// A QUEUE, not one slot. With a single slot the writer had to drain the
     /// previous flush before it could even PLAN the next, so exactly one
-    /// 64 MiB batch was ever on the wire. Up to [`APPEND_INFLIGHT_DEPTH`] ride
+    /// 64 MiB batch was ever on the wire. Up to [`--append-inflight-depth`] ride
     /// at once now — but that single slot was itself the win that mattered
-    /// (249 -> 338 MiB/s in `2949372`); see [`APPEND_INFLIGHT_DEPTH`] for how
+    /// (249 -> 338 MiB/s in `2949372`); see [`--append-inflight-depth`] for how
     /// little is left after it.
     ///
     /// While this is NON-EMPTY the extent map is INCOMPLETE and the inode's

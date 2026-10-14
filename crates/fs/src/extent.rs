@@ -29,11 +29,11 @@ use crate::state::FsState;
 
 // There is no fuse-side per-put pipeline depth: `put_many` takes no
 // `concurrency` argument. The SDK groups items by WIRE KEY and fans the groups
-// out at `autumn_client::BATCH_PUT_DEFAULT_CONCURRENCY` (32); a flush's extent
+// out at the client's `--batch-put-concurrency` (32); a flush's extent
 // keys are all distinct, so one flush's puts are singleton groups and already
 // go out in parallel over the multiplexed PS connection.
 //
-// The depth that IS tunable sits one level up: `schema::APPEND_INFLIGHT_DEPTH`
+// The depth that IS tunable sits one level up: `schema::append_inflight_depth`
 // bounds how many FLUSHES — not puts — an inode may have in flight at once.
 
 /// Range-scan page size when rebuilding the extent map of a large file.

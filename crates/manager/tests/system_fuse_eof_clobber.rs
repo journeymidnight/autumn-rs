@@ -26,7 +26,7 @@ use std::time::Duration;
 use autumn_client::ClusterClient;
 use autumn_rpc::client::RpcClient;
 
-use autumn_fs::schema::{self, WRITE_BUF_CAP};
+use autumn_fs::schema::{self, write_buf_cap};
 use autumn_fs::state::FsState;
 use autumn_fs::{key, meta, read, write};
 
@@ -82,7 +82,7 @@ fn eof_read_must_not_clobber_unpublished_size() {
         // Exactly one full buffer: the batch FLUSHES (extents land) while the
         // size covering them stays unpublished, because nothing fsyncs. This
         // is the ordinary mid-write state, not a contrived one.
-        let total = WRITE_BUF_CAP;
+        let total = write_buf_cap();
         let data = vec![0xABu8; total];
         let n = write::write(&mut state, ino, 0, &data).await.expect("write");
         assert_eq!(n as usize, total, "write returned full length");

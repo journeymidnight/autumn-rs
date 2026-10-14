@@ -25,7 +25,7 @@ use std::time::Duration;
 use autumn_client::ClusterClient;
 use autumn_rpc::client::RpcClient;
 
-use autumn_fs::schema::WRITE_BUF_CAP;
+use autumn_fs::schema::write_buf_cap;
 use autumn_fs::state::FsState;
 use autumn_fs::{meta, read, write};
 
@@ -77,7 +77,7 @@ fn a_logging_only_caller_must_not_eat_the_sticky_flush_error() {
         // Warm the extent cache with one SUCCESSFUL flush. Without this the
         // next flush fails while PLANNING (the extent-map scan needs the PS),
         // so no flush is ever spawned and no record is ever set.
-        let warm = vec![0xCDu8; WRITE_BUF_CAP];
+        let warm = vec![0xCDu8; write_buf_cap()];
         write::write(&mut state, ino, 0, &warm).await.expect("warm write");
         write::flush_inode(&mut state, ino, write::FlushReport::ToApplication)
             .await
@@ -88,8 +88,8 @@ fn a_logging_only_caller_must_not_eat_the_sticky_flush_error() {
 
         // A contiguous append fills the buffer, plans from the WARM cache, and
         // spawns a flush whose puts cannot land.
-        let doomed = vec![0xEFu8; WRITE_BUF_CAP];
-        let _ = write::write(&mut state, ino, WRITE_BUF_CAP as i64, &doomed).await;
+        let doomed = vec![0xEFu8; write_buf_cap()];
+        let _ = write::write(&mut state, ino, write_buf_cap() as i64, &doomed).await;
         let drained = write::drain_pending(&mut state, ino).await;
         assert!(
             drained.is_err(),
@@ -176,7 +176,7 @@ fn the_read_after_write_barrier_must_not_eat_the_sticky_flush_error() {
         let m = meta::new_file_meta(0o644, 0, 0);
         meta::put_inode(&mut state, ino, &m).await.expect("put_inode");
 
-        let warm = vec![0xCDu8; WRITE_BUF_CAP];
+        let warm = vec![0xCDu8; write_buf_cap()];
         write::write(&mut state, ino, 0, &warm).await.expect("warm write");
         write::flush_inode(&mut state, ino, write::FlushReport::ToApplication)
             .await
@@ -184,8 +184,8 @@ fn the_read_after_write_barrier_must_not_eat_the_sticky_flush_error() {
 
         ps.kill();
 
-        let doomed = vec![0xEFu8; WRITE_BUF_CAP];
-        let _ = write::write(&mut state, ino, WRITE_BUF_CAP as i64, &doomed).await;
+        let doomed = vec![0xEFu8; write_buf_cap()];
+        let _ = write::write(&mut state, ino, write_buf_cap() as i64, &doomed).await;
         let drained = write::drain_pending(&mut state, ino).await;
         assert!(drained.is_err(), "precondition: the spawned flush must fail");
         assert!(
@@ -287,7 +287,7 @@ fn the_write_path_flushes_must_not_eat_the_sticky_flush_error() {
         let m = meta::new_file_meta(0o644, 0, 0);
         meta::put_inode(&mut state, ino, &m).await.expect("put_inode");
 
-        let warm = vec![0xCDu8; WRITE_BUF_CAP];
+        let warm = vec![0xCDu8; write_buf_cap()];
         write::write(&mut state, ino, 0, &warm).await.expect("warm write");
         write::flush_inode(&mut state, ino, write::FlushReport::ToApplication)
             .await
@@ -295,8 +295,8 @@ fn the_write_path_flushes_must_not_eat_the_sticky_flush_error() {
 
         ps.kill();
 
-        let doomed = vec![0xEFu8; WRITE_BUF_CAP];
-        let _ = write::write(&mut state, ino, WRITE_BUF_CAP as i64, &doomed).await;
+        let doomed = vec![0xEFu8; write_buf_cap()];
+        let _ = write::write(&mut state, ino, write_buf_cap() as i64, &doomed).await;
         let drained = write::drain_pending(&mut state, ino).await;
         assert!(drained.is_err(), "precondition: the spawned flush must fail");
         assert!(

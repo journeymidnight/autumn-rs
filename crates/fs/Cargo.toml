@@ -17,6 +17,7 @@ harness = false
 
 [dependencies]
 autumn-rpc = { path = "../rpc" }
+autumn-params = { path = "../params" }
 autumn-client = { path = "../client" }
 
 anyhow.workspace = true

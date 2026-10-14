@@ -51,7 +51,7 @@ use futures::StreamExt;
 
 use autumn_client::ClusterClient;
 
-use crate::bridge::REPLY_TIMEOUT;
+use crate::bridge::reply_timeout;
 use crate::prefetch::{Admitted, Detector, Lookup, PrefetchCache, Served, Stats};
 use autumn_fs::read::{self, ChunkSpec, ReadPlan};
 
@@ -448,7 +448,7 @@ fn worker_main(
                         // is: this is the one FUSE op answered off the request
                         // loop, so it is the one that can leave the kernel
                         // waiting forever. The bound covers a wait on a block.
-                        match compio::time::timeout(REPLY_TIMEOUT, answer).await {
+                        match compio::time::timeout(reply_timeout(), answer).await {
                             Ok(Ok(served)) => reply.data(served.bytes()),
                             Ok(Err(e)) => {
                                 tracing::warn!(error = %e, "fuse read execute failed");
@@ -456,7 +456,7 @@ fn worker_main(
                             }
                             Err(_) => {
                                 tracing::warn!(
-                                    timeout_secs = REPLY_TIMEOUT.as_secs(),
+                                    timeout_secs = reply_timeout().as_secs(),
                                     "fuse read timed out — replying EIO"
                                 );
                                 reply.error(libc::EIO);
@@ -470,7 +470,7 @@ fn worker_main(
                         let PrefetchJob { slot, chunks, actual_size, direct_read } = job;
                         let (ino, block) = (slot.ino(), slot.block());
                         let plan = ReadPlan { inline_result: None, actual_size, client, chunks, direct_read };
-                        let data = match compio::time::timeout(REPLY_TIMEOUT, read::execute(plan)).await {
+                        let data = match compio::time::timeout(reply_timeout(), read::execute(plan)).await {
                             Ok(Ok(data)) => Some(data),
                             Ok(Err(e)) => {
                                 tracing::debug!(ino, block, error = %e, "prefetch fetch failed");

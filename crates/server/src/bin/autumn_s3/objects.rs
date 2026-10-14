@@ -124,8 +124,11 @@ pub async fn stat(fs: &Fs, bucket: &str, key: &str) -> Result<Option<Stat>> {
 /// How long an unused STABLE pin is kept before it is handed back. Ranged
 /// GETs of one file arrive one after another (the weight streamer, a Lance
 /// scan); without the linger each would pay a manager acquire and release.
-/// While it lingers a mount's writer on the file gets EBUSY, so it is short.
-const PIN_LINGER: Duration = Duration::from_secs(2);
+/// While it lingers a mount's writer on the file gets EBUSY, so it is short
+/// (`--pin-linger-ms`).
+fn pin_linger() -> Duration {
+    Duration::from_millis(super::params().pin_linger_ms.get())
+}
 
 /// Why an object could not be pinned.
 pub enum OpenError {
@@ -213,7 +216,7 @@ fn unpin_locked(fs: &Fs, st: &mut FsState, ino: u64) {
     if idle {
         let fs = fs.clone();
         compio::runtime::spawn(async move {
-            compio::time::sleep(PIN_LINGER).await;
+            compio::time::sleep(pin_linger()).await;
             let mut st = fs.lock().await;
             release_if_idle(&mut st, ino).await;
         })

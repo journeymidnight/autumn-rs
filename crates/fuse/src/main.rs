@@ -3,13 +3,13 @@
 //! Architecture:
 //! - fuser threads handle FUSE callbacks and unbounded_send FsRequests on a futures mpsc channel
 //! - A single compio thread owns ClusterClient and awaits rx.next() on the event loop
-//! - A 30s timeout on rx.next drives the periodic dirty-inode flush without busy-polling
+//! - A timeout on rx.next (`--dirty-sync-secs`) drives the periodic dirty-inode flush without busy-polling
 
 use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{CommandFactory, FromArgMatches, Parser};
 use futures::StreamExt;
 use tracing_subscriber::EnvFilter;
 
@@ -70,44 +70,42 @@ struct Args {
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     direct_read: bool,
 
-    /// Number of read I/O threads. Each is its own compio runtime with its own
-    /// cluster client, and prepared reads are handed to them round-robin so the
-    /// bytes do not all cross the dispatcher thread.
-    ///
-    /// The dispatcher is one thread and, at four concurrent readers and up, it
-    /// was the ceiling: pinned at ~100% of a core while eight `autumnfs` CLI
-    /// processes — eight runtimes — pushed 2x the mount's throughput over the
-    /// same loopback TCP. Reads split cleanly because `read::prepare` is the
-    /// only half that touches filesystem state.
-    ///
-    /// Four is where eight concurrent readers stopped being limited by the
-    /// mount: 2211 -> 3705 -> 4763 MiB/s at 0 / 2 / 4 threads, against 5466 for
-    /// eight separate CLI processes on the same files — so 87% of that at four
-    /// threads, and a rerun of the same cell landed 5186-5396 (95-99%). Going
-    /// higher was not measured. Single-stream reads showed no trend across any
-    /// of these settings (measured when opens were direct-io, so a synchronous
-    /// `read` reached the mount one request at a time; the daemon's prefetch,
-    /// `--prefetch-mem-mb`, now fans a single sequential reader out).
-    ///
-    /// Each thread carries its own registered-buffer pool, capped per thread
-    /// (`REGPOOL_CAP_BYTES`, 512 MiB by default), so raising this raises the
-    /// mount's worst-case retained buffer memory with it — and on UCX those
-    /// pages are pinned and count against RLIMIT_MEMLOCK.
-    ///
-    /// `0` keeps every read on the dispatcher (the pre-pool behaviour). Costs
-    /// one manager connection and one connection pool per thread.
-    #[arg(long, default_value_t = 4)]
-    read_io_threads: usize,
+    /// Lease identity of this mount (default: the machine's host name).
+    #[arg(long)]
+    host: Option<String>,
+}
 
-    /// Memory the daemon may hold for its own readahead, in MiB: blocks fetched
-    /// in parallel ahead of a sequential reader, answered from memory when the
-    /// kernel's READs reach them (`prefetch.rs`). A cap, not a reservation —
-    /// a block is freed once the kernel has read it, after 5 s unread, or when
-    /// its file closes; a block that does not fit is not fetched. On UCX this is
-    /// on top of the read threads' registered buffer pools. `0` turns it off;
-    /// it needs `--read-io-threads` > 0.
-    #[arg(long, default_value_t = 1024)]
-    prefetch_mem_mb: u64,
+fn params_help() -> String {
+    format!(
+        "parameters:\n{}{}{}",
+        autumn_params::help::<autumn_params::fuse::FuseParams>(),
+        autumn_params::help::<autumn_params::fs::FsParams>(),
+        autumn_params::help::<autumn_params::client::ClientParams>()
+    )
+}
+
+/// Take every parameter flag out of argv; clap parses the rest.
+fn parse_args() -> Args {
+    let argv: Vec<String> = std::env::args().collect();
+    let rest = autumn_params::split_params(argv, |a, v| {
+        autumn_params::take_any!(
+            a,
+            v,
+            autumn_fuse::params(),
+            autumn_fs::params(),
+            autumn_client::params()
+        )
+    })
+    .unwrap_or_else(|e| {
+        eprintln!("error: {e}");
+        std::process::exit(2);
+    });
+    if let Err(e) = autumn_params::CrossCheck::cross_check(autumn_fuse::params()) {
+        eprintln!("error: {e}");
+        std::process::exit(2);
+    }
+    let matches = Args::command().after_help(params_help()).get_matches_from(rest);
+    Args::from_arg_matches(&matches).unwrap_or_else(|e| e.exit())
 }
 
 fn main() -> Result<()> {
@@ -117,7 +115,11 @@ fn main() -> Result<()> {
         )
         .init();
 
-    let args = Args::parse();
+    let args = parse_args();
+    let host = args.host.clone().unwrap_or_else(autumn_fs::state::system_hostname);
+    if !autumn_transport::set_regpool_cap_bytes(autumn_client::params().ucx_regpool_cap_bytes.get()) {
+        tracing::warn!("regpool cap already set (ignored — first-call-wins)");
+    }
 
     // Select the transport process-wide before the compio thread connects.
     let tk = autumn_transport::parse_transport_flag(&args.transport).unwrap_or_else(|bad| {
@@ -239,14 +241,15 @@ fn main() -> Result<()> {
                 let connect = async {
                     match credential {
                         Some((principal, secret)) => {
-                            FsState::new_with_credential(
+                            FsState::new_with_host_credential(
                                 &manager_addr,
+                                host,
                                 &principal,
                                 secret,
                             )
                             .await
                         }
-                        None => FsState::new(&manager_addr).await,
+                        None => FsState::new_with_host(&manager_addr, host).await,
                     }
                 };
                 let mut state = match connect.await {
@@ -286,30 +289,35 @@ fn main() -> Result<()> {
                 // PS process hasn't yet bound each partition's listener +
                 // called `RegisterPartitionAddr`. Without this, fuse's
                 // init_root kv_put hits 10× mis-route → `ps_call after
-                // 10 refreshes: key not found`. 60 s budget is generous
+                // 10 refreshes: key not found`. The 60 s default budget is generous
                 // enough for a hot-restart-on-loaded-cluster (a few
                 // hundred MiB of WAL replay per partition); 250 ms poll
                 // is cheap.
+                let ready_timeout_secs = autumn_fuse::params().cluster_ready_timeout_secs.get();
                 if let Err(e) = state
                     .client
                     .wait_for_cluster_ready(
-                        std::time::Duration::from_secs(60),
+                        std::time::Duration::from_secs(ready_timeout_secs),
                         std::time::Duration::from_millis(250),
                     )
                     .await
                 {
-                    tracing::error!(error = %format_args!("{e:#}"), "cluster did not become ready in 60s");
+                    tracing::error!(
+                        error = %format_args!("{e:#}"),
+                        "cluster did not become ready in {ready_timeout_secs}s"
+                    );
                     return;
                 }
                 tracing::info!("cluster ready (all partition listeners reachable)");
 
                 // After readiness, so the workers' own `connect` sees the same
                 // regions the dispatcher just waited for.
+                let fuse_params = autumn_fuse::params();
                 let read_pool = autumn_fuse::read_pool::ReadPool::new(
-                    args.read_io_threads,
+                    fuse_params.read_io_threads.get(),
                     &manager_addr,
                     pool_credential,
-                    args.prefetch_mem_mb << 20,
+                    fuse_params.prefetch_mem_mb.get() << 20,
                 )
                 .await;
                 let read_pool = (!read_pool.is_empty()).then_some(read_pool);
@@ -334,7 +342,8 @@ fn main() -> Result<()> {
                 // state.invalidations via Rc<RefCell<…>>.
                 dispatch::spawn_lease_background_tasks(&state, Some(invalidator));
 
-                let sync_interval = Duration::from_secs(30);
+                let sync_interval =
+                    Duration::from_secs(autumn_fuse::params().dirty_sync_secs.get());
                 let mut last_sync = std::time::Instant::now();
 
                 loop {

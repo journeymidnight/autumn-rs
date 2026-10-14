@@ -33,7 +33,8 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 
 use anyhow::{anyhow, bail, Context, Result};
-use clap::{Parser, Subcommand};
+use autumn_params::autumnfs::AutumnfsParams;
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 
 use std::os::unix::ffi::OsStrExt;
 
@@ -79,8 +80,43 @@ struct Args {
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
     direct_read: bool,
 
+    /// Lease identity suffix (`autumnfs-<host>`; default: the machine's host name).
+    #[arg(long)]
+    host: Option<String>,
+
     #[command(subcommand)]
     cmd: Cmd,
+}
+
+/// autumnfs CLI tunables (`autumn_params::autumnfs`).
+fn params() -> &'static AutumnfsParams {
+    static PARAMS: std::sync::LazyLock<AutumnfsParams> =
+        std::sync::LazyLock::new(AutumnfsParams::default);
+    &PARAMS
+}
+
+/// Take every parameter flag out of argv; clap parses the rest.
+fn parse_args() -> Args {
+    let argv: Vec<String> = std::env::args().collect();
+    let rest = autumn_params::split_params(argv, |a, v| {
+        autumn_params::take_any!(a, v, params(), autumn_fs::params(), autumn_client::params())
+    })
+    .unwrap_or_else(|e| {
+        eprintln!("error: {e}");
+        std::process::exit(2);
+    });
+    if let Err(e) = autumn_params::CrossCheck::cross_check(params()) {
+        eprintln!("error: {e}");
+        std::process::exit(2);
+    }
+    let help = format!(
+        "parameters:\n{}{}{}",
+        autumn_params::help::<AutumnfsParams>(),
+        autumn_params::help::<autumn_params::fs::FsParams>(),
+        autumn_params::help::<autumn_params::client::ClientParams>()
+    );
+    let matches = Args::command().after_help(help).get_matches_from(rest);
+    Args::from_arg_matches(&matches).unwrap_or_else(|e| e.exit())
 }
 
 #[derive(Subcommand, Debug)]
@@ -118,7 +154,10 @@ enum Cmd {
 }
 
 fn main() -> Result<()> {
-    let args = Args::parse();
+    let args = parse_args();
+    if !autumn_transport::set_regpool_cap_bytes(autumn_client::params().ucx_regpool_cap_bytes.get()) {
+        tracing::warn!("regpool cap already set (ignored — first-call-wins)");
+    }
     // Stand up the same transport selector autumn-client uses everywhere.
     let kind = match args.transport.as_str() {
         "tcp" => autumn_transport::TransportKind::Tcp,
@@ -170,7 +209,7 @@ fn main() -> Result<()> {
         // `ensure_root` also verifies (or stamps) the filesystem's schema
         // version, so this build refuses a layout it cannot read instead of
         // decoding it wrong — which the CLI's own copy of this step never did.
-        let host = std::env::var("HOSTNAME").unwrap_or_else(|_| "autumnfs".to_string());
+        let host = args.host.clone().unwrap_or_else(autumn_fs::state::system_hostname);
         let mut state = FsState::from_client(cluster, format!("autumnfs-{host}"));
         meta::ensure_root(&mut state).await?;
         let cluster = state.client.clone();
@@ -528,13 +567,19 @@ async fn cmd_mkdir(cluster: &ClusterClient, path: &str) -> Result<()> {
 /// per `get_many_into` so a multi-extent download pipelines (per-op bulk fan-out
 /// for the ≥ 64 KiB extents; on UCX RDMA-into-dest, on TCP recv-into-dest)
 /// instead of one serial `get` per extent — and, unlike `get_many`, without
-/// assembling the whole window into one giant response frame.
-const GET_WINDOW_MIN_EXTENTS: usize = 8;
+/// assembling the whole window into one giant response frame
+/// (`--get-window-min-extents`).
+fn get_window_min_extents() -> usize {
+    params().get_window_min_extents.get()
+}
 
-/// RAM ceiling for one download's reused dest buffers. The window is derived
-/// from this, NOT fixed, so that shrinking `MAX_EXTENT` widens the window
-/// instead of silently narrowing lane coverage.
-const GET_WINDOW_MAX_BYTES: usize = 192 * 1024 * 1024;
+/// RAM ceiling for one download's reused dest buffers
+/// (`--get-window-max-bytes`). The window is derived from this, NOT fixed, so
+/// that shrinking `MAX_EXTENT` widens the window instead of silently narrowing
+/// lane coverage.
+fn get_window_max_bytes() -> usize {
+    params().get_window_max_bytes.get()
+}
 
 /// How many extents to fetch per `get_many_into`, given a file's stripe width.
 ///
@@ -551,8 +596,9 @@ const GET_WINDOW_MAX_BYTES: usize = 192 * 1024 * 1024;
 /// it, without the reader needing to know how many partitions there are (which
 /// is exactly the placement-derived lookup this feature removed).
 fn get_window_extents(lanes: u8, unit_bytes: u32) -> usize {
-    let by_ram = GET_WINDOW_MAX_BYTES / (unit_bytes.max(1) as usize);
-    (lanes as usize).clamp(GET_WINDOW_MIN_EXTENTS, by_ram.max(GET_WINDOW_MIN_EXTENTS))
+    let min = get_window_min_extents();
+    let by_ram = get_window_max_bytes() / (unit_bytes.max(1) as usize);
+    (lanes as usize).clamp(min, by_ram.max(min))
 }
 
 async fn read_file_to_writer(
@@ -628,7 +674,7 @@ async fn read_file_to_writer(
             let (lanes, unit) = s.checked().map_err(|e| anyhow!("read {ino}: {e}"))?;
             get_window_extents(lanes, unit)
         }
-        None => GET_WINDOW_MIN_EXTENTS,
+        None => get_window_min_extents(),
     };
     let mut bufs: Vec<Vec<u8>> = (0..window).map(|_| vec![0u8; MAX_EXTENT]).collect();
     let mut written: u64 = 0;
@@ -695,12 +741,12 @@ async fn read_segmented_to_writer(
     out: &mut dyn Write,
     direct_read: bool,
 ) -> Result<()> {
-    const WINDOW: u64 = (GET_WINDOW_MIN_EXTENTS * MAX_EXTENT) as u64;
+    let window = (get_window_min_extents() * MAX_EXTENT) as u64;
     let mut pages = segment::PageCache::new();
-    let mut buf = vec![0u8; WINDOW as usize];
+    let mut buf = vec![0u8; window as usize];
     let mut pos = 0u64;
     while pos < size {
-        let end = (pos + WINDOW).min(size);
+        let end = (pos + window).min(size);
         let segs = segment::load_range(cluster, &mut pages, map, pos, end).await?;
         let plan = segment::plan_reads(&segs, pos, end);
         let region = &mut buf[..(end - pos) as usize];
@@ -859,9 +905,11 @@ async fn publish_file(
         // is hidden. `depth` scales with lane count (each lane wants ~PS
         // inflight-cap worth); non-striped stays shallow (one partition).
         use futures::stream::{FuturesUnordered, StreamExt};
+        let p = params();
         let depth = match &stripe {
-            Some(s) => (s.lanes as usize * 12).clamp(24, 96),
-            None => 8,
+            Some(s) => (s.lanes as usize * p.put_depth_per_lane.get())
+                .clamp(p.put_depth_striped_min.get(), p.put_depth_striped_max.get()),
+            None => p.put_depth.get(),
         };
         let mut inflight = FuturesUnordered::new();
         // chunks ride in RegPool-backed ValueBufs — `depth` slabs

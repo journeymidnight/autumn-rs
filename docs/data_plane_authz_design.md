@@ -100,7 +100,7 @@ manager 常量时间验 `SHA-256(cred) == credential_hash` → 用**私钥**签�
 `exp = now + TTL` 的 capability token（`allowed_prefixes` 取自账户库）→ 返回
 `{token, exp}`。unknown-principal 与 wrong-credential 返回**同一个 opaque 错误**。
 
-client 库懒 mint，并在 `exp` 前 `TOKEN_RENEW_MARGIN_SECS = 300` 秒自动续；
+client 库懒 mint，并在 `exp` 前 `--token-renew-margin-secs = 300` 秒自动续；
 续期会驱逐用旧 token 认证过的 PS 连接。长期 cred = 低频长效，token = 高频短效。
 
 ### 5.3 连接 + 强制（PS）

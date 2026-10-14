@@ -5,7 +5,8 @@ use std::rc::Rc;
 use std::time::Instant;
 
 use anyhow::{anyhow, Context, Result};
-use autumn_client::{AutumnError, ClusterClient, STRIPE_CHUNK_SIZE};
+use autumn_client::{stripe_chunk_size, AutumnError, ClusterClient};
+use autumn_params::gallery::GalleryParams;
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Multipart, Path};
 use axum::http::{HeaderMap, Method, Response, StatusCode};
@@ -100,11 +101,22 @@ const HLS_PREFIX: &str = ".hls/";
 // Reserved prefix for per-file metadata KV (one small KV per field), written on
 // upload and swept on delete.
 const META_PREFIX: &str = ".meta/";
-const THUMB_WIDTH: u32 = 320;
-const THUMB_QUALITY: u8 = 80;
-const LISTEN_PORT: u16 = 5001;
+
+/// Gallery tunables (`autumn_params::gallery`).
+fn params() -> &'static GalleryParams {
+    static PARAMS: std::sync::LazyLock<GalleryParams> = std::sync::LazyLock::new(GalleryParams::default);
+    &PARAMS
+}
+fn thumb_width() -> u32 {
+    params().thumb_width.get()
+}
+fn thumb_quality() -> u8 {
+    params().thumb_quality.get()
+}
 // Chunk size for downloading source video to a temp file before transcoding.
-const RANGE_CHUNK_BYTES: u32 = 4 * 1024 * 1024;
+fn range_chunk_bytes() -> u32 {
+    params().range_chunk_bytes.get()
+}
 
 // gallery's keys are RELATIVE to the client's scope (default `gallery/`) —
 // the scoped `ClusterClient` owns
@@ -135,7 +147,7 @@ fn file_key(name: &str) -> String {
 }
 
 fn thumb_key(name: &str) -> String {
-    format!("{ROOT}{THUMB_PREFIX}{THUMB_WIDTH}/{name}")
+    format!("{ROOT}{THUMB_PREFIX}{}/{name}", thumb_width())
 }
 
 fn meta_prefix(name: &str) -> String {
@@ -341,17 +353,17 @@ fn is_svg_ext(ext: &str) -> bool {
     ext == "svg"
 }
 
-/// Decode the original image bytes, downscale to THUMB_WIDTH preserving aspect,
+/// Decode the original image bytes, downscale to thumb_width preserving aspect,
 /// re-encode as JPEG. Pure-CPU work; small for typical photos but flagged for
 /// callers that care about latency.
 fn build_thumbnail(bytes: &[u8]) -> Result<Vec<u8>> {
     let img = ImageReader::new(Cursor::new(bytes))
         .with_guessed_format()?
         .decode()?;
-    let thumb = img.thumbnail(THUMB_WIDTH, THUMB_WIDTH);
+    let thumb = img.thumbnail(thumb_width(), thumb_width());
     let rgb = thumb.to_rgb8();
     let mut out = Vec::with_capacity(32 * 1024);
-    let encoder = JpegEncoder::new_with_quality(&mut out, THUMB_QUALITY);
+    let encoder = JpegEncoder::new_with_quality(&mut out, thumb_quality());
     rgb.write_with_encoder(encoder)?;
     Ok(out)
 }
@@ -421,9 +433,15 @@ const PS_INLINE_CAP_BYTES: u64 = 64 * 1024 * 1024;
 // `-c copy` cuts on the source's keyframes, so a segment can overshoot to the
 // next keyframe. Aim for 48 MiB (16 MiB of headroom under the cap) and pick the
 // segment seconds from the source byte-rate.
-const HLS_SEGMENT_TARGET_BYTES: f64 = 48.0 * 1024.0 * 1024.0;
-const HLS_TIME_MAX_SECS: f64 = 20.0;
-const HLS_TIME_MIN_SECS: f64 = 2.0;
+fn hls_segment_target_bytes() -> f64 {
+    params().hls_segment_target_bytes.get() as f64
+}
+fn hls_time_max_secs() -> f64 {
+    params().hls_time_max_secs.get() as f64
+}
+fn hls_time_min_secs() -> f64 {
+    params().hls_time_min_secs.get() as f64
+}
 
 /// Probe the container duration (seconds) with `ffprobe`. `None` when ffprobe
 /// is missing/errors or the field is absent — the caller then falls back to the
@@ -453,19 +471,19 @@ fn probe_duration_secs(input: &str) -> Option<f64> {
 }
 
 /// Choose `-hls_time` so an average segment lands near
-/// `HLS_SEGMENT_TARGET_BYTES`. Falls back to `HLS_TIME_MAX_SECS` when the
+/// `hls_segment_target_bytes`. Falls back to `hls_time_max_secs` when the
 /// byte-rate is unknown (no duration / empty file), preserving the old 20 s
 /// behaviour for ordinary-bitrate clips.
 fn pick_hls_time(file_bytes: u64, duration_secs: Option<f64>) -> f64 {
     let dur = match duration_secs {
         Some(d) => d,
-        None => return HLS_TIME_MAX_SECS,
+        None => return hls_time_max_secs(),
     };
     let bytes_per_sec = file_bytes as f64 / dur;
     if bytes_per_sec <= 0.0 {
-        return HLS_TIME_MAX_SECS;
+        return hls_time_max_secs();
     }
-    (HLS_SEGMENT_TARGET_BYTES / bytes_per_sec).clamp(HLS_TIME_MIN_SECS, HLS_TIME_MAX_SECS)
+    (hls_segment_target_bytes() / bytes_per_sec).clamp(hls_time_min_secs(), hls_time_max_secs())
 }
 
 /// Largest `.ts` segment in `dir` (0 if none). Lets the caller detect a
@@ -668,7 +686,7 @@ fn run_transcode_blocking(input_path: &std::path::Path) -> Result<Vec<(String, V
     );
 
     let t2 = Instant::now();
-    let scale = format!("scale={THUMB_WIDTH}:-2");
+    let scale = format!("scale={}:-2", thumb_width());
     let thumb_path = dir.join("thumb.jpg");
     let thumb_status = Command::new("ffmpeg")
         .args([
@@ -735,7 +753,7 @@ fn run_transcode_blocking(input_path: &std::path::Path) -> Result<Vec<(String, V
 /// Download a blob from KV to a local file, chunk by chunk.
 ///
 /// Uses the streaming reader (`get_stream`) rather than `head` + `get_range`:
-/// large videos are stored striped (a chunk-per-`STRIPE_CHUNK_SIZE` under a
+/// large videos are stored striped (a chunk-per-`stripe_chunk_size` under a
 /// reserved namespace plus a tiny meta blob at `key`), so `head(key)` would
 /// report the 28-byte meta length and `get_range(key, …)` would read the meta
 /// bytes — not the video. `get_stream` auto-detects striped vs inline and
@@ -745,7 +763,7 @@ async fn download_to_file(client: &Client, key: &str, dest: &std::path::Path) ->
     use std::io::Write;
 
     let mut stream = client
-        .get_stream(file_key(key).as_bytes(), RANGE_CHUNK_BYTES)
+        .get_stream(file_key(key).as_bytes(), range_chunk_bytes())
         .await
         .context("get_stream for download")?
         .ok_or_else(|| anyhow!("key not found: {key}"))?;
@@ -1065,7 +1083,7 @@ async fn js_handler(headers: HeaderMap, method: Method) -> Response<Body> {
 /// Stream one multipart field straight into a striped value via
 /// `put_stream_begin` → `send` → `commit`. The field arrives as a sequence of
 /// network-sized chunks (~tens of KiB); we coalesce them into
-/// `STRIPE_CHUNK_SIZE` (4 MiB) pieces so each KV `Put` carries a full stripe
+/// `stripe_chunk_size` (4 MiB) pieces so each KV `Put` carries a full stripe
 /// rather than thousands of tiny VPs. Resident memory stays O(chunk)
 /// regardless of upload size, and no single KV value has to hold the whole
 /// file — that's what makes multi-GiB videos uploadable.
@@ -1080,7 +1098,7 @@ async fn stream_upload(
     name: &str,
     field: &mut axum::extract::multipart::Field<'_>,
 ) -> Result<u64> {
-    let chunk_size = STRIPE_CHUNK_SIZE as usize;
+    let chunk_size = stripe_chunk_size() as usize;
     let mut handle = client.put_stream_begin(file_key(name).as_bytes(), 0);
     let mut buf: Vec<u8> = Vec::with_capacity(chunk_size);
     let mut kv_ms = 0.0_f64;
@@ -1295,7 +1313,7 @@ fn stream_kv_range(
         let mut offset = start;
         let mut remaining = total_len;
         while remaining > 0 {
-            let take = remaining.min(RANGE_CHUNK_BYTES as u64) as u32;
+            let take = remaining.min(range_chunk_bytes() as u64) as u32;
             let t0 = Instant::now();
             let result = client
                 .get_range(file_key(&name).as_bytes(), offset as u32, take)
@@ -1845,6 +1863,62 @@ async fn thumb_handler_inner(
 // main
 // ---------------------------------------------------------------------------
 
+struct Args {
+    manager: String,
+    scope: String,
+    credential_file: Option<String>,
+    listen: String,
+    port: u16,
+}
+
+fn usage() -> String {
+    format!(
+        "usage: gallery [--manager 127.0.0.1:9001] [--scope gallery] [--credential-file PATH]\n\
+         \x20              [--listen 0.0.0.0] [--port 5001]\n\nparameters:\n{}{}",
+        autumn_params::help::<GalleryParams>(),
+        autumn_params::help::<autumn_params::client::ClientParams>()
+    )
+}
+
+fn parse_args() -> Args {
+    let mut a = Args {
+        manager: "127.0.0.1:9001".into(),
+        scope: "gallery".into(),
+        credential_file: None,
+        listen: "0.0.0.0".into(),
+        port: 5001,
+    };
+    let fail = |msg: String| -> ! {
+        eprintln!("error: {msg}\n\n{}", usage());
+        std::process::exit(2);
+    };
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let rest = autumn_params::split_params(argv, |f, v| {
+        autumn_params::take_any!(f, v, params(), autumn_client::params())
+    })
+    .unwrap_or_else(|e| fail(e));
+    if let Err(e) = autumn_params::CrossCheck::cross_check(params()) {
+        fail(e);
+    }
+    let mut it = rest.into_iter();
+    while let Some(flag) = it.next() {
+        if flag == "-h" || flag == "--help" {
+            print!("{}", usage());
+            std::process::exit(0);
+        }
+        let value = it.next().unwrap_or_else(|| fail(format!("{flag} requires a value")));
+        match flag.as_str() {
+            "--manager" => a.manager = value,
+            "--scope" => a.scope = value,
+            "--credential-file" => a.credential_file = Some(value),
+            "--listen" => a.listen = value,
+            "--port" => a.port = value.parse().unwrap_or_else(|_| fail(format!("--port {value}"))),
+            other => fail(format!("unknown argument {other:?}")),
+        }
+    }
+    a
+}
+
 #[compio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -1853,27 +1927,24 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let manager = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "127.0.0.1:9001".to_string());
+    let args = parse_args();
+    if !autumn_transport::set_regpool_cap_bytes(autumn_client::params().ucx_regpool_cap_bytes.get()) {
+        tracing::warn!("regpool cap already set (ignored — first-call-wins)");
+    }
 
     // gallery lives in its own namespace scope (default `gallery/`). The
     // scoped client PREPENDS that prefix to every key (incl. stripe chunks), so
     // gallery's key builders emit keys RELATIVE to the scope (see `ROOT = ""`).
-    // Under authz, point AUTUMN_CREDENTIAL_FILE at a principal credential from
+    // Under authz, `--credential-file` names a principal credential from
     // `autumn-op principal-create` — the SDK auto-mints + renews short-TTL
     // tokens. Without it, a plain scoped connect (works only with authz off).
-    // scope is a single key-prefix (the `gallery`
-    // namespace). AUTUMN_SCOPE (or legacy AUTUMN_NAMESPACE) overrides.
-    let scope = std::env::var("AUTUMN_SCOPE")
-        .or_else(|_| std::env::var("AUTUMN_NAMESPACE"))
-        .unwrap_or_else(|_| "gallery".into());
-    let client: Client = Rc::new(match std::env::var("AUTUMN_CREDENTIAL_FILE") {
-        Ok(path) if !path.is_empty() => {
-            let (principal, secret) = autumn_client::read_credential_file(&path)?;
-            ClusterClient::connect_with_credential(&manager, &scope, principal, secret).await?
+    let client: Client = Rc::new(match &args.credential_file {
+        Some(path) => {
+            let (principal, secret) = autumn_client::read_credential_file(path)?;
+            ClusterClient::connect_with_credential(&args.manager, &args.scope, principal, secret)
+                .await?
         }
-        _ => ClusterClient::connect(&manager, &scope).await?,
+        None => ClusterClient::connect(&args.manager, &args.scope).await?,
     });
     let metrics: MetricsRef = Rc::new(RefCell::new(PerfMetrics::default()));
     let transcodes: TranscodeMap = Rc::new(RefCell::new(HashMap::new()));
@@ -1993,11 +2064,12 @@ async fn main() -> Result<()> {
         .route("/metrics/", metrics_route)
         // Streamed uploads keep resident memory O(chunk) regardless of size,
         // so this only bounds pathological inputs, not real videos. 64 GiB.
-        .layer(DefaultBodyLimit::max(64 * 1024 * 1024 * 1024))
+        .layer(DefaultBodyLimit::max(params().upload_limit_bytes.get() as usize))
         .layer(axum::middleware::map_response(cache::default_no_store));
 
-    let listener = compio::net::TcpListener::bind(format!("0.0.0.0:{LISTEN_PORT}")).await?;
-    tracing::info!("Gallery listening on http://0.0.0.0:{LISTEN_PORT}");
+    let bind = format!("{}:{}", args.listen, args.port);
+    let listener = compio::net::TcpListener::bind(&bind).await?;
+    tracing::info!("Gallery listening on http://{bind}");
     cyper_axum::serve(listener, app).await?;
     Ok(())
 }
@@ -2005,8 +2077,8 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_byte_range, pick_hls_time, HLS_SEGMENT_TARGET_BYTES, HLS_TIME_MAX_SECS,
-        HLS_TIME_MIN_SECS, PS_INLINE_CAP_BYTES,
+        hls_segment_target_bytes, hls_time_max_secs, hls_time_min_secs, parse_byte_range,
+        pick_hls_time, PS_INLINE_CAP_BYTES,
     };
 
     #[test]
@@ -2014,7 +2086,7 @@ mod tests {
         // 100 MiB over 60 s ≈ 1.7 MiB/s → a 20 s segment is ~33 MiB, under the
         // cap, so keep the full 20 s.
         let secs = pick_hls_time(100 * 1024 * 1024, Some(60.0));
-        assert_eq!(secs, HLS_TIME_MAX_SECS);
+        assert_eq!(secs, hls_time_max_secs());
     }
 
     #[test]
@@ -2026,14 +2098,14 @@ mod tests {
         let dur = 200.0;
         let secs = pick_hls_time(file, Some(dur));
         assert!(
-            secs < HLS_TIME_MAX_SECS,
+            secs < hls_time_max_secs(),
             "expected a reduced duration, got {secs}"
         );
-        assert!(secs >= HLS_TIME_MIN_SECS);
+        assert!(secs >= hls_time_min_secs());
         let bytes_per_sec = file as f64 / dur;
         let seg_bytes = secs * bytes_per_sec;
-        // Targets HLS_SEGMENT_TARGET_BYTES and is comfortably below the cap.
-        assert!((seg_bytes - HLS_SEGMENT_TARGET_BYTES).abs() < 1.0);
+        // Targets hls_segment_target_bytes and is comfortably below the cap.
+        assert!((seg_bytes - hls_segment_target_bytes()).abs() < 1.0);
         assert!(seg_bytes < PS_INLINE_CAP_BYTES as f64);
     }
 
@@ -2043,14 +2115,14 @@ mod tests {
         // floor, so clamp to the minimum (the re-encode safety net then bounds
         // the actual segment bytes).
         let secs = pick_hls_time(10 * 1024 * 1024 * 1024, Some(30.0));
-        assert_eq!(secs, HLS_TIME_MIN_SECS);
+        assert_eq!(secs, hls_time_min_secs());
     }
 
     #[test]
     fn hls_time_unknown_duration_falls_back_to_max() {
-        assert_eq!(pick_hls_time(500 * 1024 * 1024, None), HLS_TIME_MAX_SECS);
+        assert_eq!(pick_hls_time(500 * 1024 * 1024, None), hls_time_max_secs());
         // Zero-length / empty file also can't yield a rate → max.
-        assert_eq!(pick_hls_time(0, Some(10.0)), HLS_TIME_MAX_SECS);
+        assert_eq!(pick_hls_time(0, Some(10.0)), hls_time_max_secs());
     }
 
     #[test]

@@ -171,7 +171,7 @@ fn multipart_complete_is_metadata_only_and_races_resolve() {
         // ...until its retention passes.
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
         assert_eq!(multipart::expire_completed(&mut st, now).await.unwrap(), 0, "not due yet");
-        assert!(multipart::expire_completed(&mut st, now + multipart::COMPLETED_RETENTION_SECS + 5).await.unwrap() >= 1);
+        assert!(multipart::expire_completed(&mut st, now + multipart::completed_retention_secs() + 5).await.unwrap() >= 1);
         assert!(matches!(
             multipart::complete(&mut st, up, b"bkt/data/a.lance", &[(1, e1.clone())], Condition::None).await,
             Err(MultipartError::NoSuchUpload)

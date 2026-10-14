@@ -8,6 +8,10 @@ use autumn_params::Params;
 const MANAGER_BIN: &str = env!("CARGO_BIN_EXE_autumn-manager-server");
 const PS_BIN: &str = env!("CARGO_BIN_EXE_autumn-ps");
 const EN_BIN: &str = env!("CARGO_BIN_EXE_autumn-extent-node");
+const AUTUMNFS_BIN: &str = env!("CARGO_BIN_EXE_autumnfs");
+const S3_BIN: &str = env!("CARGO_BIN_EXE_autumn-s3");
+const DASHBOARD_BIN: &str = env!("CARGO_BIN_EXE_autumn-dashboard");
+const CLIENT_BIN: &str = env!("CARGO_BIN_EXE_autumn-client");
 
 fn run(bin: &str, args: &[&str]) -> (i32, String) {
     let out = Command::new(bin).args(args).output().expect("spawn");
@@ -96,5 +100,35 @@ fn en_refuses_a_bad_value_and_an_unknown_argument() {
     ] {
         let (code, text) = run(EN_BIN, args);
         assert_eq!(code, 2, "{args:?}: {text}");
+    }
+}
+
+/// The client-side binaries take their own parameters plus the shared file
+/// system and client SDK ones.
+#[test]
+fn client_side_help_lists_every_parameter() {
+    use autumn_params::{autumnfs::AutumnfsParams, client::ClientParams, dashboard::DashboardParams};
+    use autumn_params::{fs::FsParams, s3::S3Params};
+    assert_help_lists_every_parameter::<AutumnfsParams>(AUTUMNFS_BIN);
+    assert_help_lists_every_parameter::<FsParams>(AUTUMNFS_BIN);
+    assert_help_lists_every_parameter::<ClientParams>(AUTUMNFS_BIN);
+    assert_help_lists_every_parameter::<S3Params>(S3_BIN);
+    assert_help_lists_every_parameter::<FsParams>(S3_BIN);
+    assert_help_lists_every_parameter::<ClientParams>(S3_BIN);
+    assert_help_lists_every_parameter::<DashboardParams>(DASHBOARD_BIN);
+}
+
+#[test]
+fn client_side_binaries_refuse_a_bad_value() {
+    for (bin, args) in [
+        (AUTUMNFS_BIN, &["--put-depth", "0", "ls"][..]),
+        (AUTUMNFS_BIN, &["--put-depth-striped-min", "50", "--put-depth-striped-max", "40", "ls"]),
+        (AUTUMNFS_BIN, &["--write-buf-extents", "0", "ls"]),
+        (S3_BIN, &["--manager", "x", "--pin-linger-ms", "lots"]),
+        (DASHBOARD_BIN, &["--metrics-interval-secs", "0"]),
+        (CLIENT_BIN, &["--rpc-timeout-ms", "1", "get", "k"]),
+    ] {
+        let (code, text) = run(bin, args);
+        assert_eq!(code, 2, "{bin} {args:?}: {text}");
     }
 }

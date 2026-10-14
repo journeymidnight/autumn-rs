@@ -2427,7 +2427,7 @@ pub struct PollInvalidationsResp {
 // overlapping ranges, even across a leader transition.
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
 pub struct AllocInodesReq {
-    /// How many inode numbers to allocate (fuse uses INODE_ALLOC_BATCH =
+    /// How many inode numbers to allocate (fuse uses --inode-alloc-batch =
     /// 1000; a short-lived client may ask for fewer). Must be ≥ 1.
     pub count: u32,
     /// Migration floor: the allocator's counter is raised to at least this

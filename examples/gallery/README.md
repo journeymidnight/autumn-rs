@@ -74,7 +74,7 @@ HLS), so the upload handler detects them by extension and streams them with
 `autumn-client`'s striped API:
 
 - `put_stream_begin` opens a handle; the multipart field's network-sized
-  chunks are coalesced into 4 MiB (`STRIPE_CHUNK_SIZE`) pieces and `send`-ed
+  chunks are coalesced into 4 MiB (`--stripe-chunk-bytes`) pieces and `send`-ed
   one at a time, then `commit` writes the meta blob (the atomic
   linearisation point). Resident memory stays O(chunk) and no single KV value
   has to hold the whole file — that's what makes multi-GiB videos uploadable.
@@ -148,7 +148,7 @@ missing. This recovers in-flight transcodes from a process crash.
 ```bash
 # 1. Bring up cluster + gallery
 ./cluster.sh start 3
-cargo run --release -p gallery -- 127.0.0.1:9001 &
+cargo run --release -p gallery -- --manager 127.0.0.1:9001 &
 
 # 2. Open the UI
 open http://localhost:5001

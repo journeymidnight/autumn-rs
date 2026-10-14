@@ -1050,8 +1050,8 @@ do_start() {
 
     # Turnkey authz (AUTUMN_AUTH=1): register the gallery namespace and mint its
     # credential into $DATA_ROOT/authz/. Idempotent — an existing credential is
-    # retained so restarts keep working. The example reads it through
-    # AUTUMN_CREDENTIAL_FILE.
+    # retained so restarts keep working. The example takes it as
+    # `gallery --credential-file`.
     # BUG-BENCH-NS-UNREGISTERED: register `bench` on EVERY cluster, not just an
     # authz one. Layer-A is active whenever the namespace registry is non-empty —
     # and bootstrap always seeds fs/kvc/mem — so it runs even with authz OFF and
@@ -1096,7 +1096,7 @@ do_start() {
         done
         echo "[cluster] authz ON: signing key + per-family creds in $_az/"
         echo "[cluster]   fuse/autumnfs: --credential-file $_az/fs.cred"
-        echo "[cluster]   gallery: AUTUMN_CREDENTIAL_FILE=$_az/gallery.cred"
+        echo "[cluster]   gallery: --credential-file $_az/gallery.cred"
     fi
 
     # snapshot launch params so per-process subcommands can replay

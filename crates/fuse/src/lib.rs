@@ -16,6 +16,13 @@ pub mod ops;
 pub mod prefetch;
 pub mod read_pool;
 
+/// Every FUSE daemon tunable (`autumn_params::fuse`), one per process.
+pub fn params() -> &'static autumn_params::fuse::FuseParams {
+    static PARAMS: std::sync::LazyLock<autumn_params::fuse::FuseParams> =
+        std::sync::LazyLock::new(autumn_params::fuse::FuseParams::default);
+    &PARAMS
+}
+
 /// Re-export `fuser` so downstream test crates (autumn-manager
 /// inode-lease tests) can name the bridge-handler reply types
 /// (`fuser::FileAttr`) without taking a direct dep on `fuser`.

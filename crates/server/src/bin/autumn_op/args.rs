@@ -97,6 +97,7 @@ fn usage() -> ! {
     eprintln!("  principal-list [--json]      list principals + their grants (read-only, no credentials)");
     eprintln!("  mint-token [--principal P] (--credential HEX | --credential-file F)");
     eprintln!("                               mint a capability token (the file names its principal)");
+    eprintln!("\nclient parameters (anywhere on the line):\n{}", autumn_params::help::<autumn_params::client::ClientParams>());
     std::process::exit(1);
 }
 
@@ -581,7 +582,15 @@ pub(crate) fn parse() -> Args {
     let mut wait = false;
     let mut wait_timeout = 600u64;
     let raw: Vec<String> = {
-        let orig: Vec<String> = std::env::args().collect();
+        // Client SDK parameters (`--rpc-timeout-ms`, ...) apply anywhere on the
+        // line, like `--wait`.
+        let orig = autumn_params::split_params(std::env::args().collect(), |f, v| {
+            autumn_params::take_flag(autumn_client::params(), f, v)
+        })
+        .unwrap_or_else(|e| {
+            eprintln!("error: {e}");
+            std::process::exit(2);
+        });
         let mut out = Vec::with_capacity(orig.len());
         let mut j = 0usize;
         while j < orig.len() {

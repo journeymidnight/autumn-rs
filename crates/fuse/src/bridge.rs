@@ -193,9 +193,12 @@ pub fn call_sync<T>(
     tx.unbounded_send(req)
         .map_err(|_| anyhow::anyhow!("fs bridge channel closed"))?;
     reply_rx
-        .recv_timeout(REPLY_TIMEOUT)
+        .recv_timeout(reply_timeout())
         .map_err(|_| anyhow::anyhow!("fs reply timeout"))?
 }
 
-/// Timeout for blocking on reply (prevent deadlock on shutdown).
-pub const REPLY_TIMEOUT: Duration = Duration::from_secs(30);
+/// Timeout for blocking on reply (prevent deadlock on shutdown;
+/// `--reply-timeout-secs`).
+pub fn reply_timeout() -> Duration {
+    Duration::from_secs(crate::params().reply_timeout_secs.get())
+}

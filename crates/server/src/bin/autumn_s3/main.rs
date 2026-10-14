@@ -43,6 +43,7 @@ use futures::channel::mpsc;
 use futures::StreamExt;
 use send_wrapper::SendWrapper;
 
+use autumn_params::s3::S3Params;
 use objects::{Fs, OpenError};
 use s3::{CondOutcome, RangeSpec, ReadConditions, S3Error};
 
@@ -64,16 +65,23 @@ struct Args {
     sweep_interval_secs: u64,
 }
 
-/// Accept threads to run by default. The gateway is CPU-bound on socket work,
-/// not on autumn reads: an AWS-CRT client drains its sockets slowly enough that
-/// each body write fragments into many partial writes, and a single accept
-/// thread saturates well below what the read path can deliver. It is also a
-/// sidecar, so it should not claim every core on a GPU node.
-const DEFAULT_WORKERS: usize = 8;
+/// Gateway tunables (`autumn_params::s3`).
+fn params() -> &'static S3Params {
+    static PARAMS: std::sync::LazyLock<S3Params> = std::sync::LazyLock::new(S3Params::default);
+    &PARAMS
+}
 
-/// How often the sweeper recovers dead publishing sessions and reclaims
-/// finished uploads, unlinked files and segment garbage.
-const DEFAULT_SWEEP_INTERVAL_SECS: u64 = 30;
+fn usage() -> String {
+    format!(
+        "autumn-s3 --manager <host:port> [--listen 0.0.0.0] [--port 9000]\n\
+         \x20         [--host <daemon-identity>] [--credential-file <path>]\n\
+         \x20         [--direct-read true|false]\n\
+         \nparameters:\n{}{}{}",
+        autumn_params::help::<S3Params>(),
+        autumn_params::help::<autumn_params::fs::FsParams>(),
+        autumn_params::help::<autumn_params::client::ClientParams>()
+    )
+}
 
 fn parse_args() -> Result<Args> {
     let mut a = Args {
@@ -83,12 +91,18 @@ fn parse_args() -> Result<Args> {
         host: "autumn-s3".into(),
         credential_file: None,
         direct_read: true,
-        workers: std::thread::available_parallelism()
-            .map(|n| n.get().min(DEFAULT_WORKERS))
-            .unwrap_or(1),
-        sweep_interval_secs: DEFAULT_SWEEP_INTERVAL_SECS,
+        workers: 0,
+        sweep_interval_secs: 0,
     };
-    let mut it = std::env::args().skip(1);
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let argv = autumn_params::split_params(argv, |f, v| {
+        autumn_params::take_any!(f, v, params(), autumn_fs::params(), autumn_client::params())
+    })
+    .unwrap_or_else(|e| {
+        eprintln!("error: {e}");
+        std::process::exit(2);
+    });
+    let mut it = argv.into_iter();
     while let Some(flag) = it.next() {
         let mut val = || {
             it.next()
@@ -101,15 +115,8 @@ fn parse_args() -> Result<Args> {
             "--host" => a.host = val()?,
             "--credential-file" => a.credential_file = Some(PathBuf::from(val()?)),
             "--direct-read" => a.direct_read = val()?.parse().context("--direct-read")?,
-            "--workers" => a.workers = val()?.parse().context("--workers")?,
-            "--sweep-interval-secs" => a.sweep_interval_secs = val()?.parse().context("--sweep-interval-secs")?,
             "-h" | "--help" => {
-                println!(
-                    "autumn-s3 --manager <host:port> [--listen 0.0.0.0] [--port 9000]\n\
-                     \x20            [--host <daemon-identity>] [--credential-file <path>]\n\
-                     \x20            [--direct-read true|false] [--workers N]\n\
-                     \x20            [--sweep-interval-secs 30]  (0 = no periodic sweeps)"
-                );
+                print!("{}", usage());
                 std::process::exit(0);
             }
             other => bail!("unknown flag {other} (try --help)"),
@@ -118,9 +125,13 @@ fn parse_args() -> Result<Args> {
     if a.manager.is_empty() {
         bail!("--manager is required");
     }
-    if a.workers == 0 {
-        bail!("--workers must be at least 1");
-    }
+    a.workers = match params().workers.get() {
+        0 => std::thread::available_parallelism()
+            .map(|n| n.get().min(8))
+            .unwrap_or(1),
+        n => n,
+    };
+    a.sweep_interval_secs = params().sweep_interval_secs.get();
     Ok(a)
 }
 
@@ -627,6 +638,9 @@ fn main() -> Result<()> {
         .init();
 
     let args = parse_args()?;
+    if !autumn_transport::set_regpool_cap_bytes(autumn_client::params().ucx_regpool_cap_bytes.get()) {
+        tracing::warn!("regpool cap already set (ignored — first-call-wins)");
+    }
 
     // Read the credential up front so a bad path fails at startup rather than
     // as a mid-stream PermissionDenied. The principal travels in the file.

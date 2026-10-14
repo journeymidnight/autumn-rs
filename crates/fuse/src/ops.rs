@@ -13,11 +13,15 @@ use fuser::{
 
 use crate::bridge::*;
 
-/// FUSE attr/entry cache TTL (from 3FS: 30s).
-const TTL: Duration = Duration::from_secs(30);
+/// FUSE attr/entry cache TTL (`--attr-ttl-secs`; 30 s, from 3FS).
+fn ttl() -> Duration {
+    Duration::from_secs(crate::params().attr_ttl_secs.get())
+}
 
 /// Background requests (readahead READs) the kernel keeps in flight.
-const MAX_BACKGROUND: u16 = 64;
+fn max_background() -> u16 {
+    crate::params().max_background.get()
+}
 
 /// The FUSE filesystem implementation. Lives on fuser threads.
 /// Sends all requests to the compio thread via the bridge channel.
@@ -71,10 +75,10 @@ impl Filesystem for AutumnFs {
         // and the kernel stops issuing async readahead once the background
         // queue reaches the congestion threshold — fuser's defaults (16, 12)
         // would cap a 16 MiB window at 12 requests in flight.
-        if let Err(nearest) = config.set_max_background(MAX_BACKGROUND) {
+        if let Err(nearest) = config.set_max_background(max_background()) {
             tracing::warn!(nearest, "kernel refused max_background");
         }
-        if let Err(nearest) = config.set_congestion_threshold(MAX_BACKGROUND * 3 / 4) {
+        if let Err(nearest) = config.set_congestion_threshold(max_background() * 3 / 4) {
             tracing::warn!(nearest, "kernel refused congestion_threshold");
         }
         match self.send(|reply| FsRequest::Init { reply }) {
@@ -96,7 +100,7 @@ impl Filesystem for AutumnFs {
             name: name.to_owned(),
             reply: r,
         }) {
-            Ok((attr, _ino)) => reply.entry(&TTL, &attr, 0),
+            Ok((attr, _ino)) => reply.entry(&ttl(), &attr, 0),
             Err(_) => reply.error(libc::ENOENT),
         }
     }
@@ -107,7 +111,7 @@ impl Filesystem for AutumnFs {
 
     fn getattr(&mut self, _req: &Request<'_>, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
         match self.send(|r| FsRequest::GetAttr { ino, reply: r }) {
-            Ok(attr) => reply.attr(&TTL, &attr),
+            Ok(attr) => reply.attr(&ttl(), &attr),
             Err(_) => reply.error(libc::ENOENT),
         }
     }
@@ -140,7 +144,7 @@ impl Filesystem for AutumnFs {
             mtime,
             reply: r,
         }) {
-            Ok(attr) => reply.attr(&TTL, &attr),
+            Ok(attr) => reply.attr(&ttl(), &attr),
             Err(_) => reply.error(libc::EIO),
         }
     }
@@ -160,7 +164,7 @@ impl Filesystem for AutumnFs {
             mode,
             reply: r,
         }) {
-            Ok(attr) => reply.entry(&TTL, &attr, 0),
+            Ok(attr) => reply.entry(&ttl(), &attr, 0),
             Err(e) => {
                 let code = err_to_errno(&e);
                 reply.error(code);
@@ -239,7 +243,7 @@ impl Filesystem for AutumnFs {
             name: name.to_owned(),
             reply: r,
         }) {
-            Ok(attr) => reply.entry(&TTL, &attr, 0),
+            Ok(attr) => reply.entry(&ttl(), &attr, 0),
             Err(e) => reply.error(err_to_errno(&e)),
         }
     }
@@ -261,7 +265,7 @@ impl Filesystem for AutumnFs {
             flags,
             reply: r,
         }) {
-            Ok((attr, fh)) => reply.created(&TTL, &attr, 0, fh, 0),
+            Ok((attr, fh)) => reply.created(&ttl(), &attr, 0, fh, 0),
             Err(e) => reply.error(err_to_errno(&e)),
         }
     }

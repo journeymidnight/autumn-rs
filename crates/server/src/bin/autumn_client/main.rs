@@ -1097,10 +1097,9 @@ async fn main() -> Result<()> {
         .init();
 
     let args = parse_args();
-    if let Some(cap) = args.ucx_regpool_cap_bytes {
-        if !autumn_transport::set_regpool_cap_bytes(cap) {
-            tracing::warn!(cap, "regpool cap already set (ignored — first-call-wins)");
-        }
+    let cap = autumn_client::params().ucx_regpool_cap_bytes.get();
+    if !autumn_transport::set_regpool_cap_bytes(cap) {
+        tracing::warn!(cap, "regpool cap already set (ignored — first-call-wins)");
     }
 
     // handle the `op` stub BEFORE attempting to connect to the

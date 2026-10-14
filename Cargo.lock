@@ -149,6 +149,7 @@ name = "autumn-client"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "autumn-params",
  "autumn-rpc",
  "autumn-stream",
  "autumn-transport",
@@ -200,6 +201,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "autumn-client",
+ "autumn-params",
  "autumn-rpc",
  "bytes",
  "compio",
@@ -216,6 +218,7 @@ dependencies = [
  "anyhow",
  "autumn-client",
  "autumn-fs",
+ "autumn-params",
  "autumn-rpc",
  "autumn-transport",
  "bytes",
@@ -1380,7 +1383,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "autumn-client",
+ "autumn-params",
  "autumn-rpc",
+ "autumn-transport",
  "axum",
  "bytes",
  "compio",

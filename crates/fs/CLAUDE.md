@@ -59,7 +59,7 @@ on-disk format changes. The `read_plan` benchmark measures cached planning acros
 指向同一 inode）、根 inode = 1 (`ROOT_INO` / FUSE_ROOT_ID)。
 
 **inode 分配 = manager 发号**：`ClusterClient::alloc_inodes` → `MSG_ALLOC_INODES`
-（leader-fenced etcd CAS），每批预分配 `INODE_ALLOC_BATCH`=1000 个，全局计数器保证
+（leader-fenced etcd CAS），每批预分配 `inode_alloc_batch`=1000 个，全局计数器保证
 并发分配者（双 mount，或 mount + Python `autumn.Fs`）不重号。`[0x04]next_inode` KV
 仅作**迁移 floor**（首批把旧值传给 manager）+ 每批 best-effort 回写（advisory-only）。
 
@@ -210,15 +210,23 @@ ino → inode 数据是 **O(log N) KV Get**（ino 编码在 key 里，LSM-tree �
 |------|-----|------|
 | `MAX_EXTENT` | 8 MiB | extent value 上限；写缓冲按此粒度刷；≥64 KiB 整 extent 读走 bulk |
 | `INLINE_THRESHOLD` | 4 KiB | 小文件 inline 阈值（匹配 VALUE_THROTTLE）|
-| `WRITE_BUF_EXTENTS` | 8 | 每 inode 写缓冲容量（extent 数）|
-| `WRITE_BUF_CAP` | 64 MiB | = `WRITE_BUF_EXTENTS × MAX_EXTENT`；>1 时 `write_region` 拆多 extent，`put_many` 按 wire key 分组后并发 fan out（`BATCH_PUT_DEFAULT_CONCURRENCY`）；extent key 互异故满并发 |
-| `STREAM_INFLIGHT` | 8 | 流式数据对象（S3 PUT / UploadPart）同时在飞的 unit put 数，见"数据对象是连续流水线" |
-| `APPEND_INFLIGHT_DEPTH` | 2 | 单 inode 同时在飞的 append flush 批数；1 批 = 8 个 extent 并发。实测比 1 快 ~6%，见写流水化一节 |
-| `INODE_ALLOC_BATCH` | 1000 | 每批向 manager 领的 inode 数 |
 | `DEFAULT_STRIPE_LANES` | 24 | fs 未声明几何时的默认 lane 数 |
 | `ROOT_INO` | 1 | 根 inode（FUSE_ROOT_ID）|
 | `SCHEMA_VERSION` | 4 | 见下 fail-loud |
 | `DT_REG`/`DT_DIR`/`DT_LNK` | 8/4/10 | 目录项类型 |
+
+参数（`crates/params/src/fs.rs` 的 `FsParams`，进程级 `autumn_fs::params()`，由嵌入 fs 层的
+binary 解析为 flag）：
+
+| flag | 默认 | 说明 |
+|------|-----|------|
+| `--write-buf-extents` | 8 | 每 inode 写缓冲容量（extent 数）；`write_buf_cap()` = 它 × `MAX_EXTENT` = 64 MiB。>1 时 `write_region` 拆多 extent，`put_many` 按 wire key 分组后并发 fan out（客户端 `--batch-put-concurrency`）|
+| `--append-inflight-depth` | 2 | 单 inode 同时在飞的 append flush 批数；1 批 = 8 个 extent 并发。实测比 1 快 ~6%，见写流水化一节 |
+| `--segment-stream-inflight` | 8 | 流式数据对象（S3 PUT / UploadPart）同时在飞的 unit put 数，见"数据对象是连续流水线" |
+| `--inode-alloc-batch` | 1000 | 每批向 manager 领的 inode 数 |
+| `--segment-page-cache-cap` | 256 | 段表页缓存上限 |
+| `--lease-heartbeat-secs` | 5 | 写租约心跳周期（manager 租约 TTL 默认 30 s）|
+| `--multipart-completed-retention-secs` | 3600 | 已完成 multipart 的应答保留时长 |
 
 ## 核心数据结构
 
@@ -240,8 +248,8 @@ struct StripeLayout { lanes: u8, unit_bytes: u32 }       // [0x04]stripe_geom + 
 // 运行时状态（compio 线程本地，不持久化）
 struct InodeState {
     meta: InodeMeta,
-    write_buf: Option<WriteBuffer>,        // buf 容量 WRITE_BUF_CAP
-    pending_flushes: VecDeque<PendingFlush>, // 在飞的 append flush（≤ APPEND_INFLIGHT_DEPTH）
+    write_buf: Option<WriteBuffer>,        // buf 容量 write_buf_cap()
+    pending_flushes: VecDeque<PendingFlush>, // 在飞的 append flush（≤ append_inflight_depth）
     flush_error: Option<String>,           // 粘性回写失败，只由会上报的 flush_inode 消费
     dirty: bool,
     open_count: u32,
@@ -290,7 +298,7 @@ Open 已被首 mount 写关的 inode 不会读到陈旧 `meta`）。
 redirect RTT。落点：`FsState.direct_read` → `ReadPlan.direct_read` → `execute` 选原语。
 
 ### Write（带缓冲）
-1. 懒分配 `WriteBuffer`（容量 `WRITE_BUF_CAP`=64 MiB）。
+1. 懒分配 `WriteBuffer`（容量 `write_buf_cap()`=64 MiB）。
 2. gap 检测（写偏移不连续）→ flush 当前缓冲。
 3. 拷贝到 buffer；满一个 buffer → `extent::write_region` 刷（拆成 `MAX_EXTENT` 封顶、
    互不重叠的 extent，`put_many` 流水）。
@@ -304,7 +312,7 @@ clear 过的缓冲会让 fill 每轮都跑 `resize(.., 0)`，把下一行就要�
 等于每次 flush 一次 64 MiB memset）。`wb.len` 是长度的唯一真源，三个消费者都按它切片，
 所以 `wb.len` 之后的陈旧字节永远读不到。实测 197 → 234 MiB/s。
 
-**`WRITE_BUF_EXTENTS` 从 8 加到 16/32 实测更慢（248→234/229），别再走**——写路径的瓶颈不在
+**`write_buf_extents` 从 8 加到 16/32 实测更慢（248→234/229），别再走**——写路径的瓶颈不在
 一次 flush 的深度。
 
 **`max_write` 也不是旋钮，但理由和上面不同**：内核把 `max_pages` 夹在 `FUSE_MAX_MAX_PAGES`
@@ -323,7 +331,7 @@ extent map），`extent::execute_append` 只需要 `Rc<ClusterClient>`，spawn �
 （`read::prepare` + spawn `read::execute`），这也正是读能扇出而写不能的原因。
 实测 **249 → 338 MiB/s（+36%）**，达到 CLI 345 的 98%。
 
-**多槽（`APPEND_INFLIGHT_DEPTH`=2）**：规划下一批前不再无条件 drain 上一批，只有队列
+**多槽（`append_inflight_depth`=2）**：规划下一批前不再无条件 drain 上一批，只有队列
 满了才等最老的一个（`write::make_room`）。`InodeState.pending_flushes` 因此是队列不是
 单槽。剩余空间本来就小：单槽已经让**一批 8 个 extent 并发**在飞，恰好等于 `autumnfs`
 非 striped 的 `depth`=8；多槽去掉的是批与批之间的空泡，**不是**去补什么 137 MiB/s 的差距
@@ -515,7 +523,7 @@ dirent 换过去——`If-None-Match: *`（期望不存在）和 `If-Match`（�
   `FsState` 的调用方（S3 网关每个 worker）因此只在 begin、inode put、publish 时持锁，字节从不在
   锁内移动。
 - **数据对象是连续流水线**（`ObjectStream`）：每个 unit（= `MAX_EXTENT`）一攒满就 spawn 一个
-  put，最多 `STREAM_INFLIGHT`=8 个在飞，满了只等最老的那个，**没有批间屏障**，所以 body 还在到达时
+  put，最多 `--segment-stream-inflight`=8 个在飞，满了只等最老的那个，**没有批间屏障**，所以 body 还在到达时
   前面的 unit 已经在写。以前是攒满 8 个 unit（64 MiB）才发一批、整批落地才回去收 body，body 接收
   与写入完全串行。本机 3-EN、4 lane 分区、urllib 客户端、交替 A/B：16 MiB 单流 228 → 259 MiB/s
   （p50 68 → 58 ms），128 MiB 单流 256 → 408 MiB/s；8 并发 413 → 434，那里瓶颈在后端（1 分区时
@@ -523,7 +531,7 @@ dirent 换过去——`If-None-Match: *`（期望不存在）和 `If-Match`（�
   compio 0.19 drop `JoinHandle` 会取消任务。
 - **记录永远领先于数据**：`segc/`（或上传的 `mpa/`）记录说这个对象最多多长，撤销/回收按它删。
   不变量是**任何数据 put 发出之前，记录已持久地覆盖它的末尾**（`ensure_recorded`）。记录最多领先
-  已写末尾 `STREAM_INFLIGHT` 个 unit（64 MiB），用掉一半余量就提前再抬（约每 5 个 unit 一次），同一
+  已写末尾 `--segment-stream-inflight` 个 unit（64 MiB），用掉一半余量就提前再抬（约每 5 个 unit 一次），同一
   时刻只有一个抬高在飞，所以落地有序。调用方知道长度时（`start_object(state, Some(n))`、
   `PartWriter::begin(.., Some(n))`，网关传 Content-Length / `x-amz-decoded-content-length`），
   `declare` 在后台先把记录写到 `min(n, 64 MiB)`，和第一个 unit 的接收重叠——≤64 MiB 的对象因此
@@ -614,7 +622,7 @@ dirent 换过去——`If-None-Match: *`（期望不存在）和 `If-Match`（�
   是否仍指向该文件（之后被覆盖、删除也一样答原 ETag）。`cleanup` 删上传记录之前先写
   `[0x04]mpx/[deadline BE][id]`（到期索引）再写 `[0x04]mpc/[id]` = `CompletedUpload{key,
   new_ino}`，记录没了时 `completed_earlier` 按它回答，并核对 S3 key。保留
-  `COMPLETED_RETENTION_SECS` = 1 h（SDK 重试几分钟内放弃，`object_store` 默认 3 min）；
+  `--multipart-completed-retention-secs` = 1 h（SDK 重试几分钟内放弃，`object_store` 默认 3 min）；
   `sweep_uploads` 里的 `expire_completed` 从 `mpx/` 头开始扫、遇到第一条未到期即停，**只读到期
   的条目**，所以保留的记录再多也不增加每轮扫描成本（放在 `mpu/` 里会让每 30 s 的扫描逐条读
   它们）。generation 取 `meta::FIRST_GENERATION`：Complete 发布的永远是全新 inode。两个清理者

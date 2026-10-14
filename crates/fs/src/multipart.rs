@@ -60,7 +60,9 @@ pub const MAX_PART_NUMBER: u32 = 10_000;
 /// How long a finished Complete's answer outlives its upload record, so a
 /// retry whose first reply was lost still gets it. SDK retries give up
 /// within minutes (`object_store`: 3 min by default).
-pub const COMPLETED_RETENTION_SECS: u64 = 3600;
+pub fn completed_retention_secs() -> u64 {
+    crate::params().multipart_completed_retention_secs.get()
+}
 
 /// Why a multipart operation did not happen, in the terms S3 reports.
 #[derive(Debug)]
@@ -291,7 +293,7 @@ fn completed(ino: u64) -> Completed {
 /// was created for.
 ///
 /// A retry of a Complete that already succeeded gets the same answer: from
-/// the upload record while it lasts, then for [`COMPLETED_RETENTION_SECS`]
+/// the upload record while it lasts, then for [`completed_retention_secs`]
 /// from the record `cleanup` leaves behind.
 pub async fn complete(
     state: &mut FsState,
@@ -692,11 +694,11 @@ fn now_secs() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs())
 }
 
-/// Keep a completed upload's answer for [`COMPLETED_RETENTION_SECS`] after
+/// Keep a completed upload's answer for [`completed_retention_secs`] after
 /// its record goes. The expiry entry is written first, so no answer is ever
 /// left without one.
 async fn remember_completed(state: &mut FsState, upload: u64, s3_key: &[u8], new_ino: u64, lease: WriteLease) -> Result<()> {
-    let deadline = now_secs() + COMPLETED_RETENTION_SECS;
+    let deadline = now_secs() + completed_retention_secs();
     state.kv_put_fenced(&key::completed_expiry_key(deadline, upload), b"", lease).await?;
     let c = schema::CompletedUpload { key: s3_key.to_vec(), new_ino };
     state

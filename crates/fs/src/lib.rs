@@ -24,3 +24,10 @@ pub mod schema;
 pub mod segment;
 pub mod state;
 pub mod write;
+
+/// Every file-system layer tunable (`autumn_params::fs`), one per process.
+pub fn params() -> &'static autumn_params::fs::FsParams {
+    static PARAMS: std::sync::LazyLock<autumn_params::fs::FsParams> =
+        std::sync::LazyLock::new(autumn_params::fs::FsParams::default);
+    &PARAMS
+}

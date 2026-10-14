@@ -123,12 +123,6 @@ pub(crate) struct Args {
     pub(crate) manager: String,
     pub(crate) command: Command,
     pub(crate) transport: autumn_transport::TransportKind,
-    /// Per-thread regpool cap (pinned/registered bytes). `None` = library
-    /// default (512 MiB/thread). Useful for perf-check tuning — large
-    /// `--threads --pipeline-depth` 8 MiB workloads can pin many slabs
-    /// in-flight and benefit from a higher cap; constrained hosts can
-    /// shrink to fit. Clamped to [16 MiB, 64 GiB].
-    pub(crate) ucx_regpool_cap_bytes: Option<usize>,
     /// the key-prefix SCOPE every data-plane KV command
     /// (put/get/del/head/ls/put-stream/get-stream) writes/reads within — a whole
     /// namespace (`fs`, `gallery`) or an in-namespace sub-prefix (`mem/agent7`).
@@ -143,7 +137,7 @@ pub(crate) struct Args {
 }
 
 fn usage() -> ! {
-    eprintln!("Usage: autumn-client --manager <ADDR> <COMMAND>");
+    eprintln!("Usage: autumn-client --manager <ADDR> [client parameters] <COMMAND>");
     eprintln!();
     eprintln!("Data-plane commands (KV + bench):");
     eprintln!("  put <KEY> <FILE>                  Put key with value from file");
@@ -168,6 +162,7 @@ fn usage() -> ! {
     eprintln!("  bootstrap, set-stream-ec, force-ec-convert, split, merge,");
     eprintln!("  compact, gc, forcegc, register-node, format, info, policy-candidates");
     eprintln!("  Run `autumn-op --help` for the full list.");
+    eprintln!("\nclient parameters:\n{}", autumn_params::help::<autumn_params::client::ClientParams>());
     std::process::exit(1);
 }
 
@@ -213,7 +208,6 @@ pub(crate) fn parse_args() -> Args {
     let raw: Vec<String> = std::env::args().collect();
     let mut manager = String::from("127.0.0.1:9001");
     let mut transport = autumn_transport::TransportKind::Tcp;
-    let mut ucx_regpool_cap_bytes: Option<usize> = None;
     let mut namespace: Option<String> = None;
     let mut credential_file: Option<String> = None;
     let mut i = 1;
@@ -244,17 +238,19 @@ pub(crate) fn parse_args() -> Args {
                 });
                 i += 1;
             }
-            "--ucx-regpool-cap-bytes" => {
-                i += 1;
-                ucx_regpool_cap_bytes = Some(
-                    val(&raw, i)
-                        .parse()
-                        .expect("--ucx-regpool-cap-bytes usize"),
-                );
-                i += 1;
-            }
             "--help" | "-h" => usage(),
-            _ => break,
+            other => match autumn_params::take_flag(
+                autumn_client::params(),
+                other,
+                raw.get(i + 1).map(|s| s.as_str()),
+            ) {
+                Ok(autumn_params::Flag::Taken) => i += 2,
+                Ok(autumn_params::Flag::Unknown) => break,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(2);
+                }
+            },
         }
     }
 
@@ -676,7 +672,6 @@ pub(crate) fn parse_args() -> Args {
         manager,
         command,
         transport,
-        ucx_regpool_cap_bytes,
         namespace,
         credential_file,
     }

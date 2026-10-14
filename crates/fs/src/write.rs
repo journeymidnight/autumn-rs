@@ -3,18 +3,18 @@
 //! Mirrors the 3FS InodeWriteBuf pattern, but the flush unit is a variable-
 //! length extent (≤ `MAX_EXTENT` = 8 MiB) keyed by logical offset, not a fixed
 //! 256 KiB chunk:
-//! - Sequential writes accumulate in the buffer (cap [`WRITE_BUF_CAP`] =
-//!   `WRITE_BUF_EXTENTS * MAX_EXTENT` = 64 MiB).
+//! - Sequential writes accumulate in the buffer (cap [`write_buf_cap`] =
+//!   `write_buf_extents * MAX_EXTENT` = 64 MiB).
 //! - Gap detection: a non-sequential offset flushes the buffer first.
 //! - A full buffer flushes the WHOLE buffer at once via `extent::write_region`,
-//!   which splits it into `WRITE_BUF_EXTENTS` ≤ `MAX_EXTENT` extents and
+//!   which splits it into `write_buf_extents` ≤ `MAX_EXTENT` extents and
 //!   dispatches the puts via `put_many` (SDK groups by partition + one
 //!   MSG_BATCH_PUT/MSG_PUT_BULK per group). Pre-pipelining the buffer was exactly
 //!   `MAX_EXTENT` and the flush was a single serial `put` — the cp ceiling
-//!   was `MAX_EXTENT / RPC_RTT` (~270 MB/s). Now `flush ≈ WRITE_BUF_EXTENTS *
+//!   was `MAX_EXTENT / RPC_RTT` (~270 MB/s). Now `flush ≈ write_buf_extents *
 //!   MAX_EXTENT / RPC_RTT` until disk + replica fanout saturates.
-//! - fsync/close flushes whatever remains (≤ WRITE_BUF_CAP) as the same
-//!   pipelined batch (1 to `WRITE_BUF_EXTENTS` extents, last may be shorter).
+//! - fsync/close flushes whatever remains (≤ write_buf_cap) as the same
+//!   pipelined batch (1 to `write_buf_extents` extents, last may be shorter).
 //!
 //! All extent placement / read-modify-write / non-overlap maintenance lives in
 //! `crate::extent`; this module only manages the in-memory buffer + inode meta.
@@ -110,7 +110,7 @@ async fn settle_oldest(state: &mut FsState, ino: u64) -> Option<Result<()>> {
 }
 
 /// Free one slot so another flush can be planned — awaits the oldest in-flight
-/// flush ONLY when the queue is already at [`APPEND_INFLIGHT_DEPTH`].
+/// flush ONLY when the queue is already at [`append_inflight_depth`].
 ///
 /// This replaced the unconditional drain the writer used to do before planning,
 /// which is precisely why only one batch was ever in flight.
@@ -118,7 +118,7 @@ async fn make_room(state: &mut FsState, ino: u64) -> Result<()> {
     let full = state
         .inodes
         .get(&ino)
-        .is_some_and(|is| is.pending_flushes.len() >= crate::schema::APPEND_INFLIGHT_DEPTH);
+        .is_some_and(|is| is.pending_flushes.len() >= crate::schema::append_inflight_depth());
     if !full {
         return Ok(());
     }
@@ -395,22 +395,22 @@ async fn write_inner(state: &mut FsState, ino: u64, offset: i64, data: &[u8]) ->
         let (flush_needed, copied) = {
             let is = state.inodes.get_mut(&ino).unwrap();
             let wb = is.write_buf.as_mut().unwrap();
-            let space = WRITE_BUF_CAP - wb.len;
+            let space = write_buf_cap() - wb.len;
             let to_copy = std::cmp::min(space, remaining.len());
             if wb.buf.len() < wb.len + to_copy {
                 wb.buf.resize(wb.len + to_copy, 0);
             }
             wb.buf[wb.len..wb.len + to_copy].copy_from_slice(&remaining[..to_copy]);
             wb.len += to_copy;
-            (wb.len >= WRITE_BUF_CAP, to_copy)
+            (wb.len >= write_buf_cap(), to_copy)
         };
         FILL_NS.fetch_add(t_fill.elapsed().as_nanos() as u64, Ordering::Relaxed);
         written += copied;
         remaining = &remaining[copied..];
 
         if flush_needed {
-            // Drain the WHOLE buffer (≤ WRITE_BUF_CAP) in one shot —
-            // `write_region` splits into `≤ WRITE_BUF_EXTENTS` extents and
+            // Drain the WHOLE buffer (≤ write_buf_cap) in one shot —
+            // `write_region` splits into `≤ write_buf_extents` extents and
             // pipelines the puts via `put_many` (server-batched per partition).
             // Pre-pipelining we drained one MAX_EXTENT at a time → single
             // serial put → `cp` ceiling was `MAX_EXTENT / RPC_RTT`.

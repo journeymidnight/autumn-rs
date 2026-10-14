@@ -273,7 +273,7 @@ SDK's `ps_conns` / `mgr_conn`.
   `launch_append` as a connection error (see stream CLAUDE.md).
 - **Why not rely on each caller's timeout.** A caller's timeout evicts only if IT
   fires. The SDK's manager call uses the full 30 s `rpc_timeout`, and the fuse
-  read that makes it is bounded by a 30 s `REPLY_TIMEOUT` that started earlier —
+  read that makes it is bounded by a 30 s `--reply-timeout-secs` that started earlier —
   so the outer timer always cancelled the call first, the dead connection was
   never evicted, and every later read (stale routing → region refresh → the same
   connection) did the same. `scripts/fuse_dead_peer_chaos.sh` scenario

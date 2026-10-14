@@ -27,6 +27,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Result};
+use autumn_params::dashboard::DashboardParams;
 use axum::body::{Body, Bytes};
 use axum::extract::{Path, Query};
 use axum::http::{Response, StatusCode};
@@ -38,10 +39,21 @@ use serde::Deserialize;
 use metrics_store::{MetricsStore, PsStatus, Scope};
 
 const INDEX_HTML: &str = include_str!("static/index.html");
-const USAGE: &str = "usage: autumn-dashboard --manager H:P [--transport tcp|ucx] \
-[--port 8799] [--listen 0.0.0.0] [--autumn-op autumn-op] \
-[--metrics-interval-secs 10] [--metrics-retention-secs 3600] \
---cluster-secret-file FILE";
+fn usage() -> String {
+    format!(
+        "usage: autumn-dashboard --manager H:P [--transport tcp|ucx] [--port 8799] \
+         [--listen 0.0.0.0] [--autumn-op autumn-op] --cluster-secret-file FILE\n\n\
+         parameters:\n{}",
+        autumn_params::help::<DashboardParams>()
+    )
+}
+
+/// Dashboard tunables (`autumn_params::dashboard`).
+fn params() -> &'static DashboardParams {
+    static PARAMS: std::sync::LazyLock<DashboardParams> =
+        std::sync::LazyLock::new(DashboardParams::default);
+    &PARAMS
+}
 
 /// Hard deadline on each `autumn-op` subprocess. Without it a manager that
 /// ACCEPTS the connection but never answers hangs the HTTP handler forever
@@ -49,8 +61,10 @@ const USAGE: &str = "usage: autumn-dashboard --manager H:P [--transport tcp|ucx]
 /// pool and wedge the whole dashboard. On expiry the child is killed + reaped
 /// (no zombie) and the call returns a timeout error, freeing the thread.
 /// Generous: read ops finish in ms; mutations only issue the RPC, they don't
-/// wait for completion.
-const OP_TIMEOUT: Duration = Duration::from_secs(30);
+/// wait for completion (`--op-timeout-secs`).
+fn op_timeout() -> Duration {
+    Duration::from_secs(params().op_timeout_secs.get())
+}
 
 struct Config {
     manager: String,
@@ -62,10 +76,15 @@ struct Config {
 }
 
 /// How often the poller re-reads the target list (`autumn-op info
-/// --file-sd`): a new PS is listed once its heartbeat carried its address.
-const PS_LIST_REFRESH: Duration = Duration::from_secs(15);
-/// One PS scrape: connect + read the whole reply.
-const SCRAPE_TIMEOUT: Duration = Duration::from_secs(3);
+/// --file-sd`, `--target-refresh-secs`): a new PS is listed once its heartbeat
+/// carried its address.
+fn ps_list_refresh() -> Duration {
+    Duration::from_secs(params().target_refresh_secs.get())
+}
+/// One PS scrape: connect + read the whole reply (`--scrape-timeout-secs`).
+fn scrape_timeout() -> Duration {
+    Duration::from_secs(params().scrape_timeout_secs.get())
+}
 
 impl Config {
     /// Run `autumn-op --manager .. --transport .. --cluster-secret-file .. --json <args>`
@@ -109,10 +128,10 @@ impl Config {
                 let _ = se.read_to_end(&mut b);
                 b
             });
-            // Poll for exit until OP_TIMEOUT; on expiry kill + reap (closing the
+            // Poll for exit until --op-timeout-secs; on expiry kill + reap (closing the
             // pipes also unblocks the reader threads), so a stuck manager frees
             // this blocking thread instead of pinning it forever.
-            let deadline = Instant::now() + OP_TIMEOUT;
+            let deadline = Instant::now() + op_timeout();
             let status = loop {
                 match child.try_wait() {
                     Ok(Some(s)) => break Some(s),
@@ -146,7 +165,7 @@ impl Config {
                     false,
                 ),
                 None => (
-                    format!("autumn-op timed out after {}s", OP_TIMEOUT.as_secs()),
+                    format!("autumn-op timed out after {}s", op_timeout().as_secs()),
                     false,
                 ),
             }
@@ -334,9 +353,9 @@ fn scrape(addr: &str) -> Result<String> {
         .to_socket_addrs()?
         .next()
         .ok_or_else(|| anyhow!("{addr} resolves to nothing"))?;
-    let mut conn = std::net::TcpStream::connect_timeout(&sa, SCRAPE_TIMEOUT)?;
-    conn.set_read_timeout(Some(SCRAPE_TIMEOUT))?;
-    conn.set_write_timeout(Some(SCRAPE_TIMEOUT))?;
+    let mut conn = std::net::TcpStream::connect_timeout(&sa, scrape_timeout())?;
+    conn.set_read_timeout(Some(scrape_timeout()))?;
+    conn.set_write_timeout(Some(scrape_timeout()))?;
     write!(conn, "GET /metrics HTTP/1.0\r\nHost: {addr}\r\n\r\n")?;
     let mut reply = String::new();
     conn.read_to_string(&mut reply)?;
@@ -373,7 +392,7 @@ fn now_ms() -> u64 {
 }
 
 /// Scrape every PS once per `metrics_interval`, forever. The target list
-/// comes from the manager every `PS_LIST_REFRESH`; a failed refresh keeps
+/// comes from the manager every `--target-refresh-secs`; a failed refresh keeps
 /// the last.
 async fn metrics_poller(cfg: Rc<Config>, store: Rc<RefCell<MetricsStore>>) {
     let mut targets: Vec<(u64, String)> = Vec::new();
@@ -384,7 +403,7 @@ async fn metrics_poller(cfg: Rc<Config>, store: Rc<RefCell<MetricsStore>>) {
             match ps_metrics_targets(&cfg).await {
                 Ok(t) => {
                     targets = t;
-                    next_list = round + PS_LIST_REFRESH;
+                    next_list = round + ps_list_refresh();
                     let ids: Vec<u64> = targets.iter().map(|(id, _)| *id).collect();
                     store.borrow_mut().retain_ps(&ids);
                 }
@@ -747,8 +766,6 @@ fn parse_args() -> Result<(Config, String, u16)> {
     let mut port: u16 = 8799;
     let mut autumn_op = "autumn-op".to_string();
     let mut cluster_secret_file: Option<String> = None;
-    let mut metrics_interval = Duration::from_secs(10);
-    let mut metrics_retention = Duration::from_secs(3600);
     let raw: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
     while i < raw.len() {
@@ -777,27 +794,23 @@ fn parse_args() -> Result<(Config, String, u16)> {
                 i += 1;
                 cluster_secret_file = Some(req(&raw, i)?);
             }
-            "--metrics-interval-secs" => {
-                i += 1;
-                metrics_interval = Duration::from_secs(req(&raw, i)?.parse()?);
-                if metrics_interval.is_zero() {
-                    bail!("--metrics-interval-secs must be at least 1");
-                }
-            }
-            "--metrics-retention-secs" => {
-                i += 1;
-                metrics_retention = Duration::from_secs(req(&raw, i)?.parse()?);
-            }
             "-h" | "--help" => {
-                println!("{USAGE}");
+                println!("{}", usage());
                 std::process::exit(0);
             }
-            other => bail!("unknown flag {other:?}\n{USAGE}"),
+            other => match autumn_params::take_flag(params(), other, raw.get(i + 1).map(|s| s.as_str()))
+                .unwrap_or_else(|e| {
+                    eprintln!("error: {e}");
+                    std::process::exit(2);
+                }) {
+                autumn_params::Flag::Taken => i += 1,
+                autumn_params::Flag::Unknown => bail!("unknown flag {other:?}\n{}", usage()),
+            },
         }
         i += 1;
     }
     let Some(cluster_secret_file) = cluster_secret_file else {
-        bail!("--cluster-secret-file is REQUIRED\n{USAGE}")
+        bail!("--cluster-secret-file is REQUIRED\n{}", usage())
     };
     // Fail at startup, not on the first click: autumn-op reads it per call.
     std::fs::metadata(&cluster_secret_file)
@@ -808,8 +821,8 @@ fn parse_args() -> Result<(Config, String, u16)> {
             transport,
             autumn_op,
             cluster_secret_file,
-            metrics_interval,
-            metrics_retention,
+            metrics_interval: Duration::from_secs(params().metrics_interval_secs.get()),
+            metrics_retention: Duration::from_secs(params().metrics_retention_secs.get()),
         },
         listen,
         port,

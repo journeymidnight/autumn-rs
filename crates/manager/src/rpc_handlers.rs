@@ -176,7 +176,7 @@ impl AutumnManager {
     /// (8 × poll_invalidations + 8 × heartbeats) onto the single
     /// `ClusterClient.mgr_conn`. The first poll parked for 10 s; the
     /// 7 follow-up polls + every AcquireLease behind them stalled.
-    /// Daemon's 30 s `DEFAULT_RPC_TIMEOUT` fired, evicted the conn,
+    /// Daemon's 30 s client `--rpc-timeout-ms` fired, evicted the conn,
     /// reconnected — but the 16 in-flight `mgr_call` futures still
     /// each held an `Rc<RpcClient>` for their own 30 s wait. Daemon
     /// accumulated **stale RpcClient instances (TCP fds) at ~0.15 conn/s**

@@ -225,26 +225,35 @@ pub struct FsState {
     pub reclaim_later: Option<Box<dyn Fn(Reclaim)>>,
 }
 
+/// This machine's host name (`gethostname`), the default daemon identity;
+/// "fuse" when it cannot be read.
+pub fn system_hostname() -> String {
+    let mut buf = [0u8; 256];
+    // SAFETY: the buffer is valid for its length; gethostname NUL-terminates
+    // within it on success.
+    let rc = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) };
+    let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    match std::str::from_utf8(&buf[..len]) {
+        Ok(h) if rc == 0 && !h.is_empty() => h.to_string(),
+        _ => "fuse".to_string(),
+    }
+}
+
 impl FsState {
+    /// Connect with this machine's host name as the daemon identity.
     pub async fn new(manager_addr: &str) -> Result<Self> {
-        // The fuse binary keeps the env-derived hostname default (the daemon
-        // has no CLI flag for it); the PyO3 `autumn.Fs` binding (M2)
-        // passes an explicit host via `new_with_host` so no env read
-        // leaks into the library path ([[feedback_no_env_in_rs]]).
-        let host = std::env::var("HOSTNAME").unwrap_or_else(|_| "fuse".to_string());
-        Self::new_with_host(manager_addr, host).await
+        Self::new_with_host(manager_addr, system_hostname()).await
     }
 
-    /// `new` with an authz credential — same HOSTNAME-derived
-    /// daemon identity, but connects via `connect_with_credential`. See
+    /// `new` with an authz credential — same host-name daemon identity, but
+    /// connects via `connect_with_credential`. See
     /// [`Self::new_with_host_credential`].
     pub async fn new_with_credential(
         manager_addr: &str,
         principal: &str,
         credential: Vec<u8>,
     ) -> Result<Self> {
-        let host = std::env::var("HOSTNAME").unwrap_or_else(|_| "fuse".to_string());
-        Self::new_with_host_credential(manager_addr, host, principal, credential).await
+        Self::new_with_host_credential(manager_addr, system_hostname(), principal, credential).await
     }
 
     /// Connect with an explicit daemon-identity host (no env read). The

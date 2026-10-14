@@ -11,6 +11,7 @@ ucx = ["autumn-rpc/ucx"]
 
 [dependencies]
 autumn-rpc = { path = "../rpc" }
+autumn-params = { path = "../params" }
 autumn-stream = { path = "../stream" }
 anyhow.workspace = true
 bytes.workspace = true
