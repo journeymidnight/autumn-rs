@@ -119,21 +119,28 @@ async fn serve_one(mut stream: compio::net::TcpStream, render: Render) {
     // kernel answer with a reset, which can discard the reply in flight.
     let read_head = async {
         let mut head = Vec::with_capacity(1024);
-        while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+        loop {
             if head.len() >= MAX_REQUEST_HEAD {
                 return None;
             }
             let BufResult(r, buf) = stream.read(Vec::with_capacity(1024)).await;
             match r {
                 Ok(0) => return None,
-                Ok(_) => head.extend_from_slice(&buf),
+                Ok(_) => {
+                    // Only new bytes are scanned, plus the last 3 old ones in
+                    // case the blank line straddles two reads.
+                    let from = head.len().saturating_sub(3);
+                    head.extend_from_slice(&buf);
+                    if head[from..].windows(4).any(|w| w == b"\r\n\r\n") {
+                        return Some(head);
+                    }
+                }
                 Err(e) => {
                     tracing::debug!("metrics read: {e}");
                     return None;
                 }
             }
         }
-        Some(head)
     };
     let head = match compio::time::timeout(Duration::from_secs(2), read_head).await {
         Ok(Some(head)) => head,
@@ -276,6 +283,23 @@ mod tests {
         c.read_to_string(&mut out).expect("whole reply, no reset");
         assert!(out.starts_with("HTTP/1.1 200 OK\r\n"), "{}", &out[..out.len().min(80)]);
         assert!(out.ends_with(&body));
+    }
+
+    #[test]
+    fn a_blank_line_split_across_two_reads_ends_the_head() {
+        let render: Render = Arc::new(|| "autumn_up 1\n".to_string());
+        let port = {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        spawn_metrics_http("127.0.0.1", port, render).unwrap();
+        let mut c = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+        c.write_all(b"GET /metrics HTTP/1.0\r\n\r").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        c.write_all(b"\n").unwrap();
+        let mut out = String::new();
+        c.read_to_string(&mut out).unwrap();
+        assert!(out.starts_with("HTTP/1.1 200 OK\r\n"), "{out}");
     }
 
     #[test]

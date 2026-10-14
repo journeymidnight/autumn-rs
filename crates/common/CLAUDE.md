@@ -76,7 +76,8 @@ Deliberately ZERO interaction with the data-plane runtimes: the
 thread at scrape time and reads only atomics — the PS through `PsMetrics`, the
 EN through its process-global mirrors. Only `/metrics` is answered; any other
 path is a 404. The request head is read up to its blank line (8 KiB cap)
-before answering: closing with request bytes unread makes the kernel send a
+before answering (each read scans only its new bytes plus the last 3 old ones,
+in case the blank line straddles two reads): closing with request bytes unread makes the kernel send a
 reset that can discard the reply — a client whose request arrives in more than
 one segment (the dashboard's `write!` sends three; across k8s nodes they land
 apart) saw `Connection reset by peer`. Nothing is published from a server's
