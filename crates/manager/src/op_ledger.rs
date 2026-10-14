@@ -19,17 +19,9 @@ use autumn_rpc::manager_rpc::{
     OP_KIND_RECOVERY, OP_STATE_PENDING, OP_STATE_RUNNING, OP_STATE_SUCCEEDED, OP_STATE_UNKNOWN,
 };
 
-/// Max live+recent entries kept (newest-first). Mirrors the auto-policy action
-/// log's bounded-ring pattern.
-pub(crate) const OP_LEDGER_CAP: usize = 256;
-
-/// A RUNNING PS-executed op (compact/gc/forcegc) whose terminal outcome never
-/// came back (PS restarted / heartbeat missed) is flipped to UNKNOWN after this
-/// long, so `ops status` stays honest instead of RUNNING forever.
-pub(crate) const OP_RUNNING_TTL_SECS: i64 = 30 * 60;
-
-#[derive(Default)]
 pub(crate) struct OpLedger {
+    /// Live+recent entries kept (`--op-ledger-cap`).
+    cap: usize,
     /// newest at the front.
     entries: VecDeque<OpRecord>,
     seq: u16,
@@ -58,8 +50,14 @@ impl OpLedger {
         }
     }
 
-    pub(crate) fn new() -> Self {
-        Self::default()
+    pub(crate) fn new(cap: usize) -> Self {
+        Self {
+            cap,
+            entries: VecDeque::new(),
+            seq: 0,
+            pending_log: Vec::new(),
+            ps_dispatch_epochs: HashMap::new(),
+        }
     }
 
     /// op_id = time-sortable, unique across leader incarnations without an etcd
@@ -76,14 +74,14 @@ impl OpLedger {
         self.entries.iter_mut().find(|e| e.op_id == op_id)
     }
 
-    /// Hold the ring at `OP_LEDGER_CAP`, dropping the entry that ENDED longest
+    /// Hold the ring at `cap`, dropping the entry that ENDED longest
     /// ago first: its history record is already queued, while an active one
     /// dropped would end with no record at all. By end time, not ring position:
     /// a long op is the oldest by position the moment it ends, and `ops status
     /// --wait` and the split commit fence still read it. Only a ring of active
     /// entries loses its oldest.
     fn trim(&mut self) {
-        while self.entries.len() > OP_LEDGER_CAP {
+        while self.entries.len() > self.cap {
             let ended_first = self
                 .entries
                 .iter()
@@ -652,13 +650,14 @@ impl OpLedger {
     }
 
     /// TTL backstop: a RUNNING PS-executed op (compact/gc/forcegc) whose terminal
-    /// outcome never came back becomes UNKNOWN, keeping `ops status` honest.
-    pub(crate) fn sweep_running_ttl(&mut self, now_s: i64) {
+    /// outcome never came back (PS restarted, load report missed) becomes
+    /// UNKNOWN after `ttl_s`, keeping `ops status` honest.
+    pub(crate) fn sweep_running_ttl(&mut self, now_s: i64, ttl_s: i64) {
         let mut ended = Vec::new();
         for e in self.entries.iter_mut() {
             if e.state == OP_STATE_RUNNING
                 && matches!(e.kind, OP_KIND_COMPACT | OP_KIND_GC | OP_KIND_FORCE_GC)
-                && now_s - e.started_at > OP_RUNNING_TTL_SECS
+                && now_s - e.started_at > ttl_s
             {
                 e.state = OP_STATE_UNKNOWN;
                 e.message = "outcome lost — PS restarted or load report missed".to_string();
@@ -756,6 +755,8 @@ impl OpLedger {
 
 #[cfg(test)]
 mod tests {
+    const OP_LEDGER_CAP: usize = 256;
+    const OP_RUNNING_TTL_SECS: i64 = 30 * 60;
     use super::*;
     use autumn_rpc::manager_rpc::{
         OP_KIND_EC_CONVERT, OP_KIND_GC, OP_KIND_SCRUB, OP_KIND_SPLIT, OP_STATE_FAILED, OP_STATE_SUCCEEDED,
@@ -767,7 +768,7 @@ mod tests {
 
     #[test]
     fn submit_then_running_then_terminal() {
-        let mut led = OpLedger::new();
+        let mut led = OpLedger::new(OP_LEDGER_CAP);
         let (id, attached) = led.submit(OP_KIND_SPLIT, 7, 0, vec![], "cli".into(), 100, 100_000);
         assert!(!attached);
         assert_eq!(q_one(&led, id).state, OP_STATE_PENDING);
@@ -789,7 +790,7 @@ mod tests {
     /// every future convert of that extent silently does nothing.
     #[test]
     fn an_abandoned_ec_op_stops_blocking_future_submits() {
-        let mut led = OpLedger::new();
+        let mut led = OpLedger::new(OP_LEDGER_CAP);
         let (first, attached) =
             led.submit(OP_KIND_EC_CONVERT, 0, 55, vec![55], "cli".into(), 100, 100_000);
         assert!(!attached);
@@ -821,7 +822,7 @@ mod tests {
 
     #[test]
     fn attach_dedup_returns_same_id() {
-        let mut led = OpLedger::new();
+        let mut led = OpLedger::new(OP_LEDGER_CAP);
         let (id1, a1) = led.submit(OP_KIND_GC, 3, 0, vec![], "cli".into(), 1, 1000);
         let (id2, a2) = led.submit(OP_KIND_GC, 3, 0, vec![], "cli".into(), 2, 2000);
         assert!(!a1 && a2);
@@ -837,7 +838,7 @@ mod tests {
 
     #[test]
     fn unknown_id_is_unknown_never_running() {
-        let led = OpLedger::new();
+        let led = OpLedger::new(OP_LEDGER_CAP);
         let r = q_one(&led, 424242);
         assert_eq!(r.state, OP_STATE_UNKNOWN);
         assert_eq!(r.op_id, 424242);
@@ -845,7 +846,7 @@ mod tests {
 
     #[test]
     fn cap_evicts_oldest() {
-        let mut led = OpLedger::new();
+        let mut led = OpLedger::new(OP_LEDGER_CAP);
         let mut first = 0;
         for i in 0..(OP_LEDGER_CAP as u64 + 10) {
             let (id, _) = led.submit(OP_KIND_GC, i, 0, vec![], "cli".into(), i as i64, i as i64 * 10);
@@ -862,7 +863,7 @@ mod tests {
     /// of short ones: they go, it stays, and its end still reaches history.
     #[test]
     fn cap_keeps_an_active_op_over_ended_ones() {
-        let mut led = OpLedger::new();
+        let mut led = OpLedger::new(OP_LEDGER_CAP);
         let (long, _) = led.submit(OP_KIND_SCRUB, 0, 0, vec![], "auto-policy".into(), 0, 0);
         led.set_running(long, 0);
         for i in 1..=(OP_LEDGER_CAP as u64 + 10) {
@@ -886,12 +887,12 @@ mod tests {
 
     #[test]
     fn ttl_flips_stale_running_maintenance_to_unknown() {
-        let mut led = OpLedger::new();
+        let mut led = OpLedger::new(OP_LEDGER_CAP);
         let (id, _) = led.submit(OP_KIND_GC, 1, 0, vec![], "cli".into(), 0, 0);
         led.set_running(id, 0);
-        led.sweep_running_ttl(OP_RUNNING_TTL_SECS - 1); // not yet
+        led.sweep_running_ttl(OP_RUNNING_TTL_SECS - 1, OP_RUNNING_TTL_SECS); // not yet
         assert_eq!(q_one(&led, id).state, OP_STATE_RUNNING);
-        led.sweep_running_ttl(OP_RUNNING_TTL_SECS + 1); // past TTL
+        led.sweep_running_ttl(OP_RUNNING_TTL_SECS + 1, OP_RUNNING_TTL_SECS); // past TTL
         assert_eq!(q_one(&led, id).state, OP_STATE_UNKNOWN);
         let queued = led.drain_pending_log();
         assert_eq!(queued.len(), 1, "the UNKNOWN end goes to history");
@@ -900,7 +901,7 @@ mod tests {
 
     #[test]
     fn terminal_records_are_queued_for_history_exactly_once() {
-        let mut led = OpLedger::new();
+        let mut led = OpLedger::new(OP_LEDGER_CAP);
         let (id, _) = led.submit(OP_KIND_GC, 1, 0, vec![], "cli".into(), 0, 0);
         led.set_running(id, 0);
         assert!(
@@ -928,7 +929,7 @@ mod tests {
 
     #[test]
     fn extent_keyed_completions_are_queued_too() {
-        let mut led = OpLedger::new();
+        let mut led = OpLedger::new(OP_LEDGER_CAP);
         let (id, _) = led.submit(OP_KIND_RECOVERY, 0, 77, vec![], "auto".into(), 0, 0);
         led.set_running(id, 0);
         led.complete_recovery(77, "rebuilt".into(), 9);
@@ -939,7 +940,7 @@ mod tests {
 
     #[test]
     fn progress_tracks_a_running_op_and_ignores_late_or_unknown_samples() {
-        let mut led = OpLedger::new();
+        let mut led = OpLedger::new(OP_LEDGER_CAP);
         let (id, _) = led.submit(OP_KIND_GC, 1, 0, vec![], "cli".into(), 0, 0);
         led.set_running(id, 0);
 
@@ -976,7 +977,7 @@ mod tests {
         // bump for a progress sample — so the PS reports `op_id: 0` and the
         // manager finds the entry by (kind, part_id). Same reason
         // `update_progress_by_extent` exists for extent nodes.
-        let mut led = OpLedger::new();
+        let mut led = OpLedger::new(OP_LEDGER_CAP);
         let (id, _) = led.submit(OP_KIND_SPLIT, 44, 0, vec![], "cli".into(), 0, 0);
         led.set_running(id, 0);
 
@@ -1021,7 +1022,7 @@ mod tests {
     /// re-animate one that already closed.
     #[test]
     fn extent_keyed_progress_lands_on_the_right_running_op() {
-        let mut led = OpLedger::new();
+        let mut led = OpLedger::new(OP_LEDGER_CAP);
         let (ec, _) = led.submit(OP_KIND_EC_CONVERT, 0, 55, vec![55], "cli".into(), 0, 100_000);
         led.set_running(ec, 0);
         let (rec, _) = led.submit(OP_KIND_RECOVERY, 0, 55, vec![55], "auto".into(), 0, 100_001);
@@ -1067,10 +1068,10 @@ mod tests {
 
     #[test]
     fn a_late_authoritative_outcome_supersedes_unknown() {
-        let mut led = OpLedger::new();
+        let mut led = OpLedger::new(OP_LEDGER_CAP);
         let (id, _) = led.submit(OP_KIND_COMPACT, 7, 0, vec![], "cli".into(), 0, 100_000);
         led.set_running(id, 0);
-        led.sweep_running_ttl(OP_RUNNING_TTL_SECS + 10);
+        led.sweep_running_ttl(OP_RUNNING_TTL_SECS + 10, OP_RUNNING_TTL_SECS);
         assert_eq!(q_one(&led, id).state, OP_STATE_UNKNOWN, "precondition: TTL flip");
 
         assert!(
@@ -1106,7 +1107,7 @@ mod tests {
     /// RUNNING, every resubmit attached to the dead op until the 30 min TTL.
     #[test]
     fn a_reopened_partition_ends_its_dispatched_op() {
-        let mut led = OpLedger::new();
+        let mut led = OpLedger::new(OP_LEDGER_CAP);
         let (id, _) = led.submit(OP_KIND_COMPACT, 7, 0, vec![], "cli".into(), 100, 100_000);
         led.set_running(id, 100);
         led.note_ps_dispatch(id, Some(40));
@@ -1141,7 +1142,7 @@ mod tests {
 
     #[test]
     fn reconcile_outcome_transitions_once() {
-        let mut led = OpLedger::new();
+        let mut led = OpLedger::new(OP_LEDGER_CAP);
         let (id, _) = led.submit(OP_KIND_GC, 1, 0, vec![], "cli".into(), 1, 1_000_000);
         led.set_running(id, 1);
         assert!(led.reconcile_outcome(id, OP_STATE_FAILED, "boom".into(), String::new(), 5));
@@ -1156,7 +1157,7 @@ mod tests {
 
     #[test]
     fn complete_ec_closes_by_extent() {
-        let mut led = OpLedger::new();
+        let mut led = OpLedger::new(OP_LEDGER_CAP);
         let (id, _) = led.submit(OP_KIND_EC_CONVERT, 0, 55, vec![], "cli".into(), 0, 0);
         led.set_running(id, 0);
         led.complete_ec(55, OP_STATE_SUCCEEDED, "ec done".into(), String::new(), 10);
@@ -1180,7 +1181,7 @@ mod tests {
     /// it. One entry per extent is what makes the reason findable.
     #[test]
     fn ec_dispatch_keeps_one_entry_and_the_coordinators_reason() {
-        let mut led = OpLedger::default();
+        let mut led = OpLedger::new(OP_LEDGER_CAP);
 
         led.note_ec_dispatch(12, 7, true, 100, 100_000);
         let recs = led.query(&OpQueryReq::default());
@@ -1205,7 +1206,7 @@ mod tests {
     /// later force-ec-convert of the extent attach-dedups into a silent no-op.
     #[test]
     fn a_response_arriving_after_the_marker_is_gone_creates_no_phantom_entry() {
-        let mut led = OpLedger::default();
+        let mut led = OpLedger::new(OP_LEDGER_CAP);
         led.note_ec_dispatch(31, 4, /*create=*/ false, 100, 100_000);
         assert!(
             led.query(&OpQueryReq::default())
@@ -1234,7 +1235,7 @@ mod tests {
     #[test]
     fn a_node_reported_failure_updates_a_running_entry_and_creates_none() {
         use autumn_rpc::manager_rpc::CODE_ERROR;
-        let mut led = OpLedger::new();
+        let mut led = OpLedger::new(OP_LEDGER_CAP);
 
         // Nothing tracked yet — the report is dropped, not turned into an entry.
         led.record_node_op_failure(OP_KIND_RECOVERY, 42, "peer 83 answered short".into(), CODE_ERROR);
@@ -1274,7 +1275,7 @@ mod tests {
 
     #[test]
     fn recovery_lifecycle_keeps_one_entry_and_the_last_error() {
-        let mut led = OpLedger::new();
+        let mut led = OpLedger::new(OP_LEDGER_CAP);
         // dispatch accepted → RUNNING
         led.note_recovery_dispatch(42, 2, 7, 100, 1_000_000);
         let recs = led.query(&OpQueryReq { kind_filter: OP_KIND_RECOVERY, ..Default::default() });
@@ -1307,7 +1308,7 @@ mod tests {
 
     #[test]
     fn recovery_failure_before_any_dispatch_still_listed() {
-        let mut led = OpLedger::new();
+        let mut led = OpLedger::new(OP_LEDGER_CAP);
         // a repair that can't even start (no candidate) must still be visible.
         led.record_recovery_failure(9, "all recovery candidates rejected".into(), 3, 5, 5_000);
         let r = led.query(&OpQueryReq { kind_filter: OP_KIND_RECOVERY, ..Default::default() })
@@ -1319,7 +1320,7 @@ mod tests {
 
     #[test]
     fn seed_ec_replay_makes_inflight_ec_listable_and_closable() {
-        let mut led = OpLedger::new();
+        let mut led = OpLedger::new(OP_LEDGER_CAP);
         led.seed_replay(OP_KIND_EC_CONVERT, [(55u64, 40), (77, 0)], 100, 1_000_000);
         let ecs = led.query(&OpQueryReq { kind_filter: OP_KIND_EC_CONVERT, ..Default::default() });
         assert_eq!(ecs.len(), 2);
@@ -1354,7 +1355,7 @@ mod tests {
 
     #[test]
     fn query_filters_active_kind_limit() {
-        let mut led = OpLedger::new();
+        let mut led = OpLedger::new(OP_LEDGER_CAP);
         let (g, _) = led.submit(OP_KIND_GC, 1, 0, vec![], "cli".into(), 0, 0);
         let (s, _) = led.submit(OP_KIND_SPLIT, 2, 0, vec![], "cli".into(), 0, 1);
         led.finish(g, OP_STATE_SUCCEEDED, String::new(), String::new(), 1);

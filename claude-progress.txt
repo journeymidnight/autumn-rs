@@ -1,3 +1,11 @@
+Date: 2026-10-14
+TaskStatus: not_completed
+Task scope: user — reorganise parameters into three kinds: hard-coded, startup flags, runtime overrides through autumn-op (e.g. recovery speed online); no env reads in rs (gallery reads AUTHZ from env); hard-coded knobs become flags unless necessary; list what is runtime-changeable. User decisions: runtime scope = recovery/repair speed (manager, EN) + PS background rate limits; all knobs to flags (servers and clients); definitions in standalone .rs files, not a docs/params.md; PS/EN fetch runtime config with a new MSG_GET_RUNTIME_CONFIG in the authz poll loop, which goes 5 s -> 30 s with a refetch when a namespace / kid is unknown (at most once a second).
+Current summary: stage 1 done — crate `autumn-params` (`params!` macro, `Live<T>` base/override atomics, take_flag / help / apply_overrides / runtime_spec); `ManagerParams` (81 params, 7 runtime: recovery max global/source/target, backoff max, catch-up inflight, EC dispatch concurrency, repair grace); manager reads params instead of Cells/consts/env (recovery limiter re-reads caps each tick); etcd request timeout via `with_request_timeout`; manager binary: unknown arg / bad value exit 2, generated --help. Stage 2 (PS) in progress in the working tree.
+Verification (stage 1): params 3, manager lib 504, workspace compiles, manager integration e2e_lifecycle / extent_repair / split_op_outcome / ioring_lease / system_asym_partition_grayfail / system_merge_replay_reachability, server param_flags 2. Fable review: no high; fixed doc claims, override-on-reject semantics, cooldown help, stale constant names.
+Main gaps: PS, EN, clients (SDK/fs/fuse/autumnfs/s3/gallery/dashboard), authz poll 30 s + refetch, runtime config (wire, etcd, autumn-op config), perf A/B.
+Next steps: stage 2 PS params; then EN; clients + gallery env; authz poll; runtime config.
+
 Date: 2026-10-13
 TaskStatus: completed
 Task scope: user — ec-convert ops failing after an EN was put in maintenance and stopped. Became F-EXTENT-OP-ARBITRATION (docs/extent_op_arbitration_design.md), done in five commits: ddf6a9dc node/disk classes; 5812ad89 one arbiter, nothing preempts; 9eeb91b5 a marker is one attempt (wire 68); 6fcc511f EC onto health nodes; bfaf2431 GC precheck (wire 69).

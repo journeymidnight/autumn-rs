@@ -1288,7 +1288,7 @@ pub const POLICY_KIND_MAJOR_COMPACT: u8 = 3;
 pub const POLICY_KIND_COMPACT: u8 = POLICY_KIND_MAJOR_COMPACT;
 /// Stage D: hot/cold imbalance advisory. Emitted once per PS
 /// when sustained `max(req_per_sec) / min(req_per_sec) ≥ HOT_COLD_RATIO`
-/// AND hottest > `HOT_COLD_MIN_HOT_QPS`, OR the same imbalance on
+/// AND hottest > `--hot-cold-min-hot-qps`, OR the same imbalance on
 /// `size_bytes`. `primary_part_id` = hottest partition, `secondary_part_id`
 /// = coldest partition; `reason` carries `ps_id=N qps_ratio=N qps_hot=[…]
 /// qps_cold=[…] size_ratio=N size_hot=[…] size_cold=[…]`.
@@ -1324,10 +1324,9 @@ pub const POLICY_KIND_REBALANCE: u8 = 7;
 /// recovery loop then rebuilds on another node — without fencing the node.
 pub const POLICY_KIND_REPAIR: u8 = 8;
 /// Scrub every sealed payload file in the cluster (`autumn-op scrub --all`),
-/// at most once per `SCRUB_POLICY_INTERVAL_SEC`. Cluster-scoped: no target id.
+/// at most once per manager `--scrub-policy-interval-secs` (weekly by
+/// default). Cluster-scoped: no target id.
 pub const POLICY_KIND_SCRUB: u8 = 9;
-/// How often the `scrub` policy switch scrubs the whole cluster: weekly.
-pub const SCRUB_POLICY_INTERVAL_SEC: u64 = 7 * 24 * 3600;
 
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
 pub struct PolicyCandidate {

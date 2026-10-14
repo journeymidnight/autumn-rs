@@ -110,6 +110,7 @@ use crate::persist::records::StreamRecord;
 use crate::store::MetadataStore;
 use anyhow::Result;
 use autumn_common::AppError;
+use autumn_params::manager::ManagerParams;
 use autumn_rpc::extent_rpc::PayloadLocation;
 use autumn_rpc::manager_rpc::*;
 use autumn_rpc::StatusCode;
@@ -120,8 +121,6 @@ use bytes::Bytes;
 /// Etcd path for the manager leader-key. Also used as the fence target
 /// for every manager etcd write txn.
 pub(crate) const LEADER_KEY: &str = "autumn-rs/stream-manager/leader";
-/// A PS silent this long is evicted from the live registry.
-const PS_DEAD_TIMEOUT: Duration = Duration::from_secs(10);
 /// `psMembers/<ps_id>` → `MemberRecord`.
 pub(crate) const PS_MEMBERS_PREFIX: &str = "psMembers/";
 
@@ -197,12 +196,6 @@ pub(crate) fn namespace_prefix_conflicts(new_prefix: &[u8], existing: &[&[u8]]) 
         .any(|p| new_prefix.starts_with(p) || p.starts_with(new_prefix))
 }
 
-/// ENOSPC-1: default allocation free-space floor — a node whose best
-/// disk has less free than this is soft-avoided by `select_nodes`.
-/// 256 MiB comfortably covers a fresh extent + its metadata while small
-/// enough not to strand mostly-full-but-usable disks.
-pub const DEFAULT_MIN_ALLOC_FREE_BYTES: u64 = 256 * 1024 * 1024;
-
 #[derive(Clone)]
 pub(crate) struct EtcdMirror {
     client: Rc<autumn_etcd::EtcdClient>,
@@ -227,8 +220,11 @@ impl EtcdMirror {
         instance_id: Rc<String>,
         leader: Rc<Cell<bool>>,
         displaced: Rc<Cell<bool>>,
+        request_timeout: Duration,
     ) -> Result<Self> {
-        let client = autumn_etcd::EtcdClient::connect_many(&endpoints).await?;
+        let client = autumn_etcd::EtcdClient::connect_many(&endpoints)
+            .await?
+            .with_request_timeout(request_timeout);
         Ok(Self {
             client: Rc::new(client),
             instance_id,
@@ -543,12 +539,16 @@ impl EtcdMirror {
 /// same node concurrently each read the other's replies off one socket.
 pub(crate) struct ConnPool {
     conns: RefCell<HashMap<SocketAddr, Rc<autumn_rpc::client::RpcClient>>>,
+    /// `call_timeout` wraps only the request, not the connect, so a hung
+    /// connect to a dead or firewalled peer needs its own bound.
+    connect_timeout: Duration,
 }
 
 impl ConnPool {
-    fn new() -> Self {
+    fn new(connect_timeout: Duration) -> Self {
         Self {
             conns: RefCell::new(HashMap::new()),
+            connect_timeout,
         }
     }
 
@@ -609,11 +609,7 @@ impl ConnPool {
                 return Ok(client.clone());
             }
         }
-        // (1A): bound the TCP connect. `call_timeout` wraps only the
-        // request future, NOT this connect — a hung connect to a dead /
-        // firewalled peer would wedge the calling background loop forever
-        // despite call_timeout. Default 5 s, env AUTUMN_MGR_CONNECT_TIMEOUT_MS.
-        let connect_to = connect_timeout();
+        let connect_to = self.connect_timeout;
         let client =
             compio::time::timeout(connect_to, autumn_rpc::client::RpcClient::connect(addr))
                 .await
@@ -623,17 +619,6 @@ impl ConnPool {
         self.conns.borrow_mut().insert(addr, client.clone());
         Ok(client)
     }
-}
-
-/// (1A): TCP connect timeout for the manager's ConnPool. See
-/// `get_or_connect`. Env `AUTUMN_MGR_CONNECT_TIMEOUT_MS` (default 5 s).
-fn connect_timeout() -> std::time::Duration {
-    let ms = std::env::var("AUTUMN_MGR_CONNECT_TIMEOUT_MS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(5_000)
-        .max(500);
-    std::time::Duration::from_millis(ms)
 }
 
 fn parse_addr(addr: &str) -> Result<SocketAddr> {
@@ -696,24 +681,10 @@ pub(crate) struct ClusterCapSnapshot {
 #[derive(Clone)]
 pub struct AutumnManager {
     pub(crate) store: MetadataStore,
+    /// Every tunable (`autumn_params::manager`). Shared by every clone, so a
+    /// runtime override reaches each background loop.
+    params: Rc<ManagerParams>,
     leader: Rc<Cell<bool>>,
-    /// How often the sealed-empty backstop ticks. Adjustable for the same reason
-    /// `PolicyConfig` is: a 60 s loop is invisible inside a short-lived dev or
-    /// test cluster.
-    ///
-    /// No operator-facing flag exposes it — the only callers are
-    /// `--policy-fast-mode` and in-process tests, so today it is a dev knob. It
-    /// WOULD be the lever for draining a large pre-fix backlog faster than the
-    /// ten hours 64-per-60s implies, once something exposes it.
-    ///
-    /// `Rc`, not a plain `Cell`, and that is load-bearing: `AutumnManager` is
-    /// Clone and every background loop holds its own clone, taken before any
-    /// caller reaches the setter. A by-value cell would leave the setter with no
-    /// effect at all.
-    sealed_empty_sweep_interval: Rc<Cell<Duration>>,
-    /// How long a submitted split waits for the PS's reply. Past it the
-    /// outcome is unknown, not failed. Tests shorten it.
-    split_reply_timeout: Rc<Cell<Duration>>,
     /// Submitted splits whose reply was lost, by op id (`split_op.rs`).
     /// Leader-local like the ledger.
     pub(crate) unknown_splits: Rc<RefCell<HashMap<u64, crate::split_op::UnknownSplit>>>,
@@ -793,9 +764,6 @@ pub struct AutumnManager {
     /// (policy, op, dispatch tick, recovery apply), and two interleaved
     /// snapshots lose a request or resurrect a withdrawn one.
     pub(crate) extent_repair_lock: Rc<futures::lock::Mutex<()>>,
-    /// How long a slot must have been degraded before the repair policy
-    /// proposes moving it (`--repair-grace-secs`, default 600).
-    pub(crate) repair_grace_secs: Rc<Cell<u64>>,
     /// Running scrub ops' per-file accounting (`extent_scrub.rs`). Leader-local
     /// like the op ledger it feeds: a failover ends them as `UNKNOWN`.
     pub(crate) scrub_ops: Rc<RefCell<HashMap<u64, crate::extent_scrub::ScrubOp>>>,
@@ -847,7 +815,7 @@ pub struct AutumnManager {
     /// true once `serve()`'s listener is actually BOUND and
     /// accepting. The UCX listener bind can retry through a killed
     /// predecessor's TIME_WAIT window for ~60 s — far past
-    /// `PS_DEAD_TIMEOUT` — during which no PS heartbeat can possibly
+    /// `--ps-dead-timeout-secs` — during which no PS heartbeat can possibly
     /// arrive. `ps_liveness_check_loop` must not evict before this is
     /// set (observed: a respawned ucx manager won the election at ~4 s,
     /// evicted the ENTIRE healthy PS fleet at ~10 s, and only bound its
@@ -912,16 +880,6 @@ pub struct AutumnManager {
     /// request on it rebuilds elsewhere. Cleared by a catch-up that succeeds.
     /// Leader-local.
     pub(crate) catch_up_copy_gone: Rc<RefCell<HashSet<(u64, u32)>>>,
-    /// ENOSPC-1: allocation soft-avoids nodes whose max per-disk free is
-    /// below this (`--min-alloc-free-bytes`, default 256 MiB; 0 =
-    /// disabled). Soft: select_nodes falls back to the full healthy set
-    /// when too few spacious nodes remain.
-    min_alloc_free_bytes: Rc<Cell<u64>>,
-    /// audit log retention (days; `--audit-retention-days`,
-    /// default 90, 0 = disabled). Enforced by `audit_gc_loop` — the GC
-    /// helper already existed but had NO caller, so `mgr_audit_log/`
-    /// grew in etcd unboundedly.
-    pub(crate) audit_retention_days: Rc<Cell<u64>>,
     /// etcd-chaos D1: WHY are we not leader? `true` (the safe default —
     /// every fresh/rejoined process starts displaced) = another instance
     /// holds/held leadership or we never won it: our in-memory state may
@@ -938,7 +896,7 @@ pub struct AutumnManager {
     displaced: Rc<Cell<bool>>,
     /// etcd-chaos D1 (coco P1): when the stale-while-leaderless window
     /// opened (keepalive lost without observed displacement). Bounds the
-    /// mode with `ROUTABLE_STALE_TTL`: in an ASYMMETRIC partition (only
+    /// mode with `--routable-stale-ttl-secs`: in an ASYMMETRIC partition (only
     /// this manager lost etcd; another instance takes over) displacement
     /// is only detected once OUR etcd link recovers (election CAS sees
     /// the new holder) — without a TTL this manager would serve stale
@@ -1061,15 +1019,6 @@ pub struct AutumnManager {
     /// the unix-nanosecond timestamp to form the `mgr_audit_log/`
     /// suffix so ordering is unique even for concurrent appends.
     pub(crate) audit_seq: Rc<Cell<u64>>,
-    /// quorum debounce — sliding-window length. Default 60 s.
-    /// Configured via the manager binary's `--report-disk-failure-window-secs`
-    /// CLI flag (was previously `AUTUMN_REPORT_DISK_FAILURE_WINDOW_SECS`).
-    pub(crate) report_disk_failure_window: Cell<Duration>,
-    /// quorum debounce — distinct-reporter threshold to flip
-    /// node offline. Default 3. Configured via the manager binary's
-    /// `--report-disk-failure-quorum` CLI flag (was previously
-    /// `AUTUMN_REPORT_DISK_FAILURE_QUORUM`).
-    pub(crate) report_disk_failure_quorum: Cell<usize>,
     /// persistent cluster identity. CAS-created in etcd
     /// (`autumn-rs/cluster_id`) by the first leader; inherited by
     /// subsequent leaders via `replay_from_etcd`. Empty when the manager
@@ -1090,10 +1039,6 @@ pub struct AutumnManager {
     /// material), loaded once from `--auth-signing-key-file`. `None` = authz
     /// disabled (opt-in; fuse/kvcache/dev unaffected). Set at startup only.
     pub(crate) authz_keyring: Rc<RefCell<Option<crate::authz::AuthzKeyring>>>,
-    /// TTL (seconds) minted tokens get. Default 3600 (1 h).
-    pub(crate) token_ttl_secs: Rc<Cell<u64>>,
-    /// clock-skew leeway (seconds) advertised to the PS. Default 60.
-    pub(crate) clock_skew_secs: Rc<Cell<u64>>,
     /// principal account DB (etcd `principal/<name>` →
     /// `persist::PrincipalAccountRecord`). Replayed on leader failover; mutated only via the
     /// admin RPCs. Stores the credential HASH, never the raw credential.
@@ -1139,13 +1084,16 @@ impl Drop for AllocatingExtentGuard {
 
 impl AutumnManager {
     pub fn new() -> Self {
+        Self::new_with_params(ManagerParams::default())
+    }
+
+    pub fn new_with_params(params: ManagerParams) -> Self {
+        let params = Rc::new(params);
+        let connect_timeout = Duration::from_millis(params.connect_timeout_ms.get());
         Self {
             store: MetadataStore::new(),
+            params: params.clone(),
             leader: Rc::new(Cell::new(true)),
-            sealed_empty_sweep_interval: Rc::new(Cell::new(
-                crate::extent_delete::SEALED_EMPTY_SWEEP_INTERVAL_DEFAULT,
-            )),
-            split_reply_timeout: Rc::new(Cell::new(Duration::from_secs(60))),
             unknown_splits: Rc::new(RefCell::new(HashMap::new())),
             etcd: None,
             instance_id: Rc::new(uuid::Uuid::new_v4().to_string()),
@@ -1162,7 +1110,6 @@ impl AutumnManager {
             slot_degraded_since: Rc::new(RefCell::new(HashMap::new())),
             extent_repair_slots: Rc::new(RefCell::new(HashMap::new())),
             extent_repair_lock: Rc::new(futures::lock::Mutex::new(())),
-            repair_grace_secs: Rc::new(Cell::new(600)),
             scrub_ops: Rc::new(RefCell::new(HashMap::new())),
             op_log_seq: Cell::new(0),
             op_log_writes_since_gc: Cell::new(0),
@@ -1181,35 +1128,35 @@ impl AutumnManager {
             faulted_disks: Rc::new(RefCell::new(HashSet::new())),
             catch_up_inflight: Rc::new(RefCell::new(HashSet::new())),
             catch_up_backoff: Rc::new(RefCell::new(
-                crate::recovery_rate_limiter::RecoveryRateLimiter::default(),
+                crate::recovery_rate_limiter::RecoveryRateLimiter::from_params(&params),
             )),
             catch_up_copy_gone: Rc::new(RefCell::new(HashSet::new())),
-            min_alloc_free_bytes: Rc::new(Cell::new(DEFAULT_MIN_ALLOC_FREE_BYTES)),
-            audit_retention_days: Rc::new(Cell::new(90)),
             displaced: Rc::new(Cell::new(true)),
             leaderless_since: Rc::new(Cell::new(None)),
-            conn_pool: Rc::new(ConnPool::new()),
-            control_pool: Rc::new(ConnPool::new()),
+            conn_pool: Rc::new(ConnPool::new(connect_timeout)),
+            control_pool: Rc::new(ConnPool::new(connect_timeout)),
             last_op_at: Rc::new(RefCell::new(HashMap::new())),
-            policy: Rc::new(RefCell::new(crate::policy::PolicyEngine::default())),
+            policy: Rc::new(RefCell::new(crate::policy::PolicyEngine {
+                config: crate::policy::PolicyConfig::from_params(&params),
+                ..Default::default()
+            })),
             auto_policy: Rc::new(RefCell::new(crate::auto_policy::AutoPolicyState::default())),
             reconcile_non_member: Rc::new(RefCell::new(HashMap::new())),
             allocating_extents: Rc::new(RefCell::new(std::collections::HashSet::new())),
-            ops: Rc::new(RefCell::new(crate::op_ledger::OpLedger::new())),
+            ops: Rc::new(RefCell::new(crate::op_ledger::OpLedger::new(
+                params.op_ledger_cap.get(),
+            ))),
             auto_policy_default: Rc::new(RefCell::new(None)),
             auto_policy_had_persisted_config: Rc::new(Cell::new(false)),
             recent_failure_reports: Rc::new(RefCell::new(HashMap::new())),
-            // defaults match the legacy env defaults.
-            report_disk_failure_window: Cell::new(Duration::from_secs(60)),
-            report_disk_failure_quorum: Cell::new(3),
-            // env-controlled soft-timeout, default 10 s.
-            node_states: Rc::new(RefCell::new(crate::node_state::NodeStateTracker::default())),
+            node_states: Rc::new(RefCell::new(crate::node_state::NodeStateTracker::new(
+                Duration::from_secs(params.node_suspected_timeout_secs.get()),
+            ))),
             // starts empty; populated by replay / admin RPCs.
             node_overrides: Rc::new(RefCell::new(HashMap::new())),
             decommissioned: Rc::new(RefCell::new(HashMap::new())),
-            // starts at the env-configured default limits.
             recovery_limiter: Rc::new(RefCell::new(
-                crate::recovery_rate_limiter::RecoveryRateLimiter::from_env(),
+                crate::recovery_rate_limiter::RecoveryRateLimiter::from_params(&params),
             )),
             roll_tails_cooldown: Rc::new(RefCell::new(HashMap::new())),
             audit_seq: Rc::new(Cell::new(0)),
@@ -1219,13 +1166,14 @@ impl AutumnManager {
             cluster_id: Rc::new(RefCell::new(uuid::Uuid::new_v4().to_string())),
             // Empty registry; populated on
             // AcquireLease and on `replay_from_etcd`.
-            inode_leases: Rc::new(RefCell::new(crate::inode_lease::LeaseRegistry::with_ttl(
-                std::time::Duration::from_secs(crate::inode_lease::DEFAULT_LEASE_TTL_SECS as u64),
-            ))),
+            inode_leases: Rc::new(RefCell::new(
+                crate::inode_lease::LeaseRegistry::with_ttl_and_revoke_grace(
+                    Duration::from_secs(params.inode_lease_ttl_secs.get() as u64),
+                    Duration::from_millis(params.inode_revoke_grace_ms.get()),
+                ),
+            )),
             // authz OFF unless the binary loads a signing-key file.
             authz_keyring: Rc::new(RefCell::new(None)),
-            token_ttl_secs: Rc::new(Cell::new(3600)),
-            clock_skew_secs: Rc::new(Cell::new(60)),
             principal_accounts: Rc::new(RefCell::new(HashMap::new())),
             principal_admin_lock: Rc::new(futures::lock::Mutex::new(())),
             // D2: empty; populated by replay / admin RPCs /
@@ -1250,30 +1198,10 @@ impl AutumnManager {
         }
     }
 
-    pub fn set_report_disk_failure_config(&self, window: Duration, quorum: usize) {
-        self.report_disk_failure_window.set(window);
-        self.report_disk_failure_quorum.set(quorum.max(1));
-    }
-
     /// install the KDC signing keyring (parsed by the binary from
     /// `--auth-signing-key-file`). Its presence ENABLES data-plane authz.
     pub fn set_authz_keyring(&self, keyring: crate::authz::AuthzKeyring) {
         *self.authz_keyring.borrow_mut() = Some(keyring);
-    }
-
-    /// set the minted-token TTL in seconds. Clamped to
-    /// [60, 30 days] — the design wants short TTLs (prod hours); the 30-day
-    /// ceiling both discourages long-lived bearer tokens and prevents an absurd
-    /// value from overflowing `now + ttl` (coco P2). 30-day cap is generous.
-    pub fn set_token_ttl_secs(&self, secs: u64) {
-        self.token_ttl_secs.set(secs.clamp(60, 30 * 24 * 3600));
-    }
-
-    /// set the advertised clock-skew leeway in seconds. Capped at 1 h
-    /// (design suggests 30-120 s; the cap bounds `exp + skew` against wrap and a
-    /// misconfigured huge leeway that would neuter expiry).
-    pub fn set_clock_skew_secs(&self, secs: u64) {
-        self.clock_skew_secs.set(secs.min(3600));
     }
 
     /// read the last_op_at timestamp for a partition (0 if never op'd).
@@ -1291,22 +1219,8 @@ impl AutumnManager {
         self.policy.borrow_mut().set_config(config);
     }
 
-    /// Shorten (or lengthen) the sealed-empty backstop's period. See the field.
-    ///
-    /// Floored at one second. Zero would spin: on a follower the tick returns at
-    /// its first statement, so the sleep is the loop's only suspension point.
-    /// And this is a reclaim-RATE knob, not just a cadence — the per-tick cap of
-    /// `SEALED_EMPTY_SWEEP_MAX_PER_TICK` is calibrated against the default
-    /// period, so halving the period doubles the reclaim rate and the etcd churn
-    /// that comes with it.
-    pub fn set_sealed_empty_sweep_interval(&self, every: Duration) {
-        self.sealed_empty_sweep_interval
-            .set(every.max(Duration::from_secs(1)));
-    }
-
-    /// See the field.
-    pub fn set_split_reply_timeout(&self, t: Duration) {
-        self.split_reply_timeout.set(t);
+    pub fn params(&self) -> &ManagerParams {
+        &self.params
     }
 
     pub async fn force_auto_split(&self, part_id: u64) -> Result<()> {
@@ -1350,8 +1264,16 @@ impl AutumnManager {
         endpoints: Vec<String>,
         identity: manager_members::ManagerIdentity,
     ) -> Result<Self> {
+        Self::new_with_etcd_params(endpoints, identity, ManagerParams::default()).await
+    }
+
+    pub async fn new_with_etcd_params(
+        endpoints: Vec<String>,
+        identity: manager_members::ManagerIdentity,
+        params: ManagerParams,
+    ) -> Result<Self> {
         anyhow::ensure!(identity.id != 0, "the manager id must be non-zero");
-        let mut s = Self::new();
+        let mut s = Self::new_with_params(params);
         s.leader.set(false);
         s.identity = Some(Rc::new(identity));
         s.etcd = Some(
@@ -1360,6 +1282,7 @@ impl AutumnManager {
                 s.instance_id.clone(),
                 s.leader.clone(),
                 s.displaced.clone(),
+                Duration::from_millis(s.params.etcd_request_timeout_ms.get()),
             )
             .await?,
         );
@@ -1409,10 +1332,9 @@ impl AutumnManager {
         // asymmetric partition displacement is detected when OUR etcd
         // link recovers (election CAS sees the new holder); the TTL caps
         // the harm until then.
-        const ROUTABLE_STALE_TTL: Duration = Duration::from_secs(900);
         if !self.displaced.get() {
             if let Some(t0) = self.leaderless_since.get() {
-                if t0.elapsed() < ROUTABLE_STALE_TTL {
+                if t0.elapsed() < Duration::from_secs(self.params.routable_stale_ttl_secs.get()) {
                     return Ok(());
                 }
             }
@@ -1595,7 +1517,7 @@ impl AutumnManager {
         });
     }
 
-    /// every POLICY_TICK_INTERVAL_SEC, leader recomputes split/merge
+    /// every --policy-tick-secs, leader recomputes split/merge
     /// candidates from the per-partition load windows + last_op_at +
     /// region owners. Logs new candidates at INFO; exposes the cache
     /// via MSG_GET_POLICY_CANDIDATES.
@@ -1612,7 +1534,10 @@ impl AutumnManager {
             // TTL backstop: flip any RUNNING PS-executed op (compact/gc/forcegc)
             // whose terminal outcome never came back to UNKNOWN, keeping
             // `ops status` honest instead of RUNNING forever.
-            self.ops.borrow_mut().sweep_running_ttl(Self::epoch_seconds());
+            let ttl = self.params.op_running_ttl_secs.get() as i64;
+            self.ops
+                .borrow_mut()
+                .sweep_running_ttl(Self::epoch_seconds(), ttl);
             self.settle_reopened_maintenance(Self::epoch_seconds());
             self.sweep_silent_scrub_ops(Self::epoch_seconds());
             self.reconcile_unknown_splits(Self::epoch_seconds()).await;
@@ -1709,7 +1634,7 @@ impl AutumnManager {
         p.sacred_boundaries = sacred;
         // prune metrics for partitions that no longer exist
         // (post-split / merge / PS-evict) whose latest bucket has aged past
-        // STALE_METRICS_AGE_SEC — else advisories fire off zombie metrics
+        // --policy-stale-metrics-secs — else advisories fire off zombie metrics
         // indefinitely after a partition is merged away.
         p.prune_stale_metrics(state, now);
         let mut cands = p.compute_candidates(crate::policy::ComputeArgs {
@@ -1986,7 +1911,7 @@ impl AutumnManager {
                 &ps_addr,
                 autumn_rpc::partition_rpc::MSG_MAINTENANCE,
                 payload,
-                Duration::from_secs(60),
+                Duration::from_secs(self.params.maintenance_rpc_timeout_secs.get()),
             )
             .await
             .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -2282,7 +2207,7 @@ impl AutumnManager {
                     (spec.extent_ids.is_empty() && spec.part_id != 0).then_some(spec.part_id),
                     match origin {
                         OpOrigin::Operator => 0,
-                        OpOrigin::Policy => self.repair_grace_secs.get(),
+                        OpOrigin::Policy => self.params.repair_grace_secs.get(),
                     },
                     match origin {
                         OpOrigin::Operator => crate::extent_repair::RepairRequester::Operator,
@@ -2460,6 +2385,7 @@ impl AutumnManager {
                 now,
                 cooldown,
                 max_actions,
+                self.params.scrub_policy_interval_secs.get() as i64,
             );
             if actions.is_empty() {
                 continue;
@@ -2607,7 +2533,7 @@ impl AutumnManager {
                 &ps_addr,
                 autumn_rpc::partition_rpc::MSG_SPLIT_PART,
                 payload,
-                self.split_reply_timeout.get(),
+                Duration::from_secs(self.params.split_reply_timeout_secs.get()),
             )
             .await?
             .map_err(|e| match e {
@@ -2711,7 +2637,6 @@ impl AutumnManager {
     }
 
     async fn try_become_leader(&self) -> Result<bool> {
-        const LEASE_TTL_SECS: i64 = 10;
         let etcd = match &self.etcd {
             Some(v) => v,
             None => return Ok(false),
@@ -2719,7 +2644,7 @@ impl AutumnManager {
 
         let lease = {
             let c = etcd.client.clone();
-            c.lease_grant(LEASE_TTL_SECS).await?
+            c.lease_grant(self.params.leader_lease_ttl_secs.get() as i64).await?
         };
         let lease_id = lease.id;
 
@@ -2977,7 +2902,7 @@ impl AutumnManager {
         }
         // etcd-chaos D1 (coco P1): open the BOUNDED stale-while-leaderless
         // window before stepping down — `ensure_routable` serves from it
-        // for at most ROUTABLE_STALE_TTL.
+        // for at most --routable-stale-ttl-secs.
         self.leaderless_since.set(Some(Instant::now()));
         self.set_leader(false);
     }
@@ -3323,7 +3248,7 @@ impl AutumnManager {
                 ns.insert(name, row);
             }
         }
-        // Every replayed PS gets a fresh `PS_DEAD_TIMEOUT` window from now:
+        // Every replayed PS gets a fresh `--ps-dead-timeout-secs` window from now:
         // with no clock it would never be evicted, and an older clock — a
         // standby's, set at its own start and never advanced (a standby
         // answers heartbeats NOT_LEADER) — would evict the healthy fleet on
@@ -3850,28 +3775,6 @@ impl AutumnManager {
         Ok(s.acquire_owner_lock(owner_key))
     }
 
-    /// called by `serve()` once the RPC listener is BOUND. Restarts
-    /// every PS's liveness clock (heartbeats physically could not arrive
-    /// earlier) and unblocks the eviction sweep. See the `serving` field
-    /// doc for the ucx TIME_WAIT motivation.
-    /// ENOSPC-1: override the allocation free-space floor (CLI
-    /// `--min-alloc-free-bytes`; 0 disables the filter).
-    pub fn set_min_alloc_free_bytes(&self, v: u64) {
-        self.min_alloc_free_bytes.set(v);
-    }
-
-    /// Repair-policy grace (CLI `--repair-grace-secs`, default 600 — Ceph's
-    /// down→out interval): how long a slot must stay degraded before the
-    /// policy proposes rebuilding it on another node.
-    pub fn set_repair_grace_secs(&self, v: u64) {
-        self.repair_grace_secs.set(v);
-    }
-
-    /// Audit-log retention window (CLI `--audit-retention-days`; 0 = off).
-    pub fn set_audit_retention_days(&self, v: u64) {
-        self.audit_retention_days.set(v);
-    }
-
     /// Daily audit-log retention GC (leader-only; etcd mode only). The
     /// first pass runs ~10 min after start so leader election + replay
     /// settle; the daily cadence is far above the helper's cost (one
@@ -3927,7 +3830,7 @@ impl AutumnManager {
     }
 
     pub(crate) fn space_low_node_ids(&self) -> HashSet<u64> {
-        let floor = self.min_alloc_free_bytes.get();
+        let floor = self.params.min_alloc_free_bytes.get();
         if floor == 0 {
             return HashSet::new();
         }
@@ -3939,6 +3842,10 @@ impl AutumnManager {
             .collect()
     }
 
+    /// called by `serve()` once the RPC listener is BOUND. Restarts
+    /// every PS's liveness clock (heartbeats physically could not arrive
+    /// earlier) and unblocks the eviction sweep. See the `serving` field
+    /// doc for the ucx TIME_WAIT motivation.
     pub fn mark_serving(&self) {
         let now = Instant::now();
         for t in self.ps_last_heartbeat.borrow_mut().values_mut() {
@@ -3966,7 +3873,8 @@ impl AutumnManager {
             if !self.leader.get() || !self.serving.get() {
                 continue;
             }
-            self.evict_silent_ps(PS_DEAD_TIMEOUT).await;
+            let dead_after = Duration::from_secs(self.params.ps_dead_timeout_secs.get());
+            self.evict_silent_ps(dead_after).await;
         }
     }
 
@@ -6431,7 +6339,7 @@ mod tests {
 
             let past = Instant::now() - Duration::from_secs(60);
             m.ps_last_heartbeat.borrow_mut().insert(2, past);
-            m.evict_silent_ps(PS_DEAD_TIMEOUT).await;
+            m.evict_silent_ps(Duration::from_secs(10)).await;
             {
                 let s = m.store.inner.borrow();
                 assert!(!s.ps_nodes.contains_key(&2));

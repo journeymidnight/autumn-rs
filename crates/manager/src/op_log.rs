@@ -29,10 +29,8 @@ use crate::AutumnManager;
 
 pub(crate) const OP_LOG_PREFIX: &str = "opLog/";
 
-/// How many terminal records to keep. At ~1 KB each this is a couple of MB in
-/// etcd — small next to the extent metadata already there, and deep enough to
-/// cover an incident that happened while nobody was watching.
-pub(crate) const OP_LOG_CAP: usize = 2000;
+// Terminal records kept (`--op-log-cap`, default 2000): at ~1 KB each a couple
+// of MB in etcd, deep enough to cover an incident nobody was watching.
 
 /// Writes between rotation sweeps. Rotation costs a prefix read, so it is
 /// amortised rather than run per write; the cap is therefore a soft ceiling
@@ -162,7 +160,7 @@ impl AutumnManager {
             .collect())
     }
 
-    /// Trim the history back to `OP_LOG_CAP`, oldest first. Leader-only by
+    /// Trim the history back to `--op-log-cap`, oldest first. Leader-only by
     /// construction — only a leader appends — and best-effort: a failed sweep
     /// just means the next one has more to remove.
     pub(crate) async fn rotate_op_log(&self) {
@@ -177,7 +175,8 @@ impl AutumnManager {
                 return;
             }
         };
-        if listed.kvs.len() <= OP_LOG_CAP {
+        let cap = self.params().op_log_cap.get();
+        if listed.kvs.len() <= cap {
             return;
         }
         // Keys are lexically ordered by timestamp, so the oldest sort first.
@@ -187,13 +186,13 @@ impl AutumnManager {
             .filter_map(|kv| String::from_utf8(kv.key.clone()).ok())
             .collect();
         keys.sort();
-        let drop_n = keys.len().saturating_sub(OP_LOG_CAP);
+        let drop_n = keys.len().saturating_sub(cap);
         let doomed: Vec<String> = keys.into_iter().take(drop_n).collect();
         if let Err(e) = etcd.put_and_delete_txn(Vec::new(), doomed).await {
             tracing::warn!(error = %e, dropped = drop_n, "op-log rotation could not delete");
             return;
         }
-        tracing::debug!(dropped = drop_n, cap = OP_LOG_CAP, "op-log rotated");
+        tracing::debug!(dropped = drop_n, cap, "op-log rotated");
     }
 }
 

@@ -9,13 +9,12 @@ use autumn_rpc::manager_rpc::{
     POLICY_KIND_REBALANCE, POLICY_KIND_SPLIT,
 };
 
-use crate::policy::{
-    ComputeArgs, PolicyEngine, COMPACT_COOLDOWN_SEC, COMPACT_PENDING_HIGH, EC_MIN_EXTENT_BYTES,
-    GC_COOLDOWN_SEC, GC_DEBT_HIGH, MERGE_COOLDOWN_SEC, MERGE_QPS_LOW, MERGE_SIZE_LOW,
-    POLICY_BUCKET_SEC,
-    POLICY_REQUIRED_BUCKETS, SPLIT_BW_HIGH, SPLIT_COOLDOWN_SEC, SPLIT_IMMFULL_HIGH,
-    SPLIT_LSM_HARD, SPLIT_QPS_HIGH, SPLIT_SIZE_MIN,
-};
+use crate::policy::{ComputeArgs, PolicyConfig, PolicyEngine};
+
+/// The production thresholds the tests are written against.
+fn d() -> PolicyConfig {
+    PolicyConfig::default()
+}
 
 /// compatibility: the old `POLICY_KIND_COMPACT` constant maps to
 /// `POLICY_KIND_MAJOR_COMPACT` (same wire value 3). Existing tests use
@@ -31,7 +30,7 @@ fn fill_window(eng: &mut PolicyEngine, part_id: u64, n: usize, load: PartitionLo
         eng.metrics
             .entry(part_id)
             .or_default()
-            .push(base_ts + i as i64 * POLICY_BUCKET_SEC, load.clone());
+            .push(base_ts + i as i64 * d().bucket_sec, load.clone());
     }
 }
 
@@ -59,16 +58,16 @@ fn split_lsm_hard_triggers() {
     fill_window(
         &mut eng,
         7,
-        POLICY_REQUIRED_BUCKETS,
+        d().required_buckets,
         PartitionLoad {
             part_id: 7,
-            size_bytes: SPLIT_LSM_HARD + GIB,
+            size_bytes: d().split_lsm_hard + GIB,
             req_per_sec: 100,
             imm_full_per_sec: 0,
             p99_us: 0,
             ..Default::default()
         },
-        now - POLICY_REQUIRED_BUCKETS as i64 * POLICY_BUCKET_SEC,
+        now - d().required_buckets as i64 * d().bucket_sec,
     );
     let out = eng.compute_candidates(ComputeArgs {
         state: &state,
@@ -89,16 +88,16 @@ fn split_qps_high_below_size_min_no_trigger() {
     fill_window(
         &mut eng,
         7,
-        POLICY_REQUIRED_BUCKETS,
+        d().required_buckets,
         PartitionLoad {
             part_id: 7,
             size_bytes: 100 * 1024 * 1024,
-            req_per_sec: SPLIT_QPS_HIGH + 1000,
+            req_per_sec: d().split_qps_high + 1000,
             imm_full_per_sec: 0,
             p99_us: 0,
             ..Default::default()
         },
-        now - POLICY_REQUIRED_BUCKETS as i64 * POLICY_BUCKET_SEC,
+        now - d().required_buckets as i64 * d().bucket_sec,
     );
     let out = eng.compute_candidates(ComputeArgs {
         state: &state,
@@ -117,16 +116,16 @@ fn split_immfull_above_threshold_triggers() {
     fill_window(
         &mut eng,
         7,
-        POLICY_REQUIRED_BUCKETS,
+        d().required_buckets,
         PartitionLoad {
             part_id: 7,
             size_bytes: 100 * 1024 * 1024,
             req_per_sec: 100,
-            imm_full_per_sec: SPLIT_IMMFULL_HIGH + 1,
+            imm_full_per_sec: d().split_immfull_high + 1,
             p99_us: 0,
             ..Default::default()
         },
-        now - POLICY_REQUIRED_BUCKETS as i64 * POLICY_BUCKET_SEC,
+        now - d().required_buckets as i64 * d().bucket_sec,
     );
     let out = eng.compute_candidates(ComputeArgs {
         state: &state,
@@ -146,20 +145,20 @@ fn split_cooldown_blocks() {
     fill_window(
         &mut eng,
         7,
-        POLICY_REQUIRED_BUCKETS,
+        d().required_buckets,
         PartitionLoad {
             part_id: 7,
-            size_bytes: SPLIT_LSM_HARD + GIB,
+            size_bytes: d().split_lsm_hard + GIB,
             req_per_sec: 0,
             imm_full_per_sec: 0,
             p99_us: 0,
             ..Default::default()
         },
-        now - POLICY_REQUIRED_BUCKETS as i64 * POLICY_BUCKET_SEC,
+        now - d().required_buckets as i64 * d().bucket_sec,
     );
     let mut last_op = HashMap::new();
     last_op.insert(7u64, now - 60);
-    let _ = SPLIT_COOLDOWN_SEC; // documented dependency
+    let _ = d().split_cooldown_sec; // documented dependency
     let out = eng.compute_candidates(ComputeArgs {
         state: &state,
         last_op_at: &last_op,
@@ -178,21 +177,21 @@ fn split_lsm_size_fires_on_current_bucket_not_debounced() {
     let state = MetadataState::default();
     let mut eng = PolicyEngine::default();
     let now = 1_700_000_000;
-    let base = now - POLICY_REQUIRED_BUCKETS as i64 * POLICY_BUCKET_SEC;
+    let base = now - d().required_buckets as i64 * d().bucket_sec;
     let small = PartitionLoad { part_id: 7, size_bytes: GIB, ..Default::default() };
     let big = PartitionLoad {
         part_id: 7,
-        size_bytes: SPLIT_LSM_HARD + GIB,
+        size_bytes: d().split_lsm_hard + GIB,
         ..Default::default()
     };
     // N-1 small buckets, then the newest bucket big (push order = oldest→newest;
     // `recent` takes from the tail, so the LAST pushed is bucket[0]).
     let w = eng.metrics.entry(7).or_default();
-    for i in 0..POLICY_REQUIRED_BUCKETS - 1 {
-        w.push(base + i as i64 * POLICY_BUCKET_SEC, small.clone());
+    for i in 0..d().required_buckets - 1 {
+        w.push(base + i as i64 * d().bucket_sec, small.clone());
     }
     w.push(
-        base + (POLICY_REQUIRED_BUCKETS - 1) as i64 * POLICY_BUCKET_SEC,
+        base + (d().required_buckets - 1) as i64 * d().bucket_sec,
         big,
     );
     let out = eng.compute_candidates(ComputeArgs {
@@ -213,24 +212,24 @@ fn split_qps_still_debounced_a_single_spike_no_trigger() {
     let state = MetadataState::default();
     let mut eng = PolicyEngine::default();
     let now = 1_700_000_000;
-    let base = now - POLICY_REQUIRED_BUCKETS as i64 * POLICY_BUCKET_SEC;
+    let base = now - d().required_buckets as i64 * d().bucket_sec;
     let calm = PartitionLoad {
         part_id: 7,
-        size_bytes: SPLIT_SIZE_MIN + GIB,
+        size_bytes: d().split_size_min + GIB,
         req_per_sec: 0,
         ..Default::default()
     };
     let spike = PartitionLoad {
         part_id: 7,
-        size_bytes: SPLIT_SIZE_MIN + GIB,
-        req_per_sec: SPLIT_QPS_HIGH + 1000,
+        size_bytes: d().split_size_min + GIB,
+        req_per_sec: d().split_qps_high + 1000,
         ..Default::default()
     };
     let w = eng.metrics.entry(7).or_default();
-    for i in 0..POLICY_REQUIRED_BUCKETS - 1 {
-        w.push(base + i as i64 * POLICY_BUCKET_SEC, calm.clone());
+    for i in 0..d().required_buckets - 1 {
+        w.push(base + i as i64 * d().bucket_sec, calm.clone());
     }
-    w.push(base + (POLICY_REQUIRED_BUCKETS - 1) as i64 * POLICY_BUCKET_SEC, spike);
+    w.push(base + (d().required_buckets - 1) as i64 * d().bucket_sec, spike);
     let out = eng.compute_candidates(ComputeArgs {
         state: &state,
         last_op_at: &HashMap::new(),
@@ -248,16 +247,16 @@ fn split_partial_window_no_trigger() {
     fill_window(
         &mut eng,
         7,
-        POLICY_REQUIRED_BUCKETS - 1,
+        d().required_buckets - 1,
         PartitionLoad {
             part_id: 7,
-            size_bytes: SPLIT_LSM_HARD + GIB,
+            size_bytes: d().split_lsm_hard + GIB,
             req_per_sec: 0,
             imm_full_per_sec: 0,
             p99_us: 0,
             ..Default::default()
         },
-        now - 4 * POLICY_BUCKET_SEC,
+        now - 4 * d().bucket_sec,
     );
     let out = eng.compute_candidates(ComputeArgs {
         state: &state,
@@ -286,16 +285,16 @@ fn merge_adjacent_pair_qualifying_same_ps() {
     fill_window(
         &mut eng,
         1,
-        POLICY_REQUIRED_BUCKETS,
+        d().required_buckets,
         small.clone(),
-        now - POLICY_REQUIRED_BUCKETS as i64 * POLICY_BUCKET_SEC,
+        now - d().required_buckets as i64 * d().bucket_sec,
     );
     fill_window(
         &mut eng,
         2,
-        POLICY_REQUIRED_BUCKETS,
+        d().required_buckets,
         small,
-        now - POLICY_REQUIRED_BUCKETS as i64 * POLICY_BUCKET_SEC,
+        now - d().required_buckets as i64 * d().bucket_sec,
     );
     let mut owners = HashMap::new();
     owners.insert(1u64, 99u64);
@@ -345,9 +344,9 @@ fn merge_candidate_is_skipped_at_a_declared_presplit_boundary() {
             fill_window(
                 &mut eng,
                 pid,
-                POLICY_REQUIRED_BUCKETS,
+                d().required_buckets,
                 small.clone(),
-                now - POLICY_REQUIRED_BUCKETS as i64 * POLICY_BUCKET_SEC,
+                now - d().required_buckets as i64 * d().bucket_sec,
             );
         }
         eng.compute_candidates(ComputeArgs {
@@ -395,16 +394,16 @@ fn merge_cross_ps_marks_infeasible() {
     fill_window(
         &mut eng,
         1,
-        POLICY_REQUIRED_BUCKETS,
+        d().required_buckets,
         small.clone(),
-        now - POLICY_REQUIRED_BUCKETS as i64 * POLICY_BUCKET_SEC,
+        now - d().required_buckets as i64 * d().bucket_sec,
     );
     fill_window(
         &mut eng,
         2,
-        POLICY_REQUIRED_BUCKETS,
+        d().required_buckets,
         small,
-        now - POLICY_REQUIRED_BUCKETS as i64 * POLICY_BUCKET_SEC,
+        now - d().required_buckets as i64 * d().bucket_sec,
     );
     let mut owners = HashMap::new();
     owners.insert(1u64, 11u64);
@@ -438,16 +437,16 @@ fn merge_non_adjacent_no_trigger() {
     fill_window(
         &mut eng,
         1,
-        POLICY_REQUIRED_BUCKETS,
+        d().required_buckets,
         small.clone(),
-        now - POLICY_REQUIRED_BUCKETS as i64 * POLICY_BUCKET_SEC,
+        now - d().required_buckets as i64 * d().bucket_sec,
     );
     fill_window(
         &mut eng,
         2,
-        POLICY_REQUIRED_BUCKETS,
+        d().required_buckets,
         small,
-        now - POLICY_REQUIRED_BUCKETS as i64 * POLICY_BUCKET_SEC,
+        now - d().required_buckets as i64 * d().bucket_sec,
     );
     let owners = HashMap::new();
     let out = eng.compute_candidates(ComputeArgs {
@@ -468,7 +467,7 @@ fn merge_size_above_low_no_trigger() {
     let now = 1_700_000_000;
     let big = PartitionLoad {
         part_id: 0,
-        size_bytes: 2 * MERGE_SIZE_LOW, // exceeds threshold
+        size_bytes: 2 * d().merge_size_low, // exceeds threshold
         req_per_sec: 100,
         imm_full_per_sec: 0,
         p99_us: 0,
@@ -477,16 +476,16 @@ fn merge_size_above_low_no_trigger() {
     fill_window(
         &mut eng,
         1,
-        POLICY_REQUIRED_BUCKETS,
+        d().required_buckets,
         big.clone(),
-        now - POLICY_REQUIRED_BUCKETS as i64 * POLICY_BUCKET_SEC,
+        now - d().required_buckets as i64 * d().bucket_sec,
     );
     fill_window(
         &mut eng,
         2,
-        POLICY_REQUIRED_BUCKETS,
+        d().required_buckets,
         big,
-        now - POLICY_REQUIRED_BUCKETS as i64 * POLICY_BUCKET_SEC,
+        now - d().required_buckets as i64 * d().bucket_sec,
     );
     let mut owners = HashMap::new();
     owners.insert(1u64, 99u64);
@@ -510,7 +509,7 @@ fn merge_qps_above_low_no_trigger() {
     let hot = PartitionLoad {
         part_id: 0,
         size_bytes: 100 * 1024 * 1024,
-        req_per_sec: MERGE_QPS_LOW, // sum >= MERGE_QPS_LOW
+        req_per_sec: d().merge_qps_low, // sum >= d().merge_qps_low
         imm_full_per_sec: 0,
         p99_us: 0,
         ..Default::default()
@@ -518,16 +517,16 @@ fn merge_qps_above_low_no_trigger() {
     fill_window(
         &mut eng,
         1,
-        POLICY_REQUIRED_BUCKETS,
+        d().required_buckets,
         hot.clone(),
-        now - POLICY_REQUIRED_BUCKETS as i64 * POLICY_BUCKET_SEC,
+        now - d().required_buckets as i64 * d().bucket_sec,
     );
     fill_window(
         &mut eng,
         2,
-        POLICY_REQUIRED_BUCKETS,
+        d().required_buckets,
         hot,
-        now - POLICY_REQUIRED_BUCKETS as i64 * POLICY_BUCKET_SEC,
+        now - d().required_buckets as i64 * d().bucket_sec,
     );
     let mut owners = HashMap::new();
     owners.insert(1u64, 99u64);
@@ -559,23 +558,23 @@ fn merge_cooldown_blocks() {
     fill_window(
         &mut eng,
         1,
-        POLICY_REQUIRED_BUCKETS,
+        d().required_buckets,
         small.clone(),
-        now - POLICY_REQUIRED_BUCKETS as i64 * POLICY_BUCKET_SEC,
+        now - d().required_buckets as i64 * d().bucket_sec,
     );
     fill_window(
         &mut eng,
         2,
-        POLICY_REQUIRED_BUCKETS,
+        d().required_buckets,
         small,
-        now - POLICY_REQUIRED_BUCKETS as i64 * POLICY_BUCKET_SEC,
+        now - d().required_buckets as i64 * d().bucket_sec,
     );
     let mut owners = HashMap::new();
     owners.insert(1u64, 99u64);
     owners.insert(2u64, 99u64);
     let mut last_op = HashMap::new();
     last_op.insert(1u64, now - 60); // freshly merged/split
-    let _ = MERGE_COOLDOWN_SEC;
+    let _ = d().merge_cooldown_sec;
     let out = eng.compute_candidates(ComputeArgs {
         state: &state,
         last_op_at: &last_op,
@@ -596,20 +595,20 @@ fn gc_advisory_fires_on_sustained_debt() {
     fill_window(
         &mut eng,
         7,
-        POLICY_REQUIRED_BUCKETS,
+        d().required_buckets,
         PartitionLoad {
             part_id: 7,
-            gc_debt_bytes: GC_DEBT_HIGH + 1024,
+            gc_debt_bytes: d().gc_debt_high + 1024,
             ..Default::default()
         },
-        now - POLICY_REQUIRED_BUCKETS as i64 * POLICY_BUCKET_SEC,
+        now - d().required_buckets as i64 * d().bucket_sec,
     );
     let out = eng.compute_maintenance_advisory(now);
     assert_eq!(out.len(), 1);
     assert_eq!(out[0].kind, POLICY_KIND_GC);
     assert_eq!(out[0].primary_part_id, 7);
     assert_eq!(out[0].secondary_part_id, 0);
-    assert_eq!(out[0].size_bytes, GC_DEBT_HIGH + 1024);
+    assert_eq!(out[0].size_bytes, d().gc_debt_high + 1024);
 }
 
 #[test]
@@ -619,14 +618,14 @@ fn gc_advisory_skipped_when_inflight() {
     fill_window(
         &mut eng,
         7,
-        POLICY_REQUIRED_BUCKETS,
+        d().required_buckets,
         PartitionLoad {
             part_id: 7,
-            gc_debt_bytes: GC_DEBT_HIGH + 1024,
+            gc_debt_bytes: d().gc_debt_high + 1024,
             gc_inflight: 1,
             ..Default::default()
         },
-        now - POLICY_REQUIRED_BUCKETS as i64 * POLICY_BUCKET_SEC,
+        now - d().required_buckets as i64 * d().bucket_sec,
     );
     let out = eng.compute_maintenance_advisory(now);
     assert!(out.iter().all(|c| c.kind != POLICY_KIND_GC));
@@ -640,18 +639,18 @@ fn gc_advisory_respects_cooldown() {
     fill_window(
         &mut eng,
         7,
-        POLICY_REQUIRED_BUCKETS,
+        d().required_buckets,
         PartitionLoad {
             part_id: 7,
-            gc_debt_bytes: GC_DEBT_HIGH + 1024,
+            gc_debt_bytes: d().gc_debt_high + 1024,
             last_gc_at: now - 10,
             ..Default::default()
         },
-        now - POLICY_REQUIRED_BUCKETS as i64 * POLICY_BUCKET_SEC,
+        now - d().required_buckets as i64 * d().bucket_sec,
     );
     let out = eng.compute_maintenance_advisory(now);
     assert!(out.iter().all(|c| c.kind != POLICY_KIND_GC));
-    let _ = GC_COOLDOWN_SEC;
+    let _ = d().gc_cooldown_sec;
 }
 
 #[test]
@@ -661,13 +660,13 @@ fn gc_advisory_no_trigger_below_threshold() {
     fill_window(
         &mut eng,
         7,
-        POLICY_REQUIRED_BUCKETS,
+        d().required_buckets,
         PartitionLoad {
             part_id: 7,
-            gc_debt_bytes: GC_DEBT_HIGH / 2,
+            gc_debt_bytes: d().gc_debt_high / 2,
             ..Default::default()
         },
-        now - POLICY_REQUIRED_BUCKETS as i64 * POLICY_BUCKET_SEC,
+        now - d().required_buckets as i64 * d().bucket_sec,
     );
     let out = eng.compute_maintenance_advisory(now);
     assert!(out.iter().all(|c| c.kind != POLICY_KIND_GC));
@@ -680,13 +679,13 @@ fn compact_advisory_fires_on_sustained_pending() {
     fill_window(
         &mut eng,
         9,
-        POLICY_REQUIRED_BUCKETS,
+        d().required_buckets,
         PartitionLoad {
             part_id: 9,
-            pending_compaction_bytes: COMPACT_PENDING_HIGH + 1024,
+            pending_compaction_bytes: d().compact_pending_high + 1024,
             ..Default::default()
         },
-        now - POLICY_REQUIRED_BUCKETS as i64 * POLICY_BUCKET_SEC,
+        now - d().required_buckets as i64 * d().bucket_sec,
     );
     let out = eng.compute_maintenance_advisory(now);
     let cs: Vec<_> = out
@@ -695,7 +694,7 @@ fn compact_advisory_fires_on_sustained_pending() {
         .collect();
     assert_eq!(cs.len(), 1);
     assert_eq!(cs[0].primary_part_id, 9);
-    assert_eq!(cs[0].size_bytes, COMPACT_PENDING_HIGH + 1024);
+    assert_eq!(cs[0].size_bytes, d().compact_pending_high + 1024);
 }
 
 #[test]
@@ -705,31 +704,31 @@ fn compact_advisory_respects_cooldown_and_inflight() {
     fill_window(
         &mut eng,
         9,
-        POLICY_REQUIRED_BUCKETS,
+        d().required_buckets,
         PartitionLoad {
             part_id: 9,
-            pending_compaction_bytes: COMPACT_PENDING_HIGH + 1024,
+            pending_compaction_bytes: d().compact_pending_high + 1024,
             last_compact_at: now - 30,
             ..Default::default()
         },
-        now - POLICY_REQUIRED_BUCKETS as i64 * POLICY_BUCKET_SEC,
+        now - d().required_buckets as i64 * d().bucket_sec,
     );
     let out = eng.compute_maintenance_advisory(now);
     assert!(out.iter().all(|c| c.kind != POLICY_KIND_COMPACT));
-    let _ = COMPACT_COOLDOWN_SEC;
+    let _ = d().compact_cooldown_sec;
 
     let mut eng2 = PolicyEngine::default();
     fill_window(
         &mut eng2,
         9,
-        POLICY_REQUIRED_BUCKETS,
+        d().required_buckets,
         PartitionLoad {
             part_id: 9,
-            pending_compaction_bytes: COMPACT_PENDING_HIGH + 1024,
+            pending_compaction_bytes: d().compact_pending_high + 1024,
             compact_inflight: 1,
             ..Default::default()
         },
-        now - POLICY_REQUIRED_BUCKETS as i64 * POLICY_BUCKET_SEC,
+        now - d().required_buckets as i64 * d().bucket_sec,
     );
     let out2 = eng2.compute_maintenance_advisory(now);
     assert!(out2.iter().all(|c| c.kind != POLICY_KIND_COMPACT));
@@ -739,17 +738,17 @@ fn compact_advisory_respects_cooldown_and_inflight() {
 fn maintenance_advisory_partial_window_no_trigger() {
     let mut eng = PolicyEngine::default();
     let now = 1_700_000_000;
-    // Only 2 of POLICY_REQUIRED_BUCKETS at high debt; rest is at zero.
+    // Only 2 of --policy-required-buckets at high debt; rest is at zero.
     eng.metrics.entry(7).or_default().push(
-        now - 2 * POLICY_BUCKET_SEC,
+        now - 2 * d().bucket_sec,
         PartitionLoad {
             part_id: 7,
-            gc_debt_bytes: GC_DEBT_HIGH + 1024,
+            gc_debt_bytes: d().gc_debt_high + 1024,
             ..Default::default()
         },
     );
     eng.metrics.entry(7).or_default().push(
-        now - POLICY_BUCKET_SEC,
+        now - d().bucket_sec,
         PartitionLoad {
             part_id: 7,
             gc_debt_bytes: 0,
@@ -764,32 +763,31 @@ fn maintenance_advisory_partial_window_no_trigger() {
 
 #[test]
 fn hot_cold_advisory_fires_on_10x_imbalance_same_ps() {
-    use crate::policy::{HOT_COLD_MIN_HOT_QPS, HOT_COLD_RATIO};
     let mut eng = PolicyEngine::default();
     let now = 1_700_000_000;
-    // Two partitions on PS=42: one hot (req_per_sec = HOT_COLD_MIN_HOT_QPS * 2),
-    // one cold (1 qps). Ratio > HOT_COLD_RATIO.
+    // Two partitions on PS=42: one hot (req_per_sec = --hot-cold-min-hot-qps * 2),
+    // one cold (1 qps). Ratio > --hot-cold-ratio.
     fill_window(
         &mut eng,
         100,
-        POLICY_REQUIRED_BUCKETS,
+        d().required_buckets,
         PartitionLoad {
             part_id: 100,
-            req_per_sec: HOT_COLD_MIN_HOT_QPS.saturating_mul(2),
+            req_per_sec: d().hot_cold_min_hot_qps.saturating_mul(2),
             ..Default::default()
         },
-        now - POLICY_REQUIRED_BUCKETS as i64 * POLICY_BUCKET_SEC,
+        now - d().required_buckets as i64 * d().bucket_sec,
     );
     fill_window(
         &mut eng,
         101,
-        POLICY_REQUIRED_BUCKETS,
+        d().required_buckets,
         PartitionLoad {
             part_id: 101,
             req_per_sec: 1,
             ..Default::default()
         },
-        now - POLICY_REQUIRED_BUCKETS as i64 * POLICY_BUCKET_SEC,
+        now - d().required_buckets as i64 * d().bucket_sec,
     );
     let owners: HashMap<u64, u64> = vec![(100u64, 42u64), (101, 42)].into_iter().collect();
     // First call should record a cooldown entry.
@@ -797,36 +795,35 @@ fn hot_cold_advisory_fires_on_10x_imbalance_same_ps() {
     assert!(
         eng.last_hot_cold_at.contains_key(&42),
         "hot/cold advisory expected to fire on >{}x imbalance",
-        HOT_COLD_RATIO,
+        d().hot_cold_ratio,
     );
 }
 
 #[test]
 fn hot_cold_advisory_skips_when_hottest_below_floor() {
-    use crate::policy::HOT_COLD_MIN_HOT_QPS;
     let mut eng = PolicyEngine::default();
     let now = 1_700_000_000;
     fill_window(
         &mut eng,
         100,
-        POLICY_REQUIRED_BUCKETS,
+        d().required_buckets,
         PartitionLoad {
             part_id: 100,
-            req_per_sec: HOT_COLD_MIN_HOT_QPS / 2, // below the floor
+            req_per_sec: d().hot_cold_min_hot_qps / 2, // below the floor
             ..Default::default()
         },
-        now - POLICY_REQUIRED_BUCKETS as i64 * POLICY_BUCKET_SEC,
+        now - d().required_buckets as i64 * d().bucket_sec,
     );
     fill_window(
         &mut eng,
         101,
-        POLICY_REQUIRED_BUCKETS,
+        d().required_buckets,
         PartitionLoad {
             part_id: 101,
             req_per_sec: 1,
             ..Default::default()
         },
-        now - POLICY_REQUIRED_BUCKETS as i64 * POLICY_BUCKET_SEC,
+        now - d().required_buckets as i64 * d().bucket_sec,
     );
     let owners: HashMap<u64, u64> = vec![(100u64, 42u64), (101, 42)].into_iter().collect();
     eng.compute_hot_cold_advisory(&owners, &HashMap::new(), now);
@@ -838,47 +835,45 @@ fn hot_cold_advisory_skips_when_hottest_below_floor() {
 
 #[test]
 fn hot_cold_advisory_cooldown_dedupes() {
-    use crate::policy::{HOT_COLD_COOLDOWN_SEC, HOT_COLD_MIN_HOT_QPS};
     let mut eng = PolicyEngine::default();
     let t0 = 1_700_000_000;
     fill_window(
         &mut eng,
         100,
-        POLICY_REQUIRED_BUCKETS,
+        d().required_buckets,
         PartitionLoad {
             part_id: 100,
-            req_per_sec: HOT_COLD_MIN_HOT_QPS.saturating_mul(2),
+            req_per_sec: d().hot_cold_min_hot_qps.saturating_mul(2),
             ..Default::default()
         },
-        t0 - POLICY_REQUIRED_BUCKETS as i64 * POLICY_BUCKET_SEC,
+        t0 - d().required_buckets as i64 * d().bucket_sec,
     );
     fill_window(
         &mut eng,
         101,
-        POLICY_REQUIRED_BUCKETS,
+        d().required_buckets,
         PartitionLoad {
             part_id: 101,
             req_per_sec: 1,
             ..Default::default()
         },
-        t0 - POLICY_REQUIRED_BUCKETS as i64 * POLICY_BUCKET_SEC,
+        t0 - d().required_buckets as i64 * d().bucket_sec,
     );
     let owners: HashMap<u64, u64> = vec![(100u64, 42u64), (101, 42)].into_iter().collect();
     eng.compute_hot_cold_advisory(&owners, &HashMap::new(), t0);
     let first = eng.last_hot_cold_at.get(&42).copied().unwrap_or(0);
     // Tick again well within cooldown — last_hot_cold_at must NOT update.
-    eng.compute_hot_cold_advisory(&owners, &HashMap::new(), t0 + HOT_COLD_COOLDOWN_SEC / 2);
+    eng.compute_hot_cold_advisory(&owners, &HashMap::new(), t0 + d().hot_cold_cooldown_sec / 2);
     let second = eng.last_hot_cold_at.get(&42).copied().unwrap_or(0);
     assert_eq!(first, second, "advisory inside cooldown must not refire");
     // Past cooldown: refires.
-    eng.compute_hot_cold_advisory(&owners, &HashMap::new(), t0 + HOT_COLD_COOLDOWN_SEC + 1);
+    eng.compute_hot_cold_advisory(&owners, &HashMap::new(), t0 + d().hot_cold_cooldown_sec + 1);
     let third = eng.last_hot_cold_at.get(&42).copied().unwrap_or(0);
     assert!(third > first, "advisory past cooldown must refire");
 }
 
 #[test]
 fn hot_cold_advisory_fires_on_size_imbalance() {
-    use crate::policy::{HOT_COLD_MIN_HOT_SIZE_BYTES, HOT_COLD_SIZE_RATIO};
     let mut eng = PolicyEngine::default();
     let now = 1_700_000_000;
     // Hot partition: 2× the floor (so e.g. 50 GiB if floor is 25 GiB).
@@ -886,37 +881,36 @@ fn hot_cold_advisory_fires_on_size_imbalance() {
     fill_window(
         &mut eng,
         200,
-        POLICY_REQUIRED_BUCKETS,
+        d().required_buckets,
         PartitionLoad {
             part_id: 200,
-            size_bytes: HOT_COLD_MIN_HOT_SIZE_BYTES.saturating_mul(2),
+            size_bytes: d().hot_cold_min_hot_size_bytes.saturating_mul(2),
             ..Default::default()
         },
-        now - POLICY_REQUIRED_BUCKETS as i64 * POLICY_BUCKET_SEC,
+        now - d().required_buckets as i64 * d().bucket_sec,
     );
     fill_window(
         &mut eng,
         201,
-        POLICY_REQUIRED_BUCKETS,
+        d().required_buckets,
         PartitionLoad {
             part_id: 201,
             size_bytes: 1,
             ..Default::default()
         },
-        now - POLICY_REQUIRED_BUCKETS as i64 * POLICY_BUCKET_SEC,
+        now - d().required_buckets as i64 * d().bucket_sec,
     );
     let owners: HashMap<u64, u64> = vec![(200u64, 99u64), (201, 99)].into_iter().collect();
     eng.compute_hot_cold_advisory(&owners, &HashMap::new(), now);
     assert!(
         eng.last_hot_cold_at.contains_key(&99),
         "size-only imbalance >{}x should also trigger the advisory",
-        HOT_COLD_SIZE_RATIO,
+        d().hot_cold_size_ratio,
     );
 }
 
 #[test]
 fn hot_cold_advisory_size_below_floor_does_not_fire() {
-    use crate::policy::HOT_COLD_MIN_HOT_SIZE_BYTES;
     let mut eng = PolicyEngine::default();
     let now = 1_700_000_000;
     // Both partitions are below the size floor; ratio is huge but
@@ -924,24 +918,24 @@ fn hot_cold_advisory_size_below_floor_does_not_fire() {
     fill_window(
         &mut eng,
         200,
-        POLICY_REQUIRED_BUCKETS,
+        d().required_buckets,
         PartitionLoad {
             part_id: 200,
-            size_bytes: HOT_COLD_MIN_HOT_SIZE_BYTES / 4, // below floor
+            size_bytes: d().hot_cold_min_hot_size_bytes / 4, // below floor
             ..Default::default()
         },
-        now - POLICY_REQUIRED_BUCKETS as i64 * POLICY_BUCKET_SEC,
+        now - d().required_buckets as i64 * d().bucket_sec,
     );
     fill_window(
         &mut eng,
         201,
-        POLICY_REQUIRED_BUCKETS,
+        d().required_buckets,
         PartitionLoad {
             part_id: 201,
             size_bytes: 1,
             ..Default::default()
         },
-        now - POLICY_REQUIRED_BUCKETS as i64 * POLICY_BUCKET_SEC,
+        now - d().required_buckets as i64 * d().bucket_sec,
     );
     let owners: HashMap<u64, u64> = vec![(200u64, 99u64), (201, 99)].into_iter().collect();
     eng.compute_hot_cold_advisory(&owners, &HashMap::new(), now);
@@ -953,31 +947,30 @@ fn hot_cold_advisory_size_below_floor_does_not_fire() {
 
 #[test]
 fn hot_cold_advisory_emits_policy_candidate_for_client_info() {
-    use crate::policy::HOT_COLD_MIN_HOT_QPS;
     use autumn_rpc::manager_rpc::POLICY_KIND_HOT_COLD;
     let mut eng = PolicyEngine::default();
     let now = 1_700_000_000;
     fill_window(
         &mut eng,
         300,
-        POLICY_REQUIRED_BUCKETS,
+        d().required_buckets,
         PartitionLoad {
             part_id: 300,
-            req_per_sec: HOT_COLD_MIN_HOT_QPS.saturating_mul(2),
+            req_per_sec: d().hot_cold_min_hot_qps.saturating_mul(2),
             ..Default::default()
         },
-        now - POLICY_REQUIRED_BUCKETS as i64 * POLICY_BUCKET_SEC,
+        now - d().required_buckets as i64 * d().bucket_sec,
     );
     fill_window(
         &mut eng,
         301,
-        POLICY_REQUIRED_BUCKETS,
+        d().required_buckets,
         PartitionLoad {
             part_id: 301,
             req_per_sec: 1,
             ..Default::default()
         },
-        now - POLICY_REQUIRED_BUCKETS as i64 * POLICY_BUCKET_SEC,
+        now - d().required_buckets as i64 * d().bucket_sec,
     );
     let owners: HashMap<u64, u64> = vec![(300u64, 77u64), (301, 77)].into_iter().collect();
     let cands = eng.compute_hot_cold_advisory(&owners, &HashMap::new(), now);
@@ -1045,7 +1038,7 @@ fn mk_extent(state: &mut MetadataState, eid: u64, sealed_length: u64, ec_convert
 fn ec_advisory_fires_for_large_sealed_unconverted_extent() {
     let mut state = MetadataState::default();
     mk_stream(&mut state, 100, (3, 1), &[1001]);
-    mk_extent(&mut state, 1001, EC_MIN_EXTENT_BYTES * 2, false);
+    mk_extent(&mut state, 1001, d().ec_min_extent_bytes * 2, false);
     let eng = PolicyEngine::default();
     let out = eng.compute_ec_advisory(&state, &|_, _| true, 999);
     assert_eq!(out.len(), 1, "expected one EC candidate: {out:?}");
@@ -1053,7 +1046,7 @@ fn ec_advisory_fires_for_large_sealed_unconverted_extent() {
     assert_eq!(c.kind, POLICY_KIND_EC);
     assert_eq!(c.primary_part_id, 0, "EC is per-extent, not per-partition");
     assert_eq!(c.secondary_part_id, 1001, "secondary carries extent_id");
-    assert_eq!(c.size_bytes, EC_MIN_EXTENT_BYTES * 2);
+    assert_eq!(c.size_bytes, d().ec_min_extent_bytes * 2);
 }
 
 /// EC advisory common-sense filter — extents below
@@ -1063,9 +1056,9 @@ fn ec_advisory_suppresses_small_extents() {
     let mut state = MetadataState::default();
     mk_stream(&mut state, 101, (3, 1), &[1002, 1003]);
     // Below threshold — should not be advised.
-    mk_extent(&mut state, 1002, EC_MIN_EXTENT_BYTES / 2, false);
+    mk_extent(&mut state, 1002, d().ec_min_extent_bytes / 2, false);
     // Above threshold — should be advised.
-    mk_extent(&mut state, 1003, EC_MIN_EXTENT_BYTES + 1, false);
+    mk_extent(&mut state, 1003, d().ec_min_extent_bytes + 1, false);
     let eng = PolicyEngine::default();
     let out = eng.compute_ec_advisory(&state, &|_, _| true, 0);
     assert_eq!(out.len(), 1, "small extent filtered out: {out:?}");
@@ -1077,7 +1070,7 @@ fn ec_advisory_suppresses_small_extents() {
 fn ec_advisory_skips_converted() {
     let mut state = MetadataState::default();
     mk_stream(&mut state, 102, (3, 1), &[1004]);
-    mk_extent(&mut state, 1004, EC_MIN_EXTENT_BYTES * 4, true);
+    mk_extent(&mut state, 1004, d().ec_min_extent_bytes * 4, true);
     let eng = PolicyEngine::default();
     let out = eng.compute_ec_advisory(&state, &|_, _| true, 0);
     assert!(
@@ -1093,7 +1086,7 @@ fn ec_advisory_skips_non_ec_streams() {
     let mut state = MetadataState::default();
     // ec=(0,0) → replication-only.
     mk_stream(&mut state, 103, (0, 0), &[1005]);
-    mk_extent(&mut state, 1005, EC_MIN_EXTENT_BYTES * 4, false);
+    mk_extent(&mut state, 1005, d().ec_min_extent_bytes * 4, false);
     let eng = PolicyEngine::default();
     let out = eng.compute_ec_advisory(&state, &|_, _| true, 0);
     assert!(
@@ -1121,7 +1114,7 @@ fn ec_advisory_skips_what_the_arbiter_refuses() {
     let mut state = MetadataState::default();
     mk_stream(&mut state, 105, (3, 1), &[1007, 1008, 1009]);
     for eid in [1007, 1008, 1009] {
-        mk_extent(&mut state, eid, EC_MIN_EXTENT_BYTES * 2, false);
+        mk_extent(&mut state, eid, d().ec_min_extent_bytes * 2, false);
     }
     let eng = PolicyEngine::default();
     let out = eng.compute_ec_advisory(&state, &|eid, _| eid == 1009, 0);
@@ -1342,7 +1335,7 @@ fn carried_payload_alone_does_not_advise_a_split() {
     fill_window(
         &mut eng,
         17,
-        POLICY_REQUIRED_BUCKETS,
+        d().required_buckets,
         PartitionLoad {
             part_id: 17,
             size_bytes: 741 * 1024 * 1024, // LSM-resident: pointers only
@@ -1351,7 +1344,7 @@ fn carried_payload_alone_does_not_advise_a_split() {
             read_bytes_per_sec: 0,
             ..Default::default()
         },
-        now - POLICY_REQUIRED_BUCKETS as i64 * POLICY_BUCKET_SEC,
+        now - d().required_buckets as i64 * d().bucket_sec,
     );
     let out = eng.compute_candidates(ComputeArgs {
         state: &state,
@@ -1369,7 +1362,7 @@ fn carried_payload_alone_does_not_advise_a_split() {
 /// The same partition DOES split once a bottleneck a split relieves appears:
 /// here the byte rate, which for a large-value workload is the binding one and
 /// which no QPS threshold can see (1 400 ops/s of 1 MiB values is idle to
-/// `SPLIT_QPS_HIGH` and saturates the single log_stream).
+/// `--split-qps-high` and saturates the single log_stream).
 #[test]
 fn sustained_byte_rate_triggers_split_where_qps_cannot() {
     let mut state = MetadataState::default();
@@ -1384,16 +1377,16 @@ fn sustained_byte_rate_triggers_split_where_qps_cannot() {
     fill_window(
         &mut eng,
         17,
-        POLICY_REQUIRED_BUCKETS,
+        d().required_buckets,
         PartitionLoad {
             part_id: 17,
             size_bytes: 741 * 1024 * 1024,
-            req_per_sec: 1_400, // far below SPLIT_QPS_HIGH
-            write_bytes_per_sec: SPLIT_BW_HIGH,
+            req_per_sec: 1_400, // far below d().split_qps_high
+            write_bytes_per_sec: d().split_bw_high,
             read_bytes_per_sec: 16 * 1024 * 1024, // sum is over the threshold
             ..Default::default()
         },
-        now - POLICY_REQUIRED_BUCKETS as i64 * POLICY_BUCKET_SEC,
+        now - d().required_buckets as i64 * d().bucket_sec,
     );
     let out = eng.compute_candidates(ComputeArgs {
         state: &state,
@@ -1430,8 +1423,8 @@ fn rate_trigger_respects_the_carried_floor_after_debt() {
     let hot_but_tiny = PartitionLoad {
         part_id: 17,
         size_bytes: 64 * 1024 * 1024,
-        req_per_sec: SPLIT_QPS_HIGH + 1,
-        write_bytes_per_sec: SPLIT_BW_HIGH + 1,
+        req_per_sec: d().split_qps_high + 1,
+        write_bytes_per_sec: d().split_bw_high + 1,
         gc_debt_bytes: 2 * GIB,
         open_tail_dead_bytes: GIB / 2,
         ..Default::default()
@@ -1439,9 +1432,9 @@ fn rate_trigger_respects_the_carried_floor_after_debt() {
     fill_window(
         &mut eng,
         17,
-        POLICY_REQUIRED_BUCKETS,
+        d().required_buckets,
         hot_but_tiny.clone(),
-        now - POLICY_REQUIRED_BUCKETS as i64 * POLICY_BUCKET_SEC,
+        now - d().required_buckets as i64 * d().bucket_sec,
     );
     let out = eng.compute_candidates(ComputeArgs {
         state: &state,
@@ -1460,13 +1453,13 @@ fn rate_trigger_respects_the_carried_floor_after_debt() {
     fill_window(
         &mut eng2,
         17,
-        POLICY_REQUIRED_BUCKETS,
+        d().required_buckets,
         PartitionLoad {
             gc_debt_bytes: 0,
             open_tail_dead_bytes: 0,
             ..hot_but_tiny
         },
-        now - POLICY_REQUIRED_BUCKETS as i64 * POLICY_BUCKET_SEC,
+        now - d().required_buckets as i64 * d().bucket_sec,
     );
     let out2 = eng2.compute_candidates(ComputeArgs {
         state: &state,
@@ -1493,14 +1486,14 @@ fn est_live_vp_partition_not_a_merge_candidate() {
 
     let mut eng = PolicyEngine::default();
     let now = 1_700_000_000;
-    let base = now - POLICY_REQUIRED_BUCKETS as i64 * POLICY_BUCKET_SEC;
+    let base = now - d().required_buckets as i64 * d().bucket_sec;
     let cold = PartitionLoad {
         size_bytes: 200 * 1024 * 1024, // both look tiny to the old measure
         req_per_sec: 1,
         ..Default::default()
     };
-    fill_window(&mut eng, 1, POLICY_REQUIRED_BUCKETS, cold.clone(), base);
-    fill_window(&mut eng, 2, POLICY_REQUIRED_BUCKETS, cold, base);
+    fill_window(&mut eng, 1, d().required_buckets, cold.clone(), base);
+    fill_window(&mut eng, 2, d().required_buckets, cold, base);
     let owners: HashMap<u64, u64> = vec![(1u64, 9u64), (2, 9)].into_iter().collect();
     let out = eng.compute_candidates(ComputeArgs {
         state: &state,
@@ -1528,15 +1521,15 @@ fn est_live_underflow_clamps_and_cold_pair_still_merges() {
 
     let mut eng = PolicyEngine::default();
     let now = 1_700_000_000;
-    let base = now - POLICY_REQUIRED_BUCKETS as i64 * POLICY_BUCKET_SEC;
+    let base = now - d().required_buckets as i64 * d().bucket_sec;
     let cold = PartitionLoad {
         size_bytes: 200 * 1024 * 1024,
         gc_debt_bytes: 5 * GIB, // stale over-report ≫ sealed sum
         req_per_sec: 1,
         ..Default::default()
     };
-    fill_window(&mut eng, 1, POLICY_REQUIRED_BUCKETS, cold.clone(), base);
-    fill_window(&mut eng, 2, POLICY_REQUIRED_BUCKETS, cold, base);
+    fill_window(&mut eng, 1, d().required_buckets, cold.clone(), base);
+    fill_window(&mut eng, 2, d().required_buckets, cold, base);
     let owners: HashMap<u64, u64> = vec![(1u64, 9u64), (2, 9)].into_iter().collect();
     let out = eng.compute_candidates(ComputeArgs {
         state: &state,
@@ -1555,11 +1548,11 @@ fn hot_cold_size_dimension_sees_est_live() {
     use autumn_rpc::manager_rpc::POLICY_KIND_HOT_COLD;
     let mut eng = PolicyEngine::default();
     let now = 1_700_000_000;
-    let base = now - POLICY_REQUIRED_BUCKETS as i64 * POLICY_BUCKET_SEC;
+    let base = now - d().required_buckets as i64 * d().bucket_sec;
     fill_window(
         &mut eng,
         300,
-        POLICY_REQUIRED_BUCKETS,
+        d().required_buckets,
         PartitionLoad {
             part_id: 300,
             size_bytes: 1024 * 1024, // 1 MiB LSM-resident
@@ -1570,7 +1563,7 @@ fn hot_cold_size_dimension_sees_est_live() {
     fill_window(
         &mut eng,
         301,
-        POLICY_REQUIRED_BUCKETS,
+        d().required_buckets,
         PartitionLoad {
             part_id: 301,
             size_bytes: 1,
@@ -1604,10 +1597,10 @@ fn hot_cold_size_dimension_sees_est_live() {
 fn overlapping_partition_gets_compact_instead_of_split() {
     let state = MetadataState::default();
     let now = 1_700_000_000;
-    let base = now - POLICY_REQUIRED_BUCKETS as i64 * POLICY_BUCKET_SEC;
+    let base = now - d().required_buckets as i64 * d().bucket_sec;
     let load = |has_overlap: u32| PartitionLoad {
         part_id: 7,
-        size_bytes: SPLIT_LSM_HARD + GIB,
+        size_bytes: d().split_lsm_hard + GIB,
         req_per_sec: 100,
         pending_compaction_bytes: 2 * GIB,
         has_overlap,
@@ -1615,7 +1608,7 @@ fn overlapping_partition_gets_compact_instead_of_split() {
     };
 
     let mut eng = PolicyEngine::default();
-    fill_window(&mut eng, 7, POLICY_REQUIRED_BUCKETS, load(1), base);
+    fill_window(&mut eng, 7, d().required_buckets, load(1), base);
     let out = eng.compute_candidates(ComputeArgs {
         state: &state,
         last_op_at: &HashMap::new(),
@@ -1633,7 +1626,7 @@ fn overlapping_partition_gets_compact_instead_of_split() {
 
     // Overlap cleared (a major compaction ran) → the split it was waiting for.
     let mut eng2 = PolicyEngine::default();
-    fill_window(&mut eng2, 7, POLICY_REQUIRED_BUCKETS, load(0), base);
+    fill_window(&mut eng2, 7, d().required_buckets, load(0), base);
     let out2 = eng2.compute_candidates(ComputeArgs {
         state: &state,
         last_op_at: &HashMap::new(),
@@ -1658,7 +1651,7 @@ fn every_overlapping_merge_side_gets_compacted_first() {
     mk_part_streams(&mut state, 1, b"a", b"m", 100, 101, 102);
     mk_part_streams(&mut state, 2, b"m", b"z", 200, 201, 202);
     let now = 1_700_000_000;
-    let base = now - POLICY_REQUIRED_BUCKETS as i64 * POLICY_BUCKET_SEC;
+    let base = now - d().required_buckets as i64 * d().bucket_sec;
     let owners: HashMap<u64, u64> = vec![(1u64, 9u64), (2, 9)].into_iter().collect();
     let cold = |has_overlap: u32| PartitionLoad {
         size_bytes: 100 * 1024 * 1024,
@@ -1670,8 +1663,8 @@ fn every_overlapping_merge_side_gets_compacted_first() {
     // (survivor = part 1 overlaps, victim = part 2 overlaps) → the compacts.
     let run = |left: u32, right: u32| {
         let mut eng = PolicyEngine::default();
-        fill_window(&mut eng, 1, POLICY_REQUIRED_BUCKETS, cold(left), base);
-        fill_window(&mut eng, 2, POLICY_REQUIRED_BUCKETS, cold(right), base);
+        fill_window(&mut eng, 1, d().required_buckets, cold(left), base);
+        fill_window(&mut eng, 2, d().required_buckets, cold(right), base);
         eng.compute_candidates(ComputeArgs {
             state: &state,
             last_op_at: &HashMap::new(),
@@ -1714,10 +1707,10 @@ fn every_overlapping_merge_side_gets_compacted_first() {
 fn unblocking_compact_waits_only_for_a_running_compaction() {
     let state = MetadataState::default();
     let now = 1_700_000_000;
-    let base = now - POLICY_REQUIRED_BUCKETS as i64 * POLICY_BUCKET_SEC;
+    let base = now - d().required_buckets as i64 * d().bucket_sec;
     let blocked = |compact_inflight: u32, last_compact_at: i64| PartitionLoad {
         part_id: 7,
-        size_bytes: SPLIT_LSM_HARD + GIB,
+        size_bytes: d().split_lsm_hard + GIB,
         req_per_sec: 100,
         has_overlap: 1,
         compact_inflight,
@@ -1726,7 +1719,7 @@ fn unblocking_compact_waits_only_for_a_running_compaction() {
     };
     let run = |load: PartitionLoad| {
         let mut eng = PolicyEngine::default();
-        fill_window(&mut eng, 7, POLICY_REQUIRED_BUCKETS, load, base);
+        fill_window(&mut eng, 7, d().required_buckets, load, base);
         eng.compute_candidates(ComputeArgs {
             state: &state,
             last_op_at: &HashMap::new(),
@@ -1743,16 +1736,16 @@ fn unblocking_compact_waits_only_for_a_running_compaction() {
     // in `policy-candidates` for five minutes after a compaction that failed
     // to separate it.
     assert_eq!(
-        run(blocked(0, now - COMPACT_COOLDOWN_SEC / 2)).len(),
+        run(blocked(0, now - d().compact_cooldown_sec / 2)).len(),
         1,
         "a compaction that finished recently and left the flag set did not do \
          the job; advise another rather than go silent"
     );
-    assert_eq!(run(blocked(0, now - COMPACT_COOLDOWN_SEC - 1)).len(), 1);
+    assert_eq!(run(blocked(0, now - d().compact_cooldown_sec - 1)).len(), 1);
 }
 
 /// A pair moving real bytes is not cold, however few requests it serves:
-/// 1 400 ops/s of 1 MiB values passes `MERGE_QPS_LOW` and is 1.4 GB/s, and the
+/// 1 400 ops/s of 1 MiB values passes `--merge-qps-low` and is 1.4 GB/s, and the
 /// merged partition would carry all of it on one log_stream.
 #[test]
 fn byte_rate_vetoes_a_merge_that_qps_calls_cold() {
@@ -1760,17 +1753,17 @@ fn byte_rate_vetoes_a_merge_that_qps_calls_cold() {
     mk_part_streams(&mut state, 1, b"a", b"m", 100, 101, 102);
     mk_part_streams(&mut state, 2, b"m", b"z", 200, 201, 202);
     let now = 1_700_000_000;
-    let base = now - POLICY_REQUIRED_BUCKETS as i64 * POLICY_BUCKET_SEC;
+    let base = now - d().required_buckets as i64 * d().bucket_sec;
     let owners: HashMap<u64, u64> = vec![(1u64, 9u64), (2, 9)].into_iter().collect();
     let busy = PartitionLoad {
         size_bytes: 100 * 1024 * 1024,
-        req_per_sec: 700, // summed 1 400 — under MERGE_QPS_LOW
+        req_per_sec: 700, // summed 1 400 — under d().merge_qps_low
         write_bytes_per_sec: 700 * 1024 * 1024,
         ..Default::default()
     };
     let mut eng = PolicyEngine::default();
-    fill_window(&mut eng, 1, POLICY_REQUIRED_BUCKETS, busy.clone(), base);
-    fill_window(&mut eng, 2, POLICY_REQUIRED_BUCKETS, busy, base);
+    fill_window(&mut eng, 1, d().required_buckets, busy.clone(), base);
+    fill_window(&mut eng, 2, d().required_buckets, busy, base);
     let out = eng.compute_candidates(ComputeArgs {
         state: &state,
         last_op_at: &HashMap::new(),
@@ -1795,14 +1788,14 @@ fn an_idle_partition_with_uncompacted_deletes_is_advised_a_major_compaction() {
     fill_window(
         &mut eng,
         13,
-        POLICY_REQUIRED_BUCKETS,
+        d().required_buckets,
         PartitionLoad {
             part_id: 13,
             size_bytes: 40 * 1024,
             unsettled_deletes: 270,
             ..Default::default()
         },
-        now - POLICY_REQUIRED_BUCKETS as i64 * POLICY_BUCKET_SEC,
+        now - d().required_buckets as i64 * d().bucket_sec,
     );
     let out = eng.compute_maintenance_advisory(now);
     let cs: Vec<_> = out
@@ -1820,10 +1813,10 @@ fn an_idle_partition_with_uncompacted_deletes_is_advised_a_major_compaction() {
 fn deletes_still_arriving_do_not_advise_a_major_compaction() {
     let mut eng = PolicyEngine::default();
     let now = 1_700_000_000;
-    let base = now - POLICY_REQUIRED_BUCKETS as i64 * POLICY_BUCKET_SEC;
-    for i in 0..POLICY_REQUIRED_BUCKETS {
+    let base = now - d().required_buckets as i64 * d().bucket_sec;
+    for i in 0..d().required_buckets {
         eng.metrics.entry(13).or_default().push(
-            base + i as i64 * POLICY_BUCKET_SEC,
+            base + i as i64 * d().bucket_sec,
             PartitionLoad {
                 part_id: 13,
                 unsettled_deletes: 100 * (i as u64 + 1),
@@ -1865,9 +1858,9 @@ fn settling_deletes_respects_the_compaction_cooldown_and_inflight() {
         fill_window(
             &mut eng,
             13,
-            POLICY_REQUIRED_BUCKETS,
+            d().required_buckets,
             load.clone(),
-            now - POLICY_REQUIRED_BUCKETS as i64 * POLICY_BUCKET_SEC,
+            now - d().required_buckets as i64 * d().bucket_sec,
         );
         let out = eng.compute_maintenance_advisory(now);
         assert!(

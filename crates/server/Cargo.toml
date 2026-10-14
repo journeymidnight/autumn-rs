@@ -82,6 +82,7 @@ tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 autumn-common = { path = "../common" }
 autumn-manager = { path = "../manager" }
+autumn-params = { path = "../params" }
 # Used only by the one-shot `migratev1_v2` converter bin; remove both together.
 autumn-etcd = { path = "../etcd" }
 autumn-stream = { path = "../stream" }

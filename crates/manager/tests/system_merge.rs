@@ -816,7 +816,7 @@ fn auto_merge_fires_via_policy_tick_loop_fast_mode() {
 }
 
 /// fast-mode policy_tick_loop e2e for auto-SPLIT: enable auto-split
-/// with a 1-bucket / 1-second config + low SPLIT_LSM_HARD threshold,
+/// with a 1-bucket / 1-second config + low --split-lsm-hard-bytes threshold,
 /// send synthetic high-load metrics for one partition, verify
 /// policy_tick_loop fires SPLIT automatically.
 ///
@@ -843,7 +843,7 @@ fn auto_split_fires_via_policy_tick_loop_fast_mode() {
     compio::runtime::Runtime::new().unwrap().block_on(async {
         let manager = AutumnManager::new();
 
-        // Fast-mode: 1 bucket / 1 s tick, no cooldown, low SPLIT_LSM_HARD
+        // Fast-mode: 1 bucket / 1 s tick, no cooldown, low --split-lsm-hard-bytes
         // (10 MiB) so a synthetic metric with size=20 MiB fires immediately.
         let mut cfg = PolicyConfig::default();
         cfg.required_buckets = 1;

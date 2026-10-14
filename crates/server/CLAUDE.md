@@ -14,6 +14,13 @@ The benchmark is single-threaded and reports sampled operation latency (1/16).
 
 Binary-only crate: the executable entry points that wire the library crates together, plus one-off repair tooling. No library logic lives here.
 
+**Flags.** A binary parses its own structural flags (ports, addresses, files,
+cpuset) and offers every other argument to its role's parameter struct in
+`autumn-params` (`autumn_params::take_flag`). An unknown argument or a value
+outside a parameter's range exits 2; `--help` lists every parameter with its
+default and range from the same declarations. No binary reads a tunable from the
+environment.
+
 ## Binaries
 
 ### `autumn-manager-server` (`src/bin/manager.rs`)
@@ -30,6 +37,7 @@ autumn-manager-server --cluster-secret-file FILE [--port 9001] [--listen 0.0.0.0
 - The leader-fenced **auto-policy controller** runs in-process (leader only). `--auto-policy-default <NAME>` seeds an Armed policy on a fresh cluster; arming is per-policy (`autumn-op auto-policy start <NAME>`). The **web dashboard is no longer served by the manager** — it is a standalone app (`crates/server/src/bin/autumn_dashboard`) that talks to the manager only through `autumn-op` (it scrapes PS `/metrics` directly for its Metrics tab). Runbook: `docs/ops.md`.
 - `--cluster-secret-file <FILE>` (REQUIRED on the manager, PS and EN; exit 2 without it): the cluster secret every Peer/Admin connection proves (`autumn_rpc::peer_auth`, `docs/cluster_secret_design.md`). `--admin-token[-file]` were removed and are refused by name.
 - Authz (opt-in): `--auth-signing-key-file <FILE>` enables data-plane authz (keys from `autumn-op gen-signing-key`). With a key, every keyed op needs a token (no protected-prefix list). `--auth-token-ttl-secs` / `--auth-clock-skew-secs` tune minted tokens.
+- `--policy-fast-mode` sets short policy windows (1 bucket of 5 s, 5 s tick, 1 MiB / 4 MiB debt thresholds, 30 s cooldowns, 5 s sealed-empty sweep) for dev/test clusters; it is applied before the other flags, so an explicit flag still wins. Every other tunable: `autumn-manager-server --help` (`crates/params/src/manager.rs`).
 
 ### `autumn-extent-node` (`src/bin/extent_node.rs`)
 

@@ -100,7 +100,10 @@ fn ioring_lease_write_conflict_returns_precondition() {
         let lease = r1.lease.expect("lease present");
         assert!(lease.writer_present);
         assert_eq!(lease.version, 1);
-        assert_eq!(lease.ttl_secs, autumn_manager::inode_lease::DEFAULT_LEASE_TTL_SECS);
+        assert_eq!(
+            lease.ttl_secs,
+            autumn_params::manager::ManagerParams::default().inode_lease_ttl_secs.get()
+        );
 
         let r2 = acquire(
             &mgr,

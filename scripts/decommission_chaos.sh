@@ -55,12 +55,6 @@ export AUTUMN_CHAOS_DECOMMISSION="${AUTUMN_CHAOS_DECOMMISSION:-1}"
 # 1 = SIGKILL the fenced node before draining (stop-then-remove flow). Default 0
 # runs the live-node path (now drains, see note above).
 export AUTUMN_CHAOS_DECOMMISSION_KILL="${AUTUMN_CHAOS_DECOMMISSION_KILL:-0}"
-# release a stuck Recovery marker fast so a live-fenced-node
-# decommission re-dispatches + drains within the test window (product default is
-# 120 s; 60 s here just speeds up CI — the recovery-specific threshold picks the
-# min of this and AUTUMN_MGR_RECOVERY_INFLIGHT_STALE_SECS).
-export AUTUMN_MGR_INFLIGHT_STALE_THRESHOLD_SECS="${AUTUMN_MGR_INFLIGHT_STALE_THRESHOLD_SECS:-60}"
-export AUTUMN_MGR_INFLIGHT_SWEEP_INTERVAL_SECS="${AUTUMN_MGR_INFLIGHT_SWEEP_INTERVAL_SECS:-5}"
 export AUTUMN_CHAOS_DURATION_SECS="${AUTUMN_CHAOS_DURATION_SECS:-45}"
 export AUTUMN_CHAOS_NEMESIS_INTERVAL_MS="${AUTUMN_CHAOS_NEMESIS_INTERVAL_MS:-2000}"
 # 6 ENs: nemesis kills/fences need healthy_count > K+M; the terminal decommission

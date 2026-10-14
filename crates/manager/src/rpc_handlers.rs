@@ -33,10 +33,6 @@ impl Drop for SplitInflightGuard {
     }
 }
 
-/// A non-force fence needs the nodes that may receive its slots to report this
-/// multiple (1.2x) of the bytes it moves off, so recovery does not fill them.
-const FENCE_HEADROOM_NUM: u64 = 12;
-const FENCE_HEADROOM_DEN: u64 = 10;
 
 /// Test-only failpoint: sleep this many ms between the commit_length capture and
 /// the merge txn inside `handle_merge_partitions`, simulating a paused/slow
@@ -487,7 +483,7 @@ impl AutumnManager {
         let now = Self::epoch_seconds().max(0) as u64;
         // saturating_add so a (clamped, but defensively) large TTL can't wrap
         // now+ttl into a past exp (coco P2).
-        let exp = now.saturating_add(self.token_ttl_secs.get());
+        let exp = now.saturating_add(self.params().auth_token_ttl_secs.get());
         let claims = autumn_rpc::cap_token::CapClaims {
             ver: autumn_rpc::cap_token::CAP_VER,
             typ: autumn_rpc::cap_token::CAP_TYP.to_string(),
@@ -554,8 +550,8 @@ impl AutumnManager {
             enabled,
             public_keys,
             namespaces,
-            token_ttl_secs: self.token_ttl_secs.get(),
-            clock_skew_secs: self.clock_skew_secs.get(),
+            token_ttl_secs: self.params().auth_token_ttl_secs.get(),
+            clock_skew_secs: self.params().auth_clock_skew_secs.get(),
             cluster_id: self.cluster_id.borrow().clone(),
         }))
     }
@@ -4409,6 +4405,7 @@ impl AutumnManager {
         // Helper closures.
         let send_freeze = |addr: String, part_id: u64, freeze: bool| {
             let pool = self.conn_pool.clone();
+            let freeze_timeout = Duration::from_secs(self.params().merge_freeze_timeout_secs.get());
             async move {
                 let req = autumn_rpc::partition_rpc::MergeFreezeReq { part_id, freeze };
                 let payload = autumn_rpc::partition_rpc::rkyv_encode(&req);
@@ -4420,7 +4417,7 @@ impl AutumnManager {
                         &addr,
                         autumn_rpc::partition_rpc::MSG_MERGE_FREEZE,
                         payload,
-                        Duration::from_secs(30),
+                        freeze_timeout,
                     )
                     .await
                     .map_err(|e| AppError::Internal(format!("freeze rpc to {addr}: {e}")))?;
@@ -5022,12 +5019,8 @@ impl AutumnManager {
             })
             .collect();
         let mut p = self.policy.borrow_mut();
-        // honour the configured `window_buckets / bucket_sec`
-        // (was hardcoded `POLICY_WINDOW_BUCKETS / POLICY_BUCKET_SEC`,
-        // making the `PolicyConfig` fields dead). With this in place
-        // `set_policy_config` actually reshapes the history window;
-        // tests using a small `window_buckets / bucket_sec` no longer
-        // need to call internal helpers.
+        // The configured `window_buckets / bucket_sec` shape the history
+        // window (`set_policy_config` reshapes it).
         let cap = p.config.window_buckets.max(1);
         let bucket_sec = p.config.bucket_sec.max(1);
         for load in req.partitions {
@@ -5731,8 +5724,8 @@ impl AutumnManager {
         let now = Instant::now();
         // read quorum config from `AutumnManager` fields
         // populated at construction / binary-flag time. No env reads.
-        let window = self.report_disk_failure_window.get();
-        let quorum: usize = self.report_disk_failure_quorum.get();
+        let window = Duration::from_secs(self.params().report_disk_failure_window_secs.get());
+        let quorum: usize = self.params().report_disk_failure_quorum.get();
         let cutoff = now.checked_sub(window).unwrap_or(now);
 
         let reached_quorum = {
@@ -6199,7 +6192,7 @@ impl AutumnManager {
         // wrong in normal operation — `apply_recovery_done` swaps a slot, a
         // freshly promoted leader is still settling — and deleting real data on a
         // transient is far worse than holding residue for a few more minutes.
-        const NON_MEMBER_ROUNDS_BEFORE_GC: u32 = 3;
+        let rounds_before_gc = self.params().non_member_rounds_before_gc.get();
         let mut placements: Vec<ExtentPlacement> = Vec::new();
         let garbage: Vec<u64> = {
             let s = self.store.inner.borrow();
@@ -6267,7 +6260,7 @@ impl AutumnManager {
                     // (2) non-member — count the rounds.
                     let c = seen.entry((req.node_id, req.shard_idx, *eid)).or_insert(0);
                     *c += 1;
-                    *c >= NON_MEMBER_ROUNDS_BEFORE_GC
+                    *c >= rounds_before_gc
                 })
                 .collect()
         };
@@ -6950,7 +6943,9 @@ impl AutumnManager {
             receivers.extend(targets);
         }
         let headroom: u64 = receivers.iter().map(free_of).sum();
-        let needed = to_move.saturating_mul(FENCE_HEADROOM_NUM) / FENCE_HEADROOM_DEN;
+        // The receivers must report `--fence-headroom-percent` of the bytes
+        // moved off, so recovery does not fill them.
+        let needed = to_move.saturating_mul(self.params().fence_headroom_percent.get()) / 100;
         if headroom < needed {
             return Err(AppError::Precondition(format!(
                 "moving {to_move} bytes off node {node_id} needs {needed} free on the \
@@ -8199,7 +8194,7 @@ mod authz_kdc_tests {
             mgr.set_authz_keyring(
                 crate::authz::AuthzKeyring::from_file_contents(&keyfile()).unwrap(),
             );
-            mgr.set_token_ttl_secs(3600);
+            mgr.params().auth_token_ttl_secs.set(3600);
             let cluster_id = mgr.cluster_id.borrow().clone();
 
             // ── (1) principal-create (admin) ───────────────────────────

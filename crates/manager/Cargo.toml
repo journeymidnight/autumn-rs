@@ -11,6 +11,7 @@ fuse-tests = ["dep:autumn-fuse"]
 [dependencies]
 anyhow.workspace = true
 autumn-common = { path = "../common" }
+autumn-params = { path = "../params" }
 autumn-etcd = { path = "../etcd" }
 autumn-rpc = { path = "../rpc" }
 autumn-transport = { path = "../transport" }

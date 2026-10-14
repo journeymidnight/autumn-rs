@@ -4903,12 +4903,9 @@ async fn run_terminal_decommission(
     // 2. Poll MSG_REMOVE_NODE until the node is fully drained. Recovery
     //    dispatches every 2 s and the fence-drain rolls open tails each tick
     //    (30 s per-partition cooldown). A fenced node's healthy SEALED replicas
-    //    are relocated by the fenced-slot recovery dispatch; if that first
-    //    recovery attempt sticks (the EN copy stalls under churn), re-dispatch
-    //    is frozen until the fence-drain stale-marker sweep releases the
-    //    Recovery marker (recovery-specific threshold, default 120 s; the
-    //    decommission chaos script sets it to 60 s for faster CI). 90 attempts
-    //    × 3 s = 270 s ceiling covers a stick + one sweep-release + retry.
+    //    are relocated by the fenced-slot recovery dispatch, re-sent every
+    //    tick and released against live state when it sticks. 90 attempts
+    //    × 3 s = 270 s ceiling covers a stick, its release and a retry.
     //    Timing out past that means a genuine drain/recovery wedge → fail.
     const MAX_ATTEMPTS: u32 = 90;
     for attempt in 1..=MAX_ATTEMPTS {

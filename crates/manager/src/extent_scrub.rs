@@ -25,7 +25,7 @@ use autumn_rpc::extent_rpc::{
 };
 use autumn_rpc::manager_rpc::{
     rkyv_decode, rkyv_encode, PolicyCandidate, OP_STATE_FAILED, OP_STATE_SUCCEEDED,
-    OP_STATE_UNKNOWN, POLICY_KIND_SCRUB, SCRUB_POLICY_INTERVAL_SEC,
+    OP_STATE_UNKNOWN, POLICY_KIND_SCRUB,
 };
 
 use crate::store::MetadataState;
@@ -42,14 +42,6 @@ pub(crate) enum ScrubScope {
 /// Tasks per `MSG_SCRUB_EXTENTS` request. A task is ~40 bytes; this keeps a
 /// request far below any frame limit however many extents a node holds.
 const TASKS_PER_REQUEST: usize = 4096;
-
-/// An op nothing has been heard about for this long is given up as `UNKNOWN`.
-/// "Heard about" is an outcome, or a `df` from a node holding its files that
-/// lists it as still queued — so a long wait behind other work keeps it alive,
-/// and this fires only when every node holding its files stopped answering.
-/// Without it such an op would sit RUNNING and, by attach-dedup, swallow every
-/// later submit of the same scope.
-pub(crate) const SCRUB_OP_SILENCE_SECS: i64 = 2 * 3600;
 
 /// How long after dispatch a node's `df` may omit an op before its files there
 /// are taken as lost. Covers a `df` already in flight when the request landed.
@@ -539,7 +531,7 @@ impl AutumnManager {
             .copied()
             .unwrap_or(0);
         let since = now_s - last;
-        if since < SCRUB_POLICY_INTERVAL_SEC as i64 {
+        if since < self.params().scrub_policy_interval_secs.get() as i64 {
             return Vec::new();
         }
         let reason = if last == 0 {
@@ -617,13 +609,19 @@ impl AutumnManager {
         }
     }
 
-    /// Give up ops nothing has been heard about for `SCRUB_OP_SILENCE_SECS`.
+    /// Give up ops nothing has been heard about for `--scrub-op-silence-secs`.
+    /// "Heard about" is an outcome, or a `df` from a node holding its files
+    /// that lists it as still queued — so a long wait behind other work keeps
+    /// it alive, and this fires only when every node holding its files stopped
+    /// answering. Without it such an op would sit RUNNING and, by attach-dedup,
+    /// swallow every later submit of the same scope.
     pub(crate) fn sweep_silent_scrub_ops(&self, now_s: i64) {
+        let silence_s = self.params().scrub_op_silence_secs.get() as i64;
         let silent: Vec<(u64, ScrubOp)> = {
             let mut ops = self.scrub_ops.borrow_mut();
             let ids: Vec<u64> = ops
                 .iter()
-                .filter(|(_, op)| now_s - op.last_heard_s > SCRUB_OP_SILENCE_SECS)
+                .filter(|(_, op)| now_s - op.last_heard_s > silence_s)
                 .map(|(id, _)| *id)
                 .collect();
             ids.into_iter()
@@ -635,7 +633,7 @@ impl AutumnManager {
                 "no outcome for {} s; {} file(s) never reported (a node restarted, or its \
                  report was lost), {} rot finding(s) still held (their extent kept an op in \
                  flight, or their node stayed offline) — {}",
-                SCRUB_OP_SILENCE_SECS,
+                silence_s,
                 op.pending.len(),
                 op.recheck.len(),
                 op.summary()
@@ -650,6 +648,7 @@ impl AutumnManager {
 
 #[cfg(test)]
 mod tests {
+    const SILENCE: i64 = 2 * 3600;
     use super::*;
     use crate::persist::records::{ExtentRecord, PartitionRecord, StreamRecord};
     use autumn_rpc::manager_rpc::OP_KIND_SCRUB;
@@ -833,7 +832,7 @@ mod tests {
             let o = ops.get_mut(&op).unwrap();
             o.delivered_s.insert(10, now - 3600);
             o.delivered_s.insert(11, now - 3600);
-            o.last_heard_s = now - SCRUB_OP_SILENCE_SECS + 5;
+            o.last_heard_s = now - SILENCE + 5;
         }
         // Node 11 still has it queued: alive, and the silence clock restarts.
         m.record_scrub_queued(11, &[op]);
@@ -898,7 +897,7 @@ mod tests {
         let now = AutumnManager::now_s_ms().0;
         m.sweep_silent_scrub_ops(now);
         assert_eq!(op_record(&m, op).state, autumn_rpc::manager_rpc::OP_STATE_RUNNING);
-        m.sweep_silent_scrub_ops(now + SCRUB_OP_SILENCE_SECS + 1);
+        m.sweep_silent_scrub_ops(now + SILENCE + 1);
         assert_eq!(op_record(&m, op).state, OP_STATE_UNKNOWN);
         assert!(m.scrub_ops.borrow().is_empty());
     }

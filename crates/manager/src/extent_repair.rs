@@ -320,7 +320,7 @@ impl AutumnManager {
     /// extent it held, and one row — "node 5: 1 234 extents, longest 812 s" —
     /// is what an operator reads and what one actuation should cover.
     pub(crate) fn repair_candidates(&self, now_s: i64) -> Vec<PolicyCandidate> {
-        let grace = self.repair_grace_secs.get();
+        let grace = self.params.repair_grace_secs.get();
         let scan = self.extent_health_scan(now_s);
         // node -> (extents, bytes, longest secs, with no redundancy left)
         let mut per_node: BTreeMap<u64, (u64, u64, u64, u64)> = BTreeMap::new();
@@ -587,7 +587,7 @@ mod tests {
     /// extent on both per `(extent_id, secs slot 0 on node 1 has been degraded)`.
     fn node_1_down(extents: &[(u64, i64)]) -> (AutumnManager, i64) {
         let m = AutumnManager::new();
-        m.set_repair_grace_secs(600);
+        m.params().repair_grace_secs.set(600);
         for (node_id, disk) in [(1u64, 10u64), (2, 20)] {
             m.store.inner.borrow_mut().nodes.insert(
                 node_id,

@@ -36,17 +36,10 @@ use autumn_rpc::manager_rpc::{
     LEASE_MODE_WRITE,
 };
 
-/// Default writer-lease TTL (seconds). Same magnitude as
-/// `acquire_owner_lock`'s etcd lease (plan §3.1). Clients must
-/// heartbeat at <= TTL / 6 (`5s` for the 30s default) to stay alive.
-pub const DEFAULT_LEASE_TTL_SECS: u32 = 30;
-
-/// Default grace window the manager gives a writer
-/// to flush + voluntarily release after a peer's
-/// `AcquireLease(force=true)`. Matches plan §5 Phase 3 "writer
-/// revoke protocol: WillRevokeIn { 5s }". Tunable per-registry via
-/// `LeaseRegistry::with_ttl_and_revoke_grace`.
-pub const DEFAULT_REVOKE_GRACE: Duration = Duration::from_secs(5);
+// The writer-lease TTL (`--inode-lease-ttl-secs`, default 30 s, the same
+// magnitude as `acquire_owner_lock`'s etcd lease) and the grace a writer gets
+// to flush and release after a peer's `AcquireLease(force=true)`
+// (`--inode-revoke-grace-ms`, default 5 s) come from the manager parameters.
 
 /// How often the revoke loop ticks. Picked under the default TTL so a
 /// revoke fires within ~1 s of the deadline.
@@ -387,7 +380,7 @@ impl LeaseRegistry {
             inboxes: HashMap::new(),
             last_version: HashMap::new(),
             lease_ttl: ttl,
-            revoke_grace: DEFAULT_REVOKE_GRACE,
+            revoke_grace: Duration::from_secs(5),
         }
     }
 

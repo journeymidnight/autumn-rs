@@ -7,7 +7,7 @@ use std::time::Duration;
 #[compio::test]
 async fn manager_pool_preserves_status_connections_and_evicts_transport_failures() {
     let peer = Peer::start(respond).await;
-    let pool = ConnPool::new();
+    let pool = ConnPool::new(Duration::from_secs(5));
     let sock = parse_addr(&peer.addr).unwrap();
     for timed in [false, true] {
         for code in STATUSES {

@@ -492,9 +492,9 @@ impl AutumnManager {
     /// stale-marker sweep with auto-release.
     ///
     /// Runs on the manager (only when leader). Every
-    /// `AUTUMN_MGR_INFLIGHT_SWEEP_INTERVAL_SECS` (default 60s), iterates
+    /// `--inflight-sweep-interval-secs` (default 60s), iterates
     /// the in-memory ledger; for any marker whose `started_at` is older
-    /// than `AUTUMN_MGR_INFLIGHT_STALE_THRESHOLD_SECS` (default 600s =
+    /// than `--inflight-stale-threshold-secs` (default 600s =
     /// 10 min), atomically releases it: one `txn_fenced` deletes
     /// `extent_inflight/<id>` from etcd under the leader fence,
     /// then `commit_extent_inflight_release` drops the in-memory shadow.
@@ -555,10 +555,9 @@ impl AutumnManager {
     /// against etcd on each tick — the operator-error scenario is too
     /// rare to justify the per-tick prefix read.
     pub(crate) async fn extent_inflight_stale_sweep_loop(self) {
-        let sweep_interval =
-            std::time::Duration::from_secs(Self::stale_sweep_interval_secs().max(1) as u64);
         loop {
-            compio::time::sleep(sweep_interval).await;
+            let every = self.params().inflight_sweep_interval_secs.get();
+            compio::time::sleep(std::time::Duration::from_secs(every)).await;
             if !self.leader.get() {
                 continue;
             }
@@ -566,24 +565,9 @@ impl AutumnManager {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs() as i64)
                 .unwrap_or(0);
-            let threshold = Self::stale_threshold_secs();
+            let threshold = self.params().inflight_stale_threshold_secs.get() as i64;
             self.sweep_stale_inflight_once(now, threshold).await;
         }
-    }
-
-    /// stale threshold in seconds. Override with env
-    /// `AUTUMN_MGR_INFLIGHT_STALE_THRESHOLD_SECS`. Default 600
-    /// (10 minutes) — generous for typical recovery / EC convert
-    /// durations on local + LAN setups; bumped if you have
-    /// multi-GiB extents on slow networks. Clamped to >= 60 to
-    /// avoid pathological values that would race against the
-    /// acquire path.
-    fn stale_threshold_secs() -> i64 {
-        std::env::var("AUTUMN_MGR_INFLIGHT_STALE_THRESHOLD_SECS")
-            .ok()
-            .and_then(|s| s.parse::<i64>().ok())
-            .unwrap_or(600)
-            .max(60)
     }
 
     // NOTE: there is no Recovery-specific stale threshold. One existed
@@ -596,19 +580,8 @@ impl AutumnManager {
     // re-sent every tick, and `recovery_dispatch_loop` releases a marker against
     // live state on either of two facts: its pinned executor is no longer
     // online, or its source slot no longer needs rebuilding. Delete
-    // keeps the general 600 s threshold (it has its own retry queue);
+    // keeps the general threshold (it has its own retry queue);
     // ConvertToEc stays WARN-only.
-
-    /// sweep interval in seconds. Override with env
-    /// `AUTUMN_MGR_INFLIGHT_SWEEP_INTERVAL_SECS`. Default 60s.
-    /// Clamped to >= 1.
-    fn stale_sweep_interval_secs() -> i64 {
-        std::env::var("AUTUMN_MGR_INFLIGHT_SWEEP_INTERVAL_SECS")
-            .ok()
-            .and_then(|s| s.parse::<i64>().ok())
-            .unwrap_or(60)
-            .max(1)
-    }
 
     /// one sweep iteration. Extracted from the loop so unit tests
     /// can drive it with controlled `now` + `threshold_secs` values.
@@ -2276,20 +2249,5 @@ mod tests {
                 "fresh ConvertToEc marker survives the sweep"
             );
         })
-    }
-
-    /// env var overrides clamp to safe minimums.
-    #[test]
-    fn env_var_clamping() {
-        std::env::set_var("AUTUMN_MGR_INFLIGHT_STALE_THRESHOLD_SECS", "5");
-        std::env::set_var("AUTUMN_MGR_INFLIGHT_SWEEP_INTERVAL_SECS", "0");
-        // Threshold floor is 60, sweep interval floor is 1.
-        assert_eq!(AutumnManager::stale_threshold_secs(), 60);
-        assert_eq!(AutumnManager::stale_sweep_interval_secs(), 1);
-        std::env::remove_var("AUTUMN_MGR_INFLIGHT_STALE_THRESHOLD_SECS");
-        std::env::remove_var("AUTUMN_MGR_INFLIGHT_SWEEP_INTERVAL_SECS");
-        // Without env, defaults apply.
-        assert_eq!(AutumnManager::stale_threshold_secs(), 600);
-        assert_eq!(AutumnManager::stale_sweep_interval_secs(), 60);
     }
 }

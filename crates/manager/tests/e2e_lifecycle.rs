@@ -51,9 +51,11 @@ fn start_extent_node_with_manager(
     std::thread::sleep(Duration::from_millis(200));
 }
 
-/// Set the soft timeout to 2s for tests (so we don't wait 10s + tick).
-fn fast_node_timeout() {
-    std::env::set_var("AUTUMN_MGR_NODE_SUSPECTED_TIMEOUT_SECS", "2");
+/// A 2 s suspected timeout, so the test does not wait 10 s + a tick.
+fn fast_node_timeout() -> autumn_params::manager::ManagerParams {
+    let p = autumn_params::manager::ManagerParams::default();
+    p.node_suspected_timeout_secs.set(2);
+    p
 }
 
 async fn list_nodes(mgr: &RpcClient) -> Vec<NodeStateEntry> {
@@ -119,9 +121,8 @@ async fn query_audit(mgr: &RpcClient, op: u8, node_id: u64) -> Vec<MgrAuditEntry
 
 #[test]
 fn e2e_phantom_node_becomes_suspected() {
-    fast_node_timeout();
     let mgr_addr = pick_addr();
-    start_manager(mgr_addr);
+    start_manager_with(mgr_addr, fast_node_timeout());
 
     compio::runtime::Runtime::new().unwrap().block_on(async {
         let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::version_hello::Role::Admin, None).await.expect("connect mgr");

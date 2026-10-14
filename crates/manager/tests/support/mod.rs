@@ -128,9 +128,13 @@ pub fn pick_stable_port_pair() -> u16 {
 
 /// Start a manager (no etcd) on its own thread.
 pub fn start_manager(mgr_addr: SocketAddr) {
+    start_manager_with(mgr_addr, autumn_params::manager::ManagerParams::default());
+}
+
+pub fn start_manager_with(mgr_addr: SocketAddr, params: autumn_params::manager::ManagerParams) {
     std::thread::spawn(move || {
         compio::runtime::Runtime::new().unwrap().block_on(async {
-            let manager = AutumnManager::new();
+            let manager = AutumnManager::new_with_params(params);
             let _ = manager.serve(mgr_addr).await;
         });
     });

@@ -70,7 +70,7 @@ Single-threaded compio (`Rc<RefCell<GrpcChannel>>`). Not Send/Sync — matches t
 
 **INVARIANT — callers hold `Rc<EtcdClient>`, not `Rc<RefCell<EtcdClient>>`.** `EtcdClient` is all-`&self`, constructed once, never replaced, and self-reconnects internally — so a manager RPC is just `self.client.method().await` with no borrow held across the await. Do not wrap `EtcdClient` in an outer `RefCell`.
 
-**INVARIANT — every unary RPC is timeout-bounded.** `unary_call` wraps both `call_with_sender` awaits AND `reconnect` in `compio::time::timeout` (`request_timeout()`, env `AUTUMN_ETCD_REQUEST_TIMEOUT_MS`, default 10 s). etcd-over-h2c has no built-in per-request deadline, so an unbounded call on a half-open TCP hangs the caller forever — and every manager background loop ultimately awaits an etcd call. On timeout it falls through to the bounded reconnect+retry path (identical to a connection error); a second timeout returns `Err`. Any new path MUST go through `unary_call` — never add a bare unbounded `call_with_sender`.
+**INVARIANT — every unary RPC is timeout-bounded.** `unary_call` wraps both `call_with_sender` awaits AND `reconnect` in `compio::time::timeout` (`request_timeout`, set by the caller through `with_request_timeout` — the manager's `--etcd-request-timeout-ms` — default 10 s). etcd-over-h2c has no built-in per-request deadline, so an unbounded call on a half-open TCP hangs the caller forever — and every manager background loop ultimately awaits an etcd call. On timeout it falls through to the bounded reconnect+retry path (identical to a connection error); a second timeout returns `Err`. Any new path MUST go through `unary_call` — never add a bare unbounded `call_with_sender`.
 
 ## Dependencies
 

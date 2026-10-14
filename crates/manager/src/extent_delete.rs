@@ -34,7 +34,7 @@ use crate::persist::records::StreamRecord;
 use crate::persist::records::ExtentRecord;
 
 /// long-lived persisted retry queue for deletes whose primary
-/// retry budget (`MAX_ATTEMPTS = 60`) was exhausted. Etcd prefix. Without
+/// retry budget (`--delete-fanout-max-attempts`) was exhausted. Etcd prefix. Without
 /// this, deleted-extent metadata in etcd already had refs=0 but the
 /// physical files persisted on the offline replica until that node's
 /// startup `MSG_RECONCILE_EXTENTS` round-trip eventually reaped them —
@@ -87,53 +87,33 @@ pub(crate) struct PendingDelete {
     /// Every replica that still owes us an ack, by address AND identity.
     /// Drained as each one acks. Entry leaves `delete_progress` when empty.
     pub pending_targets: Vec<DeleteTarget>,
-    /// Sweep counter. After `MAX_ATTEMPTS` failed sweeps, drop the
+    /// Sweep counter. After `--delete-fanout-max-attempts` failed sweeps, drop the
     /// entry; reconcile path will catch the orphan on next node boot.
     pub attempts: u32,
 }
 
-/// At ~2s per sweep, 60 attempts = ~2 min retry window per replica.
-const MAX_ATTEMPTS: u32 = 60;
 const SWEEP_INTERVAL: Duration = Duration::from_secs(2);
 
-/// EXTENT10-AUTORECLAIM: how often the leader sweeps for both-zero orphan
-/// extents (`refs == 0 && vp_table_refs == 0` per `extent_can_delete`, but in
-/// NO stream).
-const BOTH_ZERO_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
-
-/// Default period of the sealed-empty backstop; see
-/// `AutumnManager::set_sealed_empty_sweep_interval`.
-pub(crate) const SEALED_EMPTY_SWEEP_INTERVAL_DEFAULT: Duration = Duration::from_secs(60);
-
-/// Extents reclaimed per sealed-empty tick.
-///
-/// Rate-limited because the first tick on a cluster poisoned before the
-/// writer-side reclaim landed has a large backlog to work through — tens of
-/// thousands of extents on the one this was written for — and each reclaimed
-/// extent costs an etcd CAS plus a delete fanout. Draining that over minutes is
-/// deliberate; doing it in one tick would put a metadata storm in front of the
-/// foreground path. Be concrete about what that buys and costs: at 64 per 60 s
-/// tick, the ~40k backlog that motivated this drains in roughly ten HOURS, not
-/// minutes. That is the intended trade for a backstop — the leak is already
-/// there and stable, and the foreground path is not.
-const SEALED_EMPTY_SWEEP_MAX_PER_TICK: usize = 64;
+// The sealed-empty sweep is rate-limited (`--sealed-empty-sweep-max-per-tick`
+// per `--sealed-empty-sweep-interval-secs`): each reclaim is an etcd CAS plus a
+// delete fanout, and a backlog drained in one tick would put a metadata storm in
+// front of the foreground path (64 per 60 s drains a 40k backlog in ~10 hours).
 
 /// backoff cadence for the persisted retry loop. Each
 /// `MgrExtentDeleteRetry` increments `attempts` once per attempt; the
 /// backoff for the next try is `RETRY_BACKOFF_BASE * 2^min(attempts, MAX_SHIFT)`,
 /// floor `RETRY_BACKOFF_BASE`, ceiling `RETRY_BACKOFF_MAX`. With base
 /// = 60 s and max shift = 6, the schedule grows 60 s → 2 min → 4 min →
-/// 8 min → 16 min → 32 min → 1 hr. Ceiling = 1 hr keeps the loop
-/// retrying long-down extents without spamming.
+/// 8 min → 16 min → 32 min → 64 min, capped by
+/// `--delete-retry-backoff-max-secs` (default 1 hr).
 const RETRY_LOOP_INTERVAL: Duration = Duration::from_secs(60);
 const RETRY_BACKOFF_BASE_SECS: i64 = 60;
-const RETRY_BACKOFF_MAX_SECS: i64 = 3600;
 const RETRY_BACKOFF_MAX_SHIFT: u32 = 6;
 
-fn retry_backoff_secs(attempts: u32) -> i64 {
+fn retry_backoff_secs(attempts: u32, max_secs: i64) -> i64 {
     let shift = attempts.min(RETRY_BACKOFF_MAX_SHIFT);
     let v = RETRY_BACKOFF_BASE_SECS.saturating_mul(1i64 << shift);
-    v.clamp(RETRY_BACKOFF_BASE_SECS, RETRY_BACKOFF_MAX_SECS)
+    v.clamp(RETRY_BACKOFF_BASE_SECS, max_secs.max(RETRY_BACKOFF_BASE_SECS))
 }
 
 fn epoch_seconds() -> i64 {
@@ -380,7 +360,7 @@ impl AutumnManager {
         // re-borrows, and the etcd CAS is what makes a concurrent change lose.
         let plans: Vec<(u64, StreamRecord, Vec<u8>, std::collections::HashSet<u64>)> = {
             let s = self.store.inner.borrow();
-            let mut budget = SEALED_EMPTY_SWEEP_MAX_PER_TICK;
+            let mut budget = self.params().sealed_empty_sweep_max_per_tick.get();
             let mut out = Vec::new();
             for (sid, st) in s.streams.iter() {
                 if budget == 0 {
@@ -537,7 +517,8 @@ impl AutumnManager {
 
     pub(crate) async fn sealed_empty_sweep_loop(self) {
         loop {
-            compio::time::sleep(self.sealed_empty_sweep_interval.get()).await;
+            let every = self.params().sealed_empty_sweep_interval_secs.get();
+            compio::time::sleep(Duration::from_secs(every)).await;
             self.sealed_empty_sweep_once().await;
         }
     }
@@ -546,7 +527,8 @@ impl AutumnManager {
     /// `extent_both_zero_sweep_once`; supervised by `start_runtime_tasks`).
     pub(crate) async fn extent_both_zero_sweep_loop(self) {
         loop {
-            compio::time::sleep(BOTH_ZERO_SWEEP_INTERVAL).await;
+            let every = self.params().orphan_sweep_interval_secs.get();
+            compio::time::sleep(Duration::from_secs(every)).await;
             self.extent_both_zero_sweep_once().await;
         }
     }
@@ -600,7 +582,7 @@ impl AutumnManager {
                 }
                 entry.pending_targets = still_pending;
                 entry.attempts += 1;
-                if entry.attempts < MAX_ATTEMPTS {
+                if entry.attempts < self.params().delete_fanout_max_attempts.get() {
                     keep.insert(entry.extent_id, entry);
                 } else {
                     tracing::warn!(
@@ -764,11 +746,12 @@ impl AutumnManager {
             }
 
             let now = epoch_seconds();
+            let backoff_max = self.params().delete_retry_backoff_max_secs.get() as i64;
             let due: Vec<MgrExtentDeleteRetry> = {
                 let queue = self.failed_deletes.borrow();
                 queue
                     .values()
-                    .filter(|e| now - e.last_attempt_at >= retry_backoff_secs(e.attempts))
+                    .filter(|e| now - e.last_attempt_at >= retry_backoff_secs(e.attempts, backoff_max))
                     .cloned()
                     .collect()
             };

@@ -21,7 +21,7 @@ use autumn_rpc::manager_rpc::{
     OP_KIND_REBALANCE, OP_KIND_REPAIR, OP_KIND_SCRUB, OP_KIND_SPLIT, POLICY_KIND_EC,
     POLICY_KIND_GC, POLICY_KIND_HOT_COLD, POLICY_KIND_MAJOR_COMPACT, POLICY_KIND_MERGE,
     POLICY_KIND_MINOR_COMPACT, POLICY_KIND_REBALANCE, POLICY_KIND_REPAIR, POLICY_KIND_SCRUB,
-    POLICY_KIND_SPLIT, SCRUB_POLICY_INTERVAL_SEC,
+    POLICY_KIND_SPLIT,
 };
 
 /// In-manager controller state: the mode + active policy + custom policies +
@@ -294,6 +294,7 @@ pub(crate) fn decide_actions(
     now: i64,
     cooldown_secs: i64,
     max_actions: usize,
+    scrub_interval_secs: i64,
 ) -> Vec<(PolicyCandidate, Vec<String>, String)> {
     let mut ordered: Vec<&PolicyCandidate> = candidates.iter().collect();
     ordered.sort_by_key(|c| kind_priority(c.kind)); // stable — ties keep order
@@ -325,10 +326,10 @@ pub(crate) fn decide_actions(
         let effective_cooldown = match c.kind {
             POLICY_KIND_REBALANCE => cooldown_secs.max(REBALANCE_MIN_ACTUATION_COOLDOWN_SEC),
             POLICY_KIND_MAJOR_COMPACT => cooldown_secs.max(COMPACT_MIN_ACTUATION_COOLDOWN_SEC),
-            // The cadence IS the cooldown: once a week, whatever the policy's
-            // own cooldown says. Persisted with the others, so a failover does
-            // not restart the week.
-            POLICY_KIND_SCRUB => cooldown_secs.max(SCRUB_POLICY_INTERVAL_SEC as i64),
+            // The cadence IS the cooldown (`--scrub-policy-interval-secs`, a
+            // week by default), whatever the policy's own cooldown says.
+            // Persisted with the others, so a failover does not restart it.
+            POLICY_KIND_SCRUB => cooldown_secs.max(scrub_interval_secs),
             _ => cooldown_secs,
         };
         if now - last < effective_cooldown {
@@ -480,6 +481,7 @@ pub(crate) fn cooldown_key(c: &PolicyCandidate) -> String {
 
 #[cfg(test)]
 mod tests {
+    const WEEK: i64 = 7 * 24 * 3600;
     use super::*;
 
     fn cand(kind: u8, prim: u64, sec: u64) -> PolicyCandidate {
@@ -597,7 +599,7 @@ mod tests {
     fn repair_is_actuated_before_anything_else() {
         let cands = vec![cand(POLICY_KIND_SPLIT, 1, 0), cand(POLICY_KIND_REPAIR, 0, 5)];
         let enabled: HashSet<u8> = [POLICY_KIND_SPLIT, POLICY_KIND_REPAIR].into_iter().collect();
-        let picked = decide_actions(&cands, &HashMap::new(), &enabled, 1000, 0, 1);
+        let picked = decide_actions(&cands, &HashMap::new(), &enabled, 1000, 0, 1, WEEK);
         assert_eq!(picked.len(), 1);
         assert_eq!(picked[0].0.kind, POLICY_KIND_REPAIR);
     }
@@ -655,18 +657,18 @@ mod tests {
         let c = cand(POLICY_KIND_SCRUB, 0, 0);
         assert_eq!(candidate_to_cmd(&c), Some(vec!["scrub".to_string(), "--all".to_string()]));
         let key = cooldown_key(&c);
-        let week = SCRUB_POLICY_INTERVAL_SEC as i64;
+        let week = WEEK;
         let now = 10 * week;
         let fresh = HashMap::new();
-        assert_eq!(decide_actions(&[c.clone()], &fresh, &enabled, now, 60, 5).len(), 1);
+        assert_eq!(decide_actions(&[c.clone()], &fresh, &enabled, now, 60, 5, WEEK).len(), 1);
         let mut cds = HashMap::new();
         cds.insert(key.clone(), now - week + 60);
         assert!(
-            decide_actions(&[c.clone()], &cds, &enabled, now, 60, 5).is_empty(),
+            decide_actions(&[c.clone()], &cds, &enabled, now, 60, 5, WEEK).is_empty(),
             "a policy cooldown of 60 s must not shorten the week"
         );
         cds.insert(key, now - week);
-        assert_eq!(decide_actions(&[c], &cds, &enabled, now, 60, 5).len(), 1);
+        assert_eq!(decide_actions(&[c], &cds, &enabled, now, 60, 5, WEEK).len(), 1);
     }
 
     #[test]
@@ -682,7 +684,7 @@ mod tests {
             cand(POLICY_KIND_GC, 5, 0),
             cand(POLICY_KIND_SPLIT, 9, 0),
         ];
-        let out = decide_actions(&cands, &cds, &enabled, 1000, 300, 2);
+        let out = decide_actions(&cands, &cds, &enabled, 1000, 300, 2, WEEK);
         assert_eq!(out.len(), 2, "capped at max_actions");
         assert_eq!(out[0].0.kind, POLICY_KIND_SPLIT, "split before gc before merge");
         assert_eq!(out[1].0.kind, POLICY_KIND_GC);
@@ -693,17 +695,17 @@ mod tests {
         let enabled: HashSet<u8> = [POLICY_KIND_GC].into_iter().collect();
         let cands = vec![cand(POLICY_KIND_SPLIT, 1, 0), cand(POLICY_KIND_GC, 2, 0)];
         // split disabled → only gc considered.
-        let out = decide_actions(&cands, &HashMap::new(), &enabled, 1000, 300, 5);
+        let out = decide_actions(&cands, &HashMap::new(), &enabled, 1000, 300, 5, WEEK);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].0.kind, POLICY_KIND_GC);
         // gc:2 actuated 100 s ago, cooldown 300 s → suppressed.
         let mut cds = HashMap::new();
         cds.insert("gc:2".to_string(), 900i64);
-        let out2 = decide_actions(&cands, &cds, &enabled, 1000, 300, 5);
+        let out2 = decide_actions(&cands, &cds, &enabled, 1000, 300, 5, WEEK);
         assert!(out2.is_empty(), "still cooling down");
         // …but 400 s ago (> cooldown) → allowed.
         cds.insert("gc:2".to_string(), 600i64);
-        assert_eq!(decide_actions(&cands, &cds, &enabled, 1000, 300, 5).len(), 1);
+        assert_eq!(decide_actions(&cands, &cds, &enabled, 1000, 300, 5, WEEK).len(), 1);
     }
 
     /// A policy with `cooldown_sec = 0` must NOT let the expensive kinds
@@ -720,13 +722,13 @@ mod tests {
         let mut cds = HashMap::new();
         cds.insert(key.clone(), 990i64);
         assert!(
-            decide_actions(&cands, &cds, &enabled, 1000, 0, 5).is_empty(),
+            decide_actions(&cands, &cds, &enabled, 1000, 0, 5, WEEK).is_empty(),
             "rebalance floored despite cooldown_sec=0"
         );
         // Past the floor → allowed.
         cds.insert(key, 1000 - REBALANCE_MIN_ACTUATION_COOLDOWN_SEC - 1);
         assert_eq!(
-            decide_actions(&cands, &cds, &enabled, 1000, 0, 5).len(),
+            decide_actions(&cands, &cds, &enabled, 1000, 0, 5, WEEK).len(),
             1,
             "allowed once past the floor"
         );
@@ -740,12 +742,12 @@ mod tests {
         let mut mcd = HashMap::new();
         mcd.insert("major:7".to_string(), 990i64); // 10 s ago
         assert!(
-            decide_actions(&mc, &mcd, &mc_enabled, 1000, 0, 5).is_empty(),
+            decide_actions(&mc, &mcd, &mc_enabled, 1000, 0, 5, WEEK).is_empty(),
             "major compact floored despite cooldown_sec=0"
         );
         mcd.insert("major:7".to_string(), 1000 - COMPACT_MIN_ACTUATION_COOLDOWN_SEC - 1);
         assert_eq!(
-            decide_actions(&mc, &mcd, &mc_enabled, 1000, 0, 5).len(),
+            decide_actions(&mc, &mcd, &mc_enabled, 1000, 0, 5, WEEK).len(),
             1,
             "allowed once past the floor"
         );
@@ -756,7 +758,7 @@ mod tests {
         let mut gcd = HashMap::new();
         gcd.insert("gc:7".to_string(), 999i64); // 1 s ago
         assert_eq!(
-            decide_actions(&gc, &gcd, &gc_enabled, 1000, 0, 5).len(),
+            decide_actions(&gc, &gcd, &gc_enabled, 1000, 0, 5, WEEK).len(),
             1,
             "gc is not floored at cooldown_sec=0"
         );

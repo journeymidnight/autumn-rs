@@ -9,14 +9,17 @@
 //! roof. The limiter caps concurrent in-flight recoveries on three
 //! axes simultaneously:
 //!
-//! - `max_global_concurrent` (default 64): cluster-wide ceiling. Keeps
+//! - `--recovery-max-global` (default 64): cluster-wide ceiling. Keeps
 //!   a single fence from monopolising bandwidth.
-//! - `max_concurrent_per_source` (default 4): per-source-node ceiling.
+//! - `--recovery-max-per-source` (default 4): per-source-node ceiling.
 //!   Without this, a single overloaded source EN serves K-shard reads
 //!   for hundreds of concurrent EC-decode jobs.
-//! - `max_concurrent_per_target` (default 2): per-target-node ceiling.
+//! - `--recovery-max-per-target` (default 2): per-target-node ceiling.
 //!   Without this, a freshly-allocated empty target EN takes hundreds
 //!   of simultaneous writes and exhausts disk IOPS.
+//!
+//! All three are runtime parameters: `set_limits` re-reads them every
+//! dispatch tick, so an `autumn-op config set` lands on the next tick.
 //!
 //! Counters are pure-counter — no persistence. Manager restart resets
 //! them; the dispatch loop re-derives "who is recovering what" from
@@ -28,10 +31,14 @@
 
 use std::collections::HashMap;
 
+use autumn_params::manager::ManagerParams;
+
 pub struct RecoveryRateLimiter {
     pub max_global: u32,
     pub max_per_source: u32,
     pub max_per_target: u32,
+    /// Ceiling of the per-(extent, slot) failure backoff.
+    pub backoff_max_secs: i64,
     pub global_inflight: u32,
     pub per_source: HashMap<u64, u32>,
     pub per_target: HashMap<u64, u32>,
@@ -54,7 +61,7 @@ pub struct BackoffState {
 
 impl Default for RecoveryRateLimiter {
     fn default() -> Self {
-        Self::new(64, 4, 2)
+        Self::from_params(&ManagerParams::default())
     }
 }
 
@@ -64,6 +71,7 @@ impl RecoveryRateLimiter {
             max_global: max_global.max(1),
             max_per_source: max_per_source.max(1),
             max_per_target: max_per_target.max(1),
+            backoff_max_secs: 300,
             global_inflight: 0,
             per_source: HashMap::new(),
             per_target: HashMap::new(),
@@ -71,20 +79,17 @@ impl RecoveryRateLimiter {
         }
     }
 
-    pub fn from_env() -> Self {
-        let g = std::env::var("AUTUMN_MGR_RECOVERY_MAX_GLOBAL")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(64u32);
-        let s = std::env::var("AUTUMN_MGR_RECOVERY_MAX_PER_SOURCE")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(4u32);
-        let t = std::env::var("AUTUMN_MGR_RECOVERY_MAX_PER_TARGET")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(2u32);
-        Self::new(g, s, t)
+    pub fn from_params(p: &ManagerParams) -> Self {
+        let mut l = Self::new(0, 0, 0);
+        l.set_limits(p);
+        l
+    }
+
+    pub fn set_limits(&mut self, p: &ManagerParams) {
+        self.max_global = p.recovery_max_global.get();
+        self.max_per_source = p.recovery_max_per_source.get();
+        self.max_per_target = p.recovery_max_per_target.get();
+        self.backoff_max_secs = p.recovery_backoff_max_secs.get() as i64;
     }
 
     /// Try to reserve a dispatch slot for (source_node, target_node).
@@ -182,16 +187,16 @@ impl RecoveryRateLimiter {
         if e.consecutive_failures == 0 {
             return false;
         }
-        let backoff_secs = Self::backoff_secs(e.consecutive_failures);
+        let backoff_secs = self.backoff_secs(e.consecutive_failures);
         now_s.saturating_sub(e.last_attempt_at) < backoff_secs
     }
 
-    /// 2^N seconds, capped at 300 s (5 min). Caller invokes with
+    /// 2^N seconds, capped at `backoff_max_secs`. Caller invokes with
     /// the new `consecutive_failures` value (1..=u32::MAX).
-    pub fn backoff_secs(consecutive_failures: u32) -> i64 {
+    pub fn backoff_secs(&self, consecutive_failures: u32) -> i64 {
         let shift = consecutive_failures.min(20);
         let secs: i64 = 1i64 << shift;
-        secs.min(300)
+        secs.min(self.backoff_max_secs)
     }
 
     pub fn snapshot(&self) -> (Vec<(u64, u32)>, Vec<(u64, u32)>) {
@@ -217,7 +222,7 @@ impl RecoveryRateLimiter {
             .filter(|(_, st)| st.consecutive_failures > 0)
             .map(|((eid, slot), st)| {
                 let next_retry_at =
-                    st.last_attempt_at + Self::backoff_secs(st.consecutive_failures);
+                    st.last_attempt_at + self.backoff_secs(st.consecutive_failures);
                 (
                     *eid,
                     *slot,
@@ -299,10 +304,11 @@ mod tests {
 
     #[test]
     fn backoff_secs_caps_at_300() {
-        assert_eq!(RecoveryRateLimiter::backoff_secs(1), 2);
-        assert_eq!(RecoveryRateLimiter::backoff_secs(8), 256);
-        assert_eq!(RecoveryRateLimiter::backoff_secs(9), 300);
-        assert_eq!(RecoveryRateLimiter::backoff_secs(20), 300);
+        let l = RecoveryRateLimiter::default();
+        assert_eq!(l.backoff_secs(1), 2);
+        assert_eq!(l.backoff_secs(8), 256);
+        assert_eq!(l.backoff_secs(9), 300);
+        assert_eq!(l.backoff_secs(20), 300);
     }
 
     #[test]

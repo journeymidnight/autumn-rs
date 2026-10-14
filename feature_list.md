@@ -1,6 +1,6 @@
 # autumn-rs feature list — OPEN backlog
 
-**Last updated:** 2026-10-12
+**Last updated:** 2026-10-14
 
 **Rules:**
 - This file tracks the **OPEN backlog only**. A feature that reaches `passes: true`
@@ -13,6 +13,18 @@
 ---
 
 ## Active
+
+### F-PARAMS-REGISTRY — 参数分三类：写死 / 启动 flag / 运行时可由 autumn-op 覆盖
+- **Trigger** (2026-10-14 用户): gallery 等仍从 env 读参数；参数应分三类——代码里写死的、CLI 启动 flag、运行时可被 autumn-op 覆盖的（如在线改恢复速度）；写死参数非必要都应出现在 flag 里；要整理出可在运行时修改的参数。用户否决 `docs/params.md`：参数定义放在单独的 rs 文件里，不靠文档维护。
+- **Scope**:
+  1. 新 crate `crates/params`：每个角色一个 rs 文件，参数定义是唯一来源；flag 解析、`--help`、范围校验、运行时覆盖都从它生成。
+  2. rs 代码里的 env 读取全部改成 flag（gallery、manager 恢复限速/存活/连接超时、etcd 请求超时、EN 预分配/EC 条带、HOSTNAME）。
+  3. 删除 PS 死 flag；越界值、未知参数一律退出码 2（不再静默用默认值）。
+  4. 写死的运维旋钮提成 flag（manager/PS/EN/SDK/fs/fuse/autumnfs/s3/gallery/dashboard）；格式、协议不变量和互相绑死的超时不动。
+  5. authz 配置拉取周期 5 s → 30 s（flag）；遇未知 namespace / kid 立即补拉（限每秒一次）；EN 每进程拉一次而非每 shard。
+  6. 新 `MSG_GET_RUNTIME_CONFIG`，在同一拉取循环里取；覆盖值存 etcd，`autumn-op config list/get/set/unset`；生效顺序 覆盖值 > flag > 默认；运行时可改范围（用户定）：恢复/修复速度（manager、EN）与 PS 后台限速。
+- **Acceptance**: rs 非测试代码里无 `std::env::var`（RUST_LOG/UCX/jemalloc 库自身除外）；每个 binary 的 `--help` 列出全部参数及默认值；越界与未知参数退出码 2（测试）；新建 namespace 后第一次写在补拉后成功、无需等 30 s（测试）；`autumn-op config set` 恢复速度与 PS 限速在一个拉取周期内生效、`unset` 回到 flag 值、换主后仍在（集成测试 + 真集群）；未知 key 或越界值在 `config set` 时被拒；全量单测与 manager 集成套件通过；热路径改动做 perf A/B。
+- `passes: false`
 
 ### BUG-MAINT-LOOP-STARVED-BY-MINORS — 持续写入时回收探测 / 下发的 GC 可能一直排不上（推断，未复现）
 - **Trigger** (2026-10-10 minor compaction 重设计的 fable 评审): `background_maintenance_loop` 的 tick 只在 `select_minor` 找不到窗口时才派回收探测（`spawn_reclaim_probe`）。推断：高写入 PS 上 minor 排在 PS 级 compact permit 后面，tick 时总有窗口，探测永远不跑，被老大表钉住的 row stream 前缀一直截不掉。

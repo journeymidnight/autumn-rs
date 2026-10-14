@@ -13,118 +13,6 @@ use autumn_rpc::manager_rpc::{
 
 const GIB: u64 = 1024 * 1024 * 1024;
 
-/// Two size measures, two different questions, and getting them the wrong way
-/// round produced both of this module's historical misfires.
-///
-/// - `PartitionLoad.size_bytes` — **LSM-resident**: Σ SST len + memtables.
-/// - `effective_size_bytes` — **carried**: `max(size_bytes, est_live)`, which
-///   adds the large-value payload sitting in `log_stream` (a VP workload keeps
-///   only ~24-40 B pointers in the LSM, so carried runs ~60× LSM: live part 17
-///   was 741 MB LSM against ~45 GB of stream bytes).
-///
-/// **A split divides the key range, and only the LSM follows the key range.**
-/// The values do not: a CoW split leaves both children referencing the SAME
-/// log_stream extents, and nothing physically separates them until a major
-/// compaction rewrites the tables and GC relocates the live payload. So a
-/// partition carrying 73 GiB behind a 0 MiB LSM, serving no requests, gains
-/// nothing from a split except that compaction bill — which is what the
-/// carried-bytes trigger used to advise, every window, for as long as the
-/// partition existed.
-///
-/// Hence: the hard SIZE trigger reads LSM-resident bytes (`SPLIT_LSM_HARD`),
-/// and carried bytes keep their two other jobs, where the payload genuinely is
-/// what matters — the floor under the rate triggers (`SPLIT_SIZE_MIN`), and
-/// the veto on merge (`MERGE_SIZE_LOW`), since merging two fat partitions
-/// really does put all of those bytes behind one thread.
-///
-/// The 50 GiB value is unchanged from when it was applied to carried bytes.
-/// For a small-value workload the two measures are CLOSE but not equal —
-/// `est_live` also counts live `log_stream` (WAL) and meta_stream bytes on top
-/// of the row_stream SSTs — so the hard trigger now fires at the same point or
-/// slightly later for every workload, not identically. The gap is the WAL tail,
-/// not the 60× the VP case shows; the recalibration it might deserve wants a
-/// measurement on the perf cluster, not a guess here.
-pub const SPLIT_LSM_HARD: u64 = 50 * GIB;
-pub const SPLIT_SIZE_MIN: u64 = GIB;
-/// recalibrated 50K → 15K. autumn-rs's measured single-partition
-/// QPS ceiling on the perf_check workload is ~30K (one P-log thread,
-/// one io_uring). 15K = 50% of ceiling — "this partition is using
-/// half its single-thread budget, time to split." Previously the value
-/// was 50K which is unreachable on this engine; condition ② of the
-/// SPLIT predicate (`req_per_sec > SPLIT_QPS_HIGH && size > SPLIT_
-/// SIZE_MIN`) was effectively dead code.
-pub const SPLIT_QPS_HIGH: u32 = 15_000;
-/// The BYTE-RATE ceiling, which for a large-value workload is the one that
-/// binds: a partition is one log_stream, measured at ~350 MB/s, and no number
-/// of requests per second describes that limit — 1 500 ops/s of 8 MiB values
-/// saturates it while reading as an idle partition to `SPLIT_QPS_HIGH`.
-///
-/// 175 MiB/s = 50 % of the measured ceiling, the same "using half its
-/// single-stream budget" rule `SPLIT_QPS_HIGH` applies to the request ceiling.
-/// Read + write summed: the stream is one pipe.
-///
-/// What "sustained" means here, precisely, because it is weaker than it sounds:
-/// the PS ships a 5-SECOND average every 5 s and the policy bucket is 60 s
-/// LAST-WINS, so "all N buckets" tests five 5-second samples taken a minute
-/// apart — 25 s of coverage across a 5-minute span, not an integral over it. A
-/// writer that bursts near each minute boundary passes; one at 170 MiB/s
-/// continuously does not. This aliasing is inherited from `SPLIT_QPS_HIGH`
-/// rather than introduced here, but byte rate on a large-value workload is
-/// burstier than request rate, so this trigger leans on it harder.
-pub const SPLIT_BW_HIGH: u64 = 175 * 1024 * 1024;
-pub const SPLIT_IMMFULL_HIGH: u32 = 10;
-pub const SPLIT_COOLDOWN_SEC: i64 = 3600;
-
-pub const MERGE_SIZE_LOW: u64 = GIB;
-/// recalibrated 5K → 1.5K to preserve the 10× hysteresis ratio
-/// against the new `SPLIT_QPS_HIGH = 15K`. 1.5K = 5% of single-partition
-/// ceiling — "two adjacent cold partitions barely make a dent, merge
-/// them to free a core slot."
-pub const MERGE_QPS_LOW: u32 = 1_500;
-/// Byte-rate counterpart of `MERGE_QPS_LOW`. Without it the cold test can pass
-/// on a pair that is moving real data: 1 400 ops/s of 1 MiB values is under the
-/// QPS floor and is 1.4 GB/s, and merging them puts all of it on one log_stream.
-///
-/// Compared against the SUM over the pair and over both directions, exactly as
-/// `MERGE_QPS_LOW` sums the pair's requests — so the 10× hysteresis holds of
-/// the POST-MERGE partition (the entity a merge creates and the right one to
-/// compare against `SPLIT_BW_HIGH`), and is 20× per side.
-pub const MERGE_BW_LOW: u64 = SPLIT_BW_HIGH / 10;
-pub const MERGE_COOLDOWN_SEC: i64 = 6 * 3600;
-
-/// GC debt advisory threshold. Default 1 GiB sustained — large
-/// enough to filter normal write churn, small enough that operators
-/// notice before disk pressure. Tunable via `PolicyConfig`.
-pub const GC_DEBT_HIGH: u64 = GIB;
-/// major-compaction debt advisory threshold. Default 4 GiB — higher
-/// than GC because compact's pending bytes naturally accumulate to
-/// flush-size × N tables before the periodic loop fires.
-pub const COMPACT_PENDING_HIGH: u64 = 4 * GIB;
-/// GC advisory cooldown. Once an advisory fires for a partition,
-/// suppress re-emission for 5 min so operators can react without
-/// duplicate-noise. Distinct from any auto-trigger cooldown (Stage 2/3
-/// territory).
-pub const GC_COOLDOWN_SEC: i64 = 300;
-/// compaction advisory cooldown.
-pub const COMPACT_COOLDOWN_SEC: i64 = 300;
-
-/// minimum sealed-extent size to even consider EC advice. Below
-/// this, the EC encode + K+M shard write + manager state churn
-/// outweigh the (replication - K/(K+M)) × `sealed_length` saved.
-/// Aligned with the deferred PS-side `EC_MIN_EXTENT_BYTES` const in
-/// the plan; 64 MiB matches WAS lazy-EC heuristics.
-pub const EC_MIN_EXTENT_BYTES: u64 = 64 * 1024 * 1024;
-
-/// drop a partition's metrics window when its latest bucket
-/// is older than this. Without it, a deleted / merged-away partition's
-/// final `PartitionLoad` snapshot kept driving advisories indefinitely
-/// (the manager never explicitly clears `metrics[part_id]` on partition
-/// drop). 5 min covers a full `POLICY_REQUIRED_BUCKETS × bucket_sec`
-/// window plus slack — anything older has no valid contribution to any
-/// `required_buckets`-spanning advisory. Set in seconds (i64 to match
-/// the rest of the policy clock).
-pub const STALE_METRICS_AGE_SEC: i64 = 300;
-
 /// per-tick cap on EC-conversion advisory candidates. Without
 /// it, a backlog of N sealed-not-converted extents (real-cluster
 /// observation: 10k+ after a controller pause) emits N candidates per
@@ -141,38 +29,6 @@ pub const STALE_METRICS_AGE_SEC: i64 = 300;
 /// not "lose" them.
 pub const MAX_EC_ADVISORY_CANDIDATES: usize = 256;
 
-pub const POLICY_BUCKET_SEC: i64 = 60;
-/// trimmed 30 → 10 buckets. Only `REQUIRED_BUCKETS = 5` are ever
-/// consulted; the extra 25 buckets were dead memory. 10 keeps 2× safety
-/// margin for a future advisory that needs slightly more history.
-pub const POLICY_WINDOW_BUCKETS: usize = 10;
-pub const POLICY_REQUIRED_BUCKETS: usize = 5;
-pub const POLICY_TICK_INTERVAL_SEC: i64 = 60;
-
-/// Stage D: hot/cold imbalance advisory thresholds. Per PS, the
-/// ratio `max(req_per_sec) / max(1, min(req_per_sec))` over
-/// `required_buckets` consecutive sustained windows must exceed this
-/// to trigger a single advisory candidate listing the hot + cold partitions.
-pub const HOT_COLD_RATIO: u32 = 10;
-/// The hottest partition must additionally exceed this floor so a
-/// uniformly-cold cluster (e.g. idle dev) doesn't spam the operator.
-/// pinned to **10_000** (≈ 1/3 of the measured ~30K single-partition
-/// QPS ceiling). Decoupled from `SPLIT_QPS_HIGH` — operators tuning
-/// the split threshold no longer auto-shift the hot/cold floor.
-pub const HOT_COLD_MIN_HOT_QPS: u32 = 10_000;
-/// Stage D (size dimension): same 10× ratio, but on
-/// `size_bytes`. Catches large-value / low-QPS workloads that QPS
-/// imbalance can't see.
-pub const HOT_COLD_SIZE_RATIO: u64 = 10;
-/// Size-dimension floor: the largest partition must exceed this to be worth
-/// flagging. 25 GiB of CARRIED bytes — this advisory's size dimension is about
-/// where the data sits across the PS's partitions, so unlike the split trigger
-/// it reads the payload too, and it is a standalone number rather than a
-/// fraction of a threshold that measures something else.
-pub const HOT_COLD_MIN_HOT_SIZE_BYTES: u64 = 25 * GIB;
-/// Per-PS advisory cooldown — suppress re-emission for 5 min so the
-/// operator log isn't flooded while imbalance persists.
-pub const HOT_COLD_COOLDOWN_SEC: i64 = 300;
 /// band tightener for hot/cold classification. A partition
 /// only qualifies as "hot" when its window MIN is still within
 /// 1/HOT_COLD_BAND_DIVISOR of the PS's hottest reading — i.e. its
@@ -187,94 +43,190 @@ pub const HOT_COLD_COOLDOWN_SEC: i64 = 300;
 /// stay silent rather than recommending an action against it.
 pub const HOT_COLD_BAND_DIVISOR: u32 = 2;
 
-/// Phase B: emit a rebalance advisory only when the per-PS
-/// partition-count spread (max − min) EXCEEDS this. `2` gives hysteresis — a
-/// balanced cluster's irreducible remainder gap is ≤ 1, and a transient gap of 2
-/// (one partition mid-reopen) shouldn't trigger a move; a gap of 3+ is a real
-/// imbalance worth correcting.
-pub const REBALANCE_GAP_THRESHOLD: usize = 2;
-/// Cluster-level cooldown between rebalance advisories — each actuation moves a
-/// bounded batch, so re-emit only after the reopen churn settles.
-pub const REBALANCE_COOLDOWN_SEC: i64 = 120;
-/// How many partitions one armed rebalance actuation moves per tick — bounded so
-/// the target PSes aren't hit by a reopen storm; convergence is gradual across
-/// ticks (HBase limits concurrent region moves the same way).
-pub const REBALANCE_MAX_MOVES_PER_TICK: u32 = 4;
-
-/// runtime-configurable policy thresholds. Production uses the
-/// `*_DEFAULT` constants above; tests can lower `required_buckets` and
-/// `tick_interval_sec` to exercise the full policy_tick_loop fast.
+/// Policy thresholds. Defaults and flags: `autumn_params::manager`; tests
+/// lower `required_buckets` / `tick_interval_sec` to run the tick fast.
 #[derive(Clone, Debug)]
 pub struct PolicyConfig {
-    /// LSM-RESIDENT bytes above which a partition should be split (see the
-    /// `SPLIT_LSM_HARD` doc for why this measure and not carried bytes).
+    /// Two size measures, two different questions, and getting them the wrong way
+    /// round produced both of this module's historical misfires.
+    ///
+    /// - `PartitionLoad.size_bytes` — **LSM-resident**: Σ SST len + memtables.
+    /// - `effective_size_bytes` — **carried**: `max(size_bytes, est_live)`, which
+    ///   adds the large-value payload sitting in `log_stream` (a VP workload keeps
+    ///   only ~24-40 B pointers in the LSM, so carried runs ~60× LSM: live part 17
+    ///   was 741 MB LSM against ~45 GB of stream bytes).
+    ///
+    /// **A split divides the key range, and only the LSM follows the key range.**
+    /// The values do not: a CoW split leaves both children referencing the SAME
+    /// log_stream extents, and nothing physically separates them until a major
+    /// compaction rewrites the tables and GC relocates the live payload. So a
+    /// partition carrying 73 GiB behind a 0 MiB LSM, serving no requests, gains
+    /// nothing from a split except that compaction bill — which is what the
+    /// carried-bytes trigger used to advise, every window, for as long as the
+    /// partition existed.
+    ///
+    /// Hence: the hard SIZE trigger reads LSM-resident bytes (`--split-lsm-hard-bytes`),
+    /// and carried bytes keep their two other jobs, where the payload genuinely is
+    /// what matters — the floor under the rate triggers (`--split-size-min-bytes`), and
+    /// the veto on merge (`--merge-size-low-bytes`), since merging two fat partitions
+    /// really does put all of those bytes behind one thread.
+    ///
+    /// For a small-value workload the two measures are CLOSE but not equal —
+    /// `est_live` also counts live `log_stream` (WAL) and meta_stream bytes on top
+    /// of the row_stream SSTs. The gap is the WAL tail, not the 60× the VP case
+    /// shows.
     pub split_lsm_hard: u64,
     /// CARRIED bytes a partition must exceed before a rate trigger may split
     /// it — a floor, not a trigger.
     pub split_size_min: u64,
+    /// The measured single-partition QPS ceiling on the perf_check workload is
+    /// ~30K (one P-log thread, one io_uring); 15K = 50% of it — "this partition
+    /// is using half its single-thread budget, time to split."
     pub split_qps_high: u32,
-    /// Sustained read+write bytes/sec above which the partition's single
-    /// log_stream is the bottleneck.
+    /// The BYTE-RATE ceiling, which for a large-value workload is the one that
+    /// binds: a partition is one log_stream, measured at ~350 MB/s, and no number
+    /// of requests per second describes that limit — 1 500 ops/s of 8 MiB values
+    /// saturates it while reading as an idle partition to `--split-qps-high`.
+    ///
+    /// 175 MiB/s = 50 % of the measured ceiling, the same "using half its
+    /// single-stream budget" rule `--split-qps-high` applies to the request ceiling.
+    /// Read + write summed: the stream is one pipe.
+    ///
+    /// What "sustained" means here, precisely, because it is weaker than it sounds:
+    /// the PS ships a 5-SECOND average every 5 s and the policy bucket is 60 s
+    /// LAST-WINS, so "all N buckets" tests five 5-second samples taken a minute
+    /// apart — 25 s of coverage across a 5-minute span, not an integral over it. A
+    /// writer that bursts near each minute boundary passes; one at 170 MiB/s
+    /// continuously does not. This aliasing is inherited from `--split-qps-high`
+    /// rather than introduced here, but byte rate on a large-value workload is
+    /// burstier than request rate, so this trigger leans on it harder.
     pub split_bw_high: u64,
     pub split_immfull_high: u32,
     pub split_cooldown_sec: i64,
     pub merge_size_low: u64,
+    /// 10× hysteresis against `split_qps_high`: 1.5K = 5% of the single-partition
+    /// ceiling — "two adjacent cold partitions barely make a dent, merge
+    /// them to free a core slot."
     pub merge_qps_low: u32,
-    /// Summed read+write bytes/sec below which a pair counts as cold.
+    /// Byte-rate counterpart of `--merge-qps-low`. Without it the cold test can pass
+    /// on a pair that is moving real data: 1 400 ops/s of 1 MiB values is under the
+    /// QPS floor and is 1.4 GB/s, and merging them puts all of it on one log_stream.
+    ///
+    /// Compared against the SUM over the pair and over both directions, exactly as
+    /// `--merge-qps-low` sums the pair's requests — so the 10× hysteresis holds of
+    /// the POST-MERGE partition (the entity a merge creates and the right one to
+    /// compare against `--split-bw-high-bytes`), and is 20× per side.
     pub merge_bw_low: u64,
     pub merge_cooldown_sec: i64,
     pub bucket_sec: i64,
+    /// Only `required_buckets` are consulted; 10 keeps a 2× margin over the
+    /// default 5.
     pub window_buckets: usize,
     pub required_buckets: usize,
     pub tick_interval_sec: i64,
-    /// gc advisory threshold (bytes, sustained over
-    /// `required_buckets`).
+    /// drop a partition's metrics window when its latest bucket
+    /// is older than this. Without it, a deleted / merged-away partition's
+    /// final `PartitionLoad` snapshot kept driving advisories indefinitely
+    /// (the manager never explicitly clears `metrics[part_id]` on partition
+    /// drop). 5 min covers a full `required_buckets × bucket_sec` window plus
+    /// slack.
+    pub stale_metrics_age_sec: i64,
+    /// GC debt advisory threshold. Default 1 GiB sustained — large
+    /// enough to filter normal write churn, small enough that operators
+    /// notice before disk pressure.
     pub gc_debt_high: u64,
-    /// compaction advisory threshold (bytes, sustained over
-    /// `required_buckets`).
+    /// major-compaction debt advisory threshold. Default 4 GiB — higher
+    /// than GC because compact's pending bytes naturally accumulate to
+    /// flush-size × N tables before the periodic loop fires.
     pub compact_pending_high: u64,
-    /// gc advisory cooldown (seconds since `last_gc_at`).
+    /// GC advisory cooldown. Once an advisory fires for a partition,
+    /// suppress re-emission for 5 min so operators can react without
+    /// duplicate-noise.
     pub gc_cooldown_sec: i64,
-    /// compact advisory cooldown (seconds since `last_compact_at`).
+    /// compaction advisory cooldown.
     pub compact_cooldown_sec: i64,
-    /// minimum sealed-extent size below which EC advisory is
-    /// suppressed (encode overhead would outweigh the savings).
+    /// minimum sealed-extent size to even consider EC advice. Below
+    /// this, the EC encode + K+M shard write + manager state churn
+    /// outweigh the (replication - K/(K+M)) × `sealed_length` saved.
+    /// 64 MiB matches WAS lazy-EC heuristics.
     pub ec_min_extent_bytes: u64,
-    /// Phase B: fire the rebalance advisory when the per-PS
-    /// partition-count spread exceeds this (0 = disable the advisory entirely).
+    /// Phase B: emit a rebalance advisory only when the per-PS
+    /// partition-count spread (max − min) EXCEEDS this. `2` gives hysteresis — a
+    /// balanced cluster's irreducible remainder gap is ≤ 1, and a transient gap of 2
+    /// (one partition mid-reopen) shouldn't trigger a move; a gap of 3+ is a real
+    /// imbalance worth correcting.
     pub rebalance_gap_threshold: usize,
-    /// Phase B: cluster-level rebalance advisory cooldown.
+    /// Cluster-level cooldown between rebalance advisories — each actuation moves a
+    /// bounded batch, so re-emit only after the reopen churn settles.
     pub rebalance_cooldown_sec: i64,
-    /// Phase B: partitions an armed rebalance moves per tick.
+    /// How many partitions one armed rebalance actuation moves per tick — bounded so
+    /// the target PSes aren't hit by a reopen storm; convergence is gradual across
+    /// ticks (HBase limits concurrent region moves the same way).
     pub rebalance_max_moves_per_tick: u32,
+    /// Stage D: hot/cold imbalance advisory thresholds. Per PS, the
+    /// ratio `max(req_per_sec) / max(1, min(req_per_sec))` over
+    /// `required_buckets` consecutive sustained windows must exceed this
+    /// to trigger a single advisory candidate listing the hot + cold partitions.
+    pub hot_cold_ratio: u32,
+    /// The hottest partition must additionally exceed this floor so a
+    /// uniformly-cold cluster (e.g. idle dev) doesn't spam the operator.
+    /// pinned to **10_000** (≈ 1/3 of the measured ~30K single-partition
+    /// QPS ceiling). Decoupled from `--split-qps-high` — operators tuning
+    /// the split threshold no longer auto-shift the hot/cold floor.
+    pub hot_cold_min_hot_qps: u32,
+    /// Stage D (size dimension): same 10× ratio, but on
+    /// `size_bytes`. Catches large-value / low-QPS workloads that QPS
+    /// imbalance can't see.
+    pub hot_cold_size_ratio: u64,
+    /// Size-dimension floor: the largest partition must exceed this to be worth
+    /// flagging. 25 GiB of CARRIED bytes — this advisory's size dimension is about
+    /// where the data sits across the PS's partitions, so unlike the split trigger
+    /// it reads the payload too, and it is a standalone number rather than a
+    /// fraction of a threshold that measures something else.
+    pub hot_cold_min_hot_size_bytes: u64,
+    /// Per-PS advisory cooldown — suppress re-emission for 5 min so the
+    /// operator log isn't flooded while imbalance persists.
+    pub hot_cold_cooldown_sec: i64,
+}
+
+impl PolicyConfig {
+    pub fn from_params(p: &autumn_params::manager::ManagerParams) -> Self {
+        Self {
+            split_lsm_hard: p.split_lsm_hard_bytes.get(),
+            split_size_min: p.split_size_min_bytes.get(),
+            split_qps_high: p.split_qps_high.get(),
+            split_bw_high: p.split_bw_high_bytes.get(),
+            split_immfull_high: p.split_immfull_high.get(),
+            split_cooldown_sec: p.split_cooldown_secs.get(),
+            merge_size_low: p.merge_size_low_bytes.get(),
+            merge_qps_low: p.merge_qps_low.get(),
+            merge_bw_low: p.merge_bw_low_bytes.get(),
+            merge_cooldown_sec: p.merge_cooldown_secs.get(),
+            bucket_sec: p.policy_bucket_secs.get(),
+            window_buckets: p.policy_window_buckets.get(),
+            required_buckets: p.policy_required_buckets.get(),
+            tick_interval_sec: p.policy_tick_secs.get(),
+            stale_metrics_age_sec: p.policy_stale_metrics_secs.get(),
+            gc_debt_high: p.gc_debt_high_bytes.get(),
+            compact_pending_high: p.compact_pending_high_bytes.get(),
+            gc_cooldown_sec: p.gc_cooldown_secs.get(),
+            compact_cooldown_sec: p.compact_cooldown_secs.get(),
+            ec_min_extent_bytes: p.ec_min_extent_bytes.get(),
+            rebalance_gap_threshold: p.rebalance_gap_threshold.get(),
+            rebalance_cooldown_sec: p.rebalance_cooldown_secs.get(),
+            rebalance_max_moves_per_tick: p.rebalance_max_moves_per_tick.get(),
+            hot_cold_ratio: p.hot_cold_ratio.get(),
+            hot_cold_min_hot_qps: p.hot_cold_min_hot_qps.get(),
+            hot_cold_size_ratio: p.hot_cold_size_ratio.get(),
+            hot_cold_min_hot_size_bytes: p.hot_cold_min_hot_size_bytes.get(),
+            hot_cold_cooldown_sec: p.hot_cold_cooldown_secs.get(),
+        }
+    }
 }
 
 impl Default for PolicyConfig {
     fn default() -> Self {
-        Self {
-            split_lsm_hard: SPLIT_LSM_HARD,
-            split_size_min: SPLIT_SIZE_MIN,
-            split_qps_high: SPLIT_QPS_HIGH,
-            split_bw_high: SPLIT_BW_HIGH,
-            split_immfull_high: SPLIT_IMMFULL_HIGH,
-            split_cooldown_sec: SPLIT_COOLDOWN_SEC,
-            merge_size_low: MERGE_SIZE_LOW,
-            merge_qps_low: MERGE_QPS_LOW,
-            merge_bw_low: MERGE_BW_LOW,
-            merge_cooldown_sec: MERGE_COOLDOWN_SEC,
-            bucket_sec: POLICY_BUCKET_SEC,
-            window_buckets: POLICY_WINDOW_BUCKETS,
-            required_buckets: POLICY_REQUIRED_BUCKETS,
-            tick_interval_sec: POLICY_TICK_INTERVAL_SEC,
-            gc_debt_high: GC_DEBT_HIGH,
-            compact_pending_high: COMPACT_PENDING_HIGH,
-            gc_cooldown_sec: GC_COOLDOWN_SEC,
-            compact_cooldown_sec: COMPACT_COOLDOWN_SEC,
-            ec_min_extent_bytes: EC_MIN_EXTENT_BYTES,
-            rebalance_gap_threshold: REBALANCE_GAP_THRESHOLD,
-            rebalance_cooldown_sec: REBALANCE_COOLDOWN_SEC,
-            rebalance_max_moves_per_tick: REBALANCE_MAX_MOVES_PER_TICK,
-        }
+        Self::from_params(&autumn_params::manager::ManagerParams::default())
     }
 }
 
@@ -386,8 +338,10 @@ pub struct PartitionMetricsWindow {
 }
 
 impl PartitionMetricsWindow {
+    #[cfg(test)]
     pub fn push(&mut self, ts: i64, load: PartitionLoad) {
-        self.push_with_cap_and_bucket(ts, load, POLICY_WINDOW_BUCKETS, POLICY_BUCKET_SEC);
+        let c = PolicyConfig::default();
+        self.push_with_cap_and_bucket(ts, load, c.window_buckets, c.bucket_sec);
     }
     /// snap `ts` to a `bucket_sec` boundary. If the previous
     /// entry shares that snapped bucket, REPLACE its load (last-wins
@@ -466,7 +420,7 @@ impl PolicyEngine {
 
     /// drop metrics windows that no longer correspond to a
     /// known partition (post-split / merge / PS-evict) OR whose latest
-    /// bucket is stale beyond `STALE_METRICS_AGE_SEC`. Previously the
+    /// bucket is stale beyond `--policy-stale-metrics-secs`. Previously the
     /// `policy_tick_loop` would happily emit advisories — including
     /// MERGE candidates pointing at a victim that no longer exists —
     /// off these zombie windows. Also clears the per-PS hot/cold
@@ -481,7 +435,7 @@ impl PolicyEngine {
                 return false;
             }
             match window.buckets.back() {
-                Some((ts, _)) => now - *ts <= STALE_METRICS_AGE_SEC,
+                Some((ts, _)) => now - *ts <= self.config.stale_metrics_age_sec,
                 None => false,
             }
         });
@@ -524,7 +478,7 @@ impl PolicyEngine {
     /// CARRIED bytes are deliberately NOT a fourth row. The payload lives in the
     /// shared `log_stream`; a CoW split leaves both children on the same extents
     /// and buys nothing until a major compaction rewrites them (see
-    /// `SPLIT_LSM_HARD`). Carried bytes stay as the FLOOR under the two rate
+    /// `--split-lsm-hard-bytes`). Carried bytes stay as the FLOOR under the two rate
     /// triggers, which is the question they answer well: is there enough here
     /// to be worth cutting at all.
     ///
@@ -1174,10 +1128,10 @@ impl PolicyEngine {
     /// `required_buckets` for TWO dimensions:
     ///
     /// 1. **QPS**: `req_per_sec`. Triggers when the PS's `max(part.max_req)
-    ///    / max(1, min(part.min_req)) >= HOT_COLD_RATIO (10)` AND the
-    ///    hottest's `max_req > HOT_COLD_MIN_HOT_QPS (10_000)`.
+    ///    / max(1, min(part.min_req)) >= cfg.hot_cold_ratio (10)` AND the
+    ///    hottest's `max_req > cfg.hot_cold_min_hot_qps (10_000)`.
     /// 2. **Size**: `size_bytes`. Same 10× ratio with floor
-    ///    `HOT_COLD_MIN_HOT_SIZE_BYTES` (25 GiB of CARRIED bytes — this
+    ///    `--hot-cold-min-hot-size-bytes` (25 GiB of CARRIED bytes — this
     ///    advisory's size dimension is about where the data SITS, so unlike the
     ///    split trigger it counts the large-value payload).
     ///    Catches large-value / low-QPS workloads that the QPS check
@@ -1188,7 +1142,7 @@ impl PolicyEngine {
     /// coldest part_ids in `primary_part_id` / `secondary_part_id` and
     /// the full hot/cold lists + ratios in `reason`. Shared per-PS
     /// cooldown via `last_hot_cold_at`: at most one candidate per PS per
-    /// `HOT_COLD_COOLDOWN_SEC` (5 min).
+    /// `--hot-cold-cooldown-secs` (5 min).
     ///
     /// The returned candidates are appended to the manager's
     /// `advisory_cache` by `policy_tick_loop`, so `client info`
@@ -1278,20 +1232,20 @@ impl PolicyEngine {
                 continue;
             }
             if let Some(&last) = self.last_hot_cold_at.get(&ps_id) {
-                if now - last < HOT_COLD_COOLDOWN_SEC {
+                if now - last < cfg.hot_cold_cooldown_sec {
                     continue;
                 }
             }
             // ── QPS dimension ──────────────────────────────────────
             let qps_hottest = parts.iter().map(|t| t.2).max().unwrap_or(0);
             let qps_coldest = parts.iter().map(|t| t.1).min().unwrap_or(0);
-            let qps_fire = qps_hottest >= HOT_COLD_MIN_HOT_QPS
-                && qps_hottest / qps_coldest.max(1) >= HOT_COLD_RATIO;
+            let qps_fire = qps_hottest >= cfg.hot_cold_min_hot_qps
+                && qps_hottest / qps_coldest.max(1) >= cfg.hot_cold_ratio;
             // ── Size dimension ─────────────────────────────────────
             let size_hottest = parts.iter().map(|t| t.4).max().unwrap_or(0);
             let size_coldest = parts.iter().map(|t| t.3).min().unwrap_or(0);
-            let size_fire = size_hottest >= HOT_COLD_MIN_HOT_SIZE_BYTES
-                && size_hottest / size_coldest.max(1) >= HOT_COLD_SIZE_RATIO;
+            let size_fire = size_hottest >= cfg.hot_cold_min_hot_size_bytes
+                && size_hottest / size_coldest.max(1) >= cfg.hot_cold_size_ratio;
             if !qps_fire && !size_fire {
                 continue;
             }

@@ -8,8 +8,8 @@
 //! changes hands.
 //!
 //! The append goes through `txn_fenced` so a deposed leader's
-//! audit write fails along with everything else. GC runs every hour
-//! and deletes records older than `AUTUMN_MGR_AUDIT_RETENTION_DAYS`
+//! audit write fails along with everything else. GC runs daily
+//! and deletes records older than `--audit-retention-days`
 //! (default 90).
 
 use autumn_rpc::manager_rpc::MgrAuditEntry;
@@ -132,7 +132,7 @@ impl AutumnManager {
     pub(crate) async fn audit_retention_gc(&self) {
         // convention: config via CLI flag (--audit-retention-days),
         // not env (the original env read predates the no-env rule).
-        let days = self.audit_retention_days.get();
+        let days = self.params.audit_retention_days.get();
         if days == 0 {
             return; // 0 = retention disabled
         }

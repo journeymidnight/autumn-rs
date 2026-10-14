@@ -33,7 +33,13 @@ pub struct EtcdClient {
     endpoints: Vec<String>,
     /// Index of the currently connected endpoint.
     current_ep: Rc<RefCell<usize>>,
+    /// Bound on every unary call (and on its reconnect). etcd over h2c has no
+    /// request deadline of its own, so a half-open connection would hang the
+    /// caller forever; a timeout turns it into the reconnect-and-retry path.
+    request_timeout: std::time::Duration,
 }
+
+const DEFAULT_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 impl EtcdClient {
     /// Connect to an etcd endpoint (plaintext HTTP/2, h2c).
@@ -46,6 +52,7 @@ impl EtcdClient {
             channel: Rc::new(RefCell::new(channel)),
             endpoints: vec![addr],
             current_ep: Rc::new(RefCell::new(0)),
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
         })
     }
 
@@ -61,6 +68,7 @@ impl EtcdClient {
                         channel: Rc::new(RefCell::new(channel)),
                         endpoints,
                         current_ep: Rc::new(RefCell::new(i)),
+                        request_timeout: DEFAULT_REQUEST_TIMEOUT,
                     });
                 }
                 Err(e) => {
@@ -69,6 +77,11 @@ impl EtcdClient {
             }
         }
         bail!("failed to connect to any etcd endpoint: {:?}", endpoints)
+    }
+
+    pub fn with_request_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.request_timeout = timeout;
+        self
     }
 
     // ── KV: Get ──────────────────────────────────────────────────────────
@@ -197,7 +210,7 @@ impl EtcdClient {
         req: &Req,
     ) -> Result<Resp> {
         let body = grpc_encode(req);
-        let timeout = request_timeout();
+        let timeout = self.request_timeout;
 
         // clone the SendRequest out of the RefCell, then drop the borrow
         // before awaiting. Holding `RefMut<GrpcChannel>` across `.await` would
@@ -243,24 +256,6 @@ impl EtcdClient {
     async fn reconnect(&self) -> Result<()> {
         reconnect_shared(&self.channel, &self.endpoints, &self.current_ep).await
     }
-}
-
-/// Reconnect to the next available etcd endpoint (round-robin).
-/// (1A): per-request timeout for every etcd unary RPC. etcd over h2c
-/// has no built-in request deadline, so a half-open TCP connection or a
-/// stuck server would hang the caller forever. Every manager background
-/// loop ultimately awaits an etcd call; an unbounded hang here silently
-/// froze `node_health_loop` for ~11 min in production (no df, no recovery
-/// apply). Default 10 s — generous enough never to false-trip a healthy
-/// etcd (ops are normally sub-ms), tight enough to convert a true hang
-/// into a retryable error. Env `AUTUMN_ETCD_REQUEST_TIMEOUT_MS`.
-fn request_timeout() -> std::time::Duration {
-    let ms = std::env::var("AUTUMN_ETCD_REQUEST_TIMEOUT_MS")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(10_000)
-        .max(1_000);
-    std::time::Duration::from_millis(ms)
 }
 
 async fn reconnect_shared(

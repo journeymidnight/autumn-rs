@@ -59,7 +59,7 @@ fn start_fast_policy_manager(addr: SocketAddr, grace_secs: u64) {
     std::thread::spawn(move || {
         compio::runtime::Runtime::new().unwrap().block_on(async {
             let m = AutumnManager::new();
-            m.set_repair_grace_secs(grace_secs);
+            m.params().repair_grace_secs.set(grace_secs);
             m.set_policy_config(autumn_manager::policy::PolicyConfig {
                 tick_interval_sec: 1,
                 ..Default::default()

@@ -84,6 +84,26 @@ plain commands.
 Python `python/dashboard/` was retired 2026-07-04 — folded into the manager; see
 "Web dashboard + auto-policy controller" below.)
 
+## Parameters (flags)
+
+Every tunable of a binary is a flag, declared in `crates/params/src/<role>.rs`.
+No binary reads a tunable from the environment. `--help` lists each parameter
+with its default, its range, and `runtime` when it can also be changed while
+the process runs. Integer values accept `64M` / `1G` / `512k`.
+
+```sh
+target/release/autumn-manager-server --help | less
+# A value outside the range, a missing value or an unknown flag exits 2 at once:
+target/release/autumn-manager-server --recovery-max-global 0; echo "exit=$?"
+#   error: --recovery-max-global 0: 0 is outside [1, 100000]   exit=2
+target/release/autumn-manager-server --no-such-flag 1; echo "exit=$?"
+#   error: unknown argument "--no-such-flag"                    exit=2
+cargo test -p autumn-server --test param_flags
+```
+
+`--policy-fast-mode` on the manager sets the short policy windows first, so an
+explicit flag after it still wins (`--policy-fast-mode --gc-cooldown-secs 600`).
+
 ## Cluster secret
 
 Every manager, PS and extent node must be started with the same

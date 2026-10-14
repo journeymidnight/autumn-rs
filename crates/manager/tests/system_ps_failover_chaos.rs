@@ -1,5 +1,5 @@
 //! PS-failover chaos: 2 partition servers, kill one, the manager must
-//! evict it (PS_DEAD_TIMEOUT = 10 s) and migrate its partitions to the
+//! evict it (--ps-dead-timeout-secs = 10 s) and migrate its partitions to the
 //! survivor; reads AND writes must recover with zero data loss.
 //!
 //! Coverage gap this closes: `system_chaos.rs` kills ENs (subprocesses)

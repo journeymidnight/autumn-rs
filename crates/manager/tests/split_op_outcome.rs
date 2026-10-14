@@ -33,7 +33,7 @@ fn start_manager_with_split_timeout(addr: SocketAddr) {
     std::thread::spawn(move || {
         compio::runtime::Runtime::new().unwrap().block_on(async {
             let m = AutumnManager::new();
-            m.set_split_reply_timeout(REPLY_TIMEOUT);
+            m.params().split_reply_timeout_secs.set(REPLY_TIMEOUT.as_secs());
             let _ = m.serve(addr).await;
         });
     });

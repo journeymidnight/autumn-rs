@@ -690,7 +690,7 @@ impl AutumnManager {
                     &addr,
                     EXT_MSG_REQUIRE_RECOVERY,
                     payload,
-                    Duration::from_secs(30),
+                    Duration::from_secs(self.params.recovery_dispatch_timeout_secs.get()),
                 )
                 .await
             {
@@ -1313,7 +1313,7 @@ impl AutumnManager {
     }
 
     /// Start an in-place catch-up of `slot` as a background task, unless one
-    /// is already running for it or `CATCH_UP_MAX_INFLIGHT` are.
+    /// is already running for it or `--catch-up-max-inflight` are.
     ///
     /// Background because the node copies the whole missing range before it
     /// answers (up to the 30 s timeout), and the dispatch tick is serial: a
@@ -1331,7 +1331,9 @@ impl AutumnManager {
         let key = (ex.extent_id, slot as u32);
         {
             let mut running = self.catch_up_inflight.borrow_mut();
-            if running.contains(&key) || running.len() >= CATCH_UP_MAX_INFLIGHT {
+            if running.contains(&key)
+                || running.len() >= self.params.catch_up_max_inflight.get()
+            {
                 return;
             }
             running.insert(key);
@@ -1370,7 +1372,12 @@ impl AutumnManager {
         // node from wedging the tick.
         let outcome = match self
             .conn_pool
-            .call_timeout(&addr, EXT_MSG_RE_AVALI, payload, Duration::from_secs(30))
+            .call_timeout(
+                &addr,
+                EXT_MSG_RE_AVALI,
+                payload,
+                Duration::from_secs(self.params.catch_up_timeout_secs.get()),
+            )
             .await
         {
             Err(e) => Err(format!("re_avali to {addr}: {e}")),
@@ -1447,6 +1454,8 @@ impl AutumnManager {
 
     pub(crate) fn reseed_recovery_limiter(&self) {
         let mut lim = self.recovery_limiter.borrow_mut();
+        lim.set_limits(&self.params);
+        self.catch_up_backoff.borrow_mut().set_limits(&self.params);
         lim.reset_counts();
         for rec in self.inflight.borrow().values() {
             if let Some((_, crate::extent_inflight::ExtentOpPayload::Recovery(t))) = rec.unpack() {
@@ -1976,10 +1985,6 @@ impl AutumnManager {
     }
 }
 
-/// In-place catch-ups (`start_catch_up`) running at once, across the cluster.
-/// The same bound as the EC conversion dispatch.
-const CATCH_UP_MAX_INFLIGHT: usize = 8;
-
 /// What the dispatch loop should do about one replica slot.
 ///
 /// A state, not a bool: "move this copy to another node" and "leave it where it
@@ -2124,7 +2129,9 @@ impl crate::AutumnManager {
         // Per-node (open, total) slot counts, accumulated over the same cycle.
         let mut slots_partial: HashMap<u64, (u64, u64)> = HashMap::new();
         loop {
-            compio::time::sleep(Duration::from_secs(2)).await;
+            let every = self.params.node_health_interval_secs.get();
+            compio::time::sleep(Duration::from_secs(every)).await;
+            let df_timeout = Duration::from_secs(self.params.df_timeout_secs.get());
             if !self.leader.get() {
                 continue;
             }
@@ -2162,7 +2169,7 @@ impl crate::AutumnManager {
                 });
                 let resp = match self
                     .control_pool
-                    .call_timeout(&addr, EXT_MSG_DF, payload, Duration::from_secs(5))
+                    .call_timeout(&addr, EXT_MSG_DF, payload, df_timeout)
                     .await
                 {
                     Ok(v) => v,
@@ -2869,12 +2876,12 @@ impl crate::AutumnManager {
             // serialising meant one such extent stalled every other conversion
             // in the cluster for that tick. The cap keeps the fan-out (and the
             // manager's socket use) bounded.
-            const EC_DISPATCH_CONCURRENCY: usize = 8;
+            let concurrency = self.params.ec_dispatch_concurrency.get();
             let this = &self;
             let addrs = &node_addrs;
             futures::stream::StreamExt::for_each_concurrent(
                 futures::stream::iter(candidates),
-                EC_DISPATCH_CONCURRENCY,
+                concurrency,
                 move |cand| async move { this.dispatch_one_ec_conversion(cand, addrs).await },
             )
             .await;
@@ -3122,7 +3129,7 @@ impl crate::AutumnManager {
                 &coordinator_addr,
                 EXT_MSG_CONVERT_TO_EC,
                 payload,
-                Duration::from_secs(60),
+                Duration::from_secs(self.params.ec_convert_timeout_secs.get()),
             )
             .await;
 

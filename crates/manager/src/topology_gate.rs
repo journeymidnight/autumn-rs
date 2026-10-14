@@ -7,7 +7,8 @@
 //! merge commit refuses the same way for both partitions. Those ops run for
 //! seconds to minutes; met after the freeze, a split kept writes frozen for
 //! its whole freeze budget and a merge froze both sides to roll back. So the
-//! manager waits first, writes still flowing, at most `BLOCKER_WAIT_MAX`.
+//! manager waits first, writes still flowing, at most
+//! `--topology-blocker-wait-max-secs`.
 //!
 //! From before that wait until the op ends, its partitions are in
 //! `topology_held`, and nothing new starts on their extents: EC conversion,
@@ -27,9 +28,6 @@ use crate::store::MetadataState;
 use crate::AutumnManager;
 
 const BLOCKER_POLL: Duration = Duration::from_millis(500);
-
-/// Past this the op fails with its reason and releases the hold.
-const BLOCKER_WAIT_MAX: Duration = Duration::from_secs(600);
 
 /// Held from before the wait until the split's PS answers or the merge ends.
 pub(crate) struct TopologyHold {
@@ -159,7 +157,8 @@ impl AutumnManager {
         op_id: u64,
         what: &str,
     ) -> anyhow::Result<(TopologyHold, bool)> {
-        self.topology_ready_within(parts, op_id, what, BLOCKER_WAIT_MAX)
+        let wait_max = Duration::from_secs(self.params().topology_blocker_wait_max_secs.get());
+        self.topology_ready_within(parts, op_id, what, wait_max)
             .await
     }
 

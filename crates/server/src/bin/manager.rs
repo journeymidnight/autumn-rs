@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use autumn_manager::AutumnManager;
+use autumn_params::manager::ManagerParams;
 use autumn_transport::TransportKind;
 
 // allocator hygiene — see crates/server/src/bin/extent_node.rs for
@@ -29,27 +30,6 @@ struct Args {
     manager_id: u64,
     bind_host: String,
     transport: TransportKind,
-    /// enable fast-mode policy thresholds for load testing —
-    /// 1-bucket / 5 s tick / 1 MiB GC debt / 4 MiB compact pending /
-    /// 30 s cooldowns. Production should never use this; the default
-    /// is `false` (production thresholds = 1 GiB / 4 GiB / 5-bucket /
-    /// 60 s tick / 5-min cooldown).
-    policy_fast_mode: bool,
-    /// (was env): MSG_REPORT_DISK_FAILURE sliding window
-    /// length in seconds. `None` = library default (60 s).
-    report_disk_failure_window_secs: Option<u64>,
-    /// (was env): MSG_REPORT_DISK_FAILURE distinct-reporter
-    /// quorum threshold. `None` = library default (3).
-    report_disk_failure_quorum: Option<usize>,
-    /// ENOSPC-1: allocation free-space floor (bytes). Nodes whose best
-    /// disk has less free are soft-avoided by extent allocation.
-    /// `None` = library default (256 MiB); 0 = disabled.
-    min_alloc_free_bytes: Option<u64>,
-    /// `--repair-grace-secs`: how long a slot stays degraded before the repair
-    /// policy proposes rebuilding it elsewhere. `None` = default 600.
-    repair_grace_secs: Option<u64>,
-    /// audit-log retention (days). `None` = default 90; 0 = off.
-    audit_retention_days: Option<u64>,
     /// path to the Ed25519 signing-key file (KDC private material).
     /// `None` = data-plane authz DISABLED (opt-in). Format: one key per line,
     /// `<kid> <hex-32-byte-seed> [disabled]`. Generate via
@@ -57,16 +37,32 @@ struct Args {
     auth_signing_key_file: Option<String>,
     /// `--cluster-secret-file`: required. Peer and Admin connections prove it.
     cluster_secret_file: Option<std::path::PathBuf>,
-    /// minted-token TTL in seconds. `None` = library default 3600.
-    auth_token_ttl_secs: Option<u64>,
-    /// clock-skew leeway in seconds. `None` = library default 60.
-    auth_clock_skew_secs: Option<u64>,
     /// seed this preset as the active policy (Armed) on a FRESH cluster. Deploy
     /// layer passes `balanced`; unset = controller stays Off (cluster.sh /
-    /// tests). An Armed policy actuates (arming is per-policy via
-    /// `autumn-op auto-policy start <NAME>`). The web dashboard is now a
-    /// standalone app (crates/server/src/bin/autumn_dashboard) — the manager no longer serves it.
+    /// tests).
     auto_policy_default: Option<String>,
+    policy_fast_mode: bool,
+    /// Every tunable; see `autumn_params::manager`.
+    params: ManagerParams,
+}
+
+fn usage() -> String {
+    format!(
+        "usage: autumn-manager-server [options]\n\
+         \n\
+         \x20 --port <n>                    listen port (default 9001)\n\
+         \x20 --listen <host>               bind host (default 0.0.0.0)\n\
+         \x20 --etcd <a,b,...>              etcd endpoints (none = in memory only)\n\
+         \x20 --manager-id <n>              non-zero id, required with --etcd\n\
+         \x20 --transport tcp|ucx\n\
+         \x20 --cluster-secret-file <path>  required\n\
+         \x20 --auth-signing-key-file <path> turns on data-plane authz\n\
+         \x20 --auto-policy-default <preset> armed policy for a fresh cluster\n\
+         \x20 --policy-fast-mode            short policy windows for dev/test clusters\n\
+         \n\
+         parameters:\n{}",
+        autumn_params::help::<ManagerParams>()
+    )
 }
 
 fn parse_args() -> Args {
@@ -75,22 +71,24 @@ fn parse_args() -> Args {
     let mut manager_id: u64 = 0;
     let mut bind_host = String::from("0.0.0.0");
     let mut transport = TransportKind::Tcp;
-    let mut policy_fast_mode = false;
-    let mut report_disk_failure_window_secs: Option<u64> = None;
-    let mut report_disk_failure_quorum: Option<usize> = None;
-    let mut min_alloc_free_bytes: Option<u64> = None;
-    let mut repair_grace_secs: Option<u64> = None;
-    let mut audit_retention_days: Option<u64> = None;
     let mut auth_signing_key_file: Option<String> = None;
     let mut cluster_secret_file: Option<std::path::PathBuf> = None;
-    let mut auth_token_ttl_secs: Option<u64> = None;
-    let mut auth_clock_skew_secs: Option<u64> = None;
     let mut auto_policy_default: Option<String> = None;
+    let params = ManagerParams::default();
 
     let raw: Vec<String> = std::env::args().collect();
+    // Fast mode is a set of defaults; applied first so an explicit flag wins.
+    let policy_fast_mode = raw.iter().any(|a| a == "--policy-fast-mode");
+    if policy_fast_mode {
+        params.apply_policy_fast_mode();
+    }
     let mut i = 1;
     while i < raw.len() {
         match raw[i].as_str() {
+            "--help" | "-h" => {
+                print!("{}", usage());
+                std::process::exit(0);
+            }
             "--port" => {
                 i += 1;
                 port = raw[i].parse().expect("--port must be a number");
@@ -128,23 +126,7 @@ fn parse_args() -> Args {
                 );
                 std::process::exit(2);
             }
-            "--policy-fast-mode" => policy_fast_mode = true,
-            "--report-disk-failure-window-secs" => {
-                i += 1;
-                report_disk_failure_window_secs = Some(
-                    raw[i]
-                        .parse()
-                        .expect("--report-disk-failure-window-secs must be a number"),
-                );
-            }
-            "--report-disk-failure-quorum" => {
-                i += 1;
-                report_disk_failure_quorum = Some(
-                    raw[i]
-                        .parse()
-                        .expect("--report-disk-failure-quorum must be a number"),
-                );
-            }
+            "--policy-fast-mode" => {}
             // The manager exports no metrics; Prometheus finds the PS and EN
             // endpoints through `autumn-op info --file-sd`.
             "--metrics-port" | "--metrics-listen" => {
@@ -154,21 +136,6 @@ fn parse_args() -> Args {
                     raw[i]
                 );
                 std::process::exit(2);
-            }
-            "--min-alloc-free-bytes" => {
-                i += 1;
-                min_alloc_free_bytes =
-                    Some(raw[i].parse().expect("--min-alloc-free-bytes must be a number"));
-            }
-            "--repair-grace-secs" => {
-                i += 1;
-                repair_grace_secs =
-                    Some(raw[i].parse().expect("--repair-grace-secs must be a number"));
-            }
-            "--audit-retention-days" => {
-                i += 1;
-                audit_retention_days =
-                    Some(raw[i].parse().expect("--audit-retention-days must be a number"));
             }
             // ── manager-as-KDC (data-plane authz) ────────────
             "--auth-signing-key-file" => {
@@ -187,27 +154,31 @@ fn parse_args() -> Args {
                 );
                 std::process::exit(2);
             }
-            "--auth-token-ttl-secs" => {
-                i += 1;
-                auth_token_ttl_secs =
-                    Some(raw[i].parse().expect("--auth-token-ttl-secs must be a number"));
-            }
-            "--auth-clock-skew-secs" => {
-                i += 1;
-                auth_clock_skew_secs =
-                    Some(raw[i].parse().expect("--auth-clock-skew-secs must be a number"));
-            }
             "--auto-policy-default" => {
                 i += 1;
                 auto_policy_default = Some(raw[i].clone());
             }
-            other => eprintln!("unknown arg: {other}"),
+            other => match autumn_params::take_flag(&params, other, raw.get(i + 1).map(|s| s.as_str())) {
+                Ok(autumn_params::Flag::Taken) => i += 1,
+                Ok(autumn_params::Flag::Unknown) => {
+                    eprintln!("error: unknown argument {other:?}\n\n{}", usage());
+                    std::process::exit(2);
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(2);
+                }
+            },
         }
         i += 1;
     }
 
     if !etcd.is_empty() && manager_id == 0 {
         eprintln!("error: --manager-id <N> (non-zero) is required with --etcd");
+        std::process::exit(2);
+    }
+    if let Err(e) = params.validate() {
+        eprintln!("error: {e}");
         std::process::exit(2);
     }
 
@@ -217,17 +188,11 @@ fn parse_args() -> Args {
         manager_id,
         bind_host,
         transport,
-        policy_fast_mode,
-        report_disk_failure_window_secs,
-        report_disk_failure_quorum,
-        min_alloc_free_bytes,
-        repair_grace_secs,
-        audit_retention_days,
         auth_signing_key_file,
         cluster_secret_file,
-        auth_token_ttl_secs,
-        auth_clock_skew_secs,
         auto_policy_default,
+        policy_fast_mode,
+        params,
     }
 }
 
@@ -254,46 +219,19 @@ async fn main() -> Result<()> {
         tracing::warn!(
             "no --etcd endpoints given; running in-memory only (metadata will be lost on restart)"
         );
-        AutumnManager::new()
+        AutumnManager::new_with_params(args.params)
     } else {
         tracing::info!("connecting to etcd: {:?}", args.etcd);
         let identity = autumn_manager::ManagerIdentity {
             id: args.manager_id,
             address: addr.to_string(),
         };
-        AutumnManager::new_with_etcd(args.etcd, identity)
+        AutumnManager::new_with_etcd_params(args.etcd, identity, args.params)
             .await
             .context("connect to etcd")?
     };
-
-    // in-kernel auto-dispatch deleted. The manager's policy_tick_loop
-    // produces an advisory_cache via `MSG_GET_POLICY_CANDIDATES`; external
-    // operators / controllers act on it.
-    // quorum debounce config — applied if either flag was
-    // set. The library defaults (60 s / 3) match the earlier env defaults.
-    if args.report_disk_failure_window_secs.is_some() || args.report_disk_failure_quorum.is_some() {
-        let window =
-            std::time::Duration::from_secs(args.report_disk_failure_window_secs.unwrap_or(60));
-        let quorum = args.report_disk_failure_quorum.unwrap_or(3);
-        manager.set_report_disk_failure_config(window, quorum);
-        tracing::info!(
-            window_secs = window.as_secs(),
-            quorum,
-            "quorum debounce configured"
-        );
-    }
-
-    if let Some(v) = args.min_alloc_free_bytes {
-        manager.set_min_alloc_free_bytes(v);
-        tracing::info!(min_alloc_free_bytes = v, "ENOSPC-1 allocation floor configured");
-    }
-    if let Some(v) = args.repair_grace_secs {
-        manager.set_repair_grace_secs(v);
-        tracing::info!(repair_grace_secs = v, "repair policy grace configured");
-    }
-    if let Some(v) = args.audit_retention_days {
-        manager.set_audit_retention_days(v);
-        tracing::info!(audit_retention_days = v, "audit retention configured");
+    if args.policy_fast_mode {
+        tracing::warn!("--policy-fast-mode enabled: short policy windows, NOT FOR PRODUCTION");
     }
 
     // data-plane authz (opt-in). Loading a signing-key file ENABLES
@@ -304,35 +242,7 @@ async fn main() -> Result<()> {
         let keyring = autumn_manager::authz::AuthzKeyring::from_file_contents(&text)
             .map_err(|e| anyhow::anyhow!("parse --auth-signing-key-file {path}: {e}"))?;
         manager.set_authz_keyring(keyring);
-        if let Some(v) = args.auth_token_ttl_secs {
-            manager.set_token_ttl_secs(v);
-        }
-        if let Some(v) = args.auth_clock_skew_secs {
-            manager.set_clock_skew_secs(v);
-        }
         tracing::info!("data-plane authz ENABLED (manager is a KDC)");
-    }
-
-    if args.policy_fast_mode {
-        let cfg = autumn_manager::policy::PolicyConfig {
-            required_buckets: 1,
-            tick_interval_sec: 5,
-            bucket_sec: 5,
-            gc_debt_high: 1024 * 1024,
-            compact_pending_high: 4 * 1024 * 1024,
-            gc_cooldown_sec: 30,
-            compact_cooldown_sec: 30,
-            split_cooldown_sec: 30,
-            merge_cooldown_sec: 30,
-            ..Default::default()
-        };
-        manager.set_policy_config(cfg);
-        // Same intent: a 60 s backstop is invisible in a short-lived dev or
-        // test cluster, so fast mode shortens it too.
-        manager.set_sealed_empty_sweep_interval(std::time::Duration::from_secs(5));
-        tracing::warn!(
-            "--policy-fast-mode enabled; thresholds={{gc_debt=1MiB, compact=4MiB, bucket=5s, tick=5s, required=1, cooldown=30s}}. NOT FOR PRODUCTION."
-        );
     }
 
     // Leader-fenced auto-policy controller (the web dashboard is now a

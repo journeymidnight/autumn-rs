@@ -64,7 +64,10 @@ fn start_manager_sweeping(mgr_addr: SocketAddr, every: Duration) {
     std::thread::spawn(move || {
         compio::runtime::Runtime::new().unwrap().block_on(async {
             let manager = AutumnManager::new();
-            manager.set_sealed_empty_sweep_interval(every);
+            manager
+                .params()
+                .sealed_empty_sweep_interval_secs
+                .set(every.as_secs());
             let _ = manager.serve(mgr_addr).await;
         });
     });

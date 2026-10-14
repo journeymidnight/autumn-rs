@@ -49,12 +49,6 @@ pub struct NodeStateTracker {
     soft_timeout: Duration,
 }
 
-impl Default for NodeStateTracker {
-    fn default() -> Self {
-        Self::new(Self::default_soft_timeout())
-    }
-}
-
 impl NodeStateTracker {
     pub fn new(soft_timeout: Duration) -> Self {
         Self {
@@ -69,17 +63,6 @@ impl NodeStateTracker {
     /// so the operator sees the gating threshold alongside last-seen.
     pub fn soft_timeout(&self) -> Duration {
         self.soft_timeout
-    }
-
-    /// Resolve the soft-timeout from env, defaulting to 10 s. Clamped to
-    /// >= 1 to avoid pathological values that would race the df cadence.
-    pub fn default_soft_timeout() -> Duration {
-        let secs = std::env::var("AUTUMN_MGR_NODE_SUSPECTED_TIMEOUT_SECS")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(10)
-            .max(1);
-        Duration::from_secs(secs)
     }
 
     /// A new leader term: nothing the previous term saw counts. Every node

@@ -242,6 +242,7 @@ dependencies = [
  "autumn-etcd",
  "autumn-fs",
  "autumn-fuse",
+ "autumn-params",
  "autumn-partition-server",
  "autumn-rpc",
  "autumn-stream",
@@ -263,6 +264,10 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
 ]
+
+[[package]]
+name = "autumn-params"
+version = "0.1.0"
 
 [[package]]
 name = "autumn-partition-server"
@@ -316,6 +321,7 @@ dependencies = [
  "autumn-etcd",
  "autumn-fs",
  "autumn-manager",
+ "autumn-params",
  "autumn-partition-server",
  "autumn-rpc",
  "autumn-stream",

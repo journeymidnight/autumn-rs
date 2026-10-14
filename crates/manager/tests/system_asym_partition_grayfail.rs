@@ -204,10 +204,10 @@ fn asym_partition_data_cut_control_healthy_is_gray_failure() {
     // Fast Online->Suspected transition for the symmetric-partition contrast
     // (the data-only-cut case is unaffected: A's df keeps succeeding on the
     // control port, so on_heartbeat_ok refreshes last_ok every tick).
-    std::env::set_var("AUTUMN_MGR_NODE_SUSPECTED_TIMEOUT_SECS", "3");
-
+    let params = autumn_params::manager::ManagerParams::default();
+    params.node_suspected_timeout_secs.set(3);
     let mgr_addr = pick_addr();
-    start_manager(mgr_addr);
+    start_manager_with(mgr_addr, params);
 
     // 3 in-process extent nodes.
     let a_dir = tempfile::tempdir().expect("a tmpdir");

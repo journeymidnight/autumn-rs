@@ -9,6 +9,19 @@ Single-threaded compio runtime (`Rc`/`RefCell`, `!Send`). etcd (via the compio-n
 `autumn-etcd` client) is optional: without it the manager runs memory-only (no
 persistence, no election, always "leader") for dev/test/bench.
 
+**Parameters.** Every tunable is declared once in `autumn_params::manager::ManagerParams`
+(`crates/params/src/manager.rs`): type, default, range, help. The binary's flags and
+`--help` come from it, and a bad value or unknown flag exits 2. No parameter is read
+from the environment. `[runtime]` parameters are read with `self.params.<name>.get()`
+where they are used, so an override applies at the next read; the recovery limiter
+re-reads its caps every dispatch tick (`reseed_recovery_limiter`). Startup-only
+parameters may be copied once at construction: `connect_timeout_ms` (the two
+`ConnPool`s), `etcd_request_timeout_ms` (`EtcdMirror`), `node_suspected_timeout_secs`
+(`NodeStateTracker`), `inode_lease_ttl_secs` / `inode_revoke_grace_ms`
+(`LeaseRegistry`), `op_ledger_cap`, and every policy threshold (`PolicyConfig::from_params`;
+tests replace it whole with `set_policy_config`). Setting one of those through
+`params()` after construction changes nothing.
+
 ## RPC surface
 
 Handlers dispatch on a `msg_type: u8` in `rpc_handlers.rs::dispatch`. Every message
@@ -442,7 +455,7 @@ retried the refused commit with writes frozen for its whole ~20 s budget
 (19.857 s observed, behind an EC conversion), and a merge froze both sides
 only to roll back. So before anything freezes, `topology_ready` waits until no
 marker covers the partitions, with writes flowing; a submitted op shows
-`waiting, writes not frozen: <reason>` and fails after `BLOCKER_WAIT_MAX`
+`waiting, writes not frozen: <reason>` and fails after `--topology-blocker-wait-max-secs`
 (10 min); a policy split or merge is such an op too. A direct
 `MSG_MERGE_PARTITIONS` has no op, so op id 0 refuses instead of waiting
 (`<reason>; split deferred`).
@@ -733,8 +746,8 @@ tick recognizes stale layout again and retries without requiring a leader
 change.
 
 **Stale sweep** (`extent_inflight_stale_sweep_loop`): tick
-`AUTUMN_MGR_INFLIGHT_SWEEP_INTERVAL_SECS` (default 60 s, floor 1); stale threshold
-`AUTUMN_MGR_INFLIGHT_STALE_THRESHOLD_SECS` (default 600 s, floor 60). `started_at`
+`--inflight-sweep-interval-secs` (default 60 s); stale threshold
+`--inflight-stale-threshold-secs` (default 600 s, floor 60). `started_at`
 is in the persisted record so the clock survives failover. **Only Delete markers
 auto-release on wall-clock**, and their work is not dropped: the still-pending
 targets go to the persisted `extentDeleteRetry/` queue first, the same hand-off
@@ -916,7 +929,7 @@ bitmap beside the extent info, stream CLAUDE.md "Copy sources") — and
   and it writes etcd-first with a compare-and-set against the record it read,
   so a concurrent writer of the extent (split's refs, punch's ref drop) fails
   it instead of being overwritten;
-- in the BACKGROUND (`start_catch_up`), at most `CATCH_UP_MAX_INFLIGHT` (8) at
+- in the BACKGROUND (`start_catch_up`), at most `--catch-up-max-inflight` (8) at
   once and one per slot — the node copies before it answers (30 s timeout),
   and the dispatch tick is serial: a node back from a long absence with
   hundreds of behind extents would otherwise hold release, re-sends, every
@@ -1067,7 +1080,7 @@ so without that the backoff outlived the need in `recovery-stats`
 (`an_unfence_ends_the_failed_rebuild_s_backoff_and_op`).
 `record_dispatch_outcome` takes the `Result` so the failure reason is preserved
 (`recovery-stats`). `max_per_target` (default 2,
-`AUTUMN_MGR_RECOVERY_MAX_PER_TARGET`) should track the EN's `recovery_max` (default
+`--recovery-max-per-target`) should track the EN's `recovery_max` (default
 2, `--recovery-parallelism`) — same physical quantity (concurrent recoveries landing
 on one EN) throttled at two layers as defense-in-depth. `RecoveryRateLimiter` is a
 concurrency + per-`(extent, slot)` backoff limiter with NO byte-rate dimension; keep it
@@ -1487,9 +1500,9 @@ Every manager loop runs under `spawn_supervised(name, make)`
 `ERROR bg_loop=<name>` and restarts after 1 s with a fresh `mgr.clone()`). **Never add
 a bare `spawn(...).detach()`** — compio's own wrap swallows the panic and the task
 dies silently. And **never add an unbounded await reachable from a loop**: etcd
-`unary_call` has no request deadline (`AUTUMN_ETCD_REQUEST_TIMEOUT_MS`, 10 s) and
+`unary_call` has no request deadline of its own (`--etcd-request-timeout-ms`, 10 s) and
 `ConnPool::get_or_connect`'s connect sits outside `call_timeout`
-(`AUTUMN_MGR_CONNECT_TIMEOUT_MS`, 5 s) — both are bounded; any new pool RPC must use
+(`--connect-timeout-ms`, 5 s) — both are bounded; any new pool RPC must use
 `call_timeout` (or `connect_then_call`, the same bound with the connect failure
 kept apart). Both are required: `catch_unwind` can't rescue a hung await; a bound
 can't catch a panic.
@@ -1535,9 +1548,9 @@ payload lives in the shared log_stream, a CoW split leaves both children on the 
 extents, and nothing separates them until a major compaction rewrites the tables. A
 partition carrying 73 GiB behind a 0 MiB LSM with no load gets nothing from a split
 except that compaction bill — and the policy advised exactly that, every window, until
-`SPLIT_LSM_HARD` was pointed back at LSM bytes. Carried bytes keep their two other
+`--split-lsm-hard-bytes` was pointed back at LSM bytes. Carried bytes keep their two other
 jobs, where the payload IS the question: the floor under the rate triggers
-(`SPLIT_SIZE_MIN`) and the veto on merge (`MERGE_SIZE_LOW`, since merging two fat
+(`--split-size-min-bytes`) and the veto on merge (`--merge-size-low-bytes`, since merging two fat
 partitions really does put all those bytes behind one thread).
 
 **Compact before split/merge — both refuse while `has_overlap` is set.**
@@ -1613,23 +1626,23 @@ persisted):**
 
 | Const | Default | Meaning |
 |---|---|---|
-| `SPLIT_LSM_HARD` | 50 GiB | size-hard split trigger, on **LSM-resident** bytes |
-| `SPLIT_SIZE_MIN` | 1 GiB | **carried**-size floor under the rate split triggers |
-| `SPLIT_QPS_HIGH` | 15 000 | sustained QPS split trigger (≈½ the ~30K single-partition ceiling) |
-| `SPLIT_BW_HIGH` | 175 MiB/s | sustained r+w byte-rate split trigger (½ the ~350 MB/s single-log_stream ceiling) |
-| `SPLIT_IMMFULL_HIGH` | 10 | sustained imm-full/s split trigger |
-| `SPLIT_COOLDOWN_SEC` | 3600 | |
-| `MERGE_SIZE_LOW` | 1 GiB | both sides small (carried) |
-| `MERGE_QPS_LOW` | 1500 | summed cold QPS (5% of split-high) |
-| `MERGE_BW_LOW` | 17.5 MiB/s | summed cold byte rate (10× hysteresis vs `SPLIT_BW_HIGH`) |
-| `MERGE_COOLDOWN_SEC` | 21600 (6 h) | |
-| `GC_DEBT_HIGH` | 1 GiB | GC advisory — AND the per-extent absolute floor selection uses. Both manager paths build their `MaintenanceReq` through `maintenance_req_for_submitted_op`, which fills `gc_dead_bytes_high` (and `gc_stream_debt`) from this value for an AUTO_GC request that names no knobs — so the advisory and the selection judge on the same number. FORCE_GC carries the spec verbatim and the PS Force arm reads neither field. Before that they did not: the advisory fired on absolute dead bytes and selection asked for a ratio, and GC answered "no eligible extents" every cooldown. |
-| `COMPACT_PENDING_HIGH` | 4 GiB | major-compact advisory (BACKLOG); SETTLE has no threshold — any unsettled delete, once none new for the window |
+| `--split-lsm-hard-bytes` | 50 GiB | size-hard split trigger, on **LSM-resident** bytes |
+| `--split-size-min-bytes` | 1 GiB | **carried**-size floor under the rate split triggers |
+| `--split-qps-high` | 15 000 | sustained QPS split trigger (≈½ the ~30K single-partition ceiling) |
+| `--split-bw-high-bytes` | 175 MiB/s | sustained r+w byte-rate split trigger (½ the ~350 MB/s single-log_stream ceiling) |
+| `--split-immfull-high` | 10 | sustained imm-full/s split trigger |
+| `--split-cooldown-secs` | 3600 | |
+| `--merge-size-low-bytes` | 1 GiB | both sides small (carried) |
+| `--merge-qps-low` | 1500 | summed cold QPS (5% of split-high) |
+| `--merge-bw-low-bytes` | 17.5 MiB/s | summed cold byte rate (10× hysteresis vs `--split-bw-high-bytes`) |
+| `--merge-cooldown-secs` | 21600 (6 h) | |
+| `--gc-debt-high-bytes` | 1 GiB | GC advisory — AND the per-extent absolute floor selection uses. Both manager paths build their `MaintenanceReq` through `maintenance_req_for_submitted_op`, which fills `gc_dead_bytes_high` (and `gc_stream_debt`) from this value for an AUTO_GC request that names no knobs — so the advisory and the selection judge on the same number. FORCE_GC carries the spec verbatim and the PS Force arm reads neither field. Before that they did not: the advisory fired on absolute dead bytes and selection asked for a ratio, and GC answered "no eligible extents" every cooldown. |
+| `--compact-pending-high-bytes` | 4 GiB | major-compact advisory (BACKLOG); SETTLE has no threshold — any unsettled delete, once none new for the window |
 | `GC/COMPACT_COOLDOWN_SEC` | 300 | |
-| `EC_MIN_EXTENT_BYTES` | 64 MiB | below this, EC's encode+fanout costs outweigh savings |
-| `HOT_COLD_RATIO` / `_SIZE_RATIO` | 10 | hot/cold spread |
-| `HOT_COLD_MIN_HOT_QPS` | 10 000 | ; `_MIN_HOT_SIZE_BYTES` 25 GiB |
-| `REBALANCE_COOLDOWN_SEC` | 120 | emission; `_MAX_MOVES_PER_TICK` 4 |
+| `--ec-min-extent-bytes` | 64 MiB | below this, EC's encode+fanout costs outweigh savings |
+| `--hot-cold-ratio` / `_SIZE_RATIO` | 10 | hot/cold spread |
+| `--hot-cold-min-hot-qps` | 10 000 | ; `_MIN_HOT_SIZE_BYTES` 25 GiB |
+| `--rebalance-cooldown-secs` | 120 | emission; `_MAX_MOVES_PER_TICK` 4 |
 
 ## Auto-policy controller
 
@@ -1741,7 +1754,7 @@ failure reason the fire-and-forget maintenance ops used to drop.
   from the PS load heartbeat right AFTER the outcome loop (so a completion is
   durable without waiting a heartbeat) and from the policy tick as a backstop
   for kinds no PS reports (recovery, ec-convert).
-  **Rotation is by COUNT** (`OP_LOG_CAP`), amortised one sweep per
+  **Rotation is by COUNT** (`--op-log-cap`), amortised one sweep per
   `OP_LOG_GC_EVERY` writes: op volume tracks cluster activity rather than the
   clock, so a time window bounds it badly in both directions — a quiet week
   keeps nothing, a compaction storm writes more in an hour than anyone will page
@@ -2052,7 +2065,7 @@ however long its files wait; an op with files pending on a node that answers
 WITHOUT listing it, past `SCRUB_QUEUE_GRACE_SECS` (30 s) after dispatch, has
 lost them (restart, lost report) and they are FAILED at once.
 `sweep_silent_scrub_ops` (policy tick) ends an op nothing has been heard about
-for `SCRUB_OP_SILENCE_SECS` (2 h — every node holding its files stopped
+for `--scrub-op-silence-secs` (2 h — every node holding its files stopped
 answering) as UNKNOWN; a RUNNING op would attach-dedup every later submit of
 its scope into a no-op. A failover ends running scrubs the same way; nodes keep
 scrubbing and their outcomes are dropped from the accounting, but a ROT one is
@@ -2060,7 +2073,7 @@ still acted on (it cannot be held for a re-check without its op).
 
 The `scrub` auto-policy switch (switch 8; on in `maintenance`, `balanced`,
 `aggressive`) submits `scrub --all` through the ledger at most once per
-`SCRUB_POLICY_INTERVAL_SEC` (7 days): `decide_actions` floors that kind's
+`--scrub-policy-interval-secs` (7 days): `decide_actions` floors that kind's
 cooldown at the interval whatever the policy says, and cooldowns are persisted.
 `scrub_candidates` emits its one advisory row only when the week is up and no
 scrub is running.
@@ -2358,7 +2371,7 @@ strict-gating would black-hole every fresh client for the whole outage. `displac
 (default TRUE, cleared on winning the election, set when the election CAS or a leader-fence
 fence diagnosis observes a DIFFERENT instance in the leader key — a *missing* key is
 lease-expiry, not displacement) keeps a rejoined FOLLOWER from serving replay-stale
-regions. Bounded by `ROUTABLE_STALE_TTL` (15 min from `leaderless_since`): in an
+regions. Bounded by `--routable-stale-ttl-secs` (15 min from `leaderless_since`): in an
 asymmetric partition a peer may have taken over, and after the TTL PSes get NOT_LEADER
 and rotate to the real leader. PS-side `MAX_CONSECUTIVE_NOT_LEADER = 450` (15 min) is a
 SEPARATE heartbeat exit budget from the transport budget — NOT_LEADER proves the manager

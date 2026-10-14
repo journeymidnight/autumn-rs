@@ -1,6 +1,7 @@
 [workspace]
 members = [
   "crates/common",
+  "crates/params",
   "crates/rpc",
   "crates/etcd",
   "crates/stream",
@@ -16,6 +17,7 @@ members = [
 ]
 default-members = [
   "crates/common",
+  "crates/params",
   "crates/rpc",
   "crates/etcd",
   "crates/stream",
