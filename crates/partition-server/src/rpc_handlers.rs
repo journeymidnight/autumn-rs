@@ -897,7 +897,7 @@ pub(crate) async fn compare_put(
     payload: Bytes,
     part: &Rc<RefCell<PartitionData>>,
     metrics: &mut WriteLoopMetrics,
-    locked_by_other: &Rc<std::cell::Cell<bool>>,
+    poisoned: &Rc<std::cell::Cell<bool>>,
 ) -> HandlerResult {
     let req: ComparePutReq = rkyv_decode(&payload)
         .map_err(|e| (StatusCode::InvalidArgument, e))?;
@@ -913,7 +913,7 @@ pub(crate) async fn compare_put(
         },
         part,
         metrics,
-        locked_by_other,
+        poisoned,
     )
     .await
 }
@@ -925,18 +925,18 @@ pub(crate) async fn compare_write(
     payload: Bytes,
     part: &Rc<RefCell<PartitionData>>,
     metrics: &mut WriteLoopMetrics,
-    locked_by_other: &Rc<std::cell::Cell<bool>>,
+    poisoned: &Rc<std::cell::Cell<bool>>,
 ) -> HandlerResult {
     let req: CompareWriteReq = rkyv_decode(&payload)
         .map_err(|e| (StatusCode::InvalidArgument, e))?;
-    compare_write_inner(req, part, metrics, locked_by_other).await
+    compare_write_inner(req, part, metrics, poisoned).await
 }
 
 async fn compare_write_inner(
     req: CompareWriteReq,
     part: &Rc<RefCell<PartitionData>>,
     metrics: &mut WriteLoopMetrics,
-    locked_by_other: &Rc<std::cell::Cell<bool>>,
+    poisoned: &Rc<std::cell::Cell<bool>>,
 ) -> HandlerResult {
     if req.value.as_ref().is_some_and(|v| v.len() > MAX_COMPARE_PUT_BYTES)
         || req.expected.as_ref().is_some_and(|v| v.len() > MAX_COMPARE_PUT_BYTES) {
@@ -1010,7 +1010,7 @@ async fn compare_write_inner(
         .map_err(|e| (StatusCode::Internal, e.to_string()))? {
         let phase2_result = (&mut flight.phase2_fut).await;
         let id = part.borrow().part_id;
-        handle_completion(part, metrics, locked_by_other, id,
+        handle_completion(part, metrics, poisoned, id,
             InflightCompletion { data: flight.data, phase2_result }).await;
     }
     let reply = rx.await.map_err(|_| (StatusCode::Internal, "conditional writer dropped reply".into()))??;

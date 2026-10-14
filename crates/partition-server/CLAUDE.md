@@ -253,9 +253,15 @@ partition_loop (per partition):
     clients get their final ack); flush residual pending as one last batch.
 
   Error handling:
-    LockedByOther on any completion → set locked_by_other, drain inflight,
-      return (partition self-evicts in the enclosing loop).
-    Other append errors → log + propagate Err to each client's oneshot.
+    A failed log append that `must_reopen` (LockedByOther, or the stream
+      client gave up after the batch was sent: `APPEND_OUTCOME_UNKNOWN`) →
+      each writer gets `Unavailable` ("may or may not have been applied"), set
+      `poisoned`, DROP the inflight batches (no await: a connection task could
+      serve a read from the memtable the reopen may contradict), answer queued
+      never-sent writes `Unavailable` ("not applied"), return; region_sync
+      reopens the partition, whose tail seal settles the batch.
+    A failed append that sent nothing → `Unavailable` ("not applied"), keep
+      serving.
 ```
 
 Phase 1 / Phase 3 primitives are `start_write_batch` / `finish_write_batch`
@@ -2087,11 +2093,37 @@ Corrupt historical checkpoints are repaired out of band (a one-off `repair_metas
 that appends a fresh `TableLocations` record); `recover_partition` stays strict and
 authoritative — do not add silent normalization to the reopen path.
 
-## Fault Recovery: LockedByOther Self-Eviction
+## Fault Recovery: poison and reopen
 
 If `partition_loop` receives `CODE_LOCKED_BY_OTHER` from the stream layer (a newer
-partition owner took the lock), it sets `locked_by_other`; the loop checks it each
-request and exits, preventing split-brain. The classifier
+partition owner took the lock), it sets `poisoned`; the loop checks it each
+request and exits, preventing split-brain.
+
+A failed log append whose batch was SENT poisons the partition too
+(`background::must_reopen`). The stream client marks such an error
+`APPEND_OUTCOME_UNKNOWN` (set once the payload reaches its worker): it gave up —
+its alloc after an append error failed, or the roll limit was hit — with the
+tail still OPEN and the batch possibly on some replicas, so only a seal decides
+whether it counts. Keeping the partition serving left that open for as long as
+the stream took no further append, while reads said the key was absent; a crash
+then made the write appear (`write_outcome_settled::a_failed_write_reads_the_same_after_a_crash`,
+red without the marker check). Poisoning reopens the partition at once, and the
+open seals the tail before replay. A failure before anything was sent (no new
+tail can be allocated, the manager did not answer) does NOT poison: after the
+reopen sealed the tail, every write with RF = node count and a node down fails
+that way, and reopening for each took reads down with it
+(`writes_failing_before_they_are_sent_leave_the_partition_serving`, red when
+every failure poisons). The writers get `Unavailable`
+(`WriteResponder::send_unavailable`; batch status `CODE_UNAVAILABLE`), worded
+"may or may not have been applied" or "not applied"; the reply to a poisoning
+batch is usually lost with the partition's own connections when its thread
+exits (`ConnectionClosed`). The SDK retries a single put/delete on both; batch
+statuses are surfaced as errors until the SDK learns `CODE_UNAVAILABLE`. A
+request handed to a partition that went down, or queued unanswered when it did,
+gets `Unavailable` from `delegate_round_trip`. Every drain that awaits
+completions (`drain_and_shutdown`, the compare-write admission drain) stops at
+the first poisoning one; a fence poison from the flush path (`poison_for_fence`)
+likewise drops the batches still in flight unanswered. The classifier
 `background::is_locked_by_other` matches the "LockedByOther" substring across the
 WHOLE anyhow chain (`{e:#}`, not plain `{e}` which shows only the outermost
 `.context`). It fires for BOTH fence layers: the EN's native `CODE_LOCKED_BY_OTHER`

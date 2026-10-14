@@ -1810,7 +1810,7 @@ pub(crate) struct InflightCompletion {
 pub(crate) async fn handle_completion(
     part: &Rc<RefCell<PartitionData>>,
     metrics: &mut WriteLoopMetrics,
-    locked_by_other: &Rc<Cell<bool>>,
+    poisoned: &Rc<Cell<bool>>,
     part_id: u64,
     c: InflightCompletion,
 ) -> usize {
@@ -1830,9 +1830,12 @@ pub(crate) async fn handle_completion(
         Err(e) => {
             if is_locked_by_other(&e) {
                 tracing::error!(part_id, "LockedByOther detected, poisoning partition");
-                locked_by_other.set(true);
+                poisoned.set(true);
+            } else if must_reopen(&e) {
+                tracing::error!(part_id, "log append failed after it was sent, poisoning partition for a reopen: {e:#}");
+                poisoned.set(true);
             } else {
-                tracing::error!("write batch error: {e}");
+                tracing::error!(part_id, "write batch error: {e:#}");
             }
             0
         }
@@ -2160,6 +2163,15 @@ pub(crate) async fn start_write_batch(
 /// failed after append error: …") would HIDE the marker and silently
 /// downgrade a fence to a generic write error (no poison → no
 /// fresh-epoch reopen).
+/// A failed log append the partition must reopen for: fenced by a newer owner,
+/// or given up after the batch was handed to the stream — then it may sit on
+/// some replicas of an open tail, and the reopen's seal settles it. A failure
+/// before anything was sent is just a failed write; reopening for it would
+/// repeat on every write while, say, no new tail can be allocated.
+pub(crate) fn must_reopen(e: &anyhow::Error) -> bool {
+    is_locked_by_other(e) || autumn_stream::is_append_outcome_unknown(e)
+}
+
 pub(crate) fn is_locked_by_other(e: &anyhow::Error) -> bool {
     format!("{e:#}").contains("LockedByOther")
 }
@@ -2175,9 +2187,20 @@ pub(crate) async fn finish_write_batch(
     let result = match phase2_result {
         Ok(result) => result,
         Err(e) => {
-            let msg = format!("log_stream append_segments: {e}");
+            // Each writer is told to retry, never that its write failed: when
+            // the batch was handed to the stream it may sit on some replicas of
+            // a tail still open, and only the seal of the reopen the caller
+            // triggers decides whether it counts (docs/seal_length_design.md §5).
+            let msg = if must_reopen(&e) {
+                format!(
+                    "log append failed; the partition is reopening and this write may or \
+                     may not have been applied: {e:#}"
+                )
+            } else {
+                format!("log append failed before anything was written; this write was not applied: {e:#}")
+            };
             for entry in bd.valid {
-                entry.resp.send_err(msg.clone());
+                entry.resp.send_unavailable(msg.clone());
             }
             // The write FAILED — release its in-flight keys. Phase 3 never
             // inserted them, and the OLD value stays correctly live, so a later
@@ -4845,7 +4868,7 @@ mod sqcq_tests {
         mut submit_rx: mpsc::Receiver<(u32, Duration, std::result::Result<u64, String>)>,
         collected: Rc<std::cell::RefCell<Vec<(u32, std::result::Result<u64, String>)>>>,
         max_inflight: Rc<Cell<usize>>,
-        locked_by_other: Rc<Cell<bool>>,
+        poisoned: Rc<Cell<bool>>,
     ) {
         type Fut = std::pin::Pin<
             Box<dyn std::future::Future<Output = (u32, std::result::Result<u64, String>)>>,
@@ -4862,10 +4885,10 @@ mod sqcq_tests {
             // (A) Opportunistic CQ drain.
             while let Some(Some(c)) = inflight.next().now_or_never() {
                 if matches!(&c.1, Err(e) if e.contains("LockedByOther")) {
-                    locked_by_other.set(true);
+                    poisoned.set(true);
                 }
                 collected.borrow_mut().push(c);
-                if locked_by_other.get() {
+                if poisoned.get() {
                     return;
                 }
             }
@@ -4876,10 +4899,10 @@ mod sqcq_tests {
             if at_cap {
                 if let Some(c) = inflight.next().await {
                     if matches!(&c.1, Err(e) if e.contains("LockedByOther")) {
-                        locked_by_other.set(true);
+                        poisoned.set(true);
                     }
                     collected.borrow_mut().push(c);
-                    if locked_by_other.get() {
+                    if poisoned.get() {
                         return;
                     }
                 }
@@ -4915,7 +4938,7 @@ mod sqcq_tests {
                     None => {
                         while let Some(c) = inflight.next().await {
                             if matches!(&c.1, Err(e) if e.contains("LockedByOther")) {
-                                locked_by_other.set(true);
+                                poisoned.set(true);
                             }
                             collected.borrow_mut().push(c);
                         }
@@ -4925,10 +4948,10 @@ mod sqcq_tests {
                 Either::Right((maybe_c, _)) => {
                     if let Some(c) = maybe_c {
                         if matches!(&c.1, Err(e) if e.contains("LockedByOther")) {
-                            locked_by_other.set(true);
+                            poisoned.set(true);
                         }
                         collected.borrow_mut().push(c);
-                        if locked_by_other.get() {
+                        if poisoned.get() {
                             return;
                         }
                     }
@@ -4939,7 +4962,7 @@ mod sqcq_tests {
         // Drain remaining inflight after channel close (shutdown path).
         while let Some(c) = inflight.next().await {
             if matches!(&c.1, Err(e) if e.contains("LockedByOther")) {
-                locked_by_other.set(true);
+                poisoned.set(true);
             }
             collected.borrow_mut().push(c);
         }
@@ -5118,7 +5141,7 @@ mod sqcq_tests {
             tx.send((3, Duration::from_millis(50), Ok(3)))
                 .await
                 .unwrap();
-            // Channel deliberately left open; loop exits on locked_by_other flag.
+            // Channel deliberately left open; loop exits on poisoned flag.
 
             let _ = handle.await;
 
@@ -5128,7 +5151,7 @@ mod sqcq_tests {
             // entries. Check the invariant: all collected entries have the
             // right (id, result) pairing, and LBO is present, and the flag
             // is set.
-            assert!(locked.get(), "locked_by_other flag must be set");
+            assert!(locked.get(), "poisoned flag must be set");
             let got = collected.borrow();
             assert!(
                 got.iter().any(|(id, r)| *id == 2 && r.is_err()),

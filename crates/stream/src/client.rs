@@ -2254,6 +2254,16 @@ pub enum CopySource {
     EcWithoutShard { shard: usize },
 }
 
+/// Context on an append error raised after the payload was handed to the
+/// stream worker: it may sit on some replicas of a tail that is still open, so
+/// only a later seal decides whether it counts. Without it, nothing was written.
+pub const APPEND_OUTCOME_UNKNOWN: &str = "append outcome unknown";
+
+/// Whether `e` carries `APPEND_OUTCOME_UNKNOWN` anywhere in its chain.
+pub fn is_append_outcome_unknown(e: &anyhow::Error) -> bool {
+    format!("{e:#}").contains(APPEND_OUTCOME_UNKNOWN)
+}
+
 pub struct StreamClient {
     /// Weak self-reference — used by per-stream workers to clean up on
     /// exit. Set exactly once by `Rc::new_cyclic`.
@@ -3442,10 +3452,32 @@ impl StreamClient {
     /// The soft-error reload is the exception and is backstopped in
     /// `apply_completion`; see stream CLAUDE.md note 36.
     /// the new extent.
+    ///
+    /// An error after the payload was handed to the worker carries
+    /// `APPEND_OUTCOME_UNKNOWN`.
     async fn append_payload_segments(
         &self,
         stream_id: u64,
         segments: Vec<Bytes>,
+    ) -> Result<AppendResult> {
+        let sent = std::cell::Cell::new(false);
+        self.append_payload_attempts(stream_id, segments, &sent)
+            .await
+            .map_err(|e| {
+                if !sent.get() {
+                    return e;
+                }
+                // The original message stays first: callers match on it.
+                let outer = e.to_string();
+                e.context(format!("{outer} ({APPEND_OUTCOME_UNKNOWN})"))
+            })
+    }
+
+    async fn append_payload_attempts(
+        &self,
+        stream_id: u64,
+        segments: Vec<Bytes>,
+        sent: &std::cell::Cell<bool>,
     ) -> Result<AppendResult> {
         let payload_len_u32: u32 = segments.iter().map(|s| s.len() as u32).sum();
         let payload_len: usize = payload_len_u32 as usize;
@@ -3478,6 +3510,7 @@ impl StreamClient {
                     .send(msg)
                     .await
                     .map_err(|_| anyhow!("stream {stream_id} worker gone"))?;
+                sent.set(true);
             }
             let ack = ack_rx
                 .await
@@ -3606,9 +3639,10 @@ impl StreamClient {
                     //
                     // It is also unreachable by design: every append path calls
                     // `ensure_tail_initialised` first. So fail LOUDLY instead of
-                    // papering over it — the caller re-enters and re-initialises,
-                    // and a future lifecycle bug surfaces as an error instead of
-                    // as silent data loss.
+                    // papering over it — the caller re-enters and re-initialises
+                    // (a partition server reopens the partition: the error comes
+                    // back marked `APPEND_OUTCOME_UNKNOWN`), and a future lifecycle
+                    // bug surfaces as an error instead of as silent data loss.
                     if msg.contains("no tail set") {
                         // Clear the init flag on the way out, or this is not a
                         // fail-fast — it is a permanent one. Re-entry reaches the

@@ -1986,6 +1986,26 @@ impl WriteResponder {
         }
     }
 
+    /// Reply "retry elsewhere / later": `Unavailable` (batch status
+    /// `CODE_UNAVAILABLE`), which the SDK refreshes routing on and retries.
+    /// Used when the partition is going down for a reopen; the message says
+    /// whether the write may have been applied.
+    pub(crate) fn send_unavailable(self, msg: String) {
+        let outer = match self {
+            WriteResponder::Put { outer, .. } | WriteResponder::Delete { outer, .. } => outer,
+            WriteResponder::BatchPut { accum, idx } => {
+                accum.record(idx, partition_rpc::CODE_UNAVAILABLE);
+                return;
+            }
+            WriteResponder::Fence => {
+                // The admitted write riding behind it gets the same reply.
+                tracing::warn!("fence-bump WAL record not written: {msg}");
+                return;
+            }
+        };
+        let _ = outer.send(Err((StatusCode::Unavailable, msg)));
+    }
+
     /// Reply failure — propagate the error string as Internal to the outer
     /// resp_tx. "key is out of range" is InvalidArgument per existing semantics.
     pub(crate) fn send_err(self, msg: String) {
@@ -5272,7 +5292,8 @@ async fn delegate_round_trip(
         Frame::error(
             req_id,
             msg_type,
-            autumn_rpc::RpcError::encode_status(StatusCode::Internal, "partition thread closed"),
+            // Not handed over: the partition went down (a reopen or a move).
+            autumn_rpc::RpcError::encode_status(StatusCode::Unavailable, "partition thread closed"),
         )
     } else {
         let reply_started = std::time::Instant::now();
@@ -5301,8 +5322,10 @@ async fn delegate_round_trip(
             Err(_) => Frame::error(
                 req_id,
                 msg_type,
+                // The partition went down with it queued or in flight: a write
+                // may or may not have been applied.
                 autumn_rpc::RpcError::encode_status(
-                    StatusCode::Internal,
+                    StatusCode::Unavailable,
                     "partition response dropped",
                 ),
             ),
@@ -6328,10 +6351,10 @@ async fn partition_thread_main(
     // an admin fence-bump or ownership change) tears the partition down
     // for a region_sync reopen with a FRESH per-partition epoch
     // instead of retrying the stale epoch every 2 s forever.
-    let locked_by_other = Rc::new(Cell::new(false));
+    let poisoned = Rc::new(Cell::new(false));
     {
         let p = part.clone();
-        let poison = locked_by_other.clone();
+        let poison = poisoned.clone();
         spawn_failstop(format!("flush[part {part_id}]"), async move {
             background_flush_loop(p, flush_rx, poison).await;
         });
@@ -6689,7 +6712,7 @@ async fn partition_thread_main(
         imm_drained_rx,
         split_wake_rx,
         drain_rx,
-        locked_by_other,
+        poisoned,
         Routing {
             part_sc: part_sc.clone(),
             pool: pool.clone(),
@@ -6755,7 +6778,7 @@ async fn partition_loop(
     mut imm_drained_rx: mpsc::UnboundedReceiver<()>,
     mut split_wake_rx: mpsc::UnboundedReceiver<()>,
     mut drain_rx: mpsc::UnboundedReceiver<DrainAck>,
-    locked_by_other: Rc<Cell<bool>>,
+    poisoned: Rc<Cell<bool>>,
     routing: Routing,
 ) {
     use futures::future::{select, Either};
@@ -6796,11 +6819,8 @@ async fn partition_loop(
     let mut inflight: InflightQueue = InflightQueue::new();
 
     'outer: loop {
-        if locked_by_other.get() {
-            tracing::error!(
-                part_id,
-                "partition poisoned by LockedByOther, shutting down"
-            );
+        if poisoned.get() {
+            tracing::error!(part_id, "partition poisoned, shutting down for a reopen");
             break;
         }
         if drain_ack.is_some() {
@@ -6819,9 +6839,9 @@ async fn partition_loop(
         // (A) Opportunistic CQ drain — run Phase 3 for every completion that
         // is already ready without blocking.
         while let Some(Some(c)) = inflight.next().now_or_never() {
-            let acked = handle_completion(&part, &mut metrics, &locked_by_other, part_id, c).await;
+            let acked = handle_completion(&part, &mut metrics, &poisoned, part_id, c).await;
             window.arm(pending.len(), acked, Instant::now());
-            if locked_by_other.get() {
+            if poisoned.get() {
                 break 'outer;
             }
         }
@@ -6875,7 +6895,7 @@ async fn partition_loop(
                             &routing,
                             &mut inflight,
                             &mut metrics,
-                            &locked_by_other,
+                            &poisoned,
                         )
                         .await;
                         continue;
@@ -6946,9 +6966,9 @@ async fn partition_loop(
         // (C) Pipeline full — only CQ can progress.
         if at_cap {
             if let Some(c) = inflight.next().await {
-                let acked = handle_completion(&part, &mut metrics, &locked_by_other, part_id, c).await;
+                let acked = handle_completion(&part, &mut metrics, &poisoned, part_id, c).await;
                 window.arm(pending.len(), acked, Instant::now());
-                if locked_by_other.get() {
+                if poisoned.get() {
                     break;
                 }
             }
@@ -7013,9 +7033,9 @@ async fn partition_loop(
                 Either::Left((_, _)) => continue,
                 Either::Right((maybe_c, _)) => {
                     if let Some(c) = maybe_c {
-                        let acked = handle_completion(&part, &mut metrics, &locked_by_other, part_id, c).await;
+                        let acked = handle_completion(&part, &mut metrics, &poisoned, part_id, c).await;
                         window.arm(pending.len(), acked, Instant::now());
-                        if locked_by_other.get() {
+                        if poisoned.get() {
                             break;
                         }
                     }
@@ -7053,7 +7073,7 @@ async fn partition_loop(
                                 &routing,
                                 &mut inflight,
                                 &mut metrics,
-                                &locked_by_other,
+                                &poisoned,
                             )
                             .await;
                         }
@@ -7078,7 +7098,7 @@ async fn partition_loop(
                                 &routing,
                                 &mut inflight,
                                 &mut metrics,
-                                &locked_by_other,
+                                &poisoned,
                             )
                             .await;
                         }
@@ -7128,16 +7148,16 @@ async fn partition_loop(
                             &routing,
                             &mut inflight,
                             &mut metrics,
-                            &locked_by_other,
+                            &poisoned,
                         )
                         .await;
                     }
                     None => {
                         // Channel closed: drain remaining inflight, then exit.
                         while let Some(c) = inflight.next().await {
-                            handle_completion(&part, &mut metrics, &locked_by_other, part_id, c)
+                            handle_completion(&part, &mut metrics, &poisoned, part_id, c)
                                 .await;
-                            if locked_by_other.get() {
+                            if poisoned.get() {
                                 break;
                             }
                         }
@@ -7146,9 +7166,9 @@ async fn partition_loop(
                 },
                 Either::Right((maybe_c, _req_dropped)) => {
                     if let Some(c) = maybe_c {
-                        let acked = handle_completion(&part, &mut metrics, &locked_by_other, part_id, c).await;
+                        let acked = handle_completion(&part, &mut metrics, &poisoned, part_id, c).await;
                         window.arm(pending.len(), acked, Instant::now());
-                        if locked_by_other.get() {
+                        if poisoned.get() {
                             break;
                         }
                     }
@@ -7191,7 +7211,9 @@ async fn partition_loop(
         // pending; writes decode and push into pending. Skip when imm is
         // full so the back-pressure path actually applies.
         if !imm_full {
-            while pending.len() < max_write_batch() {
+            // A request handled above may have poisoned the partition; serve
+            // nothing more from this incarnation.
+            while pending.len() < max_write_batch() && !poisoned.get() {
                 match req_rx.next().now_or_never() {
                     Some(Some(req)) => {
                         handle_incoming_req(
@@ -7201,7 +7223,7 @@ async fn partition_loop(
                             &routing,
                             &mut inflight,
                             &mut metrics,
-                            &locked_by_other,
+                            &poisoned,
                         )
                         .await;
                     }
@@ -7221,7 +7243,7 @@ async fn partition_loop(
         &part,
         part_id,
         &mut metrics,
-        &locked_by_other,
+        &poisoned,
         &mut inflight,
         &mut pending,
         drain_ack,
@@ -7237,24 +7259,50 @@ async fn drain_and_shutdown(
     part: &Rc<RefCell<PartitionData>>,
     part_id: u64,
     metrics: &mut WriteLoopMetrics,
-    locked_by_other: &Rc<Cell<bool>>,
+    poisoned: &Rc<Cell<bool>>,
     inflight: &mut InflightQueue,
     pending: &mut Vec<WriteRequest>,
     drain_ack: Option<DrainAck>,
 ) {
-    while let Some(c) = inflight.next().await {
-        handle_completion(part, metrics, locked_by_other, part_id, c).await;
+    // Each step stops at a poisoning completion, for the reason below.
+    while !poisoned.get() {
+        let Some(c) = inflight.next().await else { break };
+        handle_completion(part, metrics, poisoned, part_id, c).await;
     }
     // Same byte bound as the main loop, and for the same reason — this is the
     // OTHER place a batch is taken, so a residual queue larger than one frame
     // would go out un-split here. Loop until the queue is empty: shutdown must
     // drain everything, it just cannot do it in one `AppendReq`.
-    while !pending.is_empty() {
+    while !pending.is_empty() && !poisoned.get() {
         let batch = take_byte_bounded_batch(pending);
         if let Ok(Some(mut flight)) = start_write_batch(part, batch).await {
-            let r = (&mut flight.phase2_fut).await;
-            let _ = finish_write_batch(part, flight.data, r).await;
+            let phase2_result = (&mut flight.phase2_fut).await;
+            handle_completion(
+                part,
+                metrics,
+                poisoned,
+                part_id,
+                InflightCompletion { data: flight.data, phase2_result },
+            )
+            .await;
         }
+    }
+    if poisoned.get() {
+        // No await from here on: the connection tasks share this thread, and
+        // a read they served now would answer from a memtable the reopen may
+        // contradict. The batches in flight are dropped unanswered (their
+        // writers see the connection close; the reopen's seal settles them);
+        // the queued ones were never sent.
+        *inflight = InflightQueue::new();
+        for req in pending.drain(..) {
+            req.resp.send_unavailable("the partition is reopening; this write was not applied".into());
+        }
+        metrics.flush(part_id);
+        if let Some(ack) = drain_ack {
+            // The receiver is gone only when shutdown() stopped waiting.
+            let _ = ack.send(Err("the partition was poisoned before its drain".into()));
+        }
+        return;
     }
     metrics.flush(part_id);
 
@@ -7738,16 +7786,19 @@ async fn handle_incoming_req(
     routing: &Routing,
     inflight: &mut InflightQueue,
     metrics: &mut WriteLoopMetrics,
-    locked_by_other: &Rc<Cell<bool>>,
+    poisoned: &Rc<Cell<bool>>,
 ) {
     if req.msg_type == partition_rpc::MSG_COMPARE_PUT || req.msg_type == partition_rpc::MSG_COMPARE_WRITE {
         // This actor owns user-write admission. Drain preceding writes and
         // retain admission across the comparison and durable publication.
-        while let Some(c) = inflight.next().await {
+        // Stop at a poisoning completion: awaiting the rest would let the
+        // connection tasks serve reads the reopen may contradict.
+        while !poisoned.get() {
+            let Some(c) = inflight.next().await else { break };
             let id = part.borrow().part_id;
-            handle_completion(part, metrics, locked_by_other, id, c).await;
+            handle_completion(part, metrics, poisoned, id, c).await;
         }
-        while !pending.is_empty() && !locked_by_other.get() {
+        while !pending.is_empty() && !poisoned.get() {
             match start_write_batch(part, take_byte_bounded_batch(pending)).await {
                 Ok(Some(mut flight)) => {
                     let result = (&mut flight.phase2_fut).await;
@@ -7755,7 +7806,7 @@ async fn handle_incoming_req(
                     handle_completion(
                         part,
                         metrics,
-                        locked_by_other,
+                        poisoned,
                         id,
                         InflightCompletion {
                             data: flight.data,
@@ -7771,17 +7822,17 @@ async fn handle_incoming_req(
                 }
             }
         }
-        if locked_by_other.get() {
+        if poisoned.get() {
             let _ = req.resp_tx.send(Err((
                 StatusCode::Unavailable,
-                "partition writer fenced".into(),
+                "the partition is reopening; this write was not applied".into(),
             )));
             return;
         }
         let response = if req.msg_type == partition_rpc::MSG_COMPARE_WRITE {
-            rpc_handlers::compare_write(req.payload, part, metrics, locked_by_other).await
+            rpc_handlers::compare_write(req.payload, part, metrics, poisoned).await
         } else {
-            rpc_handlers::compare_put(req.payload, part, metrics, locked_by_other).await
+            rpc_handlers::compare_put(req.payload, part, metrics, poisoned).await
         };
         let _ = req.resp_tx.send(response);
         return;
@@ -10694,16 +10745,16 @@ const STUCK_INFLIGHT_REPORT_EVERY: std::time::Duration = std::time::Duration::fr
 /// partition (the manager's region map is the arbiter on reopen).
 fn poison_for_fence(
     part: &Rc<RefCell<PartitionData>>,
-    locked_by_other: &Rc<Cell<bool>>,
+    poisoned: &Rc<Cell<bool>>,
     site: &str,
 ) {
     tracing::error!("{site} fenced (LockedByOther) — poisoning partition for fresh-epoch reopen");
-    locked_by_other.set(true);
+    poisoned.set(true);
     // Fire BOTH wake channels (coco P1): the imm-full park listens on
     // imm_drained_rx, but the fully-idle select listens only on
     // req_rx / split_wake_rx / drain_rx — without the split-wake an idle
     // partition would sleep through the poison until the next request.
-    // Every loop iteration re-checks `locked_by_other` at the top, so
+    // Every loop iteration re-checks `poisoned` at the top, so
     // either wake suffices once it lands in the right state.
     let (imm_tx, wake_tx) = {
         let p = part.borrow();
@@ -10719,7 +10770,7 @@ async fn background_flush_loop(
     // shared poison flag (same Rc `partition_loop` checks). A fence
     // rejection in the flush path must tear the partition down for a
     // fresh-epoch reopen, not retry the stale epoch forever.
-    locked_by_other: Rc<Cell<bool>>,
+    poisoned: Rc<Cell<bool>>,
 ) {
     use futures::future::{select, Either, FutureExt};
     use futures::stream::FuturesOrdered;
@@ -10835,7 +10886,7 @@ async fn background_flush_loop(
                     if let Err(e) = commit_flush_outcome(&part, outcome).await {
                         tracing::error!("background flush commit error: {e}");
                         if crate::background::is_locked_by_other(&e) {
-                            poison_for_fence(&part, &locked_by_other, "flush commit");
+                            poison_for_fence(&part, &poisoned, "flush commit");
                         }
                         failed = true;
                     }
@@ -10843,7 +10894,7 @@ async fn background_flush_loop(
                 Some(Err(e)) => {
                     tracing::error!("background flush async-phase error: {e}");
                     if crate::background::is_locked_by_other(&e) {
-                        poison_for_fence(&part, &locked_by_other, "flush async phase");
+                        poison_for_fence(&part, &poisoned, "flush async phase");
                     }
                     failed = true;
                 }

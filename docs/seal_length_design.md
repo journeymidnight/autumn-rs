@@ -111,10 +111,22 @@ length but wrong is a different case (corrupt, rebuilt elsewhere;
 Because a probe seal can keep bytes the writer never saw acknowledged, a write
 that failed or timed out may still be there after the partition reopens. Its
 outcome is **unknown**, not failed: the system guarantees only that once the
-seal is recorded, the answer never changes. The partition server answers a
-write whose log append failed with an `Internal` status; the SDK maps it to
-`ServerError` and retries it; sending a put or delete again leaves the same
-key in the same state, whether or not the first attempt survived.
+seal is recorded, the answer never changes.
+
+So a partition never answers a write as failed while its records may sit on
+an open tail. When the stream client gives up on a log append it had already
+sent (the alloc after an append error failed, or the roll limit was hit; the
+error carries `APPEND_OUTCOME_UNKNOWN`), the tail is still open, and the
+partition poisons itself and reopens without serving anything more; the open
+seals the tail before replay, which settles the batch. The batch's writers are
+answered `Unavailable` ("may or may not have been applied"), or lose the
+connection when the partition's thread exits; writes queued but never sent are
+answered `Unavailable` ("not applied"). A failure before anything was sent is
+answered "not applied" and the partition keeps serving. The SDK retries both
+for a single put or delete;
+sending a put or delete again leaves the same key in the same state, whether or
+not the first attempt survived. A conditional write (`compare_put`) is not
+idempotent: its retry can report a conflict caused by its own first attempt.
 
 HDFS block recovery and HBase behave the same way: block recovery syncs a
 block to the minimum length among the replicas it can reach, and HBase replays

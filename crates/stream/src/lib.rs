@@ -13,8 +13,9 @@ mod extent_scrub;
 pub use autumn_rpc::extent_rpc;
 
 pub use client::{
-    read_extent_shard_direct, read_extent_value_direct, set_read_hedge_ms, AppendResult,
-    CopySource, RangeCopies, RangeCopy, StaleVpOffset, StreamClient,
+    is_append_outcome_unknown, read_extent_shard_direct, read_extent_value_direct,
+    set_read_hedge_ms, AppendResult, CopySource, RangeCopies, RangeCopy, StaleVpOffset,
+    StreamClient, APPEND_OUTCOME_UNKNOWN,
 };
 pub use conn_pool::{normalize_endpoint, shard_addr_for_extent, ConnPool};
 pub use extent_node::{en_params, render_en_metrics, ExtentNode, ExtentNodeConfig, SharedAuthz};
