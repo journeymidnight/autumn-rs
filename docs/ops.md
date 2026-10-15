@@ -13,6 +13,7 @@ and the per-crate `crates/*/CLAUDE.md`.
 - [Prometheus /metrics](#prometheus-metrics)
 - [Disk-full (ENOSPC) behavior](#disk-full-enospc-behavior)
 - [WAL replay self-heal](#wal-replay-self-heal-log_stream-bit-rot--truncated-replica)
+- [Write outcomes and the tail seal on open](#write-outcomes-and-the-tail-seal-on-open)
 - [Read route-around for Suspected nodes](#read-route-around-for-suspected-nodes)
 - [Direct read on EC extents](#direct-read-on-ec-extents)
 - [A/B-ing a wire-path change](#ab-ing-a-wire-path-change-and-the-three-traps-that-fake-the-answer)
@@ -2045,6 +2046,42 @@ and forcegc there only rewrites it (seen on the VKE cluster: three 17 GB extents
 Regression: `RUST_MIN_STACK=16777216 cargo test --release -p autumn-manager --test
 system_gc_inline_wal` (needs `cargo build -p autumn-server --bins` for the killed
 child PS; the debug part-* thread overflows its default 2 MiB stack).
+
+## Write outcomes and the tail seal on open
+
+Design: `docs/seal_length_design.md`. A partition seals its open tails (the
+copies that answer decide the length) before it replays them; a write whose log
+append was sent and given up is answered `OutcomeUnknown` and the partition
+reopens, which settles it; once read, the answer never changes. A copy left out
+of a seal is caught up by `re_avali` when its node is back (whole-extent copy).
+
+Three extent nodes and three replicas, so one node down leaves no room for a
+new tail:
+
+```bash
+export AUTUMN_DATA_ROOT=/data05/autumn-outcome AUTUMN_EXTENT_BASE_PORT=20000
+./cluster.sh reset 3
+AC=(target/release/autumn-client --manager 127.0.0.1:9001 --namespace mem/demo)
+echo v0 | "${AC[@]}" put k0 /dev/stdin            # ok
+./cluster.sh stop-node 3
+echo v1 | "${AC[@]}" put k1 /dev/stdin            # Error: put: write outcome unknown (it may or may not have been applied): …
+"${AC[@]}" get k1                                 # v1 — the record reached the two live copies; the reopen kept it
+echo v2 | "${AC[@]}" put k2 /dev/stdin            # Error: put: connection error: … this write was not applied: … not enough nodes
+kill -9 "$(cat $AUTUMN_DATA_ROOT/pids/ps.pid)"; ./cluster.sh start-ps
+"${AC[@]}" get k1                                 # v1 again: the answer never changes
+grep -c "seal_tail: sealed the open tail for replay" /tmp/autumn-rs-logs/manager.log   # > 0
+./cluster.sh start-node 3; sleep 15
+grep "re_avali:" /tmp/autumn-rs-logs/node3.log     # "copied the whole extent from a peer … local_len=48 sealed_length=96"
+grep "caught a behind copy" /tmp/autumn-rs-logs/manager.log
+./cluster.sh clean; rm -rf "$AUTUMN_DATA_ROOT"
+```
+
+`re_avali` logs which way it went: "the copy already holds the sealed length;
+nothing copied" or "copied the whole extent from a peer … elapsed_ms". It never
+copies only the missing tail: past the last acknowledged commit a copy left out
+may hold bytes that differ from the sealed content, so its prefix is not
+trusted. The length check behind "nothing copied" has the same blind spot
+(BUG-SEAL-DIVERGENT-UNACKED-BYTES in `feature_list.md`, unreproduced).
 
 ## Read route-around for Suspected nodes
 

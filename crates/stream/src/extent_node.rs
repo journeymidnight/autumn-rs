@@ -9467,8 +9467,15 @@ impl ExtentNode {
 
         let local_len = extent.len.load(Ordering::SeqCst);
         if local_len >= extent_info.sealed_length {
+            tracing::info!(
+                extent_id = req.extent_id,
+                local_len,
+                sealed_length = extent_info.sealed_length,
+                "re_avali: the copy already holds the sealed length; nothing copied"
+            );
             return code_resp(CODE_OK, String::new());
         }
+        let copy_started = std::time::Instant::now();
 
         // gate cross-extent re_avali concurrency through the
         // shared recovery permit pool. Previously only `run_recovery_task`
@@ -9542,6 +9549,13 @@ impl ExtentNode {
             );
         }
 
+        tracing::info!(
+            extent_id = req.extent_id,
+            local_len,
+            sealed_length = extent_info.sealed_length,
+            elapsed_ms = copy_started.elapsed().as_millis() as u64,
+            "re_avali: copied the whole extent from a peer"
+        );
         code_resp(CODE_OK, String::new())
     }
 

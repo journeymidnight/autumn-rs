@@ -26,12 +26,17 @@
 - **Acceptance**: rs 非测试代码里无 `std::env::var`（RUST_LOG/UCX/jemalloc 库自身除外）；每个 binary 的 `--help` 列出全部参数及默认值；越界与未知参数退出码 2（测试）；新建 namespace 后第一次写在补拉后成功、无需等 30 s（测试）；`autumn-op config set` 恢复速度与 PS 限速在一个拉取周期内生效、`unset` 回到 flag 值、换主后仍在（集成测试 + 真集群）；未知 key 或越界值在 `config set` 时被拒；全量单测与 manager 集成套件通过；热路径改动做 perf A/B。
 - `passes: true`
 
-### F-SEAL-LENGTH-AND-WRITE-OUTCOME — sealed_length 与各副本长度的关系写成核心设计；失败的写结果未知；re_avali 只补缺的尾部
-- **Trigger** (2026-10-14 用户): 讨论 re_avali 是否有用时确认：probe seal（新 owner 接管）对连得上的副本取最小值，倒掉的副本可能比 sealed_length 短（实测 1/10 次短 132,854 字节，re_avali 为此整份拷贝 2.57 GB、9.75 s）；也可能更长（未 ack 的字节）。用户要求：(1) 写成核心设计；(2) 客户端收到失败、之后值又出现——学 HBase：stream client 放弃时（tail 未封）不回"失败"，回"结果未知"并 poison 分区，重开时由 probe seal 一次定下；(3) re_avali 只拉 `[local_len, sealed_length)`；(4) SDK 文档写明写错误 = 结果未知。
-- **Scope**: (1) `docs/seal_length_design.md`。(2) 先用 failpoint 复现：append 失败且 `alloc_new_extent` 也失败、+1 留在两个活副本、kill -9 PS 后重开、值出现；再改 PS 回复与 poison。(3) EN `re_avali` 短副本只拷尾部，仍临时文件 + 原子替换语义（不丢已有字节）。(4) SDK 错误类型/文档。
-- **Acceptance**: (2) 复现用例修复前客户端拿到确定失败而值随后出现、修复后拿到"结果未知"，消融变红；(3) 单测/集成测试：短副本只拷尾部字节数、拷贝失败不损原副本；真集群重复本次场景，短副本补齐字节数≈缺口；全量单测与 manager 集成套件通过。
+### F-REAVALI-TAIL-COPY — re_avali 只补缺的尾部（延后：有内容错的风险）
+- **Trigger** (2026-10-14/15 用户, F-SEAL-LENGTH-AND-WRITE-OUTCOME): 实测 probe seal 漏掉的副本 1/10 次比 sealed_length 短（132,854 字节），re_avali 为此整份拷贝 2.57 GB、9.75 s。实现前发现风险，用户定先保留整份拷贝（2026-10-15）。
+- **Scope**: 只有"最后一次确认的提交点"之前各副本字节相同；之后漏掉的副本可能是别的副本没收到的 append，而 seal 保留的是另一批。直接补尾巴会得到长度对、内容错、被当成健康的副本。可行路：先取对端块校验和、本地重算对比，从第一个不一致块起拉（多读一遍本地盘）。（"EN 持久化收到的最大 header.commit 再从该点拉"不成立：header.commit 是租约起点不是已确认提交点，回绕可低于已见过的值——2026-10-15 评审。）依赖 BUG-SEAL-DIVERGENT-UNACKED-BYTES 的结论。
+- **Acceptance**: 构造"漏掉副本在提交点后有不同字节"的用例：整份拷贝通过；尾部拷贝修复前得到内容错的副本（消融红）、修复后内容与 sealed 一致；短副本补齐的网络字节数≈缺口（或缺口+校验）。
 - `passes: false`
-- **notes** (2026-10-14): 复现时发现第二种顺序（已存在的 bug）：重开分区时回放 open tail 到"连得上的副本最小值"，第一次 append 却按"全体副本最小值"提交，副本回来后已回放、已被读到的记录被截断，再崩溃即丢。用户定按 HBase 先关 WAL 再回放：A 已提交（打开分区时 fence 后 seal 所有 open tail，wire 71）。B 已提交（发出后放弃的 append 带 APPEND_OUTCOME_UNKNOWN，PS 回 Unavailable 并 poison 重开；发出前失败只回 not applied、不重开）。SDK 已提交（wire 72 新 OutcomeUnknown 状态码；SDK 写错误在唯一出口定类；compare 类遇未知即停；批量按输入顺序重发）。re_avali 未做。
+
+### BUG-SEAL-DIVERGENT-UNACKED-BYTES — 已确认提交点之后副本内容可能不同，而 seal / re_avali 只看长度（推断，未复现）
+- **Trigger** (2026-10-15 re_avali 评审): EN 收不到已确认提交点（`header.commit` 是租约起点，client.rs `header_commit = offset`）；append 失败时 client 在同一 extent 上回绕游标（`rewind_or_poison`），流水线里的另一个 append 可能在同一偏移写入不同内容：A1 落在 X、Z，Y 失败→回绕；A2 在同偏移落在 Y、Z（Z 截掉 A1），X 没收到 → X 在 [c, ..) 是 A1、Y/Z 是 A2。probe seal（PS 打开分区，现在每次打开都封）对连得上的成员取最小长度并全部点亮 avali，不比内容；re_avali 的"本地长度够"也只比长度 → 长度对、内容错的副本可能被当成健康副本读。stream client 自己的 seal-and-roll 按已确认提交点封，不受影响。
+- **Scope**: 先复现（failpoint：让 A1 只落 X、Z，回绕后 A2 落 Y、Z 且漏 X，再 kill -9 PS 走 probe seal；比较各副本 [c, sealed) 内容与读结果）。坐实后再定修法（如 probe seal 时比较成员内容/校验和，只点亮与选定内容一致的成员；re_avali 比校验和而非长度）。
+- **Acceptance**: 复现用例修复前出现内容不一致的已点亮副本、修复后各点亮副本 [0, sealed) 一致；消融变红。
+- `passes: false`
 
 ### BUG-PUT-MANY-MIXED-SIZE-ORDER — 同一 key 在一次 put_many 里既有小值又有 ≥64 KiB 的值时，后输入的不一定赢（推断，未复现）
 - **Trigger** (2026-10-15 SDK 写结果评审): `batch_put` 先写完所有 <64 KiB 的分组（MSG_BATCH_PUT，组内按输入顺序），再写 bulk-only（≥64 KiB，按 key 串行）。`put_many([(K, big), (K, small)])` 先提交 small、后提交 big，结果是先输入的 big 赢。同尺寸类内的重复 key 有序（含失败重发，`batch_resend_plan`）。

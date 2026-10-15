@@ -3,7 +3,7 @@
 //! `avali` says a slot is not serving. It does not say WHY, and the two reasons
 //! need opposite handling:
 //!
-//! - **behind** — the replica is short. `re_avali` refetches the missing tail.
+//! - **behind** — the replica is short. `re_avali` copies the extent again.
 //! - **corrupt** — the replica is full-length and wrong. `re_avali` cannot fix
 //!   it; its entire test is `local_len >= sealed_length`, which a bit-rotted
 //!   copy passes. Only a rebuild replaces the bytes.

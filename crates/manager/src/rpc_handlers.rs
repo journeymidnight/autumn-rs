@@ -2117,7 +2117,9 @@ impl AutumnManager {
     /// reconciles it to `sealed_length` later (the laggard may hold MORE —
     /// un-acked speculation past the seal, which nothing reads, since every
     /// read is bounded by `sealed_length`; or LESS — which is copied up).
-    /// Either way acked data is safe.
+    /// Either way acked data is safe. Past the acked length a member's bytes
+    /// may also DIFFER from the others' — a length check cannot see that
+    /// (BUG-SEAL-DIVERGENT-UNACKED-BYTES, unreproduced).
     ///
     /// `Err` only when no committed member answered (there is none, or none
     /// was reachable): then nothing tells where the acked data ends.

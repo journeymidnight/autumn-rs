@@ -96,10 +96,25 @@ The manager's recovery tick (`recovery.rs`, every 2 s on the leader) sends
 once its node and disk answer, no other operation holds the extent, and the
 slot is not backing off. The extent node:
 
-- answers at once when its copy already holds `sealed_length`;
-- otherwise copies the extent from a peer into a temporary file and renames it
-  over its own only once the full `sealed_length` has landed, so a copy that
-  cannot be completed never loses what it had.
+- answers at once when its copy already holds `sealed_length` (a length check
+  only; see the open bug below);
+- otherwise copies the WHOLE extent from a peer into a temporary file and
+  renames it over its own only once the full `sealed_length` has landed, so a
+  copy that cannot be completed never loses what it had.
+
+It does not fetch only the missing tail. Only the bytes up to the last commit
+acknowledged to the writer are the same on every copy; past it, a copy left out
+may hold an append the others never got, at an offset where the others hold a
+different one that the seal kept. Appending the tail to it would make a copy of
+the right length with wrong bytes, served as healthy. The extent node does not
+receive the acknowledged commit, so it cannot tell where to start. Each outcome
+is logged ("nothing copied" / "copied the whole extent … elapsed_ms").
+
+The same blind spot sits under every length-only judgement past the
+acknowledged commit, and is open (BUG-SEAL-DIVERGENT-UNACKED-BYTES, not
+reproduced): a probe seal lights every member that answers by length alone, and
+`re_avali`'s "already holds the sealed length" is a length check too, so a
+member holding a different append at the same offsets could be served.
 
 On success the manager sets the bit. This is not a rebuild: the copy stays on
 its node and slot, nothing enters the operation ledger. A copy that is full
