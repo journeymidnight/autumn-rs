@@ -17,8 +17,6 @@ pages into the SAME autumn keyspace:
                      keyspaces; also the v2 multi-pool reservation slot).
 - `content_hash`   — the engine's own content-addressed hash (sglang chain hash
                      / vLLM block hash); adapters never re-hash.
-
-See docs/autumn_kvcache_plan.md §5 (sglang) and §13.3 (vLLM).
 """
 
 from __future__ import annotations
@@ -77,8 +75,7 @@ def _rank_int(cfg, attr: str, default: int) -> int:
 def build_model_scope(cfg, model_fingerprint=None) -> str:
     """Build the per-model key scope from a model/parallel config.
 
-    Mirrors sglang's `HiCacheFile._get_suffixed_key`
-    (docs/hicache_l3_interface.md:207-209). Accepts any object exposing the
+    Mirrors sglang's `HiCacheFile._get_suffixed_key`. Accepts any object exposing the
     attributes below (an sglang `HiCacheStorageConfig`, a vLLM-derived shim, or
     a plain namespace), so both adapters share one implementation.
 

@@ -8257,7 +8257,7 @@ fn enqueue_put(
 /// AND with `n_inflight < INFLIGHT_CAP` it can fire MULTIPLE concurrent
 /// batches against this N rather than the per-op trickle that limited
 /// cross-host throughput in `enqueue_put` (see
-/// `docs/perf_4k_loopback_vs_xhost_scaling.md`).
+/// `docs/perf_baseline.md`).
 ///
 /// Shared one-shot reply via `BatchPutAccumulator`: each per-op
 /// `WriteResponder::BatchPut::send_ok` records its slot; the LAST

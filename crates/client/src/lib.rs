@@ -4639,7 +4639,7 @@ impl ClusterClient {
     /// fires a wide batch immediately + can run multiple concurrent
     /// batches (exercises `INFLIGHT_CAP`). This is the
     /// fix for the cross-host 4K-write small-batch cliff documented in
-    /// `docs/perf_4k_loopback_vs_xhost_scaling.md`.
+    /// `docs/perf_baseline.md`.
     ///
     /// Constraints (vs the client-side `put_many` fan-out):
     /// * **Non-bulk only** — values >= 64 KiB skip this path (the wire

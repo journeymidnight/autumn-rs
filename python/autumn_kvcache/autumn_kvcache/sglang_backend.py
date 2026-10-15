@@ -11,7 +11,7 @@ Plug in via:
     "endpoint":"manager:9001"
   }'
 
-Architecture (docs/autumn_kvcache_plan.md): thin Python adapter over the
+Architecture: thin Python adapter over the
 existing `autumn` PyO3 client. No local DRAM cache, no sidecar daemon —
 partition layer's memtable + block cache serves as the implicit DRAM tier.
 """
@@ -383,8 +383,7 @@ class AutumnKVCacheStorage(HiCacheStorage):  # type: ignore[misc]
     def batch_exists(self, keys, extra_info=None) -> int:
         """Return contiguous-prefix length (NOT per-key list).
 
-        Matches the HiCacheStorage `batch_exists` contract documented in
-        docs/hicache_l3_interface.md:62-64. Uses `head` (metadata-only) so
+        Matches sglang's HiCacheStorage `batch_exists` contract. Uses `head` (metadata-only) so
         admission probing doesn't transfer the value bytes.
 
         This runs on sglang's ADMISSION path (per request, before prefill), so

@@ -90,7 +90,7 @@ Framework-agnostic, `ClusterClient`-based:
   `MgrInodeLeaseInfo.version`); the manager pushes `WriterClosed` /
   `LeaseRevoked` for close-to-open coherence.
 
-Full protocol: `docs/autumn_fs_lease_plan.md`.
+Full protocol: `docs/fs_lease_design.md`.
 
 ---
 

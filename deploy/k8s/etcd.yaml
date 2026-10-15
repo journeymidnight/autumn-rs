@@ -1,6 +1,6 @@
 # etcd control-plane store. Single member by default (bump replicas to 3 for a
 # fault-tolerant control plane and set --initial-cluster accordingly — see
-# docs/k8s_deploy.md). autumn stores all cluster metadata here.
+# "Deployment" in docs/ops.md). autumn stores all cluster metadata here.
 apiVersion: v1
 kind: Service
 metadata:
@@ -61,7 +61,7 @@ spec:
             - --listen-peer-urls=http://0.0.0.0:2380
             - --initial-advertise-peer-urls=http://$(POD_IP):2380
             # Single-member initial cluster. For a 3-member etcd, replace with
-            # the explicit member list (see docs/k8s_deploy.md).
+            # the explicit member list (see "Deployment" in docs/ops.md).
             - --initial-cluster=$(POD_NAME)=http://$(POD_IP):2380
             - --initial-cluster-state=new
             # A partition SPLIT commits one atomic txn whose op count scales with

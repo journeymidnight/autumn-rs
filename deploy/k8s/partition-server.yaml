@@ -4,7 +4,7 @@
 # IP directly (no per-pod Service needed). Per-partition listener ports are
 # DYNAMIC (base + monotonic ordinal), so they are NOT enumerated in a Service;
 # in-cluster clients reach them over flat pod networking. This is why v1 clients
-# must run INSIDE the cluster (see docs/k8s_deploy.md).
+# must run INSIDE the cluster (see "Deployment" in docs/ops.md).
 #
 # psid is derived from the pod ordinal (autumn-ps-0 → psid 1) by the entrypoint.
 apiVersion: v1

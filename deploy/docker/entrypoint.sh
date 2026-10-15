@@ -14,7 +14,7 @@
 #   - bring-up ordering guards (wait-for-leader, idempotent format,
 #     streams-guarded bootstrap) — the same protocol as cluster.sh.
 #
-# Addressing model (see docs/k8s_deploy.md):
+# Addressing model (see "Deployment" in docs/ops.md):
 #   extent-node  advertises its per-pod Service ClusterIP (Service name ==
 #                pod name). The manager keys EN
 #                identity on a stable node_uuid (persisted on the PVC), NOT
@@ -269,7 +269,7 @@ run_extent_node() {
         --advertise "${adv}:${port}"
         # Shard count == cpuset length (EN). Default: the container's first
         # AUTUMN_EXTENT_SHARDS allowed cores (first_allowed_cpus). See the
-        # sharding block above and docs/k8s_deploy.md "Multi-shard extent nodes".
+        # sharding block above and docs/ops.md "Multi-shard extent nodes".
         --cpuset "$cpuset"
     )
     # bound resident sealed-extent fds (default 4096 in the

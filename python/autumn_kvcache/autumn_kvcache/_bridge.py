@@ -3,7 +3,7 @@
 The `autumn` PyO3 module exposes async methods (each returns an awaitable that
 resolves when the compio worker thread completes the RPC). sglang's
 HiCacheController calls L3 backend methods **synchronously** from its
-prefetch/backup daemon threads (docs/hicache_l3_interface.md:216-220), so we
+prefetch/backup daemon threads, so we
 own a dedicated asyncio event loop thread and dispatch coroutines onto it via
 `run_coroutine_threadsafe`.
 

@@ -4,7 +4,7 @@
 #   docker build -f deploy/docker/Dockerfile -t autumn-rs:latest .
 #
 # One image serves every role; deploy/docker/entrypoint.sh dispatches on its
-# first argument (manager | extent-node | ps | bootstrap). See docs/k8s_deploy.md.
+# first argument (manager | extent-node | ps | bootstrap). See "Deployment" in docs/ops.md.
 
 # Optional base-image registry prefix. Empty (default) → the official Docker Hub
 # images (docker.io/library/...). Set it to build the base layers through a
@@ -91,14 +91,14 @@ RUN apt-get update \
 COPY . .
 # -p autumn-server builds exactly the server binaries. TCP transport only — the
 # ucx feature is deliberately off (RDMA-in-k8s needs hostNetwork + device
-# plugins; see docs/k8s_deploy.md).
+# plugins; see "Deployment" in docs/ops.md).
 # autumn-dashboard is the standalone web UI (crates/server/src/bin/autumn_dashboard); it embeds its
 # HTML via include_str!, so the binary alone is self-contained, and it drives the
 # cluster only through the autumn-op we already ship.
 # autumn-fuse is the FUSE mount daemon.
 # autumn-s3 is the S3 gateway (a binary of the autumn-server crate, so it comes
 # along with -p autumn-server); it serves model loaders and S3-native tools such
-# as LanceDB. See docs/model_loading.md and examples/lancedb-s3.
+# as LanceDB. See "S3 gateway" in docs/ops.md and examples/lancedb-s3.
 RUN cargo build --release \
     -p autumn-server -p autumn-fuse
 

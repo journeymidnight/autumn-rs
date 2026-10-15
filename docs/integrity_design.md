@@ -1,4 +1,4 @@
-# At-rest integrity for stream-layer content: scrub
+# At-rest integrity: scrub — design
 
 ## What is protected, and by what
 
@@ -92,17 +92,15 @@ does not hold, a quarantined `.meta`.
 ## Reads are not left waiting for the scrub
 
 The partition server checks every SST data block's own CRC32C as it decodes
-it, as it always has. A block that fails is fetched again from every other
+it. A block that fails is fetched again from every other
 copy — each lit replica, or for an EC extent one reconstruction per covering
 data shard with that shard left out and its node not asked — and the first
 copy that decodes is served. A replica of a sealed extent whose copy failed
 while another passed is reported (`MSG_REPORT_CORRUPT_REPLICA`, row stream)
 and isolated like a WAL replay's finding; an EC culprit is only logged, and
-its node's scrub reports it. A healthy read pays nothing new.
+its node's scrub reports it. A healthy read pays nothing extra.
 
 ## Where the CRCs are, and who computes them
-
-The rules, decided by the maintainer:
 
 1. **On disk: the formats carry their own CRCs, computed by the server.** Every
    SST data block and MetaBlock has a CRC32C written by the PS's SST builder;
@@ -126,11 +124,11 @@ The rules, decided by the maintainer:
    covers them, but a read fetches only the value — mostly straight from an
    extent node into the caller's buffer (`MSG_GET_REDIRECT` + direct read),
    otherwise through the PS (`resolve_value`) — and nothing checks that record
-   CRC. Decided against checking it, for two reasons: most reads are direct
+   CRC. It is not checked, for two reasons: most reads are direct
    reads, where a check costs a CRC pass over every value on the client (about
    1.2 ms for 8 MiB here, comparable to the transfer on RDMA, and one CRC per
    record cannot be checked while the value streams in); and the scrub covers
-   sealed log extents. The cost of the decision: a rotted copy of a value, or
+   sealed log extents. The cost: a rotted copy of a value, or
    one damaged in transit, reaches the reader undetected — rot until a scrub
    of its sealed log extent isolates it (up to the scrub interval; rot before
    the first scrub is recorded as the content, and an open tail is not
@@ -183,19 +181,18 @@ which attach-dedup would otherwise turn every later submit of into a no-op.
 
 The auto-policy `scrub` switch (on in `maintenance`, `balanced` and
 `aggressive`) submits `scrub --all` at most once per
-`SCRUB_POLICY_INTERVAL_SEC` (7 days). The interval is that kind's actuation
+`--scrub-policy-interval-secs` (default 7 days). The interval is that kind's actuation
 cooldown whatever the policy's own cooldown says, and cooldowns are persisted,
 so a leader change does not restart the week. The advisory row appears only
-once a week has passed and no scrub is running.
+once the interval has passed and no scrub is running.
 
 ## Non-goals
 
 - **A lying peer.** This finds media rot and silent mis-writes; a node that
   hashes bytes it already corrupted is a Byzantine problem.
 - **Cross-copy comparison.** Each copy is checked against its own record, not
-  against the other copies. Comparing replicas' records (only the records
-  travel) is a separate, deferred step; for EC it would be an RS consistency
-  check, which reads K shards across the network.
+  against the other copies. For EC that would be an RS consistency check,
+  which reads K shards across the network.
 - **Open extents.** Their content is still changing; the WAL record CRC covers
   the partition layer's use of them.
 

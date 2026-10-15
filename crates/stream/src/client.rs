@@ -1121,9 +1121,9 @@ pub struct StreamClientConfig {
     /// one (10.4 TB for 222 GB logical, 47× amplification).
     ///
     /// Why 8 MiB/s: measured healthy bulk write throughput is 277–622 MB/s
-    /// (docs/perf_tcp_vs_ucx_xhost.md — 8 MiB TCP writes 277 MB/s aggregate
-    /// with p99 ALREADY at 6.1 s > the old 5 s deadline; docs/perf_k8s_ycsb.md
-    /// — 8 MB VP writes 584 MB/s at RF=3, EN never disk-saturated on 2–3 GB/s
+    /// (docs/perf_baseline.md — 8 MiB cross-host TCP writes 277 MB/s aggregate
+    /// with p99 ALREADY at 6.1 s > the old 5 s deadline; on k8s
+    /// 8 MB VP writes 584 MB/s at RF=3, EN never disk-saturated on 2–3 GB/s
     /// NVMe). The floor is ~1.5 orders of magnitude below healthy so it
     /// tolerates near-full-disk fsync collapse, recovery/GC traffic and
     /// queueing behind other in-flight bulk appends — the deadline's job is
@@ -1178,7 +1178,7 @@ pub(crate) const IO_TIMEOUT_CAP: Duration = Duration::from_secs(600);
 /// regression). Read floor 4 MiB/s (looser than the 8 MiB/s append floor: a read
 /// is one replica's pread + transfer, no fsync barrier) sits ~1.7 orders below
 /// the worst measured wire-bound read throughput (193–601 MB/s cross-host TCP,
-/// docs/perf_tcp_vs_ucx_xhost.md) — it distinguishes a dead replica from
+/// docs/perf_baseline.md) — it distinguishes a dead replica from
 /// slow-but-progressing under congestion, not typical latency. Resulting 8 MiB
 /// read deadline = 3 + 2 = 5 s (was a fixed 3 s that stormed: 566–646 timeouts
 /// when 32 concurrent 8 MiB direct reads queued on a ~200 MB/s wire).

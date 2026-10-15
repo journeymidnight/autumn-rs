@@ -115,7 +115,7 @@ No new dependency, wire format, or data-path work is added by this integration.
   `--autumn-op`, and required `--cluster-secret-file` (its path is forwarded to
   every autumn-op call). The secret authorizes the **upstream manager**, not HTTP
   callers. HTTP remains
-  unauthenticated, including the VKE APIG route; see `docs/dashboard_review.md`.
+  unauthenticated, including the VKE APIG route.
 - Policy write bodies are typed; invalid booleans, integers, switch names and
   option-like policy names fail before spawning the CLI. HTML event arguments
   encode both JS strings and HTML delimiters/entities.

@@ -197,7 +197,7 @@ NAME, so a shard staged for one index can never be *served* as another.
 **The hot path never touches a checksum.** Appends, reads, seals and repairs
 never compute, write or consult one; the scrub is the only writer of the
 sidecars, and it runs only when the manager asks (`MSG_SCRUB_EXTENTS`, from
-`autumn-op scrub` or the weekly policy). Design: `docs/autumn_integrity_plan.md`.
+`autumn-op scrub` or the weekly policy). Design: `docs/integrity_design.md`.
 
 **The EC coordinator checks the `.dat` it encodes.** After the layout flip
 every replica is dropped, so the encoded bytes become the only version. If the

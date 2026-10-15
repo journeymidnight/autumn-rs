@@ -220,7 +220,6 @@ AUTUMN_KVCACHE_ENDPOINT=127.0.0.1:9001 AUTUMN_KVCACHE_TRANSPORT=tcp \
   parallel layouts never alias. The sglang model-scope format is unchanged
   (`model_name` is a real identity there); its escape hatch is
   `extra_config["model_id"]`.
-- See `docs/autumn_kvcache_plan.md` §13 for the full design.
 
 ## Offline unit tests (no cluster, no engine, no native module)
 

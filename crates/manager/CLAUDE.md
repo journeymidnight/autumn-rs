@@ -2068,7 +2068,7 @@ clock reset).
 `OP_KIND_SCRUB` (`autumn-op scrub EXT... | --part P | --all`, or the weekly
 policy) checks sealed copies against their recorded checksums ON THE NODES THAT
 HOLD THEM; no content crosses the network, and nothing on the hot path reads or
-writes a checksum (design: `docs/autumn_integrity_plan.md`; the node side is
+writes a checksum (design: `docs/integrity_design.md`; the node side is
 the stream crate's `extent_node/scrub.rs`).
 
 `plan_scrub` (pure) turns the scope into one `ScrubTask` per LIT copy of every
@@ -2337,7 +2337,7 @@ before reclaiming. Matrix: `mode_matrix_across_clients`; wire path:
 Consumer-side coherence rules (design rationale for the fuse consumer): a subscribe
 disconnect / overflow sentinel must drop EVERY held lease + cached fd (partial
 invalidation is a footgun); a cache-stale Read must reload extents before serving or
-return EIO (never serve pre-close bytes). See `docs/autumn_fs_lease_plan.md`.
+return EIO (never serve pre-close bytes). See `docs/fs_lease_design.md`.
 
 ## Namespace registry
 

@@ -1029,7 +1029,7 @@ do_start() {
         # UCX warmup race: wait for `replicas` EN df-health Online states
         # before bootstrap (otherwise allocate_extent → "no healthy node").
         # Same as the cross-host UCX bring-up path documented in
-        # docs/perf_tcp_vs_ucx_xhost.md.
+        # docs/perf_baseline.md.
         for _i in $(seq 1 24); do
             sleep 5
             local _n

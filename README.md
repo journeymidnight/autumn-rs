@@ -53,8 +53,8 @@ erasure-coded, self-healing extents.
 **The engine underneath:**
 - **Fast by construction** — thread-per-core on io_uring (compio), custom binary
   RPC with rkyv zero-copy, group commit, adaptive batching. Optional **RDMA
-  (UCX)** transport with zero-copy reads *and* writes: cross-host 8 MiB reads
-  run ~4.6× TCP (`docs/perf_tcp_vs_ucx_xhost.md`).
+  (UCX)** transport with zero-copy reads *and* writes: cross-host 8 MiB writes
+  run ~4.4× TCP (`docs/perf_baseline.md`).
 - **The log is the database** — no local WAL files anywhere; a min-replica
   commit protocol makes the replicated extents themselves the journal. Open
   extents are 3-way replicated; sealed extents are **erasure-coded (K+M)** in
@@ -168,8 +168,8 @@ ino = fs.resolve("/models/llama-3-8b")
 ```
 
 Large files are transparently chunked (8 MiB, zero-copy reads). For serving a
-model that lives in autumn (vLLM / SGLang), see
-[`docs/model_loading.md`](docs/model_loading.md) — run `autumn-s3` as a per-node
+model that lives in autumn (vLLM / SGLang), see "S3 gateway" in
+[`docs/ops.md`](docs/ops.md) — run `autumn-s3` as a per-node
 sidecar and point any engine's stock `--load-format runai_streamer` at it. Loads
 byte-identically to local disk on vLLM and SGLang, with no engine patches.
 
@@ -178,8 +178,7 @@ byte-identically to local disk on vLLM and SGLang, with no engine patches.
 `python/autumn_kvcache` plugs into the HiCache L3 storage-backend interface —
 the cluster becomes the shared L3 tier behind GPU/CPU cache levels, so prefix
 caches survive restarts and are shared across inference instances. Setup +
-design: [`docs/autumn_kvcache_plan.md`](docs/autumn_kvcache_plan.md),
-[`docs/hicache_l3_interface.md`](docs/hicache_l3_interface.md).
+design: [`python/autumn_kvcache/README.md`](python/autumn_kvcache/README.md).
 
 ### LanceDB — vector tables over S3
 
@@ -200,8 +199,8 @@ The workload and the captured request contract are documented in
 
 | Path | Use it for | Docs |
 |---|---|---|
-| `deploy/baremetal/autumn-deploy` | physical servers, single- or multi-host (systemd; process backend on macOS/containers) | [`docs/baremetal_deploy.md`](docs/baremetal_deploy.md) |
-| `deploy/k8s/` | Kubernetes — one image, kustomize base, guarded bootstrap Job; local-disk ENs, network-volume etcd | [`docs/k8s_deploy.md`](docs/k8s_deploy.md) |
+| `deploy/baremetal/autumn-deploy` | physical servers, single- or multi-host (systemd; process backend on macOS/containers) | [`docs/ops.md`](docs/ops.md) "Deployment" → Bare metal |
+| `deploy/k8s/` | Kubernetes — one image, kustomize base, guarded bootstrap Job; local-disk ENs, network-volume etcd | [`docs/ops.md`](docs/ops.md) "Deployment" → Kubernetes |
 | `cluster.sh` | dev / chaos / perf **testing only** (raw process kill for fault injection) | [`docs/ops.md`](docs/ops.md) |
 
 Extent nodes on Linux write large appends around the page cache by default
@@ -217,16 +216,16 @@ automatically: clusters bind **RoCE NIC IPs** (loopback is not an RDMA address a
 refused) and get `UCX_TLS=rc_mlx5,ud_mlx5,tcp,self` plus a pinned `UCX_NET_DEVICES` —
 one list serves intra-host and cross-host traffic (**never add `posix`/`cma`**: the
 posix shm path stalls concurrent ≥64 KiB transfers).
-Details: [`docs/baremetal_deploy.md`](docs/baremetal_deploy.md).
+Details: "Deployment" in [`docs/ops.md`](docs/ops.md).
 
 ## Documentation
 
 - [`docs/ops.md`](docs/ops.md) — **operations & manual-verification manual**
-  (fuse runbook, metrics, capacity, chaos suites, rolling restart, CLI reference)
+  (deployment, fuse runbook, metrics, capacity, chaos suites, rolling restart, CLI reference)
+- [`docs/perf_baseline.md`](docs/perf_baseline.md) — performance baselines and how they were measured
 - [`CLAUDE.md`](CLAUDE.md) + `crates/*/CLAUDE.md` — architecture: stream layer
   commit protocol & fencing, LSM partition server, control plane, transports
-- [`docs/baremetal_deploy.md`](docs/baremetal_deploy.md) / [`docs/k8s_deploy.md`](docs/k8s_deploy.md) — deployment guides
-- [`docs/lancedb_s3_gateway_plan.md`](docs/lancedb_s3_gateway_plan.md) / [`docs/autumn_kvcache_plan.md`](docs/autumn_kvcache_plan.md) / [`docs/data_plane_authz_design.md`](docs/data_plane_authz_design.md) — subsystem designs
+- `docs/*_design.md` — subsystem designs (e.g. [`docs/data_plane_authz_design.md`](docs/data_plane_authz_design.md))
 - [`feature_list.md`](feature_list.md) — the feature ledger
 
 ## License

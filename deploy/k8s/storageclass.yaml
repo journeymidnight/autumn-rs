@@ -15,8 +15,8 @@
 #   kubectl apply -f https://raw.githubusercontent.com/rancher/local-path-provisioner/v0.0.31/deploy/local-path-storage.yaml
 # For dedicated production NVMe, prefer STATIC local volumes instead — set
 #   provisioner: kubernetes.io/no-provisioner
-# and pre-create one PV per node/disk with nodeAffinity (example in
-# docs/k8s_deploy.md). reclaimPolicy: Retain so a deleted PVC never auto-wipes
+# and pre-create one PV per node/disk with nodeAffinity (example under
+# "Deployment" in docs/ops.md). reclaimPolicy: Retain so a deleted PVC never auto-wipes
 # extent data.
 apiVersion: storage.k8s.io/v1
 kind: StorageClass

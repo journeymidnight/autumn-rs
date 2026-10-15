@@ -28,8 +28,8 @@ resources:
 # This base is a GENERIC reference. Cluster-specific values (image ref, node
 # pinning, StorageClass names/sizes, registry mirrors, replica counts) do NOT
 # belong here — put them in an overlay that lists this dir as its base. See
-# deploy/overlays/vke for a worked Volcengine example, and the "Per-cluster
-# overlay" section of docs/k8s_deploy.md.
+# deploy/overlays/vke for a worked Volcengine example, and "Per-cluster
+# overlay" under "Deployment" in docs/ops.md.
 #
 # Override the image centrally (or, preferably, from the overlay):
 #   images:

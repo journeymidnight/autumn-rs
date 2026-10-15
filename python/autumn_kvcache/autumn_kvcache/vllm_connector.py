@@ -3,7 +3,7 @@
 Native vLLM KV connector that offloads paged KV-cache blocks into the autumn
 partition layer, reusing the SAME data plane as the sglang backend
 (`autumn.BatchClient` + the sync/async `_bridge`). No daemon, no local DRAM
-cache — partition is the only persistence path (docs/autumn_kvcache_plan.md §13).
+cache — partition is the only persistence path.
 
 Plug in via:
   vllm serve <model> \\
@@ -130,15 +130,15 @@ def prefix_hash(
     """Content hash of the first `num_tokens` token ids + context extra keys.
 
     Mirrors vLLM's `SharedStorageConnector._generate_foldername_debug`: a stable
-    digest over the token-id bytes. Content-addressed ⇒ no invalidation ever
-    (docs/autumn_kvcache_plan.md §9). MVP keys the WHOLE block-aligned prompt
+    digest over the token-id bytes. Content-addressed ⇒ no invalidation ever.
+    MVP keys the WHOLE block-aligned prompt
     prefix (per-block keying is Phase 3c).
 
     `extra_keys` MUST include any context that changes the KV beyond the token
     ids — LoRA id, multimodal-input hashes — otherwise two requests with the
     same tokens but different LoRA/mm context would alias the same KV (a
-    correctness bug). Ideally these come from vLLM's own `BlockHash` extra keys
-    (docs/autumn_kvcache_plan.md §13.3); MVP derives a best-effort subset from
+    correctness bug). Ideally these come from vLLM's own `BlockHash` extra keys;
+    MVP derives a best-effort subset from
     the request and reconciles exact parity during the e2e.
     """
     h = hashlib.sha256()

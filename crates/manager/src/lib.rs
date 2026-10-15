@@ -1034,7 +1034,7 @@ pub struct AutumnManager {
     /// Writer leases are persisted under the `inode_leases/` etcd
     /// prefix; reader leases live in memory only. See
     /// `crates/manager/src/inode_lease.rs` and
-    /// `docs/autumn_fs_lease_plan.md`.
+    /// `docs/fs_lease_design.md`.
     pub(crate) inode_leases: crate::inode_lease::SharedRegistry,
     /// the manager's Ed25519 signing keyring (KDC private
     /// material), loaded once from `--auth-signing-key-file`. `None` = authz

@@ -7282,10 +7282,9 @@ impl AutumnManager {
 
     // ── inode lease handlers ───────────────────────────────────────────────
     //
-    // Plan reference: `docs/autumn_fs_lease_plan.md`. Manager is the
-    // single decision-maker (§6 invariant 1); writer leases are
-    // persisted to etcd (§3.1) while reader leases stay in-memory only
-    // (§7, on lease-count explosion). Every etcd write routes through
+    // Design: `docs/fs_lease_design.md`. Manager is the single
+    // decision-maker; writer leases are persisted to etcd while reader
+    // leases stay in-memory only. Every etcd write routes through
     // `put_msgs_txn` / `put_and_delete_txn` so the leader fence
     // travels with it.
 

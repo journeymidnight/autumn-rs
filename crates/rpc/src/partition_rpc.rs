@@ -138,7 +138,7 @@ pub const MSG_PUT_BULK: u8 = 0x51;
 /// — for them the wire payload IS the bottleneck and per-op overhead
 /// is negligible; bundling them into one frame would force a 256 MB
 /// frame for a 32-op batch of 8 MiB values which the wire framing
-/// reject. See `docs/perf_4k_loopback_vs_xhost_scaling.md` for the
+/// reject. See `docs/perf_baseline.md` ("Findings that hold") for the
 /// motivating cross-host write cliff this closes.
 ///
 /// Client side: routes by part_id (every op must hash to the SAME

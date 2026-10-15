@@ -29,7 +29,7 @@ data:
   # this), mounted into the manager at /etc/autumn/authz. Authz engages ONLY when
   # that Secret is actually mounted (entrypoint `-s` gate), so a cluster deployed
   # WITHOUT the Secret — or with AUTUMN_AUTH_DISABLE="1" — runs authz-OFF.
-  # Clients pass the minted credential via --credential-file (see k8s_deploy.md).
+  # Clients pass the minted credential via --credential-file (see "Deployment" in docs/ops.md).
   # PROTECT-EVERYTHING: the signing key alone arms enforcement of EVERY keyed
   # op; there is no protected-prefix list to set.
   AUTUMN_AUTH_SIGNING_KEY_FILE: "/etc/autumn/authz/signing.key"

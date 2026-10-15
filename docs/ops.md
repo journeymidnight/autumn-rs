@@ -7,6 +7,7 @@ see [`README.md`](../README.md); for architecture see [`CLAUDE.md`](../CLAUDE.md
 and the per-crate `crates/*/CLAUDE.md`.
 
 - [Binaries & ports](#binaries--ports)
+- [Deployment](#deployment) (bare metal, Kubernetes)
 - [Cluster secret](#cluster-secret)
 - [Fuse daemon runbook](#fuse-daemon-runbook)
 - [Cluster capacity — `autumn-op df`](#cluster-capacity--autumn-op-df)
@@ -28,9 +29,8 @@ and the per-crate `crates/*/CLAUDE.md`.
 
 ### Core-path performance validation
 
-Replica CRC reuse and actual P-sst affinity verification are documented in
-[`perf_partition_cpu_20260914.md`](perf_partition_cpu_20260914.md), including
-TCP/UCX byte-exact integration and the isolated CRC CPU benchmark. Verify
+Replica CRC reuse and its isolated CRC CPU benchmark are summarized in
+[`perf_baseline.md`](perf_baseline.md) ("Findings that hold"). Verify
 `Cpus_allowed_list` in `/proc/<ps-pid>/task/<tid>/status` for P-log and P-sst:
 the intended CPUs in startup logs are insufficient to establish actual pinning.
 
@@ -84,6 +84,287 @@ plain commands.
 `autumn-client --help` / `autumn-op --help` lists subcommands. (The standalone
 Python `python/dashboard/` was retired 2026-07-04 — folded into the manager; see
 "Web dashboard + auto-policy controller" below.)
+
+## Deployment
+
+Two deploy paths ship: `deploy/baremetal/autumn-deploy` for physical servers and
+`deploy/k8s/` (kustomize) for Kubernetes. `cluster.sh` is the dev/chaos/perf test
+harness, not a deployment tool.
+
+Constraints both paths are shaped around:
+
+- **No DNS in the binaries.** Every address goes through `SocketAddr::parse`, so
+  flags carry IP literals (IPv6 bracketed). autumn-deploy resolves names once for
+  SSH; the k8s entrypoint resolves Service names with `getent`.
+- **EN identity is the `node_uuid`** minted at `format` and kept in the data dir.
+  The EN self-registers its current address and every shard port at each start,
+  so an address change updates the same node.
+- **The PS re-registers each partition's address on every open**, so a PS can
+  move. Per-partition listener ports are dynamic and reached over flat routable
+  networking, so clients run where they can reach PS addresses directly (on k8s:
+  in-cluster; NodePort/LoadBalancer cannot represent per-partition ports).
+- **Managers are stateless** (state in etcd). PS and clients take the full manager
+  list and rotate on `NOT_LEADER`.
+- **`bootstrap` is not idempotent**; both paths guard it by checking for existing
+  streams (`autumn-op info --full`), so re-running a start is safe.
+- **Every server needs the cluster secret** (`--cluster-secret-file`); see
+  [Cluster secret](#cluster-secret). Both paths arm data-plane authz by default;
+  see [Enabling authz](#enabling-authz).
+- **EN data dirs must accept O_DIRECT** (append bursts ≥ 1 MiB go direct on
+  Linux), or the EN refuses to start. `AUTUMN_EXTENT_DIRECT_IO=0` passes
+  `--no-direct-io` instead; see [Direct I/O on the extent nodes](#direct-io-on-the-extent-nodes).
+- **Run more ENs than the replication factor**: with `#EN == RF` one EN down stops
+  writes (no fresh replica set can form); reads tolerate a down replica.
+
+### Bare metal (`autumn-deploy`)
+
+Requirements: `cargo build --release -p autumn-server` on the driver host;
+`etcd` ≥ 3.5 on each `ETCD_HOSTS` host (in `PATH` or `DEPLOY_DIR/bin/etcd`);
+`bash` ≥ 4 on the driver (macOS ships 3.2: `brew install bash`); passwordless SSH
+to every `SSH_USER@host` for multi-host; Linux ≥ 5.15 on server hosts (io_uring;
+macOS runs a local test cluster on kqueue, but `autumn-fuse` and UCX are
+Linux-only).
+
+Service backend (`SERVICE_BACKEND=auto|systemd|process`): **systemd** when the host
+runs systemd and the user is root or has passwordless sudo (one unit per instance,
+`Restart=on-failure`, `LimitMEMLOCK=infinity`, `TimeoutStopSec=70` so the PS can
+drain on stop); otherwise **process** (background process + pidfile + logfile under
+`DATA_ROOT`).
+
+`deploy/baremetal/topology.conf` (multi-host) and `topology-singlehost.conf` are
+commented examples:
+
+```bash
+DEPLOY_DIR=/opt/autumn-rs           # binaries + rendered units per host
+DATA_ROOT=/var/lib/autumn-rs        # etcd data, PS state, logs, pids
+TRANSPORT=tcp                       # tcp | ucx
+SERVICE_BACKEND=auto                # auto | systemd | process
+SSH_USER=root
+ETCD_HOSTS=(10.0.0.1)               # member m: client 2379+m*10, peer 2380+m*10
+MANAGER_HOSTS=(10.0.0.1)            # >1 = HA (shared etcd, leader election)
+MANAGER_PORT=9001
+EN_BASE_PORT=9101
+EN_NODES=(                          # each: "HOST|DATADIR[,DATADIR2,...]"
+  "10.0.0.4|/data03/autumn"
+  "10.0.0.5|/data03/autumn"
+  "10.0.0.6|/data03/autumn"
+)
+PS_HOSTS=(10.0.0.9)
+PS_BASE_PORT=9301
+PS_PORT_STRIDE=200                  # headroom for per-partition listeners
+REPLICATION=""  EC_LOG=""  EC_ROW=""  PRESPLIT=""   # "" = auto by node count
+```
+
+`en<i>` binds `EN_BASE_PORT+i`; `ps<i>` gets psid `i+1` and base
+`PS_BASE_PORT+i*PS_PORT_STRIDE`. Several clusters on one host also set
+`ETCD_CLIENT_BASE_PORT` / `ETCD_PEER_BASE_PORT`. An EN takes a single manager
+address, so EN housekeeping RPCs go to the first manager listed.
+
+```bash
+cd deploy/baremetal
+./autumn-deploy -t topology.conf check      # topology + SSH + binaries + backend
+./autumn-deploy -t topology.conf deploy     # push binaries to DEPLOY_DIR/bin
+./autumn-deploy -t topology.conf start      # ordered bring-up; deploys if needed
+./autumn-deploy -t topology.conf status
+./autumn-deploy -t topology.conf restart [etcd|manager|en|ps]
+./autumn-deploy -t topology.conf stop [etcd|manager|en|ps]
+./autumn-deploy -t topology.conf destroy [--wipe]
+```
+
+`start` order: etcd → managers → wait for a leader → per-EN idempotent
+`autumn-op format` + launch → wait for N ENs Online → guarded `bootstrap` → PS →
+wait for a served partition. On a bootstrapped cluster it skips bootstrap, so
+`stop` + `start` is a safe restart.
+
+- **Cluster secret**: generated once at `~/.autumn-deploy/cluster.secret`
+  (override `AUTUMN_CLUSTER_SECRET_FILE`), copied to `$DATA_ROOT/cluster.secret`
+  (mode 600) on every server host and passed to every server and `autumn-op` call;
+  `restart` re-copies it. Two clusters from one driver share it unless that
+  variable differs.
+- **Authz**: a signing key under `~/.autumn-deploy/authz/` (override
+  `AUTUMN_AUTHZ_DIR`), generated once and reused so minted credentials keep
+  working; after bootstrap one principal per family is minted: `fs.cred` (grant
+  `fs/`), `kvc.cred` (grant `kvc/`). `AUTUMN_AUTH_SIGNING_KEY_FILE` brings your own
+  key (you then mint credentials); `AUTUMN_AUTH_DISABLE=1` runs authz off.
+
+  ```bash
+  autumn-op --cluster-secret-file ~/.autumn-deploy/cluster.secret --manager $M info
+  autumnfs    --manager $M --credential-file ~/.autumn-deploy/authz/fs.cred put F /F
+  autumn-fuse --manager $M --credential-file ~/.autumn-deploy/authz/fs.cred --mountpoint /mnt/x
+  # kvcache: extra_config auth_credential_file=~/.autumn-deploy/authz/kvc.cred
+  ```
+- **UCX** (`TRANSPORT=ucx`): hosts must be RoCE NIC IPs (a loopback host is
+  refused unless the topology sets `UCX_TLS` itself). Every instance gets
+  `UCX_TLS=rc_mlx5,ud_mlx5,tcp,self` and a pinned `UCX_NET_DEVICES` (default
+  `mlx5_1:1`, a non-GPU NIC); topology values override. Positive lists only;
+  never `posix`/`cma` (the posix large-message path stalls concurrent ≥ 64 KiB
+  transfers).
+- **systemd**: units at `/etc/systemd/system/autumn-<inst>.service`
+  (`autumn-manager0`, `autumn-en0`, `autumn-ps0`); `systemctl cat autumn-ps0`,
+  `journalctl -u autumn-ps0 -f`.
+
+Verification, single host, process backend (no root, no systemd):
+
+```bash
+cargo build --release -p autumn-server
+cd deploy/baremetal
+# point EN_NODES at scratch dirs if there are no /data* disks
+./autumn-deploy -t topology-singlehost.conf start
+../../target/release/autumn-op --cluster-secret-file ~/.autumn-deploy/cluster.secret \
+    --manager 127.0.0.1:9001 info                                # 3 nodes, 1 partition
+AC="../../target/release/autumn-client --manager 127.0.0.1:9001"
+echo hello | $AC put mykey /dev/stdin && $AC get mykey            # → hello
+./autumn-deploy -t topology-singlehost.conf stop
+./autumn-deploy -t topology-singlehost.conf start                # must SKIP bootstrap
+$AC get mykey                                                     # → hello (data survived)
+./autumn-deploy -t topology-singlehost.conf destroy --wipe
+```
+
+### Kubernetes (`deploy/k8s`)
+
+One image (`deploy/docker/Dockerfile`) serves every role;
+`deploy/docker/entrypoint.sh` dispatches on the first argument and does the k8s
+glue (DNS → IP, env → flags, bring-up guards). The image is TCP-only (UCX would
+need `hostNetwork`, an RDMA device plugin and memlock).
+
+| Manifest | Kind(s) | Notes |
+|---|---|---|
+| `namespace.yaml` | Namespace `autumn` | |
+| `storageclass.yaml` | StorageClass `autumn-en-local` | local disk for ENs |
+| `configmap.yaml` | ConfigMap | shared env; `AUTUMN_EXPECT_NODES` must equal the EN count |
+| `etcd.yaml` | StatefulSet + headless Service | 1 member, PVC on the default (network) class |
+| `manager.yaml` | StatefulSet + ClusterIP + headless Services | readiness = leader-gated `autumn-op info`, so the ClusterIP reaches the leader |
+| `extent-node.yaml` | headless Service | ENs are per-EN Deployments from `deploy/scripts/en-workload.sh`; advertise the pod IP |
+| `partition-server.yaml` | StatefulSet + headless Service | advertises the pod IP; no PVC (its state is in the streams) |
+| `bootstrap-job.yaml` | Job | guarded, run-once |
+
+Apply order does not matter: each role waits for the manager leader, and the
+bootstrap Job waits for `AUTUMN_EXPECT_NODES` ENs Online. All pods set
+`enableServiceLinks: false` (the injected `AUTUMN_MANAGER_PORT=tcp://…` would
+collide with the entrypoint's own variable).
+
+**Storage.** ENs use local disk (`autumn-en-local`, `WaitForFirstConsumer`, which
+pins an EN pod to its node; `reclaimPolicy: Retain`): autumn replicates itself, so
+a self-replicating network volume would multiply the copies. The shipped class
+uses `rancher.io/local-path`; for dedicated NVMe use static `local` PVs:
+
+```yaml
+# storageclass.yaml: provisioner: kubernetes.io/no-provisioner, then one PV per EN disk
+apiVersion: v1
+kind: PersistentVolume
+metadata: { name: autumn-en-node1-nvme0 }
+spec:
+  capacity: { storage: 3Ti }
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: autumn-en-local
+  local: { path: /mnt/nvme0/autumn }
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - { key: kubernetes.io/hostname, operator: In, values: ["node1"] }
+```
+
+etcd uses the cluster's default network-durable class (`storageClassName`
+omitted), so a single member survives node loss by re-attaching its volume. With
+no default StorageClass the etcd PVC stays Pending; name a class in the overlay.
+For control-plane HA run 3 etcd members with `--initial-cluster`.
+
+**Build and deploy.**
+
+```bash
+docker build -f deploy/docker/Dockerfile -t autumn-rs:latest .
+kind load docker-image autumn-rs:latest            # kind; else push to a registry
+# base kustomization only (the vke overlay's deploy.sh creates it):
+autumn-op gen-cluster-secret > cluster.secret
+kubectl -n autumn create secret generic autumn-cluster-secret --from-file=cluster.secret
+kubectl apply -k deploy/k8s                        # or: kubectl apply -k deploy/overlays/vke
+kubectl -n autumn wait --for=condition=complete job/autumn-bootstrap --timeout=300s
+kubectl -n autumn get pods,svc
+```
+
+The manifests use `autumn-rs:latest` + `IfNotPresent`, which suits kind/minikube;
+on a shared cluster pin an immutable tag or digest (`images[].newTag`), or nodes
+keep a stale `:latest`. Run `bash deploy/validate.sh` before applying (YAML,
+cross-references, entrypoint dispatch, kustomization consistency, `bash -n`).
+
+**Cluster secret and authz.** Every manager, PS and EN pod, the bootstrap Job and
+the dashboard mount Secret `autumn-cluster-secret` (key `cluster.secret`, at
+`/etc/autumn/cluster/`); `AUTUMN_CLUSTER_SECRET_FILE` in the ConfigMap points the
+entrypoint at it. The fuse and S3 roles hold no secret. `deploy/overlays/vke/deploy.sh`
+creates the cluster secret and the `autumn-authz` signing-key Secret once and never
+rotates them; the manager mounts `autumn-authz` optionally and engages authz only
+when it is present (`AUTUMN_AUTH_DISABLE=1` in the ConfigMap turns it off). Mint a
+client credential:
+
+```bash
+kubectl -n autumn get secret autumn-cluster-secret \
+    -o jsonpath='{.data.cluster\.secret}' | base64 -d > cluster.secret
+autumn-op --manager <mgr> --cluster-secret-file cluster.secret \
+    principal-create --principal app --grant fs/ > app.cred
+kubectl -n autumn create secret generic autumn-credential --from-file=credential=app.cred
+```
+
+Client pods mount `autumn-credential` and pass `--credential-file` (native),
+`auth_credential_file` (kvcache) or `credential=` (PyO3).
+
+#### Per-cluster overlay
+
+Keep `deploy/k8s` generic; put cluster specifics in an overlay listing `../../k8s`
+as a resource. `deploy/overlays/vke` is a worked Volcengine example:
+
+| Overlay knob | Why it is cluster-specific |
+|---|---|
+| `images[].newName/newTag` | registry + immutable tag/digest |
+| `images[]` etcd mirror | nodes may not reach `quay.io` |
+| `nodeSelector` patch | node pool (kernel ≥ 5.15 for io_uring) |
+| etcd `storageClassName` + size | network-durable class; provider minimum size (Volcengine ESSD 20Gi) |
+| EN count + `AUTUMN_EXPECT_NODES` | sizing; keep the two equal |
+
+#### Scaling
+
+- **Extent nodes**: one Deployment per EN. Add with
+  `deploy/scripts/en-workload.sh apply <ordinal>` and raise `AUTUMN_EXPECT_NODES`.
+  Retire with `deploy/scripts/en-decommission.sh <ordinal>` (fence → wait for
+  rebuild → remove → delete the workload); deleting the workload directly drops a
+  replica of every shard the node held. See
+  [Node decommission runbook](#node-decommission-runbook-fence--drain--remove).
+- **Partition servers**: raise `partition-server.yaml` `replicas` (psid =
+  ordinal+1). Throughput scales with partitions, not workers per PS.
+- **Managers**: raise `manager.yaml` `replicas` (3 for HA).
+
+#### Multi-shard extent nodes
+
+One shard per EN serves all its extent traffic from one io_uring core; under
+durable RF=3 writes that core becomes the limit as partitions grow.
+`AUTUMN_EXTENT_SHARDS=N` (default 1) runs N shards (`shard = extent_id % N`) on
+the container's first N allowed cores (`Cpus_allowed_list`;
+`AUTUMN_EXTENT_CPUSET` overrides). Shard `i` binds data port `9101 + i*10` and
+control port `10101 + i*10`; ENs self-register every shard port, so there is no
+Service port list. `deploy/overlays/vke` sets 4 shards and 4 CPU per EN.
+Changing N on a running cluster is a stop-the-world reshard (restart all ENs
+together; no bytes move): see
+[Resharding an extent node](#resharding-an-extent-node--changing-its-shard-count)
+and `scripts/reshard_chaos.sh`. A tmpfs `emptyDir` refuses O_DIRECT before Linux
+6.6 and only pretends from 6.6 on; use a real filesystem or
+`AUTUMN_EXTENT_DIRECT_IO=0`.
+
+#### Using the cluster
+
+Clients run in-cluster and take IP literals, so resolve the manager Service first:
+
+```bash
+kubectl -n autumn run kv --image=autumn-rs:latest --restart=Never -it --rm \
+  --command -- bash -lc '
+    M=$(getent hosts autumn-manager | awk "{print \$1}")
+    echo hi > /tmp/v
+    autumn-client --manager $M:9001 put k /tmp/v
+    autumn-client --manager $M:9001 get k'
+```
+
+Verification on kind/minikube: build and deploy as above; `kubectl -n autumn get
+pods` shows etcd, manager, the ENs and ps-0 Running and Ready, and the round trip
+above prints `hi`.
 
 ## Parameters (flags)
 
@@ -263,7 +544,7 @@ whether the stranger claims to be an extent node or a manager.
 (wire 52, and every Peer/Admin connection now runs PEER_AUTH):
 
 1. Generate one secret and put it on every manager, PS, EN and operator host
-   (in k8s: the `autumn-cluster-secret` Secret, see `docs/k8s_deploy.md`).
+   (in k8s: the `autumn-cluster-secret` Secret, see [Deployment](#deployment)).
 2. Stop everything. Replace the binaries, `autumn-op` and `autumn-dashboard`.
 3. Start with `--cluster-secret-file` on every server; drop `--admin-token[-file]`
    from the manager, autumn-op and dashboard command lines (they are refused).
@@ -616,10 +897,10 @@ partition: each endpoint shows its head and its distinguishing tail, every row
 is the same height and none overlap. Hovering a row or opening its drawer shows
 the full range, including escaped binary key bytes.
 
-The [2026-10-09 VKE fault-test report](vke-stress-20261009.md) records the
-CP revisions, live range checks, two EN outages, two manager failovers,
-split/merge outcomes, and full acknowledged-data readback. It also describes
-the reproduced standby-promotion heartbeat bug and its isolated comparison.
+The 2026-10-09 VKE fault test (two EN outages, two manager failovers, splits
+and merges under load) ended with full acknowledged-data readback: zero missing
+keys or mismatches. It also found the standby-promotion heartbeat bug, since
+fixed (`ps_members_etcd::a_standby_promoted_late_keeps_the_heartbeating_fleet`).
 
 **Metrics tab.** The one thing the dashboard does without `autumn-op`: it
 scrapes each PS's `/metrics` at the address the PS reports on its heartbeat
@@ -740,8 +1021,7 @@ button selects that named policy and runs it after confirmation, even if none
 was previously selected. **Stop** means Off. Status labels are Running /
 Stopped. `auto-policy start` selects the policy and sets its mode with
 separate RPCs: after a partial failure, refresh status and
-verify the actual name/mode before operating again. Review details and the
-remaining transaction gap: [dashboard review](dashboard_review.md).
+verify the actual name/mode before operating again.
 
 The first Policy panel is **Operational advisories**, separate from the
 controller's selectable policies. A hot/cold row is information-only: over the
@@ -4641,8 +4921,8 @@ curl -s localhost:$((PS + 500))/metrics | grep autumn_ps_plog_
 
 Multi-mount / multi-daemon coherence for `autumn-fuse` and
 `autumn-ioring-daemon` runs through a JuiceFS-style inode lease served
-by the manager. Plan + invariants live in
-[`autumn_fs_lease_plan.md`](autumn_fs_lease_plan.md).
+by the manager. Design and invariants:
+[`fs_lease_design.md`](fs_lease_design.md).
 
 Landed so far:
 - **Manager lease state** — manager state + 4 RPCs (`MSG_*_LEASE` /
@@ -5854,7 +6134,7 @@ scrub does, when asked: the manager names each lit copy of each sealed extent
 in scope, the node holding it reads and hashes it locally, and only outcomes
 come back. A copy's first scrub records its checksums (`extent-{id}.ck` for a
 replica's `.dat`, `extent-{id}.shard{i}.ck` for an EC shard); later scrubs
-compare against them. Design: `docs/autumn_integrity_plan.md`.
+compare against them. Design: `docs/integrity_design.md`.
 
     "${AO[@]}" scrub 1234 1235          # these extents
     "${AO[@]}" scrub --part 7           # every extent of partition 7

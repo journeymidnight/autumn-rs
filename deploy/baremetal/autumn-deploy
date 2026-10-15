@@ -195,7 +195,7 @@ write_unit() {
 
 # UCX env for one instance host (TRANSPORT=ucx only; the UCX C library reads
 # UCX_* from the process env — this launcher is the right layer). ONE rule
-# (2026-07-03, see docs/baremetal_deploy.md): UCX topologies use RoCE NIC IPs
+# (see "Deployment" in docs/ops.md): UCX topologies use RoCE NIC IPs
 # and every instance gets
 #   UCX_TLS=rc_mlx5,ud_mlx5,tcp,self  +  a pinned UCX_NET_DEVICES.
 # The single POSITIVE list serves both intra-host (rc loopback in the HCA)

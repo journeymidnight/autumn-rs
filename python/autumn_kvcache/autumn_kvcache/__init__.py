@@ -1,6 +1,6 @@
 """autumn-kvcache: sglang HiCache L3 + vLLM KVConnectorV1 backends over autumn-rs.
 
-See docs/autumn_kvcache_plan.md for architecture and rationale (§4 sglang, §13 vLLM).
+See python/autumn_kvcache/README.md for setup and architecture notes.
 
 The adapter classes are re-exported LAZILY (PEP 562): both submodules import
 the `autumn` native module at import time, but the pure helpers
