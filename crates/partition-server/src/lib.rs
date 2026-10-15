@@ -1986,24 +1986,34 @@ impl WriteResponder {
         }
     }
 
-    /// Reply "retry elsewhere / later": `Unavailable` (batch status
+    /// Reply "not applied, retry": `Unavailable` (batch status
     /// `CODE_UNAVAILABLE`), which the SDK refreshes routing on and retries.
-    /// Used when the partition is going down for a reopen; the message says
-    /// whether the write may have been applied.
     pub(crate) fn send_unavailable(self, msg: String) {
+        self.send_status(StatusCode::Unavailable, msg)
+    }
+
+    /// Reply "the write was handed to storage and given up; it may or may
+    /// not have been applied": `OutcomeUnknown` (batch status
+    /// `CODE_OUTCOME_UNKNOWN`). The SDK retries an idempotent write on it and
+    /// reports it to a conditional one.
+    pub(crate) fn send_outcome_unknown(self, msg: String) {
+        self.send_status(StatusCode::OutcomeUnknown, msg)
+    }
+
+    fn send_status(self, status: StatusCode, msg: String) {
         let outer = match self {
             WriteResponder::Put { outer, .. } | WriteResponder::Delete { outer, .. } => outer,
             WriteResponder::BatchPut { accum, idx } => {
-                accum.record(idx, partition_rpc::CODE_UNAVAILABLE);
+                accum.record(idx, partition_rpc::code_for_status(status));
                 return;
             }
             WriteResponder::Fence => {
                 // The admitted write riding behind it gets the same reply.
-                tracing::warn!("fence-bump WAL record not written: {msg}");
+                tracing::warn!("fence-bump WAL record: {msg}");
                 return;
             }
         };
-        let _ = outer.send(Err((StatusCode::Unavailable, msg)));
+        let _ = outer.send(Err((status, msg)));
     }
 
     /// Reply failure — propagate the error string as Internal to the outer
@@ -5325,7 +5335,7 @@ async fn delegate_round_trip(
                 // The partition went down with it queued or in flight: a write
                 // may or may not have been applied.
                 autumn_rpc::RpcError::encode_status(
-                    StatusCode::Unavailable,
+                    StatusCode::OutcomeUnknown,
                     "partition response dropped",
                 ),
             ),

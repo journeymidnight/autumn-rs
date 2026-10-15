@@ -671,6 +671,10 @@ pub const CODE_REGION_EPOCH_STALE: u8 = 8;
 /// SDK maps this to a typed error so apps can re-AcquireLease
 /// and retry.
 pub const CODE_FENCED: u8 = 9;
+/// The op was handed to storage and then given up: it may or may not have
+/// been applied (`StatusCode::OutcomeUnknown`). `CODE_UNAVAILABLE` on a write
+/// means it was not applied.
+pub const CODE_OUTCOME_UNKNOWN: u8 = 10;
 
 /// The `CODE_*` byte that carries a handler `StatusCode` in a response whose
 /// ctrl holds a code instead of a frame-level error (`MSG_GET_BULK`).
@@ -686,6 +690,7 @@ pub fn code_for_status(status: crate::StatusCode) -> u8 {
         StatusCode::InvalidArgument => CODE_INVALID_ARGUMENT,
         StatusCode::FailedPrecondition => CODE_PRECONDITION,
         StatusCode::Unavailable => CODE_UNAVAILABLE,
+        StatusCode::OutcomeUnknown => CODE_OUTCOME_UNKNOWN,
         StatusCode::Internal
         | StatusCode::AlreadyExists
         | StatusCode::PermissionDenied

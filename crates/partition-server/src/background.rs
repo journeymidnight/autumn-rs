@@ -2191,7 +2191,8 @@ pub(crate) async fn finish_write_batch(
             // the batch was handed to the stream it may sit on some replicas of
             // a tail still open, and only the seal of the reopen the caller
             // triggers decides whether it counts (docs/seal_length_design.md §5).
-            let msg = if must_reopen(&e) {
+            let reopen = must_reopen(&e);
+            let msg = if reopen {
                 format!(
                     "log append failed; the partition is reopening and this write may or \
                      may not have been applied: {e:#}"
@@ -2200,7 +2201,11 @@ pub(crate) async fn finish_write_batch(
                 format!("log append failed before anything was written; this write was not applied: {e:#}")
             };
             for entry in bd.valid {
-                entry.resp.send_unavailable(msg.clone());
+                if reopen {
+                    entry.resp.send_outcome_unknown(msg.clone());
+                } else {
+                    entry.resp.send_unavailable(msg.clone());
+                }
             }
             // The write FAILED — release its in-flight keys. Phase 3 never
             // inserted them, and the OLD value stays correctly live, so a later

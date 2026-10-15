@@ -398,6 +398,47 @@ before. Test: `connection_tests::en_credential_refusal_is_returned_without_fallb
   `VERSION_HELLO`. TERMINAL, and more sharply than the two authz cases: the version
   is compiled in, so no refresh can change the answer. Carries the SERVER's own message,
   which names which way round the mismatch is.
+- `AutumnError::OutcomeUnknown(msg)` — a WRITE may or may not have been applied
+  (HBase's "retries exhausted"). Every other write error means "not applied".
+
+### Write outcomes (`CallKind`)
+
+A write attempt may have been applied when the server answered `OutcomeUnknown`
+(`StatusCode` 9 / batch `CODE_OUTCOME_UNKNOWN`: the partition sent the append and
+gave up; its reopen's seal decides, docs/seal_length_design.md §5) or when the
+request was handed to the connection and no answer came back (`SentNoReply`, set by
+`ps_call_with_timeout` / `ps_call_bulk_multi` on a transport failure after the
+connect; a failed connect sent nothing). `Unavailable` / `CODE_UNAVAILABLE` means
+not applied. The retry loops take a `CallKind`:
+- `Idempotent` (put, put_bulk, delete, batch put/delete): retry as before. The
+  write's error is settled at its single exit (`settle_write_error`): after any
+  attempt that may have applied, every error — retries run out, a routing miss on
+  a later attempt, a token that expired meanwhile — becomes `OutcomeUnknown`, so
+  "not applied" holds only when no attempt may have applied.
+- `Conditional` (`compare_put`, `compare_write`): stop at the first attempt that may
+  have applied and return `OutcomeUnknown`. A retry would compare against the first
+  attempt's own write and report a conflict (`Ok(false)`) — what
+  `write_outcome_settled::the_sdk_stops_a_conditional_write_at_its_first_unknown_outcome`
+  shows when the stop is removed.
+- `Read` (reads, admin calls): unchanged.
+
+Batch writes resend, one by one through `put_opts` / `delete_opts`, the ops whose
+status is `CODE_UNAVAILABLE` or `CODE_OUTCOME_UNKNOWN` (HBase's AsyncProcess resubmits
+failed actions); a failed resend of a `CODE_OUTCOME_UNKNOWN` op is `OutcomeUnknown`
+(`resent_batch_op`). `call_ps_for_part_tracked` / `call_ps_for_part_bulk` also report
+whether an earlier attempt of the frame may have applied: a frame answered after a
+lost first attempt can say "not applied" for an op the lost attempt wrote, so every
+op of such a frame that ends in an error — whichever branch gave it — is settled to
+`OutcomeUnknown` (`settle_batch_ops`). A frame that fails after its retries gives
+every op the frame's class (`batch_frame_error`). Resends are serial, one
+`put_opts` budget each; the first absorbs a reopen, the rest are fast. They go
+in input order, and a later op of a resent key is resent after it even when it
+was applied (`batch_resend_plan`), so a duplicate key keeps last-input-wins among
+the small values. A key given both a small and a ≥64 KiB value in one
+`put_many` does not: the bulk-only values are written after every small group. `put_opts` /
+`delete_opts` check the answer's body inside the settled region
+(`call_ps_for_key_tracked`): a body error after a lost first attempt is
+`OutcomeUnknown` too.
 
 ## Result types
 

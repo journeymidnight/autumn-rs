@@ -21,6 +21,7 @@ mod support;
 use std::net::SocketAddr;
 use std::time::Duration;
 
+use autumn_client::{AutumnError, ClusterClient};
 use autumn_rpc::client::RpcClient;
 use autumn_rpc::partition_rpc;
 use support::*;
@@ -174,7 +175,7 @@ fn a_failed_write_reads_the_same_after_a_crash() {
         // the poisoned partition's thread exits, so it may be lost with it.
         assert!(
             failed == "ConnectionClosed"
-                || (failed.contains("Unavailable") && failed.contains("may or may not have been applied")),
+                || (failed.contains("OutcomeUnknown") && failed.contains("may or may not have been applied")),
             "k1's writer must be told the outcome is unknown and to retry: {failed}"
         );
         let before = read(ps_addr, b"k1").await;
@@ -218,6 +219,81 @@ fn writes_failing_before_they_are_sent_leave_the_partition_serving() {
                 Ok(Some(b"v0".to_vec())),
                 "k0 must be served right after {key:?} failed"
             );
+        }
+    });
+}
+
+/// Through the SDK: a put whose first attempt may have been applied ends in
+/// `OutcomeUnknown` once its retries run out; a later put that the partition
+/// refused before sending anything ends in a plain connection error.
+#[test]
+fn the_sdk_reports_an_unknown_outcome_only_for_a_write_that_may_have_applied() {
+    let mut c = Cluster::start();
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        c.create_partition().await;
+        let ps_addr = pick_addr();
+        let _ps = ChildPs::spawn(PS_ID, c.mgr, ps_addr, ChildFailpoints::default());
+        let sdk = ClusterClient::connect_raw(&c.mgr.to_string()).await.expect("sdk");
+        sdk.put(b"k0", b"v0").await.expect("k0 with every node up");
+
+        c.stop(2);
+        match sdk.put(b"k1", b"v1").await {
+            Err(AutumnError::OutcomeUnknown(_)) => {}
+            other => panic!("k1: want OutcomeUnknown, got {other:?}"),
+        }
+        match sdk.put(b"k2", b"v2").await {
+            Err(AutumnError::ConnectionError(m)) if m.contains("not applied") => {}
+            other => panic!("k2 (never sent): want a not-applied ConnectionError, got {other:?}"),
+        }
+        let k1 = sdk.get(b"k1").await.expect("read k1");
+        assert_eq!(sdk.get(b"k1").await.expect("read k1 again"), k1, "k1 settled");
+    });
+}
+
+/// A conditional write is not retried once an attempt may have been applied:
+/// a retry could report a conflict caused by its own first attempt.
+#[test]
+fn the_sdk_stops_a_conditional_write_at_its_first_unknown_outcome() {
+    let mut c = Cluster::start();
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        c.create_partition().await;
+        let ps_addr = pick_addr();
+        let _ps = ChildPs::spawn(PS_ID, c.mgr, ps_addr, ChildFailpoints::default());
+        let sdk = ClusterClient::connect_raw(&c.mgr.to_string()).await.expect("sdk");
+        sdk.put(b"k0", b"v0").await.expect("k0 with every node up");
+
+        c.stop(2);
+        let started = std::time::Instant::now();
+        match sdk.compare_put(b"k1", None, b"v1").await {
+            Err(AutumnError::OutcomeUnknown(_)) => {}
+            other => panic!("k1: want OutcomeUnknown, got {other:?}"),
+        }
+        // The retry budget is ~9 s of backoff; one attempt takes far less.
+        assert!(started.elapsed() < Duration::from_secs(5), "retried: {:?}", started.elapsed());
+    });
+}
+
+/// A batch whose frame may have been applied reports `OutcomeUnknown` for
+/// its ops, even when a later attempt is answered "not applied" per op.
+#[test]
+fn the_sdk_reports_an_unknown_outcome_for_a_batch_that_may_have_applied() {
+    let mut c = Cluster::start();
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        c.create_partition().await;
+        let ps_addr = pick_addr();
+        let _ps = ChildPs::spawn(PS_ID, c.mgr, ps_addr, ChildFailpoints::default());
+        let sdk = ClusterClient::connect_raw(&c.mgr.to_string()).await.expect("sdk");
+        sdk.put(b"k0", b"v0").await.expect("k0 with every node up");
+
+        c.stop(2);
+        let results = sdk
+            .put_many(&[
+                (&b"k1"[..], bytes::Bytes::from_static(b"v1"), 0),
+                (&b"k2"[..], bytes::Bytes::from_static(b"v2"), 0),
+            ])
+            .await;
+        for (i, r) in results.iter().enumerate() {
+            assert!(matches!(r, Err(AutumnError::OutcomeUnknown(_))), "op {i}: {r:?}");
         }
     });
 }

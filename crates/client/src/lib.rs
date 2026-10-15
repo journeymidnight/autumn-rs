@@ -79,6 +79,17 @@ pub enum AutumnError {
     /// requested operation (it has no handler for the opcode). TERMINAL until
     /// the cluster is upgraded.
     Unsupported(String),
+    /// A WRITE may or may not have been applied (HBase's "retries exhausted"):
+    /// an attempt reached the server and was given up there, or the request
+    /// was sent and no answer came back. The outcome is fixed later and never
+    /// changes once read; read the key to learn it. An idempotent write
+    /// (put, delete, batch) returns this when it fails in the end — retries
+    /// ran out, or a later attempt failed for another reason — after such an
+    /// attempt; a conditional write (`compare_put`, `compare_write`) returns it
+    /// at the first such attempt, because retrying could report a conflict
+    /// caused by its own first attempt. Every other write error means "not
+    /// applied".
+    OutcomeUnknown(String),
 }
 
 impl std::fmt::Display for AutumnError {
@@ -89,6 +100,9 @@ impl std::fmt::Display for AutumnError {
             AutumnError::NamespaceUnknown(msg) => write!(f, "namespace unknown: {msg}"),
             AutumnError::WireVersionRefused(msg) => write!(f, "{msg}"),
             AutumnError::Unsupported(msg) => write!(f, "unsupported by this cluster: {msg}"),
+            AutumnError::OutcomeUnknown(msg) => {
+                write!(f, "write outcome unknown (it may or may not have been applied): {msg}")
+            }
             AutumnError::Fenced(msg) => write!(f, "write fenced (lease revoked): {msg}"),
             AutumnError::InvalidArgument(msg) => write!(f, "invalid argument: {msg}"),
             AutumnError::PreconditionFailed(msg) => write!(f, "precondition failed: {msg}"),
@@ -298,6 +312,7 @@ fn code_to_error(code: u8, message: String) -> AutumnError {
         partition_rpc::CODE_INVALID_ARGUMENT => AutumnError::InvalidArgument(message),
         partition_rpc::CODE_PRECONDITION => AutumnError::PreconditionFailed(message),
         partition_rpc::CODE_FENCED => AutumnError::Fenced(message),
+        partition_rpc::CODE_OUTCOME_UNKNOWN => AutumnError::OutcomeUnknown(message),
         partition_rpc::CODE_VALUE_TOO_LARGE => {
             // The cap is in the message; we don't try to parse it. Surface the
             // raw size if the caller doesn't already know.
@@ -380,6 +395,7 @@ fn rpc_status_to_error(e: RpcError) -> AutumnError {
             StatusCode::NamespaceUnknown => AutumnError::NamespaceUnknown(message),
             // Unavailable is transient (overloaded / draining) → keep retryable.
             StatusCode::Unavailable => AutumnError::ConnectionError(message),
+            StatusCode::OutcomeUnknown => AutumnError::OutcomeUnknown(message),
             // Ok-as-error / Internal / AlreadyExists: surface as ServerError
             // (retryable in the loops, same as the previous stringified path).
             StatusCode::Ok | StatusCode::Internal | StatusCode::AlreadyExists => {
@@ -681,6 +697,94 @@ fn is_stale_layout_refusal(msg: &str) -> bool {
 }
 
 #[cfg(test)]
+mod write_outcome_tests {
+    use super::*;
+
+    fn status(code: StatusCode) -> RpcError {
+        RpcError::Status { code, message: "m".into() }
+    }
+
+    #[test]
+    fn an_attempt_may_have_applied_only_when_sent_unanswered_or_said_so() {
+        assert!(may_have_applied(&sent_call_error(RpcError::ConnectionClosed)));
+        assert!(may_have_applied(&sent_call_error(RpcError::Timeout(Duration::from_secs(1)))));
+        assert!(may_have_applied(&sent_call_error(status(StatusCode::OutcomeUnknown))));
+        assert!(!may_have_applied(&sent_call_error(status(StatusCode::Unavailable))));
+        assert!(!may_have_applied(&sent_call_error(status(StatusCode::Internal))));
+        // A failure to connect never sent the request.
+        assert!(!may_have_applied(&anyhow!("connect 127.0.0.1:1: refused")));
+    }
+
+    #[test]
+    fn the_sent_marker_keeps_the_error_classifiable() {
+        let e = sent_call_error(RpcError::ConnectionClosed);
+        assert!(matches!(e.downcast::<AutumnError>(), Ok(AutumnError::ConnectionError(_))));
+    }
+
+    #[test]
+    fn a_resent_batch_op_is_unknown_only_if_its_first_attempt_may_have_applied() {
+        let failed = || Err(AutumnError::ConnectionError("down".into()));
+        let not_applied = partition_rpc::CODE_UNAVAILABLE;
+        let unknown = partition_rpc::CODE_OUTCOME_UNKNOWN;
+        assert!(matches!(resent_batch_op(not_applied, failed()), Err(AutumnError::ConnectionError(_))));
+        assert!(matches!(resent_batch_op(unknown, failed()), Err(AutumnError::OutcomeUnknown(_))));
+        assert!(resent_batch_op(unknown, Ok(())).is_ok());
+        // An applied op resent to keep a duplicate key's input order.
+        assert!(matches!(
+            resent_batch_op(partition_rpc::CODE_OK, failed()),
+            Err(AutumnError::OutcomeUnknown(_))
+        ));
+    }
+
+    #[test]
+    fn a_resend_keeps_last_input_wins_for_a_duplicate_key() {
+        let (ok, retry) = (partition_rpc::CODE_OK, partition_rpc::CODE_UNAVAILABLE);
+        let keys: [&[u8]; 4] = [b"k", b"j", b"k", b"j"];
+        // The first `k` is resent, so the later applied `k` is resent after it;
+        // `j` was applied both times and is left alone.
+        assert_eq!(batch_resend_plan(keys.into_iter(), &[retry, ok, ok, ok]), [true, false, true, false]);
+        // An applied op BEFORE the resent one stays applied: the resend wins.
+        assert_eq!(batch_resend_plan(keys.into_iter(), &[ok, ok, retry, ok]), [false, false, true, false]);
+        assert_eq!(
+            batch_resend_plan(keys.into_iter(), &[partition_rpc::CODE_FENCED, ok, ok, ok]),
+            [false, false, false, false]
+        );
+    }
+
+    #[test]
+    fn any_error_after_an_attempt_that_may_have_applied_is_unknown() {
+        let denied = || AutumnError::PermissionDenied("token expired".into());
+        assert!(matches!(settle_write_error(CallKind::Idempotent, true, denied()), AutumnError::OutcomeUnknown(_)));
+        assert!(matches!(settle_write_error(CallKind::Conditional, true, denied()), AutumnError::OutcomeUnknown(_)));
+        assert!(matches!(settle_write_error(CallKind::Idempotent, false, denied()), AutumnError::PermissionDenied(_)));
+        assert!(matches!(settle_write_error(CallKind::Read, true, denied()), AutumnError::PermissionDenied(_)));
+        let mut results = vec![Err(AutumnError::RoutingError("r".into())), Ok(()), Err(denied())];
+        settle_batch_ops(&mut results, vec![0, 1]);
+        assert!(matches!(results[0], Err(AutumnError::OutcomeUnknown(_))));
+        assert!(results[1].is_ok());
+        assert!(matches!(results[2], Err(AutumnError::PermissionDenied(_))));
+    }
+
+    #[test]
+    fn a_failed_batch_frame_keeps_its_class_for_every_op() {
+        let unknown = batch_frame_error(AutumnError::OutcomeUnknown("x".into()));
+        assert!(matches!(unknown(), AutumnError::OutcomeUnknown(m) if m == "x"));
+        let down = batch_frame_error(AutumnError::ConnectionError("y".into()));
+        assert!(matches!(down(), AutumnError::ConnectionError(_)));
+    }
+
+    #[test]
+    fn status_codes_map_to_the_two_write_classes() {
+        assert!(matches!(rpc_status_to_error(status(StatusCode::OutcomeUnknown)), AutumnError::OutcomeUnknown(_)));
+        assert!(matches!(rpc_status_to_error(status(StatusCode::Unavailable)), AutumnError::ConnectionError(_)));
+        assert!(matches!(
+            code_to_error(partition_rpc::CODE_OUTCOME_UNKNOWN, "m".into()),
+            AutumnError::OutcomeUnknown(_)
+        ));
+    }
+}
+
+#[cfg(test)]
 mod stale_layout_refusal_tests {
     use super::is_stale_layout_refusal;
 
@@ -809,6 +913,73 @@ pub async fn fan_out_collect<Fut: std::future::Future>(
 // get fixed at the source, not papered over with bigger retries.
 pub(crate) const MAX_PS_REFRESHES: u32 = 10;
 
+/// What a retry loop may assume about repeating a request.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum CallKind {
+    /// A read or an admin call: retry anything retryable.
+    Read,
+    /// A write that leaves the same state when sent twice (put, delete,
+    /// batch): retry, and report `OutcomeUnknown` if it still fails after an
+    /// attempt that may have been applied.
+    Idempotent,
+    /// A conditional write: stop at the first attempt that may have been
+    /// applied and report `OutcomeUnknown`.
+    Conditional,
+}
+
+/// Context on a transport failure after the request was handed to the
+/// connection: the server may have received and applied it.
+#[derive(Debug)]
+pub(crate) struct SentNoReply;
+
+impl std::fmt::Display for SentNoReply {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "request sent, no reply")
+    }
+}
+
+/// Whether a failed attempt may have been applied: the server said so
+/// (`OutcomeUnknown`), or the request was sent and no answer came back.
+fn may_have_applied(e: &anyhow::Error) -> bool {
+    matches!(e.downcast_ref::<AutumnError>(), Some(AutumnError::OutcomeUnknown(_)))
+        || e.downcast_ref::<SentNoReply>().is_some()
+}
+
+/// A write's final error: `OutcomeUnknown` when any attempt may have been
+/// applied, whatever the last attempt said — "not applied" holds only when no
+/// attempt may have been. Reads keep their error.
+fn settle_write_error(kind: CallKind, applied: bool, e: AutumnError) -> AutumnError {
+    if kind == CallKind::Read || !applied || matches!(e, AutumnError::OutcomeUnknown(_)) {
+        e
+    } else {
+        AutumnError::OutcomeUnknown(e.to_string())
+    }
+}
+
+/// What a conditional write returns at its first attempt that may have been
+/// applied.
+fn conditional_outcome_unknown(e: anyhow::Error) -> AutumnError {
+    match e.downcast::<AutumnError>() {
+        Ok(ae @ AutumnError::OutcomeUnknown(_)) => ae,
+        Ok(other) => AutumnError::OutcomeUnknown(other.to_string()),
+        Err(other) => AutumnError::OutcomeUnknown(format!("{other:#}")),
+    }
+}
+
+/// The error a failed request becomes once the connection carried it: a
+/// transport failure gains `SentNoReply`.
+fn sent_call_error(e: RpcError) -> anyhow::Error {
+    let sent = sent_and_lost(&e);
+    let err = anyhow::Error::new(rpc_status_to_error(e));
+    if sent { err.context(SentNoReply) } else { err }
+}
+
+/// A transport failure of a call made on an established connection: the
+/// request may have reached the server. A version refusal never sent it.
+fn sent_and_lost(e: &RpcError) -> bool {
+    e.is_connection_error() && !matches!(e, RpcError::VersionMismatch { .. })
+}
+
 /// TiKV-style `NoJitterBackoff` step: sleep BEFORE the Nth refresh.
 /// Sequence: 100, 200, 400, 800, 1600, 2000, 2000, ..., 2000 ms.
 /// Cumulative: 100, 300, 700, 1500, 3100, 5100, 7100, 9100 ms at
@@ -821,6 +992,68 @@ pub(crate) fn refresh_backoff(attempt: u32) -> Duration {
     let shift = (attempt - 1).min(10);
     let ms = 100u64.saturating_mul(1u64 << shift);
     Duration::from_millis(ms.min(2000))
+}
+
+/// A batch write's frame failed after its retries: each op gets the same
+/// class — `OutcomeUnknown` when the frame may have been applied, else
+/// `ConnectionError`.
+fn batch_frame_error(e: AutumnError) -> impl Fn() -> AutumnError {
+    let (unknown, msg) = match e {
+        AutumnError::OutcomeUnknown(m) => (true, m),
+        other => (false, other.to_string()),
+    };
+    move || {
+        if unknown {
+            AutumnError::OutcomeUnknown(msg.clone())
+        } else {
+            AutumnError::ConnectionError(msg.clone())
+        }
+    }
+}
+
+/// The result of resending, on its own, a batch op whose status said it was
+/// not applied (`CODE_UNAVAILABLE`), may have been (`CODE_OUTCOME_UNKNOWN`),
+/// or was (`CODE_OK`, resent to keep a duplicate key's input order); all are
+/// safe to repeat for a put or a delete. A failed resend of one that may have
+/// been applied leaves its outcome unknown.
+fn resent_batch_op(
+    status: u8,
+    resend: std::result::Result<(), AutumnError>,
+) -> std::result::Result<(), AutumnError> {
+    let applied = status == partition_rpc::CODE_OUTCOME_UNKNOWN || status == partition_rpc::CODE_OK;
+    resend.map_err(|e| settle_write_error(CallKind::Idempotent, applied, e))
+}
+
+/// The ops of a frame an earlier attempt of which may have been applied: an
+/// error any later step gave them — a fallback resend, a "not applied" status
+/// for a later attempt, the frame failing — leaves their outcome unknown.
+fn settle_batch_ops(results: &mut [std::result::Result<(), AutumnError>], maybe_applied: Vec<usize>) {
+    for idx in maybe_applied {
+        let r = std::mem::replace(&mut results[idx], Ok(()));
+        results[idx] = r.map_err(|e| settle_write_error(CallKind::Idempotent, true, e));
+    }
+}
+
+/// Whether a batch op's status asks for it to be sent again on its own.
+fn batch_op_resendable(status: u8) -> bool {
+    status == partition_rpc::CODE_UNAVAILABLE || status == partition_rpc::CODE_OUTCOME_UNKNOWN
+}
+
+/// Which ops of one frame to send again, in input order: those whose status
+/// asks for it, and an applied op whose key an earlier resent op has, so the
+/// resends keep last-input-wins for a duplicate key.
+fn batch_resend_plan<'a>(keys: impl Iterator<Item = &'a [u8]>, statuses: &[u8]) -> Vec<bool> {
+    let mut resent: std::collections::HashSet<&[u8]> = std::collections::HashSet::new();
+    keys.zip(statuses)
+        .map(|(k, &status)| {
+            let resend = batch_op_resendable(status)
+                || (status == partition_rpc::CODE_OK && resent.contains(k));
+            if resend {
+                resent.insert(k);
+            }
+            resend
+        })
+        .collect()
 }
 
 /// Write `err()` into every result slot named by `idxs` — the per-group
@@ -2283,7 +2516,7 @@ impl ClusterClient {
             Ok(resp) => Ok(resp),
             Err(e) => {
                 self.evict_ps_on_error(ps_addr, &e);
-                Err(anyhow::Error::new(rpc_status_to_error(e)))
+                Err(sent_call_error(e))
             }
         }
     }
@@ -2315,7 +2548,7 @@ impl ClusterClient {
                 // preserve the typed error inside anyhow (downcastable)
                 // instead of stringifying, so the routing-retry loops can tell
                 // a deterministic precondition from a transient routing miss.
-                Err(anyhow::Error::new(rpc_status_to_error(e)))
+                Err(sent_call_error(e))
             }
         }
     }
@@ -2520,9 +2753,39 @@ impl ClusterClient {
     /// freshly-cached epoch.
     async fn call_ps_for_key(
         &self,
+        kind: CallKind,
         key: &[u8],
         msg_type: u8,
         build_payload: impl Fn(u64, u64) -> Bytes,
+    ) -> std::result::Result<Bytes, AutumnError> {
+        let (result, applied) = self.call_ps_for_key_tracked(kind, key, msg_type, build_payload).await;
+        result.map_err(|e| settle_write_error(kind, applied, e))
+    }
+
+    /// `call_ps_for_key`, unsettled, with whether an attempt may have been
+    /// applied — for a caller that checks the answer's body and must settle
+    /// that error too.
+    async fn call_ps_for_key_tracked(
+        &self,
+        kind: CallKind,
+        key: &[u8],
+        msg_type: u8,
+        build_payload: impl Fn(u64, u64) -> Bytes,
+    ) -> (std::result::Result<Bytes, AutumnError>, bool) {
+        let mut any_applied = false;
+        let result = self
+            .call_ps_for_key_attempts(kind, key, msg_type, build_payload, &mut any_applied)
+            .await;
+        (result, any_applied)
+    }
+
+    async fn call_ps_for_key_attempts(
+        &self,
+        kind: CallKind,
+        key: &[u8],
+        msg_type: u8,
+        build_payload: impl Fn(u64, u64) -> Bytes,
+        any_applied: &mut bool,
     ) -> std::result::Result<Bytes, AutumnError> {
         let mut attempt: u32 = 0;
         let mut last_err: Option<String> = None;
@@ -2543,6 +2806,11 @@ impl ClusterClient {
             {
                 Ok(b) => return Ok(b),
                 Err(e) => {
+                    let applied = kind != CallKind::Read && may_have_applied(&e);
+                    if applied && kind == CallKind::Conditional {
+                        return Err(conditional_outcome_unknown(e));
+                    }
+                    *any_applied |= applied;
                     // PermissionDenied is TERMINAL on the data path —
                     // refreshing routing can't grant access, so surface it
                     // immediately instead of burning MAX_PS_REFRESHES and masking
@@ -2623,33 +2891,40 @@ impl ClusterClient {
     /// values travel as their own iovecs instead of inside `payload`.
     async fn call_ps_for_part_bulk(
         &self,
+        kind: CallKind,
         part_id: u64,
         msg_type: u8,
         ctrl: Bytes,
         values: Vec<Bytes>,
-    ) -> std::result::Result<Bytes, AutumnError> {
+    ) -> (std::result::Result<Bytes, AutumnError>, bool) {
         let mut attempt: u32 = 0;
         let mut last_err: Option<String> = None;
+        let mut any_applied = false;
         while attempt <= MAX_PS_REFRESHES {
-            let ps_addr = self
-                .resolve_part_id(part_id)
-                .await
-                .map_err(|e| AutumnError::RoutingError(e.to_string()))?;
+            let ps_addr = match self.resolve_part_id(part_id).await {
+                Ok(addr) => addr,
+                Err(e) => return (Err(AutumnError::RoutingError(e.to_string())), any_applied),
+            };
             // Same fast-fail-on-attempt-0 bound the inline batch path uses.
             let t = self.first_attempt_effective_timeout(attempt);
             match self
                 .ps_call_bulk_multi(&ps_addr, msg_type, ctrl.clone(), values.clone(), t)
                 .await
             {
-                Ok(b) => return Ok(b),
+                Ok(b) => return (Ok(b), any_applied),
                 Err(e) => {
+                    let applied = kind != CallKind::Read && may_have_applied(&e);
+                    if applied && kind == CallKind::Conditional {
+                        return (Err(conditional_outcome_unknown(e)), true);
+                    }
+                    any_applied |= applied;
                     match e.downcast::<AutumnError>() {
                         Ok(
                             ae @ (AutumnError::PreconditionFailed(_)
                             | AutumnError::InvalidArgument(_)
                             | AutumnError::ValueTooLarge { .. }),
                         ) => {
-                            return Err(ae);
+                            return (Err(ae), any_applied);
                         }
                         Ok(ae) => last_err = Some(ae.to_string()),
                         Err(other) => last_err = Some(other.to_string()),
@@ -2660,7 +2935,7 @@ impl ClusterClient {
                 }
             }
         }
-        Err(self.routing_exhausted(&format!("ps_call_bulk(part {part_id})"), attempt, last_err))
+        (Err(self.routing_exhausted(&format!("ps_call_bulk(part {part_id})"), attempt, last_err)), any_applied)
     }
 
     /// `call_ps_for_part` for a request whose RESPONSE is value-separable —
@@ -2753,25 +3028,46 @@ impl ClusterClient {
     /// isn't registered yet.
     async fn call_ps_for_part(
         &self,
+        kind: CallKind,
         part_id: u64,
         msg_type: u8,
         payload: Bytes,
     ) -> std::result::Result<Bytes, AutumnError> {
+        let (result, applied) = self.call_ps_for_part_tracked(kind, part_id, msg_type, payload).await;
+        result.map_err(|e| settle_write_error(kind, applied, e))
+    }
+
+    /// `call_ps_for_part`, also saying whether an earlier attempt may have
+    /// been applied (`may_have_applied`) — a batch whose answer says an op was
+    /// not applied needs it: an attempt before may have been.
+    async fn call_ps_for_part_tracked(
+        &self,
+        kind: CallKind,
+        part_id: u64,
+        msg_type: u8,
+        payload: Bytes,
+    ) -> (std::result::Result<Bytes, AutumnError>, bool) {
         let mut attempt: u32 = 0;
         let mut last_err: Option<String> = None;
+        let mut any_applied = false;
         while attempt <= MAX_PS_REFRESHES {
-            let ps_addr = self
-                .resolve_part_id(part_id)
-                .await
-                .map_err(|e| AutumnError::RoutingError(e.to_string()))?;
+            let ps_addr = match self.resolve_part_id(part_id).await {
+                Ok(addr) => addr,
+                Err(e) => return (Err(AutumnError::RoutingError(e.to_string())), any_applied),
+            };
             // Bug #2 fix: same fast-fail-on-attempt-0 as call_ps_for_key.
             let t = self.first_attempt_effective_timeout(attempt);
             match self
                 .ps_call_with_timeout(&ps_addr, msg_type, payload.clone(), t)
                 .await
             {
-                Ok(b) => return Ok(b),
+                Ok(b) => return (Ok(b), any_applied),
                 Err(e) => {
+                    let applied = kind != CallKind::Read && may_have_applied(&e);
+                    if applied && kind == CallKind::Conditional {
+                        return (Err(conditional_outcome_unknown(e)), true);
+                    }
+                    any_applied |= applied;
                     // short-circuit DETERMINISTIC failures. Admin ops
                     // (split/compact/gc/flush) are region_epoch-exempt, so a
                     // FailedPrecondition here is never stale-routing — it's a
@@ -2787,7 +3083,7 @@ impl ClusterClient {
                             | AutumnError::InvalidArgument(_)
                             | AutumnError::ValueTooLarge { .. }),
                         ) => {
-                            return Err(ae);
+                            return (Err(ae), any_applied);
                         }
                         Ok(ae) => last_err = Some(ae.to_string()),
                         Err(other) => last_err = Some(other.to_string()),
@@ -2798,7 +3094,7 @@ impl ClusterClient {
                 }
             }
         }
-        Err(self.routing_exhausted(&format!("ps_call(part {part_id})"), attempt, last_err))
+        (Err(self.routing_exhausted(&format!("ps_call(part {part_id})"), attempt, last_err)), any_applied)
     }
 
     // ── High-level SDK API ──────────────────────────────────────────────────
@@ -2827,6 +3123,7 @@ impl ClusterClient {
         let key = self.binding.bind_key(key)?;
         let response = self
             .call_ps_for_key(
+                CallKind::Conditional,
                 &key,
                 partition_rpc::MSG_COMPARE_PUT,
                 |part_id, region_epoch| {
@@ -2881,6 +3178,7 @@ impl ClusterClient {
         let key = self.binding.bind_key(key)?;
         let response = self
             .call_ps_for_key(
+                CallKind::Conditional,
                 &key,
                 partition_rpc::MSG_COMPARE_WRITE,
                 |part_id, region_epoch| {
@@ -2966,8 +3264,8 @@ impl ClusterClient {
         }
         let key = key.to_vec();
         let value = value.to_vec();
-        let resp_bytes = self
-            .call_ps_for_key(&key, MSG_PUT, |part_id, region_epoch| {
+        let (call, applied) = self
+            .call_ps_for_key_tracked(CallKind::Idempotent, &key, MSG_PUT, |part_id, region_epoch| {
                 rkyv_encode(&PutReq {
                     part_id,
                     key: key.clone(),
@@ -2978,19 +3276,23 @@ impl ClusterClient {
                     lease_epoch: lease.lease_epoch,
                 })
             })
-            .await?;
-        let resp: PutResp = rkyv_decode(&resp_bytes).map_err(AutumnError::ServerError)?;
-        if resp.code == partition_rpc::CODE_VALUE_TOO_LARGE {
-            // PS-reported cap (lower than CLIENT_PUT_HARD_CAP). Surface the
-            // value's size so the caller can size the next put_stream
-            // chunks appropriately.
-            return Err(AutumnError::ValueTooLarge {
-                size: value.len() as u64,
-                cap: 0, // unknown server-side cap (would need to parse `resp.message`)
-            });
-        }
-        check_ps_code(resp.code, &resp.message)?;
-        Ok(())
+            .await;
+        // The body's verdict is settled like the call's: an earlier attempt
+        // may have been applied.
+        let outcome = (|| {
+            let resp: PutResp = rkyv_decode(&call?).map_err(AutumnError::ServerError)?;
+            if resp.code == partition_rpc::CODE_VALUE_TOO_LARGE {
+                // PS-reported cap (lower than CLIENT_PUT_HARD_CAP). Surface the
+                // value's size so the caller can size the next put_stream
+                // chunks appropriately.
+                return Err(AutumnError::ValueTooLarge {
+                    size: value.len() as u64,
+                    cap: 0, // unknown server-side cap (would need to parse `resp.message`)
+                });
+            }
+            check_ps_code(resp.code, &resp.message)
+        })();
+        outcome.map_err(|e| settle_write_error(CallKind::Idempotent, applied, e))
     }
 
     /// zero-copy PUT: write a value with NO intermediate value copy and
@@ -3044,6 +3346,20 @@ impl ClusterClient {
                 cap: CLIENT_PUT_HARD_CAP,
             });
         }
+        let mut any_applied = false;
+        self.put_bulk_attempts(key, value, expires_at, lease, &mut any_applied)
+            .await
+            .map_err(|e| settle_write_error(CallKind::Idempotent, any_applied, e))
+    }
+
+    async fn put_bulk_attempts(
+        &self,
+        key: &[u8],
+        value: Bytes,
+        expires_at: u64,
+        lease: WriteLease,
+        any_applied: &mut bool,
+    ) -> std::result::Result<(), AutumnError> {
         let key = key.to_vec();
         let mut attempt: u32 = 0;
         let mut last_err: Option<String> = None;
@@ -3152,6 +3468,10 @@ impl ClusterClient {
                         }
                         Err(e) => {
                             self.evict_ps_on_error(&ps_addr, &e);
+                            *any_applied |= matches!(
+                                &e,
+                                RpcError::Status { code: StatusCode::OutcomeUnknown, .. }
+                            ) || sent_and_lost(&e);
                             last_err = Some(e.to_string());
                         }
                     }
@@ -3225,7 +3545,7 @@ impl ClusterClient {
     ) -> std::result::Result<Option<bytes::Bytes>, AutumnError> {
         let key_v = self.binding.bind_key(key)?;
         let resp_bytes = self
-            .call_ps_for_key(&key_v, MSG_GET_REDIRECT, |part_id, region_epoch| {
+            .call_ps_for_key(CallKind::Read, &key_v, MSG_GET_REDIRECT, |part_id, region_epoch| {
                 rkyv_encode(&GetReq {
                     part_id,
                     key: key_v.clone(),
@@ -3321,7 +3641,7 @@ impl ClusterClient {
                     return Ok(None);
                 };
                 let Ok(resp_bytes) = self
-                    .call_ps_for_key(&key_v, MSG_GET_REDIRECT, |part_id, region_epoch| {
+                    .call_ps_for_key(CallKind::Read, &key_v, MSG_GET_REDIRECT, |part_id, region_epoch| {
                         rkyv_encode(&GetReq {
                             part_id,
                             key: key_v.clone(),
@@ -3633,7 +3953,7 @@ impl ClusterClient {
         // it themselves), so a key is bound exactly ONCE per wire request.
         let key_v = self.binding.bind_key(key)?;
         let resp_bytes = self
-            .call_ps_for_key(&key_v, MSG_GET_REDIRECT, |part_id, region_epoch| {
+            .call_ps_for_key(CallKind::Read, &key_v, MSG_GET_REDIRECT, |part_id, region_epoch| {
                 rkyv_encode(&GetReq {
                     part_id,
                     key: key_v.clone(),
@@ -3770,7 +4090,7 @@ impl ClusterClient {
             });
             async move {
                 let result = self
-                    .call_ps_for_part(part_id, partition_rpc::MSG_GET_REDIRECT_MANY, payload)
+                    .call_ps_for_part(CallKind::Read, part_id, partition_rpc::MSG_GET_REDIRECT_MANY, payload)
                     .await;
                 (idxs, result)
             }
@@ -4373,6 +4693,8 @@ impl ClusterClient {
                 .or_default()
                 .push((i, bk, v.clone(), *ttl));
         }
+        // Ops of a frame an earlier attempt of which may have been applied.
+        let mut maybe_applied: Vec<usize> = Vec::new();
         for (part_id, group) in groups {
             let region_epoch = self.lookup_epoch_for_part(part_id);
             // Bulk on the GROUP's total value bytes, not on each item's.
@@ -4403,7 +4725,7 @@ impl ClusterClient {
                 // `writev` as the caller's own buffers, never copied.
                 let values: Vec<bytes::Bytes> =
                     group.iter().map(|(_, _, v, _)| v.clone()).collect();
-                self.call_ps_for_part_bulk(part_id, partition_rpc::MSG_BATCH_PUT_BULK, ctrl, values)
+                self.call_ps_for_part_bulk(CallKind::Idempotent, part_id, partition_rpc::MSG_BATCH_PUT_BULK, ctrl, values)
                     .await
             } else {
                 let ops: Vec<partition_rpc::BatchPutOp> = group
@@ -4421,9 +4743,13 @@ impl ClusterClient {
                     region_epoch,
                     ops,
                 });
-                self.call_ps_for_part(part_id, partition_rpc::MSG_BATCH_PUT, payload)
+                self.call_ps_for_part_tracked(CallKind::Idempotent, part_id, partition_rpc::MSG_BATCH_PUT, payload)
                     .await
             };
+            let (call, earlier_applied) = call;
+            if earlier_applied {
+                maybe_applied.extend(group.iter().map(|g| g.0));
+            }
             let resp_bytes = match call {
                 Ok(b) => b,
                 Err(AutumnError::PreconditionFailed(_)) => {
@@ -4445,10 +4771,7 @@ impl ClusterClient {
                     continue;
                 }
                 Err(e) => {
-                    let s = e.to_string();
-                    fail_slots(&mut results, group.iter().map(|g| g.0), || {
-                        AutumnError::ConnectionError(s.clone())
-                    });
+                    fail_slots(&mut results, group.iter().map(|g| g.0), batch_frame_error(e));
                     continue;
                 }
             };
@@ -4478,8 +4801,14 @@ impl ClusterClient {
                 });
                 continue;
             }
-            for ((idx, _, _, _), status) in group.iter().zip(resp.statuses.iter()) {
-                if *status == partition_rpc::CODE_FENCED {
+            let plan = batch_resend_plan(group.iter().map(|g| g.1.as_slice()), &resp.statuses);
+            for (((idx, k, v, ttl), status), resend) in
+                group.iter().zip(resp.statuses.iter()).zip(plan)
+            {
+                if resend {
+                    let resend = self.put_opts(k, v.as_ref(), *ttl, lease).await;
+                    results[*idx] = resent_batch_op(*status, resend);
+                } else if *status == partition_rpc::CODE_FENCED {
                     results[*idx] = Err(AutumnError::Fenced(format!(
                         "batch_put op fenced (ino={}, epoch={})",
                         lease.inode_hint, lease.lease_epoch
@@ -4491,6 +4820,7 @@ impl ClusterClient {
                 }
             }
         }
+        settle_batch_ops(&mut results, maybe_applied);
         // bulk-only entries (values ≥ 64 KiB — every autumnfs / fuse 8 MiB extent,
         // every large kvcache page): per-op put_bulk_opts so the TTL from put_many's
         // 3-tuple is preserved end-to-end (PutBulkMeta carries expires_at on the wire;
@@ -4606,6 +4936,8 @@ impl ClusterClient {
             };
             groups.entry(part_id).or_default().push((i, bk));
         }
+        // Ops of a frame an earlier attempt of which may have been applied.
+        let mut maybe_applied: Vec<usize> = Vec::new();
         for (part_id, group) in groups {
             let region_epoch = self.lookup_epoch_for_part(part_id);
             let ops: Vec<partition_rpc::BatchDeleteOp> = group
@@ -4621,10 +4953,13 @@ impl ClusterClient {
                 region_epoch,
                 ops,
             });
-            let resp_bytes = match self
-                .call_ps_for_part(part_id, partition_rpc::MSG_BATCH_DELETE, payload)
-                .await
-            {
+            let (call, earlier_applied) = self
+                .call_ps_for_part_tracked(CallKind::Idempotent, part_id, partition_rpc::MSG_BATCH_DELETE, payload)
+                .await;
+            if earlier_applied {
+                maybe_applied.extend(group.iter().map(|g| g.0));
+            }
+            let resp_bytes = match call {
                 Ok(b) => b,
                 Err(AutumnError::PreconditionFailed(_)) => {
                     // Stale routing. Same fallback `batch_put` makes: refresh,
@@ -4645,10 +4980,7 @@ impl ClusterClient {
                     continue;
                 }
                 Err(e) => {
-                    let s = e.to_string();
-                    fail_slots(&mut results, group.iter().map(|g| g.0), || {
-                        AutumnError::ConnectionError(s.clone())
-                    });
+                    fail_slots(&mut results, group.iter().map(|g| g.0), batch_frame_error(e));
                     continue;
                 }
             };
@@ -4680,8 +5012,12 @@ impl ClusterClient {
                 });
                 continue;
             }
-            for ((idx, _), status) in group.iter().zip(resp.statuses.iter()) {
-                if *status == partition_rpc::CODE_FENCED {
+            let plan = batch_resend_plan(group.iter().map(|g| g.1.as_slice()), &resp.statuses);
+            for (((idx, k), status), resend) in group.iter().zip(resp.statuses.iter()).zip(plan) {
+                if resend {
+                    let resend = self.delete_opts(k, lease).await;
+                    results[*idx] = resent_batch_op(*status, resend);
+                } else if *status == partition_rpc::CODE_FENCED {
                     results[*idx] = Err(AutumnError::Fenced(format!(
                         "batch_delete op fenced (ino={}, epoch={})",
                         lease.inode_hint, lease.lease_epoch
@@ -4693,6 +5029,7 @@ impl ClusterClient {
                 }
             }
         }
+        settle_batch_ops(&mut results, maybe_applied);
         results
     }
 
@@ -4741,8 +5078,8 @@ impl ClusterClient {
         lease: WriteLease,
     ) -> std::result::Result<(), AutumnError> {
         let key = key.to_vec();
-        let resp_bytes = self
-            .call_ps_for_key(&key, MSG_DELETE, |part_id, region_epoch| {
+        let (call, applied) = self
+            .call_ps_for_key_tracked(CallKind::Idempotent, &key, MSG_DELETE, |part_id, region_epoch| {
                 rkyv_encode(&DeleteReq {
                     part_id,
                     key: key.clone(),
@@ -4751,12 +5088,16 @@ impl ClusterClient {
                     lease_epoch: lease.lease_epoch,
                 })
             })
-            .await?;
-        let resp: DeleteResp = rkyv_decode(&resp_bytes).map_err(AutumnError::ServerError)?;
-        if resp.code != partition_rpc::CODE_OK && resp.code != partition_rpc::CODE_NOT_FOUND {
-            return Err(code_to_error(resp.code, resp.message));
-        }
-        Ok(())
+            .await;
+        // Settled like the call's error: an earlier attempt may have applied.
+        let outcome = (|| {
+            let resp: DeleteResp = rkyv_decode(&call?).map_err(AutumnError::ServerError)?;
+            if resp.code != partition_rpc::CODE_OK && resp.code != partition_rpc::CODE_NOT_FOUND {
+                return Err(code_to_error(resp.code, resp.message));
+            }
+            Ok(())
+        })();
+        outcome.map_err(|e| settle_write_error(CallKind::Idempotent, applied, e))
     }
 
     /// Get key metadata (existence and value length).
@@ -4770,7 +5111,7 @@ impl ClusterClient {
     async fn head_bound(&self, key: &[u8]) -> std::result::Result<KeyMeta, AutumnError> {
         let key = key.to_vec();
         let resp_bytes = self
-            .call_ps_for_key(&key, MSG_HEAD, |part_id, region_epoch| {
+            .call_ps_for_key(CallKind::Read, &key, MSG_HEAD, |part_id, region_epoch| {
                 rkyv_encode(&HeadReq {
                     part_id,
                     key: key.clone(),
@@ -5224,6 +5565,7 @@ impl ClusterClient {
         at_key: Option<Vec<u8>>,
     ) -> std::result::Result<(), AutumnError> {
         self.call_ps_for_part(
+            CallKind::Read,
             part_id,
             MSG_SPLIT_PART,
             rkyv_encode(&SplitPartReq { part_id, at_key, op_id: 0 }),
@@ -5271,7 +5613,7 @@ impl ClusterClient {
             op_id: 0,
         };
         let resp_bytes = self
-            .call_ps_for_part(part_id, MSG_MAINTENANCE, rkyv_encode(&req))
+            .call_ps_for_part(CallKind::Read, part_id, MSG_MAINTENANCE, rkyv_encode(&req))
             .await?;
         let resp: MaintenanceResp = rkyv_decode(&resp_bytes).map_err(AutumnError::ServerError)?;
         check_ps_code(resp.code, &resp.message)?;
@@ -5434,6 +5776,7 @@ impl ClusterClient {
     ) -> std::result::Result<String, AutumnError> {
         let resp_bytes = self
             .call_ps_for_part(
+                CallKind::Read,
                 part_id,
                 MSG_MAINTENANCE,
                 rkyv_encode(&MaintenanceReq {

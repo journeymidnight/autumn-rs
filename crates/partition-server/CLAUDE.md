@@ -255,7 +255,7 @@ partition_loop (per partition):
   Error handling:
     A failed log append that `must_reopen` (LockedByOther, or the stream
       client gave up after the batch was sent: `APPEND_OUTCOME_UNKNOWN`) →
-      each writer gets `Unavailable` ("may or may not have been applied"), set
+      each writer gets `OutcomeUnknown` ("may or may not have been applied"), set
       `poisoned`, DROP the inflight batches (no await: a connection task could
       serve a read from the memtable the reopen may contradict), answer queued
       never-sent writes `Unavailable` ("not applied"), return; region_sync
@@ -2113,14 +2113,22 @@ tail can be allocated, the manager did not answer) does NOT poison: after the
 reopen sealed the tail, every write with RF = node count and a node down fails
 that way, and reopening for each took reads down with it
 (`writes_failing_before_they_are_sent_leave_the_partition_serving`, red when
-every failure poisons). The writers get `Unavailable`
-(`WriteResponder::send_unavailable`; batch status `CODE_UNAVAILABLE`), worded
-"may or may not have been applied" or "not applied"; the reply to a poisoning
+every failure poisons). The writers get `OutcomeUnknown`
+(`WriteResponder::send_outcome_unknown`; batch status `CODE_OUTCOME_UNKNOWN`) when the
+batch was sent, `Unavailable` (`send_unavailable`; `CODE_UNAVAILABLE`, "not applied")
+otherwise; the reply to a poisoning
 batch is usually lost with the partition's own connections when its thread
-exits (`ConnectionClosed`). The SDK retries a single put/delete on both; batch
-statuses are surfaced as errors until the SDK learns `CODE_UNAVAILABLE`. A
-request handed to a partition that went down, or queued unanswered when it did,
-gets `Unavailable` from `delegate_round_trip`. Every drain that awaits
+exits (`ConnectionClosed`). The SDK retries puts, deletes and batch ops on both
+and reports `OutcomeUnknown` to the caller when the write still fails after an
+attempt that may have applied (a conditional write: at once; client CLAUDE.md
+"Write outcomes"). A request handed
+to a partition that went down gets `Unavailable` ("partition thread closed") from
+`delegate_round_trip`; one still in the request channel or in flight when it went
+down, `OutcomeUnknown` ("partition response dropped"). A request still in the
+channel was never read, so this
+over-states it — a `compare_put` among them reports `OutcomeUnknown` where a retry
+was safe. Answering them before the thread exits does not reach the client: the
+runtime is dropped right after, before its io_uring submits the replies. Every drain that awaits
 completions (`drain_and_shutdown`, the compare-write admission drain) stops at
 the first poisoning one; a fence poison from the flush path (`poison_for_fence`)
 likewise drops the batches still in flight unanswered. The classifier

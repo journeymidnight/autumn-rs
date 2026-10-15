@@ -119,14 +119,19 @@ sent (the alloc after an append error failed, or the roll limit was hit; the
 error carries `APPEND_OUTCOME_UNKNOWN`), the tail is still open, and the
 partition poisons itself and reopens without serving anything more; the open
 seals the tail before replay, which settles the batch. The batch's writers are
-answered `Unavailable` ("may or may not have been applied"), or lose the
-connection when the partition's thread exits; writes queued but never sent are
-answered `Unavailable` ("not applied"). A failure before anything was sent is
-answered "not applied" and the partition keeps serving. The SDK retries both
-for a single put or delete;
-sending a put or delete again leaves the same key in the same state, whether or
-not the first attempt survived. A conditional write (`compare_put`) is not
-idempotent: its retry can report a conflict caused by its own first attempt.
+answered `OutcomeUnknown` (status 9, batch code `CODE_OUTCOME_UNKNOWN`), or lose
+the connection when the partition's thread exits; writes queued but never sent
+are answered `Unavailable` ("not applied"). A failure before anything was sent
+is answered `Unavailable` and the partition keeps serving.
+
+The SDK follows HBase's client. It retries a put, a delete or a batch op on
+both answers — sending one again leaves the same key in the same state, whether
+or not the first attempt survived — and returns `AutumnError::OutcomeUnknown`
+when the write fails in the end after an attempt that may have been applied
+(the server said so, or the request was sent and no answer came back); every
+other write error means not applied. A conditional write (`compare_put`,
+`compare_write`) is not idempotent — a retry can report a conflict caused by its
+own first attempt — so it returns `OutcomeUnknown` at its first such attempt.
 
 HDFS block recovery and HBase behave the same way: block recovery syncs a
 block to the minimum length among the replicas it can reach, and HBase replays

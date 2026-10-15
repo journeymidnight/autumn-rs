@@ -29,6 +29,11 @@ pub enum StatusCode {
     /// more: `WIRE_VERSION` is bumped BY HAND and nothing verifies
     /// that you did.)
     NamespaceUnknown = 8,
+    /// A write was handed to storage and then given up: it may or may not
+    /// have been applied, and a later seal decides. Unlike `Unavailable`
+    /// (nothing was applied), a non-idempotent write must not be retried
+    /// blindly on it. A client predating it decodes it as `Internal`.
+    OutcomeUnknown = 9,
 }
 
 impl StatusCode {
@@ -43,6 +48,7 @@ impl StatusCode {
             6 => Self::AlreadyExists,
             7 => Self::PermissionDenied,
             8 => Self::NamespaceUnknown,
+            9 => Self::OutcomeUnknown,
             _ => Self::Internal,
         }
     }

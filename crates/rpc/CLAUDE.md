@@ -556,7 +556,7 @@ overflows the frame.
 
 ## Wire version, and the two checks over it
 
-`WIRE_VERSION` (currently **71**) is the schema this binary speaks.
+`WIRE_VERSION` (currently **72**) is the schema this binary speaks.
 `MIN_CLIENT_WIRE_VERSION` (**43**) is the oldest CLIENT it serves. Both are maintained
 **BY HAND**. There is no schema fingerprint — hashing the sources byte for byte cost
 more than it caught (a translated comment once split a rolling cluster, and each false
@@ -901,6 +901,16 @@ and new bytes. PutResp CODE_PRECONDITION means comparison failed; region/ownersh
 errors retain frame-level status for routing refresh. Both values are capped at
 64 KiB; extract_part_id and both PS namespace/authz gates decode the new request.
 Every service and embedded client must be rebuilt together for wire 44.
+
+## Write outcome unknown (wire 72)
+
+`StatusCode::OutcomeUnknown = 9` and the batch / body code
+`partition_rpc::CODE_OUTCOME_UNKNOWN = 10`: a write the partition handed to its log
+stream and then gave up — it may or may not have been applied, and the partition's
+reopen settles it. `Unavailable` / `CODE_UNAVAILABLE` on a write now means only "not
+applied". `code_for_status` maps 9 → 10. A client predating it decodes 9 as `Internal`
+and 10 as a generic error, so it retries as it did before; the client floor stays 43,
+the ceiling rises to [43, 72].
 
 ## Seal a tail on partition open (wire 71)
 
