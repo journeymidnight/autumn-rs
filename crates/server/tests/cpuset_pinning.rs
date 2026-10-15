@@ -1,5 +1,6 @@
-//! `--cpuset` must move every work-unit thread onto its core even when the
-//! process was started under a narrower affinity mask.
+//! `--cpuset` must move every EN shard thread onto its core, and every PS
+//! thread into the PS's cpuset, even when the process was started under a
+//! narrower affinity mask.
 //!
 //! Regression target: the P-log thread and the extent-node shard threads were
 //! pinned through compio's `RuntimeBuilder::thread_affinity`, which intersects
@@ -16,6 +17,10 @@
 //! Topology: in-memory manager, one multi-shard EN, one single-shard EN (its
 //! runtime lives on the main thread — a separate code path), one PS with one
 //! partition (P-log + P-sst), replication 1.
+//!
+//! `more_partitions_than_cores_all_open` covers a PS with more partitions than
+//! `--cpuset` cores: every partition opens and splits, and every thread stays
+//! inside the cpuset.
 
 #![cfg(target_os = "linux")] // /proc and taskset
 
@@ -267,7 +272,7 @@ fn cpuset_moves_threads_off_a_narrower_launcher_mask() {
         "single-shard extent-node never listened"
     );
 
-    // PS: partition ord 0 takes cpuset[0] for P-log and cpuset[1] for P-sst.
+    // PS: pins nothing; its cpuset confines every thread, like taskset.
     let ps_port = pick_port();
     let ps_advertise = format!("127.0.0.1:{ps_port}");
     let ps_cpuset = format!("{p_log},{p_sst}");
@@ -322,13 +327,18 @@ fn cpuset_moves_threads_off_a_narrower_launcher_mask() {
     );
     assert_eq!(
         affinity_of(ps.pid(), &format!("part-{part_id}")),
-        vec![p_log],
+        vec![p_log, p_sst],
         "P-log"
     );
     assert_eq!(
         affinity_of(ps.pid(), &format!("part-{part_id}-sst")),
-        vec![p_sst],
+        vec![p_log, p_sst],
         "P-sst"
+    );
+    assert_eq!(
+        affinity_of(ps.pid(), "autumn-ps"),
+        vec![p_log, p_sst],
+        "PS main thread"
     );
 
     // io_uring's worker threads (`iou-wrk-*`) run the work the ring punts —
@@ -366,4 +376,162 @@ fn io_workers(pid: u32) -> Vec<Vec<usize>> {
         .filter(|(comm, _)| comm.starts_with("iou-wrk"))
         .map(|(_, cores)| cores)
         .collect()
+}
+
+/// A PS whose `--cpuset` has fewer cores than it has partitions opens and
+/// splits them all (the core budget it used to enforce refused the first
+/// split), every thread stays inside the cpuset, and `/metrics` counts the
+/// P-logs.
+#[test]
+fn more_partitions_than_cores_all_open() {
+    let own = std::fs::read_to_string("/proc/self/status").expect("read /proc/self/status");
+    let allowed = autumn_common::parse_cpuset(
+        own.lines()
+            .find_map(|l| l.strip_prefix("Cpus_allowed_list:"))
+            .expect("Cpus_allowed_list")
+            .trim(),
+    )
+    .expect("parse own Cpus_allowed_list");
+    assert!(allowed.len() >= 3, "needs 3 allowed cores, have {allowed:?}");
+    let c = &allowed[allowed.len() - 3..];
+    let (en_core, a, b) = (c[0], c[1], c[2]);
+
+    let tmp = TempDir::new(format!("cpuset-share-{}", std::process::id()));
+    let tmp = &tmp.0;
+
+    let mgr_port = pick_port();
+    let mgr_addr = format!("127.0.0.1:{mgr_port}");
+    let _manager = ChildGuard(
+        Command::new(MANAGER_BIN)
+            .arg("--cluster-secret-file")
+            .arg(cluster_secret_file())
+            .args(["--port", &mgr_port.to_string(), "--listen", "127.0.0.1"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn manager"),
+    );
+    assert!(wait_port_open(mgr_port, Duration::from_secs(10)), "manager never listened");
+
+    let en_dir = tmp.join("en");
+    format_dir(&mgr_addr, &en_dir);
+    let en_port = pick_port();
+    let en_addr = format!("127.0.0.1:{en_port}");
+    let _en = spawn_under_taskset(
+        en_core,
+        EXTENT_NODE_BIN,
+        &[
+            "--port",
+            &en_port.to_string(),
+            "--listen",
+            "127.0.0.1",
+            "--advertise",
+            &en_addr,
+            "--manager",
+            &mgr_addr,
+            "--data",
+            en_dir.to_str().unwrap(),
+            "--cpuset",
+            &en_core.to_string(),
+        ],
+    );
+    assert!(wait_port_open(en_port, Duration::from_secs(10)), "extent-node never listened");
+
+    let ps_port = pick_port();
+    let metrics_port = pick_port();
+    let ps_advertise = format!("127.0.0.1:{ps_port}");
+    let ps_cpuset = format!("{a},{b}");
+    // The PS log, shown when an assertion below fails.
+    let ps_log_path = tmp.join("ps.log");
+    let ps_log = || std::fs::read_to_string(&ps_log_path).unwrap_or_default();
+    let ps = ChildGuard(
+        Command::new(PARTITION_SERVER_BIN)
+            .arg("--cluster-secret-file")
+            .arg(cluster_secret_file())
+            .args([
+                "--psid",
+                "1",
+                "--port",
+                &ps_port.to_string(),
+                "--listen",
+                "127.0.0.1",
+                "--manager",
+                &mgr_addr,
+                "--advertise",
+                &ps_advertise,
+                "--cpuset",
+                &ps_cpuset,
+                "--metrics-port",
+                &metrics_port.to_string(),
+            ])
+            .stdout(Stdio::null())
+            .stderr(std::fs::File::create(&ps_log_path).expect("create ps.log"))
+            .spawn()
+            .expect("spawn PS"),
+    );
+    std::thread::sleep(Duration::from_secs(2));
+    let op = |args: &[&str]| {
+        let mut cmd = Command::new(AUTUMN_OP_BIN);
+        cmd.arg("--cluster-secret-file").arg(cluster_secret_file());
+        cmd.args(["--manager", &mgr_addr]).args(args);
+        run_or_panic(&format!("autumn-op {args:?}"), cmd)
+    };
+    let out = op(&["bootstrap", "--replication", "1+0"]);
+    let part_id: u64 = out
+        .lines()
+        .find_map(|l| l.split("created: id=").nth(1))
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|id| id.parse().ok())
+        .unwrap_or_else(|| panic!("no partition id in bootstrap output:\n{out}"));
+    assert!(
+        wait_port_open(ps_port, Duration::from_secs(15)),
+        "partition {part_id} never listened"
+    );
+    // Partition N listens on --port + N - 1. Four splits of the first
+    // partition: 5 partitions on 2 cores. The old
+    // core budget (cpuset_len / 2 = 1 partition) refused the first one.
+    let pid = part_id.to_string();
+    for at in ["80", "40", "20", "10"] {
+        op(&["split", &pid, "--at-raw-hex", at, "--wait"]);
+    }
+    let plogs = |pid: u32| -> Vec<(String, Vec<usize>)> {
+        thread_affinities(pid)
+            .into_iter()
+            .filter(|(n, _)| {
+                n.strip_prefix("part-")
+                    .is_some_and(|id| id.chars().all(|ch| ch.is_ascii_digit()))
+            })
+            .collect()
+    };
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut names: Vec<String> = Vec::new();
+    while Instant::now() < deadline {
+        names = plogs(ps.pid()).into_iter().map(|(n, _)| n).collect();
+        names.sort();
+        names.dedup();
+        if names.len() == 5 && (0..5).all(|o| wait_port_open(ps_port + o, Duration::from_millis(200))) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert_eq!(names.len(), 5, "partitions open on the PS: {names:?}\nPS log:\n{}", ps_log());
+
+    // Every thread of the PS — P-logs, P-ssts, main, listeners, io_uring
+    // workers — is allowed exactly the cpuset.
+    for (name, cores) in thread_affinities(ps.pid()) {
+        assert_eq!(cores, vec![a, b], "PS thread {name}");
+    }
+
+    // `/metrics` counts the P-logs.
+    let body = {
+        use std::io::{Read, Write};
+        let mut s = std::net::TcpStream::connect(("127.0.0.1", metrics_port))
+            .unwrap_or_else(|e| panic!("connect /metrics: {e}\nPS log:\n{}", ps_log()));
+        s.write_all(b"GET /metrics HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+        let mut body = String::new();
+        s.read_to_string(&mut body).unwrap();
+        body
+    };
+    assert!(body.contains("autumn_ps_plog_threads 5\n"), "/metrics:\n{body}");
+    drop(ps);
 }

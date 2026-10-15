@@ -53,7 +53,8 @@ require_cluster_secret() {
 
 # first_allowed_cpus N — the first N cores this container may run on, as a
 # comma list. The EN pins each shard with sched_setaffinity and REFUSES to start
-# on a core outside its cgroup cpuset, so the default cannot be host cores 0..N-1:
+# on a core outside its cgroup cpuset (so does the PS for its AUTUMN_PS_CPUSET),
+# so the default cannot be host cores 0..N-1:
 # under the kubelet's static CPU manager a pod's cores are whatever it was
 # granted (e.g. 12-15). Without the static policy every host core is allowed and
 # this yields 0..N-1, as before.

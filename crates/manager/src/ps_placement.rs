@@ -1,7 +1,7 @@
 //! Which partition server a partition goes on.
 //!
-//! A PS started with `--cpuset` pins each partition to two cores and so has a
-//! fixed number of slots, `cpuset_len / 2`, reported as `slot_cap`. A PS
+//! A PS started with `--cpuset` counts one of its cores per partition and so
+//! has `cpuset_len` slots, reported as `slot_cap`. A PS
 //! started without one reports `0`: its capacity is unknown. The manager keeps
 //! the caps in memory only (`MetadataState::ps_slot_caps`); every heartbeat
 //! repeats them, so a new leader has them back within one beat and treats a PS
@@ -15,13 +15,13 @@
 //! 3. a full cpuset PS, the lowest fill it would reach (`(used + 1) / cap`).
 //!
 //! Tier 3 exists so a placement always has an answer; the manager does not
-//! refuse it and reserves nothing. The PS does refuse: it will not open a
-//! partition past its own budget (the partition shows `ps=unknown`), so a
-//! placement there waits for a move.
+//! refuse it and reserves nothing, and the PS opens it too: past `slot_cap` its
+//! partitions share the cores.
 //!
 //! Rebalancing moves a partition only when its new seat ranks STRICTLY better
-//! than the one it leaves, and never onto a full cpuset PS: that PS would
-//! refuse to open it, and the partition moved might be one that was serving. Every move therefore replaces one seat in the
+//! than the one it leaves, and never onto a full cpuset PS: there it would only
+//! share cores, and the move closes and reopens a serving partition to get
+//! there. Every move therefore replaces one seat in the
 //! cluster's multiset of seats by a strictly smaller one, and over a finite
 //! state space that ordering has no cycle: rebalance cannot move partitions
 //! back and forth. That property, not a cooldown, is what keeps it stable.
@@ -313,8 +313,8 @@ mod tests {
         assert_eq!((l[&1], l[&2]), (2, 4), "{l:?}");
     }
 
-    /// Between two full cpuset PS a move only trades which one refuses to
-    /// open a partition, and may close one that was serving.
+    /// Between two full cpuset PS a move only trades which one shares cores,
+    /// and closes a serving partition to do it.
     #[test]
     fn rebalance_never_moves_onto_a_full_cpuset_ps() {
         let s = state(&[(1, 2, 3), (2, 4, 4)]); // fills 3/2 and 5/4 if moved

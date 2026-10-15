@@ -104,6 +104,19 @@ fn en_refuses_a_bad_value_and_an_unknown_argument() {
     }
 }
 
+/// `--cpu-start` was removed from both servers: a `--cpuset` range says it.
+#[test]
+fn ps_and_en_refuse_cpu_start() {
+    for (bin, args) in [
+        (PS_BIN, &["--psid", "1", "--cpu-start", "4"][..]),
+        (EN_BIN, &["--cpu-start", "4"]),
+    ] {
+        let (code, text) = run(bin, args);
+        assert_eq!(code, 2, "{bin} {args:?}: {text}");
+        assert!(text.contains("--cpu-start was removed"), "{bin}: {text}");
+    }
+}
+
 /// The client-side binaries take their own parameters plus the shared file
 /// system and client SDK ones.
 #[test]

@@ -37,11 +37,8 @@ struct Args {
     advertise: Option<String>,
     bind_host: String,
     transport: TransportKind,
-    cpu_start: usize,
-    /// explicit list of cores this binary may pin to, taskset
-    /// syntax (e.g. `4-11`, `0,2,4`, `0-3,8-11`). Overrides
-    /// `core_affinity::get_core_ids()` snapshot and disables
-    /// `--cpu-start`. Mutually exclusive with `--cpu-start`.
+    /// the cores the whole PS runs on, taskset syntax (e.g. `4-11`,
+    /// `0,2,4`, `0-3,8-11`). None = the mask it was started with.
     cpuset: Option<Vec<usize>>,
     /// Prometheus `/metrics` port. `None` = `--port` + 500; 0 = no endpoint.
     metrics_port: Option<u16>,
@@ -67,8 +64,7 @@ fn usage() -> String {
          \x20 --listen <host>             bind host (default 0.0.0.0)\n\
          \x20 --advertise <host:port>     address announced to the manager\n\
          \x20 --transport tcp|ucx\n\
-         \x20 --cpuset <spec>             cores to pin to (taskset syntax); budget = len/2 partitions\n\
-         \x20 --cpu-start <n>             first core to pin to (exclusive with --cpuset)\n\
+         \x20 --cpuset <spec>             cores the whole PS runs on, like taskset; len = slot_cap\n\
          \x20 --metrics-port <n>          /metrics port (default port+500, 0 = off)\n\
          \x20 --metrics-listen <host>     /metrics bind host (default --listen)\n\
          \n\
@@ -85,7 +81,6 @@ fn parse_args() -> Args {
     let mut advertise: Option<String> = None;
     let mut bind_host = String::from("0.0.0.0");
     let mut transport = TransportKind::Tcp;
-    let mut cpu_start: usize = 0;
     let mut cpuset: Option<Vec<usize>> = None;
     let mut metrics_port: Option<u16> = None;
     let mut metrics_listen: Option<String> = None;
@@ -138,8 +133,8 @@ fn parse_args() -> Args {
                     });
             }
             "--cpu-start" => {
-                i += 1;
-                cpu_start = args[i].parse().expect("--cpu-start must be a number");
+                eprintln!("error: --cpu-start was removed; pass --cpuset <SPEC> with the cores to use");
+                std::process::exit(2);
             }
             "--cpuset" => {
                 i += 1;
@@ -211,14 +206,6 @@ fn parse_args() -> Args {
         std::process::exit(2);
     }
 
-    // --cpuset and --cpu-start are mutually exclusive at the CLI
-    // layer. cpuset is the final list; offset has no meaning on top of
-    // an explicit list.
-    if cpuset.is_some() && cpu_start != 0 {
-        eprintln!("error: --cpuset and --cpu-start are mutually exclusive");
-        std::process::exit(2);
-    }
-
     Args {
         cluster_secret_file,
         port,
@@ -227,7 +214,6 @@ fn parse_args() -> Args {
         advertise,
         bind_host,
         transport,
-        cpu_start,
         cpuset,
         metrics_port,
         metrics_listen,
@@ -313,12 +299,15 @@ async fn main() -> Result<()> {
     let _ = autumn_transport::init_with(args.transport);
     autumn_rpc::client::set_prepared_zerocopy_min_bytes(params.tcp_zerocopy_min_bytes.get());
     // --cpuset (if given) is installed BEFORE any cpu_pin reader
-    // fires, so the cached core list reflects the override. Otherwise
-    // fall back to the legacy --cpu-start offset.
+    // fires, so the cached core list reflects the override.
     if let Some(cs) = args.cpuset.clone() {
         let _ = autumn_common::set_cpuset(cs);
-    } else {
-        autumn_common::set_cpu_offset(args.cpu_start);
+    }
+    // Before any thread is spawned, so every thread inherits the cpuset. The
+    // PS pins nothing: the cpuset confines it like taskset.
+    if let Err(e) = autumn_common::cpu_pin::float_current() {
+        eprintln!("error: cannot confine the PS to its cores: {e}");
+        std::process::exit(2);
     }
 
     #[cfg(unix)]

@@ -512,7 +512,7 @@ PS fail-fast, no recovery hold, no EC hold — each red).
 ### Rebalance
 
 **Every PS choice goes through one ranking, `ps_placement.rs`.** A PS started
-with `--cpuset` has `cpuset_len / 2` core slots and reports them as `slot_cap` on
+with `--cpuset` has `cpuset_len` core slots (one core per partition) and reports them as `slot_cap` on
 register AND on every heartbeat; a PS without one reports `0` (capacity unknown).
 The manager keeps them in `MetadataState::ps_slot_caps`, **in memory only** —
 not etcd, so no persisted record changes: `replay_from_etcd` clears them and each
@@ -524,15 +524,15 @@ capacity-unknown. Eviction drops the cap with the PS. The ranking, best first:
 3. a full cpuset PS, lowest fill it would reach, `(used + 1) / cap`.
 
 Tier 3 exists so a placement always has an answer: the manager never refuses
-and reserves nothing. The PS still refuses to open a partition past its budget
-(it shows `ps=unknown` until moved), so a placement there waits for a move. Ties break by lowest `ps_id` (the old count-based pick
+and reserves nothing; the PS opens it too, its partitions sharing the cores
+past `slot_cap`. Ties break by lowest `ps_id` (the old count-based pick
 iterated a `HashMap`, so its ties were arbitrary).
 
 A rebalance move is made only when the target's seat ranks STRICTLY better
 than the seat the partition leaves (`seat(to, used)` < `seat(from, used - 1)`),
-and never onto a full cpuset PS: under the PS's refusal such a move only trades
-which PS leaves a partition unopened, and the partition moved (the source's
-largest `part_id`) may be one that was serving.
+and never onto a full cpuset PS: such a move only trades which PS shares cores,
+and it closes and reopens the partition moved (the source's largest `part_id`),
+which was serving.
 Each move therefore replaces one element of the cluster's multiset of seats by a
 strictly smaller one; over a finite state space that cannot cycle, so rebalance
 never moves a partition back and forth — the property is structural, not a

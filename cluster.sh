@@ -328,9 +328,10 @@ compute_shard_config() {
 # out INSIDE its mask, and saves them in the snapshot (AUTUMN_ALLOWED_CPUS) so a
 # later start-node / restart-node from another shell reuses the same layout
 # (load_cluster_config). Empty where threads cannot be pinned (macOS has affinity
-# hints only; the binaries fail on an explicit --cpuset there) — no --cpuset is
-# passed at all. The binaries pin with sched_setaffinity, so a core number
-# outside their cgroup would stop them at startup: never hand out absolute
+# hints only; the EN fails on an explicit --cpuset there) — no --cpuset is
+# passed at all. The EN pins its shards and the PS confines itself with
+# sched_setaffinity, so a core number outside their cgroup stops them at
+# startup: never hand out absolute
 # numbers, always slices of this list.
 # AUTUMN_ALLOWED_CPUS is an OUTPUT (snapshot) only: start/restart/reset overwrite
 # it from their own mask. To restrict the layout, run them under taskset.
@@ -363,7 +364,8 @@ detect_cpu_count() {
 # ALLOWED_CPUS) is always disabled; under taskset/cgroups the gate counts
 # only the allowed cores.
 # Heuristic: need REPLICAS*SHARDS cores for EN side + 2*PS_PARTS_HINT for
-# PS (P-log + P-sst per partition). PS_PARTS_HINT defaults to 8 (matches
+# PS (a core per partition plus room for P-sst and compaction; the PS pins no
+# thread, its cpuset confines the process). PS_PARTS_HINT defaults to 8 (matches
 # perf_check.sh default partition count); override via
 # AUTUMN_PS_PARTS_HINT for clusters with more partitions.
 compute_affinity_decision() {
@@ -502,9 +504,10 @@ launch_ps() {
     # even-distribution layout (single-host, multi-process cluster):
     #   EN i ∈ [1..REPLICAS]  → cores [(i-1)*SHARDS .. i*SHARDS-1]
     #   PS                    → cores [REPLICAS*SHARDS .. REPLICAS*SHARDS + 2*PS_PARTS_HINT - 1]
-    # Each PS partition reserves 2 cores (P-log + P-sst). PS_PARTS_HINT
-    # (defaults to 8, matches perf_check.sh) sets how many partitions
-    # this PS has room for. compute_affinity_decision() guarantees
+    # Two cores per hinted partition (P-log, P-sst and compaction work run
+    # anywhere in the PS cpuset). More partitions than the PS has cores share
+    # them. PS_PARTS_HINT (defaults to 8, matches perf_check.sh)
+    # sizes it. compute_affinity_decision() guarantees
     # AFFINITY_ENABLED=1 only when total cores >= REPLICAS*SHARDS +
     # 2*PS_PARTS_HINT, so the EN ranges and the PS range are disjoint
     # by construction.
@@ -524,7 +527,7 @@ launch_ps() {
         local ps_cpus
         ps_cpus="$(allowed_cpu_slice "$ps_cpu_start" $(( 2 * ps_hint )))"
         cpu_args=(--cpuset "$ps_cpus")
-        affinity_msg="cpuset=${ps_cpus} (max_parts=$ps_hint)"
+        affinity_msg="cpuset=${ps_cpus} (parts_hint=$ps_hint)"
     fi
     # operator-set AUTUMN_* env vars are translated explicitly to
     # per-binary CLI flags here — Rust libraries no longer read env
@@ -886,13 +889,11 @@ do_start() {
         mkdir -p $(echo "$disk_arg" | tr ',' ' ')
     done
 
-    # auto-size the PS partition budget from the presplit count when the
-    # operator didn't set AUTUMN_PS_PARTS_HINT. Each partition needs 2 PS cores
-    # (P-log + P-sst); the PS refuses partitions past cpuset_len/2, and
-    # cluster.sh sizes the PS cpuset from AUTUMN_PS_PARTS_HINT (default 8). So
-    # presplitting >8 partitions without bumping the hint silently strands the
-    # surplus ("core budget exhausted"). Raise the hint to the presplit
-    # count so a fresh start "just works". Only ever RAISES above the default 8
+    # auto-size the PS cpuset from the presplit count when the operator didn't
+    # set AUTUMN_PS_PARTS_HINT (2 cores per hinted partition; see launch_ps).
+    # Presplitting >8 partitions without bumping the hint still opens them all,
+    # sharing the cores. Raise the hint to the presplit count to size the
+    # cpuset to them. Only ever RAISES above the default 8
     # (≤8 keeps the default); an explicit AUTUMN_PS_PARTS_HINT always wins. If
     # the box lacks REPLICAS*SHARDS + 2*hint cores, compute_affinity_decision
     # disables pinning and the PS falls back to all-core auto-detect (a wide
@@ -903,7 +904,7 @@ do_start() {
         local _presplit_n="${AUTUMN_BOOTSTRAP_PRESPLIT%%:*}"
         if [[ "$_presplit_n" =~ ^[0-9]+$ ]] && (( _presplit_n > 8 )); then
             export AUTUMN_PS_PARTS_HINT="$_presplit_n"
-            echo "[cluster] auto PS_PARTS_HINT=$_presplit_n (from presplit; PS budget = $(( _presplit_n * 2 )) cores)"
+            echo "[cluster] auto PS_PARTS_HINT=$_presplit_n (from presplit; PS cpuset = $(( _presplit_n * 2 )) cores)"
         fi
     fi
 

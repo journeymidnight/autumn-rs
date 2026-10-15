@@ -1090,7 +1090,10 @@ stays, and autumn-op is rebuilt with the cluster.
 ## PS core slots (wire 50)
 
 `RegisterPsReq` and `HeartbeatPsReq` gain `slot_cap: u32` — the partitions a PS
-can pin to cores, `cpuset_len / 2` under an explicit `--cpuset`, `0` without one.
+can give a core each, `cpuset_len` under an explicit `--cpuset` (it was
+`cpuset_len / 2` while P-log and P-sst each had a core pinned, changed without
+a wire bump — a cluster restarts stop-world, so old and new PS never rank side
+by side), `0` without one.
 `PsOverview` carries it back to autumn-op and the dashboard. None of the three
 is on the client surface, so the window's ceiling rises to [43, 50] and the
 floor stays; autumn-op is rebuilt with the cluster as for wire 49. Placement by

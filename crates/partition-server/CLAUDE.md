@@ -8,20 +8,47 @@ An LSM-tree based KV store built on top of the stream layer. Each `PartitionServ
 
 ### Thread Model
 
-P-log applies `cpu_pin::pin_current(cpu_log)` and P-sst `pin_current(cpu_bulk)`
-before creating their compio runtimes; a failure is reported through the
-partition's ready channel, so the partition does not open. compio's own
-`thread_affinity` is not used: it only narrows the inherited mask (P-sst inherits
-P-log's single core; a `taskset`-launched PS inherits the launcher's cores) and
-silently binds nothing when the target is outside it (`crates/common/CLAUDE.md`).
-CPU read-back must show the `--cpuset` cores, not merely the intended values in
-logs. The same budget (`cpuset_len / 2`, from `compute_partition_budget_cap`) is
-reported to the manager as `slot_cap` on `register_ps` and on every heartbeat
-(`0` when `--cpuset` was not given); the manager places partitions by it
-(`crates/manager/CLAUDE.md`, "Rebalance"). The PS still refuses to open a
-partition or split past its budget. Both then call `cpu_pin::confine_io_workers(&rt)`, so that runtime's
-io_uring worker threads (`iou-wrk-*`) stay inside the PS's `--cpuset` too
-(`crates/common/CLAUDE.md`).
+**The PS pins no thread; `--cpuset` confines the whole process, like
+`taskset`.** The binary sets its main thread's mask to the cpuset
+(`cpu_pin::float_current`) before spawning anything, so every thread — P-log,
+P-sst, their blocking pools, listeners, metrics — inherits it and the kernel
+places them. More partitions than cores just share them; nothing refuses a
+partition or a split for lack of cores. A confinement that cannot be exact (a
+core outside the cgroup, which the kernel would silently drop) exits 2 at
+start. The P-log and P-sst runtimes call
+`cpu_pin::confine_io_workers(&rt)` (the main and metrics runtimes do no file
+I/O and do not): on 6.1 io_uring's worker threads
+(`iou-wrk-*`) ignore the thread mask and take the NUMA node's cores, so the
+cpuset has to be registered for them (`crates/common/CLAUDE.md`). Keep the
+cpuset inside one NUMA node: jemalloc arenas follow threads, not CPUs, and
+pages land on the node of first touch.
+
+Why not pin (measured 2026-10-15, TCP, cpuset-isolated, tenants on the box):
+P-log pinned to one core vs floating in the cpuset — 8 partitions on 8 HTs: no
+difference; 16 on 4 HTs: +7% one round, 0 the next; 16 on 8 HTs with 12 hot
+partitions (pinning put 2 hot ones on each of 4 cores): floating +4% and +7%,
+less run_delay; pure writes (disk-bound): no difference anywhere. P-sst or
+compaction's SST build on the P-log's core cost only scheduling delay (P-log
+run_delay 4.5% / 1.5% of its CPU time), never throughput. Compaction's real
+cost (-16% throughput) is EN/disk I/O. Compaction and GC run on P-log
+(`background_maintenance_loop`); P-sst only flushes and appends to row_stream.
+The EN does pin its shards (one per core, never oversubscribed; pinned
+measured +2-3% write, p50 -12%).
+
+`slot_cap` = the `--cpuset` length (one core per partition), reported to the
+manager on `register_ps` and every heartbeat (`0` without `--cpuset`: capacity
+unknown); the manager places by it (`crates/manager/CLAUDE.md`, "Rebalance").
+A soft figure: past it partitions share cores. Every 2 s the main runtime reads
+each P-log's `/proc/self/task/<tid>/schedstat` (`plog_load`, loop
+`ps_plog_load`; the tid is registered by the P-log thread, the `PlogLease` lives
+in `PartitionHandle`) and `/metrics` shows `autumn_ps_plog_threads`,
+`autumn_ps_plog_cpu_ratio` and `autumn_ps_plog_run_delay_ratio` (P-log CPU time
+and runnable-but-waiting time over wall time, summed): a run_delay climbing
+toward the CPU figure says the cpuset is too small (run_delay needs
+CONFIG_SCHEDSTATS or delay accounting; without them it reads 0). Tests:
+`crates/server/tests/cpuset_pinning.rs` (real binaries; every PS thread's
+`Cpus_allowed_list` is the cpuset; 5 partitions split onto 2 cores all open;
+`/metrics` counts) and `plog_load` unit tests.
 
 ```
 Main compio thread (control plane + fd dispatcher)
@@ -32,7 +59,7 @@ Main compio thread (control plane + fd dispatcher)
 Accept OS thread (blocking)
 └─ std::net::accept → tx   ← dedicated accept, sends to main via channel
 
-Partition threads — 2 OS threads per partition:
+Partition threads — 2 OS threads per partition (both anywhere in the cpuset):
 ├─ part-N (P-log): OWNS
 │     • partition_loop (request dispatch + group-commit SQ/CQ; write loop is
 │       inlined here — no per-Put spawn/oneshot)
@@ -55,7 +82,11 @@ P-sst → P-log: oneshot::Sender<Result<(TableMeta, SstReader)>>
 compio runtime for hundreds of ms (syscall + 3-replica fanout CQE wait),
 head-of-line-blocking the log_stream 4 KB WAL batches sharing the same io_uring.
 P-sst gives flush its own runtime so WAL appends make forward progress
-concurrently with SST uploads.
+concurrently with SST uploads. Still true with every CPU step of a flush in
+`spawn_blocking` (measured 2026-10-15: the flush worker as a task on the P-log
+runtime, with its own connections, 4K writes at 64 threads — server write p999
+during flushes over 100 ms in 4 of 6 runs, up to 230 ms, against 0 of 6 with
+P-sst; flushes 10% slower; no difference between flushes).
 
 **ps-conn handoff (per-partition listeners)**: each partition OS thread binds its
 OWN `compio::net::TcpListener` on a unique port (`base_port + ord`) and runs its
@@ -2084,10 +2115,9 @@ wallclock (each recovery runs on its own thread/core and is latency-bound). Race
 because port ordinals are reserved synchronously per open
 (`used_port_ords.borrow_mut()` before any await) and owner locks are per-partition
 keys, so no cross-open shared-RefCell borrow is held across an await. Gating
-(already-open / backoff / budget, with a LOCAL budget reservation counter) is applied
-UP FRONT; results (insert handle + budget inc + backoff record) after `collect`.
-`--open-parallelism` caps only the manager-RPC burst; the live count is bounded by the
-per-PS partition budget (cpuset_len / 2).
+(already-open / backoff) is applied UP FRONT; results (insert handle + backoff
+record) as each open completes. `--open-parallelism` caps only the manager-RPC burst;
+there is no core budget (P-logs share cores past the cpuset's length).
 
 Corrupt historical checkpoints are repaired out of band (a one-off `repair_metastream`
 that appends a fresh `TableLocations` record); `recover_partition` stays strict and

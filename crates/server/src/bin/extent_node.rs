@@ -58,14 +58,10 @@ struct Args {
     /// Bind host for the listener (IPv4 or bare/bracketed IPv6). Default 0.0.0.0.
     bind_host: String,
     transport: TransportKind,
-    /// First core to pin shard threads to. Multi-process clusters on one host
-    /// need disjoint values across processes so they don't share cores.
-    /// Mutually exclusive with `--cpuset`.
-    cpu_start: usize,
     /// explicit list of cores this binary may pin to, taskset
-    /// syntax (e.g. `4-11`, `0,2,4`, `0-3,8-11`). Overrides
-    /// `core_affinity::get_core_ids()` snapshot and disables
-    /// `--cpu-start`. When unset, behaviour matches the earlier default.
+    /// syntax (e.g. `4-11`, `0,2,4`, `0-3,8-11`). Overrides the
+    /// `core_affinity::get_core_ids()` snapshot. Multi-process clusters on
+    /// one host give each process a disjoint list.
     cpuset: Option<Vec<usize>>,
     /// control-plane listener port. None → derive as `port + 1000`.
     /// Each shard binds its own control listener at
@@ -107,7 +103,6 @@ fn usage() -> String {
          \x20 --listen <host>             bind host (default 0.0.0.0)\n\
          \x20 --transport tcp|ucx\n\
          \x20 --cpuset <spec>             cores; shard count = number of cores\n\
-         \x20 --cpu-start <n>             first core (exclusive with --cpuset)\n\
          \x20 --no-direct-io              no O_DIRECT for large append bursts\n\
          \x20 --metrics-port <n>          /metrics port (default port+500, 0 = off)\n\
          \x20 --metrics-listen <host>     /metrics bind host (default --listen)\n\
@@ -128,7 +123,6 @@ fn parse_args() -> Args {
     let mut shard_stride: u16 = 10;
     let mut bind_host = String::from("0.0.0.0");
     let mut transport = TransportKind::Tcp;
-    let mut cpu_start: usize = 0;
     let mut cpuset: Option<Vec<usize>> = None;
     // optional override; default = port + 1000.
     let mut control_port: Option<u16> = None;
@@ -209,8 +203,8 @@ fn parse_args() -> Args {
                     });
             }
             "--cpu-start" => {
-                i += 1;
-                cpu_start = args[i].parse().expect("--cpu-start must be a number");
+                eprintln!("error: --cpu-start was removed; pass --cpuset <SPEC> with the cores to use");
+                std::process::exit(2);
             }
             "--cpuset" => {
                 i += 1;
@@ -259,14 +253,6 @@ fn parse_args() -> Args {
         data_dirs.push(PathBuf::from("/tmp/autumn-extent"));
     }
 
-    // --cpuset and --cpu-start are mutually exclusive at the CLI
-    // layer. cpuset is the final list; offset has no meaning on top of
-    // an explicit list.
-    if cpuset.is_some() && cpu_start != 0 {
-        eprintln!("error: --cpuset and --cpu-start are mutually exclusive");
-        std::process::exit(2);
-    }
-
     Args {
         cluster_secret_file,
         port,
@@ -275,7 +261,6 @@ fn parse_args() -> Args {
         shard_stride,
         bind_host,
         transport,
-        cpu_start,
         cpuset,
         control_port,
         direct_io,
@@ -659,13 +644,10 @@ fn main() -> Result<()> {
     );
     // --cpuset (if given) is installed BEFORE any cpu_pin reader
     // fires, so the cached core list reflects the override. Without
-    // --cpuset we fall back to the legacy --cpu-start offset over
-    // `core_affinity::get_core_ids()`.
+    // it the pool is `core_affinity::get_core_ids()`.
     let cpuset_given = args.cpuset.is_some();
     if let Some(cs) = args.cpuset.clone() {
         let _ = autumn_common::set_cpuset(cs);
-    } else {
-        autumn_common::set_cpu_offset(args.cpu_start);
     }
     // `--cpuset` is the sole sizing surface. Shard count = cpuset_len
     // (one shard per pre-allocated core). `--shards` was removed; CLI

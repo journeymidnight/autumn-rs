@@ -3528,8 +3528,8 @@ async fn run_overview(client: &ClusterClient, json_out: bool) -> Result<()> {
         }
         // `used/cap` core slots per PS; `cap` is `?` for a PS with no
         // `--cpuset` (or one the manager has not heard since it became
-        // leader). The PS refuses to open partitions past its cap. The state
-        // says whether it serves all of them: a PS answers heartbeats long
+        // leader). Past its cap the PS still opens every partition; they share
+        // the cores. The state says whether it serves all of them: a PS answers heartbeats long
         // before its partitions have recovered.
         println!("partition servers:");
         for p in &resp.ps_servers {
@@ -3538,7 +3538,7 @@ async fn run_overview(client: &ClusterClient, json_out: bool) -> Result<()> {
                 c => c.to_string(),
             };
             let over = if p.slot_cap > 0 && p.partition_count > p.slot_cap {
-                "  <- over its cpuset: the extra partitions are not opened (ps=unknown)"
+                "  <- over its cpuset: partitions share cores (/metrics autumn_ps_plog_*)"
             } else {
                 ""
             };

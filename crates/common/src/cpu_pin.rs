@@ -8,37 +8,21 @@
 //!
 //! 1. **`--cpuset <SPEC>`**: operator-supplied explicit list, e.g.
 //!    `4-11`, `4,5,6`, `0-3,8-11`. When present, this is the final
-//!    list (offset is ignored). Each work-unit (partition pair, extent
-//!    shard, bench worker) takes one core in ascending order:
-//!    `ord N → cpuset[N]`.
+//!    list. Each EN shard / bench worker takes one
+//!    core in ascending order: `ord N → cpuset[N]`. The PS pins nothing:
+//!    its cpuset confines the whole process, like `taskset`
+//!    (`float_current` on its main thread at start).
 //!
-//! 2. **`core_affinity::get_core_ids()`** (legacy): auto-detected from the
-//!    process's cpuset (`taskset -c <set>` carrying through). Combined
-//!    with `CPU_OFFSET` set by `--cpu-start N`, ord N pins to
-//!    `cores[CPU_OFFSET + N]`. Existing zero-config deployments keep
-//!    working unchanged.
+//! 2. **`core_affinity::get_core_ids()`**: auto-detected from the
+//!    process's mask (`taskset -c <set>` carrying through); ord N pins to
+//!    `cores[N]`.
 //!
-//! If a process has more work-units than cores remaining at the resolved
-//! offset, the surplus ones log a WARN and stay un-pinned (kernel
-//! scheduler picks). Modulo wrapping was rejected — it would force two
-//! work-units to fight for one core, which is worse than letting the
-//! kernel float them.
-//!
-//! `--cpuset` and `--cpu-start` are mutually exclusive at the CLI layer;
-//! when both are present the binary refuses to start.
+//! If a process has more work-units than cores, `pick_cpu_for_ord` logs a
+//! WARN for the surplus and leaves them un-pinned.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::OnceLock;
 
-static CPU_OFFSET: AtomicUsize = AtomicUsize::new(0);
 static CPU_SET_OVERRIDE: OnceLock<Vec<usize>> = OnceLock::new();
-
-/// Set the global cpu offset added to every `pick_cpu_for_ord` call. Intended
-/// to be called once at process startup from a `--cpu-start` CLI flag, before
-/// any work-unit threads are spawned.
-pub fn set_cpu_offset(offset: usize) {
-    CPU_OFFSET.store(offset, Ordering::Relaxed);
-}
 
 /// install an explicit cpuset overriding `core_affinity::get_core_ids()`.
 /// First-call-wins (matches the tunable pattern); subsequent calls
@@ -46,10 +30,9 @@ pub fn set_cpu_offset(offset: usize) {
 /// first `pick_cpu_for_ord` or `cpuset_len` call, since both cache the
 /// resolved list in a `OnceLock`.
 ///
-/// When this override is active, `CPU_OFFSET` is ignored — the cpuset is
-/// taken to be the final list of cores the process may pin to. Operators
-/// running multi-process clusters on one host should hand each process a
-/// disjoint cpuset directly.
+/// The cpuset is the final list of cores the process may pin to. Operators
+/// running multi-process clusters on one host hand each process a disjoint
+/// cpuset.
 pub fn set_cpuset(cores: Vec<usize>) -> bool {
     let mut v = cores;
     v.sort_unstable();
@@ -130,52 +113,37 @@ const PLATFORM_PINS: bool = cfg!(any(
 ));
 
 /// number of cores available for pinning in the resolved cpuset.
-/// Used by PS for partition-budget gating and by EN for default shard
-/// count. Returns 0 only on platforms without affinity support.
+/// The PS reports it as its core capacity; the EN sizes its shard count by
+/// it. Returns 0 only on platforms without affinity support.
 pub fn cpuset_len() -> usize {
     available_cpu_cores().len()
 }
 
 /// returns true iff the operator passed `--cpuset` explicitly
-/// (i.e. `set_cpuset` was called). PS uses this to decide whether to
-/// enforce its partition budget. EN uses it to decide whether to
-/// auto-size `--shards` from the cpuset.
+/// (i.e. `set_cpuset` was called). The PS reports a core capacity only
+/// then. EN uses it to decide whether to auto-size `--shards` from the
+/// cpuset.
 pub fn cpuset_explicit() -> bool {
     CPU_SET_OVERRIDE.get().is_some()
 }
 
-/// Pick the CPU core to pin the `zero_based_ord`-th OS thread to. Returns
-/// `None` if either the platform doesn't support affinity (then nothing is
-/// pinned) or the resolved index `CPU_OFFSET + ord` exceeds the cpuset
-/// (a WARN is logged). When `--cpuset` is set, `CPU_OFFSET` is ignored
-/// and ord N maps directly to `cpuset[N]`.
+/// Pick the CPU core to pin the `zero_based_ord`-th OS thread to:
+/// `cores[ord]`. `None` if the platform doesn't support affinity (then
+/// nothing is pinned) or `ord` is past the cores (a WARN is logged).
 pub fn pick_cpu_for_ord(zero_based_ord: usize) -> Option<usize> {
     let cores = available_cpu_cores();
     if cores.is_empty() {
         return None;
     }
-    // cpuset override = explicit list; ord indexes it directly with
-    // no offset. Without override, fall back to legacy CPU_OFFSET + ord.
-    let idx = if CPU_SET_OVERRIDE.get().is_some() {
-        zero_based_ord
-    } else {
-        let offset = CPU_OFFSET.load(Ordering::Relaxed);
-        offset.checked_add(zero_based_ord)?
-    };
-    if idx >= cores.len() {
+    let Some(&core) = cores.get(zero_based_ord) else {
         tracing::warn!(
             ord = zero_based_ord,
-            cpu_offset = if CPU_SET_OVERRIDE.get().is_some() {
-                0
-            } else {
-                CPU_OFFSET.load(Ordering::Relaxed)
-            },
             cpu_set_len = cores.len(),
-            "more work-units than cores remaining at cpu offset; this thread stays unpinned"
+            "more work-units than cores; this thread stays unpinned"
         );
         return None;
-    }
-    Some(cores[idx])
+    };
+    Some(core)
 }
 
 /// Pin the calling thread to `cpu` (no-op for `None`). Every work-unit thread
@@ -221,7 +189,7 @@ pub fn confine_io_workers(rt: &compio::runtime::Runtime) {
         if !rt.driver_type().is_iouring() {
             return;
         }
-        let cores = io_worker_cores();
+        let cores = pinning_pool();
         if cores.is_empty() {
             return;
         }
@@ -242,24 +210,73 @@ pub fn confine_io_workers(rt: &compio::runtime::Runtime) {
     let _ = rt;
 }
 
-/// The cores work units are pinned from: the explicit `--cpuset`, or the
-/// detected cores from `--cpu-start` on (to the end of the mask, like the pool
-/// `pick_cpu_for_ord` draws from — it can include a co-located process's cores).
-#[cfg(target_os = "linux")]
-fn io_worker_cores() -> Vec<usize> {
-    let cores = available_cpu_cores();
-    if CPU_SET_OVERRIDE.get().is_some() {
-        return cores.to_vec();
-    }
-    let offset = CPU_OFFSET.load(Ordering::Relaxed);
-    cores.get(offset..).unwrap_or_default().to_vec()
+/// The cores a process runs its work on (the EN pins its shards to them, the
+/// PS confines itself to them): the explicit `--cpuset`, or the mask the
+/// process started with. Empty where the OS cannot pin.
+pub fn pinning_pool() -> Vec<usize> {
+    available_cpu_cores().to_vec()
 }
 
-/// `IORING_REGISTER_IOWQ_AFF`: the io-wq of the CALLING task (the one that
-/// owns `ring`) runs its workers on `cores` only.
+/// Let the calling thread run on any core of `pinning_pool()`. The PS calls it
+/// on its main thread at start, before spawning anything: it pins no thread,
+/// so every thread it starts inherits the cpuset. A no-op where nothing can be
+/// pinned, and off Linux (no affinity masks there). An error when any core
+/// asked for cannot be had (outside the cgroup cpuset, offline, out of range).
+pub fn float_current() -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        let pool = pinning_pool();
+        if !pool.is_empty() {
+            set_mask_exactly(&pool)?;
+        }
+    }
+    Ok(())
+}
+
+/// `sched_setaffinity` to `cores`, refusing a narrower result: the kernel
+/// silently drops the cores the cgroup does not allow and fails only when none
+/// is left.
 #[cfg(target_os = "linux")]
-fn register_io_worker_cores(ring: std::os::fd::RawFd, cores: &[usize]) -> std::io::Result<()> {
-    const IORING_REGISTER_IOWQ_AFF: libc::c_uint = 17;
+fn set_mask_exactly(cores: &[usize]) -> std::io::Result<()> {
+    let size = std::mem::size_of::<libc::cpu_set_t>();
+    let set = cpu_set_of(cores)?;
+    // SAFETY: `set` outlives the call, and the length passed is its size.
+    if unsafe { libc::sched_setaffinity(0, size, &set) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: cpu_set_t is plain bits; the kernel fills `got` up to `size`.
+    let mut got: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+    if unsafe { libc::sched_getaffinity(0, size, &mut got) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: every index is below CPU_SETSIZE.
+    let got: Vec<usize> = (0..libc::CPU_SETSIZE as usize)
+        .filter(|&c| unsafe { libc::CPU_ISSET(c, &got) })
+        .collect();
+    let mut want = cores.to_vec();
+    want.sort_unstable();
+    if got != want {
+        return Err(std::io::Error::other(format!(
+            "asked for cores {want:?}, allowed only {got:?} (outside the cgroup cpuset, offline, or past CPU {})",
+            libc::CPU_SETSIZE - 1
+        )));
+    }
+    Ok(())
+}
+
+/// The kernel thread id of the calling thread (`None` off Linux).
+pub fn current_tid() -> Option<i32> {
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: gettid has no arguments and cannot fail.
+        Some(unsafe { libc::syscall(libc::SYS_gettid) } as i32)
+    }
+    #[cfg(not(target_os = "linux"))]
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn cpu_set_of(cores: &[usize]) -> std::io::Result<libc::cpu_set_t> {
     // SAFETY: cpu_set_t is plain bits; all-zero is the empty set.
     let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
     let mut any = false;
@@ -269,10 +286,17 @@ fn register_io_worker_cores(ring: std::os::fd::RawFd, cores: &[usize]) -> std::i
         any = true;
     }
     if !any {
-        return Err(std::io::Error::other(
-            "no core below CPU_SETSIZE to register",
-        ));
+        return Err(std::io::Error::other("no core below CPU_SETSIZE"));
     }
+    Ok(set)
+}
+
+/// `IORING_REGISTER_IOWQ_AFF`: the io-wq of the CALLING task (the one that
+/// owns `ring`) runs its workers on `cores` only.
+#[cfg(target_os = "linux")]
+fn register_io_worker_cores(ring: std::os::fd::RawFd, cores: &[usize]) -> std::io::Result<()> {
+    const IORING_REGISTER_IOWQ_AFF: libc::c_uint = 17;
+    let set = cpu_set_of(cores)?;
     // SAFETY: `set` outlives the call, and the length passed is its size.
     let r = unsafe {
         libc::syscall(
@@ -313,6 +337,44 @@ mod tests {
             })
             .join()
             .unwrap();
+        })
+        .join()
+        .unwrap();
+    }
+
+    /// A thread spawned by a pinned parent leaves that one core for the pool.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn float_current_widens_to_the_pool() {
+        let pool = pinning_pool();
+        if pool.len() < 2 {
+            return;
+        }
+        let ids = |v: Vec<core_affinity::CoreId>| v.into_iter().map(|c| c.id).collect::<Vec<_>>();
+        std::thread::spawn(move || {
+            pin_current(Some(pool[0])).unwrap();
+            assert_eq!(ids(core_affinity::get_core_ids().unwrap()), vec![pool[0]]);
+            float_current().unwrap();
+            assert_eq!(ids(core_affinity::get_core_ids().unwrap()), pool);
+        })
+        .join()
+        .unwrap();
+    }
+
+    /// A core the kernel cannot give (here one that does not exist) is an
+    /// error, not a silently narrower mask.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_narrowed_mask_is_refused() {
+        let pool = pinning_pool();
+        let missing = libc::CPU_SETSIZE as usize - 1;
+        if pool.is_empty() || pool.contains(&missing) {
+            return;
+        }
+        std::thread::spawn(move || {
+            set_mask_exactly(&pool).unwrap();
+            let err = set_mask_exactly(&[pool[0], missing]).unwrap_err();
+            assert!(err.to_string().contains("allowed only"), "{err}");
         })
         .join()
         .unwrap();

@@ -3887,16 +3887,16 @@ Phase B, not yet shipped.)
 
 ### Which PS a partition goes on (core slots)
 
-A PS started with `--cpuset <N cores>` has `N / 2` core slots (each partition
-pins P-log and P-sst to one core each). A new partition, a split's right child,
+A PS started with `--cpuset <N cores>` has `N` core slots, one per partition (a
+soft figure: the PS pins no thread, and past it partitions share the cores). A new partition, a split's right child,
 and a partition whose PS was evicted all go to, in order:
 
 1. a `--cpuset` PS with a free slot — the most free slots first (absolute
    count, not fraction: a 1-slot PS is used only once the larger ones are
    down to 1 free);
 2. a PS started without `--cpuset` — the fewest partitions first;
-3. only if every PS is a full `--cpuset` PS: the one it overfills least — and
-   that PS will not open it until `rebalance` or a freed slot moves it.
+3. only if every PS is a full `--cpuset` PS: the one it overfills least; that
+   PS opens it, its partitions sharing the cores.
    `rebalance` never moves a partition onto a full `--cpuset` PS.
 
 See the slots:
@@ -3919,8 +3919,7 @@ A heartbeat alone is not readiness: the PS starts beating before its partitions
 replay their logs. Wait for `ready` (`--json info`: `ps_servers[].ready`) before
 driving traffic after a start. `cluster.sh` start / `start-ps` and
 `autumn-deploy` do; `cluster.sh` FAILS the start (after 120 s, printing the
-`partition servers:` lines) when the PS cannot open every partition — e.g. more
-partitions than its `--cpuset` has slots, which it refuses to open. The rest of
+`partition servers:` lines) when the PS cannot open every partition. The rest of
 the cluster is left running for inspection; `cluster.sh stop` cleans up. A PS stopped with SIGTERM reports nothing open as it starts
 draining; one killed with `kill -9` still reads `ready` until its replacement
 registers or its last heartbeat is 6 s old.
@@ -3928,12 +3927,13 @@ registers or its last heartbeat is 6 s old.
 `?` / `null` means the PS has no `--cpuset`, or the manager has not heard its
 heartbeat since becoming leader. The caps live only in manager memory, so for
 ~2 s after a manager restart or failover every PS shows `?` and is placed as
-capacity-unknown; the next heartbeat restores them. A PS still refuses to open
-a partition or split past its own budget (`refusing to open partition — PS core
-budget exhausted` in its log; the partition shows `ps=unknown`).
+capacity-unknown; the next heartbeat restores them. A slot is one core of the
+PS's cpuset per partition; past its slots a PS still opens every partition and
+split, the partitions sharing the cores (see "A PS with more partitions than
+cores").
 
 Manual verification (throwaway etcd + manager + 1 EN + 3 PS; PS1 `--cpuset`
-2 cores = 1 slot, PS2 4 cores = 2 slots, PS3 none):
+1 core = 1 slot, PS2 2 cores = 2 slots, PS3 none):
 
 ```bash
 autumn-op --manager $MGR bootstrap --replication 1+0   # → on PS2 (2 free)
@@ -3946,7 +3946,7 @@ autumn-op --manager $MGR info                          # PS1's partition → PS3
 ```
 
 Manual verification of readiness (throwaway etcd + manager + 1 EN + PS1 with
-`--cpuset` 4 cores = 2 slots):
+`--cpuset` 2 cores = 2 slots):
 
 ```bash
 autumn-op --manager $MGR bootstrap --replication 1+0   # PS1: opening 0/1 → ready
@@ -3956,8 +3956,8 @@ autumn-op --manager $MGR info                          # PS1: opening 0/2 (not r
 # start PS1 again                                      # awaiting report / opening → ready
 # kill -9 PS1, wait 7 s
 autumn-op --manager $MGR info                          # PS1: silent 7s
-# start PS1 with --cpuset of 2 cores (1 slot)
-autumn-op --manager $MGR info                          # PS1 2/1 slots, opening 1/2, over its cpuset
+# start PS1 with --cpuset of 1 core (1 slot)
+autumn-op --manager $MGR info                          # PS1 2/1 slots, ready: both partitions share the core
 ```
 
 ### RPC version checks and general upgrade procedure
@@ -4522,11 +4522,11 @@ The auto layout (no `AUTUMN_*_CPUSET`) is carved out of that mask: `taskset -c
 `start`/`restart`/`reset` lay the cluster out afresh from the mask of the shell
 that runs them, so wrap those in the same `taskset`. Explicit
 `AUTUMN_EN{i}_CPUSET` / `AUTUMN_PS_CPUSET` are used as given, even outside the
-mask: the work-unit threads (EN shards, P-log, P-sst) `sched_setaffinity` there,
-while everything unpinned — main and accept threads, the manager, etcd — stays on
+mask: the EN shards `sched_setaffinity` there, and the PS moves its main thread
+(so every PS thread) onto its cpuset at start, as `taskset` would, while
+everything else — the EN main and accept threads, the manager, etcd — stays on
 the launcher's cores. So with an explicit layout, do not wrap the launcher. A
-core outside the process's cgroup stops the EN (and keeps that PS partition from
-opening). Check after every start that the threads really are where the layout
+core outside the process's cgroup stops the EN or the PS at start. Check after every start that the threads really are where the layout
 says:
 
 ```bash
@@ -4534,7 +4534,8 @@ for p in $(pgrep -x autumn-extent-n; pgrep -x autumn-ps); do
   for t in /proc/$p/task/*; do echo "$p $(cat $t/comm) $(awk '/Cpus_allowed_list/{print $2}' $t/status)"; done
 done | grep -E ' (extent-shard-[0-9]+|autumn-extent-n|part-[0-9]+(-sst)?) '
 # autumn-extent-n is pinned only in a single-shard EN (its runtime is the main
-# thread); listener-part-* and other helper threads are not pinned.
+# thread). Every PS thread (part-N, part-N-sst, autumn-ps, ...) lists the whole
+# PS --cpuset: the PS pins nothing.
 ```
 
 The io_uring worker threads of those runtimes (`iou-wrk-*`) must be inside the
@@ -4557,8 +4558,9 @@ cores than its `--cpuset` — buffered write throughput measured before the fix
 (~2.0 GB/s for 3 ENs x 2 cores) is not comparable with after (~1.27 GB/s).
 
 Then hand `cluster.sh` an explicit layout on the quiet node (EN cpuset length
-must equal `AUTUMN_EXTENT_SHARDS`; the PS needs ≥ 2 cores per partition; ranges
-may be comma lists). The layout that worked on 2026-09-25 with sglang pinned to
+must equal `AUTUMN_EXTENT_SHARDS`; the PS pins nothing and runs every thread
+anywhere in its cpuset, so give it one core per partition plus spare (cluster.sh
+gives two) on ONE NUMA node; ranges may be comma lists). The layout that worked on 2026-09-25 with sglang pinned to
 node 0 (`0-47,96-143`) and its stragglers on 54/58/70/71/76/77/82/94 of node 1:
 
 ```bash
@@ -4595,6 +4597,31 @@ launching on one connection's worth — the fragmentation that
 partition-server guide, "Natural batching").
 Copy `ps.log` out before the next leg starts — `perf_check.sh` wipes
 `/tmp/autumn-rs-logs/` between legs.
+
+### A PS with more partitions than cores
+
+A PS pins no thread: `--cpuset` confines the whole process, like `taskset`,
+and the kernel places P-logs, P-ssts and the rest. With more partitions than
+cores they share them; nothing refuses an open or a split. Whether the cpuset
+is big enough shows on the PS's `/metrics` (service port + 500):
+`autumn_ps_plog_threads`, `autumn_ps_plog_cpu_ratio` (P-log CPU time over wall
+time, summed) and `autumn_ps_plog_run_delay_ratio` (time the P-logs were
+runnable but waiting for a CPU, over wall time, summed). A run_delay ratio
+climbing toward the CPU ratio means the P-logs queue for cores: grow the cpuset
+or move partitions. Keep the cpuset on one NUMA node.
+
+Manual verification (throwaway etcd + manager + 1 EN, replication 1, PS with
+`--cpuset A,B` and `--port $PS`):
+
+```bash
+autumn-op --manager $MGR bootstrap --replication 1+0          # partition P
+for at in 80 40 20 10; do autumn-op --manager $MGR split P --at-raw-hex $at --wait; done
+p=$(pgrep -x autumn-ps)
+for t in /proc/$p/task/*; do awk '/Cpus_allowed_list/{print $2}' $t/status; done | sort | uniq -c
+# one line: every thread allowed exactly A,B
+curl -s localhost:$((PS + 500))/metrics | grep autumn_ps_plog_
+# autumn_ps_plog_threads 5, plus the two ratios
+```
 
 ## Inode-lease + close-to-open coherence (in flight)
 

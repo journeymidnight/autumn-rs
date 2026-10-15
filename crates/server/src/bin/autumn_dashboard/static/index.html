@@ -833,7 +833,7 @@ function renderPsDrawer(id){
       <span class="m">read <b>${fmtBytes(r.read_bytes_per_sec||0)}/s</b></span>
     </div>
     ${r.slot_cap!=null&&(r.partition_count||0)>r.slot_cap?`<div class="blocked">${(r.partition_count||0)-r.slot_cap}
-      partition(s) beyond this PS's --cpuset budget of ${r.slot_cap}; the PS does not open those (ps=unknown).</div>`:""}
+      partition(s) beyond this PS's ${r.slot_cap} --cpuset cores; they share the cores (/metrics autumn_ps_plog_*).</div>`:""}
     ${h.cls==="bad"?`<div class="blocked">This PS has not heartbeated in ${esc(h.text)}. The manager evicts a
       PS unseen for 10 s and reassigns its partitions; if it is still listed here, the eviction has not run yet.</div>`:""}
     ${h.cls==="unknown"?`<div class="blocked">No heartbeat is on record for this PS. Replay and registration both

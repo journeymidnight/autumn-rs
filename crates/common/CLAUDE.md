@@ -8,12 +8,12 @@ Shared utilities, metadata store, and error types. Used by `autumn-manager` (sto
 
 ### CPU affinity for child runtimes
 
-Every work-unit thread (P-log, P-sst, each EN shard, the single-shard EN's
-main thread) calls `pin_current` before building its runtime. Nothing pins
+Every EN shard thread (the main thread of a single-shard EN) calls
+`pin_current` before building its runtime; the PS pins nothing (below). Nothing pins
 through compio's `RuntimeBuilder::thread_affinity`: compio intersects the
 requested CPUs with the mask the thread inherited and binds nothing when they
-are disjoint, with no error. A thread spawned by a pinned parent (P-sst under
-P-log) inherits one CPU, and a process started as `taskset -c A,B` inherits
+are disjoint, with no error. A thread spawned by a pinned parent (a blocking-pool
+thread under an EN shard) inherits one CPU, and a process started as `taskset -c A,B` inherits
 A,B — so a whole cluster launched that way ran on two cores while every thread
 logged its `--cpuset` core (write throughput 500-560 MiB/s against 2.7 GiB/s
 pinned correctly, same box). `pin_current` is `sched_setaffinity`: it moves the
@@ -34,18 +34,25 @@ cores ran four more cores of page-cache copy and writeback outside them (write
 ~2.0 GB/s buffered; confined to its cores by a cgroup cpuset it made ~1.27 GB/s).
 The registration applies to the CALLING task's io-wq, which is why it happens
 on the work-unit thread itself. Cores registered: the explicit `--cpuset`, or the
-detected cores from `--cpu-start` on — the pool the work units are pinned from.
+mask the process started with — the pool the work units are pinned from.
 Linux before 5.14 lacks the call, and newer kernels refuse cores outside the
 task's cgroup cpuset (a PS `--cpuset` wider than its cgroup): one WARN,
 workers unconfined (isolation, not correctness). The polling driver has no io_uring workers. Tests:
 `io_workers_follow_the_registered_cores` (unit; red without the registration —
 the workers take the node's 96 cores) and the `iou-wrk` check in
 `crates/server/tests/cpuset_pinning.rs` (real EN; red with the EN calls removed).
-Only the pinned work-unit runtimes register; the PS main runtime and other
-unpinned threads are not confined. Not covered either: compio's
-`spawn_blocking` pool threads are spawned from the work-unit thread and inherit
-its ONE core, so blocking work (EN fallocate, PS SST building) shares that core
-instead of the `--cpuset`.
+
+**The PS pins nothing; it confines itself.** `pinning_pool()` is the explicit
+`--cpuset`, or the mask the process started with (`--cpu-start` was removed
+from both binaries: a `--cpuset` range says the same, explicitly).
+`float_current` sets the calling thread's mask to it and reads it back: the
+kernel silently drops cores the cgroup does not allow, so a narrower result is
+an error (Linux; a no-op where nothing can be pinned or elsewhere). The PS binary calls it on its main thread before spawning anything,
+so every PS thread starts inside its cpuset, as under `taskset`. Unit test
+`float_current_widens_to_the_pool`, `a_narrowed_mask_is_refused`. compio's `spawn_blocking` pool threads are
+spawned by the runtime thread and inherit its mask: in the PS that is the
+cpuset; in the EN it is the shard's ONE core, so the EN's blocking work
+(fallocate, EC rebuild) shares that core.
 
 Auto-detection pins only where the OS can bind a thread to a core (Linux,
 Android, Windows, FreeBSD). macOS has affinity hints only: `get_core_ids`

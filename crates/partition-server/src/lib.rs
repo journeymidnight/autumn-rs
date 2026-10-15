@@ -8,6 +8,7 @@ mod sstable;
 pub mod compact_policy;
 mod wal_record;
 pub mod metrics;
+mod plog_load;
 pub use metrics::{LatHist, PartitionMetrics, LAT_BUCKET_BOUNDS_NS};
 
 use background::*;
@@ -22,7 +23,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
-use autumn_common::cpu_pin::{pick_cpu_for_ord, pin_current};
 use autumn_common::metrics::{duration_to_ns, ns_to_ms};
 use autumn_params::ps::PsParams;
 use autumn_rpc::manager_rpc::{self, rkyv_decode, rkyv_encode, MgrRange as Range};
@@ -465,11 +465,8 @@ pub(crate) fn shutdown_timeout_ms() -> u64 {
     params().shutdown_timeout_ms.get()
 }
 
-// CPU affinity policy lives in `autumn_common::cpu_pin`. Both OS threads
-// owned by a partition (P-log `part-{id}` and P-sst `part-{id}-sst`)
-// pin to the SAME core — P-sst is mostly idle during P-log's busy
-// windows (its work is syscall + 3-replica network wait on a 128 MB SST
-// upload), so sharing a core is fine and keeps "one partition = one core".
+// CPU affinity: the PS pins no thread; its `--cpuset` confines the process
+// (`autumn_common::cpu_pin::float_current` in the binary).
 
 /// global cross-partition gate on concurrent compactions.
 ///
@@ -1187,11 +1184,6 @@ pub(crate) struct PartitionData {
     /// `background_compact_loop` / `background_gc_loop` /
     /// `handle_split_part`.
     pub(crate) concurrency_ctrl: std::sync::Arc<crate::ConcurrencyController>,
-    /// PS-wide partition budget (cpuset_len / 2 when --cpuset is
-    /// set; usize::MAX otherwise). `handle_split_part` consults this
-    /// before calling `multi_modify_split` so a split that would push
-    /// the PS past its core budget is rejected rather than oversubscribing.
-    pub(crate) partition_budget: std::sync::Arc<crate::PartitionBudget>,
     /// (MED-2): per-extent reader-pin map. `handle_get_bulk → resolve_value`
     /// reads a ValuePointer from an SST, drops the partition borrow, and
     /// awaits `read_bytes_from_extent` on log_stream. Without coordination,
@@ -2300,6 +2292,9 @@ struct PartitionHandle {
     /// Clone of `PartitionServer.used_port_ords` so `Drop` can release
     /// `port_ord` regardless of which path removed this handle.
     used_port_ords: Rc<RefCell<std::collections::BTreeSet<u16>>>,
+    /// The P-log's place in the load sample; dropped with the handle.
+    #[allow(dead_code)]
+    plog_lease: plog_load::PlogLease,
 }
 
 impl Drop for PartitionHandle {
@@ -2377,10 +2372,8 @@ pub struct PartitionServer {
     /// shared by every partition on this PS. Per-partition rate
     /// limiting lives in each `PartitionData.rate_ctrl`.
     pub(crate) concurrency_ctrl: std::sync::Arc<ConcurrencyController>,
-    /// static partition budget (ScyllaDB-style). Gate fires only
-    /// when `--cpuset` was explicitly supplied; otherwise `max =
-    /// usize::MAX` and `would_exceed` always returns false.
-    pub(crate) partition_budget: std::sync::Arc<PartitionBudget>,
+    /// P-log CPU and run_delay, shared with `/metrics`.
+    plog_load: std::sync::Arc<plog_load::PlogLoad>,
     /// shared data-plane authz runtime (public keys + registered
     /// namespaces), refreshed by the main-thread `authz_config_poll_loop` and read
     /// by every connection task. `Arc` because connection tasks run on the
@@ -2813,89 +2806,6 @@ impl ConcurrencyController {
             }
             compio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
-    }
-}
-
-/// ScyllaDB-style static partition budget.
-///
-/// When the operator passes `--cpuset` to the PS binary, each partition
-/// reserves 2 cores (P-log + P-sst), so the budget is `cpuset_len / 2`.
-/// `sync_regions_once` bumps `current` on insert and dec on remove;
-/// `handle_split_part` refuses to call `multi_modify_split` when adding
-/// one more partition would exceed `max`.
-///
-/// `max == usize::MAX` means "no gate" — surfaced when `--cpuset` was
-/// not supplied (legacy behaviour: surplus threads stay
-/// unpinned with a WARN).
-pub(crate) struct PartitionBudget {
-    pub(crate) max: usize,
-    pub(crate) current: std::sync::atomic::AtomicUsize,
-}
-
-impl PartitionBudget {
-    pub(crate) fn new(max: usize) -> Self {
-        Self {
-            max,
-            current: std::sync::atomic::AtomicUsize::new(0),
-        }
-    }
-    pub(crate) fn inc(&self) -> usize {
-        self.current
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            + 1
-    }
-    pub(crate) fn dec(&self) -> usize {
-        let prev = self
-            .current
-            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-        if prev == 0 {
-            self.current.store(0, std::sync::atomic::Ordering::Relaxed);
-            0
-        } else {
-            prev - 1
-        }
-    }
-    pub(crate) fn current(&self) -> usize {
-        self.current.load(std::sync::atomic::Ordering::Relaxed)
-    }
-    /// Returns `true` iff adding `delta` more partitions would push past
-    /// the budget. `max == usize::MAX` always returns `false` (gate off).
-    pub(crate) fn would_exceed(&self, delta: usize) -> bool {
-        if self.max == usize::MAX {
-            return false;
-        }
-        self.current().saturating_add(delta) > self.max
-    }
-}
-
-/// pick the partition cap for this PS.
-///
-/// - When `--cpuset` was supplied explicitly (`cpuset_explicit() == true`),
-///   the cap is `cpuset_len / 2` because each partition reserves 2 OS
-///   threads (P-log + P-sst). Floored at 1 so a single-core cpuset
-///   still permits one partition.
-/// - Otherwise the cap is `usize::MAX` (gate off — legacy behaviour).
-pub(crate) fn compute_partition_budget_cap() -> usize {
-    use autumn_common::{cpuset_explicit, cpuset_len};
-    if cpuset_explicit() {
-        let n = cpuset_len();
-        let cap = n / 2;
-        if cap == 0 {
-            tracing::warn!(
-                cpuset_len = n,
-                "--cpuset has < 2 cores; PS partition budget set to 1 (no headroom for P-sst pinning)"
-            );
-            1
-        } else {
-            tracing::info!(
-                cpuset_len = n,
-                max_partitions = cap,
-                "PS partition budget enforced (2 cores per partition)"
-            );
-            cap
-        }
-    } else {
-        usize::MAX
     }
 }
 
@@ -3381,6 +3291,7 @@ impl PartitionServer {
                     if resp.code == manager_rpc::CODE_OK {
                         let connected_idx = idx;
                         let block_cache = new_block_cache();
+                        let plog_load = std::sync::Arc::new(plog_load::PlogLoad::new());
                         let server = Self {
                             ps_id,
                             advertise_addr,
@@ -3401,13 +3312,14 @@ impl PartitionServer {
                             listen_host: Rc::new(std::cell::RefCell::new(String::from("0.0.0.0"))),
                             metrics_addr: Rc::new(RefCell::new(String::new())),
                             concurrency_ctrl: std::sync::Arc::new(ConcurrencyController::from_params()),
-                            partition_budget: std::sync::Arc::new(PartitionBudget::new(
-                                compute_partition_budget_cap(),
-                            )),
+                            plog_load: plog_load.clone(),
                             authz: std::sync::Arc::new(crate::authz::AuthzState::new()),
                             open_backoff: Rc::new(RefCell::new(HashMap::new())),
                             block_cache: block_cache.clone(),
-                            metrics: std::sync::Arc::new(metrics::PsMetrics::new(block_cache)),
+                            metrics: std::sync::Arc::new(metrics::PsMetrics::new(
+                                block_cache,
+                                plog_load,
+                            )),
                             shutting_down: Rc::new(Cell::new(false)),
                             sync_pass: Rc::new(futures::lock::Mutex::new(())),
                         };
@@ -3466,6 +3378,18 @@ impl PartitionServer {
             async move { s.report_load_loop().await }
         });
 
+        // P-log CPU / run_delay for /metrics.
+        let load = server.plog_load.clone();
+        spawn_supervised("ps_plog_load", move || {
+            let load = load.clone();
+            async move {
+                loop {
+                    load.sample();
+                    compio::time::sleep(Duration::from_secs(2)).await;
+                }
+            }
+        });
+
         // maintenance_scheduler_loop deleted. This task previously
         // picked the highest-debt partition each tick and dispatched
         // GC / minor / major compact internally. Per the mechanism /
@@ -3502,12 +3426,15 @@ impl PartitionServer {
         Ok(server)
     }
 
-    /// The core budget as the manager places by it: `0` when the budget is
-    /// off (no `--cpuset`), so the manager treats this PS as capacity-unknown.
+    /// The core capacity the manager places by: one core per partition's
+    /// P-log, so the `--cpuset` length; `0` without `--cpuset`, which the
+    /// manager reads as capacity-unknown. A soft figure: past it, P-logs share
+    /// cores.
     fn slot_cap(&self) -> u32 {
-        match self.partition_budget.max {
-            usize::MAX => 0,
-            n => u32::try_from(n).unwrap_or(u32::MAX),
+        if autumn_common::cpuset_explicit() {
+            u32::try_from(autumn_common::cpuset_len()).unwrap_or(u32::MAX)
+        } else {
+            0
         }
     }
 
@@ -4084,11 +4011,7 @@ impl PartitionServer {
                     "PS {} reloading partition {part_id} due to region change",
                     self.ps_id
                 );
-                if self.partitions.borrow_mut().remove(&part_id).is_some() {
-                    // keep budget counter in sync with the live
-                    // partition map.
-                    self.partition_budget.dec();
-                }
+                self.partitions.borrow_mut().remove(&part_id);
             }
         }
 
@@ -4106,29 +4029,13 @@ impl PartitionServer {
         // that inherits N partitions pay ~N× the single-partition recovery
         // wallclock (×32 on a full 32-partition takeover). Each recovery runs
         // on its own OS thread/core and is latency-bound, so a concurrent
-        // launch overlaps the waits. The gating (already-open / backoff /
-        // budget) is applied UP FRONT, then the opens fan out.
-        //
-        // coco P2 (2026-07-13): the up-front budget RESERVATION counts every
-        // candidate we launch (not just eventual successes), so it is a
-        // conservative concurrency bound — it will never launch more than
-        // `budget.max - current` opens at once (avoiding core over-subscription
-        // when the manager assigned more partitions than cpuset/2). In the
-        // common takeover case `budget.max` (= cpuset/2) holds all this PS's
-        // partitions, so `would_exceed` never trips and every wanted partition
-        // is launched, matching the old serial behavior. The only divergence is
-        // an OVER-subscribed PS where a reserved candidate then fails to open:
-        // its slot is retried on the next ~2 s tick rather than same-tick — a
-        // self-healing conservatism, not a stuck partition. (Full same-tick
-        // slot reuse would need dynamic replenishment; not worth it for an
-        // already-degraded, budget-warned oversubscribed PS.)
+        // launch overlaps the waits. The gating (already-open / backoff) is
+        // applied UP FRONT, then the opens fan out. Every wanted partition is
+        // opened: past the cpuset's length, partitions share the cores.
         let mut to_open: Vec<(u64, (Range, u64, u64, u64, u64))> = Vec::new();
         {
             let parts = self.partitions.borrow();
             let backoff = self.open_backoff.borrow();
-            // Reserve budget slots locally so the whole batch is decided
-            // before any `inc()` runs (see the coco P2 note above).
-            let mut reserved = 0usize;
             for (part_id, tuple) in wanted {
                 if parts.contains_key(&part_id) {
                     continue;
@@ -4142,24 +4049,6 @@ impl PartitionServer {
                         continue;
                     }
                 }
-                // refuse to open a NEW partition when the static budget
-                // is exhausted. Manager assigned more partitions than the
-                // operator pre-allocated cores for; leave the slot uncovered
-                // so the operator sees `ps=unknown` in `client info` and can
-                // either grow --cpuset or add more PSes. Existing partitions
-                // are unaffected.
-                if self.partition_budget.would_exceed(reserved + 1) {
-                    tracing::warn!(
-                        ps_id = self.ps_id,
-                        part_id,
-                        current = self.partition_budget.current(),
-                        max = self.partition_budget.max,
-                        "refusing to open partition — PS core budget exhausted (cpuset_len/2). \
-                         Operator must grow --cpuset or migrate this partition to another PS."
-                    );
-                    continue;
-                }
-                reserved += 1;
                 to_open.push((part_id, tuple));
             }
         }
@@ -4186,8 +4075,7 @@ impl PartitionServer {
             // `self.partitions` borrow is held across the `.next().await`.
             // Opens run concurrently (each replays on its own thread, so the waits
             // overlap; serial opens made a 32-partition takeover pay ~32× one
-            // recovery). The live count is already bounded by the partition budget;
-            // `--open-parallelism` only bounds the burst of manager RPCs.
+            // recovery). `--open-parallelism` bounds the burst of manager RPCs.
             let mut opens = futures::stream::iter(to_open)
                 .map(
                     |(
@@ -4215,8 +4103,6 @@ impl PartitionServer {
                     Ok(handle) => {
                         tracing::info!("PS {} partition {part_id} opened", self.ps_id);
                         self.partitions.borrow_mut().insert(part_id, handle);
-                        // bump budget counter only after a successful insert.
-                        self.partition_budget.inc();
                         // Open succeeded — clear any backoff state.
                         self.open_backoff.borrow_mut().remove(&part_id);
                     }
@@ -4400,14 +4286,8 @@ impl PartitionServer {
             ord,
             committed: false,
         };
-        // ord is 1-based; cpu pool indexing is 0-based. P-log and
-        // P-sst now pin to different cores — at sustained 4 KB write loads
-        // P-sst's `build_sst_bytes` is CPU-heavy enough to fight P-log for
-        // cycles when they share. Layout: partition i takes cores
-        // [cpu_offset + 2i, cpu_offset + 2i+1] (P-log, P-sst).
-        let ord_zero = (ord as usize).saturating_sub(1);
-        let cpu_log = pick_cpu_for_ord(2 * ord_zero);
-        let cpu_bulk = pick_cpu_for_ord(2 * ord_zero + 1);
+        let plog_lease = self.plog_load.register();
+        let plog_tid = plog_lease.tid_cell();
         let base_port = self.base_port.get();
         let listen_port = base_port.checked_add(ord).ok_or_else(|| {
             anyhow!(
@@ -4455,7 +4335,6 @@ impl PartitionServer {
         // Arc (shared) + a fresh RateController per partition (built
         // inside the thread from process-global setters).
         let concurrency_for_thread = self.concurrency_ctrl.clone();
-        let partition_budget_for_thread = self.partition_budget.clone();
         // share the authz runtime with the partition thread's
         // connection tasks (they enforce per-request; the main thread refreshes).
         let authz_for_thread = self.authz.clone();
@@ -4479,15 +4358,14 @@ impl PartitionServer {
         let join = std::thread::Builder::new()
             .name(format!("part-{part_id}"))
             .spawn(move || {
-                if let Err(e) = pin_current(cpu_log) {
-                    let _ = ready_tx.send(Err(anyhow!("P-log CPU affinity: {e}")));
-                    return;
+                if let Some(tid) = autumn_common::cpu_pin::current_tid() {
+                    plog_tid.store(tid, std::sync::atomic::Ordering::Relaxed);
                 }
                 let rt = compio::runtime::RuntimeBuilder::new()
                     .build()
                     .expect("create compio runtime");
                 autumn_common::cpu_pin::confine_io_workers(&rt);
-                tracing::info!(part_id, cpu_log = ?cpu_log, cpu_bulk = ?cpu_bulk, "P-log thread runtime ready");
+                tracing::info!(part_id, "P-log thread runtime ready");
                 rt.block_on(async move {
                     if let Err(e) = partition_thread_main(
                         part_id,
@@ -4505,7 +4383,6 @@ impl PartitionServer {
                         ready_tx,
                         shutdown_rx,
                         drain_rx,
-                        cpu_bulk,
                         metrics_for_thread,
                         block_cache_for_thread,
                         compact_tx_for_thread,
@@ -4513,7 +4390,6 @@ impl PartitionServer {
                         gc_tx_for_thread,
                         gc_rx_main,
                         concurrency_for_thread,
-                        partition_budget_for_thread,
                         opened_with_for_thread,
                         authz_for_thread,
                     )
@@ -4525,7 +4401,7 @@ impl PartitionServer {
             })
             .context("spawn partition thread")?;
 
-        // Wait for the partition thread to pin itself, bind its listener and
+        // Wait for the partition thread to bind its listener and
         // register with the manager. If any step fails, bubble the error up so
         // `sync_regions_once` reports the failure (operator-visible; no
         // silent skip).
@@ -4533,7 +4409,7 @@ impl PartitionServer {
             Ok(Ok(addr)) => addr,
             Ok(Err(e)) => {
                 return Err(e.context(format!(
-                    "partition {part_id} failed to pin its thread, bind listener on {listen_addr} or register addr"
+                    "partition {part_id} failed to bind listener on {listen_addr} or register addr"
                 )));
             }
             Err(_canceled) => {
@@ -4558,6 +4434,7 @@ impl PartitionServer {
             join: Some(join),
             port_ord: ord,
             used_port_ords: self.used_port_ords.clone(),
+            plog_lease,
         })
     }
 
@@ -5993,7 +5870,6 @@ async fn partition_thread_main(
     ready_tx: oneshot::Sender<Result<String>>,
     shutdown_rx: oneshot::Receiver<()>,
     drain_rx: mpsc::UnboundedReceiver<DrainAck>,
-    cpu_bulk: Option<usize>,
     metrics_arc: std::sync::Arc<PartitionMetrics>,
     block_cache: std::sync::Arc<crate::sstable::BlockCache>,
     // trigger channels created on the main thread; the senders
@@ -6005,7 +5881,6 @@ async fn partition_thread_main(
     gc_tx: mpsc::Sender<GcTask>,
     gc_rx: mpsc::Receiver<GcTask>,
     concurrency_ctrl: std::sync::Arc<crate::ConcurrencyController>,
-    partition_budget: std::sync::Arc<crate::PartitionBudget>,
     // fix-2: cross-thread mirror of `PartitionHandle.opened_with`.
     // Written by `handle_split_part` (and future in-place updaters) so
     // `sync_regions_once` on the main thread sees the post-update tuple
@@ -6224,7 +6099,6 @@ async fn partition_thread_main(
         flush_req_rx,
         row_append_rx,
         row_invalidate_rx,
-        cpu_bulk,
     )
     .with_context(|| format!("spawn P-sst thread for partition {part_id}"))?;
     // wait for P-sst to confirm its runtime + StreamClient are live
@@ -6316,7 +6190,6 @@ async fn partition_thread_main(
         maintenance_gate: maintenance_gate.clone(),
         rate_ctrl: rate_ctrl.clone(),
         concurrency_ctrl: concurrency_ctrl.clone(),
-        partition_budget: partition_budget.clone(),
         extent_pins: std::cell::RefCell::new(std::collections::HashMap::new()),
         merge_freeze: Rc::new(MergeFreezeState::default()),
         frozen_for_split: Cell::new(None),
@@ -10984,16 +10857,11 @@ fn spawn_sst_thread(
     flush_req_rx: mpsc::Receiver<FlushReq>,
     row_append_rx: mpsc::Receiver<RowAppendReq>,
     row_invalidate_rx: mpsc::Receiver<RowInvalidateBarrierReq>,
-    cpu: Option<usize>,
 ) -> std::io::Result<(std::thread::JoinHandle<()>, BulkReady)> {
     let (ready_tx, ready_rx) = futures::channel::oneshot::channel::<Result<()>>();
     let handle = std::thread::Builder::new()
         .name(format!("part-{part_id}-sst"))
         .spawn(move || {
-            if let Err(e) = pin_current(cpu) {
-                let _ = ready_tx.send(Err(anyhow!("P-sst CPU affinity: {e}")));
-                return;
-            }
             let rt = match compio::runtime::RuntimeBuilder::new().build() {
                 Ok(r) => r,
                 Err(e) => {
@@ -11003,7 +10871,7 @@ fn spawn_sst_thread(
                 }
             };
             autumn_common::cpu_pin::confine_io_workers(&rt);
-            tracing::info!(part_id, ?cpu, "P-sst thread runtime ready");
+            tracing::info!(part_id, "P-sst thread runtime ready");
             rt.block_on(async move {
                 let pool = Rc::new(ConnPool::new());
                 let sst_sc = match StreamClient::new_with_owner_epoch_and_config(

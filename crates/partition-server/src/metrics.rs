@@ -9,6 +9,7 @@ use std::sync::Arc;
 use autumn_common::metrics_http::{push_metric, push_type};
 use autumn_rpc::manager_rpc;
 
+use crate::plog_load::PlogLoad;
 use crate::sstable::BlockCache;
 
 /// What asked for a minor compaction; its log line and metric label.
@@ -366,6 +367,7 @@ impl PartitionMetrics {
 /// Gauges sum the partitions still open on this PS.
 pub struct PsMetrics {
     block_cache: Arc<BlockCache>,
+    plog_load: Arc<PlogLoad>,
     parts: parking_lot::Mutex<Parts>,
 }
 
@@ -446,9 +448,10 @@ struct Gauges {
 }
 
 impl PsMetrics {
-    pub fn new(block_cache: Arc<BlockCache>) -> Self {
+    pub(crate) fn new(block_cache: Arc<BlockCache>, plog_load: Arc<PlogLoad>) -> Self {
         Self {
             block_cache,
+            plog_load,
             parts: parking_lot::Mutex::new(Parts::default()),
         }
     }
@@ -550,6 +553,7 @@ impl PsMetrics {
             push_metric(&mut out, &format!("{name}_sum"), &[], h.sum_ns as f64 / 1e9);
             push_metric(&mut out, &format!("{name}_count"), &[], h.count as f64);
         }
+        self.plog_load.render(&mut out);
         out
     }
 }
@@ -566,7 +570,7 @@ mod tests {
 
     #[test]
     fn render_sums_partitions_with_no_partition_label() {
-        let ps = PsMetrics::new(Arc::new(BlockCache::new(64 << 20)));
+        let ps = PsMetrics::new(Arc::new(BlockCache::new(64 << 20)), Arc::new(PlogLoad::new()));
         let a = Arc::new(PartitionMetrics::default());
         let b = Arc::new(PartitionMetrics::default());
         ps.register(a.clone());
@@ -610,7 +614,7 @@ mod tests {
 
     #[test]
     fn counters_stay_put_when_a_partition_closes_and_reopens() {
-        let ps = PsMetrics::new(Arc::new(BlockCache::new(1 << 20)));
+        let ps = PsMetrics::new(Arc::new(BlockCache::new(1 << 20)), Arc::new(PlogLoad::new()));
         let old = Arc::new(PartitionMetrics::default());
         ps.register(old.clone());
         old.record_flush(10);

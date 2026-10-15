@@ -770,8 +770,9 @@ pub struct MultiModifySplitReq {
 pub struct RegisterPsReq {
     pub ps_id: u64,
     pub address: String,
-    /// Partitions this PS can pin to cores: `cpuset_len / 2` under an explicit
+    /// Partitions this PS can give a core each: `cpuset_len` under an explicit
     /// `--cpuset`, `0` when it was started without one (capacity unknown).
+    /// Past it, partitions share the cores.
     pub slot_cap: u32,
 }
 // Response: CodeResp
