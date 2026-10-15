@@ -28,6 +28,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Result};
 use autumn_params::dashboard::DashboardParams;
+use autumn_params::{Positional, Section};
 use axum::body::{Body, Bytes};
 use axum::extract::{Path, Query};
 use axum::http::{Response, StatusCode};
@@ -39,16 +40,7 @@ use serde::Deserialize;
 use metrics_store::{MetricsStore, PsStatus, Scope};
 
 const INDEX_HTML: &str = include_str!("static/index.html");
-fn usage() -> String {
-    format!(
-        "usage: autumn-dashboard --manager H:P [--transport tcp|ucx] [--port 8799] \
-         [--listen 0.0.0.0] [--autumn-op autumn-op] --cluster-secret-file FILE\n\n\
-         parameters:\n{}",
-        autumn_params::help::<DashboardParams>()
-    )
-}
-
-/// Dashboard tunables (`autumn_params::dashboard`).
+/// Dashboard parameters (`autumn_params::dashboard`).
 fn params() -> &'static DashboardParams {
     static PARAMS: std::sync::LazyLock<DashboardParams> =
         std::sync::LazyLock::new(DashboardParams::default);
@@ -754,79 +746,26 @@ async fn policies_delete(cfg: &Config, body: Bytes) -> Response<Body> {
     )
 }
 
-fn req(raw: &[String], i: usize) -> Result<String> {
-    raw.get(i)
-        .cloned()
-        .ok_or_else(|| anyhow!("missing value for {}", raw[i - 1]))
-}
+const USAGE: &str = "usage: autumn-dashboard --cluster-secret-file <PATH> [options]";
 
 fn parse_args() -> Result<(Config, String, u16)> {
-    let mut manager = "127.0.0.1:9001".to_string();
-    let mut transport = "tcp".to_string();
-    let mut listen = "0.0.0.0".to_string();
-    let mut port: u16 = 8799;
-    let mut autumn_op = "autumn-op".to_string();
-    let mut cluster_secret_file: Option<String> = None;
-    let raw: Vec<String> = std::env::args().skip(1).collect();
-    let mut i = 0;
-    while i < raw.len() {
-        match raw[i].as_str() {
-            "--manager" => {
-                i += 1;
-                manager = req(&raw, i)?;
-            }
-            "--transport" => {
-                i += 1;
-                transport = req(&raw, i)?;
-            }
-            "--listen" => {
-                i += 1;
-                listen = req(&raw, i)?;
-            }
-            "--port" => {
-                i += 1;
-                port = req(&raw, i)?.parse()?;
-            }
-            "--autumn-op" => {
-                i += 1;
-                autumn_op = req(&raw, i)?;
-            }
-            "--cluster-secret-file" => {
-                i += 1;
-                cluster_secret_file = Some(req(&raw, i)?);
-            }
-            "-h" | "--help" => {
-                println!("{}", usage());
-                std::process::exit(0);
-            }
-            other => match autumn_params::take_flag(params(), other, raw.get(i + 1).map(|s| s.as_str()))
-                .unwrap_or_else(|e| {
-                    eprintln!("error: {e}");
-                    std::process::exit(2);
-                }) {
-                autumn_params::Flag::Taken => i += 1,
-                autumn_params::Flag::Unknown => bail!("unknown flag {other:?}\n{}", usage()),
-            },
-        }
-        i += 1;
-    }
-    let Some(cluster_secret_file) = cluster_secret_file else {
-        bail!("--cluster-secret-file is REQUIRED\n{}", usage())
-    };
+    let p = params();
+    autumn_params::parse_or_exit(USAGE, &[p as &dyn Section], Positional::Refuse);
     // Fail at startup, not on the first click: autumn-op reads it per call.
-    std::fs::metadata(&cluster_secret_file)
-        .map_err(|e| anyhow!("--cluster-secret-file {cluster_secret_file}: {e}"))?;
+    let secret = p.cluster_secret_file.get();
+    let cluster_secret_file = secret.display().to_string();
+    std::fs::metadata(&secret).map_err(|e| anyhow!("--cluster-secret-file {cluster_secret_file}: {e}"))?;
     Ok((
         Config {
-            manager,
-            transport,
-            autumn_op,
+            manager: p.manager.get(),
+            transport: p.transport.get().to_string(),
+            autumn_op: p.autumn_op.get(),
             cluster_secret_file,
-            metrics_interval: Duration::from_secs(params().metrics_interval_secs.get()),
-            metrics_retention: Duration::from_secs(params().metrics_retention_secs.get()),
+            metrics_interval: Duration::from_secs(p.metrics_interval_secs.get()),
+            metrics_retention: Duration::from_secs(p.metrics_retention_secs.get()),
         },
-        listen,
-        port,
+        p.listen.get(),
+        p.port.get(),
     ))
 }
 

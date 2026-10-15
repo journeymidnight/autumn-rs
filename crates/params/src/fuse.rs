@@ -3,8 +3,25 @@
 use crate::MIB;
 
 crate::params! {
-    /// Every FUSE daemon tunable.
+    /// Every FUSE daemon parameter.
     pub struct FuseParams("fuse") {
+        // ── Process ──────────────────────────────────────────────────────
+        /// Mount point.
+        [required] mountpoint: std::path::PathBuf;
+        /// Manager endpoints.
+        manager: String = "127.0.0.1:9001".into();
+        transport: crate::Transport;
+        /// Credential file (`<principal>\n<hex>`, from `autumn-op
+        /// principal-create`); needed when the cluster protects `fs/`.
+        credential_file: Option<std::path::PathBuf>;
+        /// Let other users access the mount.
+        [switch] allow_other: bool;
+        /// Read extents of 64 KiB and more straight from the extent nodes
+        /// (a failed direct read falls back to the PS).
+        direct_read: bool = true;
+        /// Lease identity of this mount (default: the host name).
+        host: Option<String>;
+
         /// Read I/O threads, each with its own runtime and cluster client
         /// (0 = reads stay on the dispatcher).
         read_io_threads: usize = 4, [0, 256];
@@ -50,3 +67,4 @@ impl crate::CrossCheck for FuseParams {
         Ok(())
     }
 }
+

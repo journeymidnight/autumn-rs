@@ -19,12 +19,18 @@ fn help_lists_every_parameter_and_a_bad_value_exits_2() {
     for spec in flags {
         assert!(text.contains(&format!("--{} ", spec.flag())), "missing --{}", spec.flag());
     }
+    for f in ["--mountpoint <path>", "--manager <v>", "--transport tcp|ucx", "--allow-other  (switch)", "--direct-read true|false"] {
+        assert!(text.contains(f), "missing {f}:\n{text}");
+    }
     for args in [
         &["--mountpoint", "/nonexistent", "--read-io-threads", "999"][..],
         // A window below one block would panic the prefetch `clamp` mid-read.
         &["--mountpoint", "/nonexistent", "--prefetch-block-bytes", "8M", "--prefetch-window-bytes", "4M"],
         // 3/4 of it is the u16 congestion threshold.
         &["--mountpoint", "/nonexistent", "--max-background", "40000"],
+        &["--read-io-threads", "2"],
+        &["--mountpoint", "/nonexistent", "--allow-other=true"],
+        &["--mountpoint", "/nonexistent", "--transport", "rdma"],
     ] {
         let out = Command::new(BIN).args(args).output().expect("spawn");
         assert_eq!(out.status.code(), Some(2), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));

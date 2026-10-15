@@ -436,14 +436,14 @@ inode 的每一个缓存页（`invalidate_inode_pages2_range`）。预读中的�
 
 ## 配置（CLI）
 
-`autumn-fuse` 自己的参数（clap）：`--manager`（default `127.0.0.1:9001`）、`--mountpoint`、
+`autumn-fuse` 自己的启动参数（也在 `autumn_params::fuse::FuseParams` 里）：`--manager`（default `127.0.0.1:9001`）、`--mountpoint`、
 `--credential-file`（authz 保护 `fs/` 时必需；`<principal>\n<hex>`，覆盖不到 `fs/`
 则 fail-fast）、`--allow-other`（default false）、`--transport`（`tcp`/`ucx`，须与
 cluster 一致）、`--direct-read`（default true）、`--host`（租约身份，默认本机 `gethostname`，
 不读 `HOSTNAME` 环境变量）。
 
-可调参数来自 `crates/params/src/{fuse,fs,client}.rs`：`main.rs` 在 clap 之前用
-`autumn_params::split_params` 把它们从 argv 摘出（`--help` 末尾列出全部），越界或缺值
+可调参数来自 `crates/params/src/{fuse,fs,client}.rs`：`main.rs` 把这三组
+一起交给 `autumn_params::parse_or_exit`（`--help` 列出全部），未知参数、越界或缺值
 exit 2。fuse 自己的一组（进程级 `autumn_fuse::params()`）：`--read-io-threads`（4；`0` =
 全部读留在派发线程）、`--prefetch-mem-mb`（1024；`0` = 关预读，需要读线程池）、预读的
 `--prefetch-block-bytes` / `-window-bytes` / `-front-tolerance-bytes` / `-min-run-bytes` /
@@ -454,7 +454,7 @@ exit 2。fuse 自己的一组（进程级 `autumn_fuse::params()`）：`--read-i
 预读块大小只在启动时定：块号 = 偏移 / 块大小，运行中改会让已发出的块错位，故不是
 runtime 参数。
 
-`--read-io-threads` 的依据（原 clap 注释）：派发线程是单线程，四个以上并发读时它满核
+`--read-io-threads` 的依据：派发线程是单线程，四个以上并发读时它满核
 成了天花板；0 / 2 / 4 线程时 8 个并发读 2211 → 3705 → 4763 MiB/s（8 个独立 CLI 进程同
 文件 5466），4 线程约 87-99%，更高未测。每个线程有自己的注册缓冲池（每线程上限
 `--ucx-regpool-cap-bytes`，默认 512 MiB），线程越多最坏驻留越大，UCX 下计入

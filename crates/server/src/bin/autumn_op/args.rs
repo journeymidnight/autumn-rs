@@ -1,114 +1,109 @@
-//! `autumn-op` CLI argument parsing: `Args` / `Command` + the hand-rolled
-//! parser and its value-parse helpers. Split out of `main.rs` (2026-06-24,
-//! behaviour-preserving). `usage()` / `parse_admin_flags` / `parse_byte_size`
-//! / `parse_ec_flag` stay private — only `parse()` (and the unit tests) use
-//! them; the rest is `pub(crate)` for `main.rs`'s dispatcher + bootstrap.
+//! `autumn-op` CLI argument parsing. The global flags (`OpParams` +
+//! `ClientParams`) are taken anywhere on the line by
+//! `autumn_params::parse_or_exit`; the command and its own flags are parsed
+//! here from what is left.
 
 use anyhow::{bail, Context, Result};
+use autumn_params::op::OpParams;
+use autumn_params::{Positional, Section};
 use autumn_transport::TransportKind;
 
+/// The command list; `--help` and every usage error print it with the
+/// global flags after it.
+const USAGE: &str = "\
+usage: autumn-op [options] <COMMAND>
+Global options may stand before or after the command.
+
+read / observability commands:
+  status                       the fleet against its expected members: managers,
+                               PS ready, EN online, extents, rebuilds, sample time
+  list-nodes                   show every EN's auto-state + override
+  health [--detail N]          sealed extents clean / degraded / unavailable, slots
+                               by state, and the N worst extents (default 10)
+  extent-health [--node ID] [--all]
+                               per-slot health (default: only unhealthy)
+  list-ec-markers              ConvertToEc inflight markers + coord state
+  recovery-stats               in-flight + per-source/target counters
+  audit-log [--op N] [--node N] [--since S] [--until U] [--limit L]
+                               query operator action history
+  info [--part PID] [--detail] show cluster snapshot (--detail = partition load)
+  info --file-sd               Prometheus file_sd JSON: every PS / EN /metrics endpoint
+  policy-candidates            advisory split/merge/gc/compact/ec candidates
+
+op observability:
+  ops status <id>              live state of one op, incl. progress
+  ops list [--active] [--kind K] [--limit N]   live ledger (leader-local)
+  ops history [--kind K] [--since UNIX] [--limit N]
+                               durable terminal history from etcd, newest first
+
+node-lifecycle admin commands:
+  fence-node <id> --reason \"...\" --by alice [--force]
+  maintenance <id> --reason \"...\" --by alice [--expire UNIX_TS]
+  unfence <id> --by alice
+  remove <id> --by alice
+  ps-remove <ps_id> --by alice
+                               drop a stopped, evicted PS from the expected fleet
+  manager-remove <manager_id> --by alice
+                               drop a stopped manager from the expected fleet
+
+runtime parameters (override a flag on every running manager / PS / EN):
+  config keys                  every runtime parameter, its default and range
+  config list                  the overrides in force
+  config get <role.flag>
+  config set <role.flag> <value> --by alice
+                               e.g. ps.gc-rate-bytes-per-sec 32M; applied within
+                               --config-poll-secs (30 s) on every PS / EN
+  config unset <role.flag> --by alice
+                               back to each process's flag value
+
+cluster / partition admin commands (moved from autumn-client):
+  bootstrap [--replication 3+0] [--log-ec K+M] [--row-ec K+M]
+                               (--presplit RETIRED — use `presplit --namespace <NS>` after bootstrap)
+  set-stream-ec --stream <ID> --ec K+M
+  force-ec-convert --extent <EXTID>
+  repair [--cancel] <EXTID>... | [--cancel] --node <NODE_ID>
+                               rebuild degraded copies on other nodes now, no fence
+                               (--cancel: withdraw standing repair requests)
+  scrub <EXTID>... | --part <PART_ID> | --all
+                               check sealed copies against their checksums on the
+                               nodes that hold them; rot is isolated and rebuilt
+  split <PARTID> [--namespace <NS[/SUB]> [--at <SUFFIX> | --at-hex <HEX>]] [--at-raw-hex <HEX>]
+  presplit --namespace <NS[/SUB]> ...   (presplit EMPTY keyspace before loading; rule by NS: fs|kvc|mem|other)
+           fs: --lanes <N> [--parts <P>] [--force to narrow declared lanes]
+      fs:  --lanes <N> [--parts <P>] | --fs-inos <i,j,…> | --count <N>
+           (--lanes = stripe width, declared; --parts = partitions to cut, MUST divide lanes; default P=N)
+      kvc: --count <N> --hash-prefix <rel-prefix>       (split by content-hash first hex char)
+           hash-prefix = rel prefix down to just before the hash, e.g. '<model>/vllm/v1/'
+      mem: --agents <a,b,…>                            (split by agent boundary)
+  merge <SURVIVOR_PARTID> <VICTIM_PARTID>
+  rebalance [MAX_MOVES]        actively re-spread partitions across PS (0/absent = balance fully)
+  compact <PARTID>
+  gc [--ratio R] [--max-size B] [--stream-debt B] [--dead-bytes B] [--empty-only] <PARTID>
+                               --dead-bytes: an extent with at least this many dead bytes
+                               qualifies whatever its ratio (3 GiB in a 16 GiB extent is 0.195)
+  forcegc <PARTID> <EXTID>...
+  format <DIR>...
+                               format dir(s), register node identity, stamp cluster_id
+  gen-cluster-secret           print a new cluster secret (local, no manager)
+
+namespace registry (admin):
+  namespace-create --name <NS> [--presplit <hex,hex,...>]
+                               register a namespace
+  namespace-delete --name <NS> [--force]
+                               remove the registry row (refuses non-empty unless --force)
+  namespace-list [--json]      list registered namespaces (name/prefix/presplit/created)
+  principal-list [--json]      list principals + their grants (read-only, no credentials)
+  mint-token [--principal P] (--credential HEX | --credential-file F)
+                               mint a capability token (the file names its principal)
+";
+
 fn usage() -> ! {
-    eprintln!("usage: autumn-op [--manager addr] [--json] [--cluster-secret-file F] <command>");
-    eprintln!("  --cluster-secret-file F: the cluster secret the manager, PS and EN were started");
-    eprintln!("    with. autumn-op connects as an operator (Admin), which every server refuses");
-    eprintln!("    without it — read-only commands included.");
-    eprintln!("  --credential-file F: data-plane capability (`<principal>\\n<hex>`), for the admin");
-    eprintln!("    subcommands that read/write partition keys rather than only calling the manager");
-    eprintln!("    (e.g. `presplit --namespace fs`, which reads the declared stripe geometry).");
-    eprintln!("    Both --cluster-secret-file and --credential-file may appear BEFORE or AFTER");
-    eprintln!("    the subcommand — position does not matter.");
-    eprintln!("    The cluster secret does NOT satisfy the partition server's key checks; when");
-    eprintln!("    authz is on it protects every key, so those commands need this too.");
-    eprintln!();
-    eprintln!("read / observability commands:");
-    eprintln!("  status                       the fleet against its expected members: managers,");
-    eprintln!("                               PS ready, EN online, extents, rebuilds, sample time");
-    eprintln!("  list-nodes                   show every EN's auto-state + override");
-    eprintln!("  health [--detail N]          sealed extents clean / degraded / unavailable, slots");
-    eprintln!("                               by state, and the N worst extents (default 10)");
-    eprintln!("  extent-health [--node ID] [--all]");
-    eprintln!("                               per-slot health (default: only unhealthy)");
-    eprintln!("  list-ec-markers              ConvertToEc inflight markers + coord state");
-    eprintln!("  recovery-stats               in-flight + per-source/target counters");
-    eprintln!("  audit-log [--op N] [--node N] [--since S] [--until U] [--limit L]");
-    eprintln!("                               query operator action history");
-    eprintln!("  info [--part PID] [--detail] show cluster snapshot (--detail = partition load)");
-    eprintln!("  info --file-sd               Prometheus file_sd JSON: every PS / EN /metrics endpoint");
-    eprintln!("  policy-candidates            advisory split/merge/gc/compact/ec candidates");
-    eprintln!();
-    eprintln!("op observability:");
-    eprintln!("  ops status <id>              live state of one op, incl. progress");
-    eprintln!("  ops list [--active] [--kind K] [--limit N]   live ledger (leader-local)");
-    eprintln!("  ops history [--kind K] [--since UNIX] [--limit N]");
-    eprintln!("                               durable terminal history from etcd, newest first");
-    eprintln!();
-    eprintln!("node-lifecycle admin commands:");
-    eprintln!("  fence-node <id> --reason \"...\" --by alice [--force]");
-    eprintln!("  maintenance <id> --reason \"...\" --by alice [--expire UNIX_TS]");
-    eprintln!("  unfence <id> --by alice");
-    eprintln!("  remove <id> --by alice");
-    eprintln!("  ps-remove <ps_id> --by alice");
-    eprintln!("                               drop a stopped, evicted PS from the expected fleet");
-    eprintln!("  manager-remove <manager_id> --by alice");
-    eprintln!("                               drop a stopped manager from the expected fleet");
-    eprintln!();
-    eprintln!("runtime parameters (override a flag on every running manager / PS / EN):");
-    eprintln!("  config keys                  every runtime parameter, its default and range");
-    eprintln!("  config list                  the overrides in force");
-    eprintln!("  config get <role.flag>");
-    eprintln!("  config set <role.flag> <value> --by alice");
-    eprintln!("                               e.g. ps.gc-rate-bytes-per-sec 32M; applied within");
-    eprintln!("                               --config-poll-secs (30 s) on every PS / EN");
-    eprintln!("  config unset <role.flag> --by alice");
-    eprintln!("                               back to each process's flag value");
-    eprintln!();
-    eprintln!("cluster / partition admin commands (moved from autumn-client):");
-    eprintln!("  bootstrap [--replication 3+0] [--log-ec K+M] [--row-ec K+M]");
-    eprintln!("                               (--presplit RETIRED — use `presplit --namespace <NS>` after bootstrap)");
-    eprintln!("  set-stream-ec --stream <ID> --ec K+M");
-    eprintln!("  force-ec-convert --extent <EXTID>");
-    eprintln!("  repair [--cancel] <EXTID>... | [--cancel] --node <NODE_ID>");
-    eprintln!("                               rebuild degraded copies on other nodes now, no fence");
-    eprintln!("                               (--cancel: withdraw standing repair requests)");
-    eprintln!("  scrub <EXTID>... | --part <PART_ID> | --all");
-    eprintln!("                               check sealed copies against their checksums on the");
-    eprintln!("                               nodes that hold them; rot is isolated and rebuilt");
-    eprintln!("  split <PARTID> [--namespace <NS[/SUB]> [--at <SUFFIX> | --at-hex <HEX>]] [--at-raw-hex <HEX>]");
-    eprintln!("  presplit --namespace <NS[/SUB]> ...   (presplit EMPTY keyspace before loading; rule by NS: fs|kvc|mem|other)");
-    eprintln!("           fs: --lanes <N> [--parts <P>] [--force to narrow declared lanes]");
-    eprintln!("      fs:  --lanes <N> [--parts <P>] | --fs-inos <i,j,…> | --count <N>");
-    eprintln!("           (--lanes = stripe width, declared; --parts = partitions to cut, MUST divide lanes; default P=N)");
-    eprintln!("      kvc: --count <N> --hash-prefix <rel-prefix>       (split by content-hash first hex char)");
-    eprintln!("           hash-prefix = rel prefix down to just before the hash, e.g. '<model>/vllm/v1/'");
-    eprintln!("      mem: --agents <a,b,…>                            (split by agent boundary)");
-    eprintln!("  merge <SURVIVOR_PARTID> <VICTIM_PARTID>");
-    eprintln!("  rebalance [MAX_MOVES]        actively re-spread partitions across PS (0/absent = balance fully)");
-    eprintln!("  compact <PARTID>");
-    eprintln!("  gc [--ratio R] [--max-size B] [--stream-debt B] [--dead-bytes B] [--empty-only] <PARTID>");
-    eprintln!("                               --dead-bytes: an extent with at least this many dead bytes");
-    eprintln!("                               qualifies whatever its ratio (3 GiB in a 16 GiB extent is 0.195)");
-    eprintln!("  forcegc <PARTID> <EXTID>...");
-    // `register-node` removed; `format` is the single per-EN setup.
-    // M1c: format is IDENTITY-ONLY — it no longer takes a
-    // location (no --listen/--advertise/--shard-ports). The EN binary's own
-    // `--advertise` self-registers the live location at every startup.
-    eprintln!("  format <DIR>...");
-    eprintln!(
-        "                               format dir(s), register node identity, stamp cluster_id"
-    );
-    eprintln!("  gen-cluster-secret           print a new cluster secret (local, no manager)");
-    eprintln!();
-    eprintln!("namespace registry (admin):");
-    eprintln!("  namespace-create --name <NS> [--presplit <hex,hex,...>]");
-    eprintln!("                               register a namespace");
-    eprintln!("  namespace-delete --name <NS> [--force]");
-    eprintln!("                               remove the registry row (refuses non-empty unless --force)");
-    eprintln!("  namespace-list [--json]      list registered namespaces (name/prefix/presplit/created)");
-    eprintln!("  principal-list [--json]      list principals + their grants (read-only, no credentials)");
-    eprintln!("  mint-token [--principal P] (--credential HEX | --credential-file F)");
-    eprintln!("                               mint a capability token (the file names its principal)");
-    eprintln!("\nclient parameters (anywhere on the line):\n{}", autumn_params::help::<autumn_params::client::ClientParams>());
+    eprint!("{}", help());
     std::process::exit(1);
+}
+
+fn help() -> String {
+    autumn_params::help_text(USAGE, &[&OpParams::default() as &dyn Section, autumn_client::params()])
 }
 
 /// The CLI value at `raw[i]`, or print usage + exit. Use for every value that
@@ -140,8 +135,8 @@ fn num_arg<T: std::str::FromStr>(raw: &[String], i: usize, name: &str) -> T {
 
 /// `mint-token`'s principal and raw credential: `--credential <hex>` (with
 /// `--principal`) wins; otherwise the credential `--credential-file` names
-/// (read by `prescan_secret_flags`, so it may sit before or after the
-/// subcommand, in either form that names a principal — what `principal-create`
+/// (a global flag, so it may sit before or after the subcommand, in either
+/// form that names a principal — what `principal-create`
 /// prints, or `<principal>\n<hex>`). One `--credential-file` serves both
 /// mint-token and the data plane, so an explicit hex does not conflict with it.
 /// The file's principal fills an absent `--principal` and must match a given
@@ -532,165 +527,41 @@ pub(crate) enum Command {
     PrincipalList,
 }
 
-/// Find `--cluster-secret-file` and `--credential-file` anywhere in argv.
-///
-/// Position-independence is the point — see the comment at the call site.
-/// Values are consumed positionally, and the value of any OTHER flag is skipped,
-/// so `--principal --cluster-secret-file` cannot be misread as the secret flag.
-/// The last occurrence wins.
-fn prescan_secret_flags(
-    raw: &[String],
-) -> (Option<std::path::PathBuf>, Option<(String, Vec<u8>)>) {
-    let mut secret: Option<std::path::PathBuf> = None;
-    let mut cred: Option<(String, Vec<u8>)> = None;
-    let mut k = 1usize;
-    while k < raw.len() {
-        match raw[k].as_str() {
-            "--cluster-secret-file" if k + 1 < raw.len() => {
-                secret = Some(raw[k + 1].clone().into());
-                k += 2;
-            }
-            "--admin-token" | "--admin-token-file" => {
-                eprintln!(
-                    "autumn-op: {} was removed: pass the cluster secret with \
-                     --cluster-secret-file",
-                    raw[k]
-                );
-                std::process::exit(2);
-            }
-            "--credential-file" if k + 1 < raw.len() => {
-                let path = &raw[k + 1];
-                match autumn_client::read_credential_file(path) {
-                    Ok((principal, secret)) if !principal.is_empty() => {
-                        cred = Some((principal, secret));
-                    }
-                    Ok(_) => {
-                        eprintln!(
-                            "--credential-file {path}: missing principal name (expected '<principal>\n<hex>')"
-                        );
-                        std::process::exit(2);
-                    }
-                    Err(e) => {
-                        eprintln!("{e:#}");
-                        std::process::exit(2);
-                    }
-                }
-                k += 2;
-            }
-            // Skip another flag's VALUE so `--principal --cluster-secret-file`
-            // can't be misread as the secret flag. But boolean flags (`--json`, `--force`)
-            // have no value, and blindly skipping one token past them would
-            // swallow the very flag we are looking for — so only skip a token
-            // that isn't itself a flag.
-            f if f.starts_with('-') => {
-                if k + 1 < raw.len() && !raw[k + 1].starts_with('-') {
-                    k += 2;
-                } else {
-                    k += 1;
-                }
-            }
-            _ => k += 1,
+/// The data-plane credential of `--credential-file`, read up front so a bad
+/// file fails before any connection.
+fn read_credential(path: &str) -> (String, Vec<u8>) {
+    match autumn_client::read_credential_file(path) {
+        Ok((principal, secret)) if !principal.is_empty() => (principal, secret),
+        Ok(_) => {
+            eprintln!("--credential-file {path}: missing principal name (expected '<principal>\n<hex>')");
+            std::process::exit(2);
+        }
+        Err(e) => {
+            eprintln!("{e:#}");
+            std::process::exit(2);
         }
     }
-    (secret, cred)
 }
 
 pub(crate) fn parse() -> Args {
-    // `--wait` / `--timeout SECS` are position-INDEPENDENT (they apply to the
-    // async op triggers regardless of whether they land before or after the
-    // subcommand, matching operator muscle memory `autumn-op compact 7 --wait`).
-    // Pre-filter them out so the per-subcommand parsers never see them.
-    let mut wait = false;
-    let mut wait_timeout = 600u64;
-    let raw: Vec<String> = {
-        // Client SDK parameters (`--rpc-timeout-ms`, ...) apply anywhere on the
-        // line, like `--wait`.
-        let orig = autumn_params::split_params(std::env::args().collect(), |f, v| {
-            autumn_params::take_flag(autumn_client::params(), f, v)
-        })
-        .unwrap_or_else(|e| {
-            eprintln!("error: {e}");
-            std::process::exit(2);
-        });
-        let mut out = Vec::with_capacity(orig.len());
-        let mut j = 0usize;
-        while j < orig.len() {
-            match orig[j].as_str() {
-                "--wait" => {
-                    wait = true;
-                    j += 1;
-                }
-                "--timeout" => {
-                    j += 1;
-                    wait_timeout = orig
-                        .get(j)
-                        .and_then(|s| s.parse::<u64>().ok())
-                        .unwrap_or_else(|| usage());
-                    j += 1;
-                }
-                _ => {
-                    out.push(orig[j].clone());
-                    j += 1;
-                }
-            }
+    // Global flags and client parameters may stand anywhere on the line
+    // (`autumn-op compact 7 --wait`); what is left is the command.
+    let g = OpParams::default();
+    let raw = autumn_params::parse_or_exit(
+        USAGE,
+        &[&g as &dyn Section, autumn_client::params()],
+        Positional::Anywhere,
+    );
+    match raw.first().map(String::as_str) {
+        None => usage(),
+        Some("--help" | "-h") => {
+            print!("{}", help());
+            std::process::exit(0);
         }
-        out
-    };
-    // FLAG POSITION MUST NOT MATTER for the two secret-bearing flags.
-    //
-    // This was inconsistent in a way that cost real time to diagnose: `presplit`
-    // read `--credential-file` ONLY from the global position (before the
-    // subcommand), while `principal-create` read its secret ONLY from its own
-    // (after it). Each refused the other's placement with a bare usage dump
-    // naming neither the flag nor the position, so a correct-looking command
-    // read as "this build lacks that flag". Both placements now work for every
-    // subcommand.
-    let (cluster_secret_file, scanned_credential) = prescan_secret_flags(&raw);
-    let mut manager = "127.0.0.1:9001".to_string();
-    let mut json = false;
-    let mut transport = TransportKind::Tcp;
-    let credential: Option<(String, Vec<u8>)> = scanned_credential;
-    let mut i = 1usize;
-    while i < raw.len() {
-        match raw[i].as_str() {
-            "--manager" => {
-                i += 1;
-                manager = raw.get(i).cloned().unwrap_or_else(|| usage());
-                i += 1;
-            }
-            "--json" => {
-                json = true;
-                i += 1;
-            }
-            // Must match the manager's transport — a TCP autumn-op cannot
-            // talk to a UCX-only manager (the connect/RPC just hangs).
-            "--transport" => {
-                i += 1;
-                let raw_t = raw.get(i).cloned().unwrap_or_else(|| usage());
-                transport = autumn_transport::parse_transport_flag(&raw_t).unwrap_or_else(|bad| {
-                    eprintln!("--transport must be `tcp` or `ucx`, got {bad:?}");
-                    usage()
-                });
-                i += 1;
-            }
-            // Read by `prescan_secret_flags`.
-            "--cluster-secret-file" => {
-                i += 2;
-            }
-            // Data-plane credential, for the admin subcommands that read or write
-            // partition keys rather than only talking to the manager. Read by
-            // `prescan_secret_flags` (last occurrence wins, wherever it sits);
-            // reading it again here made a pre-subcommand file override a later one.
-            "--credential-file" => {
-                i += 2;
-            }
-            "--help" | "-h" => usage(),
-            _ => break,
-        }
+        Some(_) => {}
     }
-    if i >= raw.len() {
-        usage();
-    }
+    let credential = g.credential_file.get().as_deref().map(read_credential);
+    let mut i = 0usize;
     let sub = raw[i].as_str();
     i += 1;
     let cmd = match sub {
@@ -729,14 +600,10 @@ pub(crate) fn parse() -> Args {
                         max_problems = val(&raw, i).parse().unwrap_or_else(|_| usage());
                         i += 1;
                     }
-                    // `--json` is a global flag and goes BEFORE the subcommand;
-                    // an unknown token here must not silently become a plain
+                    // An unknown token must not silently become a plain
                     // `health` with exit 0.
                     other => {
-                        eprintln!(
-                            "health: unexpected argument {other:?} (global flags such as \
-                             --json go before the subcommand)"
-                        );
+                        eprintln!("health: unexpected argument {other:?}");
                         usage()
                     }
                 }
@@ -933,11 +800,6 @@ pub(crate) fn parse() -> Args {
                         grants.push(val(&raw, i).to_owned());
                         i += 1;
                     }
-                    // Read by `prescan_secret_flags`; skipped here so position
-                    // never matters.
-                    "--credential-file" | "--cluster-secret-file" => {
-                        i += 2;
-                    }
                     _ => break,
                 }
             }
@@ -957,11 +819,6 @@ pub(crate) fn parse() -> Args {
                         i += 1;
                         principal = val(&raw, i).to_owned();
                         i += 1;
-                    }
-                    // Read by `prescan_secret_flags`; skipped here so position
-                    // never matters.
-                    "--credential-file" | "--cluster-secret-file" => {
-                        i += 2;
                     }
                     _ => break,
                 }
@@ -985,12 +842,6 @@ pub(crate) fn parse() -> Args {
                         i += 1;
                         credential_hex = Some(val(&raw, i).to_owned());
                         i += 1;
-                    }
-                    // Read by `prescan_secret_flags` (the long-lived credential
-                    // from a FILE instead of argv); skipped here so position
-                    // never matters.
-                    "--credential-file" | "--cluster-secret-file" => {
-                        i += 2;
                     }
                     _ => break,
                 }
@@ -1023,11 +874,6 @@ pub(crate) fn parse() -> Args {
                         presplit = parse_hex_split_points(val(&raw, i));
                         i += 1;
                     }
-                    // Read by `prescan_secret_flags`; skipped here so position
-                    // never matters.
-                    "--credential-file" | "--cluster-secret-file" => {
-                        i += 2;
-                    }
                     other => {
                         eprintln!("namespace-create: unexpected argument {other:?}");
                         std::process::exit(1);
@@ -1052,11 +898,6 @@ pub(crate) fn parse() -> Args {
                     "--force" => {
                         force = true;
                         i += 1;
-                    }
-                    // Read by `prescan_secret_flags`; skipped here so position
-                    // never matters.
-                    "--credential-file" | "--cluster-secret-file" => {
-                        i += 2;
                     }
                     _ => break,
                 }
@@ -1550,10 +1391,6 @@ pub(crate) fn parse() -> Args {
                         parts = Some(num(val(&raw, i), "--parts") as usize);
                         i += 1;
                     }
-                    // Already read by `prescan_secret_flags`; accepted (and
-                    // skipped) here only so the flag may follow the subcommand
-                    // as well as precede it.
-                    "--credential-file" | "--cluster-secret-file" => { i += 2; }
                     "--hash-prefix" => { i += 1; hash_prefix = Some(val(&raw, i).to_owned()); i += 1; }
                     "--force" => { i += 1; presplit_force = true; }
                     "--agents" => {
@@ -1863,13 +1700,13 @@ pub(crate) fn parse() -> Args {
         }
     };
     Args {
-        manager,
-        json,
-        transport,
-        cluster_secret_file,
+        manager: g.manager.get(),
+        json: g.json.get(),
+        transport: g.transport.get().into(),
+        cluster_secret_file: g.cluster_secret_file.get(),
         credential,
-        wait,
-        wait_timeout,
+        wait: g.wait.get(),
+        wait_timeout: g.timeout.get(),
         cmd,
     }
 }
@@ -2337,7 +2174,7 @@ mod tests {
     use super::{mint_token_credential, parse_hex_split_points, SplitPoint};
 
     /// The file's credential (both named forms are parsed by the SDK reader;
-    /// `prescan_secret_flags` hands it over) fills or checks `--principal`;
+    /// `parse` hands it over) fills or checks `--principal`;
     /// `--credential` hex needs `--principal`.
     #[test]
     fn mint_token_takes_the_credential_files_principal() {
@@ -2829,55 +2666,50 @@ mod lane_parts_tests {
         assert!(presplit_suffixes(&PresplitRule::FsLanes { lanes: 1, parts: 1 }).unwrap().is_empty());
     }
 
-    /// `--cluster-secret-file` and `--credential-file` must work in BOTH
-    /// positions, for every subcommand.
-    ///
-    /// They used to be split: `presplit` took the credential only before the
-    /// subcommand, `principal-create` took its secret only after it, and each
-    /// rejected the other placement with a usage dump that named neither the
-    /// flag nor the position — so a correct-looking command read as an
-    /// unsupported flag. This pins the prescan that fixed it, including the
-    /// boolean-flag case that would otherwise swallow the following flag.
-    /// Two `--credential-file`s: the prescan keeps the last one, wherever each
-    /// sits. The global argv loop must not read the flag again (it did, and a
-    /// pre-subcommand file overrode a later one).
+    /// Global flags work before and after the command, and the command's
+    /// own flags reach it untouched, in order.
     #[test]
-    fn the_last_credential_file_wins() {
-        let dir = std::env::temp_dir();
-        let path = |n: &str| dir.join(format!("autumn-op-{}-{n}", std::process::id()));
-        std::fs::write(path("a"), "a\n0a\n").expect("write a");
-        std::fs::write(path("b"), "b\n0b\n").expect("write b");
-        let argv: Vec<String> = ["autumn-op", "--credential-file"]
-            .iter()
-            .map(|s| s.to_string())
-            .chain([path("a").to_string_lossy().into_owned()])
-            .chain(["mint-token".to_string(), "--credential-file".to_string()])
-            .chain([path("b").to_string_lossy().into_owned()])
-            .collect();
-        let got = super::prescan_secret_flags(&argv).1;
-        std::fs::remove_file(path("a")).expect("remove a");
-        std::fs::remove_file(path("b")).expect("remove b");
-        assert_eq!(got, Some(("b".to_string(), vec![0x0b])));
+    fn global_flags_stand_anywhere() {
+        use autumn_params::{op::OpParams, Positional};
+        let parse = |line: &str| {
+            let argv: Vec<String> = line.split_whitespace().map(String::from).collect();
+            let g = OpParams::default();
+            match autumn_params::parse(&argv, &[&g], Positional::Anywhere) {
+                Ok(autumn_params::Parsed::Rest(rest)) => (g, rest.join(" ")),
+                other => panic!("{line}: {other:?}"),
+            }
+        };
+        let f = Some(std::path::PathBuf::from("F"));
+        for line in [
+            "principal-create --cluster-secret-file F --principal p",
+            "--cluster-secret-file F principal-create --principal p",
+            "principal-create --principal p --cluster-secret-file F",
+        ] {
+            let (g, rest) = parse(line);
+            assert_eq!((g.cluster_secret_file.get(), rest.as_str()), (f.clone(), "principal-create --principal p"));
+        }
+        let (g, rest) = parse("--json presplit --force --namespace fs --cluster-secret-file F");
+        assert_eq!((g.json.get(), g.cluster_secret_file.get(), rest.as_str()), (true, f, "presplit --force --namespace fs"));
+        let (g, rest) = parse("compact 7 --wait --timeout 30 --json");
+        assert_eq!((g.wait.get(), g.timeout.get(), g.json.get(), rest.as_str()), (true, 30, true, "compact 7"));
+        // The last --credential-file wins, wherever each stands.
+        let (g, _) = parse("--credential-file a mint-token --credential-file b");
+        assert_eq!(g.credential_file.get().as_deref(), Some("b"));
     }
 
+    /// A global flag is taken anywhere on the line, so a command flag of the
+    /// same name would never reach its command.
     #[test]
-    fn secret_flags_are_position_independent() {
-        let argv = |v: &[&str]| -> Vec<String> {
-            std::iter::once("autumn-op".to_string())
-                .chain(v.iter().map(|s| s.to_string()))
-                .collect()
-        };
-        let secret = |a: &[&str]| super::prescan_secret_flags(&argv(a)).0;
-        let f = Some(std::path::PathBuf::from("F"));
-
-        // After the subcommand, before it, and either side of a boolean flag.
-        assert_eq!(secret(&["principal-create", "--cluster-secret-file", "F"]), f);
-        assert_eq!(secret(&["--cluster-secret-file", "F", "principal-create"]), f);
-        assert_eq!(secret(&["--json", "--cluster-secret-file", "F", "presplit"]), f);
-        assert_eq!(secret(&["presplit", "--force", "--cluster-secret-file", "F"]), f);
-
-        // A flag's VALUE is never mistaken for the flag itself.
-        assert_eq!(secret(&["principal-create", "--principal", "--cluster-secret-file"]), None);
-        assert_eq!(secret(&["presplit", "--namespace", "fs"]), None);
+    fn no_command_flag_shadows_a_global_flag() {
+        use autumn_params::Params;
+        let globals: Vec<String> = autumn_params::op::OpParams::specs()
+            .iter()
+            .chain(autumn_params::client::ClientParams::specs())
+            .map(|s| format!("\"--{}\"", s.flag()))
+            .collect();
+        let src = include_str!("args.rs");
+        for g in &globals {
+            assert!(!src.contains(g.as_str()), "a command parses {g}, which is a global flag");
+        }
     }
 }

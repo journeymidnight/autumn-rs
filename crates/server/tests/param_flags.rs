@@ -169,3 +169,55 @@ fn config_keys_lists_every_runtime_parameter() {
         .collect();
     assert_eq!(listed, want, "{text}");
 }
+
+const MIGRATE_BIN: &str = env!("CARGO_BIN_EXE_migratev1_v2");
+
+/// The CLIs' own parameter structs (the servers' are checked above): their
+/// `--help` lists every flag the parser takes.
+#[test]
+fn cli_help_lists_every_parameter() {
+    assert_help_lists_every_parameter::<autumn_params::op::OpParams>(OP_BIN);
+    assert_help_lists_every_parameter::<autumn_params::client_cli::ClientCliParams>(CLIENT_BIN);
+    assert_help_lists_every_parameter::<autumn_params::migrate::MigrateParams>(MIGRATE_BIN);
+}
+
+/// A bad startup argument exits 2 before anything starts, on every binary
+/// (a non-numeric `--port` used to panic).
+#[test]
+fn bad_startup_arguments_exit_2() {
+    for (bin, args, want) in [
+        (MANAGER_BIN, &["--port", "x"][..], "--port x"),
+        (MANAGER_BIN, &["--transport", "rdma"], "not tcp or ucx"),
+        (MANAGER_BIN, &["--etcd", "http://e:2379"], "--manager-id"),
+        (MANAGER_BIN, &["--metrics-port", "1"], "the manager serves no /metrics"),
+        (PS_BIN, &["--port", "9201"], "--psid is required"),
+        (PS_BIN, &["--psid", "0"], "--psid 0"),
+        (PS_BIN, &["--psid", "1", "--cpuset", "3-1"], "hi<lo"),
+        (PS_BIN, &["--psid", "1", "--metrics-port", "70000"], "--metrics-port 70000"),
+        (EN_BIN, &["--port", "9101"], "--data is required"),
+        (EN_BIN, &["--data", "/x", "--shard-stride", "0"], "--shard-stride 0"),
+        (EN_BIN, &["--data", "/x", "--shards", "2"], "--shards was removed"),
+        (S3_BIN, &["--port", "9000"], "--manager is required"),
+        (S3_BIN, &["--manager", ""], "--manager needs a non-empty value"),
+        (DASHBOARD_BIN, &["--port", "1"], "--cluster-secret-file is required"),
+        (AUTUMNFS_BIN, &["frob"], "unknown command"),
+        (AUTUMNFS_BIN, &["--direct-read", "maybe", "ls"], "--direct-read maybe"),
+        (CLIENT_BIN, &["--transport", "x", "get", "k"], "not tcp or ucx"),
+        (OP_BIN, &["status", "--timeout", "soon"], "--timeout soon"),
+        (OP_BIN, &["--admin-token", "t", "status"], "--admin-token was removed"),
+        (MIGRATE_BIN, &["--dry-run"], "--etcd is required"),
+        (MIGRATE_BIN, &["--etcd", "e", "--bogus"], "unknown argument"),
+    ] {
+        let (code, text) = run(bin, args);
+        assert_eq!(code, 2, "{bin} {args:?}: {text}");
+        assert!(text.contains(want), "{bin} {args:?}: {text}");
+    }
+}
+
+/// `--scope` stays an accepted spelling of autumn-client's `--namespace`.
+#[test]
+fn client_accepts_scope_for_namespace() {
+    let (code, text) = run(CLIENT_BIN, &["--scope", "x", "--transport", "rdma", "get", "k"]);
+    assert_eq!(code, 2, "{text}");
+    assert!(text.contains("not tcp or ucx"), "--scope was not taken as a flag: {text}");
+}

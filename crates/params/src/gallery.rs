@@ -3,8 +3,21 @@
 use crate::{GIB, MIB};
 
 crate::params! {
-    /// Every gallery tunable.
+    /// Every gallery parameter.
     pub struct GalleryParams("gallery") {
+        // ── Process ──────────────────────────────────────────────────────
+        /// Manager endpoints.
+        manager: String = "127.0.0.1:9001".into();
+        /// Namespace scope every key lives under.
+        scope: String = "gallery".into();
+        /// Credential file (`<principal>\n<hex>`, from `autumn-op
+        /// principal-create`); needed when authz is on.
+        credential_file: Option<std::path::PathBuf>;
+        /// Bind host.
+        listen: String = "0.0.0.0".into();
+        /// Listen port.
+        port: u16 = 5001;
+
         /// Thumbnail width in pixels.
         thumb_width: u32 = 320, [16, 8192];
         /// Thumbnail JPEG quality.
@@ -31,3 +44,4 @@ impl crate::CrossCheck for GalleryParams {
         Ok(())
     }
 }
+

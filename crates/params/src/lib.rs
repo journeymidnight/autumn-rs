@@ -14,20 +14,34 @@
 //!
 //! Values live in atomics (`Live`), so a reader anywhere sees an override as
 //! soon as it is applied, and a struct can be shared without a lock.
+//!
+//! Not only tunables: a binary's ports, addresses, paths, ids and switches
+//! are parameters too (startup-only, kept in a `Fixed` when they do not fit
+//! in 64 bits). `parse_or_exit` reads argv into them (`args.rs`).
 
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::RwLock;
 
+mod args;
 pub mod autumnfs;
 pub mod client;
+pub mod client_cli;
 pub mod dashboard;
 pub mod en;
 pub mod fs;
 pub mod fuse;
 pub mod gallery;
 pub mod manager;
+pub mod migrate;
+pub mod op;
 pub mod ps;
 pub mod s3;
+
+pub use args::{
+    help_text, parse, parse_cpuset, parse_or_exit, ArgValue, CpuSet, Flag, Parsed, Positional,
+    Section, Transport,
+};
 
 pub const KIB: u64 = 1024;
 pub const MIB: u64 = 1024 * KIB;
@@ -126,17 +140,16 @@ impl Value for bool {
     }
 }
 
-/// Parse `s` and check it against `[lo, hi]`.
-pub fn check<T: Value>(s: &str, lo: T, hi: T) -> Result<T, String> {
-    let v = T::parse(s)?;
-    if v < lo || v > hi {
+/// `v` within `[lo, hi]`.
+pub fn in_range<T: PartialOrd + std::fmt::Display>(v: &T, lo: T, hi: T) -> Result<(), String> {
+    if *v < lo || *v > hi {
         return Err(format!("{v} is outside [{lo}, {hi}]"));
     }
-    Ok(v)
+    Ok(())
 }
 
-/// One parameter's value. `base` is what the flag (or the default) set;
-/// `cur` is what readers see: `base`, or a runtime override.
+/// A numeric parameter. `base` is what the flag (or the default) set; `cur`
+/// is what readers see: `base`, or a runtime override.
 pub struct Live<T: Value> {
     cur: AtomicU64,
     base: AtomicU64,
@@ -180,13 +193,100 @@ impl<T: Value + std::fmt::Debug> std::fmt::Debug for Live<T> {
     }
 }
 
+/// A parameter that does not fit in 64 bits (a string, a path, a list): set
+/// while the flags are parsed, never overridden at runtime.
+pub struct Fixed<T>(RwLock<T>);
+
+impl<T: Clone> Fixed<T> {
+    pub fn new(v: T) -> Self {
+        Self(RwLock::new(v))
+    }
+
+    pub fn get(&self) -> T {
+        self.0.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    pub fn set(&self, v: T) {
+        *self.0.write().unwrap_or_else(|e| e.into_inner()) = v;
+    }
+}
+
+impl<T: Clone + std::fmt::Debug> std::fmt::Debug for Fixed<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&self.get(), f)
+    }
+}
+
+/// How the `params!` macro stores and reads a field, whatever its cell.
+pub trait Slot<T>: Send + Sync {
+    fn new_slot(v: T) -> Self;
+    fn load(&self) -> T;
+    fn store(&self, v: T);
+}
+
+impl<T: Value> Slot<T> for Live<T> {
+    fn new_slot(v: T) -> Self {
+        Live::new(v)
+    }
+    fn load(&self) -> T {
+        self.get()
+    }
+    fn store(&self, v: T) {
+        self.set(v)
+    }
+}
+
+impl<T: Clone + Send + Sync> Slot<T> for Fixed<T> {
+    fn new_slot(v: T) -> Self {
+        Fixed::new(v)
+    }
+    fn load(&self) -> T {
+        self.get()
+    }
+    fn store(&self, v: T) {
+        self.set(v)
+    }
+}
+
+/// A parameter type and the cell it lives in: numbers and `bool` in a `Live`
+/// (the only kind a `[runtime]` field can be), the rest in a `Fixed`.
+pub trait Param: ArgValue + Default + Clone + Send + Sync + 'static {
+    type Cell: Slot<Self>;
+}
+
+macro_rules! live_param {
+    ($($t:ty),*) => {$(impl Param for $t { type Cell = Live<$t>; })*};
+}
+live_param!(u8, u16, u32, u64, usize, i64, f64, bool);
+
+macro_rules! fixed_param {
+    ($($t:ty),*) => {$(impl Param for $t { type Cell = Fixed<$t>; })*};
+}
+fixed_param!(String, std::path::PathBuf, Transport, CpuSet);
+
+impl<T: ArgValue + Default + Clone + Send + Sync + 'static> Param for Option<T> {
+    type Cell = Fixed<Option<T>>;
+}
+
+impl<T: ArgValue + Default + Clone + Send + Sync + 'static> Param for Vec<T> {
+    type Cell = Fixed<Vec<T>>;
+}
+
 /// The declaration of one parameter, as `--help` and `autumn-op` see it.
 pub struct Spec {
     /// Field name; the flag is this with `_` → `-`.
     pub field: &'static str,
     pub help: &'static str,
     pub runtime: bool,
+    /// Must be given on the command line, with a non-empty value.
+    pub required: bool,
+    /// Takes no value: the flag alone sets it.
+    pub switch: bool,
+    /// Placeholder for the value in `--help`.
+    pub meta: fn() -> &'static str,
+    /// "" when there is nothing to show.
     pub default: fn() -> String,
+    /// "" for a field without a range.
     pub range: fn() -> String,
     /// Parse and range-check a value without an instance (the manager
     /// validating `config set` for a PS or EN key).
@@ -212,6 +312,10 @@ pub trait Params: Sync + CrossCheck {
     /// Role name, the prefix of a runtime key (`ps.fg-rate-bytes-per-sec`).
     const ROLE: &'static str;
     fn specs() -> &'static [Spec];
+    /// Retired flags (dash spelling, no `--`) and the hint refusing each.
+    fn removed() -> &'static [(&'static str, &'static str)];
+    /// Older spellings: (old, current), dash spelling, no `--`.
+    fn aliases() -> &'static [(&'static str, &'static str)];
     /// Set the startup value of `field`. `None` = not a field of this struct.
     fn set_str(&self, field: &str, value: &str) -> Option<Result<(), String>>;
     /// Apply (`Some`) or drop (`None`) a runtime override of a `[runtime]` field.
@@ -219,78 +323,79 @@ pub trait Params: Sync + CrossCheck {
     fn get_str(&self, field: &str) -> Option<String>;
 }
 
-/// Outcome of offering one argv entry to a parameter struct.
-pub enum Flag {
-    /// The flag and its value were consumed.
-    Taken,
-    /// Not a parameter of this struct.
-    Unknown,
+/// The current spelling of `name` (an alias resolved).
+fn canonical<P: Params>(name: &str) -> &str {
+    P::aliases().iter().find(|(old, _)| *old == name).map_or(name, |(_, new)| new)
 }
 
-/// Offer `--flag value` to `p`. A known flag with a missing or bad value is an
-/// error; the caller exits 2 on it.
+/// Offer `--flag` and the token after it to `p`. A retired flag, or a known
+/// flag with a missing or bad value, is an error; the caller exits 2 on it.
 pub fn take_flag<P: Params>(p: &P, arg: &str, value: Option<&str>) -> Result<Flag, String> {
     let Some(name) = arg.strip_prefix("--") else {
         return Ok(Flag::Unknown);
     };
-    let field = name.replace('-', "_");
-    if !P::specs().iter().any(|s| s.field == field) {
+    if let Some((_, why)) = P::removed().iter().find(|(old, _)| *old == name) {
+        return Err(why.to_string());
+    }
+    let field = canonical::<P>(name).replace('-', "_");
+    let Some(spec) = P::specs().iter().find(|s| s.field == field) else {
         return Ok(Flag::Unknown);
+    };
+    if spec.switch {
+        return match p.set_str(&field, "true") {
+            Some(Err(e)) => Err(format!("{arg}: {e}")),
+            _ => Ok(Flag::Switch),
+        };
     }
     let value = value.ok_or_else(|| format!("{arg} requires a value"))?;
     match p.set_str(&field, value) {
-        Some(Ok(())) => Ok(Flag::Taken),
+        Some(Ok(())) => Ok(Flag::Value),
         Some(Err(e)) => Err(format!("{arg} {value}: {e}")),
         None => Ok(Flag::Unknown),
     }
 }
 
-/// Pull every parameter flag out of `args` (for a binary whose own parser,
-/// e.g. clap, runs on what is left). `take` offers one flag and its value to
-/// the binary's parameter structs, usually a chain of `take_flag` calls.
-pub fn split_params(
-    args: Vec<String>,
-    take: impl Fn(&str, Option<&str>) -> Result<Flag, String>,
-) -> Result<Vec<String>, String> {
-    let mut rest = Vec::with_capacity(args.len());
-    let mut i = 0;
-    while i < args.len() {
-        match take(&args[i], args.get(i + 1).map(|s| s.as_str()))? {
-            Flag::Taken => i += 2,
-            Flag::Unknown => {
-                rest.push(args[i].clone());
-                i += 1;
-            }
+/// After the last flag: every `[required]` field was given a non-empty
+/// value, then the cross-field checks. `given` holds the flags taken, as typed.
+pub fn finish<P: Params>(p: &P, given: &[String]) -> Result<(), String> {
+    for s in P::specs().iter().filter(|s| s.required) {
+        let flag = s.flag();
+        if !given.iter().any(|g| canonical::<P>(g) == flag) {
+            return Err(format!("--{flag} is required"));
+        }
+        if p.get_str(s.field).is_none_or(|v| v.is_empty()) {
+            return Err(format!("--{flag} needs a non-empty value"));
         }
     }
-    Ok(rest)
-}
-
-/// Offer `--flag value` to several parameter structs in turn.
-#[macro_export]
-macro_rules! take_any {
-    ($arg:expr, $value:expr, $($p:expr),+ $(,)?) => {{
-        let mut out: Result<$crate::Flag, String> = Ok($crate::Flag::Unknown);
-        $(
-            if matches!(out, Ok($crate::Flag::Unknown)) {
-                out = $crate::take_flag($p, $arg, $value);
-            }
-        )+
-        out
-    }};
+    p.cross_check()
 }
 
 /// The `--help` section listing every parameter of `P`.
 pub fn help<P: Params>() -> String {
     let mut out = String::new();
     for s in P::specs() {
-        out.push_str(&format!(
-            "  --{} <v>  (default {}, range {}{})\n",
-            s.flag(),
-            (s.default)(),
-            (s.range)(),
-            if s.runtime { ", runtime" } else { "" }
-        ));
+        let mut notes: Vec<String> = Vec::new();
+        if s.required {
+            notes.push("required".into());
+        } else if s.switch {
+            notes.push("switch".into());
+        } else if !(s.default)().is_empty() {
+            notes.push(format!("default {}", (s.default)()));
+        }
+        if !(s.range)().is_empty() {
+            notes.push(format!("range {}", (s.range)()));
+        }
+        if s.runtime {
+            notes.push("runtime".into());
+        }
+        out.push_str(&format!("  --{}", s.flag()));
+        if !s.switch {
+            out.push_str(&format!(" {}", (s.meta)()));
+        }
+        if !notes.is_empty() {
+            out.push_str(&format!("  ({})", notes.join(", ")));
+        }
+        out.push('\n');
         for line in s.help.lines() {
             out.push_str(&format!("        {}\n", line.trim()));
         }
@@ -404,12 +509,67 @@ impl Default for Installed {
 
 #[doc(hidden)]
 #[macro_export]
-macro_rules! __runtime {
-    () => {
+macro_rules! __is {
+    ($want:ident;) => {
         false
     };
-    (runtime) => {
+    (runtime; runtime) => {
         true
+    };
+    (required; required) => {
+        true
+    };
+    (switch; switch) => {
+        true
+    };
+    ($want:ident; $kind:ident) => {
+        false
+    };
+}
+
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __default {
+    ($ty:ty) => {
+        <$ty as ::core::default::Default>::default()
+    };
+    ($ty:ty, $def:expr) => {
+        $def
+    };
+}
+
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __range {
+    ($ty:ty) => {
+        String::new()
+    };
+    ($ty:ty, $lo:expr, $hi:expr) => {
+        format!("[{}, {}]", $lo as $ty, $hi as $ty)
+    };
+}
+
+/// A runtime override of field `$name`; `None` (not overridable) unless the
+/// field is `[runtime]`, which only a `Live` (numeric) field can be.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __override {
+    ([runtime], $self:ident, $name:ident, $ty:ty, $value:ident, [$($lo:expr, $hi:expr)?]) => {
+        Some(match $value {
+            Some(v) => (|| {
+                let x = <$ty as $crate::Value>::parse(v)?;
+                $($crate::in_range::<$ty>(&x, $lo, $hi)?;)?
+                $self.$name.set_override(Some(x));
+                Ok(())
+            })(),
+            None => {
+                $self.$name.set_override(None);
+                Ok(())
+            }
+        })
+    };
+    ([$($kind:ident)?], $self:ident, $name:ident, $ty:ty, $value:ident, [$($lo:expr, $hi:expr)?]) => {
+        None
     };
 }
 
@@ -418,12 +578,24 @@ macro_rules! __runtime {
 /// ```ignore
 /// params! {
 ///     pub struct PsParams("ps") {
+///         /// Partition server id.
+///         [required] psid: u64, [1, u64::MAX];
+///         /// Manager endpoints.
+///         manager: String = "127.0.0.1:9001".into();
 ///         /// Help text.
 ///         group_commit_cap: usize = 3072, [1, 1_000_000];
 ///         [runtime] fg_rate_bytes_per_sec: u64 = GIB, [0, u64::MAX];
+///         [switch] policy_fast_mode: bool;
 ///     }
+///     removed { "cpu-start" => "--cpu-start was removed; pass --cpuset" }
+///     aliases { "scope" => "namespace" }
 /// }
 /// ```
+///
+/// Flag = field name with `_` → `-`. Every field is a startup flag;
+/// `[runtime]` (numbers and `bool` only) may also be overridden while the
+/// process runs. `[required]` must be given, `[switch]` takes no value. A
+/// field without a default starts at `Default::default()`.
 #[macro_export]
 macro_rules! params {
     (
@@ -431,21 +603,28 @@ macro_rules! params {
         pub struct $S:ident ($role:literal) {
             $(
                 $(#[doc = $doc:literal])*
-                $([$rt:ident])? $name:ident : $ty:ty = $def:expr, [$lo:expr, $hi:expr];
+                $([$kind:ident])? $name:ident : $ty:ty $(= $def:expr)? $(, [$lo:expr, $hi:expr])? ;
             )*
         }
+        $(removed { $($old:literal => $why:literal),* $(,)? })?
+        $(aliases { $($alias:literal => $canon:literal),* $(,)? })?
     ) => {
         $(#[$smeta])*
         pub struct $S {
             $(
                 $(#[doc = $doc])*
-                pub $name: $crate::Live<$ty>,
+                pub $name: <$ty as $crate::Param>::Cell,
             )*
         }
 
         impl Default for $S {
             fn default() -> Self {
-                Self { $($name: $crate::Live::new($def),)* }
+                Self {
+                    $($name: {
+                        let d: $ty = $crate::__default!($ty $(, $def)?);
+                        <<$ty as $crate::Param>::Cell as $crate::Slot<$ty>>::new_slot(d)
+                    },)*
+                }
             }
         }
 
@@ -457,41 +636,63 @@ macro_rules! params {
                     $crate::Spec {
                         field: stringify!($name),
                         help: concat!($($doc, "\n"),*),
-                        runtime: $crate::__runtime!($($rt)?),
-                        default: || <$ty as ::std::string::ToString>::to_string(&$def),
-                        range: || format!("[{}, {}]", $lo as $ty, $hi as $ty),
-                        check: |s| $crate::check::<$ty>(s, $lo, $hi).map(|_| ()),
+                        runtime: $crate::__is!(runtime; $($kind)?),
+                        required: $crate::__is!(required; $($kind)?),
+                        switch: $crate::__is!(switch; $($kind)?),
+                        meta: <$ty as $crate::ArgValue>::meta,
+                        default: || {
+                            let d: $ty = $crate::__default!($ty $(, $def)?);
+                            $crate::ArgValue::show(&d)
+                        },
+                        range: || $crate::__range!($ty $(, $lo, $hi)?),
+                        check: |s| {
+                            let mut v: $ty = ::core::default::Default::default();
+                            $crate::ArgValue::set(&mut v, s)?;
+                            $($crate::in_range::<$ty>(&v, $lo, $hi)?;)?
+                            Ok(())
+                        },
                     },
                 )*];
                 SPECS
             }
 
+            fn removed() -> &'static [(&'static str, &'static str)] {
+                &[$($(($old, $why)),*)?]
+            }
+
+            fn aliases() -> &'static [(&'static str, &'static str)] {
+                &[$($(($alias, $canon)),*)?]
+            }
+
             fn set_str(&self, field: &str, value: &str) -> Option<Result<(), String>> {
                 match field {
-                    $(stringify!($name) => Some(
-                        $crate::check::<$ty>(value, $lo, $hi).map(|v| self.$name.set(v)),
-                    ),)*
+                    $(stringify!($name) => Some((|| {
+                        let mut v: $ty = $crate::Slot::load(&self.$name);
+                        $crate::ArgValue::set(&mut v, value)?;
+                        $($crate::in_range::<$ty>(&v, $lo, $hi)?;)?
+                        $crate::Slot::store(&self.$name, v);
+                        Ok(())
+                    })()),)*
                     _ => None,
                 }
             }
 
+            // `value` is unused in a struct without a `[runtime]` field.
+            #[allow(unused_variables)]
             fn override_str(&self, field: &str, value: Option<&str>) -> Option<Result<(), String>> {
                 match field {
-                    $(stringify!($name) if $crate::__runtime!($($rt)?) => Some(match value {
-                        Some(v) => $crate::check::<$ty>(v, $lo, $hi)
-                            .map(|v| self.$name.set_override(Some(v))),
-                        None => {
-                            self.$name.set_override(None);
-                            Ok(())
-                        }
-                    }),)*
+                    $(stringify!($name) => $crate::__override!(
+                        [$($kind)?], self, $name, $ty, value, [$($lo, $hi)?]
+                    ),)*
                     _ => None,
                 }
             }
 
             fn get_str(&self, field: &str) -> Option<String> {
                 match field {
-                    $(stringify!($name) => Some(self.$name.get().to_string()),)*
+                    $(stringify!($name) => Some($crate::ArgValue::show(
+                        &$crate::Slot::<$ty>::load(&self.$name),
+                    )),)*
                     _ => None,
                 }
             }
@@ -537,19 +738,12 @@ mod tests {
     #[test]
     fn flags_set_and_range_check() {
         let t = T::default();
-        assert!(matches!(take_flag(&t, "--count", Some("8")), Ok(Flag::Taken)));
+        assert_eq!(take_flag(&t, "--count", Some("8")), Ok(Flag::Value));
         assert_eq!(t.count.get(), 8);
         assert!(take_flag(&t, "--count", Some("0")).is_err());
         assert!(take_flag(&t, "--count", None).is_err());
-        assert!(matches!(take_flag(&t, "--nope", Some("1")), Ok(Flag::Unknown)));
+        assert_eq!(take_flag(&t, "--nope", Some("1")), Ok(Flag::Unknown));
         assert!(help::<T>().contains("--rate-bytes-per-sec"));
-        let argv: Vec<String> = ["x", "--count", "9", "--mount", "/m", "--ratio", "0.5"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        let rest = split_params(argv, |a, v| take_any!(a, v, &t)).unwrap();
-        assert_eq!(rest, ["x", "--mount", "/m"]);
-        assert_eq!((t.count.get(), t.ratio.get()), (9, 0.5));
     }
 
     #[test]

@@ -28,7 +28,6 @@ mod write;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::rc::Rc;
 
 use anyhow::{bail, Context, Result};
@@ -44,6 +43,7 @@ use futures::StreamExt;
 use send_wrapper::SendWrapper;
 
 use autumn_params::s3::S3Params;
+use autumn_params::{Positional, Section};
 use objects::{Fs, OpenError};
 use s3::{CondOutcome, RangeSpec, ReadConditions, S3Error};
 
@@ -54,86 +54,13 @@ const CHUNK: u64 = 8 << 20;
 /// S3's default and maximum page size.
 const DEFAULT_MAX_KEYS: usize = 1000;
 
-struct Args {
-    manager: String,
-    listen: String,
-    port: u16,
-    host: String,
-    credential_file: Option<PathBuf>,
-    direct_read: bool,
-    workers: usize,
-    sweep_interval_secs: u64,
-}
-
 /// Gateway tunables (`autumn_params::s3`).
 fn params() -> &'static S3Params {
     static PARAMS: std::sync::LazyLock<S3Params> = std::sync::LazyLock::new(S3Params::default);
     &PARAMS
 }
 
-fn usage() -> String {
-    format!(
-        "autumn-s3 --manager <host:port> [--listen 0.0.0.0] [--port 9000]\n\
-         \x20         [--host <daemon-identity>] [--credential-file <path>]\n\
-         \x20         [--direct-read true|false]\n\
-         \nparameters:\n{}{}{}",
-        autumn_params::help::<S3Params>(),
-        autumn_params::help::<autumn_params::fs::FsParams>(),
-        autumn_params::help::<autumn_params::client::ClientParams>()
-    )
-}
-
-fn parse_args() -> Result<Args> {
-    let mut a = Args {
-        manager: String::new(),
-        listen: "0.0.0.0".into(),
-        port: 9000,
-        host: "autumn-s3".into(),
-        credential_file: None,
-        direct_read: true,
-        workers: 0,
-        sweep_interval_secs: 0,
-    };
-    let argv: Vec<String> = std::env::args().skip(1).collect();
-    let argv = autumn_params::split_params(argv, |f, v| {
-        autumn_params::take_any!(f, v, params(), autumn_fs::params(), autumn_client::params())
-    })
-    .unwrap_or_else(|e| {
-        eprintln!("error: {e}");
-        std::process::exit(2);
-    });
-    let mut it = argv.into_iter();
-    while let Some(flag) = it.next() {
-        let mut val = || {
-            it.next()
-                .ok_or_else(|| anyhow::anyhow!("{flag} needs a value"))
-        };
-        match flag.as_str() {
-            "--manager" => a.manager = val()?,
-            "--listen" => a.listen = val()?,
-            "--port" => a.port = val()?.parse().context("--port")?,
-            "--host" => a.host = val()?,
-            "--credential-file" => a.credential_file = Some(PathBuf::from(val()?)),
-            "--direct-read" => a.direct_read = val()?.parse().context("--direct-read")?,
-            "-h" | "--help" => {
-                print!("{}", usage());
-                std::process::exit(0);
-            }
-            other => bail!("unknown flag {other} (try --help)"),
-        }
-    }
-    if a.manager.is_empty() {
-        bail!("--manager is required");
-    }
-    a.workers = match params().workers.get() {
-        0 => std::thread::available_parallelism()
-            .map(|n| n.get().min(8))
-            .unwrap_or(1),
-        n => n,
-    };
-    a.sweep_interval_secs = params().sweep_interval_secs.get();
-    Ok(a)
-}
+const USAGE: &str = "usage: autumn-s3 --manager <host:port> [options]";
 
 /// `GET /` — the buckets are the `fs/` root's subdirectories.
 async fn list_buckets(fs: &Fs) -> Response {
@@ -375,12 +302,12 @@ fn reuseport_listener(addr: SocketAddr) -> Result<std::net::TcpListener> {
 }
 
 /// This process's `FsState`, under the daemon identity `host`.
-async fn connect_state(args: &Args, host: String, credential: Option<(String, Vec<u8>)>) -> Result<FsState> {
+async fn connect_state(host: String, credential: Option<(String, Vec<u8>)>) -> Result<FsState> {
     let mut state = match credential {
-        Some((who, secret)) => FsState::new_with_host_credential(&args.manager, host, &who, secret).await?,
-        None => FsState::new_with_host(&args.manager, host).await?,
+        Some((who, secret)) => FsState::new_with_host_credential(&params().manager.get(), host, &who, secret).await?,
+        None => FsState::new_with_host(&params().manager.get(), host).await?,
     };
-    state.direct_read = args.direct_read;
+    state.direct_read = params().direct_read.get();
     // Renews every lease this state holds: the publishing session (which
     // lapses after 30 s without it, and a sweeper would then recover the
     // session and fence out its writes) and the GET pins.
@@ -392,7 +319,6 @@ async fn connect_state(args: &Args, host: String, credential: Option<(String, Ve
 /// share no lock), its own listener. Data reclamation goes to `reclaims`.
 fn serve_worker(
     idx: usize,
-    args: &Args,
     credential: Option<(String, Vec<u8>)>,
     addr: SocketAddr,
     reclaims: mpsc::UnboundedSender<Reclaim>,
@@ -402,7 +328,7 @@ fn serve_worker(
         // A distinct daemon identity per worker: the manager keys its lease
         // registry on it, and two workers sharing one would look like a single
         // client reconnecting.
-        let mut state = connect_state(args, format!("{}-{idx}", args.host), credential).await?;
+        let mut state = connect_state(format!("{}-{idx}", params().host.get()), credential).await?;
         state.reclaim_later = Some(Box::new(move |r| {
             if reclaims.unbounded_send(r).is_err() {
                 tracing::warn!(?r, "the reclaimer is gone; the next sweep reclaims this");
@@ -435,14 +361,14 @@ fn serve_worker(
 /// worker releases its own leases on a file before handing it over. Every
 /// step is idempotent and safe to run in several gateways at once.
 fn reclaim_worker(
-    args: &Args,
     credential: Option<(String, Vec<u8>)>,
     mut reclaims: mpsc::UnboundedReceiver<Reclaim>,
 ) -> Result<()> {
     let rt = compio::runtime::Runtime::new().context("compio runtime")?;
     rt.block_on(async move {
-        let mut st = connect_state(args, format!("{}-sweep", args.host), credential).await?;
-        let every = (args.sweep_interval_secs > 0).then(|| std::time::Duration::from_secs(args.sweep_interval_secs));
+        let mut st = connect_state(format!("{}-sweep", params().host.get()), credential).await?;
+        let secs = params().sweep_interval_secs.get();
+        let every = (secs > 0).then(|| std::time::Duration::from_secs(secs));
         let mut next_sweep = every.map(|d| std::time::Instant::now() + d);
         // Until every worker has exited.
         let mut open = true;
@@ -637,14 +563,23 @@ fn main() -> Result<()> {
         )
         .init();
 
-    let args = parse_args()?;
+    autumn_params::parse_or_exit(
+        USAGE,
+        &[params() as &dyn Section, autumn_fs::params(), autumn_client::params()],
+        Positional::Refuse,
+    );
+    let p = params();
+    let workers = match params().workers.get() {
+        0 => std::thread::available_parallelism().map(|n| n.get().min(8)).unwrap_or(1),
+        n => n,
+    };
     if !autumn_transport::set_regpool_cap_bytes(autumn_client::params().ucx_regpool_cap_bytes.get()) {
         tracing::warn!("regpool cap already set (ignored — first-call-wins)");
     }
 
     // Read the credential up front so a bad path fails at startup rather than
     // as a mid-stream PermissionDenied. The principal travels in the file.
-    let credential: Option<(String, Vec<u8>)> = match &args.credential_file {
+    let credential: Option<(String, Vec<u8>)> = match &p.credential_file.get() {
         Some(path) => {
             let (principal, secret) = autumn_client::read_credential_file(path)?;
             if principal.is_empty() {
@@ -658,50 +593,31 @@ fn main() -> Result<()> {
         None => None,
     };
 
-    let addr: SocketAddr = format!("{}:{}", args.listen, args.port)
+    let (listen, port) = (p.listen.get(), p.port.get());
+    let addr: SocketAddr = format!("{listen}:{port}")
         .parse()
-        .with_context(|| format!("--listen/--port: {}:{}", args.listen, args.port))?;
+        .with_context(|| format!("--listen/--port: {listen}:{port}"))?;
 
     tracing::info!(
-        manager = %args.manager,
-        authz = args.credential_file.is_some(),
-        direct_read = args.direct_read,
-        workers = args.workers,
-        sweep_interval_secs = args.sweep_interval_secs,
+        manager = %p.manager.get(),
+        authz = p.credential_file.get().is_some(),
+        direct_read = p.direct_read.get(),
+        workers,
+        sweep_interval_secs = params().sweep_interval_secs.get(),
         "autumn-s3 (unauthenticated) on http://{addr}"
     );
 
     let (reclaim_tx, reclaim_rx) = mpsc::unbounded();
     let (exit_tx, exit_rx) = std::sync::mpsc::channel();
-    for idx in 0..args.workers {
-        let args = Args {
-            manager: args.manager.clone(),
-            listen: args.listen.clone(),
-            port: args.port,
-            host: args.host.clone(),
-            credential_file: args.credential_file.clone(),
-            direct_read: args.direct_read,
-            workers: args.workers,
-            sweep_interval_secs: args.sweep_interval_secs,
-        };
+    for idx in 0..workers {
         let cred = credential.clone();
         let tx = reclaim_tx.clone();
-        spawn_role(format!("autumn-s3-{idx}"), exit_tx.clone(), move || serve_worker(idx, &args, cred, addr, tx))?;
+        spawn_role(format!("autumn-s3-{idx}"), exit_tx.clone(), move || serve_worker(idx, cred, addr, tx))?;
     }
     drop(reclaim_tx);
     {
-        let sweep_args = Args {
-            manager: args.manager.clone(),
-            listen: args.listen.clone(),
-            port: args.port,
-            host: args.host.clone(),
-            credential_file: args.credential_file.clone(),
-            direct_read: args.direct_read,
-            workers: args.workers,
-            sweep_interval_secs: args.sweep_interval_secs,
-        };
         let cred = credential.clone();
-        spawn_role("autumn-s3-sweep".into(), exit_tx.clone(), move || reclaim_worker(&sweep_args, cred, reclaim_rx))?;
+        spawn_role("autumn-s3-sweep".into(), exit_tx.clone(), move || reclaim_worker(cred, reclaim_rx))?;
     }
     // No thread returns while the gateway is healthy: a worker only on error,
     // the reclaimer only once every worker is gone. The first to stop ends the

@@ -14,18 +14,6 @@
 
 ## Active
 
-### F-PARAMS-REGISTRY — 参数分三类：写死 / 启动 flag / 运行时可由 autumn-op 覆盖
-- **Trigger** (2026-10-14 用户): gallery 等仍从 env 读参数；参数应分三类——代码里写死的、CLI 启动 flag、运行时可被 autumn-op 覆盖的（如在线改恢复速度）；写死参数非必要都应出现在 flag 里；要整理出可在运行时修改的参数。用户否决 `docs/params.md`：参数定义放在单独的 rs 文件里，不靠文档维护。
-- **Scope**:
-  1. 新 crate `crates/params`：每个角色一个 rs 文件，参数定义是唯一来源；flag 解析、`--help`、范围校验、运行时覆盖都从它生成。
-  2. rs 代码里的 env 读取全部改成 flag（gallery、manager 恢复限速/存活/连接超时、etcd 请求超时、EN 预分配/EC 条带、HOSTNAME）。
-  3. 删除 PS 死 flag；越界值、未知参数一律退出码 2（不再静默用默认值）。
-  4. 写死的运维旋钮提成 flag（manager/PS/EN/SDK/fs/fuse/autumnfs/s3/gallery/dashboard）；格式、协议不变量和互相绑死的超时不动。
-  5. authz 配置拉取周期 5 s → 30 s（flag）；遇未知 namespace / kid 立即补拉（限每秒一次）；EN 每进程拉一次而非每 shard。
-  6. 新 `MSG_GET_RUNTIME_CONFIG`，在同一拉取循环里取；覆盖值存 etcd，`autumn-op config list/get/set/unset`；生效顺序 覆盖值 > flag > 默认；运行时可改范围（用户定）：恢复/修复速度（manager、EN）与 PS 后台限速。
-- **Acceptance**: rs 非测试代码里无 `std::env::var`（RUST_LOG/UCX/jemalloc 库自身除外）；每个 binary 的 `--help` 列出全部参数及默认值；越界与未知参数退出码 2（测试）；新建 namespace 后第一次写在补拉后成功、无需等 30 s（测试）；`autumn-op config set` 恢复速度与 PS 限速在一个拉取周期内生效、`unset` 回到 flag 值、换主后仍在（集成测试 + 真集群）；未知 key 或越界值在 `config set` 时被拒；全量单测与 manager 集成套件通过；热路径改动做 perf A/B。
-- `passes: true`
-
 ### F-REAVALI-TAIL-COPY — re_avali 只补缺的尾部（延后：有内容错的风险）
 - **Trigger** (2026-10-14/15 用户, F-SEAL-LENGTH-AND-WRITE-OUTCOME): 实测 probe seal 漏掉的副本 1/10 次比 sealed_length 短（132,854 字节），re_avali 为此整份拷贝 2.57 GB、9.75 s。实现前发现风险，用户定先保留整份拷贝（2026-10-15）。
 - **Scope**: 只有"最后一次确认的提交点"之前各副本字节相同；之后漏掉的副本可能是别的副本没收到的 append，而 seal 保留的是另一批。直接补尾巴会得到长度对、内容错、被当成健康的副本。可行路：先取对端块校验和、本地重算对比，从第一个不一致块起拉（多读一遍本地盘）。（"EN 持久化收到的最大 header.commit 再从该点拉"不成立：header.commit 是租约起点不是已确认提交点，回绕可低于已见过的值——2026-10-15 评审。）依赖 BUG-SEAL-DIVERGENT-UNACKED-BYTES 的结论。

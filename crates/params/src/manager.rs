@@ -5,8 +5,30 @@ use crate::{GIB, MIB};
 const DAY: u64 = 86_400;
 
 crate::params! {
-    /// Every manager tunable. One instance per `AutumnManager`.
+    /// Every manager parameter. One instance per `AutumnManager`.
     pub struct ManagerParams("manager") {
+        // ── Process ──────────────────────────────────────────────────────
+        /// Listen port.
+        port: u16 = 9001;
+        /// Bind host.
+        listen: String = "0.0.0.0".into();
+        /// etcd endpoints (none = in memory only, lost on restart).
+        etcd: Vec<String>;
+        /// This manager's id in the membership; non-zero, required with --etcd.
+        manager_id: u64;
+        transport: crate::Transport;
+        /// Cluster secret; peer and admin connections prove it. The server
+        /// refuses to start without it.
+        cluster_secret_file: Option<std::path::PathBuf>;
+        /// Ed25519 signing keys (`autumn-op gen-signing-key`); turns on
+        /// data-plane authz.
+        auth_signing_key_file: Option<String>;
+        /// Policy preset armed on a fresh cluster.
+        auto_policy_default: Option<String>;
+        /// Short policy windows for dev/test clusters; explicit parameter
+        /// flags still win.
+        [switch] policy_fast_mode: bool;
+
         // ── Recovery and repair speed (runtime) ──────────────────────────
         /// Recoveries in flight across the cluster.
         [runtime] recovery_max_global: u32 = 64, [1, 100_000];
@@ -189,6 +211,15 @@ crate::params! {
         /// Shortest gap between two hot/cold advisories for one PS.
         hot_cold_cooldown_secs: i64 = 300, [0, 30 * DAY as i64];
     }
+
+    removed {
+        "auto-split" => "--auto-split was removed: use `autumn-op policy` + `autumn-op split`",
+        "auto-merge" => "--auto-merge was removed: use `autumn-op policy` + `autumn-op merge`",
+        "metrics-port" => "--metrics-port was removed: the manager serves no /metrics (Prometheus targets: autumn-op info --file-sd)",
+        "metrics-listen" => "--metrics-listen was removed: the manager serves no /metrics (Prometheus targets: autumn-op info --file-sd)",
+        "admin-token" => "--admin-token was removed: admin operations are authorized by the cluster secret (--cluster-secret-file)",
+        "admin-token-file" => "--admin-token-file was removed: admin operations are authorized by the cluster secret (--cluster-secret-file)",
+    }
 }
 
 impl ManagerParams {
@@ -210,6 +241,9 @@ impl ManagerParams {
 
 impl crate::CrossCheck for ManagerParams {
     fn cross_check(&self) -> Result<(), String> {
+        if !self.etcd.get().is_empty() && self.manager_id.get() == 0 {
+            return Err("--manager-id <N> (non-zero) is required with --etcd".into());
+        }
         if self.policy_required_buckets.get() > self.policy_window_buckets.get() {
             return Err(format!(
                 "--policy-required-buckets {} exceeds --policy-window-buckets {}",

@@ -3,8 +3,21 @@
 use crate::MIB;
 
 crate::params! {
-    /// Every autumnfs CLI tunable.
+    /// Every autumnfs CLI parameter.
     pub struct AutumnfsParams("autumnfs") {
+        // ── Process ──────────────────────────────────────────────────────
+        /// Manager endpoints.
+        manager: String = "127.0.0.1:9001".into();
+        transport: crate::Transport;
+        /// Credential file (`<principal>\n<hex>`, from `autumn-op
+        /// principal-create`); needed when the cluster protects `fs/`.
+        credential_file: Option<std::path::PathBuf>;
+        /// Read extents of 64 KiB and more straight from the extent nodes
+        /// (a failed direct read falls back to the PS).
+        direct_read: bool = true;
+        /// Lease identity suffix, `autumnfs-<host>` (default: the host name).
+        host: Option<String>;
+
         /// Fewest extents a download fetches per request.
         get_window_min_extents: usize = 8, [1, 4096];
         /// RAM ceiling of one download's reused buffers.
@@ -29,3 +42,4 @@ impl crate::CrossCheck for AutumnfsParams {
         Ok(())
     }
 }
+

@@ -10,6 +10,7 @@ default = []
 ucx = ["dep:ucx-sys-mini", "dep:socket2"]
 
 [dependencies]
+autumn-params = { path = "../params" }
 compio = { workspace = true, features = ["net", "io", "macros", "fs", "time"] }
 async-trait = "0.1"
 futures = "0.3"

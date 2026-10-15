@@ -7,6 +7,7 @@ use autumn_rpc::manager_rpc::{
     CODE_NOT_LEADER, CODE_OK, MSG_GET_CLUSTER_ID, MSG_REGISTER_NODE,
 };
 use autumn_stream::{ExtentNode, ExtentNodeConfig};
+use autumn_params::{Positional, Section};
 use autumn_transport::TransportKind;
 
 // allocator hygiene + read-perf fix. jemalloc (vs glibc) keeps the
@@ -40,235 +41,8 @@ static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 #[export_name = "_rjem_malloc_conf"]
 pub static malloc_conf: &[u8] = b"oversize_threshold:0\0";
 
-struct Args {
-    /// `--cluster-secret-file`: required. Peer and Admin connections prove it.
-    cluster_secret_file: Option<PathBuf>,
-    /// Primary (shard 0) listen port. Sibling shards use
-    /// `port + shard_idx * shard_stride` (default stride 10).
-    port: u16,
-    /// One or more data directories. Comma-separated or repeated --data flags.
-    /// every dir must be formatted via `autumn-op format` first;
-    /// the EN reads `disk_id` + `cluster_id` from each dir's sentinel
-    /// files. The old `--disk-id` CLI bypass is gone.
-    data_dirs: Vec<PathBuf>,
-    manager: Option<String>,
-    /// port stride between sibling shards. Shard count itself
-    /// is always `cpuset_len` — supply `--cpuset` to control it.
-    shard_stride: u16,
-    /// Bind host for the listener (IPv4 or bare/bracketed IPv6). Default 0.0.0.0.
-    bind_host: String,
-    transport: TransportKind,
-    /// explicit list of cores this binary may pin to, taskset
-    /// syntax (e.g. `4-11`, `0,2,4`, `0-3,8-11`). Overrides the
-    /// `core_affinity::get_core_ids()` snapshot. Multi-process clusters on
-    /// one host give each process a disjoint list.
-    cpuset: Option<Vec<usize>>,
-    /// control-plane listener port. None → derive as `port + 1000`.
-    /// Each shard binds its own control listener at
-    /// `control_port + shard_idx * shard_stride`. Operators only need
-    /// to override this when 1000 collides on a non-default deployment.
-    control_port: Option<u16>,
-    /// Append bursts of 1 MiB and more bypass the page cache for their aligned
-    /// part. On by default on Linux (off elsewhere, where there is no O_DIRECT
-    /// path); `--no-direct-io` turns it off. While on, startup fails if any
-    /// data dir's filesystem refuses O_DIRECT.
-    direct_io: bool,
-    /// Prometheus `/metrics` port. `None` = `--port` + 500; 0 = no endpoint.
-    /// One endpoint per PROCESS (shard gauges are aggregated by the renderer).
-    metrics_port: Option<u16>,
-    /// Bind host for /metrics only. `None` = follow `--listen`. The
-    /// endpoint is unauthenticated — operators exposing the RPC plane
-    /// on 0.0.0.0 can pin metrics to 127.0.0.1 with this.
-    metrics_listen: Option<String>,
-    /// M1: `HOST:PORT` this EN announces to the manager at
-    /// startup (HOST must be an IP — the binary stays DNS-free; the shell
-    /// resolves names). PORT is the shard-0 data port (== `--port`). When set
-    /// (and `--manager` is given), the EN self-registers its live location +
-    /// shard ports on every boot, so a changed shard-port layout (a reshard) or
-    /// a fresh pod IP is picked up automatically. When unset, the EN relies on
-    /// the location `autumn-op format` stamped (the pre-M1 behavior).
-    advertise: Option<String>,
-}
-
-fn usage() -> String {
-    format!(
-        "usage: autumn-extent-node --cluster-secret-file <PATH> --data <DIR[,DIR...]> [options]\n\
-         \n\
-         \x20 --data <dirs>               formatted data dirs (autumn-op format), comma-separated or repeated\n\
-         \x20 --port <n>                  shard 0 data port (default 9101)\n\
-         \x20 --shard-stride <n>          port stride between shards (default 10)\n\
-         \x20 --control-port <n>          control port of shard 0 (default port+1000)\n\
-         \x20 --manager <a,b,...>         manager endpoints (requires --advertise)\n\
-         \x20 --advertise <ip:port>       location announced to the manager\n\
-         \x20 --listen <host>             bind host (default 0.0.0.0)\n\
-         \x20 --transport tcp|ucx\n\
-         \x20 --cpuset <spec>             cores; shard count = number of cores\n\
-         \x20 --no-direct-io              no O_DIRECT for large append bursts\n\
-         \x20 --metrics-port <n>          /metrics port (default port+500, 0 = off)\n\
-         \x20 --metrics-listen <host>     /metrics bind host (default --listen)\n\
-         \n\
-         parameters:\n{}",
-        autumn_params::help::<autumn_params::en::EnParams>()
-    )
-}
-
-fn parse_args() -> Args {
-    let mut cluster_secret_file: Option<PathBuf> = None;
-    let mut port: u16 = 9101;
-    let mut data_dirs: Vec<PathBuf> = Vec::new();
-    let mut manager: Option<String> = None;
-    // `--shards` was removed. Shard count = cpuset_len; supply
-    // `--cpuset` to control it. `--shard-stride` survives as the
-    // port stride between sibling shards.
-    let mut shard_stride: u16 = 10;
-    let mut bind_host = String::from("0.0.0.0");
-    let mut transport = TransportKind::Tcp;
-    let mut cpuset: Option<Vec<usize>> = None;
-    // optional override; default = port + 1000.
-    let mut control_port: Option<u16> = None;
-    let mut metrics_port: Option<u16> = None;
-    let mut metrics_listen: Option<String> = None;
-    let mut direct_io = cfg!(target_os = "linux");
-    let mut advertise: Option<String> = None;
-    let params = autumn_stream::en_params();
-
-    let args: Vec<String> = std::env::args().collect();
-    let mut i = 1;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--help" | "-h" => {
-                print!("{}", usage());
-                std::process::exit(0);
-            }
-            "--cluster-secret-file" => {
-                i += 1;
-                cluster_secret_file = Some(PathBuf::from(&args[i]));
-            }
-            "--port" => {
-                i += 1;
-                port = args[i].parse().expect("--port must be a number");
-            }
-            "--data" => {
-                i += 1;
-                for part in args[i].split(',') {
-                    let p = part.trim();
-                    if !p.is_empty() {
-                        data_dirs.push(PathBuf::from(p));
-                    }
-                }
-            }
-            "--disk-id" => {
-                // --disk-id removed. Every data dir must be
-                // formatted via `autumn-op format` first; the EN reads
-                // `disk_id` from the dir's sentinel file. Print a
-                // migration error and exit 2, matching the --shards
-                // pattern below.
-                i += 1;
-                let _ = args[i].clone();
-                eprintln!(
-                    "error: --disk-id was removed. \
-                     Run `autumn-op format <DIR>...` \
-                     first; the EN reads disk_id from each dir's \
-                     `disk_id` sentinel file."
-                );
-                std::process::exit(2);
-            }
-            "--manager" => {
-                i += 1;
-                manager = Some(args[i].clone());
-            }
-            "--shards" => {
-                i += 1;
-                let _ = args[i].clone();
-                eprintln!(
-                    "error: --shards was removed; pass --cpuset <SPEC> to size the EN (shard count = cpuset_len)"
-                );
-                std::process::exit(2);
-            }
-            "--shard-stride" => {
-                i += 1;
-                shard_stride = args[i].parse().expect("--shard-stride must be a number");
-                assert!(shard_stride >= 1, "--shard-stride must be >= 1");
-            }
-            "--listen" => {
-                i += 1;
-                bind_host = args[i].clone();
-            }
-            "--transport" => {
-                i += 1;
-                transport =
-                    autumn_transport::parse_transport_flag(&args[i]).unwrap_or_else(|bad| {
-                        eprintln!("--transport must be `tcp` or `ucx`, got {bad:?}");
-                        std::process::exit(2);
-                    });
-            }
-            "--cpu-start" => {
-                eprintln!("error: --cpu-start was removed; pass --cpuset <SPEC> with the cores to use");
-                std::process::exit(2);
-            }
-            "--cpuset" => {
-                i += 1;
-                cpuset = Some(autumn_common::parse_cpuset(&args[i]).unwrap_or_else(|e| {
-                    eprintln!("--cpuset parse error: {e}");
-                    std::process::exit(2);
-                }));
-            }
-            "--control-port" => {
-                i += 1;
-                control_port = Some(args[i].parse().expect("--control-port must be a number"));
-            }
-            "--no-direct-io" => direct_io = false,
-            "--metrics-port" => {
-                i += 1;
-                metrics_port = Some(args[i].parse().expect("--metrics-port must be a port"));
-            }
-            "--metrics-listen" => {
-                i += 1;
-                metrics_listen = Some(args[i].clone());
-            }
-            "--advertise" => {
-                i += 1;
-                advertise = Some(args[i].clone());
-            }
-            other => match autumn_params::take_flag(params, other, args.get(i + 1).map(|s| s.as_str())) {
-                Ok(autumn_params::Flag::Taken) => i += 1,
-                Ok(autumn_params::Flag::Unknown) => {
-                    eprintln!("error: unknown argument {other:?}\n\n{}", usage());
-                    std::process::exit(2);
-                }
-                Err(e) => {
-                    eprintln!("error: {e}");
-                    std::process::exit(2);
-                }
-            },
-        }
-        i += 1;
-    }
-
-    if let Err(e) = autumn_params::CrossCheck::cross_check(params) {
-        eprintln!("error: {e}");
-        std::process::exit(2);
-    }
-    if data_dirs.is_empty() {
-        data_dirs.push(PathBuf::from("/tmp/autumn-extent"));
-    }
-
-    Args {
-        cluster_secret_file,
-        port,
-        data_dirs,
-        manager,
-        shard_stride,
-        bind_host,
-        transport,
-        cpuset,
-        control_port,
-        direct_io,
-        metrics_port,
-        metrics_listen,
-        advertise,
-    }
-}
+const USAGE: &str =
+    "usage: autumn-extent-node --cluster-secret-file <PATH> --data <DIR[,DIR...]> [options]";
 
 /// async manager cross-check. Connects to the manager once,
 /// fetches its cluster_id, and verifies it matches the value stamped
@@ -573,9 +347,15 @@ fn main() -> Result<()> {
         )
         .init();
 
-    let args = parse_args();
-    if let Err(e) = autumn_rpc::peer_auth::install_for_server(args.cluster_secret_file.as_deref())
-        .and_then(|()| match args.manager.as_deref() {
+    autumn_params::parse_or_exit(USAGE, &[autumn_stream::en_params() as &dyn Section], Positional::Refuse);
+    let p = autumn_stream::en_params();
+    let (manager, advertise, data, listen) =
+        (p.manager.get(), p.advertise.get(), p.data.get(), p.listen.get());
+    let (port, shard_stride, control_port) = (p.port.get(), p.shard_stride.get(), p.control_port.get());
+    let transport: TransportKind = p.transport.get().into();
+    let direct_io = p.direct_io();
+    if let Err(e) = autumn_rpc::peer_auth::install_for_server(p.cluster_secret_file.get().as_deref())
+        .and_then(|()| match manager.as_deref() {
             Some(m) => autumn_rpc::peer_auth::designate_managers(m),
             None => Ok(()),
         })
@@ -589,7 +369,7 @@ fn main() -> Result<()> {
     if !autumn_transport::set_regpool_cap_bytes(regpool_cap) {
         tracing::warn!(regpool_cap, "regpool cap already set (ignored — first-call-wins)");
     }
-    let _ = autumn_transport::init_with(args.transport);
+    let _ = autumn_transport::init_with(transport);
 
     // the EN is by far the biggest fd consumer — `ExtentNode::load_extents` opens every
     // owned extent's data file at startup and the fd-LRU cache keeps up to
@@ -637,7 +417,7 @@ fn main() -> Result<()> {
     // sentinel file before launching shard threads. The manager
     // cross-check happens inside the per-shard async block below
     // (needs a compio runtime to do an RPC).
-    let stamped_cluster_id = read_and_verify_cluster_id(&args.data_dirs)?;
+    let stamped_cluster_id = read_and_verify_cluster_id(&data)?;
     tracing::info!(
         cluster_id = %stamped_cluster_id,
         "data dirs verified consistent"
@@ -645,8 +425,8 @@ fn main() -> Result<()> {
     // --cpuset (if given) is installed BEFORE any cpu_pin reader
     // fires, so the cached core list reflects the override. Without
     // it the pool is `core_affinity::get_core_ids()`.
-    let cpuset_given = args.cpuset.is_some();
-    if let Some(cs) = args.cpuset.clone() {
+    let cpuset_given = p.cpuset.get().is_some();
+    if let Some(cs) = p.cpuset.get().map(|c| c.0) {
         let _ = autumn_common::set_cpuset(cs);
     }
     // `--cpuset` is the sole sizing surface. Shard count = cpuset_len
@@ -672,14 +452,14 @@ fn main() -> Result<()> {
 
     // each shard i listens on port + i * shard_stride.
     let shard_ports: Vec<u16> = (0..shards)
-        .map(|i| args.port + (i as u16) * args.shard_stride)
+        .map(|i| port + (i as u16) * shard_stride)
         .collect();
     // per-shard control port. Operator can override the shard-0
     // base via --control-port; per-shard stride matches data plane so
     // shard-N has its own control listener too.
-    let control_port_base = local_control_port(args.control_port, args.port)?;
+    let control_port_base = local_control_port(control_port, port)?;
     let control_ports: Vec<u16> = (0..shards)
-        .map(|i| control_port_base + (i as u16) * args.shard_stride)
+        .map(|i| control_port_base + (i as u16) * shard_stride)
         .collect();
 
     // M1c: --advertise is now REQUIRED whenever --manager is
@@ -695,7 +475,7 @@ fn main() -> Result<()> {
     // --port + i*stride locally). We warn (not fail) on a mismatch so a bare
     // typo surfaces without forbidding the legitimate proxy case. `advertise_port`
     // (Some when --advertise given) drives the REGISTERED shard_ports below.
-    let advertise_port: Option<u16> = match (args.manager.as_ref(), args.advertise.as_ref()) {
+    let advertise_port: Option<u16> = match (manager.as_ref(), advertise.as_ref()) {
         (Some(_), None) => {
             eprintln!(
                 "error: --advertise HOST:PORT is required when --manager is given \
@@ -706,10 +486,10 @@ fn main() -> Result<()> {
         }
         (_, Some(adv)) => match adv.parse::<std::net::SocketAddr>() {
             Ok(sa) => {
-                if sa.port() != args.port {
+                if sa.port() != port {
                     tracing::warn!(
                         advertise_port = sa.port(),
-                        listen_port = args.port,
+                        listen_port = port,
                         "advertise port differs from --port — assuming NAT/proxy; \
                          registered shard_ports derive from the advertise port"
                     );
@@ -730,12 +510,12 @@ fn main() -> Result<()> {
     let advertise_shard_ports: Vec<u16> = advertise_port
         .map(|ap| {
             (0..shards)
-                .map(|i| ap + (i as u16) * args.shard_stride)
+                .map(|i| ap + (i as u16) * shard_stride)
                 .collect()
         })
         .unwrap_or_default();
     let advertise_control_base: u16 = match advertise_port {
-        Some(ap) => advertise_control_port(args.control_port, ap)?,
+        Some(ap) => advertise_control_port(control_port, ap)?,
         None => 0,
     };
 
@@ -745,9 +525,9 @@ fn main() -> Result<()> {
     let sibling_addrs: Vec<String> = shard_ports
         .iter()
         .map(|p| {
-            autumn_transport::format_listen_addr(&args.bind_host, *p)
+            autumn_transport::format_listen_addr(&listen, *p)
                 .map(|sa| sa.to_string())
-                .unwrap_or_else(|_| format!("{}:{}", args.bind_host, p))
+                .unwrap_or_else(|_| format!("{}:{}", listen, p))
         })
         .collect();
 
@@ -762,14 +542,15 @@ fn main() -> Result<()> {
     // process-global atomics + the per-shard gauge slots each ExtentNode
     // registers at construction.
     let mut metrics_reach = String::new();
-    if let Some(mport) = autumn_common::metrics_http::metrics_port(args.metrics_port, args.port) {
-        let mhost = args.metrics_listen.as_deref().unwrap_or(&args.bind_host);
+    if let Some(mport) = autumn_common::metrics_http::metrics_port(p.metrics_port.get(), port) {
+        let metrics_listen = p.metrics_listen.get();
+        let mhost = metrics_listen.as_deref().unwrap_or(&listen);
         let render = std::sync::Arc::new(autumn_stream::render_en_metrics);
         match autumn_common::metrics_http::spawn_metrics_http(mhost, mport, render) {
             Ok(()) => {
                 // The advertised host when bound to every address; without
                 // --advertise the node is not registered and reports nothing.
-                let adv_host = args.advertise.as_deref().and_then(|a| a.rsplit_once(':')).map_or("", |(h, _)| h);
+                let adv_host = advertise.as_deref().and_then(|a| a.rsplit_once(':')).map_or("", |(h, _)| h);
                 metrics_reach = autumn_common::metrics_http::metrics_reach_addr(mhost, adv_host, mport);
                 tracing::info!(port = mport, host = mhost, reach = %metrics_reach, "metrics endpoint up at /metrics");
             }
@@ -780,7 +561,7 @@ fn main() -> Result<()> {
 
     if shards == 1 {
         // Single-shard fast path — preserve exact single-core behaviour.
-        return run_single_shard(args, stamped_cluster_id, metrics_reach);
+        return run_single_shard(stamped_cluster_id, metrics_reach);
     }
 
     // Multi-shard: spawn one OS thread per shard, each with its own compio
@@ -792,29 +573,28 @@ fn main() -> Result<()> {
     // when all of them did; a shard that fails first exits the process.
     let (bound_tx, bound_rx) = std::sync::mpsc::channel::<()>();
     // One authz config for the whole process, fetched by shard 0.
-    let shared_authz = autumn_stream::SharedAuthz::new(args.manager.is_some());
+    let shared_authz = autumn_stream::SharedAuthz::new(manager.is_some());
     for shard_idx in 0..shards {
-        let data_dirs = args.data_dirs.clone();
-        let manager = args.manager.clone();
+        let data_dirs = data.clone();
+        let manager = manager.clone();
         let stamped_cluster_id = stamped_cluster_id.clone();
         let siblings = sibling_addrs.clone();
         let shards_for_thread = shards;
         let listen_port = shard_ports[shard_idx as usize];
-        let bind_host = args.bind_host.clone();
+        let bind_host = listen.clone();
         let cpu = autumn_common::pick_cpu_for_ord(shard_idx as usize);
 
         let control_listen_port = control_ports[shard_idx as usize];
         // M1: shard 0 self-registers the live location. Capture
         // the full port vector + advertise + control base + transport (unused
         // by shards > 0).
-        let reg_advertise = args.advertise.clone();
+        let reg_advertise = advertise.clone();
         // Register the ADVERTISE-side (peer-reachable) ports, NOT the local
         // bind ports — they differ behind a proxy/NAT (see advertise_port above).
         let reg_shard_ports = advertise_shard_ports.clone();
         let reg_control_base = advertise_control_base;
-        let reg_transport = args.transport;
+        let reg_transport = transport;
         let reg_metrics_addr = metrics_reach.clone();
-        let direct_io = args.direct_io;
         let authz = shared_authz.clone();
         let bound_tx = bound_tx.clone();
         // Fail-stop: any shard exit (Err / panic / unexpected clean return)
@@ -980,7 +760,13 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn run_single_shard(args: Args, stamped_cluster_id: String, metrics_addr: String) -> Result<()> {
+fn run_single_shard(stamped_cluster_id: String, metrics_addr: String) -> Result<()> {
+    let p = autumn_stream::en_params();
+    let (manager, advertise, data, listen) =
+        (p.manager.get(), p.advertise.get(), p.data.get(), p.listen.get());
+    let (port, control_port) = (p.port.get(), p.control_port.get());
+    let transport: TransportKind = p.transport.get().into();
+    let direct_io = p.direct_io();
     let cpu = autumn_common::pick_cpu_for_ord(0);
     autumn_common::cpu_pin::pin_current(cpu).context("pin extent node")?;
     let rt = compio::runtime::RuntimeBuilder::new()
@@ -989,17 +775,17 @@ fn run_single_shard(args: Args, stamped_cluster_id: String, metrics_addr: String
     autumn_common::cpu_pin::confine_io_workers(&rt);
     tracing::info!(?cpu, "extent-node (single-shard) runtime ready");
     // control port defaults to port + 1000.
-    let ctl_port = local_control_port(args.control_port, args.port)?;
+    let ctl_port = local_control_port(control_port, port)?;
     rt.block_on(async move {
-        let addr = autumn_transport::format_listen_addr(&args.bind_host, args.port)
+        let addr = autumn_transport::format_listen_addr(&listen, port)
             .context("parse listen address")?;
         autumn_transport::check_listen_addr(addr, autumn_transport::current().kind()).ok();
-        let ctl_addr = autumn_transport::format_listen_addr(&args.bind_host, ctl_port)
+        let ctl_addr = autumn_transport::format_listen_addr(&listen, ctl_port)
             .context("parse control listen address")?;
 
         // manager cross-check (skipped when --manager is omitted).
         let mut reg_for_cfg: Option<(String, String, Vec<u16>)> = None;
-        if let Some(mgr) = args.manager.as_ref() {
+        if let Some(mgr) = manager.as_ref() {
             verify_manager_cluster_id(mgr, &stamped_cluster_id).await?;
             // M1: self-register live location before serving. A
             // single-shard node registers `[advertise_port]` — the PEER-reachable
@@ -1007,16 +793,16 @@ fn run_single_shard(args: Args, stamped_cluster_id: String, metrics_addr: String
             // and control = --control-port, else advertise_port + 1000
             // (`advertise_control_port`). main() already required
             // --advertise here, so the parse cannot fail.
-            if let Some(adv) = args.advertise.as_ref() {
+            if let Some(adv) = advertise.as_ref() {
                 let advertise_port = adv
                     .parse::<std::net::SocketAddr>()
                     .expect("--advertise validated in main()")
                     .port();
-                let (node_uuid, disk_uuids) = read_node_identity(&args.data_dirs)?;
+                let (node_uuid, disk_uuids) = read_node_identity(&data)?;
                 let req = build_register_req(
                     adv,
-                    args.transport,
-                    advertise_control_port(args.control_port, advertise_port)?,
+                    transport,
+                    advertise_control_port(control_port, advertise_port)?,
                     &node_uuid,
                     &disk_uuids,
                     &[advertise_port],
@@ -1026,8 +812,8 @@ fn run_single_shard(args: Args, stamped_cluster_id: String, metrics_addr: String
             }
         }
 
-        let mut config = ExtentNodeConfig::new_multi(args.data_dirs.clone());
-        if let Some(mgr) = args.manager.clone() {
+        let mut config = ExtentNodeConfig::new_multi(data.clone());
+        if let Some(mgr) = manager.clone() {
             config = config.with_manager_endpoint(mgr);
         }
         // M1b: echo identity in handle_df for the manager's
@@ -1035,7 +821,7 @@ fn run_single_shard(args: Args, stamped_cluster_id: String, metrics_addr: String
         if let Some((nu, adv, ports)) = reg_for_cfg {
             config = config.with_registration(nu, adv, ports).with_metrics_addr(metrics_addr);
         }
-        let config = config.with_direct_io(args.direct_io);
+        let config = config.with_direct_io(direct_io);
 
         let node = ExtentNode::new(config).await.context("create ExtentNode")?;
         node.serve_with_control(addr, ctl_addr, || {

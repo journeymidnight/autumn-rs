@@ -1,8 +1,9 @@
-//! `autumn-client` CLI argument parsing: `Command` / `Args` + the hand-rolled
-//! `parse_args` and its deprecation-warn helpers. Split out of `main.rs`
-//! (2026-06-25, behaviour-preserving). `usage()` / `warn_*_deprecated_once`
-//! stay private — only `parse_args` uses them; `Command` / `Args` / `parse_args`
-//! are `pub(crate)` for `main.rs`'s dispatcher.
+//! `autumn-client` CLI argument parsing. The global flags before the command
+//! are `ClientCliParams` + `ClientParams` (`autumn_params::parse_or_exit`); the
+//! command and its own flags are parsed here.
+
+use autumn_params::client_cli::ClientCliParams;
+use autumn_params::{Positional, Section};
 
 pub(crate) enum Command {
     /// stub that points to `autumn-op` (all op subcommands moved).
@@ -136,33 +137,39 @@ pub(crate) struct Args {
     pub(crate) credential_file: Option<String>,
 }
 
+/// The command list; `--help` and every usage error print it with the
+/// global flags after it.
+const USAGE: &str = "\
+Usage: autumn-client [options] <COMMAND>
+
+Data-plane commands (KV + bench):
+  put <KEY> <FILE>                  Put key with value from file
+  put-stream [--chunk-size N] <KEY> <FILE-or->>
+                                    Chunked stream put (default 4 MiB chunks)
+  get <KEY>                         Get value for key
+  get-stream [--chunk-size N] [--out FILE] <KEY>
+                                    Chunked stream get (default 4 MiB chunks)
+  del <KEY>                         Delete key
+  head <KEY>                        Get key metadata (size)
+  ls [--prefix P] [--start S] [--limit N]  List keys
+  perf-check [--threads 256] [--duration 10] [--size 4096] [--baseline perf_baseline.json] [--threshold 0.8] [--update-baseline] [--partitions N] [--pipeline-depth K]   (zero-copy auto on --transport ucx)
+                                    Quick write+read bench; warns if >threshold regression vs baseline
+  perf-clean [--dry-run] [--parallel 8]
+                                    Delete everything perf-check / ycsb wrote (the bench/perf scope)
+  ycsb [--threads 32] [--duration 30] [--size 1024] [--partitions N] [--pipeline-depth 16] [--read-ratio 0.5] [--key-dist zipfian|uniform] [--records 100000] [--rmw]
+                                    YCSB-equivalent mixed workload (A=0.5 B=0.95 C=1.0 D=0.95 F=--rmw); LOAD then mixed RUN
+
+Operator / admin commands moved to `autumn-op`:
+  bootstrap, set-stream-ec, force-ec-convert, split, merge,
+  compact, gc, forcegc, register-node, format, info, policy-candidates
+  Run `autumn-op --help` for the full list.
+";
+
 fn usage() -> ! {
-    eprintln!("Usage: autumn-client --manager <ADDR> [client parameters] <COMMAND>");
-    eprintln!();
-    eprintln!("Data-plane commands (KV + bench):");
-    eprintln!("  put <KEY> <FILE>                  Put key with value from file");
-    eprintln!("  put-stream [--chunk-size N] <KEY> <FILE-or->>");
-    eprintln!(
-        "                                    Chunked stream put (default 4 MiB chunks)"
+    eprint!(
+        "{}",
+        autumn_params::help_text(USAGE, &[&ClientCliParams::default() as &dyn Section, autumn_client::params()])
     );
-    eprintln!("  get <KEY>                         Get value for key");
-    eprintln!("  get-stream [--chunk-size N] [--out FILE] <KEY>");
-    eprintln!("                                    Chunked stream get (default 4 MiB chunks)");
-    eprintln!("  del <KEY>                         Delete key");
-    eprintln!("  head <KEY>                        Get key metadata (size)");
-    eprintln!("  ls [--prefix P] [--start S] [--limit N]  List keys");
-    eprintln!("  perf-check [--threads 256] [--duration 10] [--size 4096] [--baseline perf_baseline.json] [--threshold 0.8] [--update-baseline] [--partitions N] [--pipeline-depth K]   (zero-copy auto on --transport ucx)");
-    eprintln!("                                    Quick write+read bench; warns if >threshold regression vs baseline");
-    eprintln!("  perf-clean [--dry-run] [--parallel 8]");
-    eprintln!("                                    Delete everything perf-check / ycsb wrote (the bench/perf scope)");
-    eprintln!("  ycsb [--threads 32] [--duration 30] [--size 1024] [--partitions N] [--pipeline-depth 16] [--read-ratio 0.5] [--key-dist zipfian|uniform] [--records 100000] [--rmw]");
-    eprintln!("                                    YCSB-equivalent mixed workload (A=0.5 B=0.95 C=1.0 D=0.95 F=--rmw); LOAD then mixed RUN");
-    eprintln!();
-    eprintln!("Operator / admin commands moved to `autumn-op`:");
-    eprintln!("  bootstrap, set-stream-ec, force-ec-convert, split, merge,");
-    eprintln!("  compact, gc, forcegc, register-node, format, info, policy-candidates");
-    eprintln!("  Run `autumn-op --help` for the full list.");
-    eprintln!("\nclient parameters:\n{}", autumn_params::help::<autumn_params::client::ClientParams>());
     std::process::exit(1);
 }
 
@@ -205,58 +212,16 @@ fn parse_size(s: &str) -> usize {
 }
 
 pub(crate) fn parse_args() -> Args {
-    let raw: Vec<String> = std::env::args().collect();
-    let mut manager = String::from("127.0.0.1:9001");
-    let mut transport = autumn_transport::TransportKind::Tcp;
-    let mut namespace: Option<String> = None;
-    let mut credential_file: Option<String> = None;
-    let mut i = 1;
-
-    while i < raw.len() {
-        match raw[i].as_str() {
-            "--manager" => {
-                i += 1;
-                manager = val(&raw, i).to_owned();
-                i += 1;
-            }
-            // the key-prefix scope for data-plane KV cmds.
-            "--namespace" | "--scope" => {
-                i += 1;
-                namespace = Some(val(&raw, i).to_owned());
-                i += 1;
-            }
-            "--credential-file" => {
-                i += 1;
-                credential_file = Some(val(&raw, i).to_owned());
-                i += 1;
-            }
-            "--transport" => {
-                i += 1;
-                transport = autumn_transport::parse_transport_flag(val(&raw, i)).unwrap_or_else(|bad| {
-                    eprintln!("--transport must be `tcp` or `ucx`, got {bad:?}");
-                    std::process::exit(2);
-                });
-                i += 1;
-            }
-            "--help" | "-h" => usage(),
-            other => match autumn_params::take_flag(
-                autumn_client::params(),
-                other,
-                raw.get(i + 1).map(|s| s.as_str()),
-            ) {
-                Ok(autumn_params::Flag::Taken) => i += 2,
-                Ok(autumn_params::Flag::Unknown) => break,
-                Err(e) => {
-                    eprintln!("error: {e}");
-                    std::process::exit(2);
-                }
-            },
-        }
-    }
-
-    if i >= raw.len() {
+    let cli = ClientCliParams::default();
+    let raw = autumn_params::parse_or_exit(
+        USAGE,
+        &[&cli as &dyn Section, autumn_client::params()],
+        Positional::Stop,
+    );
+    if raw.is_empty() {
         usage();
     }
+    let mut i = 0;
 
     let subcmd = raw[i].as_str();
     i += 1;
@@ -669,11 +634,11 @@ pub(crate) fn parse_args() -> Args {
     };
 
     Args {
-        manager,
+        manager: cli.manager.get(),
         command,
-        transport,
-        namespace,
-        credential_file,
+        transport: cli.transport.get().into(),
+        namespace: cli.namespace.get(),
+        credential_file: cli.credential_file.get(),
     }
 }
 

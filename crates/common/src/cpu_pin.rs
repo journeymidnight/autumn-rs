@@ -40,46 +40,9 @@ pub fn set_cpuset(cores: Vec<usize>) -> bool {
     CPU_SET_OVERRIDE.set(v).is_ok()
 }
 
-/// parse a taskset-style cpu list spec into a sorted, deduped
-/// vector of core indices. Accepts `<int>` or `<int>-<int>` segments
-/// separated by commas, e.g. `"4"`, `"4-11"`, `"0-3,8,12-15"`. The
-/// `:groupsize/chunksize` advanced form is intentionally not supported.
-pub fn parse_cpuset(spec: &str) -> Result<Vec<usize>, String> {
-    let mut out: Vec<usize> = Vec::new();
-    for seg in spec.split(',') {
-        let seg = seg.trim();
-        if seg.is_empty() {
-            continue;
-        }
-        if let Some((lo, hi)) = seg.split_once('-') {
-            let lo: usize = lo
-                .trim()
-                .parse()
-                .map_err(|_| format!("cpuset range lo not a non-negative integer: {seg:?}"))?;
-            let hi: usize = hi
-                .trim()
-                .parse()
-                .map_err(|_| format!("cpuset range hi not a non-negative integer: {seg:?}"))?;
-            if hi < lo {
-                return Err(format!("cpuset range hi<lo: {seg:?}"));
-            }
-            for c in lo..=hi {
-                out.push(c);
-            }
-        } else {
-            let c: usize = seg
-                .parse()
-                .map_err(|_| format!("cpuset segment not a non-negative integer: {seg:?}"))?;
-            out.push(c);
-        }
-    }
-    if out.is_empty() {
-        return Err("cpuset is empty".to_string());
-    }
-    out.sort_unstable();
-    out.dedup();
-    Ok(out)
-}
+/// Taskset-style core list (`4`, `4-11`, `0-3,8,12-15`); the `--cpuset`
+/// argument type parses with it.
+pub use autumn_params::parse_cpuset;
 
 fn available_cpu_cores() -> &'static [usize] {
     static CELL: OnceLock<Vec<usize>> = OnceLock::new();

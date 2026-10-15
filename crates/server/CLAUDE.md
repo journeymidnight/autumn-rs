@@ -14,12 +14,16 @@ The benchmark is single-threaded and reports sampled operation latency (1/16).
 
 Binary-only crate: the executable entry points that wire the library crates together, plus one-off repair tooling. No library logic lives here.
 
-**Flags.** A binary parses its own structural flags (ports, addresses, files,
-cpuset) and offers every other argument to its role's parameter struct in
-`autumn-params` (`autumn_params::take_flag`). An unknown argument or a value
-outside a parameter's range exits 2; `--help` lists every parameter with its
-default and range from the same declarations. No binary reads a tunable from the
-environment.
+**Flags.** Every flag a binary takes is declared in `crates/params`: its
+role struct (`PsParams`, `EnParams`, `OpParams`, ...) holds every flag, its
+ports, addresses, files, cpuset and switches as well as its tunables. `main`
+hands it (plus the shared `fs` / `client` structs it embeds) to
+`autumn_params::parse_or_exit`, one pass over argv. An unknown argument,
+a bad or out-of-range value, a missing required flag (`--psid`, the EN's
+`--data`, autumn-s3's `--manager`, the dashboard's `--cluster-secret-file`,
+autumn-fuse's `--mountpoint`, migratev1_v2's `--etcd`) or a
+removed flag exits 2; `--help` lists every flag with its default and range from
+the same declarations. No binary reads a tunable from the environment.
 
 ## Binaries
 
@@ -181,7 +185,7 @@ Global `--cluster-secret-file` (position-independent): autumn-op connects as an 
 | Read / observability | `status` (fleet vs expected members, `--json`), `list-nodes` (incl. `FULL`: disks the node reports out of space), `df`, `extent-health [--node N] [--all]`, `list-ec-markers`, `recovery-stats`, `audit-log [--op N --node N --since/--until --limit L]`, `info [--part PID] [--detail]`, `info --file-sd` (every live PS / EN `/metrics` endpoint as Prometheus `file_sd` JSON, labelled `autumn_role` and `ps_id` / `node_id`), `policy-candidates` |
 | Node lifecycle | `fence-node <id> --reason ... --by ... [--force]`, `maintenance <id> --reason ... --by ... [--expire TS]`, `unfence <id> --by ...`, `remove <id> --by ...`, `ps-remove <ps_id> --by ...` (drop a stopped, evicted PS from the expected fleet; refused while it is registered) |
 | Cluster / partition admin | `bootstrap [--replication 3+0] [--log-ec K+M] [--row-ec K+M]`, `set-stream-ec --stream <ID> --ec K+M`, `force-ec-convert --extent <EXTID>`, `split <PARTID> [--namespace <NS[/SUB]> [--at S \| --at-hex H]] [--at-raw-hex H]`, `presplit --namespace <NS[/SUB]> <rule flags>`, `merge <SURVIVOR> <VICTIM> [--force]`, `rebalance`, `compact <PARTID>`, `gc [--ratio R --max-size B --stream-debt B --empty-only] <PARTID>`, `forcegc <PARTID> <EXTID>...`, `format <DIR>...` |
-| Auth / namespaces | `gen-cluster-secret`, `gen-signing-key [--kid K]`, `principal-create --principal P --grant P...`, `principal-delete --principal P`, `principal-list`, `mint-token [--principal P] (--credential HEX \| --credential-file F)` (the file, before or after the subcommand, is read once by `prescan_secret_flags` in a form that names its principal — what `principal-create` prints, or `<principal>\n<hex>`; that principal fills or must match `--principal`), `namespace-create --name N [--presplit hex,…]`, `namespace-delete --name N`, `namespace-list` |
+| Auth / namespaces | `gen-cluster-secret`, `gen-signing-key [--kid K]`, `principal-create --principal P --grant P...`, `principal-delete --principal P`, `principal-list`, `mint-token [--principal P] (--credential HEX \| --credential-file F)` (the file, a global flag before or after the subcommand, is read once in a form that names its principal — what `principal-create` prints, or `<principal>\n<hex>`; that principal fills or must match `--principal`), `namespace-create --name N [--presplit hex,…]`, `namespace-delete --name N`, `namespace-list` |
 | Auto-policy controller | `auto-policy status`, `auto-policy start <NAME>` (select and run; `activate` / `--arm` were removed with the observe mode and are refused), `auto-policy deactivate`, `auto-policy upsert <NAME> --switches split,gc,… [--interval N --cooldown N --max N --desc "…"]` (create/replace a custom policy), `auto-policy delete <NAME>`. Leader-routed |
 | Async op-ledger | `ops status <OP_ID>` (one op, `unknown` if this leader doesn't know it), `ops list [--active] [--kind split\|merge\|rebalance\|compact\|gc\|forcegc\|ec\|recovery] [--limit N]`. The seven op triggers above submit here + print an `op_id`; global `--wait` blocks to terminal. **`recovery` is auto-dispatched** (never submitted — submit refuses it): it appears on its own and, while still `running`, carries the last failure as `ERROR[code]: reason` — including the executing node's own reason, which arrives on the `df` heartbeat rather than waiting for the next re-dispatch. Leader-routed |
 
@@ -221,7 +225,7 @@ never succeed looks exactly like an empty open extent.
 
 `format` is IDENTITY-ONLY: no location flags — it stamps the sentinels and registers an EMPTY location; the EN self-registers its real location. `register-node` is a migration stub that hints and exits 1 before connecting.
 
-**CLI conventions (canonical + accepted aliases).** Both binaries hand-parse args (no clap; `autumn_op/args.rs`, `autumn_client/args.rs`). Canonical subcommands are kebab-case; the old snake_case / no-separator spellings stay as accepted aliases (`policy-candidates`←`policy_candidates`/`policy`, `auto-policy`←`auto_policy`, `put-stream`←`putstream`, `get-stream`←`getstream`). Canonical flag names per concept, with the older spelling kept as an alias: `--namespace` (←`--scope`, client KV scope). `split`/`presplit --namespace` take the same scope form (`kvc` or `kvc/acme`; each segment `[a-z0-9._-]+`); `presplit` picks its rule by the first segment. Byte-size flags accept an optional binary suffix (`4k`/`8m`/`1gib`) across both binaries (`gc --max-size`/`--stream-debt`, `perf-check`/`ycsb --size`). Three `autumn-client` subcommands are INTERNAL zero-copy verification paths, deliberately omitted from `usage()`: `put-bulk`, `direct-get`, `bulk-get` (they mirror `put`/`get` through the ZC codepaths). NOT YET unified (follow-ups): the verb-noun vs noun-verb split (`list-nodes`/`fence-node` vs `namespace-create`), and `split`'s three targeting flags (`--at`/`--at-hex`/`--at-raw-hex`).
+**CLI conventions (canonical + accepted aliases).** Every binary's flags are declared in `crates/params` (`params!`) and read by `autumn_params::parse_or_exit`; there is no clap. `autumn-op`'s global flags stand anywhere on the line (`Positional::Anywhere`), `autumn-client`'s and `autumnfs`'s before the command (`Positional::Stop`); the command and its own flags are hand-parsed (`autumn_op/args.rs`, `autumn_client/args.rs`, `autumnfs.rs`). Canonical subcommands are kebab-case; the old snake_case / no-separator spellings stay as accepted aliases (`policy-candidates`←`policy_candidates`/`policy`, `auto-policy`←`auto_policy`, `put-stream`←`putstream`, `get-stream`←`getstream`). Canonical flag names per concept, with the older spelling kept as an alias: `--namespace` (←`--scope`, client KV scope). `split`/`presplit --namespace` take the same scope form (`kvc` or `kvc/acme`; each segment `[a-z0-9._-]+`); `presplit` picks its rule by the first segment. Byte-size flags accept an optional binary suffix (`4k`/`8m`/`1gib`) across both binaries (`gc --max-size`/`--stream-debt`, `perf-check`/`ycsb --size`). Three `autumn-client` subcommands are INTERNAL zero-copy verification paths, deliberately omitted from `usage()`: `put-bulk`, `direct-get`, `bulk-get` (they mirror `put`/`get` through the ZC codepaths). NOT YET unified (follow-ups): the verb-noun vs noun-verb split (`list-nodes`/`fence-node` vs `namespace-create`), and `split`'s three targeting flags (`--at`/`--at-hex`/`--at-raw-hex`).
 
 ### `autumn-s3` (`src/bin/autumn_s3/`)
 

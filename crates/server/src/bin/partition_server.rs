@@ -1,9 +1,9 @@
 use anyhow::{Context, Result};
 #[cfg(unix)]
 extern crate libc;
-use autumn_params::ps::PsParams;
+use autumn_params::ps::PprofParams;
+use autumn_params::{Positional, Section};
 use autumn_partition_server::PartitionServer;
-use autumn_transport::TransportKind;
 
 // allocator hygiene + read-perf fix — see
 // crates/server/src/bin/extent_node.rs for the full rationale.
@@ -28,202 +28,16 @@ static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 #[export_name = "_rjem_malloc_conf"]
 pub static malloc_conf: &[u8] = b"oversize_threshold:0\0";
 
-struct Args {
-    /// `--cluster-secret-file`: required. Peer and Admin connections prove it.
-    cluster_secret_file: Option<std::path::PathBuf>,
-    port: u16,
-    psid: u64,
-    manager: String,
-    advertise: Option<String>,
-    bind_host: String,
-    transport: TransportKind,
-    /// the cores the whole PS runs on, taskset syntax (e.g. `4-11`,
-    /// `0,2,4`, `0-3,8-11`). None = the mask it was started with.
-    cpuset: Option<Vec<usize>>,
-    /// Prometheus `/metrics` port. `None` = `--port` + 500; 0 = no endpoint.
-    metrics_port: Option<u16>,
-    /// Bind host for /metrics only. `None` = follow `--listen`. The
-    /// endpoint is unauthenticated — operators exposing the RPC plane
-    /// on 0.0.0.0 can pin metrics to 127.0.0.1 with this.
-    metrics_listen: Option<String>,
-    #[cfg(feature = "profiling")]
-    pprof_secs: Option<u64>,
-    #[cfg(feature = "profiling")]
-    pprof_out: Option<String>,
-    #[cfg(feature = "profiling")]
-    pprof_threads: Option<String>,
-}
+const USAGE: &str = "usage: autumn-ps --psid <ID> --cluster-secret-file <PATH> [options]";
 
-fn usage() -> String {
-    format!(
-        "usage: autumn-ps --psid <ID> --cluster-secret-file <PATH> [options]\n\
-         \n\
-         \x20 --psid <id>                 partition server id (required, non-zero)\n\
-         \x20 --port <n>                  first partition's port; partition N binds port+N-1 (default 9201)\n\
-         \x20 --manager <a,b,...>         manager endpoints (default 127.0.0.1:9001)\n\
-         \x20 --listen <host>             bind host (default 0.0.0.0)\n\
-         \x20 --advertise <host:port>     address announced to the manager\n\
-         \x20 --transport tcp|ucx\n\
-         \x20 --cpuset <spec>             cores the whole PS runs on, like taskset; len = slot_cap\n\
-         \x20 --metrics-port <n>          /metrics port (default port+500, 0 = off)\n\
-         \x20 --metrics-listen <host>     /metrics bind host (default --listen)\n\
-         \n\
-         parameters:\n{}",
-        autumn_params::help::<PsParams>()
-    )
-}
-
-fn parse_args() -> Args {
-    let mut cluster_secret_file: Option<std::path::PathBuf> = None;
-    let mut port: u16 = 9201;
-    let mut psid: u64 = 0;
-    let mut manager = String::from("127.0.0.1:9001");
-    let mut advertise: Option<String> = None;
-    let mut bind_host = String::from("0.0.0.0");
-    let mut transport = TransportKind::Tcp;
-    let mut cpuset: Option<Vec<usize>> = None;
-    let mut metrics_port: Option<u16> = None;
-    let mut metrics_listen: Option<String> = None;
-    #[cfg(feature = "profiling")]
-    let mut pprof_secs: Option<u64> = None;
-    #[cfg(feature = "profiling")]
-    let mut pprof_out: Option<String> = None;
-    #[cfg(feature = "profiling")]
-    let mut pprof_threads: Option<String> = None;
-    let params = autumn_partition_server::params();
-
-    let args: Vec<String> = std::env::args().collect();
-    let mut i = 1;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--help" | "-h" => {
-                print!("{}", usage());
-                std::process::exit(0);
-            }
-            "--port" => {
-                i += 1;
-                port = args[i].parse().expect("--port must be a number");
-            }
-            "--cluster-secret-file" => {
-                i += 1;
-                cluster_secret_file = Some(args[i].clone().into());
-            }
-            "--psid" => {
-                i += 1;
-                psid = args[i].parse().expect("--psid must be a number");
-            }
-            "--manager" => {
-                i += 1;
-                manager = args[i].clone();
-            }
-            "--advertise" => {
-                i += 1;
-                advertise = Some(args[i].clone());
-            }
-            "--listen" => {
-                i += 1;
-                bind_host = args[i].clone();
-            }
-            "--transport" => {
-                i += 1;
-                transport =
-                    autumn_transport::parse_transport_flag(&args[i]).unwrap_or_else(|bad| {
-                        eprintln!("--transport must be `tcp` or `ucx`, got {bad:?}");
-                        std::process::exit(2);
-                    });
-            }
-            "--cpu-start" => {
-                eprintln!("error: --cpu-start was removed; pass --cpuset <SPEC> with the cores to use");
-                std::process::exit(2);
-            }
-            "--cpuset" => {
-                i += 1;
-                cpuset = Some(autumn_common::parse_cpuset(&args[i]).unwrap_or_else(|e| {
-                    eprintln!("--cpuset parse error: {e}");
-                    std::process::exit(2);
-                }));
-            }
-            "--metrics-port" => {
-                i += 1;
-                metrics_port = Some(args[i].parse().expect("--metrics-port must be a port"));
-            }
-            "--metrics-listen" => {
-                i += 1;
-                metrics_listen = Some(args[i].clone());
-            }
-            #[cfg(feature = "profiling")]
-            "--pprof-secs" => {
-                i += 1;
-                pprof_secs = Some(args[i].parse().expect("--pprof-secs u64"));
-            }
-            #[cfg(feature = "profiling")]
-            "--pprof-out" => {
-                i += 1;
-                pprof_out = Some(args[i].clone());
-            }
-            #[cfg(feature = "profiling")]
-            "--pprof-threads" => {
-                i += 1;
-                pprof_threads = Some(args[i].clone());
-            }
-            "--bg-rate-bytes-per-sec" => {
-                eprintln!(
-                    "error: --bg-rate-bytes-per-sec was removed. Use \
-                     --admission-compact-rate-bytes-per-sec + \
-                     --admission-gc-rate-bytes-per-sec instead."
-                );
-                std::process::exit(2);
-            }
-            // Never read by anything; the GC / compaction advisory thresholds
-            // and cooldowns are the manager's (`--gc-debt-high-bytes` etc.).
-            "--fg-qps-quota" | "--gc-debt-high-bytes" | "--compact-pending-high-bytes"
-            | "--gc-cooldown-secs" | "--compact-cooldown-secs" | "--min-pipeline-batch"
-            | "--conn-threads" => {
-                eprintln!("error: {} was removed: it had no effect on the PS", args[i]);
-                std::process::exit(2);
-            }
-            other => match autumn_params::take_flag(params, other, args.get(i + 1).map(|s| s.as_str())) {
-                Ok(autumn_params::Flag::Taken) => i += 1,
-                Ok(autumn_params::Flag::Unknown) => {
-                    eprintln!("error: unknown argument {other:?}\n\n{}", usage());
-                    std::process::exit(2);
-                }
-                Err(e) => {
-                    eprintln!("error: {e}");
-                    std::process::exit(2);
-                }
-            },
-        }
-        i += 1;
-    }
-
-    if psid == 0 {
-        eprintln!("error: --psid is required and must be non-zero");
-        std::process::exit(1);
-    }
-    if let Err(e) = autumn_params::CrossCheck::cross_check(params) {
-        eprintln!("error: {e}");
-        std::process::exit(2);
-    }
-
-    Args {
-        cluster_secret_file,
-        port,
-        psid,
-        manager,
-        advertise,
-        bind_host,
-        transport,
-        cpuset,
-        metrics_port,
-        metrics_listen,
-        #[cfg(feature = "profiling")]
-        pprof_secs,
-        #[cfg(feature = "profiling")]
-        pprof_out,
-        #[cfg(feature = "profiling")]
-        pprof_threads,
-    }
+/// Every flag lands in the process-wide `PsParams` or, in a `profiling`
+/// build, `PprofParams`.
+fn parse_args() -> PprofParams {
+    let ps: &dyn Section = autumn_partition_server::params();
+    let pprof = PprofParams::default();
+    let sections: &[&dyn Section] = if cfg!(feature = "profiling") { &[ps, &pprof] } else { &[ps] };
+    autumn_params::parse_or_exit(USAGE, sections, Positional::Refuse);
+    pprof
 }
 
 #[compio::main]
@@ -240,7 +54,7 @@ async fn main() -> Result<()> {
     // remaining AUTUMN_* in the operator's shell (e.g. for cluster.sh's
     // own use) are no longer the source of truth for binary config.
 
-    let args = parse_args();
+    let prof = parse_args();
 
     let params = autumn_partition_server::params();
     // Apply the regpool cap BEFORE any compio runtime / TLS pool init, so
@@ -249,58 +63,21 @@ async fn main() -> Result<()> {
         tracing::warn!("regpool cap already set (ignored — first-call-wins)");
     }
 
-    // ---- pprof CLI flags (replaces AUTUMN_PPROF_* env reads) ----
-    #[cfg(feature = "profiling")]
-    {
-        if let Some(secs) = args.pprof_secs {
-            if secs > 0 {
-                let out_path = args
-                    .pprof_out
-                    .clone()
-                    .unwrap_or_else(|| "/tmp/autumn_ps_pprof.svg".to_string());
-                let thread_filter = args.pprof_threads.clone();
-                std::thread::spawn(move || {
-                    let guard = pprof::ProfilerGuardBuilder::default()
-                        .frequency(99)
-                        .blocklist(&["libc", "libgcc", "pthread", "vdso"])
-                        .build()
-                        .expect("pprof guard");
-                    std::thread::sleep(std::time::Duration::from_secs(secs));
-                    let report = guard.report().build().expect("pprof report");
-                    let mut file = std::fs::File::create(&out_path).expect("pprof outfile");
-                    report.flamegraph(&mut file).expect("flamegraph write");
-                    if let Some(prefix) = thread_filter {
-                        let txt_path = format!("{}.threads.txt", out_path);
-                        if let Ok(mut txt) = std::fs::File::create(&txt_path) {
-                            use std::io::Write;
-                            for (frames, count) in &report.data {
-                                if frames.thread_name.starts_with(&prefix) {
-                                    writeln!(txt, "thread={} count={}", frames.thread_name, count)
-                                        .ok();
-                                }
-                            }
-                        }
-                    }
-                    eprintln!("[R2] pprof flamegraph written: {}", out_path);
-                });
-            }
-        }
-    }
-    // ---- end pprof hook ----
+    start_pprof(&prof);
 
     autumn_stream::set_read_hedge_ms(params.read_hedge_ms.get());
 
-    if let Err(e) = autumn_rpc::peer_auth::install_for_server(args.cluster_secret_file.as_deref())
-        .and_then(|()| autumn_rpc::peer_auth::designate_managers(&args.manager))
+    if let Err(e) = autumn_rpc::peer_auth::install_for_server(params.cluster_secret_file.get().as_deref())
+        .and_then(|()| autumn_rpc::peer_auth::designate_managers(&params.manager.get()))
     {
         eprintln!("error: {e}");
         std::process::exit(2);
     }
-    let _ = autumn_transport::init_with(args.transport);
+    let _ = autumn_transport::init_with(params.transport.get().into());
     autumn_rpc::client::set_prepared_zerocopy_min_bytes(params.tcp_zerocopy_min_bytes.get());
     // --cpuset (if given) is installed BEFORE any cpu_pin reader
     // fires, so the cached core list reflects the override.
-    if let Some(cs) = args.cpuset.clone() {
+    if let Some(cs) = params.cpuset.get().map(|c| c.0) {
         let _ = autumn_common::set_cpuset(cs);
     }
     // Before any thread is spawned, so every thread inherits the cpuset. The
@@ -344,26 +121,28 @@ async fn main() -> Result<()> {
             }
         }
     }
-    let addr = autumn_transport::format_listen_addr(&args.bind_host, args.port)
+    let (psid, port, listen, manager) =
+        (params.psid.get(), params.port.get(), params.listen.get(), params.manager.get());
+    let addr = autumn_transport::format_listen_addr(&listen, port)
         .context("parse listen address")?;
     autumn_transport::check_listen_addr(addr, autumn_transport::current().kind()).ok();
 
-    let advertise = args.advertise.unwrap_or_else(|| {
-        autumn_transport::format_listen_addr(&args.bind_host, args.port)
+    let advertise = params.advertise.get().unwrap_or_else(|| {
+        autumn_transport::format_listen_addr(&listen, port)
             .map(|sa| sa.to_string())
-            .unwrap_or_else(|_| format!("{}:{}", args.bind_host, args.port))
+            .unwrap_or_else(|_| format!("{listen}:{port}"))
     });
 
     tracing::info!(
         "autumn-ps starting: psid={}, first_part_port={}, manager={}, advertise={}",
-        args.psid,
+        psid,
         addr,
-        args.manager,
+        manager,
         advertise,
     );
     tracing::info!(
         "per-partition listener — partition N binds port={}+N-1",
-        args.port,
+        port,
     );
 
     // fix: use `_and_port` so `base_port` is set BEFORE `finish_connect`'s
@@ -375,8 +154,8 @@ async fn main() -> Result<()> {
         .map_or(advertise.as_str(), |(h, _)| h)
         .to_string();
     let ps = PartitionServer::connect_with_advertise_and_port(
-        args.psid,
-        &args.manager,
+        psid,
+        &manager,
         Some(advertise),
         addr,
     )
@@ -419,8 +198,9 @@ async fn main() -> Result<()> {
     }
 
     // /metrics on its own thread and runtime, reading the PS's atomics.
-    if let Some(mport) = autumn_common::metrics_http::metrics_port(args.metrics_port, args.port) {
-        let mhost = args.metrics_listen.as_deref().unwrap_or(&args.bind_host);
+    if let Some(mport) = autumn_common::metrics_http::metrics_port(params.metrics_port.get(), port) {
+        let metrics_listen = params.metrics_listen.get();
+        let mhost = metrics_listen.as_deref().unwrap_or(&listen);
         let m = ps.metrics();
         match autumn_common::metrics_http::spawn_metrics_http(mhost, mport, std::sync::Arc::new(move || m.render())) {
             Ok(()) => {
@@ -486,3 +266,39 @@ fn install_term_handler() {
     }
 }
 
+/// Writes a flamegraph `--pprof-secs` after start (`profiling` builds only).
+#[cfg(feature = "profiling")]
+fn start_pprof(prof: &PprofParams) {
+    let secs = prof.pprof_secs.get();
+    if secs > 0 {
+        let out_path = prof.pprof_out.get();
+        let thread_filter = prof.pprof_threads.get();
+        std::thread::spawn(move || {
+            let guard = pprof::ProfilerGuardBuilder::default()
+                .frequency(99)
+                .blocklist(&["libc", "libgcc", "pthread", "vdso"])
+                .build()
+                .expect("pprof guard");
+            std::thread::sleep(std::time::Duration::from_secs(secs));
+            let report = guard.report().build().expect("pprof report");
+            let mut file = std::fs::File::create(&out_path).expect("pprof outfile");
+            report.flamegraph(&mut file).expect("flamegraph write");
+            if let Some(prefix) = thread_filter {
+                let txt_path = format!("{}.threads.txt", out_path);
+                if let Ok(mut txt) = std::fs::File::create(&txt_path) {
+                    use std::io::Write;
+                    for (frames, count) in &report.data {
+                        if frames.thread_name.starts_with(&prefix) {
+                            writeln!(txt, "thread={} count={}", frames.thread_name, count)
+                                .ok();
+                        }
+                    }
+                }
+            }
+            eprintln!("[R2] pprof flamegraph written: {}", out_path);
+        });
+    }
+}
+
+#[cfg(not(feature = "profiling"))]
+fn start_pprof(_: &PprofParams) {}

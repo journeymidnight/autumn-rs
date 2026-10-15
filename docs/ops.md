@@ -87,20 +87,34 @@ Python `python/dashboard/` was retired 2026-07-04 — folded into the manager; s
 
 ## Parameters (flags)
 
-Every tunable of a binary is a flag, declared in `crates/params/src/<role>.rs`.
-No binary reads a tunable from the environment. `--help` lists each parameter
-with its default, its range, and `runtime` when it can also be changed while
-the process runs. Integer values accept `64M` / `1G` / `512k`.
+Every flag of every binary is declared in `crates/params/src/<role>.rs`, in
+one struct per binary: ports, addresses, files, ids and switches as well as
+the tunables. One parser reads them; no binary reads a tunable from the
+environment. `--help` lists each flag with its default and range, and `runtime`
+on a parameter that can also be changed while the process runs. Integer values
+accept `64M` / `1G` / `512k`; `--flag=value` works as well as `--flag value`.
 
 ```sh
-target/release/autumn-manager-server --help | less    # also autumn-ps, autumn-extent-node
-# A value outside the range, a missing value or an unknown flag exits 2 at once:
+target/release/autumn-ps --help | less
+# A bad or out-of-range value, a missing required flag, a removed or unknown
+# flag exits 2 at once, before anything starts:
 target/release/autumn-manager-server --recovery-max-global 0; echo "exit=$?"
 #   error: --recovery-max-global 0: 0 is outside [1, 100000]   exit=2
+target/release/autumn-manager-server --port x; echo "exit=$?"
+#   error: --port x: "x" is not a number                        exit=2
+target/release/autumn-ps --port 9201; echo "exit=$?"
+#   error: --psid is required                                   exit=2
+target/release/autumn-extent-node --data /x --shards 2; echo "exit=$?"
+#   error: --shards was removed; pass --cpuset <SPEC> ...       exit=2
 target/release/autumn-manager-server --no-such-flag 1; echo "exit=$?"
 #   error: unknown argument "--no-such-flag"                    exit=2
 cargo test -p autumn-server --test param_flags
 ```
+
+autumn-op's global flags (`--manager`, `--json`, `--wait`, `--timeout`,
+`--cluster-secret-file`, `--credential-file`, client parameters) stand anywhere
+on the line, before or after the command (`autumn-op compact 7 --wait --json`).
+autumn-client's and autumnfs's go before the command.
 
 `--policy-fast-mode` on the manager sets the short policy windows first, so an
 explicit flag after it still wins (`--policy-fast-mode --gc-cooldown-secs 600`).

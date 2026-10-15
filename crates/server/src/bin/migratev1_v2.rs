@@ -289,34 +289,16 @@ async fn convert_auto_policy_config(
     Ok(true)
 }
 
-const USAGE: &str = "usage: migratev1_v2 --etcd <http://host:2379[,…]> [--dry-run]";
-
 #[compio::main]
 async fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().collect();
-    let mut endpoints = String::new();
-    let mut dry_run = false;
-    let mut i = 1;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--etcd" => {
-                i += 1;
-                endpoints = args.get(i).cloned().unwrap_or_default();
-            }
-            "--dry-run" => dry_run = true,
-            other => {
-                eprintln!("unknown argument: {other}\n{USAGE}");
-                return ExitCode::FAILURE;
-            }
-        }
-        i += 1;
-    }
-    if endpoints.is_empty() {
-        eprintln!("{USAGE}");
-        return ExitCode::FAILURE;
-    }
-
-    let list: Vec<String> = endpoints.split(',').map(|s| s.trim().to_string()).collect();
+    let p = autumn_params::migrate::MigrateParams::default();
+    autumn_params::parse_or_exit(
+        "usage: migratev1_v2 --etcd <http://host:2379[,...]> [--dry-run]",
+        &[&p],
+        autumn_params::Positional::Refuse,
+    );
+    let (list, dry_run) = (p.etcd.get(), p.dry_run.get());
+    let endpoints = list.join(",");
     let client = match autumn_etcd::EtcdClient::connect_many(&list).await {
         Ok(c) => c,
         Err(e) => {

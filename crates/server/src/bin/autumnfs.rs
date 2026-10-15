@@ -34,7 +34,7 @@ use std::path::PathBuf;
 
 use anyhow::{anyhow, bail, Context, Result};
 use autumn_params::autumnfs::AutumnfsParams;
-use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
+use autumn_params::{Positional, Section};
 
 use std::os::unix::ffi::OsStrExt;
 
@@ -47,125 +47,102 @@ use autumn_fs::schema::{
     MAX_EXTENT, ROOT_INO,
 };
 
-#[derive(Parser, Debug)]
-#[command(
-    name = "autumnfs",
-    about = "POSIX-ish CLI over the autumn-rs fuse KV layout (no mount needed)"
-)]
-struct Args {
-    /// Manager address (comma-separated for HA).
-    #[arg(long, default_value = "127.0.0.1:9001")]
-    manager: String,
-
-    /// Transport: tcp (default) or ucx (if built with the ucx feature).
-    #[arg(long, default_value = "tcp")]
-    transport: String,
-
-    /// path to a file holding this client's authz credential
-    /// (`<principal>\n<hex>`, from `autumn-op principal-create`). REQUIRED when the
-    /// cluster protects the `fs/` namespace; omit on an authz-off cluster. Connects
-    /// via `connect_with_credential` (principal read from the file) and FAILS FAST
-    /// if it doesn't cover `fs/`. This CLI sees the WHOLE `fs/` namespace, same
-    /// as a mount.
-    #[arg(long)]
-    credential_file: Option<PathBuf>,
-
-    /// Read extents STRAIGHT from the extent nodes instead of proxying every
-    /// byte through the partition server (default true, same as a fuse mount).
-    /// Applies per extent at or above 64 KiB; anything smaller stays on the
-    /// proxy path, and ANY direct read that fails falls back to the proxy, so
-    /// this is a routing choice and never a correctness one. Turn it off when
-    /// the extent nodes' data ports are not reachable from this host — then
-    /// each large extent would pay a pointless redirect round trip first.
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
-    direct_read: bool,
-
-    /// Lease identity suffix (`autumnfs-<host>`; default: the machine's host name).
-    #[arg(long)]
-    host: Option<String>,
-
-    #[command(subcommand)]
-    cmd: Cmd,
-}
-
-/// autumnfs CLI tunables (`autumn_params::autumnfs`).
+/// autumnfs CLI parameters (`autumn_params::autumnfs`).
 fn params() -> &'static AutumnfsParams {
     static PARAMS: std::sync::LazyLock<AutumnfsParams> =
         std::sync::LazyLock::new(AutumnfsParams::default);
     &PARAMS
 }
 
-/// Take every parameter flag out of argv; clap parses the rest.
-fn parse_args() -> Args {
-    let argv: Vec<String> = std::env::args().collect();
-    let rest = autumn_params::split_params(argv, |a, v| {
-        autumn_params::take_any!(a, v, params(), autumn_fs::params(), autumn_client::params())
-    })
-    .unwrap_or_else(|e| {
-        eprintln!("error: {e}");
-        std::process::exit(2);
-    });
-    if let Err(e) = autumn_params::CrossCheck::cross_check(params()) {
-        eprintln!("error: {e}");
-        std::process::exit(2);
+const USAGE: &str = "\
+usage: autumnfs [options] <COMMAND>
+POSIX-ish CLI over the autumn-rs fuse KV layout (no mount needed).
+
+commands:
+  ls [-l|--long] [PATH]    list a directory (default /)
+  stat <PATH>              inode metadata
+  mkdir <PATH>             create a directory (parents must exist)
+  cat <PATH>               print a file to stdout
+  put <LOCAL> <REMOTE>     upload a local file
+  get <REMOTE> <LOCAL>     download a file (LOCAL `-` = stdout)
+  rm <PATH>                remove a file or empty directory
+  touch <PATH>             create an empty file";
+
+/// Global flags land in the parameter structs; the words from the command on
+/// are the command.
+fn parse_args() -> Cmd {
+    let sections: &[&dyn Section] = &[params(), autumn_fs::params(), autumn_client::params()];
+    let rest = autumn_params::parse_or_exit(USAGE, sections, Positional::Stop);
+    if rest.iter().any(|w| w == "-h" || w == "--help") {
+        print!("{}", autumn_params::help_text(USAGE, sections));
+        std::process::exit(0);
     }
-    let help = format!(
-        "parameters:\n{}{}{}",
-        autumn_params::help::<AutumnfsParams>(),
-        autumn_params::help::<autumn_params::fs::FsParams>(),
-        autumn_params::help::<autumn_params::client::ClientParams>()
-    );
-    let matches = Args::command().after_help(help).get_matches_from(rest);
-    Args::from_arg_matches(&matches).unwrap_or_else(|e| e.exit())
+    Cmd::parse(&rest).unwrap_or_else(|e| {
+        eprintln!("error: {e}\n\n{USAGE}");
+        std::process::exit(2);
+    })
 }
 
-#[derive(Subcommand, Debug)]
+#[derive(Debug, PartialEq)]
 enum Cmd {
-    /// List a directory's entries (default `/`).
-    Ls {
-        #[arg(default_value = "/")]
-        path: String,
-        /// Long format: include mode/size/mtime.
-        #[arg(short, long)]
-        long: bool,
-    },
-    /// Show inode metadata for a path.
+    Ls { path: String, long: bool },
     Stat { path: String },
-    /// Create a directory (parents must exist).
     Mkdir { path: String },
-    /// Print a file's contents to stdout.
     Cat { path: String },
-    /// Upload a local file to the cluster.
-    Put {
-        local: PathBuf,
-        /// Destination path in the autumn fs. Parents must exist.
-        remote: String,
-    },
-    /// Download a cluster file to local disk.
-    Get {
-        remote: String,
-        /// Local destination path. Use `-` for stdout.
-        local: PathBuf,
-    },
-    /// Remove a file or empty directory.
+    Put { local: PathBuf, remote: String },
+    Get { remote: String, local: PathBuf },
     Rm { path: String },
-    /// Create an empty file (no-op if it already exists).
     Touch { path: String },
 }
 
+impl Cmd {
+    fn parse(words: &[String]) -> Result<Cmd, String> {
+        let Some((sub, rest)) = words.split_first() else {
+            return Err("a command is required".into());
+        };
+        let rest: Vec<&str> = rest.iter().map(String::as_str).collect();
+        let one = |rest: &[&str]| match rest {
+            [p] => Ok(p.to_string()),
+            _ => Err(format!("{sub} takes one <PATH>")),
+        };
+        Ok(match sub.as_str() {
+            "ls" => {
+                let long = rest.iter().any(|w| matches!(*w, "-l" | "--long"));
+                let paths: Vec<&str> =
+                    rest.iter().copied().filter(|w| !matches!(*w, "-l" | "--long")).collect();
+                let path = match paths[..] {
+                    [] => "/".to_string(),
+                    [p] => p.to_string(),
+                    _ => return Err("ls takes at most one PATH".into()),
+                };
+                Cmd::Ls { path, long }
+            }
+            "stat" => Cmd::Stat { path: one(&rest)? },
+            "mkdir" => Cmd::Mkdir { path: one(&rest)? },
+            "cat" => Cmd::Cat { path: one(&rest)? },
+            "rm" => Cmd::Rm { path: one(&rest)? },
+            "touch" => Cmd::Touch { path: one(&rest)? },
+            "put" => match rest[..] {
+                [l, r] => Cmd::Put { local: l.into(), remote: r.to_string() },
+                _ => return Err("put takes <LOCAL> <REMOTE>".into()),
+            },
+            "get" => match rest[..] {
+                [r, l] => Cmd::Get { remote: r.to_string(), local: l.into() },
+                _ => return Err("get takes <REMOTE> <LOCAL>".into()),
+            },
+            other => return Err(format!("unknown command {other:?}")),
+        })
+    }
+}
+
 fn main() -> Result<()> {
-    let args = parse_args();
+    let cmd = parse_args();
+    let p = params();
     if !autumn_transport::set_regpool_cap_bytes(autumn_client::params().ucx_regpool_cap_bytes.get()) {
         tracing::warn!("regpool cap already set (ignored — first-call-wins)");
     }
     // Stand up the same transport selector autumn-client uses everywhere.
-    let kind = match args.transport.as_str() {
-        "tcp" => autumn_transport::TransportKind::Tcp,
-        #[cfg(feature = "ucx")]
-        "ucx" => autumn_transport::TransportKind::Ucx,
-        other => bail!("unknown transport: {other}"),
-    };
-    let _ = autumn_transport::init_with(kind);
+    let _ = autumn_transport::init_with(p.transport.get().into());
 
     let rt = compio::runtime::RuntimeBuilder::new()
         .build()
@@ -175,7 +152,7 @@ fn main() -> Result<()> {
         // the binding prepends `fs/` to every relative fuse key (and strips it off
         // range results), so a write here is visible to a fuse mount. Every
         // `key::*`-based op below is unchanged; the client owns the prefix.
-        let cluster = match &args.credential_file {
+        let cluster = match &p.credential_file.get() {
             Some(path) => {
                 let (principal, secret) = autumn_client::read_credential_file(path)
                     .context("--credential-file")?;
@@ -183,7 +160,7 @@ fn main() -> Result<()> {
                     bail!("--credential-file: missing principal name (expected '<principal>\\n<hex>')");
                 }
                 ClusterClient::connect_with_credential(
-                    &args.manager,
+                    &p.manager.get(),
                     "fs",
                     principal,
                     secret,
@@ -191,7 +168,7 @@ fn main() -> Result<()> {
                 .await
                 .context("connect to manager (with credential)")?
             }
-            None => ClusterClient::connect(&args.manager, "fs")
+            None => ClusterClient::connect(&p.manager.get(), "fs")
                 .await
                 .context("connect to manager")?,
         };
@@ -209,21 +186,21 @@ fn main() -> Result<()> {
         // `ensure_root` also verifies (or stamps) the filesystem's schema
         // version, so this build refuses a layout it cannot read instead of
         // decoding it wrong — which the CLI's own copy of this step never did.
-        let host = args.host.clone().unwrap_or_else(autumn_fs::state::system_hostname);
+        let host = p.host.get().unwrap_or_else(autumn_fs::state::system_hostname);
         let mut state = FsState::from_client(cluster, format!("autumnfs-{host}"));
         meta::ensure_root(&mut state).await?;
         let cluster = state.client.clone();
 
-        match args.cmd {
+        match cmd {
             Cmd::Ls { path, long } => cmd_ls(&cluster, &path, long).await,
             Cmd::Stat { path } => cmd_stat(&cluster, &path).await,
             Cmd::Mkdir { path } => cmd_mkdir(&cluster, &path).await,
-            Cmd::Cat { path } => cmd_cat(&cluster, &path, args.direct_read).await,
+            Cmd::Cat { path } => cmd_cat(&cluster, &path, p.direct_read.get()).await,
             Cmd::Put { local, remote } => {
                 cmd_put(&cluster, &local, &remote).await
             }
             Cmd::Get { remote, local } => {
-                cmd_get(&cluster, &remote, &local, args.direct_read).await
+                cmd_get(&cluster, &remote, &local, p.direct_read.get()).await
             }
             Cmd::Rm { path } => cmd_rm(&mut state, &path).await,
             Cmd::Touch { path } => cmd_touch(&cluster, &path).await,
@@ -1110,6 +1087,19 @@ async fn cmd_rm(state: &mut FsState, path: &str) -> Result<()> {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    #[test]
+    fn commands_parse_like_the_usage_says() {
+        let p = |s: &str| Cmd::parse(&s.split_whitespace().map(String::from).collect::<Vec<_>>());
+        assert_eq!(p("ls"), Ok(Cmd::Ls { path: "/".into(), long: false }));
+        assert_eq!(p("ls -l /d"), Ok(Cmd::Ls { path: "/d".into(), long: true }));
+        assert_eq!(p("ls /d --long"), Ok(Cmd::Ls { path: "/d".into(), long: true }));
+        assert_eq!(p("put a /b"), Ok(Cmd::Put { local: "a".into(), remote: "/b".into() }));
+        assert_eq!(p("get /b -"), Ok(Cmd::Get { remote: "/b".into(), local: "-".into() }));
+        for bad in ["", "stat", "stat a b", "ls a b", "put a", "frob x"] {
+            assert!(p(bad).is_err(), "{bad:?} accepted");
+        }
+    }
 
     /// A `Read` that hands back at most `step` bytes per call — models a socket
     /// / pipe that returns short reads WITHOUT EOF. `read_full_chunk` must keep

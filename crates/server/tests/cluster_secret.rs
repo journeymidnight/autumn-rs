@@ -127,9 +127,10 @@ fn run_op(args: &[&str]) -> std::process::Output {
 
 #[test]
 fn servers_refuse_to_start_without_the_secret() {
-    for bin in [MANAGER_BIN, EXTENT_NODE_BIN] {
+    for (bin, extra) in [(MANAGER_BIN, &[][..]), (EXTENT_NODE_BIN, &["--data", "/nonexistent"])] {
         let out = Command::new(bin)
             .args(["--port", &pick_port().to_string(), "--listen", "127.0.0.1"])
+            .args(extra)
             .output()
             .expect("run server");
         assert_eq!(out.status.code(), Some(2), "{bin} started without a secret");

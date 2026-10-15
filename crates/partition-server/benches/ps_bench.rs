@@ -85,11 +85,12 @@ impl Config {
                 _ => {}
             }
         }
-        let kind = autumn_transport::parse_transport_flag(&c.transport).unwrap_or_else(|bad| {
-            eprintln!("--transport must be `tcp` or `ucx`, got {bad:?}");
+        let mut kind = autumn_params::Transport::default();
+        if let Err(e) = autumn_params::ArgValue::set(&mut kind, &c.transport) {
+            eprintln!("--transport: {e}");
             std::process::exit(2);
-        });
-        let _ = autumn_transport::init_with(kind);
+        }
+        let _ = autumn_transport::init_with(kind.into());
         c
     }
 }

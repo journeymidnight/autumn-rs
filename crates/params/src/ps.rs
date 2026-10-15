@@ -4,8 +4,31 @@
 use crate::{GIB, KIB, MIB};
 
 crate::params! {
-    /// Every partition-server tunable.
+    /// Every partition-server parameter.
     pub struct PsParams("ps") {
+        // ── Process ──────────────────────────────────────────────────────
+        /// Partition server id (non-zero).
+        [required] psid: u64, [1, u64::MAX];
+        /// First partition's port; partition N binds port+N-1.
+        port: u16 = 9201;
+        /// Manager endpoints.
+        manager: String = "127.0.0.1:9001".into();
+        /// Bind host.
+        listen: String = "0.0.0.0".into();
+        /// Address announced to the manager (default: the listen address).
+        advertise: Option<String>;
+        transport: crate::Transport;
+        /// Cluster secret; peer and admin connections prove it. The server
+        /// refuses to start without it.
+        cluster_secret_file: Option<std::path::PathBuf>;
+        /// Cores the whole PS runs on, like taskset; its size is the slot cap
+        /// (default: the mask it was started with).
+        cpuset: Option<crate::CpuSet>;
+        /// /metrics port (default port+500, 0 = off).
+        metrics_port: Option<u16>;
+        /// /metrics bind host (default: --listen).
+        metrics_listen: Option<String>;
+
         // ── Background work speed (runtime) ──────────────────────────────
         /// Per-partition foreground byte rate cap (0 = unlimited).
         [runtime] fg_rate_bytes_per_sec: u64 = GIB, [0, u64::MAX];
@@ -162,6 +185,18 @@ crate::params! {
         /// Log the UCX pool every this many seconds (0 = off).
         regpool_log_interval_secs: u64 = 0, [0, 86_400];
     }
+
+    removed {
+        "cpu-start" => "--cpu-start was removed; pass --cpuset <SPEC> with the cores to use",
+        "bg-rate-bytes-per-sec" => "--bg-rate-bytes-per-sec was removed: use --admission-compact-rate-bytes-per-sec and --admission-gc-rate-bytes-per-sec",
+        "fg-qps-quota" => "--fg-qps-quota was removed: it had no effect on the PS",
+        "gc-debt-high-bytes" => "--gc-debt-high-bytes was removed from the PS: it is a manager parameter",
+        "compact-pending-high-bytes" => "--compact-pending-high-bytes was removed from the PS: it is a manager parameter",
+        "gc-cooldown-secs" => "--gc-cooldown-secs was removed from the PS: it is a manager parameter",
+        "compact-cooldown-secs" => "--compact-cooldown-secs was removed from the PS: it is a manager parameter",
+        "min-pipeline-batch" => "--min-pipeline-batch was removed: it had no effect on the PS",
+        "conn-threads" => "--conn-threads was removed: it had no effect on the PS",
+    }
 }
 
 impl crate::CrossCheck for PsParams {
@@ -183,3 +218,17 @@ impl crate::CrossCheck for PsParams {
         Ok(())
     }
 }
+
+crate::params! {
+    /// autumn-ps flamegraph parameters; only a `profiling` build accepts them.
+    pub struct PprofParams("pprof") {
+        /// Profile this many seconds after start (0 = off).
+        pprof_secs: u64;
+        /// Flamegraph output path.
+        pprof_out: String = "/tmp/autumn_ps_pprof.svg".into();
+        /// Also write per-thread sample counts for threads with this name prefix.
+        pprof_threads: Option<String>;
+    }
+}
+
+impl crate::CrossCheck for PprofParams {}

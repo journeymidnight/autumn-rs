@@ -21,7 +21,6 @@ use std::io;
 use std::net::SocketAddr;
 use std::sync::OnceLock;
 
-mod probe;
 mod tcp;
 mod zerocopy;
 #[cfg(feature = "ucx")]
@@ -35,7 +34,6 @@ mod ucx;
 #[path = "ucx/regpool.rs"]
 mod regpool;
 
-pub use probe::parse_transport_flag;
 pub use regpool::{
     acquire as regpool_acquire, set_regpool_cap_bytes,
     snapshot as regpool_snapshot, PooledBuf, RegpoolStats,
@@ -279,6 +277,15 @@ fn is_link_local(ip: &std::net::IpAddr) -> bool {
 pub enum TransportKind {
     Tcp,
     Ucx,
+}
+
+impl From<autumn_params::Transport> for TransportKind {
+    fn from(t: autumn_params::Transport) -> Self {
+        match t {
+            autumn_params::Transport::Tcp => TransportKind::Tcp,
+            autumn_params::Transport::Ucx => TransportKind::Ucx,
+        }
+    }
 }
 
 #[async_trait::async_trait(?Send)]

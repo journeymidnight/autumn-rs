@@ -4,8 +4,38 @@
 use crate::{GIB, KIB, MIB};
 
 crate::params! {
-    /// Every extent-node tunable.
+    /// Every extent-node parameter.
     pub struct EnParams("en") {
+        // ── Process ──────────────────────────────────────────────────────
+        /// Data dirs formatted by `autumn-op format`; comma-separated or repeated.
+        [required] data: Vec<std::path::PathBuf>;
+        /// Shard 0 data port; shard i binds port + i * shard-stride.
+        port: u16 = 9101;
+        /// Port stride between shards.
+        shard_stride: u16 = 10, [1, u16::MAX];
+        /// Control port of shard 0 (default port+1000).
+        control_port: Option<u16>;
+        /// Manager endpoints (requires --advertise).
+        manager: Option<String>;
+        /// `IP:PORT` announced to the manager at startup; PORT is --port.
+        advertise: Option<String>;
+        /// Bind host.
+        listen: String = "0.0.0.0".into();
+        transport: crate::Transport;
+        /// Cluster secret; peer and admin connections prove it. The server
+        /// refuses to start without it.
+        cluster_secret_file: Option<std::path::PathBuf>;
+        /// Cores, like taskset; one shard per core (default: the mask it was
+        /// started with).
+        cpuset: Option<crate::CpuSet>;
+        /// No O_DIRECT for append bursts of 1 MiB and more (on by default on
+        /// Linux).
+        [switch] no_direct_io: bool;
+        /// /metrics port (default port+500, 0 = off).
+        metrics_port: Option<u16>;
+        /// /metrics bind host (default: --listen).
+        metrics_listen: Option<String>;
+
         // ── Recovery and scrub speed (runtime) ───────────────────────────
         /// Recoveries (replica rebuilds) running at once per shard.
         [runtime] recovery_parallelism: usize = 2, [1, 16];
@@ -57,6 +87,19 @@ crate::params! {
         /// UCX registered buffer pool cap per thread.
         ucx_regpool_cap_bytes: usize = 512 * MIB as usize, [16 * MIB as usize, 64 * GIB as usize];
     }
+
+    removed {
+        "cpu-start" => "--cpu-start was removed; pass --cpuset <SPEC> with the cores to use",
+        "shards" => "--shards was removed; pass --cpuset <SPEC> to size the EN (shard count = cpuset_len)",
+        "disk-id" => "--disk-id was removed. Run `autumn-op format <DIR>...` first; the EN reads disk_id from each dir's `disk_id` sentinel file.",
+    }
 }
 
 impl crate::CrossCheck for EnParams {}
+
+impl EnParams {
+    /// O_DIRECT for large append bursts: on by default, and only on Linux.
+    pub fn direct_io(&self) -> bool {
+        cfg!(target_os = "linux") && !self.no_direct_io.get()
+    }
+}

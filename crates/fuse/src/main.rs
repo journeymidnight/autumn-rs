@@ -5,11 +5,9 @@
 //! - A single compio thread owns ClusterClient and awaits rx.next() on the event loop
 //! - A timeout on rx.next (`--dirty-sync-secs`) drives the periodic dirty-inode flush without busy-polling
 
-use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use clap::{CommandFactory, FromArgMatches, Parser};
 use futures::StreamExt;
 use tracing_subscriber::EnvFilter;
 
@@ -18,95 +16,9 @@ use autumn_fuse::dispatch;
 use autumn_fuse::ops::AutumnFs;
 use autumn_fs::state::FsState;
 use autumn_fs::write;
+use autumn_params::{Positional, Section};
 
-#[derive(Parser)]
-#[command(
-    name = "autumn-fuse",
-    about = "Mount autumn-rs KV store as a POSIX filesystem"
-)]
-struct Args {
-    /// Manager address (host:port)
-    #[arg(long, default_value = "127.0.0.1:9001")]
-    manager: String,
-
-    /// Mount point
-    #[arg(long)]
-    mountpoint: PathBuf,
-
-    /// path to a file holding this mount's authz credential
-    /// (`<principal>\n<hex>`, from `autumn-op principal-create`). REQUIRED when the
-    /// cluster protects the `fs/` namespace; omit on an authz-off cluster. The
-    /// mount connects via `connect_with_credential` (principal read from the file)
-    /// and FAILS FAST if the credential doesn't cover `fs/`. A mount covers the
-    /// WHOLE `fs/` namespace.
-    #[arg(long)]
-    credential_file: Option<PathBuf>,
-
-    /// Allow other users to access the mount
-    #[arg(long, default_value = "false")]
-    allow_other: bool,
-
-    /// Transport backend: `tcp` (default) or `ucx`. Must match the cluster's
-    /// transport (the ClusterClient talks to the PS over it).
-    #[arg(long, default_value = "tcp")]
-    transport: String,
-
-    /// read whole extents (≥ 64 KiB) STRAIGHT from an extent
-    /// node, bypassing the PS on the large-value data path (`get_many_direct`).
-    /// A cross-host throughput win for large-file (model) serving: the PS NIC
-    /// egress leaves the read path. Size-gated per read (< 64 KiB stays on the
-    /// PS proxy), and SAFE even when ENs are unreachable — each large read
-    /// falls back to the PS proxy (the client warns once). DEFAULT ON; disable
-    /// with `--direct-read false` on a topology that keeps EN data ports on a
-    /// PS-only subnet (fallback works but wastes one redirect RTT per extent).
-    // `action = Set` is what makes `--direct-read false` actually parse. With
-    // clap 4's derive, a plain `bool` field becomes a valueless SetTrue flag and
-    // `default_value = "true"` is inert — so the form this flag's own help text
-    // and startup log both tell operators to use was rejected with "unexpected
-    // argument 'false'", and there was NO way to turn direct reads off. That
-    // matters more than a usability wart: the size-gated EN-direct path is the
-    // one an operator needs to disable when it misbehaves, and the escape hatch
-    // was documented but absent.
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
-    direct_read: bool,
-
-    /// Lease identity of this mount (default: the machine's host name).
-    #[arg(long)]
-    host: Option<String>,
-}
-
-fn params_help() -> String {
-    format!(
-        "parameters:\n{}{}{}",
-        autumn_params::help::<autumn_params::fuse::FuseParams>(),
-        autumn_params::help::<autumn_params::fs::FsParams>(),
-        autumn_params::help::<autumn_params::client::ClientParams>()
-    )
-}
-
-/// Take every parameter flag out of argv; clap parses the rest.
-fn parse_args() -> Args {
-    let argv: Vec<String> = std::env::args().collect();
-    let rest = autumn_params::split_params(argv, |a, v| {
-        autumn_params::take_any!(
-            a,
-            v,
-            autumn_fuse::params(),
-            autumn_fs::params(),
-            autumn_client::params()
-        )
-    })
-    .unwrap_or_else(|e| {
-        eprintln!("error: {e}");
-        std::process::exit(2);
-    });
-    if let Err(e) = autumn_params::CrossCheck::cross_check(autumn_fuse::params()) {
-        eprintln!("error: {e}");
-        std::process::exit(2);
-    }
-    let matches = Args::command().after_help(params_help()).get_matches_from(rest);
-    Args::from_arg_matches(&matches).unwrap_or_else(|e| e.exit())
-}
+const USAGE: &str = "usage: autumn-fuse --mountpoint <DIR> [options]\nMount autumn-rs KV store as a POSIX filesystem.";
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -115,25 +27,26 @@ fn main() -> Result<()> {
         )
         .init();
 
-    let args = parse_args();
-    let host = args.host.clone().unwrap_or_else(autumn_fs::state::system_hostname);
+    let p = autumn_fuse::params();
+    autumn_params::parse_or_exit(
+        USAGE,
+        &[p as &dyn Section, autumn_fs::params(), autumn_client::params()],
+        Positional::Refuse,
+    );
+    let host = p.host.get().unwrap_or_else(autumn_fs::state::system_hostname);
     if !autumn_transport::set_regpool_cap_bytes(autumn_client::params().ucx_regpool_cap_bytes.get()) {
         tracing::warn!("regpool cap already set (ignored — first-call-wins)");
     }
 
     // Select the transport process-wide before the compio thread connects.
-    let tk = autumn_transport::parse_transport_flag(&args.transport).unwrap_or_else(|bad| {
-        eprintln!("--transport must be `tcp` or `ucx`, got {bad:?}");
-        std::process::exit(2);
-    });
-    autumn_transport::init_with(tk);
+    autumn_transport::init_with(p.transport.get().into());
 
-    let mountpoint = args.mountpoint.clone();
+    let mountpoint = p.mountpoint.get();
 
     // read the authz credential up front (fail-loud on a
     // bad path) so the compio thread just carries (principal, bytes). The
     // principal identity travels IN the file (§8.5).
-    let credential: Option<(String, Vec<u8>)> = match &args.credential_file {
+    let credential: Option<(String, Vec<u8>)> = match &p.credential_file.get() {
         Some(path) => {
             let (principal, secret) =
                 autumn_client::read_credential_file(path).unwrap_or_else(|e| {
@@ -153,7 +66,7 @@ fn main() -> Result<()> {
     };
 
     tracing::info!(
-        manager = %args.manager,
+        manager = %p.manager.get(),
         mountpoint = %mountpoint.display(),
         authz = credential.is_some(),
         "starting autumn-fuse"
@@ -208,7 +121,7 @@ fn main() -> Result<()> {
         // via `get_many_into` — each whole-extent get is bulk-eligible (≥ 64 KiB).
         fuser::MountOption::CUSTOM("max_read=8388608".to_string()),
     ];
-    if args.allow_other {
+    if p.allow_other.get() {
         options.push(fuser::MountOption::AllowOther);
     }
 
@@ -230,7 +143,7 @@ fn main() -> Result<()> {
     let (compio_done_tx, compio_done_rx) = std::sync::mpsc::channel::<()>();
 
     // Start the compio thread
-    let manager_addr = args.manager.clone();
+    let manager_addr = p.manager.get();
     let compio_handle = std::thread::Builder::new()
         .name("autumn-fuse-compio".to_string())
         .spawn(move || {
@@ -266,12 +179,12 @@ fn main() -> Result<()> {
                         return;
                     }
                 };
-                state.direct_read = args.direct_read;
+                state.direct_read = p.direct_read.get();
                 // Only the mount: every non-write request goes through
                 // `dispatch::handle_request`, which drains an in-flight flush
                 // before the handler runs. Nothing else has that funnel.
                 state.pipelined_writes = true;
-                if args.direct_read {
+                if p.direct_read.get() {
                     tracing::info!(
                         "direct-read ON (default): ≥64 KiB reads go EN-direct, bypassing the PS \
                          (falls back to proxy per read if ENs unreachable). EC-converted extents \

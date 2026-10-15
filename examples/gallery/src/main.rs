@@ -7,6 +7,7 @@ use std::time::Instant;
 use anyhow::{anyhow, Context, Result};
 use autumn_client::{stripe_chunk_size, AutumnError, ClusterClient};
 use autumn_params::gallery::GalleryParams;
+use autumn_params::{Positional, Section};
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Multipart, Path};
 use axum::http::{HeaderMap, Method, Response, StatusCode};
@@ -102,7 +103,7 @@ const HLS_PREFIX: &str = ".hls/";
 // upload and swept on delete.
 const META_PREFIX: &str = ".meta/";
 
-/// Gallery tunables (`autumn_params::gallery`).
+/// Gallery parameters (`autumn_params::gallery`).
 fn params() -> &'static GalleryParams {
     static PARAMS: std::sync::LazyLock<GalleryParams> = std::sync::LazyLock::new(GalleryParams::default);
     &PARAMS
@@ -1863,61 +1864,7 @@ async fn thumb_handler_inner(
 // main
 // ---------------------------------------------------------------------------
 
-struct Args {
-    manager: String,
-    scope: String,
-    credential_file: Option<String>,
-    listen: String,
-    port: u16,
-}
-
-fn usage() -> String {
-    format!(
-        "usage: gallery [--manager 127.0.0.1:9001] [--scope gallery] [--credential-file PATH]\n\
-         \x20              [--listen 0.0.0.0] [--port 5001]\n\nparameters:\n{}{}",
-        autumn_params::help::<GalleryParams>(),
-        autumn_params::help::<autumn_params::client::ClientParams>()
-    )
-}
-
-fn parse_args() -> Args {
-    let mut a = Args {
-        manager: "127.0.0.1:9001".into(),
-        scope: "gallery".into(),
-        credential_file: None,
-        listen: "0.0.0.0".into(),
-        port: 5001,
-    };
-    let fail = |msg: String| -> ! {
-        eprintln!("error: {msg}\n\n{}", usage());
-        std::process::exit(2);
-    };
-    let argv: Vec<String> = std::env::args().skip(1).collect();
-    let rest = autumn_params::split_params(argv, |f, v| {
-        autumn_params::take_any!(f, v, params(), autumn_client::params())
-    })
-    .unwrap_or_else(|e| fail(e));
-    if let Err(e) = autumn_params::CrossCheck::cross_check(params()) {
-        fail(e);
-    }
-    let mut it = rest.into_iter();
-    while let Some(flag) = it.next() {
-        if flag == "-h" || flag == "--help" {
-            print!("{}", usage());
-            std::process::exit(0);
-        }
-        let value = it.next().unwrap_or_else(|| fail(format!("{flag} requires a value")));
-        match flag.as_str() {
-            "--manager" => a.manager = value,
-            "--scope" => a.scope = value,
-            "--credential-file" => a.credential_file = Some(value),
-            "--listen" => a.listen = value,
-            "--port" => a.port = value.parse().unwrap_or_else(|_| fail(format!("--port {value}"))),
-            other => fail(format!("unknown argument {other:?}")),
-        }
-    }
-    a
-}
+const USAGE: &str = "usage: gallery [options]";
 
 #[compio::main]
 async fn main() -> Result<()> {
@@ -1927,7 +1874,12 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    let args = parse_args();
+    autumn_params::parse_or_exit(
+        USAGE,
+        &[params() as &dyn Section, autumn_client::params()],
+        Positional::Refuse,
+    );
+    let p = params();
     if !autumn_transport::set_regpool_cap_bytes(autumn_client::params().ucx_regpool_cap_bytes.get()) {
         tracing::warn!("regpool cap already set (ignored — first-call-wins)");
     }
@@ -1938,13 +1890,13 @@ async fn main() -> Result<()> {
     // Under authz, `--credential-file` names a principal credential from
     // `autumn-op principal-create` — the SDK auto-mints + renews short-TTL
     // tokens. Without it, a plain scoped connect (works only with authz off).
-    let client: Client = Rc::new(match &args.credential_file {
+    let client: Client = Rc::new(match &p.credential_file.get() {
         Some(path) => {
             let (principal, secret) = autumn_client::read_credential_file(path)?;
-            ClusterClient::connect_with_credential(&args.manager, &args.scope, principal, secret)
+            ClusterClient::connect_with_credential(&p.manager.get(), &p.scope.get(), principal, secret)
                 .await?
         }
-        None => ClusterClient::connect(&args.manager, &args.scope).await?,
+        None => ClusterClient::connect(&p.manager.get(), &p.scope.get()).await?,
     });
     let metrics: MetricsRef = Rc::new(RefCell::new(PerfMetrics::default()));
     let transcodes: TranscodeMap = Rc::new(RefCell::new(HashMap::new()));
@@ -2067,7 +2019,7 @@ async fn main() -> Result<()> {
         .layer(DefaultBodyLimit::max(params().upload_limit_bytes.get() as usize))
         .layer(axum::middleware::map_response(cache::default_no_store));
 
-    let bind = format!("{}:{}", args.listen, args.port);
+    let bind = format!("{}:{}", p.listen.get(), p.port.get());
     let listener = compio::net::TcpListener::bind(&bind).await?;
     tracing::info!("Gallery listening on http://{bind}");
     cyper_axum::serve(listener, app).await?;

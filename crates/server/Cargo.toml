@@ -74,7 +74,6 @@ axum = "0.8"
 cyper-axum = "0.9"
 send_wrapper = { version = "0.6", features = ["futures"] }
 socket2 = { version = "0.5", features = ["all"] }
-clap = { version = "4", features = ["derive"] }
 anyhow.workspace = true
 bytes.workspace = true
 crc32c.workspace = true
