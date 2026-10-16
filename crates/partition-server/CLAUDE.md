@@ -235,7 +235,7 @@ old `ValuePointer`s after a child truncated the log) is upheld by GC relocating
 live values out before `punch_holes` drops `refs`
 (`crates/manager/tests/system_vp_after_split_gc.rs`).
 
-## Write Path: Put / Delete (Group Commit)
+## Write Path: Put / Delete (Batched, Pipelined Log Appends)
 
 ```
 Put(key, value, part_id):
