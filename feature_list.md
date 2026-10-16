@@ -14,6 +14,12 @@
 
 ## Active
 
+### BUG-UCX-PS-LOCAL-PROTECTION — UCX 4K 读时 PS 被 `Local protection error` 打死（已复现，旧版本同样出现）
+- **Trigger** (2026-10-16 perf check): 本机 UCX 4K perf-check（RoCE mlx5_2、rc_mlx5,ud_mlx5,tcp,self、8 分区、cpuset 隔离、sglang 租户在）读阶段约 2 s 时 PS 进程退出：`ib_mlx5_log.c:179 Local protection error on mlx5_2:1/RoCE (synd 0x4 vend 0x52)`，出错 WQE 是 `SEND [inl len 10] [va .. len 4096 lkey ..] [va .. len 19 lkey ..]`——读回复的 4 KiB value 段 lkey 失效（注册内存被注销 / 复用后仍在发）。栈在 `ucp_worker_progress`。所有分区端口同时 Connection reset，同集群后续 8M 段 0 ops。HEAD（5c841ab6）6 次中 4 次崩，前一提交 10437778 3 次中 1 次崩：早于参数改动。`perf_baseline.md` 记录过 UCX 1.16 四分区下 SEND 偶发 Local protection error。
+- **Scope**: 先找根因：4 KiB 读回复走哪块注册内存（regpool slab / 零拷贝回复 / SST block cache），谁在发送完成前释放或复用了它；用 `UCX_LOG_LEVEL` / regpool 统计 / 地址追踪定位，必要时二分到 2026-09-28 基线之后的提交。坐实后修生命周期，不加重试或兜底。
+- **Acceptance**: 同配置 UCX 4K perf-check 连续 10 次 PS 不崩、无 Local protection error；修复前同测试稳定复现（消融变红）；perf-check UCX 4K/8M 回到基线 80% 内。
+- `passes: false`
+
 ### F-REAVALI-TAIL-COPY — re_avali 只补缺的尾部（延后：有内容错的风险）
 - **Trigger** (2026-10-14/15 用户, F-SEAL-LENGTH-AND-WRITE-OUTCOME): 实测 probe seal 漏掉的副本 1/10 次比 sealed_length 短（132,854 字节），re_avali 为此整份拷贝 2.57 GB、9.75 s。实现前发现风险，用户定先保留整份拷贝（2026-10-15）。
 - **Scope**: 只有"最后一次确认的提交点"之前各副本字节相同；之后漏掉的副本可能是别的副本没收到的 append，而 seal 保留的是另一批。直接补尾巴会得到长度对、内容错、被当成健康的副本。可行路：先取对端块校验和、本地重算对比，从第一个不一致块起拉（多读一遍本地盘）。（"EN 持久化收到的最大 header.commit 再从该点拉"不成立：header.commit 是租约起点不是已确认提交点，回绕可低于已见过的值——2026-10-15 评审。）依赖 BUG-SEAL-DIVERGENT-UNACKED-BYTES 的结论。
