@@ -2401,7 +2401,7 @@ pub(crate) fn settle_deletes(metrics: &crate::PartitionMetrics, settled: u64) {
     use std::sync::atomic::Ordering::Relaxed;
     metrics
         .unsettled_deletes
-        .fetch_update(Relaxed, Relaxed, |n| Some(n.saturating_sub(settled)))
+        .try_update(Relaxed, Relaxed, |n| Some(n.saturating_sub(settled)))
         .expect("the update closure never declines");
 }
 

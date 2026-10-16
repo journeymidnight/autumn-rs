@@ -30,3 +30,6 @@ libc = "0.2"
 # The core already runs on a compio runtime through ClusterClient; it also
 # spawns the per-session lease heartbeat/poll tasks (`lease_tasks`).
 compio = { workspace = true, features = ["runtime", "time", "io", "net"] }
+
+[lints]
+workspace = true

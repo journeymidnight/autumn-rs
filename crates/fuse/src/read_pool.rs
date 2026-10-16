@@ -344,10 +344,10 @@ mod tests {
         for v in 0..4u32 {
             assert!(submit_round_robin(&txs, &next, v).is_ok());
         }
-        assert_eq!(r0.try_next().unwrap(), Some(0));
-        assert_eq!(r0.try_next().unwrap(), Some(2));
-        assert_eq!(r1.try_next().unwrap(), Some(1));
-        assert_eq!(r1.try_next().unwrap(), Some(3));
+        assert_eq!(r0.try_recv().unwrap(), 0);
+        assert_eq!(r0.try_recv().unwrap(), 2);
+        assert_eq!(r1.try_recv().unwrap(), 1);
+        assert_eq!(r1.try_recv().unwrap(), 3);
     }
 
     #[test]
@@ -363,9 +363,9 @@ mod tests {
         for v in 0..3u32 {
             assert!(submit_round_robin(&txs, &next, v).is_ok());
         }
-        assert_eq!(r1.try_next().unwrap(), Some(0));
-        assert_eq!(r1.try_next().unwrap(), Some(1));
-        assert_eq!(r1.try_next().unwrap(), Some(2));
+        assert_eq!(r1.try_recv().unwrap(), 0);
+        assert_eq!(r1.try_recv().unwrap(), 1);
+        assert_eq!(r1.try_recv().unwrap(), 2);
     }
 
     #[test]

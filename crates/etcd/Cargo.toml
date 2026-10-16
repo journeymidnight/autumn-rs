@@ -14,7 +14,6 @@ tracing.workspace = true
 compio = { workspace = true, features = ["net", "time", "io-compat"] }
 cyper-core = "0.9"
 hyper = { version = "1.4.1", features = ["client", "http2"] }
-hyper-util = { version = "0.1.8", features = ["client-legacy", "http2"] }
 http = "1"
 http-body-util = "0.1"
 send_wrapper = { version = "0.6", features = ["futures"] }

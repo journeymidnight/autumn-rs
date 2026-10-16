@@ -282,7 +282,7 @@ fn build_register_req(
 /// NOT_LEADER retries fail-stop — an EN the manager can't route to must not
 /// serve (same rationale as the multi-shard bind fail-stop).
 async fn register_with_manager(manager: &str, req: &RegisterNodeReq) -> Result<()> {
-    let mut last_err = String::new();
+    let mut last_err: String;
     let mut attempt = 0u32;
     loop {
         attempt += 1;

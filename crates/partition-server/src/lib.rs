@@ -130,7 +130,7 @@ pub fn fail_nth_flush_checkpoint(n: u64) {
 }
 fn flush_checkpoint_failpoint() -> bool {
     FLUSH_CHECKPOINT_FAIL_AT
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
         == Ok(1)
 }
 /// Test failpoint: while set, a merged open fails before it publishes the
@@ -13521,7 +13521,7 @@ fn memtable_snapshot_cost_scales_with_memtable_not_page_size() {
                 .expect("ping must be answered as a success");
             assert!(pong.is_empty());
             assert!(
-                req_rx.try_next().is_err(),
+                matches!(req_rx.try_recv(), Err(mpsc::TryRecvError::Empty)),
                 "a ping must never reach the partition loop"
             );
         });
@@ -13897,7 +13897,7 @@ fn memtable_snapshot_cost_scales_with_memtable_not_page_size() {
             response.feed(&reply);
             assert!(response.try_decode().unwrap().unwrap().is_error());
             assert!(
-                rx.try_next().is_err(),
+                matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)),
                 "revoked write must not reach the partition"
             );
         });

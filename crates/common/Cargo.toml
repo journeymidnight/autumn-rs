@@ -6,14 +6,11 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-anyhow.workspace = true
 futures = "0.3"
-autumn-rpc = { path = "../rpc" }
 autumn-params = { path = "../params" }
 core_affinity = "0.8"
 compio = { workspace = true, features = ["net", "time"] }
 libc = "0.2"
-serde.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 

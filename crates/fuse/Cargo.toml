@@ -46,7 +46,9 @@ crc32c.workspace = true
 # that did — see the flags guard in `ops.rs::rename`.
 fuser = { version = "0.15", features = ["abi-7-28"] }
 libc = "0.2"
-crossbeam-channel = "0.5"
 futures = "0.3"
 compio = { workspace = true, features = ["runtime", "time", "io", "net"] }
 rand = "0.8"
+
+[lints]
+workspace = true
