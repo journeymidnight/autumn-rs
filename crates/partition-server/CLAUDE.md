@@ -1441,8 +1441,9 @@ it from the tables it lists, then moves that off a sealed end. A reopen before
 that takes the whole-log path, which after GC is only the extents left. The
 rebuild is never ahead of what the tables cover (flushes commit in order), but
 it can land behind the lost cursor — on an older stamp when GC already punched
-the newest one's extent, or when a deposed manager answers `MSG_STREAM_INFO`
-with a stale list (that RPC is not leader-checked) — which only lowers GC's
+the newest one's extent, or when a deposed ex-leader still inside its
+leaderless window (`ensure_routable`) answers `MSG_STREAM_INFO` with a stale
+list — which only lowers GC's
 floor until the next flush (inferred, not reproduced).
 `background::sealed_anchor_tests`,
 `crates/manager/tests/system_compact_advance_anchor.rs` (major, GC, SIGKILL,

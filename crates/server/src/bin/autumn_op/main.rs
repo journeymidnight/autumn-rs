@@ -1754,23 +1754,7 @@ async fn cmd_auto_policy(
             if name.is_empty() {
                 anyhow::bail!("auto-policy start requires a policy name");
             }
-            client
-                .auto_policy_set(AutoPolicySetReq {
-                    op: AUTOPOLICY_OP_SET_ACTIVE,
-                    mode: 0,
-                    name: name.to_string(),
-                    entry: None,
-                })
-                .await?;
-            // SET_ACTIVE keeps the mode; a stopped controller needs Armed.
-            client
-                .auto_policy_set(AutoPolicySetReq {
-                    op: AUTOPOLICY_OP_SET_MODE,
-                    mode: 2,
-                    name: String::new(),
-                    entry: None,
-                })
-                .await?;
+            client.auto_policy_start(name).await?;
         }
         "deactivate" => {
             client

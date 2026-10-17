@@ -2827,6 +2827,8 @@ pub const AUTOPOLICY_OP_SET_MODE: u8 = 0;
 pub const AUTOPOLICY_OP_SET_ACTIVE: u8 = 1;
 pub const AUTOPOLICY_OP_UPSERT: u8 = 2;
 pub const AUTOPOLICY_OP_DELETE: u8 = 3;
+/// Select `name` and arm it, persisted as one config (wire 73).
+pub const AUTOPOLICY_OP_START: u8 = 4;
 
 /// One named policy (preset or custom). `switches` is [split, ec, compact, gc,
 /// merge] — a `Vec<bool>` (not a fixed array) for forward-compat; the controller
@@ -2884,7 +2886,7 @@ pub struct AutoPolicySetReq {
     pub op: u8,
     /// For SET_MODE.
     pub mode: u8,
-    /// For SET_ACTIVE / DELETE (and the name of an UPSERT entry).
+    /// For SET_ACTIVE / START / DELETE (and the name of an UPSERT entry).
     pub name: String,
     /// For UPSERT.
     pub entry: Option<MgrAutoPolicyEntry>,

@@ -556,7 +556,7 @@ overflows the frame.
 
 ## Wire version, and the two checks over it
 
-`WIRE_VERSION` (currently **72**) is the schema this binary speaks.
+`WIRE_VERSION` (currently **73**) is the schema this binary speaks.
 `MIN_CLIENT_WIRE_VERSION` (**43**) is the oldest CLIENT it serves. Both are maintained
 **BY HAND**. There is no schema fingerprint — hashing the sources byte for byte cost
 more than it caught (a translated comment once split a rolling cluster, and each false
@@ -901,6 +901,20 @@ and new bytes. PutResp CODE_PRECONDITION means comparison failed; region/ownersh
 errors retain frame-level status for routing refresh. Both values are capped at
 64 KiB; extract_part_id and both PS namespace/authz gates decode the new request.
 Every service and embedded client must be rebuilt together for wire 44.
+
+## Start an auto-policy in one write (wire 73)
+
+`AUTOPOLICY_OP_START` (4) on `MSG_AUTOPOLICY_SET`: select `name` and set the
+mode to Armed in one persisted `autoPolicy/config`. `autumn-op auto-policy
+start` used to send SET_ACTIVE then SET_MODE, so a failed second call left the
+policy selected but off, and another operator could interleave. No struct
+changed, but what `op` may carry did, so it is a bump: a wire-72 manager would
+answer op 4 InvalidArgument. Admin-only (exact wire equality), not on the client
+surface; the ceiling rises to [43, 73], the floor stays. SET_ACTIVE still
+selects a policy without touching the mode. In the same version a standby
+manager answers `MSG_STREAM_INFO` / `MSG_EXTENT_INFO` / `MSG_NODES_INFO` with
+`CODE_NOT_LEADER` instead of its frozen replay state; the PS stream client and
+the EN rotate on that code.
 
 ## Write outcome unknown (wire 72)
 

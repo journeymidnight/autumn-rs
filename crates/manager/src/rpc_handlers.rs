@@ -1850,9 +1850,23 @@ impl AutumnManager {
         }))
     }
 
+    /// `stream_info`, `extent_info` and `nodes_info` are routing-gated: a
+    /// standby's store is what it replayed when it started, and its callers act
+    /// on the answer (an extent node refuses a stale writer's truncate when the
+    /// manager says the extent is sealed). A standby answers NOT_LEADER and the
+    /// caller moves on; an ex-leader still answers while etcd is down
+    /// (`ensure_routable`).
     async fn handle_stream_info(&self, payload: Bytes) -> HandlerResult {
         let req: StreamInfoReq =
             rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+        if let Err(err) = self.ensure_routable() {
+            return Ok(rkyv_encode(&StreamInfoResp {
+                code: Self::err_to_code(&err),
+                message: err.to_string(),
+                streams: Vec::new(),
+                extents: Vec::new(),
+            }));
+        }
         let s = self.store.inner.borrow();
 
         let full_dump = req.stream_ids.is_empty();
@@ -1907,6 +1921,15 @@ impl AutumnManager {
     async fn handle_extent_info(&self, payload: Bytes) -> HandlerResult {
         let req: ExtentInfoReq =
             rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+        if let Err(err) = self.ensure_routable() {
+            return Ok(rkyv_encode(&ExtentInfoResp {
+                code: Self::err_to_code(&err),
+                message: err.to_string(),
+                extent: None,
+                payload_location: 0,
+                corrupt_slots: 0,
+            }));
+        }
         let payload_location = self.payload_location_of(req.extent_id).as_byte();
         let corrupt_slots = self.corrupt_slots_of(req.extent_id);
         let s = self.store.inner.borrow();
@@ -1929,6 +1952,14 @@ impl AutumnManager {
     }
 
     async fn handle_nodes_info(&self) -> HandlerResult {
+        if let Err(err) = self.ensure_routable() {
+            return Ok(rkyv_encode(&NodesInfoResp {
+                code: Self::err_to_code(&err),
+                message: err.to_string(),
+                nodes: Vec::new(),
+                disks_info: Vec::new(),
+            }));
+        }
         let s = self.store.inner.borrow();
         // Both registries cross to the wire here, and only here.
         let nodes = s.nodes.iter().map(|(&id, n)| (id, n.into())).collect();

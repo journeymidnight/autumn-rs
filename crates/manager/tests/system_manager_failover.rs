@@ -138,7 +138,8 @@ fn manager_failover_preserves_streams_and_partitions() {
 
         let mgr2 = RpcClient::connect_as(mgr2_addr, autumn_rpc::version_hello::Role::Admin, None).await.expect("connect mgr2");
 
-        // M2 should have replayed the streams
+        // M2 is a standby: its replayed store is frozen at its start, so it
+        // refuses metadata lookups too. Replay is checked after the failover.
         let resp = mgr2
             .call(
                 MSG_STREAM_INFO,
@@ -149,14 +150,9 @@ fn manager_failover_preserves_streams_and_partitions() {
             .await
             .expect("m2 stream_info");
         let info: StreamInfoResp = rkyv_decode(&resp).expect("decode");
-        assert_eq!(info.code, CODE_OK);
-        assert_eq!(
-            info.streams.len(),
-            3,
-            "M2 should have all 3 streams from replay"
-        );
+        assert_eq!(info.code, CODE_NOT_LEADER);
 
-        // M2 is a standby: it refuses both writes and routing.
+        // It refuses writes and routing as well.
         let resp = mgr2
             .call(
                 MSG_CREATE_STREAM,

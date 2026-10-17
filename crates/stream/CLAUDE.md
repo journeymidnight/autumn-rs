@@ -1026,9 +1026,19 @@ task (`set_rate` restarts the pacing run when it changed). Their overrides
 come from the manager: the shard that polls the authz config
 (`spawn_client_authz_poll_loop`) also fetches `MSG_GET_RUNTIME_CONFIG`
 (`poll_runtime_config`) and installs the `en.` entries process-wide through
-`autumn_params::Installed`; a failed fetch keeps what is installed. The poll
-uses the `--manager` string as one address, so it reaches a manager only when
-that is a single address (true of the authz poll too). `--ec-stripe-bytes`
+`autumn_params::Installed`; a failed fetch keeps what is installed. Every EN
+call to the manager (both polls, reconcile, extent info, nodes info, recovery
+validation) goes through `manager_call`: `--manager` is split on commas, each
+address is tried once from the one that answered last, and a transport error
+(a timeout included) or a NOT_LEADER answer moves on; the index is per shard
+and the timeout per address. The manager answers `stream_info`, `extent_info`
+and `nodes_info` NOT_LEADER from a standby, whose store is frozen at its
+replay, so a blip that moves the EN onto a standby cannot get it a stale
+"not sealed". The truncate guard still proceeds when no manager answers
+(fail-open, unchanged; open question in the feature list). Test: `crates/manager/tests/en_multi_manager_etcd.rs` (standby
+listed first, then the leader stopped; ablations: no move on NOT_LEADER, no
+move on a transport error, the raw list as one address — each red; a standby
+answering the three lookups — red without the gate). `--ec-stripe-bytes`
 sets the chunked EC-convert stripe: peak EC-convert RAM = `(K+M) × stripe`;
 bigger = fewer WriteShard RPCs / syncs at higher RAM, and the 1 GiB cap keeps a
 single stripe's WriteShard under the frame `payload_len: u32` ceiling.

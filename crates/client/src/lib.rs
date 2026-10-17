@@ -1565,6 +1565,18 @@ impl ClusterClient {
         Ok(resp)
     }
 
+    /// Select policy `name` and arm it: one request, one persisted config, so
+    /// a failure leaves the previous config whole.
+    pub async fn auto_policy_start(&self, name: &str) -> Result<AutoPolicySetResp> {
+        self.auto_policy_set(AutoPolicySetReq {
+            op: autumn_rpc::manager_rpc::AUTOPOLICY_OP_START,
+            mode: 0,
+            name: name.to_string(),
+            entry: None,
+        })
+        .await
+    }
+
     /// The operator's runtime parameter overrides (`MSG_GET_RUNTIME_CONFIG`).
     /// Leader-routed.
     pub async fn runtime_config_get(

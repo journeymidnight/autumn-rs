@@ -1775,7 +1775,11 @@ never persisted, safest → most aggressive:
 space, a copy short is durability.
 
 Headless control: `MSG_AUTOPOLICY_GET/SET` + `autumn-op auto-policy
-status|start <name>|deactivate`. Manual per-target actions go through
+status|start <name>|deactivate`. `start` is one `AUTOPOLICY_OP_START`:
+name and Armed go into one persisted config, so a failure or a second operator
+never leaves a policy selected but off, or armed under the old name
+(`tests/auto_policy_start_etcd.rs` counts the etcd writes; red as the old
+SET_ACTIVE + SET_MODE pair). Manual per-target actions go through
 the async op-ledger below (`autumn-op split/gc/compact/merge/force-ec-convert/
 rebalance`), leader-routed — the same underlying ops the controller uses.
 
@@ -2448,9 +2452,16 @@ write-lease conflicts. `AllocInodesReq.volume` stays on the frozen client surfac
 
 ## Routing while leaderless
 
-`get_regions` and `heartbeat_ps` gate on `ensure_routable()` = `leader || !displaced`
-(the two READ-ONLY routing/liveness RPCs) rather than the strict `ensure_leader` that
-every mutating handler keeps. During an etcd outage the ex-leader's in-memory routing is
+`get_regions`, `heartbeat_ps` and the metadata lookups `stream_info` /
+`extent_info` / `nodes_info` gate on `ensure_routable()` = `leader || !displaced`
+(READ-ONLY routing/liveness/metadata RPCs) rather than the strict `ensure_leader` that
+every mutating handler keeps. A standby's store is frozen at its replay (nothing
+resyncs it), and an EN acts on the lookups — it refuses a stale writer's
+truncate when the manager says the extent is sealed, and proceeds when it cannot
+ask — so a standby must not answer "not sealed" about an extent the leader
+sealed since (`en_multi_manager_etcd::a_standby_refuses_metadata_lookups`). An
+ex-leader inside its leaderless window still answers them, as stale as its
+routing; the epoch fences, not this gate, are what keep data safe. During an etcd outage the ex-leader's in-memory routing is
 the freshest in existence and nothing can supersede it (no election, no mutation), so
 strict-gating would black-hole every fresh client for the whole outage. `displaced`
 (default TRUE, cleared on winning the election, set when the election CAS or a leader-fence

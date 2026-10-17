@@ -937,6 +937,7 @@ pub struct NodeRegistration {
 pub struct ExtentNodeConfig {
     /// (dir, disk_id): None disk_id → read from `disk_id` file in dir.
     disks: Vec<(PathBuf, Option<u64>)>,
+    /// `--manager`: one address or a comma-separated list.
     pub manager_endpoint: Option<String>,
     /// this shard's index (0..shard_count). Only extents where
     /// `autumn_rpc::shard_for_extent(extent_id, shard_count) == shard_idx` are
@@ -1783,11 +1784,16 @@ impl SharedAuthz {
         );
     }
 
+    /// `refresh_signal::mono_ms` of the last fetched config; 0 = none yet.
+    pub fn installed_at_ms(&self) -> u64 {
+        self.installed_at_ms.load(std::sync::atomic::Ordering::Acquire)
+    }
+
     /// A token naming a key this config does not know: final, or may the key
     /// be newer than the config? Asks for a fetch when it may. Keyed by the
     /// kid, so every client presenting a new key shares one entry.
     fn on_unknown_kid(&self, token: &[u8]) -> autumn_common::refresh_signal::Miss {
-        let installed = self.installed_at_ms.load(std::sync::atomic::Ordering::Acquire);
+        let installed = self.installed_at_ms();
         let kid = autumn_rpc::cap_token::token_kid(token).unwrap_or(u32::MAX);
         let name = autumn_common::refresh_signal::name_hash(&kid.to_le_bytes());
         let verdict = self.misses.on_miss(name, installed);
@@ -1861,6 +1867,28 @@ impl ClientAuthz {
     }
 }
 
+/// The `--manager a,b,…` list and the address that answered last, shared by
+/// one shard's clones.
+#[derive(Clone)]
+struct Managers {
+    addrs: Rc<[String]>,
+    current: Rc<Cell<usize>>,
+}
+
+impl Managers {
+    fn parse(endpoint: &str) -> Self {
+        Self {
+            addrs: endpoint
+                .split(',')
+                .map(str::trim)
+                .filter(|a| !a.is_empty())
+                .map(crate::conn_pool::normalize_endpoint)
+                .collect(),
+            current: Rc::new(Cell::new(0)),
+        }
+    }
+}
+
 pub struct ExtentNode {
     extents: Rc<DashMap<u64, Rc<ExtentEntry>>>,
     /// bounded cache of open fds for SEALED extents (open/active
@@ -1868,7 +1896,8 @@ pub struct ExtentNode {
     fd_lru: Rc<FdLru>,
     /// All disks attached to this node, keyed by disk_id.
     disks: Rc<HashMap<u64, Rc<DiskFS>>>,
-    manager_endpoint: Option<String>,
+    /// `None` = no manager (tests).
+    managers: Option<Managers>,
     /// ConnPool for manager RPC calls (nodes_info, extent_info, etc.)
     manager_pool: Rc<crate::ConnPool>,
     /// See `ClientAuthz`; refreshed by `spawn_client_authz_poll_loop` on the
@@ -1991,7 +2020,7 @@ impl Clone for ExtentNode {
             extents: self.extents.clone(),
             fd_lru: self.fd_lru.clone(),
             disks: self.disks.clone(),
-            manager_endpoint: self.manager_endpoint.clone(),
+            managers: self.managers.clone(),
             manager_pool: self.manager_pool.clone(),
             client_authz: self.client_authz.clone(),
             polls_authz: self.polls_authz,
@@ -3755,7 +3784,7 @@ impl ExtentNode {
                 .shared_authz
                 .clone()
                 .unwrap_or_else(|| SharedAuthz::new(config.manager_endpoint.is_some())),
-            manager_endpoint: config.manager_endpoint,
+            managers: config.manager_endpoint.as_deref().map(Managers::parse),
             manager_pool: Rc::new(crate::ConnPool::new()),
             done,
             recovery_inflight: Rc::new(DashMap::new()),
@@ -3843,25 +3872,23 @@ impl ExtentNode {
         if !self.polls_authz {
             return;
         }
-        let Some(mgr) = self.manager_endpoint.clone() else {
+        if self.managers.is_none() {
             return;
-        };
-        let mgr = crate::conn_pool::normalize_endpoint(&mgr);
+        }
         let node = self.clone();
         en_spawn_supervised("en_client_authz_poll", move || {
             let node = node.clone();
-            let mgr = mgr.clone();
             async move {
                 use futures::future::{select, Either};
                 loop {
                     let last_fetch = Instant::now();
-                    let failed = match node.poll_client_authz(&mgr).await {
+                    let failed = match node.poll_client_authz().await {
                         Ok(()) => false,
                         Err(e) => {
                             // Loud while the EN still refuses every direct read
                             // for want of an answer; quiet once it has one.
                             if matches!(*node.client_authz.state.read(), ClientAuthz::Unknown) {
-                                tracing::warn!(error = %e, manager = %mgr,
+                                tracing::warn!(error = %e,
                                     "EN authz config poll failed; direct reads are refused until it succeeds");
                             } else {
                                 tracing::debug!(error = %e, "EN authz config poll failed");
@@ -3869,7 +3896,7 @@ impl ExtentNode {
                             true
                         }
                     };
-                    if let Err(e) = node.poll_runtime_config(&mgr).await {
+                    if let Err(e) = node.poll_runtime_config().await {
                         tracing::debug!(error = %e, "EN runtime config poll failed");
                     }
                     let mut every = Duration::from_secs(en_params().config_poll_secs.get());
@@ -3886,18 +3913,59 @@ impl ExtentNode {
         });
     }
 
-    async fn poll_client_authz(&self, mgr: &str) -> Result<()> {
+    /// One manager RPC, tried once per address from the one that answered
+    /// last. A transport error (a timeout included) or a NOT_LEADER answer
+    /// moves on to the next address; any other answer goes back to the caller.
+    /// `timeout` is per address, so a call can take `addrs × (connect bound +
+    /// timeout)`. `decode` returns the response with its code.
+    async fn manager_call<T>(
+        &self,
+        msg_type: u8,
+        req: Bytes,
+        timeout: Duration,
+        decode: impl Fn(&[u8]) -> Result<(u8, T), String>,
+    ) -> Result<T> {
+        let Some(m) = &self.managers else {
+            anyhow::bail!("no manager endpoint configured");
+        };
+        let n = m.addrs.len();
+        let start = m.current.get();
+        let mut last_err = anyhow::anyhow!("--manager names no address");
+        for k in 0..n {
+            let i = (start + k) % n;
+            let addr = &m.addrs[i];
+            match self
+                .manager_pool
+                .call_timeout(addr, msg_type, req.clone(), timeout)
+                .await
+            {
+                Ok(bytes) => {
+                    let (code, resp) = decode(&bytes)
+                        .map_err(|e| anyhow::anyhow!("decode answer of manager {addr}: {e}"))?;
+                    if code != manager_rpc::CODE_NOT_LEADER {
+                        m.current.set(i);
+                        return Ok(resp);
+                    }
+                    last_err = anyhow::anyhow!("manager {addr} is not the leader");
+                }
+                Err(e) => last_err = e.context(format!("manager {addr}")),
+            }
+        }
+        Err(last_err)
+    }
+
+    async fn poll_client_authz(&self) -> Result<()> {
         let resp = self
-            .manager_pool
-            .call_timeout(
-                mgr,
+            .manager_call(
                 manager_rpc::MSG_GET_AUTHZ_CONFIG,
                 Bytes::new(),
                 Duration::from_secs(5),
+                |b| {
+                    let r: manager_rpc::GetAuthzConfigResp = manager_rpc::rkyv_decode(b)?;
+                    Ok((r.code, r))
+                },
             )
             .await?;
-        let resp: manager_rpc::GetAuthzConfigResp =
-            manager_rpc::rkyv_decode(&resp).map_err(|e| anyhow::anyhow!("{e}"))?;
         if resp.code != manager_rpc::CODE_OK {
             anyhow::bail!("get_authz_config: {}", resp.message);
         }
@@ -3922,18 +3990,18 @@ impl ExtentNode {
     /// Fetch the operator's runtime overrides and install the `en.` entries
     /// (process-wide: every shard reads `en_params()`). A failed fetch keeps
     /// what is installed.
-    async fn poll_runtime_config(&self, mgr: &str) -> Result<()> {
+    async fn poll_runtime_config(&self) -> Result<()> {
         let resp = self
-            .manager_pool
-            .call_timeout(
-                mgr,
+            .manager_call(
                 manager_rpc::MSG_GET_RUNTIME_CONFIG,
                 Bytes::new(),
                 Duration::from_secs(5),
+                |b| {
+                    let r: manager_rpc::GetRuntimeConfigResp = manager_rpc::rkyv_decode(b)?;
+                    Ok((r.code, r))
+                },
             )
             .await?;
-        let resp: manager_rpc::GetRuntimeConfigResp =
-            manager_rpc::rkyv_decode(&resp).map_err(|e| anyhow::anyhow!("{e}"))?;
         if resp.code != manager_rpc::CODE_OK {
             anyhow::bail!("get_runtime_config: {}", resp.message);
         }
@@ -4050,7 +4118,7 @@ impl ExtentNode {
     /// full set over multiple sweeps) — the helper signature is
     /// already shaped for that.
     fn spawn_reconcile_orphans_loop(&self) {
-        if self.manager_endpoint.is_none() {
+        if self.managers.is_none() {
             // Test setups without a manager: nothing to reconcile.
             return;
         }
@@ -4073,17 +4141,16 @@ impl ExtentNode {
     }
 
     /// best-effort startup orphan reconcile.
-    /// If `manager_endpoint` is configured, ship every loaded
+    /// If a manager is configured, ship every loaded
     /// `extent_id` to the manager; receive back the subset that's no
     /// longer registered and unlink the corresponding `.dat`/`.meta`.
     /// Skips silently when there's no manager (test setups). Per-disk
     /// errors are logged but don't propagate — partial cleanup is fine,
     /// the retry loop will catch the next iteration.
     async fn reconcile_orphans_with_manager(&self) -> Result<()> {
-        let mgr = match &self.manager_endpoint {
-            Some(ep) => crate::conn_pool::normalize_endpoint(ep),
-            None => return Ok(()),
-        };
+        if self.managers.is_none() {
+            return Ok(());
+        }
         // Sampled BEFORE the request goes out, so any staging that lands while
         // the manager is answering is stamped above it and the answer is known
         // not to be about that attempt.
@@ -4109,21 +4176,21 @@ impl ExtentNode {
             shard_idx: self.shard_idx,
             extent_ids: extent_ids.clone(),
         });
-        // 10 s — read-only manager call (returns subset of submitted
+        // 10 s per manager address — read-only manager call (returns subset of submitted
         // extent ids that are no longer in s.extents). Bounded so a
         // hanging manager doesn't trap the periodic 5-min sweep.
-        let resp_data = self
-            .manager_pool
-            .call_timeout(
-                &mgr,
+        let resp = self
+            .manager_call(
                 manager_rpc::MSG_RECONCILE_EXTENTS,
                 req,
                 Duration::from_secs(10),
+                |b| {
+                    let r: manager_rpc::ReconcileExtentsResp = manager_rpc::rkyv_decode(b)?;
+                    Ok((r.code, r))
+                },
             )
             .await
-            .map_err(|e| anyhow::anyhow!("reconcile_extents rpc: {e}"))?;
-        let resp: manager_rpc::ReconcileExtentsResp = manager_rpc::rkyv_decode(&resp_data)
-            .map_err(|e| anyhow::anyhow!("decode reconcile resp: {e}"))?;
+            .context("reconcile_extents rpc")?;
         if resp.code != manager_rpc::CODE_OK {
             return Err(anyhow::anyhow!(
                 "reconcile_extents non-OK: {}",
@@ -6780,26 +6847,25 @@ impl ExtentNode {
         &self,
         extent_id: u64,
     ) -> Result<Option<(ExtentInfo, u32)>, String> {
-        let mgr = match &self.manager_endpoint {
-            Some(ep) => crate::conn_pool::normalize_endpoint(ep),
-            None => return Ok(None),
-        };
+        if self.managers.is_none() {
+            return Ok(None);
+        }
         let req = manager_rpc::rkyv_encode(&manager_rpc::ExtentInfoReq { extent_id });
         // 5 s — read-only manager call. Hot in EC convert
         // (handle_convert_to_ec syncs sealed_length / eversion from
         // manager) and the recovery verify-after-fetch path.
-        let resp_data = self
-            .manager_pool
-            .call_timeout(
-                &mgr,
+        let resp = self
+            .manager_call(
                 autumn_rpc::manager_rpc::MSG_EXTENT_INFO,
                 req,
                 Duration::from_secs(5),
+                |b| {
+                    let r: manager_rpc::ExtentInfoResp = manager_rpc::rkyv_decode(b)?;
+                    Ok((r.code, r))
+                },
             )
             .await
-            .map_err(|e| format!("extent_info rpc: {e}"))?;
-        let resp: manager_rpc::ExtentInfoResp =
-            manager_rpc::rkyv_decode(&resp_data).map_err(|e| format!("decode: {e}"))?;
+            .map_err(|e| format!("extent_info rpc: {e:#}"))?;
         if resp.code != manager_rpc::CODE_OK {
             return Ok(None);
         }
@@ -6817,23 +6883,19 @@ impl ExtentNode {
     /// base address always lands on shard 0 and is refused with
     /// "extent N belongs to shard M not shard 0".
     async fn nodes_map_from_manager(&self) -> Result<HashMap<u64, (String, Vec<u16>)>, String> {
-        let mgr = match &self.manager_endpoint {
-            Some(ep) => crate::conn_pool::normalize_endpoint(ep),
-            None => return Err("no manager endpoint configured".to_string()),
-        };
         // 5 s — read-only manager call.
-        let resp_data = self
-            .manager_pool
-            .call_timeout(
-                &mgr,
+        let resp = self
+            .manager_call(
                 autumn_rpc::manager_rpc::MSG_NODES_INFO,
                 Bytes::new(),
                 Duration::from_secs(5),
+                |b| {
+                    let r: manager_rpc::NodesInfoResp = manager_rpc::rkyv_decode(b)?;
+                    Ok((r.code, r))
+                },
             )
             .await
-            .map_err(|e| format!("nodes_info rpc: {e}"))?;
-        let resp: manager_rpc::NodesInfoResp =
-            manager_rpc::rkyv_decode(&resp_data).map_err(|e| format!("decode: {e}"))?;
+            .map_err(|e| format!("nodes_info rpc: {e:#}"))?;
         if resp.code != manager_rpc::CODE_OK {
             return Err(format!("nodes_info failed: {}", resp.message));
         }
@@ -6849,10 +6911,9 @@ impl ExtentNode {
         task: &crate::extent_rpc::RecoveryTask,
         attempt: &crate::extent_rpc::RecoveryAttempt,
     ) -> Result<(), String> {
-        let mgr = self
-            .manager_endpoint
-            .as_ref()
-            .ok_or("manager endpoint is not configured")?;
+        if self.managers.is_none() {
+            return Err("manager endpoint is not configured".into());
+        }
         if attempt.nonce == 0 {
             return Err("recovery instruction has no attempt identity".into());
         }
@@ -6860,19 +6921,20 @@ impl ExtentNode {
             return Err("recovery instruction targets another node identity".into());
         }
         let response = self
-            .manager_pool
-            .call_timeout(
-                &crate::conn_pool::normalize_endpoint(mgr),
+            .manager_call(
                 manager_rpc::MSG_VALIDATE_RECOVERY,
                 rkyv_encode(&RequireRecoveryReq {
                     task: task.clone(),
                     attempt: attempt.clone(),
                 }),
                 Duration::from_secs(5),
+                |b| {
+                    let r: CodeResp = rkyv_decode(b)?;
+                    Ok((r.code, r))
+                },
             )
             .await
-            .map_err(|e| e.to_string())?;
-        let response: CodeResp = rkyv_decode(&response)?;
+            .map_err(|e| format!("{e:#}"))?;
         if response.code != CODE_OK {
             return Err(response.message);
         }
@@ -9024,7 +9086,7 @@ impl ExtentNode {
         let task = req.task;
         let attempt = req.attempt;
 
-        if self.manager_endpoint.is_none() {
+        if self.managers.is_none() {
             return code_resp(
                 CODE_PRECONDITION,
                 "manager endpoint is not configured".to_string(),

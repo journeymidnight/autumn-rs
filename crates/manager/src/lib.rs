@@ -1882,7 +1882,7 @@ impl AutumnManager {
         Ok(())
     }
 
-    /// Apply an `AutoPolicySet` op (SET_MODE / SET_ACTIVE / UPSERT / DELETE),
+    /// Apply an `AutoPolicySet` op (SET_MODE / SET_ACTIVE / START / UPSERT / DELETE),
     /// persist the new config to etcd, and echo the resulting state. Leader-only
     /// (the etcd write is leader-fenced; a follower fails NotLeader). Reached only
     /// through the Admin-only `MSG_AUTOPOLICY_SET` (`autumn-op auto-policy`, which
@@ -1921,6 +1921,13 @@ impl AutumnManager {
                         return Err(AppError::NotFound(format!("no such policy '{name}'")));
                     }
                     new_active = name;
+                }
+                AUTOPOLICY_OP_START => {
+                    if st.find_policy(&name).is_none() {
+                        return Err(AppError::NotFound(format!("no such policy '{name}'")));
+                    }
+                    new_active = name;
+                    new_mode = crate::auto_policy::AutoPolicyMode::Armed;
                 }
                 AUTOPOLICY_OP_UPSERT => {
                     let mut e = entry.ok_or_else(|| {

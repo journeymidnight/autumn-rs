@@ -1,6 +1,6 @@
 # autumn-rs feature list — OPEN backlog
 
-**Last updated:** 2026-10-17 (put_many mixed-size order, owner-epoch memory backwards, update_stream_ec CAS fixed and removed; BUG-ETCD-RESEND-AFTER-TIMEOUT-DOUBLE-COMMIT filed, reproduced and fixed the same day; BUG-FUSE-UMOUNT-JOIN-HANG reproduced on a real mount and fixed; BUG-LEASE-LOST-WRITER-FLUSH-UNFENCED reproduced and fixed; BUG-SEAL-DIVERGENT-UNACKED-BYTES and F-REAVALI-TAIL-COPY closed by the user 2026-10-17: divergence past the commit point is expected, re_avali keeps the whole copy)
+**Last updated:** 2026-10-17 (BUG-EN-MULTI-MANAGER-POLL and BUG-POLICY-ACTIVATE-ATOMIC reproduced, fixed and removed; F-METRICS-PER-PROCESS removed, it had passed; BUG-EN-TRUNCATE-GUARD-FAILS-OPEN filed from the review)
 
 **Rules:**
 - This file tracks the **OPEN backlog only**. A feature that reaches `passes: true`
@@ -14,10 +14,10 @@
 
 ## Active
 
-### BUG-EN-MULTI-MANAGER-POLL — EN 的 `--manager a,b` 被当成一个地址，authz / runtime config 拉取与 reconcile 永远连不上 manager
-- **Trigger** (2026-10-14 runtime config 实现中发现): EN 二进制把整个 `--manager` 串交给 `ExtentNodeConfig::with_manager_endpoint`；`ConnPool::parse_addr("a,b")` 失败。shard 0 的 authz 拉取（→ authz 开启时直读一直 Unavailable，回退 PS 代理）、runtime config 拉取、startup/周期 reconcile 都用它。cluster.sh 只起一个 manager，所以没暴露。
-- **Scope**: 先在多 manager 集群复现（EN 日志里拉取失败、`config set en.x` 不生效）。坐实后 EN 侧按逗号拆分并在失败 / NOT_LEADER 时轮换（与 PS `rotate_manager` 同形）。
-- **Acceptance**: 两个 manager、EN `--manager m1,m2`：authz 配置与 `config set en.*` 在一个拉取周期内生效；停掉 leader 后仍生效；修复前该用例红。
+### BUG-EN-TRUNCATE-GUARD-FAILS-OPEN — EN 的 commit 截断守卫在问不到 manager 时照样截断（推断，未复现）
+- **Trigger** (2026-10-17 EN 多 manager 修复的 fable 评审): append 的 commit 对账在截断前问 manager 该 extent 是否已 seal（`extent_node.rs` 批量路径与非批量路径），只在 `Ok(Some(sealed))` 时拒绝；`Err` / `Ok(None)`（manager 不可达、所有地址 NOT_LEADER）直接截断。standby 现在对 `extent_info` 答 NOT_LEADER，于是单个 etcd manager 启动后、赢得选举前的几秒里，这个守卫也问不到。
+- **Scope**: 先复现（当前 epoch 的写者 commit 落后于文件、manager 不可答、该 extent 已被 seal），确认能把已 seal 的 extent 截短。坐实后再定：问不到时拒绝（代价：manager 不可用期间这类 append 失败）还是别的形状。
+- **Acceptance**: 复现用例修复前已 seal 的 extent 被截短、修复后不被截短；消融变红。
 - `passes: false`
 
 ### BUG-MAINT-LOOP-STARVED-BY-MINORS — 持续写入时回收探测 / 下发的 GC 可能一直排不上（推断，未复现）
@@ -47,14 +47,6 @@
 - **Acceptance**: 对开了 auth+TLS 的真实 etcd，manager 选主、replay、写入、token 过期后自动重认证均正常；错误口令/证书启动即响亮失败；不带新 flag 时对明文 etcd 行为不变。
 - `passes: false`
 - **notes** (2026-10-07): 用户定：后做，排在 F-CLUSTER-STATUS-SUMMARY 之后。
-
-### BUG-POLICY-ACTIVATE-ATOMIC — policy 名称与模式切换跨两次 RPC
-- **Trigger** (2026-09-27 dashboard review): `autumn-op auto-policy activate` 先 SET_ACTIVE 后 SET_MODE；manager 的 SET_ACTIVE 保留旧 mode。旧模式为 Armed 时，选择本应 DryRun 的新 policy 会先继承 Armed；第二次请求失败会留下部分更新，其他操作者也可在两次调用之间交错。
-- **Scope**: 在 manager 提供一次持久化事务中的 name+mode 更新，让 CLI/dashboard 共用；明确已有 wire 的兼容/升级要求。不能仅换两次 RPC 的顺序或靠 dashboard 本地锁掩盖。
-- **Acceptance**: Armed→选择新 policy 的 DryRun 更新只发布一份完整配置；注入持久化失败、leader 切换与并发操作者，不出现部分配置或误 arm 其他 policy；消融测试失败。
-- `passes: false`
-- **notes**: 两次 RPC 与 manager 保留旧 mode 已按代码核实；窗口内真实误派发尚未复现。本次 dashboard 迁移不改这个跨层契约。
-- **notes** (2026-10-09): 观察模式已删（只剩 Off/Armed，CLI `auto-policy start`）。"本应 DryRun 的新 policy 先继承 Armed"这一误 arm 场景已不存在；剩下两次 RPC 之间的部分失败（选中但仍 Off）和并发操作者交错。
 
 ### F-REVIEW-T3-REAL-CRASH — P2 crash 测试真正停止旧 runtime
 - **Trigger**: review.md T3；drop RpcClient 不等于杀 PS/EN。
@@ -475,24 +467,3 @@
 - **Status**: `passes: false` (2026-09-16) — 未开工；可行性未证，passthrough 与
   非 POSIX 后端的适配形态是最大未知。
 - `passes: false`
-
-### F-METRICS-PER-PROCESS — 每进程 /metrics + manager http_sd
-- **Trigger** (2026-10-12，用户定案): 经 manager 汇总 PS/EN 指标（单点、换主断点、大量 wire）
-  和"PS 先把分区加起来再上报"都被否；照 TiKV/CockroachDB/etcd 的做法，每个进程自己暴露
-  `/metrics`，跨进程聚合交给 Prometheus。
-- **Scope**: (1) PS/EN 各自暴露进程级 `/metrics`，不带 partition 标签；(2) 端口 = 服务端口 +
-  固定偏移，可用 `--metrics-port` 覆盖；(3) manager 提供 Prometheus `http_sd`；(4) 分区级信息
-  只走心跳供调度，dashboard 的热点分区从 manager 拿 top-N，不做成时间序列；(5) PS/EN 的
-  HTTP 在单独的 compio runtime 线程上、不绑核，直接读 atomic；(6) 撤掉经 manager 中转时塞进
-  PS/EN 的指标字段。
-- **Acceptance**: PS 计数器在分区关闭/迁移/重开后不回退（单测）；PS/EN 默认端口可抓、无
-  partition 标签，manager `/sd` 列出二者（单测 + 真集群 api_contract）、follower 返回 `[]`（单测）；
-  dashboard 无分区 scope、显示热点分区表（JS 测试）；全量单测与 manager 集成套件通过。
-- `passes: true` (2026-10-12)
-- **notes** (2026-10-12): 用户随后定：`/metrics` 只放性能指标（iops、延迟、缓存命中率之类），manager
-  不导出任何指标、不开 HTTP 端口（`--metrics-port` 按名拒绝），`/sd` 去掉；目标列表改由
-  `autumn-op info --file-sd` 输出 Prometheus `file_sd` JSON（EN 地址经 `NodeStateEntry.metrics_addr`，
-  wire 65）；dashboard 也从它取 PS 目标。
-- **notes** (2026-10-12): 用户再定：EN `/metrics` 也只留性能（append 批次/字节/耗时）；盘 online/full、
-  extent 数移到 `autumn-op`（full 经 `DiskStatus.full` → `NodeStateEntry.full_disks`，wire 66；
-  `DiskCapWire` 属客户端冻结面不改）；鉴权拒绝计数不需要，整体删除。

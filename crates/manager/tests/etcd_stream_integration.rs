@@ -394,7 +394,8 @@ fn etcd_election_and_replay_on_second_manager() {
 
         let mgr2 = RpcClient::connect_as(mgr2_addr, autumn_rpc::version_hello::Role::Admin, None).await.expect("connect mgr2");
 
-        // Manager2 should be able to read replayed state
+        // Manager2 is a standby: its replayed store is frozen at its start, so
+        // it refuses metadata lookups.
         let resp = mgr2
             .call(
                 MSG_STREAM_INFO,
@@ -405,8 +406,7 @@ fn etcd_election_and_replay_on_second_manager() {
             .await
             .expect("manager2 stream_info");
         let replayed: StreamInfoResp = rkyv_decode(&resp).expect("decode");
-        assert_eq!(replayed.code, CODE_OK);
-        assert!(replayed.streams.iter().any(|(id, _)| *id == stream_id));
+        assert_eq!(replayed.code, CODE_NOT_LEADER);
 
         // Write on manager2 (follower) should be rejected
         let resp = mgr2

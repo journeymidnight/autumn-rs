@@ -523,9 +523,24 @@ The PS and EN log `runtime overrides installed` with the set they applied, and
 `runtime override refused` for an entry they cannot apply (e.g. one that breaks a
 cross-field check against that process's own flags); the other entries still
 apply. Every `config set` / `unset` is in the audit log
-(`$AO audit-log --op 18`). An extent node polls
-only when its `--manager` is a single address (its authz poll has the same limit):
-with a comma-separated list the poll fails and the EN keeps its flag values.
+(`$AO audit-log --op 18`). An extent node takes `--manager` as one address or
+a comma-separated list; each poll (authz and runtime config, and its reconcile,
+extent-info and recovery-validation calls) tries the addresses in turn, starting
+from the one that answered last, and moves on after a transport error (a
+timeout included) or a NOT_LEADER answer. A standby manager answers the stream,
+extent and node lookups NOT_LEADER: its metadata is what it replayed when it
+started. To check it on a two-manager cluster:
+
+```bash
+# EN started with --manager m2:9001,m1:9001 (the standby first), m1 leading:
+$AO config set en.recovery-parallelism 5 --by alice
+sleep 31; grep "runtime overrides installed" $LOGS/node*.log   # recovery_parallelism 5
+kill <m1-pid>; sleep 15                                         # m2 takes over
+$AO config set en.recovery-parallelism 3 --by alice
+sleep 31; grep "runtime overrides installed" $LOGS/node*.log   # now 3
+grep "authz config poll failed" $LOGS/node*.log                 # nothing at WARN
+cargo test -p autumn-manager --test en_multi_manager_etcd
+```
 
 Removed PS flags are refused by name (exit 2): `--fg-qps-quota`,
 `--gc-debt-high-bytes`, `--compact-pending-high-bytes`, `--gc-cooldown-secs`,
@@ -1093,9 +1108,20 @@ and tunnel. HTTP authentication is an existing non-goal retained in this move.
 editor input; failed status queries display `unknown`. Each policy's **Start**
 button selects that named policy and runs it after confirmation, even if none
 was previously selected. **Stop** means Off. Status labels are Running /
-Stopped. `auto-policy start` selects the policy and sets its mode with
-separate RPCs: after a partial failure, refresh status and
-verify the actual name/mode before operating again.
+Stopped. `auto-policy start` selects the policy and arms it in one request,
+persisted as one config: if it fails, the previous name and mode are still in
+place. Check it against etcd:
+
+```bash
+etcdctl get autoPolicy/config -w json | jq '.kvs[0].version'   # N
+autumn-op auto-policy start maintenance
+etcdctl get autoPolicy/config -w json | jq '.kvs[0].version'   # N+1
+autumn-op auto-policy status                                  # mode=armed active=maintenance
+cargo test -p autumn-manager --test auto_policy_start_etcd
+```
+
+autumn-op connects as an operator, which needs the cluster's exact wire
+version, so it is rebuilt with the cluster for wire 73.
 
 The first Policy panel is **Operational advisories**, separate from the
 controller's selectable policies. A hot/cold row is information-only: over the

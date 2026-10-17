@@ -168,8 +168,8 @@ who can reach it can read cluster state and submit mutations with the cluster
 secret the dashboard holds. The VKE overlay includes an APIG Ingress for all paths; ClusterIP
 does not make that route private. Use network access controls or a loopback
 bind and tunnel. HTTP authentication remains outside this migration, following
-the existing access contract. `autumn-op auto-policy start` is not atomic: it sends
-SET_ACTIVE then SET_MODE, so a failure between them leaves the policy selected but Off.
+the existing access contract. `autumn-op auto-policy start` is one request: the
+name and the Armed mode are persisted together, or neither is.
 
 ## Maintenance-ops panel
 
