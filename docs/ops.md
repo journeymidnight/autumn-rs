@@ -1160,6 +1160,16 @@ cargo test -p autumn-manager --features fuse-tests --test fuse_umount_exit
 #   → the_daemon_exits_after_a_plain_unmount ... ok   (before the fix: "still running 10 s after the unmount")
 ```
 
+A mount whose lease the manager forgot (its heartbeats came later than the
+TTL) must drop what it cached about the inode; a writer that closes meanwhile
+is not pushed to it any more. In-process, two mounts, ~25 s:
+
+```bash
+cargo test -p autumn-manager --features fuse-tests --test fuse_lease_loss
+#   → a_lease_the_manager_forgot_invalidates_the_cached_inode ... ok
+#     (before the fix: GETATTR answered the pre-loss size 0 for a 4096-byte file)
+```
+
 If a previous daemon died it can leave a stale mount (`ls` reports "Transport
 endpoint is not connected"); clear it before re-mounting with
 `fusermount3 -u "$MP"` (or `umount -l "$MP"`).

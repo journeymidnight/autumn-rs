@@ -76,8 +76,9 @@ pub fn invalidate_kernel_cache_for_events(
 /// loop). Two tasks: a lease heartbeat loop + an invalidation poll loop:
 ///
 /// - heartbeat: TTL/6 = 5s tick; renews every held lease;
-///   `HeartbeatResult::NotHeld` drops the entry (open fds surface EIO on their
-///   next op — explicit failure beats silently serving stale state).
+///   `HeartbeatResult::NotHeld` drops the entry and invalidates the inode's
+///   cached meta and kernel pages (nothing is pushed to a mount the manager
+///   no longer lists); open fds then fail their next write with EIO.
 /// - invalidation poll: persistent long-poll; per-event update
 ///   `invalidations[ino]` via `apply_invalidation`; per-ino call
 ///   `invalidator(ino)` (when supplied) so the kernel's attribute + page cache
@@ -99,6 +100,9 @@ pub fn spawn_lease_background_tasks(state: &FsState, invalidator: Option<InodeIn
     let cluster_h = state.client.clone();
     let id_h = state.client_id.clone();
     let held_h = state.held_leases.clone();
+    let inv_h = state.invalidations.clone();
+    let stale_h = state.meta_invalidated.clone();
+    let invalidator_h = invalidator.clone();
     compio::runtime::spawn(async move {
         loop {
             let every = Duration::from_secs(crate::params().lease_heartbeat_secs.get());
@@ -115,11 +119,17 @@ pub fn spawn_lease_background_tasks(state: &FsState, invalidator: Option<InodeIn
                         }
                     }
                     Ok(autumn_client::lease::HeartbeatResult::NotHeld) => {
-                        tracing::warn!(
-                            ino,
-                            "heartbeat NotHeld; dropping local lease entry"
-                        );
+                        // The manager forgot this lease (TTL ran out), so a
+                        // writer closing since is not pushed to us: the
+                        // cached meta and the kernel's pages are as stale as
+                        // after a lost poll, and are dropped the same way.
+                        tracing::warn!(ino, "heartbeat NotHeld; dropping the lease and the inode's cache");
                         held_h.borrow_mut().remove(&ino);
+                        inv_h.borrow_mut().remove(&ino);
+                        stale_h.borrow_mut().insert(ino);
+                        if let Some(inv) = &invalidator_h {
+                            inv(ino);
+                        }
                     }
                     Err(e) => {
                         tracing::warn!(ino, error = %e, "heartbeat transient");

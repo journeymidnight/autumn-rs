@@ -412,7 +412,9 @@ invalidator，binding 传 None（headless，无内核页缓存驱逐）。
 （见 `crates/fuse/CLAUDE.md`「页缓存」）。
 `FsState.meta_invalidated`：轮询循环收到某 ino 的失效事件（或 poll 失败 / overflow 丢掉全部
 held lease）就标记它，`meta::get_inode` 遇到标记时从 KV 重读一次——缓存的 meta 不再活过
-别处的写者关闭。本会话持写 lease 或 inode 脏时不重读（缓存的 size 可能领先 KV，收下更小的
+别处的写者关闭。心跳对某 ino 拿到 `NotHeld` 时同样处理：manager 已忘掉这个 lease，之后别处的
+写者关闭不会再推给本会话，所以删条目、忘 invalidation 版本、标记、调内核 invalidator
+（`crates/manager/tests/fuse_lease_loss.rs`）。本会话持写 lease 或 inode 脏时不重读（缓存的 size 可能领先 KV，收下更小的
 就是 `get_inode_uncached` 说的删数据）。挂载与 binding 都经过这里。
 
 - **写写围栏**：写路径 `acquire(WRITE)` 环绕；冲突时 fsspec facade 抛
