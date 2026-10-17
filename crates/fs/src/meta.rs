@@ -177,8 +177,8 @@ pub async fn ensure_schema_version(state: &mut FsState) -> Result<()> {
 /// The cached copy stays authoritative while this session holds the inode's
 /// write lease (not revoked) or has it dirty: nobody else can change the file
 /// then, so a mark (a `WillRevokeIn` to us) says nothing about its content —
-/// and this session's size may be ahead of KV's (flush clears `dirty` before
-/// its put lands; a failed put leaves it so). Adopting KV's smaller size there
+/// and this session's size may be ahead of KV's (`dirty` clears only once the
+/// flush's put landed). Adopting KV's smaller size there
 /// is the data loss `get_inode_uncached` describes. The mark is taken BEFORE
 /// the read, so an event arriving during it marks the inode again; a failed
 /// read puts it back and returns the error.

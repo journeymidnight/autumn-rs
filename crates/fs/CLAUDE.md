@@ -413,9 +413,22 @@ invalidator，binding 传 None（headless，无内核页缓存驱逐）。
 `FsState.meta_invalidated`：轮询循环收到某 ino 的失效事件（或 poll 失败 / overflow 丢掉全部
 held lease）就标记它，`meta::get_inode` 遇到标记时从 KV 重读一次——缓存的 meta 不再活过
 别处的写者关闭。心跳对某 ino 拿到 `NotHeld` 时同样处理：manager 已忘掉这个 lease，之后别处的
-写者关闭不会再推给本会话，所以删条目、忘 invalidation 版本、标记、调内核 invalidator
-（`crates/manager/tests/fuse_lease_loss.rs`）。本会话持写 lease 或 inode 脏时不重读（缓存的 size 可能领先 KV，收下更小的
+写者关闭不会再推给本会话，所以忘 invalidation 版本、标记、调内核 invalidator，READ slot 删掉；
+WRITE slot 留下并置 `revoked`（与 manager 主动 revoke 同形）：之后的写 EIO，flush 仍带原 epoch、
+被围栏拒掉。删掉的话 `write_lease_for` 退成 ANON，脏数据会不带围栏地盖掉现在持 lease 的写者
+（`crates/manager/tests/fuse_lease_loss.rs` 两个用例）。本会话持写 lease 或 inode 脏时不重读（缓存的 size 可能领先 KV，收下更小的
 就是 `get_inode_uncached` 说的删数据）。挂载与 binding 都经过这里。
+
+`InodeState.write_epoch`：脏状态（`write_buf`、`dirty`）在哪个 WRITE lease epoch 下产生，写入时盖上
+（`write.rs` 的 write 路径、`segment.rs` 的 splice），flush 成功后清零。`write_lease_for` 没有 WRITE
+条目时退到它：丢了 lease 的脏数据以原 epoch 写出、被围栏拒掉，而不是退成 ANON 盖掉现在持 lease
+的写者——条目被删的路径不止一条（Release 丢 revoked 条目、Open 重取前先删、poll 失败 drain），
+靠条目在不在来决定 flush 的身份是靶子。`flush_inode` 把围栏拒绝当终局：丢掉未发布状态、记
+sticky `flush_error`（下一次 fsync/close 报 EIO）；其他失败也记 sticky、保留 `dirty`——记录在时
+flush 只返回它不再 put，报掉之后的那次 flush 才重试（绑定因此要两次 `flush()`）。`dirty` 只在 put
+落地后才清（以前先清再 put，put 失败就既没有可重试的、也没有可报告的）。
+用例：`crates/manager/tests/fuse_lease_loss.rs` 第二个（A 丢 lease 后 release 的 flush 和之后的
+periodic sync 都不能盖掉 B 的 100 字节；fsync 报错）。
 
 - **写写围栏**：写路径 `acquire(WRITE)` 环绕；冲突时 fsspec facade 抛
   `BlockingIOError`，被抢占租约标 revoked、`write` 对 revoked 租约快失败（无租约的

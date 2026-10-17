@@ -581,6 +581,12 @@ impl WriteBuffer {
 /// Per-inode runtime state (compio thread-local, not persisted).
 pub struct InodeState {
     pub meta: InodeMeta,
+    /// The WRITE lease epoch the unpublished state (`write_buf`, `dirty`) was
+    /// made under; 0 when it was made under no lease. A flush stamps this when
+    /// the lease entry is gone, so it is refused by the fence instead of going
+    /// out anonymous over whoever holds the lease now. Cleared by a successful
+    /// flush.
+    pub write_epoch: u64,
     pub write_buf: Option<WriteBuffer>,
     /// Append flushes whose puts are still in flight, OLDEST FIRST, each with
     /// the extent-map updates it will imply once it lands. This is what lets

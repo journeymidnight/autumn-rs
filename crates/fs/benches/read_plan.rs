@@ -33,6 +33,7 @@ fn main() {
                     42,
                     InodeState {
                         meta: inode,
+                        write_epoch: 0,
                         write_buf: None,
                         pending_flushes: VecDeque::new(),
                         flush_error: None,

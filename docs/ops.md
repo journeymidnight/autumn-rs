@@ -1161,13 +1161,29 @@ cargo test -p autumn-manager --features fuse-tests --test fuse_umount_exit
 ```
 
 A mount whose lease the manager forgot (its heartbeats came later than the
-TTL) must drop what it cached about the inode; a writer that closes meanwhile
-is not pushed to it any more. In-process, two mounts, ~25 s:
+TTL) must drop what it cached about the inode — a writer that closes meanwhile
+is not pushed to it any more — and, if it was the writer, must not flush its
+dirty data over the writer that took the lease after it. In-process, two
+mounts, ~30 s:
 
 ```bash
 cargo test -p autumn-manager --features fuse-tests --test fuse_lease_loss
 #   → a_lease_the_manager_forgot_invalidates_the_cached_inode ... ok
 #     (before the fix: GETATTR answered the pre-loss size 0 for a 4096-byte file)
+#   → a_writer_whose_lease_was_forgotten_does_not_flush_over_the_next_writer ... ok
+#     (before the fix: once A's lease entry was gone — a re-open refused under B's lease,
+#      or a close — A's flush went out anonymous and the file became A's 4096 bytes;
+#      now A's fsync reports "write fenced" and B's 100 bytes stay)
+```
+
+A manager restart starts lease versions over, so a mount re-opening an inode it
+still caches cannot rely on "newer version → reload"; the Open adopts the meta
+it has just read. etcd-backed manager restarted in place; ~20 s:
+
+```bash
+cargo test -p autumn-manager --features fuse-tests --test fuse_lease_restart
+#   → a_reopened_inode_takes_the_current_meta_after_a_manager_restart ... ok
+#     (before the fix: cached version 5, re-acquired 2, GETATTR answered 0 for 4096 bytes)
 ```
 
 If a previous daemon died it can leave a stale mount (`ls` reports "Transport

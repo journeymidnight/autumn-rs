@@ -326,7 +326,7 @@ pub async fn execute_append(
         .map(|(k, v)| (k.as_slice(), v.clone(), 0u64))
         .collect();
     for r in client.put_many_fenced(&items, plan.lease).await {
-        r.map_err(|e| anyhow!("KV put: {e}"))?;
+        r.map_err(|e| anyhow::Error::new(e).context("KV put"))?;
     }
     Ok(())
 }
@@ -494,7 +494,7 @@ async fn flush_appends(
         .collect();
     let results = state.client.put_many_fenced(&items, lease).await;
     for (i, r) in results.into_iter().enumerate() {
-        r.map_err(|e| anyhow!("KV put: {e}"))?;
+        r.map_err(|e| anyhow::Error::new(e).context("KV put"))?;
         let (start, len) = drained_upserts[i];
         upsert(ext, start, len);
     }

@@ -527,8 +527,10 @@ async fn write_inner(state: &mut FsState, ino: u64, offset: i64, data: &[u8]) ->
     }
 
     // Update file size and timestamps
+    let epoch = state.write_lease_for(ino).lease_epoch;
     {
         let is = state.inodes.get_mut(&ino).unwrap();
+        is.write_epoch = is.write_epoch.max(epoch);
         let new_end = offset as u64 + written as u64;
         if new_end > is.meta.size {
             is.meta.size = new_end;
@@ -589,33 +591,59 @@ pub async fn flush_inode(state: &mut FsState, ino: u64, report: FlushReport) -> 
     // `write_region` splits into MAX_EXTENT-capped, non-overlapping extents.
     if buf_len > 0 {
         let file_size = state.inodes.get(&ino).map(|is| is.meta.size).unwrap_or(0);
-        extent::write_region(
-            state,
-            ino,
-            buf_offset as u64,
-            &buf_data[..buf_len],
-            file_size,
-        )
-        .await?;
+        if let Err(e) =
+            extent::write_region(state, ino, buf_offset as u64, &buf_data[..buf_len], file_size).await
+        {
+            return Err(settle_refused_flush(state, ino, e));
+        }
     }
 
     // Persist the current InodeMeta if dirty — captures size/mtime updates from
     // writes whose chunk data was already flushed incrementally during write().
-    let meta = {
-        let is = match state.inodes.get_mut(&ino) {
-            Some(is) => is,
-            None => return Ok(()),
-        };
-        if !is.dirty {
-            return Ok(());
-        }
-        is.dirty = false;
-        is.meta.clone()
+    // `dirty` clears only once the put landed: cleared first, a refused put
+    // left nothing for the next flush to retry and an fsync nothing to report.
+    let meta = match state.inodes.get(&ino) {
+        Some(is) if is.dirty => is.meta.clone(),
+        _ => return Ok(()),
     };
+    if let Err(e) = put_inode(state, ino, &meta).await {
+        return Err(settle_refused_flush(state, ino, e));
+    }
+    if let Some(is) = state.inodes.get_mut(&ino) {
+        is.dirty = false;
+        is.write_epoch = 0;
+    }
     state.dirty_inodes.remove(&ino);
-    put_inode(state, ino, &meta).await?;
 
     Ok(())
+}
+
+/// A put of this inode's unpublished state failed. The failure sticks to the
+/// inode until a `FlushReport::ToApplication` flush reports it (the write that
+/// made the state returned long ago; while it stands, flushes return it instead
+/// of putting). A FENCE refusal is final — the lease moved to another writer,
+/// so these bytes can never land — and the state is dropped; anything else
+/// stays dirty, and the flush after the report retries it.
+fn settle_refused_flush(state: &mut FsState, ino: u64, e: anyhow::Error) -> anyhow::Error {
+    let fenced = e.chain().any(|c| {
+        c.downcast_ref::<autumn_client::AutumnError>()
+            .is_some_and(|a| matches!(a, autumn_client::AutumnError::Fenced(_)))
+    });
+    if let Some(is) = state.inodes.get_mut(&ino) {
+        if is.flush_error.is_none() {
+            is.flush_error = Some(format!("{e:#}"));
+        }
+        if fenced {
+            tracing::warn!(ino, error = format!("{e:#}"), "flush fenced: the lease is gone; dropping the unpublished state");
+            is.write_buf = None;
+            is.dirty = false;
+            is.write_epoch = 0;
+        }
+    }
+    if fenced {
+        state.dirty_inodes.remove(&ino);
+    }
+    e
 }
 
 /// Ensure the inode is loaded in the cache.
@@ -628,6 +656,7 @@ pub(crate) async fn ensure_inode_cached(state: &mut FsState, ino: u64) -> Result
         ino,
         InodeState {
             meta,
+            write_epoch: 0,
             write_buf: None,
             pending_flushes: std::collections::VecDeque::new(),
             flush_error: None,

@@ -393,10 +393,12 @@ impl FsState {
         v: &[u8],
         lease: autumn_client::WriteLease,
     ) -> Result<()> {
+        // The chain is kept: `write::flush_inode` asks whether the refusal
+        // was the fence.
         self.client
             .put_fenced(k, v, lease)
             .await
-            .map_err(|e| anyhow!("KV put: {e}"))
+            .map_err(|e| anyhow::Error::new(e).context("KV put"))
     }
 
     /// BUG-LEASE-2 Phase 2: the fencing identity to stamp on writes for
@@ -424,7 +426,17 @@ impl FsState {
                     lease_epoch: l.lease_epoch,
                 }
             }
-            _ => autumn_client::WriteLease::ANON,
+            // No entry any more, but unpublished state made under one: it goes
+            // out under that epoch and is refused once the lease moved on. An
+            // anonymous put here wrote a lost writer's bytes over the current
+            // writer's (`fuse_lease_loss`).
+            _ => match self.inodes.get(&ino) {
+                Some(is) if is.write_epoch != 0 => autumn_client::WriteLease {
+                    inode_hint: ino,
+                    lease_epoch: is.write_epoch,
+                },
+                _ => autumn_client::WriteLease::ANON,
+            },
         }
     }
 
@@ -447,7 +459,7 @@ impl FsState {
         self.client
             .delete_fenced(k, lease)
             .await
-            .map_err(|e| anyhow!("KV delete: {e}"))
+            .map_err(|e| anyhow::Error::new(e).context("KV delete"))
     }
 
     /// Range scan with prefix and optional start key.

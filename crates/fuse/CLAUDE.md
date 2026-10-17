@@ -147,6 +147,13 @@ Open 不再回 `FOPEN_DIRECT_IO`。以前回它是为了"测出来的数字不�
 便利，不是一致性需要；代价是 `MAP_SHARED` mmap 报 `ENODEV`、6.1 内核每次 mmap 都把整个文件
 的缓存清掉、`pread` 读者一次一个请求、第二次加载一样从远端重读。
 
+**Open 读到的 `fresh_meta` 也是 inode 的现状。** 打开前不持 lease 的 Open 会读一次 KV 上的
+meta（为了 generation 比对）；若 inode 仍在 `state.inodes`（dentry 钉着）且不脏，就直接采用它、
+丢掉 `extents` 缓存。只靠 `inode_cache_needs_reload(cached < acquired)` 不够：manager 重启后
+lease version 从头计，重取到的 version 可能不比缓存的高，而本挂载没持 lease、别处的写者关闭
+也不会推过来（`crates/manager/tests/fuse_lease_restart.rs`：重启前 version 5、重启后 2，
+GETATTR 一直答旧 size）。
+
 **是否保留（回 `FOPEN_KEEP_CACHE`）**，`dispatch.rs::open_keeps_page_cache`：
 - **打开前本挂载已持有该 inode 的 lease**（且未被撤销）→ 保留。持 lease 期间别的客户端的
   写都会以 WriterClosed/LeaseRevoked 推过来，`inval.rs` 把缓存丢掉。

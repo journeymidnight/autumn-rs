@@ -1,6 +1,6 @@
 # autumn-rs feature list — OPEN backlog
 
-**Last updated:** 2026-10-17 (put_many mixed-size order, owner-epoch memory backwards, update_stream_ec CAS fixed and removed; BUG-ETCD-RESEND-AFTER-TIMEOUT-DOUBLE-COMMIT filed, reproduced and fixed the same day; BUG-FUSE-UMOUNT-JOIN-HANG reproduced on a real mount and fixed; BUG-SEAL-DIVERGENT-UNACKED-BYTES and F-REAVALI-TAIL-COPY closed by the user 2026-10-17: divergence past the commit point is expected, re_avali keeps the whole copy)
+**Last updated:** 2026-10-17 (put_many mixed-size order, owner-epoch memory backwards, update_stream_ec CAS fixed and removed; BUG-ETCD-RESEND-AFTER-TIMEOUT-DOUBLE-COMMIT filed, reproduced and fixed the same day; BUG-FUSE-UMOUNT-JOIN-HANG reproduced on a real mount and fixed; BUG-LEASE-LOST-WRITER-FLUSH-UNFENCED reproduced and fixed; BUG-SEAL-DIVERGENT-UNACKED-BYTES and F-REAVALI-TAIL-COPY closed by the user 2026-10-17: divergence past the commit point is expected, re_avali keeps the whole copy)
 
 **Rules:**
 - This file tracks the **OPEN backlog only**. A feature that reaches `passes: true`
@@ -26,18 +26,20 @@
 - **Acceptance**: 复现用例修复前头部 extent 一直不被回收、修复后被回收；消融变红。
 - `passes: false`
 - **notes**: 两种负载未复现：每 300 ms 一次 flush、以及不间断 flush（`system_minor_compaction_triggers::a_mostly_dead_head_extent_is_reclaimed` 的变体），探测都正常跑。改动已撤回。同类推断（opus 评审）：`background_maintenance_loop` 的 select 先轮询 `compact_rx`，flush 快于 minor 时 `GcRecv` / `GcTimeout` 排不上；`a_dispatched_gc_runs_under_steady_flushes`（两个写者不间断 flush 时下发 forcegc）6 s 内即执行，未复现，未改。周期 tick 的同类饿死已复现并修复（tick 到点先走、收到任务不推迟）。
+- **notes** (2026-10-17 第三次分析，未试): 唯一能让每个 tick 都有窗口的形状是 minor 排在 PS 级 compact permit（`ps_major_compact_parallelism`）后面——别的分区一个长 major 占着 permit，本分区小表堆积、`pick_minor` 每次都有窗口、探测被跳过。但 major 一结束 minor 就把窗口消掉、探测照跑：这是"回收推迟 major 的时长"，不是无限饿死。要做实验需要两个分区 + 一个慢 major；没做。
+
+### BUG-LEASE-DRAIN-DROPS-WRITE-SLOTS — poll 失败 / overflow 的整体 drain 删掉 WRITE slot 并 best-effort release，脏数据之后以 ANON 写出（推断，未复现）
+- **Trigger** (2026-10-17 fuse_lease_loss 第二个用例的修复): NotHeld 已改为把 WRITE slot 留下并置 `revoked`（flush 带原 epoch、被围栏拒），但 `lease_tasks.rs` 的 poll 失败与 overflow 分支仍 `held.clear()` 全部条目并逐个 `lease::release`——manager 不可达时 lease 可能仍在手里，清掉后 `write_lease_for` 退成 ANON，之后的 flush 不带围栏；release 又把 writer slot 主动交出。
+- **Scope**: 先复现（A 持写并脏着 → 断 A 到 manager 的 poll（toxiproxy）→ poll 失败 drain → 恢复 → B 取写并写 → A flush 看是否盖掉 B）。坐实后与 NotHeld 同形：WRITE slot 置 `revoked` 而非删除，不主动 release。
+- **Acceptance**: 复现用例修复前 B 的写被盖、修复后保留；消融变红。
+- `passes: false`
 
 ### BUG-LEASE-HEARTBEAT-STALE-NOTHELD — 心跳快照期间重新 acquire 的 lease 会被迟到的 NotHeld 删掉（推断，未复现）
 - **Trigger** (2026-10-17 fuse_lease_loss 修复的 opus 评审): `lease_tasks.rs` 心跳循环先快照 `held_leases` 的 ino 再逐个 await 心跳 RPC；期间最后一次 release + 新 Open 可以重新 acquire 同一 ino，迟到的 `NotHeld` 把新条目删掉（现在还会多做一次失效）：后续写 EIO "no lease"，manager 那份新 lease 漏到 TTL 过期。
 - **Scope**: 先复现（心跳 RPC 前挂暂停点，期间 release+acquire）。坐实后：删条目前比较快照时的 `lease_epoch`，不同则不删。
 - **Acceptance**: 复现用例修复前新 lease 被删、修复后保留；消融变红。
 - `passes: false`
-
-### BUG-LEASE-LOST-WRITER-FLUSH-UNFENCED — 丢了写 lease 之后的 flush 不带围栏（推断，未复现）
-- **Trigger** (同上评审): `held_leases` 条目一没，`write_lease_for` 对该 inode 返回 ANON；此时还脏着的 meta 之后 flush 时是一次不带 lease 的 put，新写者的写不能挡住它。poll 失败的 drain 路径同样暴露。
-- **Scope**: 先复现（A 持写并脏着 → manager 忘掉 lease（TTL）→ B 取得写 lease 并写 → A 心跳 NotHeld 后 flush → 看 B 的写是否被盖）。坐实后再定修法（丢 lease 后的脏数据应失败而不是 ANON 写出）。
-- **Acceptance**: 复现用例修复前 B 的写被 A 盖掉、修复后 A 的 flush 被拒且 B 的写保留；消融变红。
-- `passes: false`
+- **notes** (2026-10-17): 分析后未复现、未修。挂载对 manager 只有一条 FIFO 连接：心跳的回复总在之后发出的 release/acquire 的回复之前到达，新条目只可能在迟到的 NotHeld 落地之后插入——单连接上不可达。可达的前提是心跳与重新 acquire 走不同连接（心跳期间 manager 换主、`mgr_call_retry` 轮换到新 leader）。若要修，删/置 revoked 前比较快照时的 `lease_epoch` 即可；等有换主中的复现再做。
 
 ### F-ETCD-AUTH — manager 连接带认证/TLS 的 etcd
 - **Trigger** (2026-10-07 用户): 生产 etcd 要开 auth。现 manager 只有 `--etcd <endpoints>`，`crates/etcd` 是 h2c 明文 gRPC，无 `Auth/Authenticate`、无 token 头、无 TLS；开 auth 的 etcd 连不上。
@@ -430,7 +432,7 @@
   直接替换缓存的 meta；(c) 绑定写 → 读 acquire 只加引用、不降 mode（与挂载一致）。
 - **Acceptance**: 各自确定性复现（或证伪），修则消融能变红。
 - `passes: false`
-- **notes** (2026-10-17): (a) 已复现并修：`crates/manager/tests/fuse_lease_loss.rs`（manager TTL 15 s、挂载心跳 20 s；B 写 4096 后 A 的 GETATTR 仍答 0、无失效调用）；`lease_tasks.rs` 的 NotHeld 现在与 poll 失败同样处理（删条目、忘 invalidation 版本、标 `meta_invalidated`、调内核 invalidator），修后 GETATTR 答 4096。(b) 需要 etcd 版 manager 重启的 harness，未动。(c) 读代码坐实：`python/src/fs.rs` acquire 在 `add_ref` 后无条件 `e.mode = req_mode`，持写再 acquire("r") 后 `write_lease_for` 对该 inode 返回 ANON（写不带围栏；`release` 不看 mode，最后一次 release 仍释放整个 lease）。后果只有在之后被 force-preempt 时才可见，而绑定无法触发 preempt，也不暴露 held 状态——没有 Python 可见的探针，所以没改；修法是一行（持写的 slot 上读 acquire 只加引用、不降 mode，与挂载一致），要不要在没有判别测试的情况下改由用户定。绑定的手动 `heartbeat()` 方法对 NotHeld 也只删条目（同 (a) 类，后台任务那条已修），同样未动。
+- **notes** (2026-10-17): (a) 已复现并修：`crates/manager/tests/fuse_lease_loss.rs`（manager TTL 15 s、挂载心跳 20 s；B 写 4096 后 A 的 GETATTR 仍答 0、无失效调用）；`lease_tasks.rs` 的 NotHeld 现在与 poll 失败同样处理（删条目、忘 invalidation 版本、标 `meta_invalidated`、调内核 invalidator），修后 GETATTR 答 4096。(b) 已复现并修（`crates/manager/tests/fuse_lease_restart.rs`：etcd 版 manager 原地重启，A 缓存 version 5、重取得 2，GETATTR 答 0；修：Open 对已缓存且不脏的 inode 直接采用刚读到的 `fresh_meta`）。(c) 读代码坐实：`python/src/fs.rs` acquire 在 `add_ref` 后无条件 `e.mode = req_mode`，持写再 acquire("r") 后 `write_lease_for` 对该 inode 返回 ANON（写不带围栏；`release` 不看 mode，最后一次 release 仍释放整个 lease）。后果只有在之后被 force-preempt 时才可见，而绑定无法触发 preempt，也不暴露 held 状态——没有 Python 可见的探针，所以没改；修法是一行（持写的 slot 上读 acquire 只加引用、不降 mode，与挂载一致），要不要在没有判别测试的情况下改由用户定。绑定的手动 `heartbeat()` 方法对 NotHeld 也只删条目（同 (a) 类，后台任务那条已修），同样未动。
 
 ### F-FUSE-BIG-IO-TUNING — writeback cache + splice 零拷贝，把大 IO 的 FUSE 开销压进 5%
 - **Trigger** (2026-09-16，用户在 FUSE 性能讨论后确认的三件套之一): 实测

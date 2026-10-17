@@ -712,6 +712,7 @@ pub async fn write_file_range(state: &mut FsState, ino: u64, off: u64, data: &[u
     is.meta.size = is.meta.size.max(off + len);
     is.meta.generation += 1;
     is.dirty = true;
+    is.write_epoch = is.write_epoch.max(lease.lease_epoch);
     state.dirty_inodes.insert(ino);
     Ok(())
 }

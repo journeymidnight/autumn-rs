@@ -69,5 +69,9 @@ required-features = ["fuse-tests"]
 name = "fuse_lease_loss"
 required-features = ["fuse-tests"]
 
+[[test]]
+name = "fuse_lease_restart"
+required-features = ["fuse-tests"]
+
 [lints]
 workspace = true

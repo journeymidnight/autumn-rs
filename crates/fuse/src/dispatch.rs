@@ -625,6 +625,7 @@ pub async fn handle_request(
                     ino,
                     InodeState {
                         meta: meta.clone(),
+                        write_epoch: 0,
                         write_buf: None,
                         pending_flushes: std::collections::VecDeque::new(),
                         flush_error: None,
@@ -869,6 +870,15 @@ pub async fn handle_request(
                     if acquired_version > is.cached_version {
                         is.cached_version = acquired_version;
                     }
+                    // `fresh_meta` is the inode as the cluster has it now. A
+                    // clean cached copy yields to it: the version rule above
+                    // cannot see a change made under a manager that restarted
+                    // (its versions start over), and this mount held no lease,
+                    // so no writer close was pushed to it either.
+                    if let (Some(m), false) = (fresh_meta, is.dirty) {
+                        is.meta = m;
+                        is.extents = None;
+                    }
                 } else {
                     let meta = match fresh_meta {
                         Some(m) => m,
@@ -878,6 +888,7 @@ pub async fn handle_request(
                         ino,
                         InodeState {
                             meta,
+                            write_epoch: 0,
                             write_buf: None,
                             pending_flushes: std::collections::VecDeque::new(),
                             flush_error: None,

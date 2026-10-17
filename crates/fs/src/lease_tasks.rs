@@ -76,9 +76,10 @@ pub fn invalidate_kernel_cache_for_events(
 /// loop). Two tasks: a lease heartbeat loop + an invalidation poll loop:
 ///
 /// - heartbeat: TTL/6 = 5s tick; renews every held lease;
-///   `HeartbeatResult::NotHeld` drops the entry and invalidates the inode's
-///   cached meta and kernel pages (nothing is pushed to a mount the manager
-///   no longer lists); open fds then fail their next write with EIO.
+///   `HeartbeatResult::NotHeld` invalidates the inode's cached meta and kernel
+///   pages (nothing is pushed to a mount the manager no longer lists) and drops
+///   a READ slot; a WRITE slot stays `revoked` so its writes fail with EIO and
+///   its flush carries the epoch it had, which the fence refuses.
 /// - invalidation poll: persistent long-poll; per-event update
 ///   `invalidations[ino]` via `apply_invalidation`; per-ino call
 ///   `invalidator(ino)` (when supplied) so the kernel's attribute + page cache
@@ -107,7 +108,10 @@ pub fn spawn_lease_background_tasks(state: &FsState, invalidator: Option<InodeIn
         loop {
             let every = Duration::from_secs(crate::params().lease_heartbeat_secs.get());
             compio::time::sleep(every).await;
-            let inos: Vec<u64> = held_h.borrow().keys().copied().collect();
+            // A revoked slot is kept only so its flush is fenced; the
+            // manager has nothing to renew for it.
+            let inos: Vec<u64> =
+                held_h.borrow().iter().filter(|(_, l)| !l.revoked).map(|(ino, _)| *ino).collect();
             if inos.is_empty() {
                 continue;
             }
@@ -123,8 +127,21 @@ pub fn spawn_lease_background_tasks(state: &FsState, invalidator: Option<InodeIn
                         // writer closing since is not pushed to us: the
                         // cached meta and the kernel's pages are as stale as
                         // after a lost poll, and are dropped the same way.
+                        // A WRITE slot stays, revoked, like one the manager
+                        // revoked: its dirty data is flushed under the epoch
+                        // it had, which the fence refuses. Dropped, the flush
+                        // would go out anonymous and write over whoever holds
+                        // the lease now.
                         tracing::warn!(ino, "heartbeat NotHeld; dropping the lease and the inode's cache");
-                        held_h.borrow_mut().remove(&ino);
+                        {
+                            let mut held = held_h.borrow_mut();
+                            match held.get_mut(&ino) {
+                                Some(l) if l.mode == autumn_rpc::manager_rpc::LEASE_MODE_WRITE => l.revoked = true,
+                                _ => {
+                                    held.remove(&ino);
+                                }
+                            }
+                        }
                         inv_h.borrow_mut().remove(&ino);
                         stale_h.borrow_mut().insert(ino);
                         if let Some(inv) = &invalidator_h {
