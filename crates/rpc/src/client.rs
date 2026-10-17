@@ -279,24 +279,18 @@ pub struct RpcClient {
     /// still be waiting (a caller holds its own `Rc`, so `Drop` cannot run
     /// while one is in flight).
     ///
-    /// On UCX a cancelled transfer LEAKS its buffer by design rather than free
-    /// one UCX may still be writing into (`ucx_recv` / `ucx_send` /
-    /// `ucx_send_vectored` hold it in `ManuallyDrop`, because the cancel drain
-    /// can bail out at its progress cap while UCX still holds the pointer). Per
-    /// closed connection that is at most one in-flight recv window plus one
-    /// in-flight send: the SEND is the larger of the two (a whole bulk frame —
-    /// MiBs — plus its iov array), and the recv window is not fixed at 64 KiB
-    /// either, since `read_loop` sizes an in-progress frame's window to
-    /// `front_frame_remaining()`. Bounded per connection, against leaking the
-    /// connection itself.
+    /// On UCX a cancelled transfer cannot be stopped; the transport keeps its
+    /// buffers on an orphan list until UCX completes it and frees them then
+    /// (a pool slab goes back to its pool). Per closed connection that is at
+    /// most one in-flight recv window plus one in-flight send, held until the
+    /// peer's next bytes or its own send completion arrive.
     _writer_task: JoinHandle<()>,
     _reader_task: JoinHandle<()>,
     /// The caller of the bulk value receive `read_loop` is in the middle of,
     /// if any. Its entry left `pending` when the receive began, so
     /// `close_silent_peer` releases it from here. Deliberately not by
-    /// cancelling the reader: on UCX that receive writes into a borrowed pool
-    /// slab, and a cancel that does not complete would hand the slab back to
-    /// the pool while UCX may still write into it.
+    /// cancelling the reader: on UCX a dropped receive stays posted and takes
+    /// the connection's next bytes, which would be lost to a reader kept alive.
     receiving: Rc<RefCell<Option<BulkWaiter>>>,
     /// Watches for a silent peer (see `Keepalive`). Holds only a `Weak` to the
     /// client, so it never keeps a connection alive, and ends with it.
@@ -1312,10 +1306,10 @@ async fn read_loop(
                         };
                         let mut pb = autumn_transport::regpool_acquire(value_len);
                         if reader.is_ucx() {
-                            let (dest, reg) = pb.dest_and_reg();
-                            match recv_value_ucx(&mut reader, &mut decoder, dest, reg, &rx_progress)
-                                .await
-                            {
+                            let (outcome, p) =
+                                recv_value_ucx(&mut reader, &mut decoder, pb, &rx_progress).await;
+                            pb = p;
+                            match outcome {
                                 ValueRecv::Done => {}
                                 ValueRecv::PeerClosed => {
                                     finish(Err(RpcError::ConnectionClosed));
@@ -1429,28 +1423,31 @@ async fn read_value_tcp(
 }
 
 /// UCX bulk value recv: drain the value's already-buffered prefix out of the
-/// decoder, then recv the remainder straight into `dest` (one UCX Stream
-/// unpack; `reg` names the slab's memh when registered). `dest.len()` is the
-/// exact value length.
+/// decoder, then recv the remainder straight into `pb` (one UCX Stream unpack
+/// per recv; a registered slab names its memh). `pb`'s writable region is the
+/// exact value length. The buffer travels by value: a recv dropped mid-await
+/// keeps it until UCX is done (see `autumn_transport::ReadHalf::recv_pooled`).
 async fn recv_value_ucx(
     reader: &mut ReadHalf,
     decoder: &mut FrameDecoder,
-    dest: &mut [u8],
-    reg: Option<&autumn_transport::RegisteredMem>,
+    mut pb: autumn_transport::PooledBuf,
     rx_progress: &Cell<u64>,
-) -> ValueRecv {
-    let mut filled = decoder.drain_into(dest);
-    while filled < dest.len() {
-        match reader.recv_into(&mut dest[filled..], reg).await {
-            Ok(0) => return ValueRecv::PeerClosed,
+) -> (ValueRecv, autumn_transport::PooledBuf) {
+    let value_len = pb.cap();
+    let mut filled = decoder.drain_into(pb.dest_mut());
+    while filled < value_len {
+        let BufResult(r, p) = reader.recv_pooled(pb, filled).await;
+        pb = p;
+        match r {
+            Ok(0) => return (ValueRecv::PeerClosed, pb),
             Ok(k) => {
                 rx_progress.set(rx_progress.get().wrapping_add(1));
                 filled += k
             }
-            Err(e) => return ValueRecv::Failed(e),
+            Err(e) => return (ValueRecv::Failed(e), pb),
         }
     }
-    ValueRecv::Done
+    (ValueRecv::Done, pb)
 }
 
 /// Complete a `call_into_pooled` from a fully-decoded value frame (TCP /

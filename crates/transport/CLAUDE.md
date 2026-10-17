@@ -30,7 +30,7 @@ zerocopy module tests hold the completion notification pending and exercise
 partial-send fallback without duplicated bytes. compio_features is an isolated
 receive/scheduler benchmark; it does not set production runtime defaults.
 
-The registered UCX cancellation test explicitly calls init_with(Ucx); merely
+The registered-pool UCX tests explicitly call init_with(Ucx); merely
 constructing UcxTransport does not enable regpool registration.
 
 ## UCX library version and two worked-around defects
@@ -59,7 +59,7 @@ a request and calling the callback with `req->status` inside the call;
 a recycled request reports a stale value (`UCS_INPROGRESS` on the PS's 8 MiB bulk
 receives, arbitrary values on clients). That request is also never marked
 completed (`ucp_request_prevent_imm_cmpl`), so `ucp_request_free` only flags it
-released and the mpool element is lost. `ucx_recv_raw` therefore no longer passes
+released and the mpool element is lost. `ucx_recv_guarded` therefore no longer passes
 the flag: `ucp_stream_try_recv_inplace` unpacks queued data straight into the
 buffer and the call returns NULL with the length (the `Done` arm); a request is
 built only when nothing is queued, and then it cannot complete inside the call.
@@ -74,9 +74,51 @@ worker has not progressed yet), the progress it triggers pulls a backlog into
 rdescs, and the following recvs find data queued. It fails if any completed
 through the callback (it did with the flag: 22–33 of 200).
 
-Known, not fixed: `ucp_request_cancel` does nothing for stream operations (it
-handles tag receives only), so `InflightSlot::drop`'s cancel path only waits for
-the operation to finish on its own; on a live ep that is the `SPIN_CAP` bail-out
-and the "leaking slot + request" warning, and the leaked recv stays posted on
-the ep. Also PS connection-handler errors are logged at debug, which hid the
-stale-status exits.
+PS connection-handler errors are logged at debug, which hid the stale-status
+exits.
+
+## A dropped in-flight operation cannot be cancelled
+
+`ucp_request_cancel` handles tag receives only; a stream send or recv stays in
+flight until it completes, and a posted stream recv leaves the ep's queue only
+by completing or when the ep is destroyed (`ucp_stream_ep_cleanup`). The old
+guard called cancel and spun `ucp_worker_progress` 100k times waiting for a
+callback that only a completion could bring; on a live ep it bailed out with a
+"leaking slot + request" warning (every rpc client teardown: 397 of a
+perf-check run's connections), and a `recv_into` into a borrowed pool slab
+then let the slab go back to the pool while the recv stayed posted. Measured
+with `tests/ucx_dropped_recv.rs` before the change: the slab was handed out
+again at once and the peer's next 8184 bytes were unpacked into it, and a
+later recv on the connection got the bytes after those, so 8184 bytes left the
+stream silently.
+
+Now every operation guards its buffers (`Inflight<P>`): they stay in the
+caller's async frame in a `ManuallyDrop` the guard only points at (moving them
+through the generic await cost 6% of loopback 64 B RTT; the pointer costs 2%),
+and a receive takes its buffer by value (`UcxReadHalf::recv_pooled(pb, filled)
+-> BufResult<usize, PooledBuf>`, `ReadHalf::recv_pooled`; `AsyncRead::read`
+already did). A future dropped mid-await reads the buffers out of the dying
+frame and moves them with request and slot to the thread's orphan list, so a
+buffer whose bytes live inside the value (`[u8; N]`, `ArrayVec`, `SmallVec`
+inline — compio implements `IoBuf` for them) is refused before posting, since
+UCX would keep a pointer into the moved-from frame. `reap_orphans` frees orphans
+whose callback has fired and the slab returns to its pool with its
+registration. The callback of an orphaned slot counts the completion
+(`ORPHANS_DONE`), and the reap's fast path compares that with the reaped count:
+an orphan that never completes — every recv dropped on a connection the peer
+never writes again, i.e. every rpc client teardown — must not put later
+operations on the scan path (which allocates). Reaping runs after the progress
+loop's drain and in `regpool::acquire`, which wants the slab back; the `self`
+transport and the inline spin complete receives inside another call without
+waking the loop, and a done orphan's slab is pushed back before the acquire
+pops. An orphan still pending at thread exit stays allocated, as the
+never-destroyed worker does. An orphaned recv still takes the connection's next
+bytes, so the ep is marked (`recv_abandoned`) and every later recv on it fails
+with `ConnectionAborted`. Droppers today: teardowns (the rpc client's held
+`JoinHandle`s, the PS connection task's shutdown select) and the handshake
+timeouts (`version_hello`, `peer_auth`), all of which drop the connection.
+`ucx_orphan_counts()` reports this thread's orphaned / reaped operations and
+list scans. Tests (`tests/ucx_dropped_recv.rs`): a dropped registered recv keeps
+its slab out of the pool, the slab is not written after the drop, the slab is
+reused once the bytes landed; a read after a dropped recv fails at once; a
+pending orphan costs 200 later ping-pongs no list scan.

@@ -18,13 +18,11 @@
 //! threads; each thread pools its own.
 //!
 //! ## Lifetime / cancel-safety (load-bearing)
-//! UCX may DMA into a registered buffer until the recv completes. The
-//! `RegisteredMem` MUST outlive that DMA. The rule: **the future that owns the
-//! in-flight recv holds the `PooledBuf` for the whole `await`; the buffer only
-//! returns to the free-list when the `PooledBuf` drops, which the caller does
-//! after the op resolves.** `endpoint.rs::InflightSlot::drop` already drains
-//! UCX synchronously on cancel before the recv borrow ends, so dropping a
-//! `PooledBuf` right after the recv call returns is safe even on cancel.
+//! UCX writes into the slab until the recv completes, and a stream recv cannot
+//! be cancelled. So a recv takes the `PooledBuf` by value (`recv_pooled`) and
+//! hands it back with the result; a recv dropped mid-await keeps the buffer on
+//! the transport's orphan list until UCX is done, then drops it here — back to
+//! the free-list, registration kept (`endpoint.rs`).
 //!
 //! ## memlock
 //! Registration pins pages (counts against `RLIMIT_MEMLOCK`). The per-thread
@@ -265,7 +263,7 @@ pub struct PooledBuf {
     /// Defaults to `used` on acquire (the legacy assumption was "the recv
     /// will fully fill the requested area" — every current dest_and_reg
     /// caller's recv loop does exactly that, and breaks early on error
-    /// before exposing `pb`). The UCX recv path (`endpoint.rs:recv_into`)
+    /// before exposing `pb`). The UCX owned-read path (`endpoint.rs:ucx_recv`)
     /// and compio's owned-read path both call `SetLen::set_len(got)` with
     /// the actual recv count; that now narrows `filled_len` so `filled()`
     /// / `AsRef<[u8]>` / `IoBuf::as_init` only expose the valid portion
@@ -287,14 +285,9 @@ impl PooledBuf {
         self.slab.as_ref().expect("slab present").reg.as_ref()
     }
 
-    /// Disjoint split-borrow of the dest slice + its registration, so a single
-    /// `recv_into(buf, reg)` call can take both from one `PooledBuf` (the
-    /// `dest_mut()` + `reg()` pair can't be held simultaneously). This is the
-    /// shape every server recv-into-registered loop needs: the loop owns the
-    /// `PooledBuf`, calls `recv_into(dest, reg)`, and — because the recv's
-    /// `InflightSlot` drains UCX on drop while the `PooledBuf` is still owned
-    /// here — a cancelled recv can never leave the NIC writing a freed/recycled
-    /// registered buffer (cancel-safety, see module note).
+    /// Disjoint split-borrow of the dest slice + its registration (the
+    /// `dest_mut()` + `reg()` pair can't be held simultaneously); the UCX recv
+    /// takes both from the `PooledBuf` it was handed.
     pub fn dest_and_reg(&mut self) -> (&mut [u8], Option<&RegisteredMem>) {
         let used = self.used;
         let Slab { buf, reg } = self.slab.as_mut().expect("slab present");
@@ -360,8 +353,7 @@ impl compio::buf::IoBuf for PooledBuf {
 impl compio::buf::SetLen for PooledBuf {
     /// Mark `len` bytes of the writable area as initialized. compio calls
     /// this internally after `read_exact_at` / `read_at` fills the slab;
-    /// the UCX recv path (`endpoint.rs::recv_into`) calls it explicitly
-    /// with the recv'd `got` count. Clamps to `used` to guarantee
+    /// the UCX recv loops fill the whole area before exposing `pb`. Clamps to `used` to guarantee
     /// `filled_len <= cap()` even if a buggy caller passes a wild value.
     /// (The contract is "I just read `len` bytes into `as_uninit`" — `len`
     /// SHOULD always be `<= as_uninit().len() == used`. The clamp is
@@ -475,6 +467,9 @@ impl Drop for PooledBuf {
 /// total while making "absurdly large" allocations cheap-and-non-pinning
 /// instead of OOM-aborting via `next_power_of_two` panic.
 pub fn acquire(need: usize) -> PooledBuf {
+    // A finished orphan recv (`endpoint.rs`) hands its slab back here first.
+    #[cfg(feature = "ucx")]
+    crate::ucx::endpoint::reap_orphans();
     ACQUIRE_TOTAL.fetch_add(1, Ordering::Relaxed);
     let Some(class) = size_class(need) else {
         // Out-of-pool: allocate exact size, never register, never pool.
@@ -688,7 +683,7 @@ mod tests {
         let mut pb = acquire(8000); // class=8192
         assert_eq!(pb.cap(), 8000, "cap = requested capacity");
         assert_eq!(pb.len(), 8000, "default filled_len = used (legacy contract)");
-        // Simulate the UCX recv_into path receiving fewer bytes than asked.
+        // Simulate an owned read receiving fewer bytes than asked.
         unsafe { pb.set_len(3000) };
         assert_eq!(pb.len(), 3000, "set_len narrows filled_len");
         assert_eq!(pb.filled().len(), 3000, "filled() narrows");

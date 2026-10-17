@@ -171,25 +171,27 @@ async fn drain_n(r: &mut autumn_transport::ReadHalf, size: usize, count: u64) ->
     true
 }
 
-/// Drain `count` messages of `reuse.len()` bytes each via zero-copy
-/// registered receives. False when the connection died.
+/// Drain `count` messages of `pb.cap()` bytes each via registered receives
+/// into one pool slab. False when the connection died.
 #[cfg(feature = "ucx")]
 async fn drain_registered(
     r: &mut autumn_transport::ReadHalf,
-    reuse: &mut [u8],
-    reg: &autumn_transport::RegisteredMem,
+    mut pb: autumn_transport::PooledBuf,
     count: u64,
-) -> bool {
+) -> Option<autumn_transport::PooledBuf> {
+    let size = pb.cap();
     for _ in 0..count {
         let mut filled = 0usize;
-        while filled < reuse.len() {
-            match r.recv_registered(&mut reuse[filled..], reg).await {
-                Ok(0) | Err(_) => return false,
+        while filled < size {
+            let compio::BufResult(res, p) = r.recv_pooled(pb, filled).await;
+            pb = p;
+            match res {
+                Ok(0) | Err(_) => return None,
                 Ok(n) => filled += n,
             }
         }
     }
-    true
+    Some(pb)
 }
 
 async fn rtt_one<T: AutumnTransport + Clone>(
@@ -409,20 +411,13 @@ async fn regbw_ucx(
         let (c, _) = listener.accept().await.expect("accept");
         let (mut r, _w) = c.into_split();
         let Some(warm) = read_count(&mut r).await else { return };
-        // One registered dest buffer (ptr stable — never realloc). recv into it
-        // with memh = zero-copy receive.
-        let mut reuse = vec![0u8; size];
-        let reg =
-            autumn_transport::register_memory(reuse.as_mut_ptr() as *mut std::ffi::c_void, size)
-                .expect("register recv buffer");
-        if !drain_registered(&mut r, &mut reuse, &reg, warm).await {
-            return;
-        }
+        // One registered pool slab (ptr stable). recv into it with its memh.
+        let pb = autumn_transport::regpool_acquire(size);
+        let Some(pb) = drain_registered(&mut r, pb, warm).await else { return };
         let Some(timed) = read_count(&mut r).await else { return };
-        if !drain_registered(&mut r, &mut reuse, &reg, timed).await {
+        if drain_registered(&mut r, pb, timed).await.is_none() {
             return;
         }
-        drop(reg);
     });
 
     let c = t.connect(bound).await.expect("connect");

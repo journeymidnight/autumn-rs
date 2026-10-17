@@ -168,7 +168,7 @@ cargo build --release -p autumn-server --features ucx
 ldd target/release/autumn-ps | grep libucs    # → /usr/local/lib/libucs.so.0
 ```
 
-Both regression tests need a RoCE host (`AUTUMN_UCX_TEST_BIND='[<roce-ip>]:0'`,
+The regression tests need a RoCE host (`AUTUMN_UCX_TEST_BIND='[<roce-ip>]:0'`,
 `UCX_TLS=rc_mlx5,ud_mlx5,tcp,self`, `UCX_NET_DEVICES=<dev>:1`):
 
 ```bash
@@ -178,6 +178,10 @@ cargo test --release -p autumn-transport --features ucx --test ucx_rcache_race -
 # 2: 200 messages queued before the receiver posts a recv; fails if any recv
 #    completed through UCX's request callback (it does with NO_IMM_CMPL).
 cargo test --release -p autumn-transport --features ucx --test ucx_immediate_recv
+# 3: a recv future dropped mid-await (UCX cannot cancel stream operations): its
+#    pool slab stays out of the pool until the bytes land, then is reused, and a
+#    later read on that connection fails instead of losing bytes.
+cargo test --release -p autumn-transport --features ucx --test ucx_dropped_recv
 ```
 
 Perf-check on UCX 1.20.1 vs the 2026-09-28 baselines (system 1.16), over a

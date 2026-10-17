@@ -42,12 +42,14 @@ pub use tcp::TcpTransport;
 #[cfg(feature = "ucx")]
 pub use ucx::UcxTransport;
 #[cfg(feature = "ucx")]
-pub use ucx::{check_library as check_ucx_library, recv_counts as ucx_recv_counts, register_memory, RegisteredMem};
+pub use ucx::{
+    check_library as check_ucx_library, orphan_counts as ucx_orphan_counts, recv_counts as ucx_recv_counts,
+    register_memory, RegisteredMem,
+};
 
 /// Placeholder when built without the `ucx` feature — never constructed (TCP
-/// has no memory registration). Lets the recv-into seam
-/// (`ReadHalf::recv_into(reg: Option<&RegisteredMem>)`) compile uniformly
-/// across features; `reg` is always `None` on TCP-only builds.
+/// has no memory registration). Lets `PooledBuf::reg()` compile uniformly
+/// across features; it is always `None` on TCP-only builds.
 #[cfg(not(feature = "ucx"))]
 pub enum RegisteredMem {}
 
@@ -466,48 +468,28 @@ impl compio::io::AsyncRead for ReadHalf {
 }
 
 impl ReadHalf {
-    /// recv into a pre-registered buffer (UCX only); Stream unpacks into it.
-    /// Single recv (may be partial). See `UcxReadHalf::recv_registered`.
-    #[cfg(feature = "ucx")]
-    pub async fn recv_registered(
-        &mut self,
-        buf: &mut [u8],
-        reg: &RegisteredMem,
-    ) -> io::Result<usize> {
-        match self {
-            ReadHalf::Ucx(r) => r.recv_registered(buf, reg).await,
-            ReadHalf::Tcp(_) => Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "recv_registered is UCX-only",
-            )),
-        }
-    }
-
-    /// recv-into seam (UCX). `Some(reg)` → receive naming the slab's memh;
-    /// `None` (regpool over-cap fallback) → plain receive. Both are one UCX
-    /// Stream unpack into the slice.
-    /// Single recv (may be partial); caller loops for read_exact semantics.
-    /// TCP errors — the autumn-rpc read_loop handles TCP bulk recvs via
-    /// `read_exact_into_pooled` / the normal decode + memcpy path, never this
-    /// seam. Defined for all builds so autumn-rpc compiles uniformly; on
-    /// TCP-only builds it always errors.
-    pub async fn recv_into(
-        &mut self,
-        buf: &mut [u8],
-        reg: Option<&RegisteredMem>,
-    ) -> io::Result<usize> {
+    /// UCX recv into `pb`'s writable region from `filled` on, one Stream
+    /// unpack into the slab (a registered slab names its memh). Single recv
+    /// (may be partial); the caller loops for read_exact semantics. The buffer
+    /// is passed by value because a dropped recv cannot be cancelled: the
+    /// transport then keeps the buffer until UCX is done and returns it to its
+    /// pool (see `ucx/endpoint.rs`). TCP errors — the autumn-rpc read_loop
+    /// handles TCP bulk recvs via `read_exact_into_pooled` / the normal
+    /// decode + memcpy path, never this seam. Defined for all builds so
+    /// autumn-rpc compiles uniformly; on TCP-only builds it always errors.
+    pub async fn recv_pooled(&mut self, pb: PooledBuf, filled: usize) -> compio::BufResult<usize, PooledBuf> {
         match self {
             #[cfg(feature = "ucx")]
-            ReadHalf::Ucx(r) => match reg {
-                Some(reg) => r.recv_registered(buf, reg).await,
-                None => r.recv_unregistered(buf).await,
-            },
+            ReadHalf::Ucx(r) => r.recv_pooled(pb, filled).await,
             ReadHalf::Tcp(_) => {
-                let _ = (buf, reg);
-                Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "recv_into is UCX-only; TCP uses read_exact_into_pooled / decode+memcpy",
-                ))
+                let _ = filled;
+                compio::BufResult(
+                    Err(io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "recv_pooled is UCX-only; TCP uses read_exact_into_pooled / decode+memcpy",
+                    )),
+                    pb,
+                )
             }
         }
     }
@@ -515,7 +497,7 @@ impl ReadHalf {
     /// TCP recv the remaining `[filled..target]` bytes of a value
     /// straight into a `PooledBuf` via compio owned reads, eliminating the
     /// FrameDecoder accumulation copy (only the unavoidable kernel→userspace
-    /// copy remains). The counterpart to UCX's `recv_into` on the recv-side
+    /// copy remains). The counterpart to UCX's `recv_pooled` on the recv-side
     /// zero-copy paths (PS←EN read = `call_into_pooled`, PS←client write =
     /// `drain_bulk_writes`). Reads exactly `target - filled` bytes; returns the
     /// filled buffer.
@@ -525,9 +507,9 @@ impl ReadHalf {
     /// lands even if the task is dropped — so `pb` returns to the pool on cancel,
     /// never a freed buffer the kernel is still writing into. This is the same
     /// rule as the UCX recv path, just via compio's owned-buffer semantics
-    /// instead of UCX's `InflightSlot` drain.
+    /// instead of UCX's orphan list.
     ///
-    /// UCX errors (callers gate on `!is_ucx()` and use `recv_into` there).
+    /// UCX errors (callers gate on `!is_ucx()` and use `recv_pooled` there).
     pub async fn read_exact_into_pooled(
         &mut self,
         pb: crate::PooledBuf,
@@ -538,7 +520,7 @@ impl ReadHalf {
         if self.is_ucx() {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
-                "read_exact_into_pooled is TCP-only; UCX uses recv_into",
+                "read_exact_into_pooled is TCP-only; UCX uses recv_pooled",
             ));
         }
         if filled >= target {

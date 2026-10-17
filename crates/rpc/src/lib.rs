@@ -24,9 +24,8 @@ pub mod version_hello;
 /// Re-exported for SDK-level source-staging decisions (autumn-client
 /// `ValueBuf` docs): staging into a pool slab only pays off on a UCX runtime.
 pub use autumn_transport::runtime_transport_is_ucx;
-/// Re-exported so consumers of the recv-into seam (`autumn_transport::
-/// ReadHalf::recv_into(reg: Option<&RegisteredMem>)`) don't need a direct
-/// autumn-transport dependency. (Uninhabited stub on non-ucx builds — `reg`
+/// Re-exported so consumers of `PooledBuf::reg()` don't need a direct
+/// autumn-transport dependency. (Uninhabited stub on non-ucx builds — `reg()`
 /// is always `None` there.)
 pub use autumn_transport::RegisteredMem;
 /// Re-exported so `call_into_pooled` consumers (autumn-stream's StreamClient)

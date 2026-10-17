@@ -832,7 +832,7 @@ Mechanics:
   `FrameDecoder` reserve the same count plus a copy.
 - Consume the prologue, `drain_into` any buffered tail prefix into the
   `PooledBuf` (the one application copy, ≤ one 64 KiB window — a whole 64 KiB
-  value; 0.8% of an 8 MiB one), recv the remainder (UCX `recv_into` / TCP
+  value; 0.8% of an 8 MiB one), recv the remainder (UCX `recv_pooled` / TCP
   `read_exact_into_pooled` owned). Nothing follows the tail (v28 removed the
   per-value CRC — value integrity is the transport's job).
 - The tail rides onward as `Bytes::from_owner(pb)` via a
@@ -841,9 +841,10 @@ Mechanics:
   present — provenance-blind, so a frame behaves identically whichever path
   delivered it. The PS→EN `append_batch` send is already rcache-zero-copy (UCX) /
   Arc-Bytes (TCP).
-- Cancel-safe on both transports: `drain_bulk_writes` owns the `PooledBuf` across the
-  recv (UCX `InflightSlot` drains the NIC on drop; TCP compio retains the owned
-  buffer until the read CQE lands). All replies use the bounded in-flight queue;
+- Cancel-safe on both transports: `drain_bulk_writes` hands the `PooledBuf` to each
+  recv by value (UCX keeps a dropped recv's buffer on its orphan list until the
+  NIC is done; TCP compio retains the owned buffer until the read CQE lands).
+  All replies use the bounded in-flight queue;
   receiving continues below the cap even when only one operation is pending.
 
 Small writes (< 64 KiB) keep the unchanged FrameDecoder path — the only added cost

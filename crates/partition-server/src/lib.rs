@@ -4879,10 +4879,10 @@ fn push_resp(tx_bufs: &mut Vec<Bytes>, done: (Bytes, Vec<Bytes>)) {
 /// kernel segment checksum — measured the per-value crc at ~20% of a
 /// core @ 8 MiB) and there is no trailer after the value to consume.
 ///
-/// Cancel-safe on both transports: the `PooledBuf` is owned here for the whole
-/// recv. On UCX, `recv_into`'s `InflightSlot` drains the NIC before the buffer
-/// drops back to the pool; on TCP, compio retains the owned buffer until the
-/// in-flight read CQE lands. Either way: no leak, no DMA/kernel-writes-to-freed.
+/// Cancel-safe on both transports: the `PooledBuf` is passed to each recv by
+/// value, and a recv dropped mid-await keeps it until the transport is done
+/// with it (UCX: the orphan list; TCP: compio holds it until the CQE lands),
+/// then returns it to the pool. No leak, no DMA/kernel-writes-to-freed.
 /// Small writes (< `--bulk-recv-min-bytes`) keep the proven decode path.
 #[allow(clippy::too_many_arguments)]
 async fn drain_bulk_writes(
@@ -4995,9 +4995,10 @@ async fn drain_bulk_writes(
         if reader.is_ucx() {
             // UCX Stream receive into the slab, bypassing FrameDecoder.
             let mut filled = filled;
-            let (dest, reg) = pb.dest_and_reg();
             while filled < value_len {
-                let n = reader.recv_into(&mut dest[filled..], reg).await?;
+                let compio::BufResult(r, p) = reader.recv_pooled(pb, filled).await;
+                pb = p;
+                let n = r?;
                 if n == 0 {
                     return Err(anyhow!(
                         "eof mid bulk write value (msg_type={msg_type:#x}, got {filled}/{value_len})"

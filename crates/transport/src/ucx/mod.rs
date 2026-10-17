@@ -25,6 +25,16 @@ pub fn recv_counts() -> (u64, u64) {
     (endpoint::RECV_IN_PLACE.get(), endpoint::RECV_VIA_CALLBACK.get())
 }
 
+/// This thread's `(operations dropped mid-flight, of those freed since, orphan
+/// list scans)`.
+pub fn orphan_counts() -> (u64, u64, u64) {
+    (
+        endpoint::ORPHANED.get(),
+        endpoint::ORPHANS_REAPED.get(),
+        endpoint::ORPHAN_SCANS.get(),
+    )
+}
+
 use crate::{AutumnTransport, Conn, Listener, TransportKind};
 use async_trait::async_trait;
 use std::io;

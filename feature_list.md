@@ -14,12 +14,6 @@
 
 ## Active
 
-### BUG-UCX-STREAM-CANCEL-NOOP — `ucp_request_cancel` 对 stream 操作是空操作，取消路径从未生效
-- **Trigger** (2026-10-17 追 8M 写卡顿时读 UCX 1.16/1.20 源码): `ucp_request_cancel` 只处理 tag recv。`InflightSlot::drop` 在 future 被中途丢弃时调它再自旋等回调，等的其实只是操作自己完成；连接活着时就是 `SPIN_CAP` 退出 + "leaking slot + request" 告警（每次关连接必现，一轮 400 条连接 353 次），泄漏的 recv 仍挂在 ep 上会吞掉后续字节；`recv_into` 到池 buffer 的场景，buffer 已归还复用而 UCX 仍可能往里写。目前连接关闭后 ep 不再用，未观察到数据错误。
-- **Scope**: 先写用例复现（live ep 上 drop 一个 recv future，再看后续数据去向 / 池 buffer 是否被写）。坐实后改设计：stream 上在途操作不"取消"，要么等它完成要么关闭 ep（`ucp_ep_close_nbx` 的限制见 endpoint.rs 头注释）。
-- **Acceptance**: 复现用例修复前出现吞字节或 buffer 被写、修复后 drop 一个 recv 不影响同连接后续数据且不写已归还 buffer；消融变红。
-- `passes: false`
-
 ### F-REAVALI-TAIL-COPY — re_avali 只补缺的尾部（延后：有内容错的风险）
 - **Trigger** (2026-10-14/15 用户, F-SEAL-LENGTH-AND-WRITE-OUTCOME): 实测 probe seal 漏掉的副本 1/10 次比 sealed_length 短（132,854 字节），re_avali 为此整份拷贝 2.57 GB、9.75 s。实现前发现风险，用户定先保留整份拷贝（2026-10-15）。
 - **Scope**: 只有"最后一次确认的提交点"之前各副本字节相同；之后漏掉的副本可能是别的副本没收到的 append，而 seal 保留的是另一批。直接补尾巴会得到长度对、内容错、被当成健康的副本。可行路：先取对端块校验和、本地重算对比，从第一个不一致块起拉（多读一遍本地盘）。（"EN 持久化收到的最大 header.commit 再从该点拉"不成立：header.commit 是租约起点不是已确认提交点，回绕可低于已见过的值——2026-10-15 评审。）依赖 BUG-SEAL-DIVERGENT-UNACKED-BYTES 的结论。

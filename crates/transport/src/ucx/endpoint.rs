@@ -3,21 +3,22 @@
 //!
 //! ## Cancel safety
 //!
-//! `ucp_stream_send_nbx` requires the caller-supplied buffer to remain valid
-//! until UCX fires the completion callback. compio's owned-buffer Future
-//! model owns the buffer in the future itself, so a normal `await` keeps it
-//! alive. **But** if the future is dropped mid-await (timeouts, `select!`,
-//! task cancellation), Rust drops the buffer immediately — yet UCX still
-//! holds a pointer.
+//! A stream send or recv hands UCX a buffer pointer that stays live until the
+//! completion callback fires, and a stream operation cannot be cancelled:
+//! `ucp_request_cancel` handles tag receives only (ucp_request.c), a posted
+//! stream recv leaves the ep's queue only by completing or when the ep is
+//! destroyed (`ucp_stream_ep_cleanup`). So when a future is dropped mid-await
+//! (timeouts, `select!`, task teardown) the operation is still in flight, and
+//! every buffer it uses is owned by the future that was just dropped.
 //!
-//! `InflightGuard` plugs that hole. When the future is dropped before the
-//! callback has fired, the guard's `Drop` calls `ucp_request_cancel` and
-//! then synchronously drives `ucp_worker_progress` until the callback runs
-//! (which, in single-thread mode, the spawned progress task can't do for
-//! us — we're on the same OS thread, holding it). UCX guarantees the
-//! cancel callback fires within bounded progress iterations. Once it has
-//! fired, UCX no longer holds the buffer pointer, so it's safe for Rust
-//! to free the buffer.
+//! `Inflight` therefore owns the operation's buffers, and its `Drop` before
+//! completion moves request, slot and buffers to this thread's orphan list
+//! (`reap_orphans`, run by the progress loop) instead of freeing anything; a
+//! pool slab goes back to its pool when UCX is done with it, so cancel costs
+//! no registration. This is why every receive takes its buffer by value.
+//!
+//! An orphaned recv still takes the connection's next bytes, which no later
+//! recv can get back, so the ep is marked and every later recv on it fails.
 //!
 //! ## EP lifetime
 //!
@@ -52,6 +53,7 @@
 use crate::ucx::ffi::*;
 use crate::ucx::sockaddr;
 use crate::ucx::worker::{ucs_err, with_thread_ctx};
+use crate::PooledBuf;
 use compio::buf::{IoBuf, IoBufMut, IoVectoredBuf};
 use compio::BufResult;
 use std::cell::Cell;
@@ -106,21 +108,38 @@ enum PtrStatus {
     Pending(*mut c_void),
 }
 
-// ---- Owned EP (drops via FORCE close) ----
+// ---- Owned EP ----
 
 /// Single-owner wrapper around `*mut ucp_ep`. Cloned via `Rc` between
 /// `UcxConn` / `UcxReadHalf` / `UcxWriteHalf` so the EP outlives whichever
 /// half-handle is dropped last.
 pub(crate) struct UcxEp {
     raw: *mut ucp_ep,
+    /// A recv on this ep was dropped before it completed. It stays posted and
+    /// takes the next bytes the peer sends, so no later recv can be trusted.
+    recv_abandoned: Cell<bool>,
 }
 
 impl UcxEp {
     fn new(raw: *mut ucp_ep) -> Rc<Self> {
-        Rc::new(Self { raw })
+        Rc::new(Self {
+            raw,
+            recv_abandoned: Cell::new(false),
+        })
     }
     fn ptr(&self) -> *mut ucp_ep {
         self.raw
+    }
+    #[inline]
+    fn check_readable(&self) -> io::Result<()> {
+        if self.recv_abandoned.get() {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "a receive on this UCX connection was dropped while in flight; it still \
+                 takes the next bytes, so the connection cannot be read any further",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -149,6 +168,8 @@ struct Slot {
     /// Waker registered by the polling future when it suspends. The cb
     /// takes it (replace with None) and wakes after setting state.
     waker: Cell<Option<std::task::Waker>>,
+    /// The owning future was dropped; the completion counts for `reap_orphans`.
+    orphaned: Cell<bool>,
 }
 
 impl Slot {
@@ -158,6 +179,7 @@ impl Slot {
             status: Cell::new(0),
             length: Cell::new(0),
             waker: Cell::new(None),
+            orphaned: Cell::new(false),
         }
     }
     fn reset(&self) {
@@ -165,6 +187,7 @@ impl Slot {
         self.status.set(0);
         self.length.set(0);
         self.waker.set(None);
+        self.orphaned.set(false);
     }
     fn is_done(&self) -> bool {
         self.state.get() == 1
@@ -174,16 +197,18 @@ impl Slot {
     /// `is_done() == true`.
     fn complete_send(&self, status: ucs_status_t::Type) {
         self.status.set(status);
-        self.state.set(1);
-        if let Some(w) = self.waker.replace(None) {
-            w.wake();
-        }
+        self.complete();
     }
     fn complete_recv(&self, status: ucs_status_t::Type, length: usize) {
         self.status.set(status);
         self.length.set(length);
+        self.complete();
+    }
+    fn complete(&self) {
         self.state.set(1);
-        if let Some(w) = self.waker.replace(None) {
+        if self.orphaned.get() {
+            ORPHANS_DONE.with(|c| c.set(c.get() + 1));
+        } else if let Some(w) = self.waker.replace(None) {
             w.wake();
         }
     }
@@ -194,7 +219,7 @@ thread_local! {
     /// completed: unpacked in place by `ucp_stream_recv_nbx` (the only path the
     /// transport accepts), or through UCX's request callback before the call
     /// returned (never: that path reports a stale status and leaks the request
-    /// on release builds up to 1.20.1, see `ucx_recv_raw`). Read by
+    /// on release builds up to 1.20.1, see `ucx_recv_guarded`). Read by
     /// `ucx_recv_counts`.
     pub(crate) static RECV_IN_PLACE: Cell<u64> = const { Cell::new(0) };
     pub(crate) static RECV_VIA_CALLBACK: Cell<u64> = const { Cell::new(0) };
@@ -247,7 +272,7 @@ impl std::future::Future for WaitSlot {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<()> {
         // SAFETY: the slot pointer is owned by the parent function (held in
-        // an `InflightSlot` in the same scope), so it's live for the whole
+        // an `Inflight` in the same scope), so it's live for the whole
         // future.
         let slot = unsafe { &*self.slot };
         if slot.is_done() {
@@ -264,56 +289,152 @@ impl std::future::Future for WaitSlot {
     }
 }
 
-// ---- Cancel-safe in-flight guard ----
+// ---- In-flight operation and its orphans ----
 
-/// Owns the in-flight `(request, slot)` pair. Drops the pair on:
-///
-///   * normal return — slot already completed by the cb; drop frees the
-///     UCX request and returns the slot to the pool.
-///   * early drop (timeout / cancel / select! loser) — slot not yet
-///     completed; we issue `ucp_request_cancel` then synchronously drive
-///     `ucp_worker_progress` until the cancel callback fires (UCX is
-///     thread-local; the spawned progress task can't run while we hold
-///     the OS thread). Once `is_done()` flips, UCX is done with the
-///     buffer pointer and Rust can safely drop the buffer.
-struct InflightSlot {
+/// An in-flight nbx operation: its UCX request, completion slot, and every
+/// buffer UCX may still touch (`payload`). The buffers stay in the caller's
+/// frame, in a `ManuallyDrop` the guard only points at, so the hot path never
+/// moves them. `finish` runs after the slot completed and frees request and
+/// slot. `Drop` runs only on a future dropped mid-await: the operation cannot
+/// be cancelled, so the buffers are read out of the caller's frame and move
+/// with request and slot to the thread's orphan list, freed once the callback
+/// has fired.
+struct Inflight<'a, P: 'static> {
     request: *mut c_void,
-    worker: *mut ucp_worker,
     slot: *mut Slot,
-    cleaned_up: Cell<bool>,
+    /// A local of the awaiting async fn, declared before the guard and alive
+    /// until after it; the future is pinned, so the address holds.
+    payload: *mut ManuallyDrop<P>,
+    /// Set for a recv: dropping it leaves the ep unreadable.
+    recv_on: Option<&'a UcxEp>,
 }
 
-impl Drop for InflightSlot {
+impl<P: 'static> Inflight<'_, P> {
+    /// SAFETY: the slot must be completed (UCX has released every pointer).
+    unsafe fn finish(self) {
+        debug_assert!((*self.slot).is_done());
+        ucp_request_free(self.request);
+        slot_release(self.slot);
+        std::mem::forget(self);
+    }
+}
+
+impl<P: 'static> Drop for Inflight<'_, P> {
     fn drop(&mut self) {
-        if self.cleaned_up.replace(true) {
-            return;
-        }
+        // SAFETY: the caller's `ManuallyDrop` is still live (it is dropped
+        // after this guard) and never read again after a drop mid-await.
+        let payload = ManuallyDrop::into_inner(unsafe { ptr::read(self.payload) });
         unsafe {
-            if !(*self.slot).is_done() {
-                ucp_request_cancel(self.worker, self.request);
-                // Bounded in practice — UCX queues the cancel callback on the
-                // next progress drain; empirically <1k iters on rc_mlx5.
-                // Cap as a safety net; on overflow we leak the slot rather
-                // than hang.
-                let mut iters = 0;
-                const SPIN_CAP: usize = 100_000;
-                while !(*self.slot).is_done() && iters < SPIN_CAP {
-                    ucp_worker_progress(self.worker);
-                    iters += 1;
-                }
-                if !(*self.slot).is_done() {
-                    tracing::warn!(
-                        iters,
-                        "ucp_request_cancel did not complete in {SPIN_CAP} progress iters; \
-                         leaking slot + request (UCX still owns the buffer pointer)"
-                    );
-                    return;
-                }
+            if (*self.slot).is_done() {
+                ucp_request_free(self.request);
+                slot_release(self.slot);
+                return;
             }
-            ucp_request_free(self.request);
-            slot_release(self.slot);
+            (*self.slot).orphaned.set(true);
+        }
+        if let Some(ep) = self.recv_on {
+            ep.recv_abandoned.set(true);
+        }
+        ORPHANED.with(|c| c.set(c.get() + 1));
+        tracing::debug!(
+            op = if self.recv_on.is_some() { "recv" } else { "send" },
+            "ucx operation dropped before completion; its buffers wait on the orphan list"
+        );
+        ORPHANS.with(|o| {
+            o.borrow_mut().list.push(Orphan {
+                request: self.request,
+                slot: self.slot,
+                payload: Box::new(payload),
+            })
+        });
+    }
+}
+
+struct Orphan {
+    request: *mut c_void,
+    slot: *mut Slot,
+    payload: Box<dyn std::any::Any>,
+}
+
+/// Dropped in-flight operations of this thread, freed by `reap_orphans` once
+/// UCX has completed them. The thread's worker is never destroyed, so an
+/// orphan still pending at thread exit stays allocated, as the worker does.
+struct Orphans {
+    list: Vec<Orphan>,
+}
+
+impl Drop for Orphans {
+    fn drop(&mut self) {
+        for o in self.list.drain(..) {
+            if unsafe { (*o.slot).is_done() } {
+                drop(o.payload);
+            } else {
+                std::mem::forget(o.payload);
+            }
         }
     }
+}
+
+thread_local! {
+    static ORPHANS: std::cell::RefCell<Orphans> = const { std::cell::RefCell::new(Orphans { list: Vec::new() }) };
+    /// Orphans created / completed / freed on this thread, and list scans.
+    /// `ORPHANS_DONE == ORPHANS_REAPED` is the "nothing to reap" fast path,
+    /// so an orphan that never completes (its peer never sends again) costs
+    /// later operations nothing. Read by `ucx_orphan_counts`.
+    pub(crate) static ORPHANED: Cell<u64> = const { Cell::new(0) };
+    static ORPHANS_DONE: Cell<u64> = const { Cell::new(0) };
+    pub(crate) static ORPHANS_REAPED: Cell<u64> = const { Cell::new(0) };
+    pub(crate) static ORPHAN_SCANS: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Free every orphan whose callback has fired. Runs from the progress loop's
+/// drain and from a pool `acquire`, which wants the slab back (the `self`
+/// transport and the inline spin complete receives inside another call, with
+/// no event for the loop). Nothing completed since the last reap costs two
+/// thread-local reads.
+#[inline]
+pub(crate) fn reap_orphans() {
+    if ORPHANS_DONE.get() == ORPHANS_REAPED.get() {
+        return;
+    }
+    let done: Vec<Orphan> = ORPHANS.with(|o| {
+        let mut o = o.borrow_mut();
+        ORPHAN_SCANS.with(|c| c.set(c.get() + 1));
+        let mut done = Vec::new();
+        let mut i = 0;
+        while i < o.list.len() {
+            if unsafe { (*o.list[i].slot).is_done() } {
+                done.push(o.list.swap_remove(i));
+            } else {
+                i += 1;
+            }
+        }
+        done
+    });
+    for orphan in done {
+        unsafe {
+            ucp_request_free(orphan.request);
+            slot_release(orphan.slot);
+        }
+        drop(orphan.payload);
+        ORPHANS_REAPED.with(|c| c.set(c.get() + 1));
+    }
+}
+
+/// A buffer whose bytes live inside the value itself (`[u8; N]`, `ArrayVec`,
+/// `SmallVec` inline) cannot be guarded: `Inflight::drop` moves the value out
+/// of the dying frame while UCX keeps the pointer. Refused before posting.
+#[inline]
+fn inline_storage<P>(payload: &ManuallyDrop<P>, ptr: *const c_void) -> bool {
+    let start = payload as *const _ as usize;
+    (start..start + std::mem::size_of::<P>()).contains(&(ptr as usize))
+}
+
+fn inline_storage_err() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Unsupported,
+        "buffer with inline storage cannot be handed to UCX (a dropped operation could not keep it alive)",
+    )
 }
 
 // ---- Send / recv callbacks ----
@@ -399,7 +520,7 @@ impl UcxConn {
 
 impl compio::io::AsyncRead for UcxConn {
     async fn read<B: IoBufMut>(&mut self, buf: B) -> BufResult<usize, B> {
-        ucx_recv(self.ep.ptr(), buf).await
+        ucx_recv(&self.ep, buf).await
     }
 }
 
@@ -434,41 +555,19 @@ pub struct UcxWriteHalf {
 
 impl compio::io::AsyncRead for UcxReadHalf {
     async fn read<B: IoBufMut>(&mut self, buf: B) -> BufResult<usize, B> {
-        ucx_recv(self.ep.ptr(), buf).await
+        ucx_recv(&self.ep, buf).await
     }
 }
 
 impl UcxReadHalf {
-    /// `ucp_stream_recv_nbx` into `buf` with the registered region's `memh`
-    /// passed via `UCP_OP_ATTR_FIELD_MEMH`. Stream receive still unpacks the
-    /// arrived AM data into `buf` (see `ucx/mod.rs`); receiving into the final
-    /// buffer is what saves the application copy. Single recv — may return
-    /// < buf.len(); the caller loops for read_exact semantics. `buf` must lie
-    /// inside `reg`'s registered range.
-    pub async fn recv_registered(
-        &mut self,
-        buf: &mut [u8],
-        reg: &crate::RegisteredMem,
-    ) -> io::Result<usize> {
-        ucx_recv_raw(
-            self.ep.ptr(),
-            buf.as_mut_ptr() as *mut c_void,
-            buf.len(),
-            reg.memh(),
-        )
-        .await
-    }
-
-    /// Recv into a borrowed slice WITHOUT a memh (copy-out path). Used when the
-    /// dest buffer is the regpool over-cap unregistered fallback. Single recv.
-    pub async fn recv_unregistered(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        ucx_recv_raw(
-            self.ep.ptr(),
-            buf.as_mut_ptr() as *mut c_void,
-            buf.len(),
-            std::ptr::null_mut(),
-        )
-        .await
+    /// `ucp_stream_recv_nbx` into `pb`'s writable region from `filled` on. A
+    /// registered slab passes its `memh` via `UCP_OP_ATTR_FIELD_MEMH`; Stream
+    /// receive still unpacks the arrived AM data into the slab (see
+    /// `ucx/mod.rs`), and receiving into the final buffer is what saves the
+    /// application copy. Single recv — may fill less than the region; the
+    /// caller loops for read_exact semantics.
+    pub async fn recv_pooled(&mut self, pb: PooledBuf, filled: usize) -> BufResult<usize, PooledBuf> {
+        ucx_recv_pooled(&self.ep, pb, filled).await
     }
 }
 
@@ -489,24 +588,25 @@ impl compio::io::AsyncWrite for UcxWriteHalf {
 
 // ---- Internals ----
 
-/// Await a `PtrStatus::Pending` nbx request: install the cancel-safe
-/// `InflightSlot` guard, inline-spin the worker up to `spin_iters` (0 = no
-/// spin) so fast completions skip the eventfd wakeup, then park on the slot.
-/// Returns the callback's `(status, length)`; the guard is dropped before
-/// returning so the slot is back in the pool when the caller chains ops.
-async fn await_pending(
+/// Await a `PtrStatus::Pending` nbx request whose buffers sit in the caller's
+/// `payload` (see `Inflight`): inline-spin the worker up to `spin_iters` (0 =
+/// no spin) so fast completions skip the eventfd wakeup, then park on the
+/// slot. Returns the callback's `(status, length)`; request and slot are freed
+/// before returning so the slot is back in the pool when the caller chains
+/// ops, and the caller may then take its payload back.
+async fn await_pending<'a, P: 'static>(
     req: *mut c_void,
     slot: *mut Slot,
     spin_iters: usize,
+    payload: *mut ManuallyDrop<P>,
+    recv_on: Option<&'a UcxEp>,
 ) -> (ucs_status_t::Type, usize) {
     let worker = with_thread_ctx(|c| c.worker);
-    // Guard owns slot + request from here; its Drop frees both on normal
-    // return AND on early-drop (cancel path).
-    let guard = InflightSlot {
+    let inflight = Inflight {
         request: req,
-        worker,
         slot,
-        cleaned_up: Cell::new(false),
+        payload,
+        recv_on,
     };
     for _ in 0..spin_iters {
         if unsafe { (*slot).is_done() } {
@@ -523,17 +623,20 @@ async fn await_pending(
     .await;
     let status = unsafe { (*slot).status.get() };
     let length = unsafe { (*slot).length.get() };
-    drop(guard);
+    unsafe { inflight.finish() };
     (status, length)
 }
 
 async fn ucx_send<B: IoBuf>(ep: *mut ucp_ep, buf: B) -> BufResult<usize, B> {
-    let buf = ManuallyDrop::new(buf);
+    let mut buf = ManuallyDrop::new(buf);
     let len = buf.buf_len();
     if len == 0 {
         return BufResult(Ok(0), ManuallyDrop::into_inner(buf));
     }
     let ptr = buf.buf_ptr();
+    if inline_storage(&buf, ptr as *const c_void) {
+        return BufResult(Err(inline_storage_err()), ManuallyDrop::into_inner(buf));
+    }
 
     let slot = slot_acquire();
 
@@ -544,30 +647,25 @@ async fn ucx_send<B: IoBuf>(ep: *mut ucp_ep, buf: B) -> BufResult<usize, B> {
     params.user_data = slot as *mut c_void;
 
     let r = unsafe { ucp_stream_send_nbx(ep, ptr as *const c_void, len, &params) };
-    match classify_ptr(r) {
+    let outcome = match classify_ptr(r) {
         PtrStatus::Done => {
             unsafe { slot_release(slot) };
-            BufResult(Ok(len), ManuallyDrop::into_inner(buf))
+            Ok(len)
         }
         PtrStatus::Err(st) => {
             unsafe { slot_release(slot) };
-            BufResult(
-                Err(ucs_err(st, "ucp_stream_send_nbx")),
-                ManuallyDrop::into_inner(buf),
-            )
+            Err(ucs_err(st, "ucp_stream_send_nbx"))
         }
         PtrStatus::Pending(req) => {
-            let (status, _) = await_pending(req, slot, SPIN_ITERS).await;
+            let (status, _) = await_pending(req, slot, SPIN_ITERS, &mut buf, None).await;
             if status == ucs_status_t::UCS_OK {
-                BufResult(Ok(len), ManuallyDrop::into_inner(buf))
+                Ok(len)
             } else {
-                BufResult(
-                    Err(ucs_err(status, "ucp_stream_send cb")),
-                    ManuallyDrop::into_inner(buf),
-                )
+                Err(ucs_err(status, "ucp_stream_send cb"))
             }
         }
-    }
+    };
+    BufResult(outcome, ManuallyDrop::into_inner(buf))
 }
 
 /// Vectored send — ONE `ucp_stream_send_nbx` for the whole buffer list, via
@@ -579,13 +677,9 @@ async fn ucx_send<B: IoBuf>(ep: *mut ucp_ep, buf: B) -> BufResult<usize, B> {
 /// the sendmsg-with-N-iovecs path all along; this is the UCX counterpart.
 ///
 /// UCX reads the iov ARRAY itself — not just the payloads it points at — for
-/// the duration of the operation, so the array follows the SAME rule the
-/// payload buffers do: held in `ManuallyDrop`, freed only on a path that
-/// reached completion. On `InflightSlot`'s cancel-overflow path the guard
-/// returns with UCX still owning every pointer it was handed, and a plain local
-/// would be freed there while UCX may still read it.
+/// the duration of the operation, so the array is part of the payload
+/// `Inflight` guards and is freed only once the operation completed.
 async fn ucx_send_vectored<T: IoVectoredBuf>(ep: *mut ucp_ep, buf: T) -> BufResult<usize, T> {
-    let buf = ManuallyDrop::new(buf);
     let mut iov: Vec<ucp_dt_iov_t> = Vec::new();
     let mut total = 0usize;
     for s in buf.iter_slice() {
@@ -599,9 +693,14 @@ async fn ucx_send_vectored<T: IoVectoredBuf>(ep: *mut ucp_ep, buf: T) -> BufResu
         });
     }
     if total == 0 {
-        return BufResult(Ok(0), ManuallyDrop::into_inner(buf));
+        return BufResult(Ok(0), buf);
     }
-    let iov = ManuallyDrop::new(iov);
+    let mut payload = ManuallyDrop::new((buf, iov));
+    let iov = &payload.1;
+    if iov.iter().any(|e| inline_storage(&payload, e.buffer)) {
+        let (buf, _iov) = ManuallyDrop::into_inner(payload);
+        return BufResult(Err(inline_storage_err()), buf);
+    }
 
     let slot = slot_acquire();
 
@@ -616,37 +715,26 @@ async fn ucx_send_vectored<T: IoVectoredBuf>(ep: *mut ucp_ep, buf: T) -> BufResu
     // With UCP_DATATYPE_IOV the "buffer" is the iov array and the "count" is
     // the number of entries, not a byte length.
     let r = unsafe { ucp_stream_send_nbx(ep, iov.as_ptr() as *const c_void, iov.len(), &params) };
-    // Every arm below is reached only once UCX is DONE with the operation
-    // (`await_pending` returns only when the slot completes; a mid-await drop
-    // unwinds through the guard and never gets here), so freeing the array is
-    // safe here — and NOT freeing it on the drop path is the point.
-    match classify_ptr(r) {
+    let outcome = match classify_ptr(r) {
         PtrStatus::Done => {
             unsafe { slot_release(slot) };
-            drop(ManuallyDrop::into_inner(iov));
-            BufResult(Ok(total), ManuallyDrop::into_inner(buf))
+            Ok(total)
         }
         PtrStatus::Err(st) => {
             unsafe { slot_release(slot) };
-            drop(ManuallyDrop::into_inner(iov));
-            BufResult(
-                Err(ucs_err(st, "ucp_stream_send_nbx(iov)")),
-                ManuallyDrop::into_inner(buf),
-            )
+            Err(ucs_err(st, "ucp_stream_send_nbx(iov)"))
         }
         PtrStatus::Pending(req) => {
-            let (status, _) = await_pending(req, slot, SPIN_ITERS).await;
-            drop(ManuallyDrop::into_inner(iov));
+            let (status, _) = await_pending(req, slot, SPIN_ITERS, &mut payload, None).await;
             if status == ucs_status_t::UCS_OK {
-                BufResult(Ok(total), ManuallyDrop::into_inner(buf))
+                Ok(total)
             } else {
-                BufResult(
-                    Err(ucs_err(status, "ucp_stream_send(iov) cb")),
-                    ManuallyDrop::into_inner(buf),
-                )
+                Err(ucs_err(status, "ucp_stream_send(iov) cb"))
             }
         }
-    }
+    };
+    let (buf, _iov) = ManuallyDrop::into_inner(payload);
+    BufResult(outcome, buf)
 }
 
 pub(crate) async fn ucx_flush(ep: *mut ucp_ep) -> io::Result<()> {
@@ -669,7 +757,8 @@ pub(crate) async fn ucx_flush(ep: *mut ucp_ep) -> io::Result<()> {
             Err(ucs_err(st, "ucp_ep_flush_nbx"))
         }
         PtrStatus::Pending(req) => {
-            let (status, _) = await_pending(req, slot, 0).await;
+            let mut none = ManuallyDrop::new(());
+            let (status, _) = await_pending(req, slot, 0, &mut none, None).await;
             if status == ucs_status_t::UCS_OK {
                 Ok(())
             } else {
@@ -679,19 +768,24 @@ pub(crate) async fn ucx_flush(ep: *mut ucp_ep) -> io::Result<()> {
     }
 }
 
-/// Raw recv into a borrowed buffer (ptr+cap), optionally naming its registered
-/// `memh`. Either way UCX Stream unpacks into the buffer; `memh.is_null()` is
-/// the same path `ucx_recv` takes. Returns bytes received. Cancel-safe: the
-/// `InflightSlot` guard drains UCX before returning; the buffer is borrowed
-/// by the caller (no ManuallyDrop leak on cancel).
-async fn ucx_recv_raw(
-    ep: *mut ucp_ep,
+/// One stream recv into `cap` bytes at `ptr`, a region of the caller's `buf`,
+/// which the operation guards until it completes (see `Inflight`; the caller
+/// takes the buffer back only after this returns). `memh` names the region's
+/// registration or is null; UCX Stream unpacks into the buffer either way.
+/// Returns the bytes received, which may be fewer than `cap`.
+async fn ucx_recv_guarded<P: 'static>(
+    ep: &UcxEp,
+    buf: &mut ManuallyDrop<P>,
     ptr: *mut c_void,
     cap: usize,
     memh: ucp_mem_h,
 ) -> io::Result<usize> {
+    ep.check_readable()?;
     if cap == 0 {
         return Ok(0);
+    }
+    if inline_storage(buf, ptr) {
+        return Err(inline_storage_err());
     }
     let slot = slot_acquire();
 
@@ -714,7 +808,7 @@ async fn ucx_recv_raw(
     params.user_data = slot as *mut c_void;
 
     let mut got: usize = 0;
-    let r = unsafe { ucp_stream_recv_nbx(ep, ptr, cap, &mut got, &params) };
+    let r = unsafe { ucp_stream_recv_nbx(ep.ptr(), ptr, cap, &mut got, &params) };
     match classify_ptr(r) {
         PtrStatus::Done => {
             unsafe { slot_release(slot) };
@@ -729,7 +823,7 @@ async fn ucx_recv_raw(
             if unsafe { (*slot).is_done() } {
                 RECV_VIA_CALLBACK.with(|c| c.set(c.get() + 1));
             }
-            let (status, n) = await_pending(req, slot, SPIN_ITERS).await;
+            let (status, n) = await_pending(req, slot, SPIN_ITERS, buf, Some(ep)).await;
             if status == ucs_status_t::UCS_OK {
                 Ok(n)
             } else {
@@ -739,23 +833,32 @@ async fn ucx_recv_raw(
     }
 }
 
-/// Recv into an owned compio buffer (copy-out path, no memh) — a thin wrapper
-/// over `ucx_recv_raw`. On cancel the `ManuallyDrop` deliberately leaks the
-/// buffer: the guard's drain normally makes freeing safe, but its SPIN_CAP
-/// bail-out can return while UCX still holds the pointer, so leaking is the
-/// only always-safe choice for an owned buffer.
-async fn ucx_recv<B: IoBufMut>(ep: *mut ucp_ep, buf: B) -> BufResult<usize, B> {
+/// Recv into an owned compio buffer (copy-out path, no memh).
+async fn ucx_recv<B: IoBufMut>(ep: &UcxEp, buf: B) -> BufResult<usize, B> {
     let mut buf = ManuallyDrop::new(buf);
     let cap = buf.buf_capacity();
-    if cap == 0 {
-        return BufResult(Ok(0), ManuallyDrop::into_inner(buf));
-    }
     let ptr = buf.as_uninit().as_mut_ptr() as *mut c_void;
-    match ucx_recv_raw(ep, ptr, cap, ptr::null_mut()).await {
-        Ok(n) => {
-            unsafe { buf.set_len(n) };
-            BufResult(Ok(n), ManuallyDrop::into_inner(buf))
-        }
-        Err(e) => BufResult(Err(e), ManuallyDrop::into_inner(buf)),
+    let r = ucx_recv_guarded(ep, &mut buf, ptr, cap, ptr::null_mut()).await;
+    if let Ok(n) = r {
+        unsafe { buf.set_len(n) };
     }
+    BufResult(r, ManuallyDrop::into_inner(buf))
+}
+
+/// Recv into `pb`'s writable region from `filled` on, naming the slab's
+/// registration when it has one. Returns the bytes received (may be fewer than
+/// the region) and the buffer; a buffer whose recv was dropped mid-await is
+/// held by the orphan list and returns to its pool once UCX is done with it.
+async fn ucx_recv_pooled(ep: &UcxEp, pb: PooledBuf, filled: usize) -> BufResult<usize, PooledBuf> {
+    let mut pb = ManuallyDrop::new(pb);
+    let (dest, reg) = pb.dest_and_reg();
+    let memh = reg.map_or(ptr::null_mut(), |r| r.memh());
+    let cap = dest.len().saturating_sub(filled);
+    let ptr = if cap == 0 {
+        ptr::null_mut()
+    } else {
+        dest[filled..].as_mut_ptr() as *mut c_void
+    };
+    let r = ucx_recv_guarded(ep, &mut pb, ptr, cap, memh).await;
+    BufResult(r, ManuallyDrop::into_inner(pb))
 }

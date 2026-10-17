@@ -216,7 +216,7 @@ that were ESTABLISHED with empty queues.
 
 Every `RpcClient` runs a third held task, `keepalive_task`, and the rule is about
 SILENCE. Signs of life: any byte received (`read_loop` bumps `rx_progress` on every
-read, each UCX `recv_into`, each 4 MiB step of a TCP bulk value — `read_value_tcp`);
+read, each UCX `recv_pooled`, each 4 MiB step of a TCP bulk value — `read_value_tcp`);
 and on TCP, the peer's kernel ACKing more of our bytes WHILE more are queued unsent
 behind them — `AckProbe`, `TCP_INFO` `tcpi_bytes_acked` / `tcpi_notsent_bytes`,
 read through a local `repr(C)` prefix because the `libc` crate's glibc `tcp_info`
@@ -364,13 +364,13 @@ Calls: `call`, `call_vectored` (vectored ctrl, zero-copy parts),
   not an API guarantee — an outside `send_frame` user may drop the client
   mid-await, and gets a clean `Canceled` → `ConnectionClosed`.
 
-  On UCX a cancelled transfer LEAKS its buffer by
-  design instead of freeing one UCX may still write into (`ucx_recv` /
-  `ucx_send` / `ucx_send_vectored` `ManuallyDrop`; the cancel drain can bail out
-  at its progress cap while UCX still holds the pointer): at most one in-flight
-  recv window plus one in-flight send per closed connection, the send being the
-  larger (a whole bulk frame plus its iov array) and the recv window not fixed at
-  64 KiB (`read_loop` sizes an in-progress frame's window to
+  On UCX a cancelled transfer cannot be stopped; the transport keeps its
+  buffers on an orphan list until UCX completes it (a pool slab then returns
+  to its pool), which for a recv on a connection the peer never writes again
+  is for the thread's life: at most one in-flight recv window plus one
+  in-flight send per closed connection, the send being the larger (a whole bulk
+  frame plus its iov array) and the recv window not fixed at 64 KiB
+  (`read_loop` sizes an in-progress frame's window to
   `front_frame_remaining()`). Bounded per connection, against leaking the
   connection itself. UCX teardown is reasoned from the code, not measured.
 
@@ -402,7 +402,7 @@ Pending::Frame (non-bulk call)
 Pending::IntoPooled (bulk call), response frame NOT FLAG_ERROR
   ├─ UCX                → fast path: peek_bulk_prologue (verify crc, parse
   │                       code+message), consume prologue, regpool_acquire +
-  │                       recv_into(dest, reg) — one Stream unpack into the
+  │                       recv_pooled(pb, filled) — one Stream unpack into the
   │                       slab (a memh does not remove it). Unconditional:
   │                       recv-into is never worse than decode on UCX.
   └─ TCP
