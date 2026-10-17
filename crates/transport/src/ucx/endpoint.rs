@@ -190,6 +190,17 @@ impl Slot {
 }
 
 thread_local! {
+    /// How this thread's stream recvs that found their data already queued
+    /// completed: unpacked in place by `ucp_stream_recv_nbx` (the only path the
+    /// transport accepts), or through UCX's request callback before the call
+    /// returned (never: that path reports a stale status and leaks the request
+    /// on release builds up to 1.20.1, see `ucx_recv_raw`). Read by
+    /// `ucx_recv_counts`.
+    pub(crate) static RECV_IN_PLACE: Cell<u64> = const { Cell::new(0) };
+    pub(crate) static RECV_VIA_CALLBACK: Cell<u64> = const { Cell::new(0) };
+}
+
+thread_local! {
     static SLOT_POOL: std::cell::RefCell<Vec<Box<Slot>>> =
         std::cell::RefCell::new(Vec::with_capacity(64));
 }
@@ -685,9 +696,14 @@ async fn ucx_recv_raw(
     let slot = slot_acquire();
 
     let mut params: ucp_request_param_t = unsafe { std::mem::zeroed() };
-    let mut mask = ucp_op_attr_t::UCP_OP_ATTR_FIELD_CALLBACK
-        | ucp_op_attr_t::UCP_OP_ATTR_FIELD_USER_DATA
-        | ucp_op_attr_t::UCP_OP_ATTR_FLAG_NO_IMM_CMPL;
+    // No NO_IMM_CMPL: data already queued at the ep is then unpacked in place
+    // and the call returns NULL with `got` set, no request involved. With the
+    // flag UCX builds a request, completes it inside the call and hands the
+    // callback `req->status`, which release builds up to 1.20.1 never set for
+    // a stream recv (stream_recv.c, assert-only): the PS saw UCS_INPROGRESS on
+    // 8 MiB receives and dropped the connection. That request is also never
+    // marked completed, so `ucp_request_free` leaked it.
+    let mut mask = ucp_op_attr_t::UCP_OP_ATTR_FIELD_CALLBACK | ucp_op_attr_t::UCP_OP_ATTR_FIELD_USER_DATA;
     if !memh.is_null() {
         // The dest is registered; Stream still unpacks AM data into it.
         mask |= ucp_op_attr_t::UCP_OP_ATTR_FIELD_MEMH;
@@ -702,6 +718,7 @@ async fn ucx_recv_raw(
     match classify_ptr(r) {
         PtrStatus::Done => {
             unsafe { slot_release(slot) };
+            RECV_IN_PLACE.with(|c| c.set(c.get() + 1));
             Ok(got)
         }
         PtrStatus::Err(st) => {
@@ -709,6 +726,9 @@ async fn ucx_recv_raw(
             Err(ucs_err(st, "ucp_stream_recv_nbx"))
         }
         PtrStatus::Pending(req) => {
+            if unsafe { (*slot).is_done() } {
+                RECV_VIA_CALLBACK.with(|c| c.set(c.get() + 1));
+            }
             let (status, n) = await_pending(req, slot, SPIN_ITERS).await;
             if status == ucs_status_t::UCS_OK {
                 Ok(n)

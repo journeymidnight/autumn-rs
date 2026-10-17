@@ -210,7 +210,10 @@ written is then read from disk rather than memory, and the data directories must
 be on a filesystem that takes O_DIRECT (not tmpfs before Linux 6.6) — see
 "Direct I/O on the extent nodes" in [`docs/ops.md`](docs/ops.md).
 
-UCX (RDMA) builds are opt-in: `cargo build --release -p autumn-server --features ucx`.
+UCX (RDMA) builds are opt-in: `cargo build --release -p autumn-server --features ucx`,
+and need UCX ≥ 1.17 (older libraries are refused at start; Ubuntu 24.04 ships 1.16,
+so build it from source — "UCX library" in [`docs/ops.md`](docs/ops.md), which also
+records the second UCX defect the transport works around).
 With `TRANSPORT=ucx`, the launchers (`autumn-deploy`, `cluster.sh`) set the UCX env
 automatically: clusters bind **RoCE NIC IPs** (loopback is not an RDMA address and is
 refused) and get `UCX_TLS=rc_mlx5,ud_mlx5,tcp,self` plus a pinned `UCX_NET_DEVICES` —

@@ -16,7 +16,14 @@ pub(crate) mod worker;
 
 pub use endpoint::UcxConn;
 pub use listener::UcxListener;
-pub use worker::{register_memory, RegisteredMem};
+pub use worker::{check_library, register_memory, RegisteredMem};
+
+/// This thread's (recvs completed in place, recvs completed through UCX's
+/// request callback) for stream recvs that found their data already queued;
+/// see `endpoint.rs`.
+pub fn recv_counts() -> (u64, u64) {
+    (endpoint::RECV_IN_PLACE.get(), endpoint::RECV_VIA_CALLBACK.get())
+}
 
 use crate::{AutumnTransport, Conn, Listener, TransportKind};
 use async_trait::async_trait;

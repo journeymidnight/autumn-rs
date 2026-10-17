@@ -37,6 +37,7 @@ fn main() {
         // ucp_init in the header is a static inline that bindgen skips;
         // we call ucp_init_version directly with the macro-defined version.
         .allowlist_function("ucp_init_version")
+        .allowlist_function("ucp_get_version")
         .allowlist_function("ucp_cleanup")
         .allowlist_function("ucp_config_read")
         .allowlist_function("ucp_config_release")

@@ -242,8 +242,11 @@ moves peak write (65K → 72K) but cuts write p99 46 → 17 ms.
   (`--tcp-zerocopy-min-bytes`, default 0 = off) is slower on loopback (8 MiB
   single-partition write 711 vs 898 MiB/s, more CPU/GiB) and stays off. UCX 64 KiB
   single-partition reads were ~8% lower on 0.19 (2,573 vs 2,797 MiB/s; not at 4
-  partitions), unresolved. UCX 1.16 intermittently hits `Local protection error`
-  on SEND under four partitions on both versions. SQPOLL adds CPU.
+  partitions), unresolved. The intermittent UCX `Local protection error` on SEND
+  seen on both versions was UCX 1.16's registration-cache race; UCX ≥ 1.17 is
+  required, and receives no longer ask for `NO_IMM_CMPL`, whose in-call completion
+  reported an uninitialised status on release builds (ops.md "UCX library").
+  SQPOLL adds CPU.
 - **Replica CRC reuse:** sharing one payload CRC scan across replica frames
   (`crc32c_combine`) beats re-scanning only for large payloads: measured
   crossover ~460 KiB at RF=3, ~600 KiB at RF=2; below it sharing costs up to 23×

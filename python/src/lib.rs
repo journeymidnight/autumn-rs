@@ -840,6 +840,9 @@ fn set_transport(kind: &str) -> PyResult<()> {
                         }
                     }
                 }
+                // init_with exits the process on a refused library; raise instead.
+                autumn_transport::check_ucx_library()
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
                 autumn_transport::init_with(autumn_transport::TransportKind::Ucx);
                 IS_UCX.store(true, std::sync::atomic::Ordering::SeqCst);
                 Ok(())

@@ -115,6 +115,76 @@ Constraints both paths are shaped around:
   `--no-direct-io` instead; see [Direct I/O on the extent nodes](#direct-io-on-the-extent-nodes).
 - **Run more ENs than the replication factor**: with `#EN == RF` one EN down stops
   writes (no fresh replica set can form); reads tolerate a down replica.
+- **UCX needs UCX ≥ 1.17** on every host running a UCX process; see
+  [UCX library](#ucx-library).
+
+### UCX library
+
+Two UCX defects shaped this section: the first killed the PS under 4 KiB UCX
+reads, the second stalled 8 MiB UCX writes.
+
+**1. Registration-cache race (UCX < 1.17).** Before 1.17, UCX's registration
+cache let a `munmap`/`madvise` on one thread (an allocator purge) deregister a
+cached region while a worker thread was taking it for a zero-copy send. The NIC
+then fails the send and UCX aborts the process: `Local protection error ... SEND
+[inl len 10] [va .. len 4096 lkey ..]`, a segfault, or `rcache.c:427 Assertion
+'region->refcount == 0' failed`. The PS died this way under 4 KiB UCX reads (2
+of 4 perf-check runs on 1.16; 0 of 14 on 1.20.1). Every UCX process (servers,
+clients, fuse, Python `set_transport("ucx")`) refuses an older library at start:
+
+```
+autumn-transport: UCX 1.16.0 is too old: before 1.17 its registration cache can deregister memory under an in-flight send ...   exit=2
+```
+
+**2. Uninitialised status on an immediately completed stream recv (release
+builds up to 1.20.1).** When the data is already queued, UCX completes
+`ucp_stream_recv_nbx` inside the call and hands the callback `req->status`, a
+field release builds never set for a stream recv (`stream_recv.c`, assert-only).
+A recycled request reports whatever it held: `UCS_INPROGRESS` on the PS's
+8 MiB receives 3–5 times per 10 s run, other stale values on clients. The PS
+treated it as an error and ended the connection without a word on the wire (no
+`ucp_ep_close`), so the client waited out its 8 s keepalive: 8 MiB writes ran
+at ~75% of baseline with p99 10–12 s, and clients logged `rpc client reader
+exited ... ucp_stream_recv cb: Unknown error 16/48/80`. The Ubuntu 24.04 package is built with assertions and never showed it. The transport no longer
+asks for `UCP_OP_ATTR_FLAG_NO_IMM_CMPL` on receives: queued data is then
+unpacked in place with no request, which also stops the request leak that path
+had (those requests were never marked completed). A stock 1.17+ library works
+unpatched; the fix also belongs upstream.
+
+Ubuntu 24.04 packages 1.16, so install from source (needs the rdma-core
+`libibverbs` headers and `librdmacm-dev`; connections by address go through
+rdmacm). Plain `configure-release` is fine: assertions are not needed.
+
+```bash
+ucx_info -v                                   # Library version the binaries load
+curl -LO https://github.com/openucx/ucx/releases/download/v1.20.1/ucx-1.20.1.tar.gz
+tar xzf ucx-1.20.1.tar.gz && cd ucx-1.20.1
+./contrib/configure-release --prefix=/usr/local --enable-mt --with-verbs --with-rdmacm \
+    --without-cuda --without-rocm --without-java --without-go
+make -j"$(nproc)" && sudo make install && sudo ldconfig
+ucx_info -d | grep -E 'Connection manager: rdmacm|Transport: rc_mlx5' | sort -u
+cd <autumn-rs> && cargo clean -p ucx-sys-mini   # regenerate bindings against /usr/local
+cargo build --release -p autumn-server --features ucx
+ldd target/release/autumn-ps | grep libucs    # → /usr/local/lib/libucs.so.0
+```
+
+Both regression tests need a RoCE host (`AUTUMN_UCX_TEST_BIND='[<roce-ip>]:0'`,
+`UCX_TLS=rc_mlx5,ud_mlx5,tcp,self`, `UCX_NET_DEVICES=<dev>:1`):
+
+```bash
+# 1: 60 s of zero-copy sends while other threads release pages. Against a 1.16
+#    library (e.g. via LD_LIBRARY_PATH) it dies within the minute.
+cargo test --release -p autumn-transport --features ucx --test ucx_rcache_race -- --nocapture
+# 2: 200 messages queued before the receiver posts a recv; fails if any recv
+#    completed through UCX's request callback (it does with NO_IMM_CMPL).
+cargo test --release -p autumn-transport --features ucx --test ucx_immediate_recv
+```
+
+Perf-check on UCX 1.20.1 vs the 2026-09-28 baselines (system 1.16), over a
+day of runs on a shared host: 8 MiB write 266–282 ops/s (baseline 269), 11.1 s
+per 10 s run and no keepalive closes; 8 MiB read 740–950 (622); 4 KiB read
+0.88–1.25 M (0.96 M); 4 KiB write 13–19 K (18 K), the same band the 1.16
+library showed the same day.
 
 ### Bare metal (`autumn-deploy`)
 
@@ -123,7 +193,7 @@ Requirements: `cargo build --release -p autumn-server` on the driver host;
 `bash` ≥ 4 on the driver (macOS ships 3.2: `brew install bash`); passwordless SSH
 to every `SSH_USER@host` for multi-host; Linux ≥ 5.15 on server hosts (io_uring;
 macOS runs a local test cluster on kqueue, but `autumn-fuse` and UCX are
-Linux-only).
+Linux-only); UCX ≥ 1.17 on every host for `TRANSPORT=ucx` ([UCX library](#ucx-library)).
 
 Service backend (`SERVICE_BACKEND=auto|systemd|process`): **systemd** when the host
 runs systemd and the user is root or has passwordless sudo (one unit per instance,

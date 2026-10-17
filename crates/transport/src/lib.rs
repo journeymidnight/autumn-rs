@@ -42,7 +42,7 @@ pub use tcp::TcpTransport;
 #[cfg(feature = "ucx")]
 pub use ucx::UcxTransport;
 #[cfg(feature = "ucx")]
-pub use ucx::{register_memory, RegisteredMem};
+pub use ucx::{check_library as check_ucx_library, recv_counts as ucx_recv_counts, register_memory, RegisteredMem};
 
 /// Placeholder when built without the `ucx` feature — never constructed (TCP
 /// has no memory registration). Lets the recv-into seam
@@ -57,8 +57,16 @@ static GLOBAL: OnceLock<Box<dyn AutumnTransport>> = OnceLock::new();
 /// Idempotent — the first call wins; subsequent calls are no-ops.
 ///
 /// Panics if `TransportKind::Ucx` is requested but the binary was built
-/// without the `ucx` feature.
+/// without the `ucx` feature; exits 2 if the UCX library fails
+/// [`check_ucx_library`].
 pub fn init_with(kind: TransportKind) -> &'static dyn AutumnTransport {
+    #[cfg(feature = "ucx")]
+    if kind == TransportKind::Ucx && GLOBAL.get().is_none() {
+        if let Err(e) = ucx::check_library() {
+            eprintln!("autumn-transport: {e}");
+            std::process::exit(2);
+        }
+    }
     let _ = GLOBAL.set(match kind {
         TransportKind::Tcp => Box::new(TcpTransport) as Box<dyn AutumnTransport>,
         #[cfg(feature = "ucx")]

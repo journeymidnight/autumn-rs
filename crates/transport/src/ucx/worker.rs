@@ -202,6 +202,32 @@ pub fn register_memory(ptr: *mut c_void, len: usize) -> io::Result<RegisteredMem
     })
 }
 
+/// First UCX release whose registration cache defers memory-release events to
+/// the cache's own lock holders. Before it, a `munmap`/`madvise` on any thread
+/// could deregister a cached region while a worker thread was taking a
+/// reference to it for a zero-copy send; the NIC then fails the send with
+/// `Local protection error` and UCX aborts the process.
+const UCX_MIN_VERSION: (u32, u32) = (1, 17);
+
+fn version_has_rcache_fix(major: u32, minor: u32) -> bool {
+    (major, minor) >= UCX_MIN_VERSION
+}
+
+/// Refuse a UCX library older than [`UCX_MIN_VERSION`].
+pub fn check_library() -> io::Result<()> {
+    let (mut major, mut minor, mut release) = (0u32, 0u32, 0u32);
+    unsafe { ucp_get_version(&mut major, &mut minor, &mut release) };
+    if version_has_rcache_fix(major, minor) {
+        return Ok(());
+    }
+    Err(io::Error::other(format!(
+        "UCX {major}.{minor}.{release} is too old: before {}.{} its registration cache can \
+         deregister memory under an in-flight send, which kills the process with \
+         'Local protection error'. Install UCX >= {}.{} (docs/ops.md, \"UCX library\").",
+        UCX_MIN_VERSION.0, UCX_MIN_VERSION.1, UCX_MIN_VERSION.0, UCX_MIN_VERSION.1,
+    )))
+}
+
 fn capture_context_info(ctx: *mut ucp_context) -> String {
     let mut buf: *mut libc::c_char = ptr::null_mut();
     let mut size: libc::size_t = 0;
@@ -389,4 +415,18 @@ async fn progress_loop(w: WorkerPtr, efd: std::os::fd::RawFd) {
 pub(crate) fn ucs_err(st: ucs_status_t::Type, ctx: &str) -> io::Error {
     let cstr = unsafe { std::ffi::CStr::from_ptr(ucs_status_string(st)) };
     io::Error::other(format!("{ctx}: {}", cstr.to_string_lossy()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::version_has_rcache_fix;
+
+    #[test]
+    fn rcache_fix_starts_at_1_17() {
+        assert!(!version_has_rcache_fix(1, 16));
+        assert!(version_has_rcache_fix(1, 17));
+        assert!(version_has_rcache_fix(1, 20));
+        assert!(version_has_rcache_fix(2, 0));
+        assert!(!version_has_rcache_fix(0, 99));
+    }
 }

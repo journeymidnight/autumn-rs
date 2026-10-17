@@ -1,6 +1,6 @@
 # autumn-rs feature list — OPEN backlog
 
-**Last updated:** 2026-10-15
+**Last updated:** 2026-10-17
 
 **Rules:**
 - This file tracks the **OPEN backlog only**. A feature that reaches `passes: true`
@@ -14,10 +14,10 @@
 
 ## Active
 
-### BUG-UCX-PS-LOCAL-PROTECTION — UCX 4K 读时 PS 被 `Local protection error` 打死（已复现，旧版本同样出现）
-- **Trigger** (2026-10-16 perf check): 本机 UCX 4K perf-check（RoCE mlx5_2、rc_mlx5,ud_mlx5,tcp,self、8 分区、cpuset 隔离、sglang 租户在）读阶段约 2 s 时 PS 进程退出：`ib_mlx5_log.c:179 Local protection error on mlx5_2:1/RoCE (synd 0x4 vend 0x52)`，出错 WQE 是 `SEND [inl len 10] [va .. len 4096 lkey ..] [va .. len 19 lkey ..]`——读回复的 4 KiB value 段 lkey 失效（注册内存被注销 / 复用后仍在发）。栈在 `ucp_worker_progress`。所有分区端口同时 Connection reset，同集群后续 8M 段 0 ops。HEAD（5c841ab6）6 次中 4 次崩，前一提交 10437778 3 次中 1 次崩：早于参数改动。`perf_baseline.md` 记录过 UCX 1.16 四分区下 SEND 偶发 Local protection error。
-- **Scope**: 先找根因：4 KiB 读回复走哪块注册内存（regpool slab / 零拷贝回复 / SST block cache），谁在发送完成前释放或复用了它；用 `UCX_LOG_LEVEL` / regpool 统计 / 地址追踪定位，必要时二分到 2026-09-28 基线之后的提交。坐实后修生命周期，不加重试或兜底。
-- **Acceptance**: 同配置 UCX 4K perf-check 连续 10 次 PS 不崩、无 Local protection error；修复前同测试稳定复现（消融变红）；perf-check UCX 4K/8M 回到基线 80% 内。
+### BUG-UCX-STREAM-CANCEL-NOOP — `ucp_request_cancel` 对 stream 操作是空操作，取消路径从未生效
+- **Trigger** (2026-10-17 追 8M 写卡顿时读 UCX 1.16/1.20 源码): `ucp_request_cancel` 只处理 tag recv。`InflightSlot::drop` 在 future 被中途丢弃时调它再自旋等回调，等的其实只是操作自己完成；连接活着时就是 `SPIN_CAP` 退出 + "leaking slot + request" 告警（每次关连接必现，一轮 400 条连接 353 次），泄漏的 recv 仍挂在 ep 上会吞掉后续字节；`recv_into` 到池 buffer 的场景，buffer 已归还复用而 UCX 仍可能往里写。目前连接关闭后 ep 不再用，未观察到数据错误。
+- **Scope**: 先写用例复现（live ep 上 drop 一个 recv future，再看后续数据去向 / 池 buffer 是否被写）。坐实后改设计：stream 上在途操作不"取消"，要么等它完成要么关闭 ep（`ucp_ep_close_nbx` 的限制见 endpoint.rs 头注释）。
+- **Acceptance**: 复现用例修复前出现吞字节或 buffer 被写、修复后 drop 一个 recv 不影响同连接后续数据且不写已归还 buffer；消融变红。
 - `passes: false`
 
 ### F-REAVALI-TAIL-COPY — re_avali 只补缺的尾部（延后：有内容错的风险）
@@ -142,13 +142,6 @@
   noise limits whole-machine efficiency claims; sampled stacks have ID collisions.
   H200-2 offline, cross-host unavailable. Full acceptance remains passes:false.
 
-
-### F-UCX-LOCAL-PROTECTION — 四分区 UCX SEND 间歇性本地保护错误
-- **Trigger** (2026-09-14): compio 0.19 受控四分区 UCX 写入在 mlx5_1 上出现 Local protection error (synd 0x4 vend 0x52) 并 abort；compio 0.18 基线在相同拓扑的诊断采样中也复现，说明问题早于运行时升级。失败 SEND 包含无效/失效 lkey，根因尚未确定。
-- **Scope**: 定位 UCX 1.16 stream vectored send 的 buffer ownership、注册缓存和取消完成生命周期，复现后只保留有证据的修复；不得通过加超时、重试或丢弃失败样本掩盖。
-- **Acceptance**: 可重复触发的最小用例；修复消融失败/修复后通过；四分区 TCP/UCX 字节一致性、注册 buffer 取消/复用及重复压力验证；记录吞吐和 CPU 代价。
-- **notes**: 受控验证保留了 0.19 普通跑分和 0.18 诊断采样两份崩溃证据。后续重复成功不关闭该问题。
-- `passes: false`
 
 > **这个账本只记 autumn-rs 自己的东西。** 下游怎么被 autumn 的改动影响（例如一次 wire
 > 版本变更要求哪些内嵌客户端重建）算 autumn 的后果，该记；下游自己的缺陷、进展和上线
