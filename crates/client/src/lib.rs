@@ -4434,7 +4434,9 @@ impl ClusterClient {
     /// value travels as its own iovec straight from the `Bytes` backing memory,
     /// RDMA on UCX when that memory is registered, so `clone` = Arc bump and
     /// nothing is copied); everything smaller is grouped by owning partition and
-    /// packed into ONE `MSG_BATCH_PUT` frame per partition. Result `i` matches
+    /// packed into ONE `MSG_BATCH_PUT` frame per partition. A key with a value
+    /// in each class has all its values written one by one in input order, so
+    /// the last input wins. Result `i` matches
     /// `items[i]`: `Ok(())` = stored, `Err` = that item's RPC failed (others
     /// still ran).
     #[allow(clippy::type_complexity)]
@@ -4669,18 +4671,36 @@ impl ClusterClient {
         let mut groups: std::collections::HashMap<u64, Vec<(usize, Vec<u8>, bytes::Bytes, u64)>> =
             std::collections::HashMap::new();
         let mut bulk_only: Vec<(usize, Vec<u8>, bytes::Bytes, u64)> = Vec::new();
-        for (i, (k, v, ttl)) in items.iter().enumerate() {
-            let bk = match self.binding.bind_key(k) {
-                Ok(b) => b,
+        let bound: Vec<Option<Vec<u8>>> = items
+            .iter()
+            .enumerate()
+            .map(|(i, (k, _, _))| match self.binding.bind_key(k) {
+                Ok(b) => Some(b),
                 Err(e) => {
                     results[i] = Err(e);
-                    continue;
+                    None
                 }
-            };
-            if bulk_worthwhile(v.len()) {
-                bulk_only.push((i, bk, v.clone(), *ttl));
+            })
+            .collect();
+        // The small groups are written before the bulk-only values, so a key
+        // with a value in each class would commit out of input order. Such a
+        // key takes the per-key serial path (below) for ALL its values.
+        const SMALL: u8 = 1;
+        const BULK: u8 = 2;
+        let mut classes: std::collections::HashMap<&[u8], u8> = std::collections::HashMap::new();
+        for (bk, (_, v, _)) in bound.iter().zip(items) {
+            if let Some(bk) = bk {
+                *classes.entry(bk.as_slice()).or_default() |=
+                    if bulk_worthwhile(v.len()) { BULK } else { SMALL };
+            }
+        }
+        for (i, ((_, v, ttl), bk)) in items.iter().zip(bound.iter()).enumerate() {
+            let Some(bk) = bk else { continue };
+            if classes[bk.as_slice()] != SMALL {
+                bulk_only.push((i, bk.clone(), v.clone(), *ttl));
                 continue;
             }
+            let bk = bk.clone();
             let part_id = match self.resolve_key(&bk).await {
                 Ok((pid, _addr)) => pid,
                 Err(e) => {
@@ -4844,6 +4864,8 @@ impl ClusterClient {
         // order, fan the GROUPS out concurrently. Unique keys (extents, distinct
         // kvcache hashes) are all singletons ⇒ full concurrency; only the rare
         // same-key-twice batch serialises, which is exactly where order matters.
+        // A key with values in BOTH classes is routed here whole (`classes`
+        // above), since the small groups have already been written by now.
         //
         // CONNECTIONS (coco P3): in STEADY state each partition has one cached
         // multiplexed conn that all groups reuse. On a COLD cache (first big write,
@@ -4863,7 +4885,14 @@ impl ClusterClient {
             let mut out = Vec::with_capacity(positions.len());
             for pos in positions {
                 let (idx, k, v, ttl) = &bulk[pos];
-                out.push((*idx, this.put_bulk_opts(k, v.clone(), *ttl, lease).await));
+                // A small value is here only because its key also has a bulk
+                // value in this batch (see `classes`).
+                let r = if bulk_worthwhile(v.len()) {
+                    this.put_bulk_opts(k, v.clone(), *ttl, lease).await
+                } else {
+                    this.put_opts(k, v.as_ref(), *ttl, lease).await
+                };
+                out.push((*idx, r));
             }
             out
         });

@@ -625,3 +625,68 @@ fn delete_many_and_head_many() {
         assert!(!after[1].as_ref().unwrap().found);
     });
 }
+
+/// A key given both a small (< 64 KiB) and a bulk (>= 64 KiB) value in one
+/// `put_many` keeps last-input-wins, whichever class the later value is in.
+/// The small groups and the bulk-only values take different wire paths, so
+/// the orders are only equal if the SDK serialises a key that appears in both.
+#[test]
+fn put_many_mixed_size_duplicate_key_keeps_last_input() {
+    let mgr_addr = pick_addr();
+    start_manager(mgr_addr);
+
+    let n1_dir = tempfile::tempdir().expect("n1");
+    let n2_dir = tempfile::tempdir().expect("n2");
+    let n1_addr = pick_addr();
+    let n2_addr = pick_addr();
+    start_extent_node(n1_addr, n1_dir.path().to_path_buf(), 1);
+    start_extent_node(n2_addr, n2_dir.path().to_path_buf(), 2);
+
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        let cluster = boot_cluster(mgr_addr, n1_addr, n2_addr, 124, 12401).await;
+
+        let small = bytes::Bytes::from(pattern(4 * 1024));
+        let large = bytes::Bytes::from(pattern(256 * 1024));
+
+        // Bulk first, small last: the small value must win.
+        let items: [(&[u8], bytes::Bytes, u64); 2] =
+            [(b"pm-dup-a", large.clone(), 0), (b"pm-dup-a", small.clone(), 0)];
+        for (i, r) in cluster.put_many(&items).await.iter().enumerate() {
+            assert!(r.is_ok(), "op {i}: {r:?}");
+        }
+        assert_eq!(
+            cluster.get(b"pm-dup-a").await.unwrap().map(|v| v.len()),
+            Some(small.len()),
+            "the later small value lost to the earlier bulk value"
+        );
+
+        // Small first, bulk last: the bulk value must win.
+        let items: [(&[u8], bytes::Bytes, u64); 2] =
+            [(b"pm-dup-b", small.clone(), 0), (b"pm-dup-b", large.clone(), 0)];
+        for (i, r) in cluster.put_many(&items).await.iter().enumerate() {
+            assert!(r.is_ok(), "op {i}: {r:?}");
+        }
+        assert_eq!(
+            cluster.get(b"pm-dup-b").await.unwrap().as_deref(),
+            Some(large.as_ref()),
+            "the later bulk value lost to the earlier small value"
+        );
+
+        // Three values, alternating classes, other keys interleaved: the last
+        // one wins and the other keys keep their own values.
+        let mid = bytes::Bytes::from(pattern(128 * 1024));
+        let items: [(&[u8], bytes::Bytes, u64); 5] = [
+            (b"pm-dup-c", small.clone(), 0),
+            (b"pm-dup-other", large.clone(), 0),
+            (b"pm-dup-c", large.clone(), 0),
+            (b"pm-dup-other2", small.clone(), 0),
+            (b"pm-dup-c", mid.clone(), 0),
+        ];
+        for (i, r) in cluster.put_many(&items).await.iter().enumerate() {
+            assert!(r.is_ok(), "op {i}: {r:?}");
+        }
+        assert_eq!(cluster.get(b"pm-dup-c").await.unwrap().as_deref(), Some(mid.as_ref()));
+        assert_eq!(cluster.get(b"pm-dup-other").await.unwrap().as_deref(), Some(large.as_ref()));
+        assert_eq!(cluster.get(b"pm-dup-other2").await.unwrap().as_deref(), Some(small.as_ref()));
+    });
+}

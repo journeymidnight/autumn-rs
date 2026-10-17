@@ -4812,8 +4812,9 @@ not check it — it never compares what it read against what it wrote. Cover a n
 write path with an ignored system test that reads every value back:
 
 ```bash
-cargo test -p autumn-manager --test system_putstream -- --ignored put_many
+cargo test -p autumn-manager --test system_putstream -- --include-ignored put_many
 #   → put_many_small_values_take_the_batched_bulk_path ... ok
+#   → put_many_mixed_size_duplicate_key_keeps_last_input ... ok   (same key, small + bulk value, last input wins)
 ```
 
 ## Test matrix

@@ -170,7 +170,9 @@ bulk decisions go through `bulk_worthwhile`. No `concurrency` arg — internal d
   a relative TTL with `ClusterClient::ttl_to_expires_at(ttl_secs)`. SDK groups by owning
   partition. An item ≥ 64 KiB leaves the batch entirely and goes per-op
   `MSG_PUT_BULK`, fanned out CONCURRENTLY via
-  `fan_out_collect(batch_put_concurrency())`. What remains is sent as ONE frame
+  `fan_out_collect(batch_put_concurrency())`, one serial chain per key; a key
+  that also has a < 64 KiB item in the same batch brings that item along, so
+  the key's input order holds. What remains is sent as ONE frame
   per partition, and which frame depends on the GROUP's total value bytes, not on any
   single item's: ≥ 64 KiB → `MSG_BATCH_PUT_BULK` (keys and `value_len`s in ctrl, the
   values as their own iovecs in the raw tail — `Bytes::clone` is a refcount bump, so no
@@ -435,7 +437,9 @@ every op the frame's class (`batch_frame_error`). Resends are serial, one
 in input order, and a later op of a resent key is resent after it even when it
 was applied (`batch_resend_plan`), so a duplicate key keeps last-input-wins among
 the small values. A key given both a small and a ≥64 KiB value in one
-`put_many` does not: the bulk-only values are written after every small group. `put_opts` /
+`put_many` takes the per-key serial path with ALL its values, because the
+bulk-only values are written after every small group (test:
+`system_putstream::put_many_mixed_size_duplicate_key_keeps_last_input`). `put_opts` /
 `delete_opts` check the answer's body inside the settled region
 (`call_ps_for_key_tracked`): a body error after a lost first attempt is
 `OutcomeUnknown` too.
