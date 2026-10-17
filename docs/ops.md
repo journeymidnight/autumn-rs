@@ -2989,6 +2989,32 @@ should still list every live PS with its partitions. A failure shows every PS
 timing out within ~2 s of the promotion and all partitions moving to the first
 PS to re-register.
 
+## An owner epoch answered out of order does not move memory back
+
+Two acquires of one owner key can be answered out of commit order: the etcd
+client re-sends a request after its timeout (`--etcd-request-timeout-ms`) on a
+new connection while the old connection still delivers the other acquire's
+reply. The manager's in-memory epoch must end at etcd's latest write, or the
+leader fences the real owner until the next failover. The test (needs `etcd`,
+`toxiproxy-server` and `toxiproxy-cli` on `PATH`; ~2 s) holds the replies with
+a toxiproxy latency toxic and releases them after the re-send:
+
+```bash
+cargo test -p autumn-manager --test owner_epoch_etcd_reorder -- --nocapture
+#   → first=9 a=12 b=11 etcd: ... mod_rev=12 ... memory=12   (memory=11 before the fix)
+```
+
+The same re-send can land a whole-record write late. `update_stream_ec` is
+value-CAS'd against the record it read, so a tail allocated while it was in
+flight survives the next leader's replay (same binaries on `PATH`; ~15 s, it
+includes a leader change):
+
+```bash
+cargo test -p autumn-manager --test update_stream_ec_cas -- --nocapture
+#   → U answered ...: code 3 precondition failed: stream changed concurrently (CAS conflict) ...
+#   → replayed: [4, 5] ec 1/0          ([4] before the fix: the tail was gone)
+```
+
 ## fs stripe geometry: lanes vs partitions
 
 Large-file striping spreads one file's extents across N **lanes** so a single

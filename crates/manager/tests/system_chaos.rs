@@ -2547,6 +2547,7 @@ async fn do_latency_spike(ctx: &NemesisCtx) -> Result<String, String> {
         &victim_proxy,
         "latency",
         &toxic_name,
+        false,
         &[("latency", "500"), ("jitter", "100")],
     ) {
         ctx.proxy_faults.fetch_add(1, Ordering::Relaxed);

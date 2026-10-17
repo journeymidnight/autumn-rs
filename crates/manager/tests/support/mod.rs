@@ -1277,6 +1277,8 @@ impl ToxiproxyCli {
         proxy: &str,
         toxic_type: &str,
         toxic_name: &str,
+        // `false` = downstream (server → client bytes), toxiproxy's default.
+        upstream: bool,
         attrs: &[(&str, &str)],
     ) -> Result<(), String> {
         let mut cmd = self.cmd();
@@ -1285,7 +1287,8 @@ impl ToxiproxyCli {
             .arg("-t")
             .arg(toxic_type)
             .arg("-n")
-            .arg(toxic_name);
+            .arg(toxic_name)
+            .arg(if upstream { "-u" } else { "-d" });
         for (k, v) in attrs {
             cmd.arg("-a").arg(format!("{k}={v}"));
         }

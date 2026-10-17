@@ -943,7 +943,10 @@ member). When its node answers again the loop sends `re_avali`, the node copies
 the bytes up to `sealed_length` from its peers — lit ones first, never one
 marked corrupt (a corrupt-isolated copy is full length; the manager sends the
 bitmap beside the extent info, stream CLAUDE.md "Copy sources") — and
-`mark_extent_available` sets the bit. The conditions and why:
+`mark_extent_available` sets the bit. It copies the WHOLE extent, not the
+missing tail: members may differ past the acked commit point (above), so a
+tail stitched onto the local prefix is not a copy of any member (user,
+2026-10-17; a tail copy is not to be proposed again). The conditions and why:
 - replicated extents only — an EC node answers `re_avali` OK without checking
   that its shard exists;
 - node Online and disk not offline — an unreachable node would only time out;
@@ -1422,7 +1425,12 @@ reconciled by recovery later; it does not block the seal.
 **Phantom-commit is ACCEPTABLE.** Seal-over-reachable can promote an
 un-acked-but-replicated tail byte to committed (data *gain*, never *loss*),
 consistent with uncertain-write semantics. Do NOT add strict-mode/watermark threading
-to kill it — it trades a benign gain for a real loss risk.
+to kill it — it trades a benign gain for a real loss risk. The same holds for
+CONTENT past the acked commit point: a failed append's rewind lets a later
+append land at the same offset on a different subset of replicas, so members may
+hold different un-acked bytes there, and the seal length may sit above or below
+any one member's length. Seal and `re_avali` judge by length on purpose; this is
+expected behaviour, not a bug to file (user, 2026-10-17).
 
 **Authoritative seal state.** `persist::ExtentRecord.sealed: bool` is the authoritative STATE
 (`sealed_length` is the LENGTH; invariant `sealed_length > 0 ⇒ sealed`; every
@@ -1493,7 +1501,16 @@ covers each, red without its part of the fix, plus a wrong `ownerLocks/` key
   owner). Newest-acquirer-wins: each PS incarnation acquires once at startup and keeps
   the epoch for its lifetime; per-partition StreamClients inherit it. A stable per-key
   epoch cannot support A→B→A failback and lets two live processes share an epoch (no
-  mutual fencing). Memory-mode mirrors this.
+  mutual fencing). Memory-mode mirrors this. The in-memory epoch takes the MAX of
+  what it holds and the acquire's revision: the etcd client re-sends a request
+  after its timeout on a new connection while the old connection still delivers
+  the other acquire's reply, so two acquires of one key can be answered out of
+  commit order (`tests/owner_epoch_etcd_reorder.rs`, with toxiproxy holding the
+  replies: memory read 11 with etcd at 12 — the real owner fenced, the fenced
+  one accepted — until the next leader replayed). `handle_acquire_owner_lock`
+  is leader-gated like every other writer: the fence alone let an acquire
+  commit between winning the leader key and finishing replay, and replay then
+  wrote its older `ownerLocks/` snapshot over the epoch.
 - **Stream-membership etcd writes value-CAS.** Any read-modify-write of a
   `streams/<id>` membership MUST value-CAS the write against the read baseline
   (`put_delete_txn_cas` prepends `Cmp::value(streams/<id>) == baseline`), never a bare
@@ -1503,7 +1520,12 @@ covers each, red without its part of the fix, plus a wrong `ownerLocks/` key
   and lose writes under kill); a genuine conflict returns `Precondition` → client
   retries with a fresh snapshot. rkyv is deterministic so the baseline byte-matches
   etcd. Covered: `handle_stream_alloc_extent` / `handle_stream_punch_holes` /
-  `handle_truncate` / `handle_multi_modify_merge` (all 3 survivor streams). Accepted
+  `handle_truncate` / `handle_multi_modify_merge` (all 3 survivor streams) /
+  `handle_update_stream_ec` (it rewrites the whole record; a bare put landing late —
+  the etcd client's timeout re-send had moved the channel while the first attempt
+  was still in flight — wrote a stream back without the tail allocated meanwhile,
+  and the next leader replayed it without that tail:
+  `tests/update_stream_ec_cas.rs`). Accepted
   residual: a CAS-failed alloc orphans the just-created extent files (reaped by the
   node-startup reconcile), and GC/compaction callers don't client-retry but their
   background loops re-attempt (`classify_gc_failure_cooldown` maps `precondition

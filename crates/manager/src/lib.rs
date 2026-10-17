@@ -3795,7 +3795,13 @@ impl AutumnManager {
             let rev = etcd.txn_fenced_put_revision(vec![put_op]).await?;
 
             let mut s = self.store.inner.borrow_mut();
-            s.owner_epochs.insert(owner_key.to_string(), rev);
+            // Two acquires of one key can be answered out of commit order: a
+            // request that timed out is re-sent on a new connection while the
+            // old connection still delivers the other's reply. Memory mirrors
+            // etcd's latest write, so it never moves back; the caller handed
+            // the older revision is fenced at its next op, as etcd says.
+            let cur = s.owner_epochs.entry(owner_key.to_string()).or_insert(rev);
+            *cur = (*cur).max(rev);
             s.next_revision = s.next_revision.max(rev);
             return Ok(rev);
         }
@@ -4876,10 +4882,17 @@ impl AutumnManager {
         Ok(())
     }
 
-    async fn mirror_stream_meta_update(&self, stream: &StreamRecord) -> Result<(), AppError> {
+    /// Writes the stream record if etcd still holds `baseline` (the record it
+    /// was computed from); a concurrent membership change is `Precondition`.
+    async fn mirror_stream_meta_update_cas(
+        &self,
+        stream: &StreamRecord,
+        baseline: Vec<u8>,
+    ) -> Result<(), AppError> {
         if let Some(etcd) = &self.etcd {
-            let kvs = vec![Self::persist_kv_entry("streams", stream.stream_id, stream)];
-            etcd.put_msgs_txn(kvs).await?;
+            let (key, value) = Self::persist_kv_entry("streams", stream.stream_id, stream);
+            let cas = vec![(key.clone(), baseline)];
+            etcd.put_delete_txn_cas(vec![(key, value)], vec![], cas).await?;
         }
         Ok(())
     }

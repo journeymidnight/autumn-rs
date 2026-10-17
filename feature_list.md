@@ -1,6 +1,6 @@
 # autumn-rs feature list — OPEN backlog
 
-**Last updated:** 2026-10-17 (put_many mixed-size order fixed, entry removed)
+**Last updated:** 2026-10-17 (put_many mixed-size order, owner-epoch memory backwards, update_stream_ec CAS fixed and removed; BUG-ETCD-RESEND-AFTER-TIMEOUT-DOUBLE-COMMIT filed; BUG-SEAL-DIVERGENT-UNACKED-BYTES and F-REAVALI-TAIL-COPY closed by the user 2026-10-17: divergence past the commit point is expected, re_avali keeps the whole copy)
 
 **Rules:**
 - This file tracks the **OPEN backlog only**. A feature that reaches `passes: true`
@@ -13,18 +13,6 @@
 ---
 
 ## Active
-
-### F-REAVALI-TAIL-COPY — re_avali 只补缺的尾部（延后：有内容错的风险）
-- **Trigger** (2026-10-14/15 用户, F-SEAL-LENGTH-AND-WRITE-OUTCOME): 实测 probe seal 漏掉的副本 1/10 次比 sealed_length 短（132,854 字节），re_avali 为此整份拷贝 2.57 GB、9.75 s。实现前发现风险，用户定先保留整份拷贝（2026-10-15）。
-- **Scope**: 只有"最后一次确认的提交点"之前各副本字节相同；之后漏掉的副本可能是别的副本没收到的 append，而 seal 保留的是另一批。直接补尾巴会得到长度对、内容错、被当成健康的副本。可行路：先取对端块校验和、本地重算对比，从第一个不一致块起拉（多读一遍本地盘）。（"EN 持久化收到的最大 header.commit 再从该点拉"不成立：header.commit 是租约起点不是已确认提交点，回绕可低于已见过的值——2026-10-15 评审。）依赖 BUG-SEAL-DIVERGENT-UNACKED-BYTES 的结论。
-- **Acceptance**: 构造"漏掉副本在提交点后有不同字节"的用例：整份拷贝通过；尾部拷贝修复前得到内容错的副本（消融红）、修复后内容与 sealed 一致；短副本补齐的网络字节数≈缺口（或缺口+校验）。
-- `passes: false`
-
-### BUG-SEAL-DIVERGENT-UNACKED-BYTES — 已确认提交点之后副本内容可能不同，而 seal / re_avali 只看长度（推断，未复现）
-- **Trigger** (2026-10-15 re_avali 评审): EN 收不到已确认提交点（`header.commit` 是租约起点，client.rs `header_commit = offset`）；append 失败时 client 在同一 extent 上回绕游标（`rewind_or_poison`），流水线里的另一个 append 可能在同一偏移写入不同内容：A1 落在 X、Z，Y 失败→回绕；A2 在同偏移落在 Y、Z（Z 截掉 A1），X 没收到 → X 在 [c, ..) 是 A1、Y/Z 是 A2。probe seal（PS 打开分区，现在每次打开都封）对连得上的成员取最小长度并全部点亮 avali，不比内容；re_avali 的"本地长度够"也只比长度 → 长度对、内容错的副本可能被当成健康副本读。stream client 自己的 seal-and-roll 按已确认提交点封，不受影响。
-- **Scope**: 先复现（failpoint：让 A1 只落 X、Z，回绕后 A2 落 Y、Z 且漏 X，再 kill -9 PS 走 probe seal；比较各副本 [c, sealed) 内容与读结果）。坐实后再定修法（如 probe seal 时比较成员内容/校验和，只点亮与选定内容一致的成员；re_avali 比校验和而非长度）。
-- **Acceptance**: 复现用例修复前出现内容不一致的已点亮副本、修复后各点亮副本 [0, sealed) 一致；消融变红。
-- `passes: false`
 
 ### BUG-EN-MULTI-MANAGER-POLL — EN 的 `--manager a,b` 被当成一个地址，authz / runtime config 拉取与 reconcile 永远连不上 manager
 - **Trigger** (2026-10-14 runtime config 实现中发现): EN 二进制把整个 `--manager` 串交给 `ExtentNodeConfig::with_manager_endpoint`；`ConnPool::parse_addr("a,b")` 失败。shard 0 的 authz 拉取（→ authz 开启时直读一直 Unavailable，回退 PS 代理）、runtime config 拉取、startup/周期 reconcile 都用它。cluster.sh 只起一个 manager，所以没暴露。
@@ -39,17 +27,12 @@
 - `passes: false`
 - **notes**: 两种负载未复现：每 300 ms 一次 flush、以及不间断 flush（`system_minor_compaction_triggers::a_mostly_dead_head_extent_is_reclaimed` 的变体），探测都正常跑。改动已撤回。同类推断（opus 评审）：`background_maintenance_loop` 的 select 先轮询 `compact_rx`，flush 快于 minor 时 `GcRecv` / `GcTimeout` 排不上；`a_dispatched_gc_runs_under_steady_flushes`（两个写者不间断 flush 时下发 forcegc）6 s 内即执行，未复现，未改。周期 tick 的同类饿死已复现并修复（tick 到点先走、收到任务不推迟）。
 
-### BUG-UPDATE-STREAM-EC-NO-CAS — `update_stream_ec` 写 etcd 不做 CAS，可能覆盖并发提交的 stream 成员变更（推断，未复现）
-- **Trigger** (2026-10-09 alloc 修复的 fable 评审): `handle_update_stream_ec` 用 `put_msgs_txn` 把整条 `streams/<id>` 写回 etcd，没有值 CAS。它的 etcd RTT 期间若有 alloc / punch / split 提交了该 stream 的成员变更，etcd 被写回旧的 `extent_ids`；内存里只改了两个 ec 字段，所以内存保留了新成员。换主 replay 后，已提交的尾巴会从 stream 里消失。运维触发（autumn-op），罕见。
-- **Scope**: 先复现（在 update_stream_ec 的 etcd 写前挂暂停点，期间做一次 alloc，换主后看 stream）。坐实后给它加 `streams/<id>` 的值 CAS（与 alloc/punch 同一机制）。
-- **Acceptance**: 复现用例修复前换主后丢成员、修复后 update_stream_ec 被拒并可重试；消融变红。
+### BUG-ETCD-RESEND-AFTER-TIMEOUT-DOUBLE-COMMIT — etcd 客户端超时后盲目重发，第一次可能已提交（推断，未复现）
+- **Trigger** (2026-10-17 owner-epoch 修复的 opus 评审): `autumn_etcd::EtcdClient::unary_call` 对超时的请求重连后原样重发（`crates/etcd/src/lib.rs`），而第一次请求可能已经在 etcd 提交（owner_epoch_etcd_reorder 测试里 `version=4` 实证了 A 的两次 txn 都落了）。对带值 CAS 的 txn（alloc / punch / truncate / merge / update_stream_ec）：第一次提交 X→X'，重发的 CAS 必失败 → 调用方得 Precondition、内存不应用 X' → 内存 X 与 etcd X' 分叉，之后该记录的每次 CAS 都用过期基线、永远失败（`cas_conflict_message` 被当瞬态冲突重试 20×500 ms），直到换主回放。对 `create_revision==0` CAS（extent_inflight / fs_alloc / inflight_commit）：自己创建的 marker 被报成"别人持有"。对 acquire：两次都失败但其一已提交时，内存停在旧 epoch。
+- **Scope**: 先复现（owner_epoch_etcd_reorder 的 toxiproxy 下游 hold 即可：hold 住 alloc 的回复让它超时重发，看 alloc 返回 Precondition 后该流后续 alloc 是否全部 CAS 失败）。坐实后定修法：超时的非幂等 txn 不盲目重发——要么客户端只对幂等读重发、写返回超时让调用方按"结果未知"重读后再试，要么重发前先读该 key 判断第一次是否已提交。
+- **Acceptance**: 复现用例修复前出现"内存与 etcd 分叉、后续 CAS 连环失败直到换主"，修复后要么写入成功要么调用方得到可重试的明确结果且内存与 etcd 一致；消融变红。
 - `passes: false`
-
-### BUG-OWNER-EPOCH-MEMORY-BACKWARDS — 同一 key 的两次 acquire 交错时，内存 epoch 可能落后于 etcd（推断，未复现）
-- **Trigger** (2026-10-09 merge 接管修复的 fable 评审): etcd 模式下 `acquire_owner_epoch` 先 await 事务，再无条件 `owner_epochs.insert(rev)`。两次并发 acquire（如 merge 接管与 PS 重开）事务 rev 100、101，若 continuation 逆序恢复，内存留 100、etcd 是 101。后果：持 101 的一方被 `ensure_owner_epoch` 拒（poison → 重开 → 收敛，不卡死）；持 100 的一方通过所有内存检查——merge 现在靠事务里的 `mod_revision` 比较兜住。
-- **Scope**: 先复现（manager 侧在 acquire 的 await 之后挂暂停点，让两次 acquire 逆序落内存）。坐实后插入改为取 max，并核对 replay 的一致性。
-- **Acceptance**: 确定性复现或不可达证据；修则内存 epoch 永不回退，消融变红。
-- `passes: false`
+- **notes** (2026-10-17 update_stream_ec CAS 评审): `handle_update_stream_ec` 加了值 CAS 后也进入这一类（第一次提交迟到、重发的 CAS 失败 → 答 Precondition、内存不应用），比之前"盲写覆盖成员、换主丢尾部"的后果轻；根因修在 etcd 客户端，不逐 handler 修。
 
 ### F-ETCD-AUTH — manager 连接带认证/TLS 的 etcd
 - **Trigger** (2026-10-07 用户): 生产 etcd 要开 auth。现 manager 只有 `--etcd <endpoints>`，`crates/etcd` 是 h2c 明文 gRPC，无 `Auth/Authenticate`、无 token 头、无 TLS；开 auth 的 etcd 连不上。

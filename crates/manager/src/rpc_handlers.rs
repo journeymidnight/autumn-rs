@@ -1207,6 +1207,16 @@ impl AutumnManager {
     pub(crate) async fn handle_acquire_owner_lock(&self, payload: Bytes) -> HandlerResult {
         let req: AcquireOwnerLockReq =
             rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+        // Between winning the leader key and finishing replay the fence
+        // would let this commit, and replay would then overwrite the
+        // epoch in memory with the older snapshot it read.
+        if let Err(err) = self.ensure_leader() {
+            return Ok(rkyv_encode(&AcquireOwnerLockResp {
+                code: Self::err_to_code(&err),
+                message: err.to_string(),
+                owner_epoch: 0,
+            }));
+        }
         match self.acquire_owner_epoch(&req.owner_key).await {
             Ok(rev) => Ok(rkyv_encode(&AcquireOwnerLockResp {
                 code: CODE_OK,
@@ -1790,14 +1800,14 @@ impl AutumnManager {
         // crash between memory-mutate and etcd-write left the new leader
         // dispatching the OLD EC shape via ec_conversion_dispatch_loop
         // while the deposed leader thought it was already updated.
-        let stream = {
+        let (stream, baseline) = {
             let s = self.store.inner.borrow();
             match s.streams.get(&req.stream_id) {
                 Some(st) => {
                     let mut updated = st.clone();
                     updated.ec_data_shard = req.ec_data_shard;
                     updated.ec_parity_shard = req.ec_parity_shard;
-                    updated
+                    (updated, Self::persist_kv_entry("streams", st.stream_id, st).1)
                 }
                 None => {
                     let err = AppError::NotFound(format!("stream {} not found", req.stream_id));
@@ -1810,7 +1820,11 @@ impl AutumnManager {
             }
         };
 
-        if let Err(err) = self.mirror_stream_meta_update(&stream).await {
+        // The write carries the whole record, membership included, so it is
+        // value-CAS'd against the record it was computed from: a tail
+        // allocated while this request was in flight must not be written
+        // over (the next leader replays what etcd holds).
+        if let Err(err) = self.mirror_stream_meta_update_cas(&stream, baseline).await {
             return Ok(rkyv_encode(&UpdateStreamEcResp {
                 code: Self::err_to_code(&err),
                 message: err.to_string(),
@@ -1820,11 +1834,9 @@ impl AutumnManager {
 
         {
             let mut s = self.store.inner.borrow_mut();
-            // Apply to memory only after etcd persistence succeeds. If the
-            // stream was concurrently removed (e.g. by a future delete RPC)
-            // the get_mut returns None and we silently skip — the etcd
-            // mirror already wrote the update; replay would resurrect it.
-            // Today no delete-stream path exists so this is unreachable.
+            // Apply to memory only after etcd persistence succeeds. A stream
+            // a merge deleted meanwhile fails the CAS above (its key is
+            // gone), so this is reached only with the stream still present.
             if let Some(st) = s.streams.get_mut(&req.stream_id) {
                 st.ec_data_shard = stream.ec_data_shard;
                 st.ec_parity_shard = stream.ec_parity_shard;
