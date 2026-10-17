@@ -1,6 +1,6 @@
 # autumn-rs feature list — OPEN backlog
 
-**Last updated:** 2026-10-17 (put_many mixed-size order, owner-epoch memory backwards, update_stream_ec CAS fixed and removed; BUG-ETCD-RESEND-AFTER-TIMEOUT-DOUBLE-COMMIT filed; BUG-SEAL-DIVERGENT-UNACKED-BYTES and F-REAVALI-TAIL-COPY closed by the user 2026-10-17: divergence past the commit point is expected, re_avali keeps the whole copy)
+**Last updated:** 2026-10-17 (put_many mixed-size order, owner-epoch memory backwards, update_stream_ec CAS fixed and removed; BUG-ETCD-RESEND-AFTER-TIMEOUT-DOUBLE-COMMIT filed, reproduced and fixed the same day; BUG-FUSE-UMOUNT-JOIN-HANG reproduced on a real mount and fixed; BUG-SEAL-DIVERGENT-UNACKED-BYTES and F-REAVALI-TAIL-COPY closed by the user 2026-10-17: divergence past the commit point is expected, re_avali keeps the whole copy)
 
 **Rules:**
 - This file tracks the **OPEN backlog only**. A feature that reaches `passes: true`
@@ -26,13 +26,6 @@
 - **Acceptance**: 复现用例修复前头部 extent 一直不被回收、修复后被回收；消融变红。
 - `passes: false`
 - **notes**: 两种负载未复现：每 300 ms 一次 flush、以及不间断 flush（`system_minor_compaction_triggers::a_mostly_dead_head_extent_is_reclaimed` 的变体），探测都正常跑。改动已撤回。同类推断（opus 评审）：`background_maintenance_loop` 的 select 先轮询 `compact_rx`，flush 快于 minor 时 `GcRecv` / `GcTimeout` 排不上；`a_dispatched_gc_runs_under_steady_flushes`（两个写者不间断 flush 时下发 forcegc）6 s 内即执行，未复现，未改。周期 tick 的同类饿死已复现并修复（tick 到点先走、收到任务不推迟）。
-
-### BUG-ETCD-RESEND-AFTER-TIMEOUT-DOUBLE-COMMIT — etcd 客户端超时后盲目重发，第一次可能已提交（推断，未复现）
-- **Trigger** (2026-10-17 owner-epoch 修复的 opus 评审): `autumn_etcd::EtcdClient::unary_call` 对超时的请求重连后原样重发（`crates/etcd/src/lib.rs`），而第一次请求可能已经在 etcd 提交（owner_epoch_etcd_reorder 测试里 `version=4` 实证了 A 的两次 txn 都落了）。对带值 CAS 的 txn（alloc / punch / truncate / merge / update_stream_ec）：第一次提交 X→X'，重发的 CAS 必失败 → 调用方得 Precondition、内存不应用 X' → 内存 X 与 etcd X' 分叉，之后该记录的每次 CAS 都用过期基线、永远失败（`cas_conflict_message` 被当瞬态冲突重试 20×500 ms），直到换主回放。对 `create_revision==0` CAS（extent_inflight / fs_alloc / inflight_commit）：自己创建的 marker 被报成"别人持有"。对 acquire：两次都失败但其一已提交时，内存停在旧 epoch。
-- **Scope**: 先复现（owner_epoch_etcd_reorder 的 toxiproxy 下游 hold 即可：hold 住 alloc 的回复让它超时重发，看 alloc 返回 Precondition 后该流后续 alloc 是否全部 CAS 失败）。坐实后定修法：超时的非幂等 txn 不盲目重发——要么客户端只对幂等读重发、写返回超时让调用方按"结果未知"重读后再试，要么重发前先读该 key 判断第一次是否已提交。
-- **Acceptance**: 复现用例修复前出现"内存与 etcd 分叉、后续 CAS 连环失败直到换主"，修复后要么写入成功要么调用方得到可重试的明确结果且内存与 etcd 一致；消融变红。
-- `passes: false`
-- **notes** (2026-10-17 update_stream_ec CAS 评审): `handle_update_stream_ec` 加了值 CAS 后也进入这一类（第一次提交迟到、重发的 CAS 失败 → 答 Precondition、内存不应用），比之前"盲写覆盖成员、换主丢尾部"的后果轻；根因修在 etcd 客户端，不逐 handler 修。
 
 ### F-ETCD-AUTH — manager 连接带认证/TLS 的 etcd
 - **Trigger** (2026-10-07 用户): 生产 etcd 要开 auth。现 manager 只有 `--etcd <endpoints>`，`crates/etcd` 是 h2c 明文 gRPC，无 `Auth/Authenticate`、无 token 头、无 TLS；开 auth 的 etcd 连不上。
@@ -424,19 +417,6 @@
   坐实再修：(a) NotHeld 与 poll 失败同样处理；(b) Open 手里的 `fresh_meta` 在 inode 不脏时
   直接替换缓存的 meta；(c) 绑定写 → 读 acquire 只加引用、不降 mode（与挂载一致）。
 - **Acceptance**: 各自确定性复现（或证伪），修则消融能变红。
-- `passes: false`
-
-### BUG-FUSE-UMOUNT-JOIN-HANG — 普通卸载后守护进程可能永不退出（未复现）
-- **Trigger** (2026-09-27，SIGTERM 优雅退出的独立评审读代码发现，既有问题): `umount` /
-  `fusermount -u` 之后 `Session::run` 因 ENODEV 返回，`main` 接着 `compio_handle.join()`；
-  派发循环只在收到 `FsRequest::Destroy` 或 `rx.next() == None` 时退出。此刻 bridge 的 sender
-  还活着（`main` 里的 `bridge`、`Session` 内 `AutumnFs` 的那份），而 `Session::drop`（会发
-  Destroy）要到 join 之后才跑。推断（内核知识，未在本机核实）：非 fuseblk 挂载内核不发
-  FUSE_DESTROY ⇒ join 永远等下去，进程在没有挂载的情况下每 30 s 跑一次 `periodic_sync`。
-  SIGTERM 现在能把它救出来（信号线程发 Destroy）。
-- **Scope（复现之后才谈）**: 挂载 → `umount` → 看守护进程是否退出；若坐实，修法是 join 之前
-  `drop(session)`（一行），并在脚本里加一条卸载后进程必须退出的断言。
-- **Acceptance**: 确定性复现（或证伪），修则消融能变红。
 - `passes: false`
 
 ### F-FUSE-BIG-IO-TUNING — writeback cache + splice 零拷贝，把大 IO 的 FUSE 开销压进 5%

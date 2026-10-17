@@ -301,12 +301,22 @@ fn main() -> Result<()> {
 
     // Run the fuse session loop on the main thread. Blocks until
     // unmount.
-    session.run()?;
+    let served = session.run();
 
     tracing::info!("filesystem unmounted");
 
+    // The dispatch loop stops on Destroy or once every sender is gone, and
+    // three senders outlive this point: `bridge.tx`, the session's, and the
+    // signal thread's (parked in `sigwait`). The kernel sends no FUSE_DESTROY
+    // for a plain `umount`, so without this the join below never returned
+    // and the daemon stayed up, syncing every 30 s, with nothing mounted.
+    // Sent before `served` is judged, so a session error still flushes.
+    if bridge.tx.unbounded_send(FsRequest::Destroy).is_err() {
+        tracing::info!("dispatcher already stopped");
+    }
     // Wait for compio thread to finish
     let _ = compio_handle.join();
+    served?;
 
     Ok(())
 }

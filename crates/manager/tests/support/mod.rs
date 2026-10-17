@@ -1563,7 +1563,7 @@ pub fn child_ps_main() {
 }
 
 /// `target/debug/<name>`, honouring `CARGO_TARGET_DIR`.
-fn support_binary_path(name: &str) -> std::path::PathBuf {
+pub fn support_binary_path(name: &str) -> std::path::PathBuf {
     let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let workspace = manifest
         .parent()
@@ -1577,7 +1577,7 @@ fn support_binary_path(name: &str) -> std::path::PathBuf {
     let p = dir.join(name);
     assert!(
         p.exists(),
-        "binary {name} not found at {} — run `cargo build -p autumn-server --bins` first",
+        "binary {name} not found at {} — build it first (`cargo build -p autumn-server --bins`, or `-p autumn-fuse`)",
         p.display()
     );
     p

@@ -61,5 +61,9 @@ required-features = ["fuse-tests"]
 name = "fuse_page_cache"
 required-features = ["fuse-tests"]
 
+[[test]]
+name = "fuse_umount_exit"
+required-features = ["fuse-tests"]
+
 [lints]
 workspace = true

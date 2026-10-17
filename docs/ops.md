@@ -1148,6 +1148,16 @@ mountpoint -q "$MP" && echo "mounted" || { echo "FAILED — see log:"; tail -20 
 
 ls "$MP"; echo hi > "$MP"/x; cat "$MP"/x      # → hi
 fusermount3 -u "$MP"                          # unmount (needs the `fuse3` package)
+sleep 3; pgrep -x autumn-fuse || echo "daemon exited"   # it must; it used to stay up forever
+```
+
+The unmount ending the daemon is a test too (real mount; needs `/dev/fuse`,
+`fusermount3`, and `cargo build -p autumn-fuse` first):
+
+```bash
+cargo build -p autumn-fuse        # the test runs the binary in target/debug
+cargo test -p autumn-manager --features fuse-tests --test fuse_umount_exit
+#   → the_daemon_exits_after_a_plain_unmount ... ok   (before the fix: "still running 10 s after the unmount")
 ```
 
 If a previous daemon died it can leave a stale mount (`ls` reports "Transport
@@ -3013,6 +3023,17 @@ includes a leader change):
 cargo test -p autumn-manager --test update_stream_ec_cas -- --nocapture
 #   → U answered ...: code 3 precondition failed: stream changed concurrently (CAS conflict) ...
 #   → replayed: [4, 5] ec 1/0          ([4] before the fix: the tail was gone)
+```
+
+A txn whose reply or request was lost is settled, not re-sent blind: the
+manager moves its leader fence, reads the written keys back and re-sends only
+what provably did not land (same binaries; ~25 s for both cases):
+
+```bash
+cargo test -p autumn-manager --test etcd_resend_after_timeout -- --nocapture
+#   → first alloc at ~1.0 s: code 0      (code 3 and every later alloc refused before the fix)
+#   → cycle N: etcd mod_rev=<settled>    (the late copy committed over it in ~40% of runs
+#                                         without the fence move; five cycles per run)
 ```
 
 ## fs stripe geometry: lanes vs partitions

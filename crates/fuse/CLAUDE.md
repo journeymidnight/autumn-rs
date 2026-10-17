@@ -412,6 +412,14 @@ inode 的每一个缓存页（`invalidate_inode_pages2_range`）。预读中的�
   write 把线程挂住是同一个死锁。所以 Open 臂对 sticky ino 的重试是**只入队**，结果
   以后再清 sticky；以前那句"retry succeeded on Open"的同步判断因此移到 `record_result`。
 - 线程不 join：所有 sender 丢掉、结果流丢掉或 `InvalGate` 关闭时自然结束。
+- **普通 `umount` / `fusermount3 -u` 之后 `main` 自己发 Destroy。** 派发循环只在收到
+  Destroy 或 channel 关闭时退出，而 `session.run()` 返回时还有三个 sender 活着（`main`
+  里的 `bridge.tx`、Session 里 `AutumnFs` 的那份、信号线程停在 `sigwait` 里握着的那份），内核对非 fuseblk 挂载也
+  不发 FUSE_DESTROY——于是 `compio_handle.join()` 永远等，进程在没有挂载的情况下每 30 s
+  跑一次 `periodic_sync`（实测卸载后 10 s 仍在）。现在 `session.run()` 返回后先
+  `bridge.tx.unbounded_send(Destroy)` 再 join。测试：
+  `crates/manager/tests/fuse_umount_exit.rs`（`--features fuse-tests`；真挂载，需要
+  `/dev/fuse` + `fusermount3`，且先 `cargo build -p autumn-fuse`——它跑的是 target 里的二进制）。
 - **退出前必须先关 `InvalGate`（SIGTERM / SIGINT，`main.rs::shutdown_on_signal`）**。
   notify 正等着预读页时整个进程被杀（默认动作一次杀光所有线程），能应答那条读的线程都死了，
   等待的线程不可中断，而 `/dev/fuse` fd 要等**所有**线程退出才释放（释放才会 abort 连接、
