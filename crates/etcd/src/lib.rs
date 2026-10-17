@@ -159,8 +159,17 @@ impl EtcdClient {
     // ── KV: Txn ──────────────────────────────────────────────────────────
 
     /// Execute a transaction.
+    /// A txn is not re-sent after a timeout or a connection error: the first
+    /// copy may have committed, and a compare-and-set sent twice refuses its
+    /// own write. The caller gets [`UncertainOutcome`] and decides.
     pub async fn txn(&self, req: TxnRequest) -> Result<TxnResponse> {
-        self.unary_call("/etcdserverpb.KV/Txn", &req).await
+        self.txn_ref(&req).await
+    }
+
+    /// `txn` for a request the caller keeps (to send again under a new
+    /// compare without cloning its ops).
+    pub async fn txn_ref(&self, req: &TxnRequest) -> Result<TxnResponse> {
+        self.unary_call_with("/etcdserverpb.KV/Txn", req, false).await
     }
 
     // ── Lease ────────────────────────────────────────────────────────────
@@ -209,6 +218,17 @@ impl EtcdClient {
         path: &str,
         req: &Req,
     ) -> Result<Resp> {
+        self.unary_call_with(path, req, true).await
+    }
+
+    /// `resend`: whether a request whose first attempt failed or timed out is
+    /// sent again on the new connection. Reads and leases are; a txn is not.
+    async fn unary_call_with<Req: Message, Resp: Message + Default>(
+        &self,
+        path: &str,
+        req: &Req,
+        resend: bool,
+    ) -> Result<Resp> {
         let body = grpc_encode(req);
         let timeout = self.request_timeout;
 
@@ -222,24 +242,29 @@ impl EtcdClient {
         // node_health_loop production freeze. A timeout falls through to the
         // reconnect + retry path, same as a connection error.
         let mut sender = self.channel.borrow().sender();
-        match compio::time::timeout(timeout, call_with_sender(&mut sender, path, body.clone()))
+        let cause = match compio::time::timeout(timeout, call_with_sender(&mut sender, path, body.clone()))
             .await
         {
             Ok(Ok(resp_bytes)) => return grpc_decode::<Resp>(&resp_bytes),
             Ok(Err(e)) => {
                 // Connection might be dead. Try reconnecting to another endpoint.
                 tracing::warn!(path, error = %e, "etcd call failed, attempting reconnect");
+                e.to_string()
             }
             Err(_elapsed) => {
                 tracing::warn!(path, ?timeout, "etcd call timed out, attempting reconnect");
+                format!("timed out after {timeout:?}")
             }
-        }
+        };
 
         // Reconnect: try each endpoint once (round-robin from the next one).
         // (1A): also bounded — a hung connect must not wedge the loop.
         compio::time::timeout(timeout, self.reconnect())
             .await
             .map_err(|_| anyhow::anyhow!("etcd reconnect timed out after {timeout:?}"))??;
+        if !resend {
+            return Err(UncertainOutcome { path: path.to_string(), cause }.into());
+        }
 
         // Retry on the new connection (re-clone after the channel was swapped).
         let mut sender = self.channel.borrow().sender();
@@ -423,6 +448,22 @@ impl Cmp {
     }
 }
 
+/// A request that may or may not have been applied: it failed or timed out
+/// after it was handed to the connection, and was not sent again.
+#[derive(Debug)]
+pub struct UncertainOutcome {
+    pub path: String,
+    pub cause: String,
+}
+
+impl std::fmt::Display for UncertainOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "etcd call '{}' outcome unknown: {}", self.path, self.cause)
+    }
+}
+
+impl std::error::Error for UncertainOutcome {}
+
 /// Helper for building RequestOp operations.
 pub struct Op;
 
@@ -451,6 +492,16 @@ impl Op {
     }
 
     /// Create a Delete operation.
+    /// Read one key inside a txn (`ResponseOpInner::ResponseRange`).
+    pub fn get(key: impl AsRef<[u8]>) -> RequestOp {
+        RequestOp {
+            request: Some(RequestOpInner::RequestRange(RangeRequest {
+                key: key.as_ref().to_vec(),
+                ..Default::default()
+            })),
+        }
+    }
+
     pub fn delete(key: impl AsRef<[u8]>) -> RequestOp {
         RequestOp {
             request: Some(RequestOpInner::RequestDeleteRange(DeleteRangeRequest {

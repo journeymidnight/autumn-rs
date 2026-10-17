@@ -170,6 +170,12 @@ Lease-based (10 s TTL):
 3. Lease expiry / keepalive failure → `leader = false` (step down).
 4. A background loop retries election every 2 s when not leader.
 
+The win seeds `EtcdMirror::fence_rev` with the election txn's commit revision —
+the leader key's `mod_revision` — and the lease id. Every fenced txn compares
+that revision, not the key's value (see "Leader fence on every etcd write"):
+a value compare cannot be withdrawn, and withdrawing it is how a txn whose
+outcome is unknown gets settled.
+
 `replay_from_etcd` is **fail-loud**: a persisted rkyv blob that no longer decodes
 refuses leadership (`replay_decode_err` with an actionable message) rather than
 silently decoding stale bytes into wrong values.
@@ -1480,14 +1486,42 @@ covers each, red without its part of the fix, plus a wrong `ownerLocks/` key
   and (2) leaves etcd and memory consistent. Exception: `register_ps` /
   `upsert_partition` apply to memory first because `mirror_partition_snapshot` reads
   the store (idempotent on retry). Any new persistent-state handler MUST follow this.
-- **Leader fence on every etcd write** (`txn_fenced`). Prepends
-  `Cmp::value("autumn-rs/stream-manager/leader") == instance_id` to the txn. On
-  fence-fail it flips `leader = false` (so `ensure_leader` short-circuits later RPCs)
-  and returns `NotLeader` → `CODE_NOT_LEADER`. Bare puts (not CAS) would let a deposed
-  leader (still believing it leads during a starvation/GC window) last-writer-wins over
-  the new leader. NOT fenced: `try_become_leader` (it establishes ownership),
-  `replay_from_etcd` (read-only), the keepalive loop (no k/v write). All `mirror_*`,
-  `persist_extent`, owner-lock and inflight CAS, split/merge Phase-2 route through it.
+- **Leader fence on every etcd write** (`txn_fenced` → `fenced_txn`). Prepends
+  `Cmp::mod_revision("autumn-rs/stream-manager/leader") == fence_rev` to the txn
+  (`fence_rev` = the key's revision as this leader last wrote it). A failed compare
+  is read again (`diagnose_fence`, against the revision THAT txn carried): the key
+  ours at that revision → the business compare failed; ours at a newer one → the
+  fence moved under the txn, which therefore did not land, so it is sent again under
+  the new revision; anyone else's or gone → `leader = false` (so `ensure_leader`
+  short-circuits later RPCs), `displaced` if someone else holds it, `NotLeader` →
+  `CODE_NOT_LEADER`. Bare puts (not CAS) would let a deposed leader (still believing
+  it leads during a starvation/GC window) last-writer-wins over the new leader. NOT
+  fenced: `try_become_leader` (it establishes ownership), `replay_from_etcd`
+  (read-only), the keepalive loop (no k/v write). All `mirror_*`, `persist_extent`,
+  owner-lock and inflight CAS, split/merge Phase-2 route through it.
+- **A txn whose outcome is unknown is settled, never re-sent blind.** The etcd
+  client does not re-send a txn that failed or timed out after it was handed to
+  the connection (`autumn_etcd::UncertainOutcome`): the first copy may still
+  commit, now or when its connection drains. `fenced_txn` then (1) rewrites the
+  leader key, same value and lease, until its revision is strictly past the one
+  THAT txn carried (`bump_fence(sent_rev)`), so the old copy's compare can never
+  hold — etcd proposes a cancelled txn often enough that the copy commits in ~40%
+  of runs without this; (2) reads back the keys the txn wrote in ONE txn under the
+  fence (`read_back`; a successor leader's identical bytes must not pass for
+  ours): every put key holding our value and every deleted key absent means it
+  had committed, and a put key's `mod_revision` is its revision; (3) otherwise
+  sends it once more under the new fence (two uncertain outcomes end in
+  `Internal`; a "fence moved" retry is not an attempt). `fence_rev` only moves
+  forward (`advance_fence`). Legitimate txns in flight across a bump fail their
+  compare and take the "fence moved" retry above. `acquire_owner_epoch`
+  writes a per-attempt value (`instance_id#seq`) because the read-back compares
+  values and every acquire writing the same bytes would make another acquire's
+  write look like ours. Before this the client re-sent blindly; the second copy of
+  a value-CAS'd write refused its own first copy, the handler kept memory as it
+  was, and every later CAS on that record failed until the next leader replayed —
+  a per-stream alloc wedge. Tests: `tests/etcd_resend_after_timeout.rs` (a held
+  reply: the alloc is settled as committed; a held request delivered late: fenced
+  out, five cycles because the race is etcd's).
 - **`alloc_ids` is the ONLY id source.** `next_id = max(all entity ids) + 1` at replay,
   so wasted ids from failed mutations are safe. Not used for fs inode numbers (those
   have their own counter).

@@ -213,6 +213,19 @@ pub(crate) struct EtcdMirror {
     /// untouched when the key is merely GONE (lease expiry / etcd blip —
     /// no one superseded us).
     displaced: Rc<Cell<bool>>,
+    /// `mod_revision` of the leader key as this leader last wrote it; every
+    /// fenced txn compares it. Rewriting the key (`bump_fence`) moves it, so
+    /// a txn still in flight with the old compare can never commit.
+    fence_rev: Rc<Cell<i64>>,
+    /// The leader lease; the rewrite keeps the key on it.
+    lease_id: Rc<Cell<i64>>,
+}
+
+/// The leader key as `diagnose_fence` found it: ours at `fence_rev`, or ours
+/// at a newer revision (a bump settled an uncertain attempt meanwhile).
+enum Fence {
+    Held,
+    Moved,
 }
 
 impl EtcdMirror {
@@ -231,7 +244,16 @@ impl EtcdMirror {
             instance_id,
             leader,
             displaced,
+            fence_rev: Rc::new(Cell::new(0)),
+            lease_id: Rc::new(Cell::new(0)),
         })
+    }
+
+    /// Called when the election txn put the leader key: `rev` is that txn's
+    /// commit revision, the key's `mod_revision`.
+    fn seed_fence(&self, rev: i64, lease_id: i64) {
+        self.advance_fence(rev);
+        self.lease_id.set(lease_id);
     }
 
     /// run a fenced txn. Always prepends a
@@ -254,64 +276,8 @@ impl EtcdMirror {
         success: Vec<autumn_etcd::proto::RequestOp>,
         failure: Vec<autumn_etcd::proto::RequestOp>,
     ) -> Result<bool, AppError> {
-        let mut compare = Vec::with_capacity(1 + extra_cmp.len());
-        compare.push(autumn_etcd::Cmp::value(
-            LEADER_KEY.as_bytes(),
-            self.instance_id.as_bytes(),
-        ));
-        compare.extend(extra_cmp);
-
-        let txn = autumn_etcd::proto::TxnRequest {
-            compare,
-            success,
-            failure,
-        };
-
-        let resp = {
-            self.client
-                .txn(txn)
-                .await
-                .map_err(|e| AppError::Internal(e.to_string()))?
-        };
-
-        if resp.succeeded {
-            return Ok(true);
-        }
-        self.diagnose_post_txn_fence().await?;
-        Ok(false)
-    }
-
-    /// Shared post-txn fence diagnosis: a fenced txn came back
-    /// `succeeded == false` — distinguish fence-failure from
-    /// extra_cmp-failure by reading the current leader-key value. If it
-    /// still matches our instance_id, the fence held and only a business
-    /// CAS failed (e.g., create_revision==0 refused because the key already
-    /// exists) — returns `Ok(())` and the caller decides how to surface the
-    /// soft-fail. If it differs (or is gone), we have been deposed —
-    /// flips `leader`/`displaced` and returns `Err(NotLeader)`.
-    async fn diagnose_post_txn_fence(&self) -> Result<(), AppError> {
-        let got = {
-            self.client
-                .get(LEADER_KEY.as_bytes())
-                .await
-                .map_err(|e| AppError::Internal(e.to_string()))?
-        };
-        let still_leader = got
-            .kvs
-            .first()
-            .map(|kv| kv.value.as_slice() == self.instance_id.as_bytes())
-            .unwrap_or(false);
-        if !still_leader {
-            // etcd-chaos D1: a DIFFERENT holder = true displacement (our
-            // state can be superseded); a missing key = lease expiry with
-            // no successor — leaderless, not displaced.
-            if !got.kvs.is_empty() {
-                self.displaced.set(true);
-            }
-            self.leader.set(false);
-            return Err(AppError::NotLeader);
-        }
-        Ok(())
+        debug_assert!(failure.is_empty(), "fenced txns have no failure branch");
+        Ok(self.fenced_txn(extra_cmp, success).await?.is_some())
     }
 
     /// A fenced txn with NO extra_cmp returned `succeeded == false` even
@@ -320,15 +286,8 @@ impl EtcdMirror {
         AppError::Internal("etcd txn rejected with empty extra_cmp".to_string())
     }
 
-    /// fenced txn whose success value is the txn's COMMIT REVISION
-    /// (`ResponseHeader.revision`). For a txn containing exactly one PUT
-    /// on a key, that revision IS the PUT's `mod_revision` — read
-    /// atomically from the same txn response, with no separate GET that
-    /// a concurrent same-key writer could interleave (coco P1: a
-    /// PUT-then-GET pair let two concurrent acquires both observe the
-    /// later writer's mod_revision and share one fencing epoch).
-    /// `succeeded == false` with no extra_cmp is a server-side anomaly
-    /// and surfaces as an error — never a silently-reused epoch.
+    /// `txn_fenced_revision` with no extra compare: the commit revision of an
+    /// unconditional fenced put.
     async fn txn_fenced_put_revision(
         &self,
         success: Vec<autumn_etcd::proto::RequestOp>,
@@ -354,36 +313,195 @@ impl EtcdMirror {
         extra_cmp: Vec<autumn_etcd::proto::Compare>,
         success: Vec<autumn_etcd::proto::RequestOp>,
     ) -> Result<Option<i64>, AppError> {
+        self.fenced_txn(extra_cmp, success).await
+    }
+
+    /// The one fenced txn. The fence is `mod_revision(LEADER_KEY) ==
+    /// fence_rev`, not the key's value: a value compare cannot be withdrawn,
+    /// and withdrawing it is how an uncertain attempt is settled (below).
+    ///
+    /// The etcd client does not re-send a txn whose first attempt failed or
+    /// timed out — that copy may still commit, now or when its connection
+    /// drains. So on `UncertainOutcome`: rewrite the leader key until its
+    /// revision is past the one this attempt carried (`bump_fence`; the old
+    /// copy's compare can never hold again), read the keys the txn wrote
+    /// under the fence (`read_back`; all of them hold our values → it had
+    /// committed, and its revision is theirs), else send it once more under
+    /// the new fence. Before this the client re-sent blindly: the second copy
+    /// of a value-CAS'd write refused its own first copy, the handler kept
+    /// memory as it was, and every later CAS on that record failed until the
+    /// next leader replayed (`tests/etcd_resend_after_timeout.rs`).
+    ///
+    /// A compare that fails is read again (`diagnose_fence`): the leader key
+    /// still ours at the revision this attempt carried → the business compare
+    /// failed (`Ok(None)`); ours at a newer revision → a concurrent bump, this
+    /// attempt did not land, retry under it (not counted as an attempt);
+    /// anyone else's or gone → `Err(NotLeader)`.
+    async fn fenced_txn(
+        &self,
+        extra_cmp: Vec<autumn_etcd::proto::Compare>,
+        success: Vec<autumn_etcd::proto::RequestOp>,
+    ) -> Result<Option<i64>, AppError> {
         let mut compare = Vec::with_capacity(1 + extra_cmp.len());
-        compare.push(autumn_etcd::Cmp::value(
-            LEADER_KEY.as_bytes(),
-            self.instance_id.as_bytes(),
-        ));
+        compare.push(autumn_etcd::Cmp::mod_revision(LEADER_KEY.as_bytes(), 0));
         compare.extend(extra_cmp);
-        let txn = autumn_etcd::proto::TxnRequest {
-            compare,
-            success,
+        let mut txn = autumn_etcd::proto::TxnRequest { compare, success, failure: vec![] };
+        let mut uncertain = 0;
+        for _ in 0..8 {
+            let sent_rev = self.fence_rev.get();
+            txn.compare[0] = autumn_etcd::Cmp::mod_revision(LEADER_KEY.as_bytes(), sent_rev);
+            match self.client.txn_ref(&txn).await {
+                Ok(resp) if resp.succeeded => return Ok(Some(Self::commit_revision(&resp)?)),
+                Ok(_) => match self.diagnose_fence(sent_rev).await? {
+                    Fence::Held => return Ok(None),
+                    Fence::Moved => {}
+                },
+                Err(e) if e.downcast_ref::<autumn_etcd::UncertainOutcome>().is_some() => {
+                    uncertain += 1;
+                    if uncertain > 2 {
+                        return Err(AppError::Internal("etcd txn did not land in two attempts".to_string()));
+                    }
+                    tracing::warn!(error = %e, uncertain, "fenced txn outcome unknown; settling it");
+                    self.bump_fence(sent_rev).await?;
+                    if let Some(rev) = self.read_back(&txn.success).await? {
+                        return Ok(Some(rev));
+                    }
+                }
+                Err(e) => return Err(AppError::Internal(e.to_string())),
+            }
+        }
+        Err(AppError::Internal("the leader fence kept moving".to_string()))
+    }
+
+    fn commit_revision(resp: &autumn_etcd::proto::TxnResponse) -> Result<i64, AppError> {
+        resp.header
+            .as_ref()
+            .map(|h| h.revision)
+            .filter(|r| *r > 0)
+            .ok_or_else(|| AppError::Internal("etcd txn response missing header revision".to_string()))
+    }
+
+    /// `fence_rev` only moves forward: the key's revision only grows, and a
+    /// GET answered before a concurrent bump must not set it back.
+    fn advance_fence(&self, rev: i64) {
+        self.fence_rev.set(self.fence_rev.get().max(rev));
+    }
+
+    /// Returns once the leader key's revision is strictly past `sent_rev`, the
+    /// one an uncertain txn carried, rewriting the key (same value, same
+    /// lease) if it is still there. From then on that txn cannot commit.
+    async fn bump_fence(&self, sent_rev: i64) -> Result<(), AppError> {
+        for _ in 0..4 {
+            // Deposed → NotLeader. Moved → done, by this bump or another.
+            if let Fence::Moved = self.diagnose_fence(sent_rev).await? {
+                return Ok(());
+            }
+            let txn = autumn_etcd::proto::TxnRequest {
+                compare: vec![autumn_etcd::Cmp::mod_revision(LEADER_KEY.as_bytes(), sent_rev)],
+                success: vec![autumn_etcd::Op::put_with_lease(
+                    LEADER_KEY.as_bytes(),
+                    self.instance_id.as_bytes(),
+                    self.lease_id.get(),
+                )],
+                failure: vec![],
+            };
+            match self.client.txn_ref(&txn).await {
+                Ok(resp) if resp.succeeded => {
+                    self.advance_fence(Self::commit_revision(&resp)?);
+                    return Ok(());
+                }
+                // Compare failed, or the bump itself is uncertain: the next
+                // read of the key tells whether it moved.
+                Ok(_) => {}
+                Err(e) if e.downcast_ref::<autumn_etcd::UncertainOutcome>().is_some() => {}
+                Err(e) => return Err(AppError::Internal(e.to_string())),
+            }
+        }
+        Err(AppError::Internal("could not move the leader fence".to_string()))
+    }
+
+    /// Whether etcd holds exactly what `success` wrote: every put key with
+    /// its value, every deleted key absent. One fenced read txn: a value
+    /// written by a successor leader must not pass for ours. `Some(rev)` is
+    /// the commit revision (a put key's `mod_revision`; 0 for a delete-only
+    /// txn).
+    async fn read_back(&self, success: &[autumn_etcd::proto::RequestOp]) -> Result<Option<i64>, AppError> {
+        use autumn_etcd::proto::{RequestOpInner as Request, ResponseOpInner as Response};
+        let mut wanted: Vec<Option<&[u8]>> = Vec::with_capacity(success.len());
+        let mut reads = Vec::with_capacity(success.len());
+        for op in success {
+            let (key, want) = match &op.request {
+                Some(Request::RequestPut(p)) => (p.key.as_slice(), Some(p.value.as_slice())),
+                Some(Request::RequestDeleteRange(d)) => (d.key.as_slice(), None),
+                other => {
+                    return Err(AppError::Internal(format!("fenced txn op cannot be read back: {other:?}")))
+                }
+            };
+            wanted.push(want);
+            reads.push(autumn_etcd::Op::get(key));
+        }
+        let mut txn = autumn_etcd::proto::TxnRequest {
+            compare: vec![autumn_etcd::Cmp::mod_revision(LEADER_KEY.as_bytes(), 0)],
+            success: reads,
             failure: vec![],
         };
-        let resp = {
-            self.client
-                .txn(txn)
-                .await
-                .map_err(|e| AppError::Internal(e.to_string()))?
-        };
-        if resp.succeeded {
-            let rev = resp
-                .header
-                .as_ref()
-                .map(|h| h.revision)
-                .filter(|r| *r > 0)
-                .ok_or_else(|| {
-                    AppError::Internal("etcd txn response missing header revision".to_string())
-                })?;
+        for _ in 0..4 {
+            let sent_rev = self.fence_rev.get();
+            txn.compare[0] = autumn_etcd::Cmp::mod_revision(LEADER_KEY.as_bytes(), sent_rev);
+            let resp = match self.client.txn_ref(&txn).await {
+                Ok(resp) => resp,
+                // A read: sending it again is harmless.
+                Err(e) if e.downcast_ref::<autumn_etcd::UncertainOutcome>().is_some() => continue,
+                Err(e) => return Err(AppError::Internal(e.to_string())),
+            };
+            if !resp.succeeded {
+                // Deposed → NotLeader; moved → read again under the new fence.
+                self.diagnose_fence(sent_rev).await?;
+                continue;
+            }
+            let mut rev = 0;
+            for (got, want) in resp.responses.iter().zip(&wanted) {
+                let kvs = match &got.response {
+                    Some(Response::ResponseRange(r)) => &r.kvs,
+                    other => return Err(AppError::Internal(format!("read-back answered {other:?}"))),
+                };
+                match (kvs.first(), want) {
+                    (Some(kv), Some(v)) if kv.value == *v => rev = rev.max(kv.mod_revision),
+                    (None, None) => {}
+                    _ => return Ok(None),
+                }
+            }
             return Ok(Some(rev));
         }
-        self.diagnose_post_txn_fence().await?;
-        Ok(None)
+        Err(AppError::Internal("the leader fence kept moving during read-back".to_string()))
+    }
+
+    /// Reads the leader key after a txn sent under `sent_rev` failed its
+    /// compare or is being settled. Deposed → flips `leader` / `displaced`,
+    /// `Err(NotLeader)`.
+    async fn diagnose_fence(&self, sent_rev: i64) -> Result<Fence, AppError> {
+        let got = self
+            .client
+            .get(LEADER_KEY.as_bytes())
+            .await
+            .map_err(|e| AppError::Internal(e.to_string()))?;
+        match got.kvs.first() {
+            Some(kv) if kv.value.as_slice() == self.instance_id.as_bytes() => {
+                if kv.mod_revision == sent_rev {
+                    Ok(Fence::Held)
+                } else {
+                    self.advance_fence(kv.mod_revision);
+                    Ok(Fence::Moved)
+                }
+            }
+            holder => {
+                if holder.is_some() {
+                    self.displaced.set(true);
+                }
+                self.leader.set(false);
+                Err(AppError::NotLeader)
+            }
+        }
     }
 
     async fn put_msgs_txn(&self, kvs: Vec<(String, Vec<u8>)>) -> Result<(), AppError> {
@@ -2644,6 +2762,14 @@ impl AutumnManager {
         }
     }
 
+    fn commit_revision_of(resp: &autumn_etcd::proto::TxnResponse) -> Result<i64> {
+        resp.header
+            .as_ref()
+            .map(|h| h.revision)
+            .filter(|r| *r > 0)
+            .ok_or_else(|| anyhow::anyhow!("etcd txn response missing header revision"))
+    }
+
     async fn try_become_leader(&self) -> Result<bool> {
         let etcd = match &self.etcd {
             Some(v) => v,
@@ -2671,6 +2797,9 @@ impl AutumnManager {
             let c = etcd.client.clone();
             c.txn(txn).await?
         };
+        if resp.succeeded {
+            etcd.seed_fence(Self::commit_revision_of(&resp)?, lease_id);
+        }
         if !resp.succeeded {
             // etcd-chaos D1: the CAS failing proves etcd is ALIVE and the
             // key exists — read the holder. A DIFFERENT instance holding
@@ -3791,7 +3920,13 @@ impl AutumnManager {
             // response. A separate post-commit GET would race a
             // concurrent same-key acquire (both observing the later
             // mod_revision and sharing one epoch — coco P1).
-            let put_op = autumn_etcd::Op::put(key.as_bytes(), self.instance_id.as_bytes());
+            // The value names THIS attempt: nothing reads it (replay and the
+            // fences use `mod_revision`), but `read_back` settles an uncertain
+            // attempt by comparing values, and every acquire writing the same
+            // bytes would make another acquire's write look like ours.
+            static ACQUIRE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let value = format!("{}#{}", self.instance_id, ACQUIRE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+            let put_op = autumn_etcd::Op::put(key.as_bytes(), value.as_bytes());
             let rev = etcd.txn_fenced_put_revision(vec![put_op]).await?;
 
             let mut s = self.store.inner.borrow_mut();
