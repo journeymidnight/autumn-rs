@@ -416,7 +416,8 @@ held lease）就标记它，`meta::get_inode` 遇到标记时从 KV 重读一次
 写者关闭不会再推给本会话，所以忘 invalidation 版本、标记、调内核 invalidator，READ slot 删掉；
 WRITE slot 留下并置 `revoked`（与 manager 主动 revoke 同形）：之后的写 EIO，flush 仍带原 epoch、
 被围栏拒掉。删掉的话 `write_lease_for` 退成 ANON，脏数据会不带围栏地盖掉现在持 lease 的写者
-（`crates/manager/tests/fuse_lease_loss.rs` 两个用例）。本会话持写 lease 或 inode 脏时不重读（缓存的 size 可能领先 KV，收下更小的
+（`crates/manager/tests/fuse_lease_loss.rs` 两个用例）。这段处理在 `lease_tasks::lease_not_held`，
+后台心跳与 binding 的手动 `heartbeat()` 共用。本会话持写 lease 或 inode 脏时不重读（缓存的 size 可能领先 KV，收下更小的
 就是 `get_inode_uncached` 说的删数据）。挂载与 binding 都经过这里。
 
 `InodeState.write_epoch`：脏状态（`write_buf`、`dirty`）在哪个 WRITE lease epoch 下产生，写入时盖上

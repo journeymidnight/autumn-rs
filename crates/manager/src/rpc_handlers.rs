@@ -1852,10 +1852,9 @@ impl AutumnManager {
 
     /// `stream_info`, `extent_info` and `nodes_info` are routing-gated: a
     /// standby's store is what it replayed when it started, and its callers act
-    /// on the answer (an extent node refuses a stale writer's truncate when the
-    /// manager says the extent is sealed). A standby answers NOT_LEADER and the
-    /// caller moves on; an ex-leader still answers while etcd is down
-    /// (`ensure_routable`).
+    /// on the answer (a stream's tail, an extent's layout, node addresses). A
+    /// standby answers NOT_LEADER and the caller moves on; an ex-leader still
+    /// answers while etcd is down (`ensure_routable`).
     async fn handle_stream_info(&self, payload: Bytes) -> HandlerResult {
         let req: StreamInfoReq =
             rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;

@@ -2456,10 +2456,9 @@ write-lease conflicts. `AllocInodesReq.volume` stays on the frozen client surfac
 `extent_info` / `nodes_info` gate on `ensure_routable()` = `leader || !displaced`
 (READ-ONLY routing/liveness/metadata RPCs) rather than the strict `ensure_leader` that
 every mutating handler keeps. A standby's store is frozen at its replay (nothing
-resyncs it), and an EN acts on the lookups — it refuses a stale writer's
-truncate when the manager says the extent is sealed, and proceeds when it cannot
-ask — so a standby must not answer "not sealed" about an extent the leader
-sealed since (`en_multi_manager_etcd::a_standby_refuses_metadata_lookups`). An
+resyncs it), and PS and EN act on these answers (a stream's tail, an extent's
+layout, node addresses), so a standby refuses them
+(`en_multi_manager_etcd::a_standby_refuses_metadata_lookups`). An
 ex-leader inside its leaderless window still answers them, as stale as its
 routing; the epoch fences, not this gate, are what keep data safe. During an etcd outage the ex-leader's in-memory routing is
 the freshest in existence and nothing can supersede it (no election, no mutation), so

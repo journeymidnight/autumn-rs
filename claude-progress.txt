@@ -1,3 +1,10 @@
+Date: 2026-10-17 (11)
+TaskStatus: completed
+Task scope: user — (1) fix BUG-FUSE-CACHED-META-AFTER-LEASE-LOSS window (c) without a discriminating test (user decision); (2) re-judge BUG-EN-TRUNCATE-GUARD-FAILS-OPEN.
+Current summary: (1) `autumn.Fs.acquire` follows the mount's Open rule: a non-revoked slot held at least as strongly (READ requested, or writers present) only adds a ref, no manager call, mode and epoch kept — `acquire("r")` on a held write no longer downgrades it to READ (writes went ANON). The binding's manual `heartbeat()` NotHeld now runs the same `lease_tasks::lease_not_held` as the background heartbeat (WRITE slot kept revoked, READ dropped, cache invalidated) instead of dropping the slot. Green: autumn-fs lib 27, autumn-fuse lib 63, fuse_lease_loss / fuse_lease_restart / fuse_lease_1 / fuse_lease_2, `cd python && cargo check`. Entry removed ((a)(b)(c) all done). (2) Withdrawn (user was right): every seal is an etcd txn comparing the extent record and the caller's `ownerLocks/` revision, so only the current owner seals and only it passes the EN epoch fence before the truncate; ledger entry deleted, the docs that leaned on it corrected. Review (fable): no high; refactor behaviour-identical.
+Main gaps: pre-existing, not filed: a revoked WRITE slot followed by `acquire("r")` re-grants READ on the stale slot, so new writes on a clean inode go ANON (dirty ones stay fenced by write_epoch). Reviewer's hypothesis, not filed (user rejected the class): a replica the takeover's fence_tail could not reach still relies on the pre-truncate manager lookup (note 31 residual).
+Next steps: BUG-MAINT-LOOP-STARVED-BY-MINORS.
+
 Date: 2026-10-17 (10)
 TaskStatus: completed
 Task scope: user — fix BUG-EN-MULTI-MANAGER-POLL and BUG-POLICY-ACTIVATE-ATOMIC.

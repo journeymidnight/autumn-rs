@@ -511,31 +511,49 @@ impl Fs {
             _ => return Err(PyRuntimeError::new_err(format!("bad lease mode: {mode}"))),
         };
         fs_blocking!(self, py, u64, |st| {
-            let cluster = st.client.clone();
-            let id = st.client_id.clone();
-            match lease::acquire(&cluster, &id, ino, req_mode).await {
-                Ok(AcquireResult::Granted(info)) => {
-                    let mut held = st.held_leases.borrow_mut();
-                    let e = held.entry(ino).or_insert(FuseLease {
-                        writer_refs: 0,
-                        reader_refs: 0,
-                        mode: req_mode,
-                        lease_epoch: info.version,
-                        revoked: false,
-                    });
-                    e.add_ref(req_mode);
-                    e.mode = req_mode;
-                    e.lease_epoch = info.version;
-                    e.revoked = false;
-                    Ok(info.version)
+            // A lease already held at least as strongly only counts one more
+            // holder, as the mount's Open does: a read acquire on a held write
+            // lease must keep its mode and epoch, or later writes go out
+            // unfenced.
+            let covered = {
+                let mut held = st.held_leases.borrow_mut();
+                match held.get_mut(&ino) {
+                    Some(e) if !e.revoked && (req_mode == LEASE_MODE_READ || e.writer_refs > 0) => {
+                        e.add_ref(req_mode);
+                        Some(e.lease_epoch)
+                    }
+                    _ => None,
                 }
-                Ok(AcquireResult::Conflict { manager_message }) => {
-                    Err(format!("lease conflict on ino {ino}: {manager_message}"))
+            };
+            if let Some(epoch) = covered {
+                Ok(epoch)
+            } else {
+                let cluster = st.client.clone();
+                let id = st.client_id.clone();
+                match lease::acquire(&cluster, &id, ino, req_mode).await {
+                    Ok(AcquireResult::Granted(info)) => {
+                        let mut held = st.held_leases.borrow_mut();
+                        let e = held.entry(ino).or_insert(FuseLease {
+                            writer_refs: 0,
+                            reader_refs: 0,
+                            mode: req_mode,
+                            lease_epoch: info.version,
+                            revoked: false,
+                        });
+                        e.add_ref(req_mode);
+                        e.mode = req_mode;
+                        e.lease_epoch = info.version;
+                        e.revoked = false;
+                        Ok(info.version)
+                    }
+                    Ok(AcquireResult::Conflict { manager_message }) => {
+                        Err(format!("lease conflict on ino {ino}: {manager_message}"))
+                    }
+                    Ok(AcquireResult::RevokePending { .. }) => {
+                        Err(format!("lease revoke pending on ino {ino}"))
+                    }
+                    Err(e) => Err(format!("acquire ino {ino}: {e}")),
                 }
-                Ok(AcquireResult::RevokePending { .. }) => {
-                    Err(format!("lease revoke pending on ino {ino}"))
-                }
-                Err(e) => Err(format!("acquire ino {ino}: {e}")),
             }
         })
     }
@@ -549,7 +567,14 @@ impl Fs {
             match lease::heartbeat(&cluster, &id, ino).await {
                 Ok(HeartbeatResult::Renewed(_)) => Ok(true),
                 Ok(HeartbeatResult::NotHeld) => {
-                    st.held_leases.borrow_mut().remove(&ino);
+                    let invalidator = st.kernel_invalidator.borrow().clone();
+                    autumn_fs::lease_tasks::lease_not_held(
+                        &st.held_leases,
+                        &st.invalidations,
+                        &st.meta_invalidated,
+                        invalidator.as_ref(),
+                        ino,
+                    );
                     Ok(false)
                 }
                 Err(e) => Err(format!("heartbeat ino {ino}: {e}")),

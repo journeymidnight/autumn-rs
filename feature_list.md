@@ -1,6 +1,6 @@
 # autumn-rs feature list — OPEN backlog
 
-**Last updated:** 2026-10-17 (BUG-EN-MULTI-MANAGER-POLL and BUG-POLICY-ACTIVATE-ATOMIC reproduced, fixed and removed; F-METRICS-PER-PROCESS removed, it had passed; BUG-EN-TRUNCATE-GUARD-FAILS-OPEN filed from the review)
+**Last updated:** 2026-10-17 (BUG-EN-MULTI-MANAGER-POLL and BUG-POLICY-ACTIVATE-ATOMIC reproduced, fixed and removed; F-METRICS-PER-PROCESS removed, it had passed; BUG-EN-TRUNCATE-GUARD-FAILS-OPEN filed from a review and withdrawn after the user's review: every seal CASes the caller's owner revision in etcd, so only the owner that passes the EN fence can have sealed the tail; BUG-FUSE-CACHED-META-AFTER-LEASE-LOSS window (c) fixed by user decision without a discriminating test, entry removed)
 
 **Rules:**
 - This file tracks the **OPEN backlog only**. A feature that reaches `passes: true`
@@ -13,12 +13,6 @@
 ---
 
 ## Active
-
-### BUG-EN-TRUNCATE-GUARD-FAILS-OPEN — EN 的 commit 截断守卫在问不到 manager 时照样截断（推断，未复现）
-- **Trigger** (2026-10-17 EN 多 manager 修复的 fable 评审): append 的 commit 对账在截断前问 manager 该 extent 是否已 seal（`extent_node.rs` 批量路径与非批量路径），只在 `Ok(Some(sealed))` 时拒绝；`Err` / `Ok(None)`（manager 不可达、所有地址 NOT_LEADER）直接截断。standby 现在对 `extent_info` 答 NOT_LEADER，于是单个 etcd manager 启动后、赢得选举前的几秒里，这个守卫也问不到。
-- **Scope**: 先复现（当前 epoch 的写者 commit 落后于文件、manager 不可答、该 extent 已被 seal），确认能把已 seal 的 extent 截短。坐实后再定：问不到时拒绝（代价：manager 不可用期间这类 append 失败）还是别的形状。
-- **Acceptance**: 复现用例修复前已 seal 的 extent 被截短、修复后不被截短；消融变红。
-- `passes: false`
 
 ### BUG-MAINT-LOOP-STARVED-BY-MINORS — 持续写入时回收探测 / 下发的 GC 可能一直排不上（推断，未复现）
 - **Trigger** (2026-10-10 minor compaction 重设计的 fable 评审): `background_maintenance_loop` 的 tick 只在 `select_minor` 找不到窗口时才派回收探测（`spawn_reclaim_probe`）。推断：高写入 PS 上 minor 排在 PS 级 compact permit 后面，tick 时总有窗口，探测永远不跑，被老大表钉住的 row stream 前缀一直截不掉。
@@ -405,26 +399,6 @@
   并非处处更高——零延迟单核 −12%/多核 −37%，合成的多线程 CPU 拷贝 1/2 ms −25%/−38%（开着时内核
   READ 多一倍多、更碎，原因未在内核核实）；(2) "RSS 不超预算"只对预取块成立（预算 128 MiB 时 RSS
   峰值 287 MiB）。写路径不经过预读，未单独复测。
-
-### BUG-FUSE-CACHED-META-AFTER-LEASE-LOSS — lease 丢了之后缓存的 meta / 页没有人再失效（未复现）
-- **Trigger** (2026-09-27，挂载改走页缓存那次的独立评审推断，读代码得出): 挂载走页缓存之后
-  两个既有窗口的暴露面变大。(a) 心跳 `NotHeld`（manager 在 poll 仍正常时忘了这个 lease，如
-  TTL 过期）只删 `held_leases` 条目，不调内核 invalidator、不标 `meta_invalidated`：仍开着
-  的 fd 继续信任旧页，之后的写者关闭也不会再推给本挂载。(b) manager 重启后 lease version
-  从 1 重来，`inode_cache_needs_reload` 的 `cached < acquired` 比较失效；dentry 仍在（
-  `InodeState` 被 lookup 计数钉住）的已关闭 inode 再次打开时，Open 已经现读了 meta
-  （`fresh_meta`）却只在未缓存时才用，GETATTR 继续答旧 size。poll 失败路径（manager 重启时
-  通常先走到）已经会标记全部 held ino，所以 (b) 只剩"重启期间本挂载未持 lease"的 inode。
-  (c) PyO3 `acquire("r")` 在已持写的 inode 上无条件把 `mode` 改成 READ（`python/src/fs.rs`
-  acquire 分支）：之后 `write_lease_for` 发 ANON 写，`get_inode` 的"本会话是写者"豁免也失效。
-  既有问题，挂载侧读 open 只 `add_ref` 不改 mode。
-- **Scope（复现之后才谈）**: (a) 让心跳在 manager 仍在线时收到 NotHeld（停心跳超过 TTL 再
-  恢复）；(b) 挂载 A 读后关闭（dentry 保留）→ 重启 manager → B 追加 → A 重开后 `stat`。
-  坐实再修：(a) NotHeld 与 poll 失败同样处理；(b) Open 手里的 `fresh_meta` 在 inode 不脏时
-  直接替换缓存的 meta；(c) 绑定写 → 读 acquire 只加引用、不降 mode（与挂载一致）。
-- **Acceptance**: 各自确定性复现（或证伪），修则消融能变红。
-- `passes: false`
-- **notes** (2026-10-17): (a) 已复现并修：`crates/manager/tests/fuse_lease_loss.rs`（manager TTL 15 s、挂载心跳 20 s；B 写 4096 后 A 的 GETATTR 仍答 0、无失效调用）；`lease_tasks.rs` 的 NotHeld 现在与 poll 失败同样处理（删条目、忘 invalidation 版本、标 `meta_invalidated`、调内核 invalidator），修后 GETATTR 答 4096。(b) 已复现并修（`crates/manager/tests/fuse_lease_restart.rs`：etcd 版 manager 原地重启，A 缓存 version 5、重取得 2，GETATTR 答 0；修：Open 对已缓存且不脏的 inode 直接采用刚读到的 `fresh_meta`）。(c) 读代码坐实：`python/src/fs.rs` acquire 在 `add_ref` 后无条件 `e.mode = req_mode`，持写再 acquire("r") 后 `write_lease_for` 对该 inode 返回 ANON（写不带围栏；`release` 不看 mode，最后一次 release 仍释放整个 lease）。后果只有在之后被 force-preempt 时才可见，而绑定无法触发 preempt，也不暴露 held 状态——没有 Python 可见的探针，所以没改；修法是一行（持写的 slot 上读 acquire 只加引用、不降 mode，与挂载一致），要不要在没有判别测试的情况下改由用户定。绑定的手动 `heartbeat()` 方法对 NotHeld 也只删条目（同 (a) 类，后台任务那条已修），同样未动。
 
 ### F-FUSE-BIG-IO-TUNING — writeback cache + splice 零拷贝，把大 IO 的 FUSE 开销压进 5%
 - **Trigger** (2026-09-16，用户在 FUSE 性能讨论后确认的三件套之一): 实测

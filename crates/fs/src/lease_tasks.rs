@@ -32,6 +32,36 @@ use crate::state::FsState;
 /// user-space lease bookkeeping still updates correctly).
 pub type InodeInvalidator = std::rc::Rc<dyn Fn(u64)>;
 
+/// A heartbeat answered NotHeld: the manager forgot `ino`'s lease (TTL ran
+/// out), so a writer closing since is not pushed to us and the cached meta and
+/// kernel pages are as stale as after a lost poll; they are dropped the same
+/// way. A WRITE slot stays, revoked, like one the manager revoked: its writes
+/// fail and its flush carries the epoch it had, which the fence refuses.
+/// Dropped, the flush would go out anonymous over whoever holds the lease now.
+pub fn lease_not_held(
+    held: &std::cell::RefCell<std::collections::HashMap<u64, crate::state::FuseLease>>,
+    invalidations: &std::cell::RefCell<autumn_client::lease::InvalidationMap>,
+    meta_invalidated: &std::cell::RefCell<std::collections::HashSet<u64>>,
+    invalidator: Option<&InodeInvalidator>,
+    ino: u64,
+) {
+    tracing::warn!(ino, "heartbeat NotHeld; dropping the lease and the inode's cache");
+    {
+        let mut held = held.borrow_mut();
+        match held.get_mut(&ino) {
+            Some(l) if l.mode == autumn_rpc::manager_rpc::LEASE_MODE_WRITE => l.revoked = true,
+            _ => {
+                held.remove(&ino);
+            }
+        }
+    }
+    invalidations.borrow_mut().remove(&ino);
+    meta_invalidated.borrow_mut().insert(ino);
+    if let Some(inv) = invalidator {
+        inv(ino);
+    }
+}
+
 /// R2-P0 #3 — mark every held lease that just got a `LEASE_REVOKED` event as
 /// revoked. Returns the newly-revoked inos (the caller best-effort releases
 /// them). A `revoked` entry is KEPT in the map so `check_write_allowed` can
@@ -123,30 +153,7 @@ pub fn spawn_lease_background_tasks(state: &FsState, invalidator: Option<InodeIn
                         }
                     }
                     Ok(autumn_client::lease::HeartbeatResult::NotHeld) => {
-                        // The manager forgot this lease (TTL ran out), so a
-                        // writer closing since is not pushed to us: the
-                        // cached meta and the kernel's pages are as stale as
-                        // after a lost poll, and are dropped the same way.
-                        // A WRITE slot stays, revoked, like one the manager
-                        // revoked: its dirty data is flushed under the epoch
-                        // it had, which the fence refuses. Dropped, the flush
-                        // would go out anonymous and write over whoever holds
-                        // the lease now.
-                        tracing::warn!(ino, "heartbeat NotHeld; dropping the lease and the inode's cache");
-                        {
-                            let mut held = held_h.borrow_mut();
-                            match held.get_mut(&ino) {
-                                Some(l) if l.mode == autumn_rpc::manager_rpc::LEASE_MODE_WRITE => l.revoked = true,
-                                _ => {
-                                    held.remove(&ino);
-                                }
-                            }
-                        }
-                        inv_h.borrow_mut().remove(&ino);
-                        stale_h.borrow_mut().insert(ino);
-                        if let Some(inv) = &invalidator_h {
-                            inv(ino);
-                        }
+                        lease_not_held(&held_h, &inv_h, &stale_h, invalidator_h.as_ref(), ino);
                     }
                     Err(e) => {
                         tracing::warn!(ino, error = %e, "heartbeat transient");

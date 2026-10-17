@@ -382,7 +382,10 @@ WriteConflict）——拦截完全发生在挂载侧的簿记里。
 - **PyO3 `autumn.Fs`**：`acquire(ino, mode)` / `release(ino, mode="w")` 也按角色记
   （`release` 因此多了 mode 参数），但**绑定没有降级逻辑**：`release("w")` 在还有读者
   时只减计数、不通知 manager，写者槽留到最后一次 release。绑定是 headless 的显式
-  lease API，没有内核 fd 生命周期，也没有 in-tree 调用方。
+  lease API，没有内核 fd 生命周期，也没有 in-tree 调用方。`acquire` 与挂载的 Open
+  同规则：本会话已持有足够强的 lease（读请求、或已有写者）时只加引用、不问 manager、
+  不改 mode 和 epoch；以前持写再 `acquire("r")` 会把 mode 降成 READ，之后的写不带围栏。
+  手动 `heartbeat()` 拿到 `NotHeld` 走与后台心跳同一个 `lease_tasks::lease_not_held`。
 - 测试：`dispatch.rs` 的纯函数状态机（dual-open / 降级 / revoked 不降级 /
   faststart 全序列）+ `crates/manager/tests/fuse_lease_1.rs` 的真集群
   `fuse_write_open_then_read_open_in_same_mount_coexist`、

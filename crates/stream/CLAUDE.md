@@ -1033,9 +1033,11 @@ address is tried once from the one that answered last, and a transport error
 (a timeout included) or a NOT_LEADER answer moves on; the index is per shard
 and the timeout per address. The manager answers `stream_info`, `extent_info`
 and `nodes_info` NOT_LEADER from a standby, whose store is frozen at its
-replay, so a blip that moves the EN onto a standby cannot get it a stale
-"not sealed". The truncate guard still proceeds when no manager answers
-(fail-open, unchanged; open question in the feature list). Test: `crates/manager/tests/en_multi_manager_etcd.rs` (standby
+replay, so a blip that moves the EN onto a standby does not get it stale
+metadata. Every seal is an etcd txn that compares the caller's `ownerLocks/`
+revision, so only the current owner seals, and on every replica its takeover
+fenced only it passes the epoch fence that precedes the commit-reconcile
+truncate; a replica the takeover could not reach is note 31's residual. Test: `crates/manager/tests/en_multi_manager_etcd.rs` (standby
 listed first, then the leader stopped; ablations: no move on NOT_LEADER, no
 move on a transport error, the raw list as one address — each red; a standby
 answering the three lookups — red without the gate). `--ec-stripe-bytes`
