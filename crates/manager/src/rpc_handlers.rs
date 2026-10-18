@@ -7356,6 +7356,7 @@ impl AutumnManager {
         // only AFTER etcd commit — so an etcd-fail leaves clients
         // with NO phantom LeaseRevoked / WillRevokeIn events from a
         // preemption that didn't actually persist.
+        let term = self.etcd.as_ref().map(|e| e.term());
         let (pre_snapshot, outcome, mut deferred_pushes) = {
             let mut reg = self.inode_leases.borrow_mut();
             let snap = reg.inodes.get(&req.ino).cloned();
@@ -7396,10 +7397,15 @@ impl AutumnManager {
                             // also rewinds the force-revoke
                             // version bump + DROPS the deferred
                             // pushes (clients never see the
-                            // phantom revoke).
-                            self.inode_leases
-                                .borrow_mut()
-                                .revert_writer_acquire(req.ino, pre_snapshot);
+                            // phantom revoke). Not across a term:
+                            // replay replaced the registry, and the
+                            // snapshot would overwrite whoever holds
+                            // the inode now.
+                            if self.etcd.as_ref().map(|e| e.term()) == term {
+                                self.inode_leases
+                                    .borrow_mut()
+                                    .revert_writer_acquire(req.ino, pre_snapshot);
+                            }
                             std::mem::take(&mut deferred_pushes); // drop without flush
                             return Ok(rkyv_encode(&AcquireLeaseResp {
                                 code: Self::err_to_code(&e),

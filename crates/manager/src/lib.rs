@@ -221,8 +221,43 @@ pub(crate) struct EtcdMirror {
     /// fenced txn compares it. Rewriting the key (`bump_fence`) moves it, so
     /// a txn still in flight with the old compare can never commit.
     fence_rev: Rc<Cell<i64>>,
-    /// The leader lease; the rewrite keeps the key on it.
+    /// The leader lease; the rewrite keeps the key on it. Each election
+    /// grants a new one, so it names this process's leader term.
     lease_id: Rc<Cell<i64>>,
+}
+
+/// Test-only failpoint: while armed with a key prefix, the first fenced txn
+/// that puts a key under it (taking the prefix) parks after taking its fence
+/// revision and before it is sent (a request still in flight) until
+/// disarmed. Always compiled; production pays one relaxed load per attempt.
+#[doc(hidden)]
+pub static FENCED_TXN_TEST_HOLD_ARMED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+#[doc(hidden)]
+pub static FENCED_TXN_TEST_HOLD_PREFIX: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+#[doc(hidden)]
+pub static FENCED_TXN_TEST_PARKED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+async fn fenced_txn_test_hold(success: &[autumn_etcd::proto::RequestOp]) {
+    use std::sync::atomic::Ordering::Relaxed;
+    if !FENCED_TXN_TEST_HOLD_ARMED.load(Relaxed) {
+        return;
+    }
+    {
+        let mut prefix = FENCED_TXN_TEST_HOLD_PREFIX.lock().unwrap_or_else(|e| e.into_inner());
+        let hit = !prefix.is_empty()
+            && success.iter().any(|op| {
+                matches!(&op.request, Some(autumn_etcd::proto::RequestOpInner::RequestPut(p)) if p.key.starts_with(prefix.as_bytes()))
+            });
+        if !hit {
+            return;
+        }
+        prefix.clear();
+    }
+    FENCED_TXN_TEST_PARKED.fetch_add(1, Relaxed);
+    while FENCED_TXN_TEST_HOLD_ARMED.load(Relaxed) {
+        compio::time::sleep(Duration::from_millis(5)).await;
+    }
 }
 
 /// The leader key as `diagnose_fence` found it: ours at `fence_rev`, or ours
@@ -340,7 +375,13 @@ impl EtcdMirror {
     /// still ours at the revision this attempt carried → the business compare
     /// failed (`Ok(None)`); ours at a newer revision → a concurrent bump, this
     /// attempt did not land, retry under it (not counted as an attempt);
-    /// anyone else's or gone → `Err(NotLeader)`.
+    /// anyone else's or gone → `Err(NotLeader)`. The txn belongs to the term
+    /// it started in (the leader lease then): once this process leads a later
+    /// term it is not sent again (`Err(NotLeader)`), since the memory its
+    /// caller decided from was replaced by that term's replay. An attempt sent
+    /// earlier cannot commit then: the election rewrote the key. (Settling an
+    /// uncertain one still reads back by value, so it reports committed when
+    /// the new term holds the same bytes.)
     async fn fenced_txn(
         &self,
         extra_cmp: Vec<autumn_etcd::proto::Compare>,
@@ -350,10 +391,15 @@ impl EtcdMirror {
         compare.push(autumn_etcd::Cmp::mod_revision(LEADER_KEY.as_bytes(), 0));
         compare.extend(extra_cmp);
         let mut txn = autumn_etcd::proto::TxnRequest { compare, success, failure: vec![] };
+        let term = self.lease_id.get();
         let mut uncertain = 0;
         for _ in 0..8 {
+            if self.lease_id.get() != term {
+                return Err(AppError::NotLeader);
+            }
             let sent_rev = self.fence_rev.get();
             txn.compare[0] = autumn_etcd::Cmp::mod_revision(LEADER_KEY.as_bytes(), sent_rev);
+            fenced_txn_test_hold(&txn.success).await;
             match self.client.txn_ref(&txn).await {
                 Ok(resp) if resp.succeeded => return Ok(Some(Self::commit_revision(&resp)?)),
                 Ok(_) => match self.diagnose_fence(sent_rev).await? {
@@ -383,6 +429,12 @@ impl EtcdMirror {
             .map(|h| h.revision)
             .filter(|r| *r > 0)
             .ok_or_else(|| AppError::Internal("etcd txn response missing header revision".to_string()))
+    }
+
+    /// This process's current leader term (its leader lease; 0 before the
+    /// first election).
+    pub(crate) fn term(&self) -> i64 {
+        self.lease_id.get()
     }
 
     /// `fence_rev` only moves forward: the key's revision only grows, and a

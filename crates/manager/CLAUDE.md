@@ -1500,6 +1500,17 @@ covers each, red without its part of the fix, plus a wrong `ownerLocks/` key
   fenced: `try_become_leader` (it establishes ownership), `replay_from_etcd`
   (read-only), the keepalive loop (no k/v write). All `mirror_*`, `persist_extent`,
   owner-lock and inflight CAS, split/merge Phase-2 route through it.
+- **A fenced txn belongs to the term it started in.** "Ours at a newer revision"
+  is also what the key looks like after this same process lost leadership and won
+  it again, and re-sending under the new revision committed an old-term decision
+  after the new term's replay: a write-lease grant landed beside the grant made in
+  the new term, two writers. `fenced_txn` notes the leader lease (one per election,
+  `EtcdMirror::term`) when it starts and refuses (`NotLeader`) once it changed; an
+  attempt sent before cannot commit, the election rewrote the key. The acquire
+  handler skips its rollback across a term (it would overwrite the replayed
+  entry). `tests/fence_same_process_reelection.rs` (failpoint
+  `FENCED_TXN_TEST_HOLD_*` holds the grant's txn before it is sent; ablations: no
+  term check → W granted beside X, rollback across the term → X's grant cleared).
 - **A txn whose outcome is unknown is settled, never re-sent blind.** The etcd
   client does not re-send a txn that failed or timed out after it was handed to
   the connection (`autumn_etcd::UncertainOutcome`): the first copy may still

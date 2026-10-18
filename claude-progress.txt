@@ -1,3 +1,10 @@
+Date: 2026-10-18 (4)
+TaskStatus: completed
+Task scope: user — BUG-FENCE-SAME-PROCESS-REELECTION.
+Current summary: reproduced with `tests/fence_same_process_reelection.rs`: a one-shot test failpoint (`FENCED_TXN_TEST_HOLD_*`) holds W's write-lease grant txn after it took its fence revision; the test revokes the leader lease, the same process is elected again (replay clears the lease registry), X is granted the inode, W's txn is released. Before: `diagnose_fence` read "ours at a newer revision" as an in-term move, re-sent W's txn under the new fence and W was granted beside X (its record replaced X's). Fix: `fenced_txn` notes the leader lease (one per election) at entry and refuses (NotLeader, flags untouched) once it changed; the acquire handler skips its rollback across a term (the old snapshot overwrote X). Ablations red: no term check → W granted; rollback across terms → Y granted. A check inside `diagnose_fence` was tried and removed (ablation showed it redundant). Green: `cargo test --no-fail-fast -p autumn-manager --features fuse-tests` (160 targets) and the ignored etcd tests except `apply_done_atomicity` (3 fail identically on unmodified HEAD: `EC target: node 1 is Fence`, a stale harness). Review (fable): no high.
+Main gaps: filed BUG-FENCE-LATE-DIAGNOSIS-STEPS-DOWN-NEW-TERM (review, inferred, pre-existing). `apply_done_atomicity` (ignored) is stale on HEAD, not filed.
+Next steps: BUG-FENCE-LATE-DIAGNOSIS-STEPS-DOWN-NEW-TERM (reproduce first).
+
 Date: 2026-10-18 (3)
 TaskStatus: completed
 Task scope: user — reproduce and fix BUG-LEASE-VERSION-RESET-VS-DURABLE-FENCE.
