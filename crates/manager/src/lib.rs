@@ -147,6 +147,10 @@ pub const CLUSTER_ID_KEY: &str = "autumn-rs/cluster_id";
 /// ephemeral, and a manager failover invalidates every reader's cache
 /// per plan §6.4).
 pub const INODE_LEASES_PREFIX: &str = "inode_leases/";
+/// Upper bound (exclusive, BE u64) of every lease version handed out so far.
+pub(crate) const LEASE_VERSION_KEY: &str = "autumn-rs/fs/lease_version_floor";
+/// Versions one leader term may hand out (`reserve_lease_versions`).
+const LEASE_VERSION_TERM: u64 = 1 << 40;
 
 /// etcd prefix for the KDC principal account DB
 /// (`principal/<name>` → `persist::PrincipalAccountRecord`). Replayed on leader
@@ -2850,6 +2854,7 @@ impl AutumnManager {
         // through arbitrarily long replays) is filed as a P3 follow-up
         // — it needs a stop-signal to revoke the lease on replay error.
         self.replay_from_etcd().await?;
+        self.reserve_lease_versions().await?;
         self.set_leader(true);
         self.displaced.set(false);
         self.leaderless_since.set(None);
@@ -3665,13 +3670,27 @@ impl AutumnManager {
                 writers.push(rec);
             }
             // All records valid — now commit to the registry.
-            let mut reg = self.inode_leases.borrow_mut();
-            let now = Instant::now();
-            for rec in writers {
-                reg.install_persisted_writer(rec, now);
-            }
+            self.inode_leases.borrow_mut().replace_with_persisted(writers, Instant::now());
         }
 
+        Ok(())
+    }
+
+    /// Reserve this term's lease versions before serving: every version any
+    /// leader handed out is below the value at `LEASE_VERSION_KEY`, so this
+    /// one starts at it and moves it up by `LEASE_VERSION_TERM`. The first
+    /// reservation starts at `LEASE_VERSION_TERM`, above the per-inode
+    /// versions from 1 that managers issued before the key existed.
+    async fn reserve_lease_versions(&self) -> Result<()> {
+        let Some(etcd) = &self.etcd else {
+            return Ok(());
+        };
+        let base = etcd
+            .alloc_counter_cas(LEASE_VERSION_KEY.as_bytes(), LEASE_VERSION_TERM, LEASE_VERSION_TERM)
+            .await
+            .map_err(|e| anyhow::anyhow!("reserve lease versions: {e}"))?;
+        self.inode_leases.borrow_mut().set_version_base(base);
+        tracing::info!(base, "lease versions reserved for this term");
         Ok(())
     }
 

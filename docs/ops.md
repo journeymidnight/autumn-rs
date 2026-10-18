@@ -5119,6 +5119,16 @@ Landed so far:
   leases, keeping its write leases (the heartbeat still renews them).
   Check: `cargo test -p autumn-manager --features fuse-tests --test
   fuse_lease_drain` (needs `toxiproxy-server` on `PATH`).
+- **Lease versions across a manager restart** — each leader reserves 2^40
+  lease versions before it serves, so a version handed out after a restart
+  or failover is above every one before it (the PS's per-inode write fence
+  is durable). Each election moves the key up by 2^40 (1099511627776):
+  `etcdctl get autumn-rs/fs/lease_version_floor -w json | jq -r '.kvs[0].value' | base64 -d | od -An -tu8 --endian=big`.
+  The leader logs `lease versions reserved for this term` with the base.
+  Every manager must run a build that reserves: an older one ignores the key
+  and starts versions at 1 again.
+  Check: `cargo test -p autumn-manager --features fuse-tests --test
+  fuse_lease_restart` (needs `etcd` on `PATH`).
 - **Close-to-open coherence** — `OpenedExtents.lease_version` populated
   from the AcquireLease response; per-session `InvalidationMap`
   bumped by the poll loop. Read SQE arm calls `cache_is_stale`

@@ -282,6 +282,7 @@ All writes go through the leader-fenced `txn_fenced` (below). On promotion
 | `autoPolicy/config`, `autoPolicy/cooldowns` | policy state | leader-owned |
 | `autumn-rs/cluster_id` | UUID | CAS-imprinted once |
 | `autumn-rs/fs/next_inode` | BE u64 | fs inode counter (one, global) |
+| `autumn-rs/fs/lease_version_floor` | BE u64 | every inode-lease version handed out is below it; each leader reserves 2^40 above it |
 
 `part_addrs` (client routing hints) is deliberately **in-memory only** — see the
 leaderless-routing note below.
@@ -2343,7 +2344,19 @@ Invariants (enforced by code structure):
 - **L6** `host` never affects identity.
 - **L11** `version` is monotonic across the inode entry's FULL lifetime, not just a live
   entry: `last_version` shadow preserves the high-water mark across remove/re-create so a
-  re-acquire never re-hands `(ino, version)` a stale reader cache still holds.
+  re-acquire never re-hands `(ino, version)` a stale reader cache still holds. Across a
+  restart or failover too: before it serves, each leader reserves a range of 2^40 versions
+  (`reserve_lease_versions`: a fenced counter grant on `autumn-rs/fs/lease_version_floor`,
+  above every version handed out before) and starts every fresh inode at its bottom
+  (`set_version_base`); a replayed writer keeps its recorded epoch. The PS's per-inode
+  fence floor is durable, so versions starting over at 1 got every later writer of a file
+  written at a higher epoch fenced and its unpublished data dropped
+  (`fuse_lease_restart.rs::a_writer_after_a_manager_restart_is_not_fenced_by_an_older_epoch`).
+  Replay replaces the registry with the persisted writers (`replace_with_persisted`): a
+  demoted leader keeps its registry and runs no expiry, and an entry from its earlier term
+  would otherwise resume below the new base. A re-promoted process therefore loses its
+  memory-only holders exactly as a failover does (see "What a manager failover loses"). Memory mode starts at 1 and so does not
+  survive a restart against a PS that keeps its state.
 - **L12** at most one parked waker per `ClientInbox` (`drain_or_park` replaces it; the
   displaced sender drops → the prior long-poll resolves `Canceled` = "no events, retry").
 - **L13** `ClientInbox::push` fires the parked waker before returning (else a long-poll

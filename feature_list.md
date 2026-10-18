@@ -1,6 +1,6 @@
 # autumn-rs feature list — OPEN backlog
 
-**Last updated:** 2026-10-18 (BUG-LEASE-DRAIN-DROPS-WRITE-SLOTS fixed and removed: a lost poll keeps write leases, and a heartbeat no longer sets a write slot's epoch; BUG-LEASE-VERSION-RESET-VS-DURABLE-FENCE filed from the review)
+**Last updated:** 2026-10-18 (BUG-LEASE-VERSION-RESET-VS-DURABLE-FENCE reproduced, fixed and removed: each leader reserves 2^40 lease versions in etcd and replay replaces the lease registry; BUG-FENCE-SAME-PROCESS-REELECTION filed from the review)
 
 **Rules:**
 - This file tracks the **OPEN backlog only**. A feature that reaches `passes: true`
@@ -14,10 +14,10 @@
 
 ## Active
 
-### BUG-LEASE-VERSION-RESET-VS-DURABLE-FENCE — manager 重启后 lease version 从 1 重来，PS 的 inode 围栏下限却是持久的（推断，未复现）
-- **Trigger** (2026-10-18 lease drain 修复的 fable 评审): `inode_lease.rs` 的 `last_version` 只在内存，重放只装回持久化的写者（`fuse_lease_restart.rs` 也证实重启后 version 从 1 开始）；PS 的 per-inode 围栏下限随 checkpoint 和 `OP_FENCE_BUMP` 重放持久。推断：A 多次开关某文件把 version 推到 N、以 epoch N 写入（floor=N）后关闭，manager 重启，B 取写得 version 1，`1 < N` 被围栏拒，`settle_refused_flush` 按"lease 没了"丢掉 B 未发布的数据。另一个窄变体：重启后被抢占的旧写者与新写者 epoch 都是 1。
-- **Scope**: 先复现（`fuse_lease_restart.rs` 里让 A 在重启前最后一次打开时写入并 fsync，重启后断言 B 的写和 fsync 成功）。坐实后再定修法（例如持久化 version 高水位，或重启后从 PS 围栏取下限）。
-- **Acceptance**: 复现用例修复前 B 的 fsync 被围栏拒、修复后成功；消融变红。
+### BUG-FENCE-SAME-PROCESS-REELECTION — 同一进程重新当选时，上一任挂着的 fenced txn 被当成"任内 fence 变动"重发（推断，未复现）
+- **Trigger** (2026-10-18 lease 版本预留修复的 opus 评审): `fenced_txn` 的 compare 失败或结果不确定时，`diagnose_fence` 只看 leader 键的值是不是本进程的 instance_id：是且 revision 变了就判 `Fence::Moved`、在新 fence 下重发。同一进程被降级后又当选，键值仍是自己、revision 变了，于是上一任里挂着的 txn 会在新任里提交。改内存在前、写 etcd 在后的 handler（lease acquire 等）会在新任回放之后才落地：lease 上表现为 replay 清掉内存后又落一条写者记录，新任里第二个写者也能拿到写 lease（围栏在新写者第一次写之前挡不住旧授予的写，心跳 ≤5 s 内 NotHeld）；失败回滚则把上一任的快照套到新任条目上。
+- **Scope**: 先复现（toxiproxy 扣住 etcd 回复，跨过 leader 键过期和同进程重新当选）。坐实后在 `diagnose_fence` 区分"同一任内 fence 前移"与"新的一任"（例如比较键的 lease id 与发出时的是否相同，不同即 NotLeader）。
+- **Acceptance**: 复现用例修复前上一任的 txn 在新任提交、修复后拒绝；消融变红。
 - `passes: false`
 
 ### BUG-LEASE-HEARTBEAT-STALE-NOTHELD — 心跳快照期间重新 acquire 的 lease 会被迟到的 NotHeld 删掉（推断，未复现）

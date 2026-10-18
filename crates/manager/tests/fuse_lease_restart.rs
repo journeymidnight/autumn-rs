@@ -1,8 +1,8 @@
-//! A manager restart starts lease versions over. A mount that still caches an
-//! inode it has closed (the dentry keeps it) then re-opens it with a version
-//! no higher than the one it cached, so the "newer version → reload" rule
-//! cannot fire; the Open has read the inode's current meta anyway and must
-//! use it. Needs `etcd` on `PATH`.
+//! Across a manager restart: lease versions keep rising (each leader reserves
+//! a fresh range), so a writer after the restart is not fenced by the epoch a
+//! writer before it left in the PS; and a mount that still caches an inode it
+//! has closed (the dentry keeps it) re-opens it with the current meta. Needs
+//! `etcd` on `PATH`.
 
 mod support;
 
@@ -157,12 +157,74 @@ fn a_reopened_inode_takes_the_current_meta_after_a_manager_restart() {
         release(&mut b, INO, O_WRONLY).await;
         assert_eq!(getattr_size(&mut b, INO).await, 4096);
 
-        // A re-opens: its new lease version is no higher than the one it
-        // cached, but the Open has read the current meta and must use it.
+        // A re-opens with a version above the one it cached.
         open(&mut a, INO, O_RDONLY).await;
         let acquired = a.held_leases.borrow().get(&INO).map(|l| l.lease_epoch).unwrap_or(0);
         eprintln!("A re-acquired version {acquired}");
-        assert!(acquired <= cached_version, "harness: the version did not start over ({acquired} > {cached_version})");
+        assert!(acquired > cached_version, "lease versions went back across the restart ({acquired} <= {cached_version})");
         assert_eq!(getattr_size(&mut a, INO).await, 4096, "GETATTR answers the meta cached before the restart");
+    });
+}
+
+/// The PS's per-inode fence floor is durable; the manager's lease versions
+/// must not start below it after a restart. A writes at a version pushed up
+/// by a few open/close cycles, the manager restarts, and B, the only writer,
+/// must be able to write and fsync.
+#[test]
+fn a_writer_after_a_manager_restart_is_not_fenced_by_an_older_epoch() {
+    let _ = tracing_subscriber::fmt().with_env_filter("autumn_fs=warn,autumn_fuse=info").try_init();
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        let (_etcd_guard, etcd_url) = start_etcd().await;
+        let mgr_addr = pick_addr();
+        let mgr1 = start_manager(mgr_addr, etcd_url.clone());
+        wait_leader(mgr_addr).await;
+
+        let n1_dir = tempfile::tempdir().expect("n1");
+        let n2_dir = tempfile::tempdir().expect("n2");
+        let n1_addr = pick_addr();
+        let n2_addr = pick_addr();
+        start_extent_node(n1_addr, n1_dir.path().to_path_buf(), 1);
+        start_extent_node(n2_addr, n2_dir.path().to_path_buf(), 2);
+        let mgr = RpcClient::connect(mgr_addr).await.unwrap();
+        register_two_nodes(&mgr, n1_addr, n2_addr, 130).await;
+        let (log, row, meta_stream) = create_three_streams(&mgr).await;
+        upsert_partition(&mgr, 13001, log, row, meta_stream, b"", b"\xff\xff\xff\xff").await;
+        let ps_addr = pick_addr();
+        start_partition_server(130, mgr_addr, ps_addr);
+        compio::time::sleep(Duration::from_millis(1500)).await;
+        let _ = RpcClient::connect(ps_addr).await.unwrap();
+
+        let mut a = FsState::new(&mgr_addr.to_string()).await.expect("mount a");
+        dispatch::spawn_lease_background_tasks(&a, None);
+        let mut b = FsState::new(&mgr_addr.to_string()).await.expect("mount b");
+        seed_file(&mut a, b"floor.bin", INO + 1).await;
+
+        // Four open/close cycles move the version up; the fifth writes.
+        for _ in 0..4 {
+            open(&mut a, INO + 1, O_WRONLY).await;
+            release(&mut a, INO + 1, O_WRONLY).await;
+        }
+        open(&mut a, INO + 1, O_WRONLY).await;
+        let a_epoch = a.held_leases.borrow().get(&(INO + 1)).map(|l| l.lease_epoch).unwrap_or(0);
+        write(&mut a, INO + 1, vec![0xAAu8; 4096]).await;
+        release(&mut a, INO + 1, O_WRONLY).await;
+        eprintln!("A wrote at epoch {a_epoch}");
+
+        mgr1.store(true, Ordering::Release);
+        compio::time::sleep(Duration::from_secs(1)).await;
+        let _mgr2 = start_manager(mgr_addr, etcd_url.clone());
+        wait_leader(mgr_addr).await;
+        compio::time::sleep(Duration::from_secs(5)).await;
+
+        open(&mut b, INO + 1, O_WRONLY).await;
+        let b_epoch = b.held_leases.borrow().get(&(INO + 1)).map(|l| l.lease_epoch).unwrap_or(0);
+        eprintln!("B granted epoch {b_epoch} after the restart");
+        write(&mut b, INO + 1, vec![0xBBu8; 100]).await;
+        let synced = autumn_fs::write::flush_inode(&mut b, INO + 1, autumn_fs::write::FlushReport::ToApplication).await;
+        assert!(synced.is_ok(), "B's fsync after the restart: {synced:?}");
+        release(&mut b, INO + 1, O_WRONLY).await;
+        let mut c = FsState::new(&mgr_addr.to_string()).await.expect("mount c");
+        let head = autumn_fs::read::read(&mut c, INO + 1, 0, 100).await.expect("c read");
+        assert_eq!(head, vec![0xBBu8; 100], "B's bytes did not land");
     });
 }

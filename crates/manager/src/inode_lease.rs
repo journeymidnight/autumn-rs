@@ -366,6 +366,9 @@ pub struct LeaseRegistry {
     /// coherence for any client whose cache still carried version=1
     /// from a different generation.
     pub last_version: HashMap<u64, u64>,
+    /// Where a fresh inode's version starts: the bottom of the range this
+    /// leader reserved (`set_version_base`). 0 = memory mode.
+    version_base: u64,
     pub lease_ttl: Duration,
     /// How long the manager waits between pushing
     /// `WillRevokeIn` to a writer and force-revoking on a subsequent
@@ -379,6 +382,7 @@ impl LeaseRegistry {
             inodes: HashMap::new(),
             inboxes: HashMap::new(),
             last_version: HashMap::new(),
+            version_base: 0,
             lease_ttl: ttl,
             revoke_grace: Duration::from_secs(5),
         }
@@ -392,6 +396,7 @@ impl LeaseRegistry {
             inodes: HashMap::new(),
             inboxes: HashMap::new(),
             last_version: HashMap::new(),
+            version_base: 0,
             lease_ttl: ttl,
             revoke_grace,
         }
@@ -401,8 +406,21 @@ impl LeaseRegistry {
         self.lease_ttl.as_secs() as u32
     }
 
+    /// Every version this leader hands out lies at or above `base`, the
+    /// bottom of the range it reserved in etcd: a PS fence floor persists the
+    /// highest epoch it has seen, so versions must not start over at 1 after
+    /// a restart or a failover.
+    pub fn set_version_base(&mut self, base: u64) {
+        self.version_base = base;
+    }
+
     fn inode_or_create(&mut self, ino: u64) -> &mut InodeLeaseState {
-        let seed = self.last_version.get(&ino).copied().unwrap_or(0);
+        let seed = self
+            .last_version
+            .get(&ino)
+            .copied()
+            .unwrap_or(0)
+            .max(self.version_base);
         self.inodes.entry(ino).or_insert_with(|| {
             let mut s = InodeLeaseState::new(ino);
             // If the inode has ever been seen, resume from the highest
@@ -1119,6 +1137,20 @@ impl LeaseRegistry {
         }
     }
 
+    /// Leader replay: the persisted writers become the whole lease state, as
+    /// on a fresh process. Every other entry is from an earlier term of this
+    /// process (a demoted leader keeps its registry and runs no expiry) and
+    /// would hand out a version below the new term's base; its holders learn
+    /// it at their next heartbeat (NotHeld). `last_version` is below the new
+    /// base too.
+    pub fn replace_with_persisted(&mut self, writers: Vec<MgrInodeLeaseRecord>, now: Instant) {
+        self.inodes.clear();
+        self.last_version.clear();
+        for rec in writers {
+            self.install_persisted_writer(rec, now);
+        }
+    }
+
     /// On leader-promotion replay, install a writer lease from etcd.
     /// `now` is the new leader's monotonic clock; the remaining TTL is
     /// derived from `expires_at - epoch_now`.
@@ -1132,7 +1164,10 @@ impl LeaseRegistry {
         let ino = rec.ino;
         let recorded = rec.version;
         let s = self.inode_or_create(ino);
-        s.version = s.version.max(recorded);
+        // The writer keeps the epoch it was granted: a held writer's version
+        // never moves, and its next bump is still above every PS fence floor
+        // for this inode (no one else wrote it meanwhile).
+        s.version = recorded;
         s.writer = Some(key);
         s.writer_kind = WriterKind::Write;
         s.writer_diag_host = rec.writer.host.clone();
@@ -1605,6 +1640,50 @@ mod tests {
         assert!(matches!(
             r2.acquire(&other, 77, LEASE_MODE_WRITE, Instant::now()),
             AcquireOutcome::WriteConflict { .. }
+        ));
+    }
+
+    #[test]
+    fn a_new_term_starts_fresh_inodes_at_its_base_and_keeps_a_replayed_writer() {
+        let mut r = reg();
+        let w = cid(1, 1, "host-x");
+        let _ = r.acquire(&w, 77, LEASE_MODE_WRITE, Instant::now());
+        let rec = r.writer_record(77).expect("must persist");
+
+        // The next leader reserved versions from 1000.
+        let mut r2 = reg();
+        r2.set_version_base(1000);
+        r2.install_persisted_writer(rec, Instant::now());
+        // The replayed writer keeps its epoch; its next bump is above it.
+        assert_eq!(r2.inodes.get(&77).unwrap().version, 1);
+        assert_eq!(r2.release(&w, 77), ReleaseOutcome::WriterClosed { new_version: 2 });
+        // A fresh inode starts at the base, not at 1.
+        let other = cid(1, 2, "host-y");
+        assert!(matches!(
+            r2.acquire(&other, 78, LEASE_MODE_WRITE, Instant::now()),
+            AcquireOutcome::Granted { version: 1000, .. }
+        ));
+    }
+
+    /// A demoted leader keeps its registry; promoted again, an entry from its
+    /// earlier term must not hand out a version below the new base.
+    #[test]
+    fn a_replay_drops_entries_from_an_earlier_term() {
+        let mut r = reg();
+        let reader = cid(1, 1, "reader");
+        let writer = cid(1, 2, "writer");
+        let _ = r.acquire(&reader, 9, LEASE_MODE_READ, Instant::now());
+        for _ in 0..4 {
+            let _ = r.acquire(&writer, 9, LEASE_MODE_WRITE, Instant::now());
+            let _ = r.release(&writer, 9);
+        }
+        assert_eq!(r.inodes.get(&9).unwrap().version, 5, "the reader keeps the entry alive");
+
+        r.replace_with_persisted(Vec::new(), Instant::now());
+        r.set_version_base(1000);
+        assert!(matches!(
+            r.acquire(&writer, 9, LEASE_MODE_WRITE, Instant::now()),
+            AcquireOutcome::Granted { version: 1000, .. }
         ));
     }
 

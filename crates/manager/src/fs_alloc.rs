@@ -60,7 +60,7 @@ impl AutumnManager {
             Some(etcd) => {
                 // Two etcd round trips (get, txn) per grant of ~1000 inodes.
                 let _turn = self.fs_alloc_turn.lock().await;
-                etcd.alloc_fs_inodes_cas(FS_NEXT_INODE_KEY.as_bytes(), count, floor)
+                etcd.alloc_counter_cas(FS_NEXT_INODE_KEY.as_bytes(), count, floor)
                     .await
             }
         }
@@ -77,12 +77,13 @@ fn alloc_from_cell(next: &Cell<u64>, count: u64, floor: u64) -> u64 {
 }
 
 impl EtcdMirror {
-    /// Leader-fenced CAS grant loop. Reads the counter, computes
+    /// Leader-fenced CAS grant loop (the inode counter, the lease-version
+    /// range). Reads the counter, computes
     /// `base = max(cur, floor)`, and commits `base + count` back with a
     /// txn that requires BOTH the leader fence AND the counter still
     /// holding the value we read (value-CAS; the counter is strictly
     /// monotonic so ABA is impossible). Conflict → re-read and retry.
-    pub(crate) async fn alloc_fs_inodes_cas(
+    pub(crate) async fn alloc_counter_cas(
         &self,
         key: &[u8],
         count: u64,
@@ -99,7 +100,7 @@ impl EtcdMirror {
                 .client
                 .get(key)
                 .await
-                .map_err(|e| AppError::Internal(format!("alloc_fs_inodes get: {e}")))?;
+                .map_err(|e| AppError::Internal(format!("{} get: {e}", String::from_utf8_lossy(key))))?;
 
             let (base, cas_cmp) = match got.kvs.first() {
                 None => {
@@ -117,7 +118,7 @@ impl EtcdMirror {
             };
 
             let next = base.checked_add(count).ok_or_else(|| {
-                AppError::Internal("alloc_fs_inodes: inode counter overflow".to_string())
+                AppError::Internal(format!("{}: counter overflow", String::from_utf8_lossy(key)))
             })?;
             let committed = self
                 .txn_fenced(
@@ -133,7 +134,7 @@ impl EtcdMirror {
             // our txn. Loop re-reads the fresh counter.
         }
         Err(AppError::Internal(format!(
-            "alloc_fs_inodes({}): {MAX_CAS_ATTEMPTS} CAS attempts exhausted — etcd churn?",
+            "{}: {MAX_CAS_ATTEMPTS} CAS attempts exhausted — etcd churn?",
             String::from_utf8_lossy(key)
         )))
     }

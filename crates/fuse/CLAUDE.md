@@ -169,8 +169,8 @@ GETATTR 一直答旧 size）。
 - 内核 FORGET 掉 inode（lookup 计数归零）时删记录——页跟着 inode 一起没了。
 
 **为什么用 `generation` 不用 mtime / lease version**：`generation` 由每次改字节的路径抬高
-（flush 的写、truncate、segment 换图）；mtime 可被 `setattr` 指定成旧值；lease version 只在
-manager 内存里，写者关闭后 etcd 记录即删，manager 重启后从 1 重来。S3 覆盖写、`autumnfs put`
+（flush 的写、truncate、segment 换图）；mtime 可被 `setattr` 指定成旧值；lease version 只随写者
+关闭、撤销抬高，说明不了字节变没变（manager 重启后从新 leader 预留的区间起步）。S3 覆盖写、`autumnfs put`
 都换新 ino，是另一个内核 inode，不涉及这里。
 **已知窗口（与以前相同，不是本改动引入）**：写者崩在"extent 已落、meta 未 flush"之间时，字节
 变了而 generation 没变；未 fsync 的写本来就不保证。
@@ -188,8 +188,8 @@ manager 内存里，写者关闭后 etcd 记录即删，manager 重启后从 1 �
 旧 EOF，`fstat` 也是旧值；HEAD 上同一步通过。修法：invalidation 轮询循环把每个事件的 ino
 （以及 poll 失败 / overflow 时的全部 held ino）放进 `FsState.meta_invalidated`，
 `meta::get_inode`（GetAttr、Lookup 都经过它）遇到标记时从 KV 重读一次、丢掉按 size 算的
-extent map、清标记。不用 `invalidations` 的版本下限做比较：lease version 在 manager 重启后
-从 1 重来，比较会漏。**本挂载持写 lease（未撤销）或 inode 脏时不重读**：那时别人改不了文件，
+extent map、清标记。不用 `invalidations` 的版本下限做比较：poll 失败 / overflow 时本来就不知道
+漏了哪个版本的事件，只能整体标记。**本挂载持写 lease（未撤销）或 inode 脏时不重读**：那时别人改不了文件，
 标记（发给我们的 WillRevokeIn）不说明内容变了，而缓存的 size 可能领先 KV（flush 在 put
 落地前清 `dirty`，put 失败就停在那里）——收下 KV 的更小 size 就是 `get_inode_uncached`
 注释里那条删数据的路（`clean_beyond_eof`）；最初版本只看 `dirty`，评审指出后改。poll 失败

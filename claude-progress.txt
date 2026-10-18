@@ -1,3 +1,10 @@
+Date: 2026-10-18 (3)
+TaskStatus: completed
+Task scope: user — reproduce and fix BUG-LEASE-VERSION-RESET-VS-DURABLE-FENCE.
+Current summary: reproduced in `tests/fuse_lease_restart.rs::a_writer_after_a_manager_restart_is_not_fenced_by_an_older_epoch` (etcd manager restarted in place: A wrote at epoch 5, B was granted 1 after the restart, B's fsync fenced `stamped_epoch=1 < floor=5`, its data dropped). Fix: before serving, each leader reserves 2^40 lease versions with a fenced counter grant on `autumn-rs/fs/lease_version_floor` (`reserve_lease_versions`; the inode allocator's helper, renamed `alloc_counter_cas`) and starts fresh inodes at the base (`set_version_base`); a replayed writer keeps its recorded epoch; replay replaces the registry (`replace_with_persisted`, from review 1: a demoted leader's stale entries would resume below the base). The old restart test now asserts versions rise across the restart. Red before / green after; ablations red (base not set: both restart tests; no clear: unit test). Green: manager lib 510, every lease / ioring / fs_alloc test incl. etcd-backed and ignored ones.
+Main gaps: filed BUG-FENCE-SAME-PROCESS-REELECTION (review 2, inferred): `diagnose_fence` treats a same-process re-election as an in-term fence move and re-sends an old-term txn under the new term; with the registry cleared, a lease grant in flight across that can land after replay (brief double writer, bounded by the heartbeat and the PS fence).
+Next steps: BUG-FENCE-SAME-PROCESS-REELECTION (reproduce first).
+
 Date: 2026-10-18 (2)
 TaskStatus: completed
 Task scope: user — fix BUG-LEASE-DRAIN-DROPS-WRITE-SLOTS.
