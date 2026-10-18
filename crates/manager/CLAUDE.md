@@ -2395,9 +2395,15 @@ before reclaiming. Matrix: `mode_matrix_across_clients`; wire path:
 `crates/manager/tests/lease_modes.rs`.
 
 Consumer-side coherence rules (design rationale for the fuse consumer): a subscribe
-disconnect / overflow sentinel must drop EVERY held lease + cached fd (partial
-invalidation is a footgun); a cache-stale Read must reload extents before serving or
-return EIO (never serve pre-close bytes). See `docs/fs_lease_design.md`.
+disconnect / overflow sentinel must invalidate EVERY cached inode and drop every READ
+lease (partial invalidation is a footgun); a WRITE lease is kept — the lost poll says
+nothing about it, the heartbeat still renews it and turns NotHeld into revoked
+(`crates/fs/CLAUDE.md`). A writer that read the file first stays in `readers`, so
+after a force revoke its heartbeat is renewed as a reader with the NEW writer's
+version: a client never takes a write slot's epoch from a heartbeat.
+
+A cache-stale Read must reload extents before serving or return EIO (never serve
+pre-close bytes). See `docs/fs_lease_design.md`.
 
 ## Namespace registry
 

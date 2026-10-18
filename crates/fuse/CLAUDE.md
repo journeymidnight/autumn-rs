@@ -186,7 +186,7 @@ manager 内存里，写者关闭后 etcd 记录即删，manager 重启后从 1 �
 走页缓存后内核在自己的 `i_size` 处就截断，**超出部分根本不发 READ**，而是问 GETATTR——
 那里答的是缓存的旧 meta。实测（真挂载 TAIL：A 持 fd 读到 EOF，B 追加并关闭）：A 永远停在
 旧 EOF，`fstat` 也是旧值；HEAD 上同一步通过。修法：invalidation 轮询循环把每个事件的 ino
-（以及 poll 失败 / overflow 时丢掉的全部 held ino）放进 `FsState.meta_invalidated`，
+（以及 poll 失败 / overflow 时的全部 held ino）放进 `FsState.meta_invalidated`，
 `meta::get_inode`（GetAttr、Lookup 都经过它）遇到标记时从 KV 重读一次、丢掉按 size 算的
 extent map、清标记。不用 `invalidations` 的版本下限做比较：lease version 在 manager 重启后
 从 1 重来，比较会漏。**本挂载持写 lease（未撤销）或 inode 脏时不重读**：那时别人改不了文件，

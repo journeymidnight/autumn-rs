@@ -62,6 +62,37 @@ pub fn lease_not_held(
     }
 }
 
+/// A failed poll or an overflow sentinel: invalidations may have been missed,
+/// so every held inode's cached meta and kernel pages are dropped, and every
+/// slot but a WRITE one with them (re-acquired at the next open). A WRITE slot stays: the
+/// poll says nothing about the write lease, which the heartbeat still renews
+/// and marks revoked on NotHeld. Dropping it handed the lease to the next mount
+/// that asked and failed the writer's open fd. Returns the dropped inos.
+pub fn drop_after_lost_poll(
+    held: &std::cell::RefCell<std::collections::HashMap<u64, crate::state::FuseLease>>,
+    invalidations: &std::cell::RefCell<autumn_client::lease::InvalidationMap>,
+    meta_invalidated: &std::cell::RefCell<std::collections::HashSet<u64>>,
+    invalidator: Option<&InodeInvalidator>,
+) -> Vec<u64> {
+    let all: Vec<u64> = held.borrow().keys().copied().collect();
+    let mut dropped = Vec::new();
+    held.borrow_mut().retain(|ino, l| {
+        let keep = l.mode == autumn_rpc::manager_rpc::LEASE_MODE_WRITE;
+        if !keep {
+            dropped.push(*ino);
+        }
+        keep
+    });
+    invalidations.borrow_mut().clear();
+    meta_invalidated.borrow_mut().extend(all.iter().copied());
+    if let Some(inv) = invalidator {
+        for ino in &all {
+            inv(*ino);
+        }
+    }
+    dropped
+}
+
 /// R2-P0 #3 — mark every held lease that just got a `LEASE_REVOKED` event as
 /// revoked. Returns the newly-revoked inos (the caller best-effort releases
 /// them). A `revoked` entry is KEPT in the map so `check_write_allowed` can
@@ -148,8 +179,14 @@ pub fn spawn_lease_background_tasks(state: &FsState, invalidator: Option<InodeIn
             for ino in inos {
                 match autumn_client::lease::heartbeat(&cluster_h, &id_h, ino).await {
                     Ok(autumn_client::lease::HeartbeatResult::Renewed(info)) => {
+                        // A write slot's epoch comes only from its grant: a
+                        // held writer's version never moves, and a writer the
+                        // manager deposed but still lists as a reader is
+                        // renewed with the NEW writer's version.
                         if let Some(slot) = held_h.borrow_mut().get_mut(&ino) {
-                            slot.lease_epoch = info.version;
+                            if slot.mode != autumn_rpc::manager_rpc::LEASE_MODE_WRITE {
+                                slot.lease_epoch = info.version;
+                            }
                         }
                     }
                     Ok(autumn_client::lease::HeartbeatResult::NotHeld) => {
@@ -214,16 +251,9 @@ pub fn spawn_lease_background_tasks(state: &FsState, invalidator: Option<InodeIn
                         tracing::warn!(
                             "overflow sentinel; wholesale invalidating session"
                         );
-                        let drained: Vec<u64> = held_p.borrow().keys().copied().collect();
-                        held_p.borrow_mut().clear();
-                        inv_p.borrow_mut().clear();
-                        stale_p.borrow_mut().extend(drained.iter().copied());
-                        if let Some(inv) = &invalidator_p {
-                            for ino in &drained {
-                                inv(*ino);
-                            }
-                        }
-                        for ino in drained {
+                        let dropped =
+                            drop_after_lost_poll(&held_p, &inv_p, &stale_p, invalidator_p.as_ref());
+                        for ino in dropped {
                             if let Err(e) =
                                 autumn_client::lease::release(&cluster_p, &id_p, ino).await
                             {
@@ -237,17 +267,12 @@ pub fn spawn_lease_background_tasks(state: &FsState, invalidator: Option<InodeIn
                         error = %e,
                         "poll failed; invalidating session cache + retry"
                     );
-                    let drained: Vec<u64> = held_p.borrow().keys().copied().collect();
-                    held_p.borrow_mut().clear();
-                    inv_p.borrow_mut().clear();
-                    stale_p.borrow_mut().extend(drained.iter().copied());
-                    if let Some(inv) = &invalidator_p {
-                        for ino in &drained {
-                            inv(*ino);
+                    let dropped =
+                        drop_after_lost_poll(&held_p, &inv_p, &stale_p, invalidator_p.as_ref());
+                    for ino in dropped {
+                        if let Err(e) = autumn_client::lease::release(&cluster_p, &id_p, ino).await {
+                            tracing::warn!(ino, error = %e, "best-effort release after a failed poll");
                         }
-                    }
-                    for ino in drained {
-                        let _ = autumn_client::lease::release(&cluster_p, &id_p, ino).await;
                     }
                     compio::time::sleep(Duration::from_millis(500)).await;
                 }

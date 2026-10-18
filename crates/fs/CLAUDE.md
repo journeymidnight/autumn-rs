@@ -410,8 +410,8 @@ invalidator，binding 传 None（headless，无内核页缓存驱逐）。
 `FsState.page_cache_generation` 只有挂载用：挂载跨 open 保留内核页缓存，没持 lease 的 Open
 用 `meta::fetch_inode`（直读 KV、不碰 `state.inodes`）拿 `generation` 与这张表比，决定保不保留
 （见 `crates/fuse/CLAUDE.md`「页缓存」）。
-`FsState.meta_invalidated`：轮询循环收到某 ino 的失效事件（或 poll 失败 / overflow 丢掉全部
-held lease）就标记它，`meta::get_inode` 遇到标记时从 KV 重读一次——缓存的 meta 不再活过
+`FsState.meta_invalidated`：轮询循环收到某 ino 的失效事件（或 poll 失败 / overflow，此时标记全部
+held ino）就标记它，`meta::get_inode` 遇到标记时从 KV 重读一次——缓存的 meta 不再活过
 别处的写者关闭。心跳对某 ino 拿到 `NotHeld` 时同样处理：manager 已忘掉这个 lease，之后别处的
 写者关闭不会再推给本会话，所以忘 invalidation 版本、标记、调内核 invalidator，READ slot 删掉；
 WRITE slot 留下并置 `revoked`（与 manager 主动 revoke 同形）：之后的写 EIO，flush 仍带原 epoch、
@@ -419,6 +419,19 @@ WRITE slot 留下并置 `revoked`（与 manager 主动 revoke 同形）：之后
 （`crates/manager/tests/fuse_lease_loss.rs` 两个用例）。这段处理在 `lease_tasks::lease_not_held`，
 后台心跳与 binding 的手动 `heartbeat()` 共用。本会话持写 lease 或 inode 脏时不重读（缓存的 size 可能领先 KV，收下更小的
 就是 `get_inode_uncached` 说的删数据）。挂载与 binding 都经过这里。
+
+poll 失败或 overflow（`lease_tasks::drop_after_lost_poll`）：可能漏了失效事件，所以全部缓存失效、
+READ slot 删掉并 release；WRITE slot 留着、不 release——poll 失败说明不了写 lease 丢没丢，心跳照常续，
+真丢了就 `NotHeld` → revoked。以前一并删掉并 release，写 lease 就交给了下一个来要的挂载，本挂载开着的
+写 fd 之后每次写都 EIO（`crates/manager/tests/fuse_lease_drain.rs`，toxiproxy 切断 manager 连接）。
+
+WRITE slot 的 epoch 只来自它的授予，心跳不改它（只刷新非写 slot 的版本）：持有中的写者版本不会变，而
+先读后写的会话在 manager 那里同时是 reader，被强制抢占后心跳按 reader 续约、带回的是新写者的版本，抄进
+写 slot 就能穿过 PS 围栏盖掉新写者已确认的字节（`fuse_lease_deposed_writer.rs`：断开期间 inbox 溢出
+丢了 `LeaseRevoked`）。`LeaseRevoked` 可能在 inbox 溢出（>1024 条）时被丢，也可能在 manager 已取走、
+回复还没到时连接断开而丢。漏掉后旧写者照用原 epoch 写；它若先读过，心跳一直按 reader 续约、拿不到
+`NotHeld`，挡住它的只有 PS 的 inode 围栏：按分区、在新写者第一次写该分区时抬高，所以旧写者的写进不了
+新写者已写过的分区，盖不掉它已确认的字节。
 
 `InodeState.write_epoch`：脏状态（`write_buf`、`dirty`）在哪个 WRITE lease epoch 下产生，写入时盖上
 （`write.rs` 的 write 路径、`segment.rs` 的 splice），flush 成功后清零。`write_lease_for` 没有 WRITE

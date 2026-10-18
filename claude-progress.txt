@@ -1,3 +1,10 @@
+Date: 2026-10-18 (2)
+TaskStatus: completed
+Task scope: user — fix BUG-LEASE-DRAIN-DROPS-WRITE-SLOTS.
+Current summary: reproduced with `tests/fuse_lease_drain.rs` (mount A reaches the manager through toxiproxy; the cut fails a poll; past the TTL mount B asked for WRITE): the drain dropped and released A's write lease, so B was granted and A's open fd failed every later write. No data loss there (writes without a lease are refused, dirty data is fenced by write_epoch). Fix: `lease_tasks::drop_after_lost_poll` keeps WRITE slots on a failed poll or overflow (caches still invalidated, other slots dropped and released). Review (fable) found that keeping the slot exposed a hole, reproduced as `tests/fuse_lease_deposed_writer.rs`: a writer that read first stays in the manager's `readers`; after a force revoke whose LeaseRevoked was lost (inbox overflow) its heartbeat is renewed as a reader with the NEW writer's version, which the loop copied into the write slot's epoch, so the deposed writer's bytes replaced the new writer's acknowledged ones. Fix: the heartbeat no longer sets a WRITE slot's epoch (a held writer's version never moves; the epoch comes from the grant). Both tests red before their fix, ablations red; green: autumn-fs lib 27, autumn-fuse lib 63, all fuse/ioring lease tests incl. real-mount ignored ones, lease_modes, lease_preempt. Second review (fable): both changes correct, docs corrected, precondition assert added.
+Main gaps: filed BUG-LEASE-VERSION-RESET-VS-DURABLE-FENCE (pre-existing, inferred): versions restart at 1 after a manager restart while PS fence floors are durable.
+Next steps: BUG-LEASE-VERSION-RESET-VS-DURABLE-FENCE (reproduce first).
+
 Date: 2026-10-18
 TaskStatus: completed
 Task scope: user — run the experiment for BUG-MAINT-LOOP-STARVED-BY-MINORS (two partitions + a slow major).

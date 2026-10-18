@@ -73,5 +73,13 @@ required-features = ["fuse-tests"]
 name = "fuse_lease_restart"
 required-features = ["fuse-tests"]
 
+[[test]]
+name = "fuse_lease_drain"
+required-features = ["fuse-tests"]
+
+[[test]]
+name = "fuse_lease_deposed_writer"
+required-features = ["fuse-tests"]
+
 [lints]
 workspace = true
