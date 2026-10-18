@@ -260,6 +260,13 @@ async fn fenced_txn_test_hold(success: &[autumn_etcd::proto::RequestOp]) {
     }
 }
 
+/// Test-only failpoint: 1 = armed; the first `diagnose_fence` after it takes it
+/// (2) and parks after its read of the leader key, before acting on it (a late
+/// answer), until the test stores 0. Always compiled; one relaxed CAS per
+/// diagnosis.
+#[doc(hidden)]
+pub static DIAGNOSE_FENCE_TEST_HOLD: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
 /// The leader key as `diagnose_fence` found it: ours at `fence_rev`, or ours
 /// at a newer revision (a bump settled an uncertain attempt meanwhile).
 enum Fence {
@@ -402,7 +409,7 @@ impl EtcdMirror {
             fenced_txn_test_hold(&txn.success).await;
             match self.client.txn_ref(&txn).await {
                 Ok(resp) if resp.succeeded => return Ok(Some(Self::commit_revision(&resp)?)),
-                Ok(_) => match self.diagnose_fence(sent_rev).await? {
+                Ok(_) => match self.diagnose_fence(sent_rev, term).await? {
                     Fence::Held => return Ok(None),
                     Fence::Moved => {}
                 },
@@ -412,8 +419,8 @@ impl EtcdMirror {
                         return Err(AppError::Internal("etcd txn did not land in two attempts".to_string()));
                     }
                     tracing::warn!(error = %e, uncertain, "fenced txn outcome unknown; settling it");
-                    self.bump_fence(sent_rev).await?;
-                    if let Some(rev) = self.read_back(&txn.success).await? {
+                    self.bump_fence(sent_rev, term).await?;
+                    if let Some(rev) = self.read_back(&txn.success, term).await? {
                         return Ok(Some(rev));
                     }
                 }
@@ -446,10 +453,10 @@ impl EtcdMirror {
     /// Returns once the leader key's revision is strictly past `sent_rev`, the
     /// one an uncertain txn carried, rewriting the key (same value, same
     /// lease) if it is still there. From then on that txn cannot commit.
-    async fn bump_fence(&self, sent_rev: i64) -> Result<(), AppError> {
+    async fn bump_fence(&self, sent_rev: i64, term: i64) -> Result<(), AppError> {
         for _ in 0..4 {
             // Deposed → NotLeader. Moved → done, by this bump or another.
-            if let Fence::Moved = self.diagnose_fence(sent_rev).await? {
+            if let Fence::Moved = self.diagnose_fence(sent_rev, term).await? {
                 return Ok(());
             }
             let txn = autumn_etcd::proto::TxnRequest {
@@ -481,7 +488,11 @@ impl EtcdMirror {
     /// written by a successor leader must not pass for ours. `Some(rev)` is
     /// the commit revision (a put key's `mod_revision`; 0 for a delete-only
     /// txn).
-    async fn read_back(&self, success: &[autumn_etcd::proto::RequestOp]) -> Result<Option<i64>, AppError> {
+    async fn read_back(
+        &self,
+        success: &[autumn_etcd::proto::RequestOp],
+        term: i64,
+    ) -> Result<Option<i64>, AppError> {
         use autumn_etcd::proto::{RequestOpInner as Request, ResponseOpInner as Response};
         let mut wanted: Vec<Option<&[u8]>> = Vec::with_capacity(success.len());
         let mut reads = Vec::with_capacity(success.len());
@@ -512,7 +523,7 @@ impl EtcdMirror {
             };
             if !resp.succeeded {
                 // Deposed → NotLeader; moved → read again under the new fence.
-                self.diagnose_fence(sent_rev).await?;
+                self.diagnose_fence(sent_rev, term).await?;
                 continue;
             }
             let mut rev = 0;
@@ -532,15 +543,28 @@ impl EtcdMirror {
         Err(AppError::Internal("the leader fence kept moving during read-back".to_string()))
     }
 
-    /// Reads the leader key after a txn sent under `sent_rev` failed its
-    /// compare or is being settled. Deposed → flips `leader` / `displaced`,
-    /// `Err(NotLeader)`.
-    async fn diagnose_fence(&self, sent_rev: i64) -> Result<Fence, AppError> {
+    /// Reads the leader key after a txn sent under `sent_rev` in `term` failed
+    /// its compare or is being settled. Deposed → flips `leader` / `displaced`,
+    /// `Err(NotLeader)` — unless this process leads a later term by the time
+    /// the read answers: then the answer is about a term that is over, and
+    /// only this txn is refused.
+    async fn diagnose_fence(&self, sent_rev: i64, term: i64) -> Result<Fence, AppError> {
         let got = self
             .client
             .get(LEADER_KEY.as_bytes())
             .await
             .map_err(|e| AppError::Internal(e.to_string()))?;
+        {
+            use std::sync::atomic::Ordering::Relaxed;
+            if DIAGNOSE_FENCE_TEST_HOLD.compare_exchange(1, 2, Relaxed, Relaxed).is_ok() {
+                while DIAGNOSE_FENCE_TEST_HOLD.load(Relaxed) == 2 {
+                    compio::time::sleep(Duration::from_millis(5)).await;
+                }
+            }
+        }
+        if self.lease_id.get() != term {
+            return Err(AppError::NotLeader);
+        }
         match got.kvs.first() {
             Some(kv) if kv.value.as_slice() == self.instance_id.as_bytes() => {
                 if kv.mod_revision == sent_rev {
@@ -3074,32 +3098,39 @@ impl AutumnManager {
         Ok(())
     }
 
+    /// Keeps the leader lease of one term alive; steps down when it fails.
+    /// Once this process leads a later term (it stepped down for another
+    /// reason and won again) the loop ends without stepping down: its lease
+    /// is not what that term stands on.
     async fn leader_keepalive_loop(self, lease_id: i64) {
-        let keeper = {
-            let c = match self.etcd.as_ref() {
-                Some(v) => v.client.clone(),
-                None => {
-                    self.leaderless_since.set(Some(Instant::now()));
-                    self.set_leader(false);
-                    return;
-                }
-            };
-            match c.lease_keep_alive(lease_id).await {
-                Ok(k) => k,
-                Err(_) => {
-                    self.leaderless_since.set(Some(Instant::now()));
-                    self.set_leader(false);
-                    return;
-                }
+        let Some(etcd) = self.etcd.clone() else {
+            self.step_down_from(lease_id);
+            return;
+        };
+        let keeper = match etcd.client.lease_keep_alive(lease_id).await {
+            Ok(k) => k,
+            Err(_) => {
+                self.step_down_from(lease_id);
+                return;
             }
         };
-
         loop {
             compio::time::sleep(Duration::from_secs(2)).await;
+            if etcd.term() != lease_id {
+                return;
+            }
             match keeper.keep_alive().await {
                 Ok(r) if r.ttl > 0 => {}
                 _ => break,
             }
+        }
+        self.step_down_from(lease_id);
+    }
+
+    /// Steps down if `lease_id` is still this process's leader term.
+    fn step_down_from(&self, lease_id: i64) {
+        if self.etcd.as_ref().is_some_and(|e| e.term() != lease_id) {
+            return;
         }
         // etcd-chaos D1 (coco P1): open the BOUNDED stale-while-leaderless
         // window before stepping down — `ensure_routable` serves from it

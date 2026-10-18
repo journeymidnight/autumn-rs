@@ -170,6 +170,18 @@ Lease-based (10 s TTL):
 3. Lease expiry / keepalive failure → `leader = false` (step down).
 4. A background loop retries election every 2 s when not leader.
 
+Each election grants a new leader lease, and that lease names the term
+(`EtcdMirror::term`). Only the current term steps the process down: a fence
+diagnosis whose read of the key is answered after this process won it again
+refuses its txn and leaves `leader` alone, and the keepalive loop of an old
+lease ends quietly once a newer term exists. Either used to step the new term
+down while its own key stayed alive, and then the process never ran for leader
+again (the election CAS found its key; it waited for a deletion that never
+came). `tests/leader_step_down_stale_term.rs` (failpoint
+`DIAGNOSE_FENCE_TEST_HOLD`; ablations red: no term check in the diagnosis; no
+term check in the keepalive loop nor in `step_down_from` — each of those two
+alone is enough there, the loop's also stops renewing a lease nobody uses).
+
 The win seeds `EtcdMirror::fence_rev` with the election txn's commit revision —
 the leader key's `mod_revision` — and the lease id. Every fenced txn compares
 that revision, not the key's value (see "Leader fence on every etcd write"):

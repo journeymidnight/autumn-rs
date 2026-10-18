@@ -1,3 +1,10 @@
+Date: 2026-10-18 (5)
+TaskStatus: completed
+Task scope: user — BUG-FENCE-LATE-DIAGNOSIS-STEPS-DOWN-NEW-TERM (continue).
+Current summary: reproduced two ways in `tests/leader_step_down_stale_term.rs`: (A) a fence diagnosis read the leader key gone, was held (failpoint `DIAGNOSE_FENCE_TEST_HOLD`) until this process won the key again, then stepped the new term down; (B) the key was deleted with its lease kept, the manager stepped down and won under a new lease, the old lease's keepalive loop ran on and, when the old lease was revoked, stepped the new term down. In both the process never ran for leader again (election CAS finds its own live key, waits for a deletion). Fix: the term (leader lease) is threaded into `diagnose_fence` (via fenced_txn / bump_fence / read_back), which refuses its txn without touching the flags once the term changed; the keepalive loop ends quietly once a newer term exists and every step-down goes through `step_down_from(lease_id)`, which acts only for the current term. Ablations red: (A) no diagnosis term check; (B) no term check in the loop nor in step_down_from (each alone suffices for B). Green: `cargo test --no-fail-fast -p autumn-manager --features fuse-tests` (161 targets) + ignored etcd tests (35 targets, `apply_done_atomicity` excluded: stale on HEAD). Review (fable): no high; test hygiene (failpoint reset per test, assert W not granted) applied.
+Main gaps: `apply_done_atomicity` (ignored) fails on HEAD with `EC target: node 1 is Fence` (stale harness, not filed).
+Next steps: none queued from this line of work; pick from feature_list.md.
+
 Date: 2026-10-18 (4)
 TaskStatus: completed
 Task scope: user — BUG-FENCE-SAME-PROCESS-REELECTION.

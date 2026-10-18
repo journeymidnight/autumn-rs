@@ -1,6 +1,6 @@
 # autumn-rs feature list — OPEN backlog
 
-**Last updated:** 2026-10-18 (BUG-FENCE-SAME-PROCESS-REELECTION reproduced with a fenced-txn hold failpoint, fixed and removed: a fenced txn is refused once its process leads a later term, and the lease acquire rollback skips a term change; BUG-FENCE-LATE-DIAGNOSIS-STEPS-DOWN-NEW-TERM filed from the review)
+**Last updated:** 2026-10-18 (BUG-FENCE-LATE-DIAGNOSIS-STEPS-DOWN-NEW-TERM reproduced (a late fence diagnosis, and the old leader lease's keepalive failing later), fixed and removed: only the current term steps the process down)
 
 **Rules:**
 - This file tracks the **OPEN backlog only**. A feature that reaches `passes: true`
@@ -13,12 +13,6 @@
 ---
 
 ## Active
-
-### BUG-FENCE-LATE-DIAGNOSIS-STEPS-DOWN-NEW-TERM — 迟到的 fence 诊断可能把同一进程的新一任降级（推断，未复现）
-- **Trigger** (2026-10-18 同进程重新当选修复的 fable 评审): `diagnose_fence` 发现 leader 键不在时置 `leader = false`。若这次 GET 在旧 lease 被撤销后发出、却在本进程新一任 `set_leader(true)` 之后才得到回答，新一任会被无端降级；新的 keepalive 循环不看 `leader`、继续续着自己的键，选举循环的 `watch_key_until_delete` 等不到删除，可能一直不再当选。需要那次 GET 的回答晚于 lease 申请、选举 CAS 和 replay。
-- **Scope**: 先复现（在 `diagnose_fence` 的 GET 前后挂暂停点，期间撤销 leader lease 让本进程重新当选）。坐实后让 `diagnose_fence` 只在其所属的那一任里改 `leader` / `displaced`。
-- **Acceptance**: 复现用例修复前新一任被降级且不再当选、修复后保持 leader；消融变红。
-- `passes: false`
 
 ### BUG-LEASE-HEARTBEAT-STALE-NOTHELD — 心跳快照期间重新 acquire 的 lease 会被迟到的 NotHeld 删掉（推断，未复现）
 - **Trigger** (2026-10-17 fuse_lease_loss 修复的 opus 评审): `lease_tasks.rs` 心跳循环先快照 `held_leases` 的 ino 再逐个 await 心跳 RPC；期间最后一次 release + 新 Open 可以重新 acquire 同一 ino，迟到的 `NotHeld` 把新条目删掉（现在还会多做一次失效）：后续写 EIO "no lease"，manager 那份新 lease 漏到 TTL 过期。
