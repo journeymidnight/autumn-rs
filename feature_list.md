@@ -1,6 +1,6 @@
 # autumn-rs feature list — OPEN backlog
 
-**Last updated:** 2026-10-18 (BUG-MAINT-LOOP-STARVED-BY-MINORS: the two-partition experiment measured a bounded wait — notes added, entry kept open for the unmeasured sustained-contention case)
+**Last updated:** 2026-10-18 (BUG-MAINT-LOOP-STARVED-BY-MINORS closed by the user: the two-partition experiment measured a bounded wait — 53-57 s behind a 60 s held major vs 0.3-3 s without; the unmeasured sustained-contention case only delays a head-extent reclaim, which a major also performs)
 
 **Rules:**
 - This file tracks the **OPEN backlog only**. A feature that reaches `passes: true`
@@ -13,15 +13,6 @@
 ---
 
 ## Active
-
-### BUG-MAINT-LOOP-STARVED-BY-MINORS — 持续写入时回收探测 / 下发的 GC 可能一直排不上（推断，未复现）
-- **Trigger** (2026-10-10 minor compaction 重设计的 fable 评审): `background_maintenance_loop` 的 tick 只在 `select_minor` 找不到窗口时才派回收探测（`spawn_reclaim_probe`）。推断：高写入 PS 上 minor 排在 PS 级 compact permit 后面，tick 时总有窗口，探测永远不跑，被老大表钉住的 row stream 前缀一直截不掉。
-- **Scope**: 先复现（PS 级 permit 被别的分区占满 + 本分区持续 flush，观察 `minor_compaction_runs().2` 与头部 extent）。坐实后让探测按自己的节奏跑、与 count 窗口无关。
-- **Acceptance**: 复现用例修复前头部 extent 一直不被回收、修复后被回收；消融变红。
-- `passes: false`
-- **notes**: 两种负载未复现：每 300 ms 一次 flush、以及不间断 flush（`system_minor_compaction_triggers::a_mostly_dead_head_extent_is_reclaimed` 的变体），探测都正常跑。改动已撤回。同类推断（opus 评审）：`background_maintenance_loop` 的 select 先轮询 `compact_rx`，flush 快于 minor 时 `GcRecv` / `GcTimeout` 排不上；`a_dispatched_gc_runs_under_steady_flushes`（两个写者不间断 flush 时下发 forcegc）6 s 内即执行，未复现，未改。周期 tick 的同类饿死已复现并修复（tick 到点先走、收到任务不推迟）。
-- **notes** (2026-10-17 第三次分析，未试): 唯一能让每个 tick 都有窗口的形状是 minor 排在 PS 级 compact permit（`ps_major_compact_parallelism`）后面——别的分区一个长 major 占着 permit，本分区小表堆积、`pick_minor` 每次都有窗口、探测被跳过。但 major 一结束 minor 就把窗口消掉、探测照跑：这是"回收推迟 major 的时长"，不是无限饿死。要做实验需要两个分区 + 一个慢 major；没做。
-- **notes** (2026-10-18 实验，`crates/manager/tests/minor_waits_behind_major.rs`): 两分区、PS 级 permit=1、A 的 major 被测试开关停住 60 s、B 每 300 ms flush。占许可期间 B 的维护任务停在等 permit 上，minor、探测、回收都不跑（回收本身也是 minor）；放开后回收在 53–57 s 后发生，对照（不占许可）0.3–3 s。延迟来自"tick 无 minor 窗口才探测"这道门：要等 minor 消化完占许可期间堆的表。这个形状是有界等待。未测：持续争 permit、本分区 minor 永远追不上 flush 的情况，那时窗口可能一直在。
 
 ### BUG-LEASE-DRAIN-DROPS-WRITE-SLOTS — poll 失败 / overflow 的整体 drain 删掉 WRITE slot 并 best-effort release，脏数据之后以 ANON 写出（推断，未复现）
 - **Trigger** (2026-10-17 fuse_lease_loss 第二个用例的修复): NotHeld 已改为把 WRITE slot 留下并置 `revoked`（flush 带原 epoch、被围栏拒），但 `lease_tasks.rs` 的 poll 失败与 overflow 分支仍 `held.clear()` 全部条目并逐个 `lease::release`——manager 不可达时 lease 可能仍在手里，清掉后 `write_lease_for` 退成 ANON，之后的 flush 不带围栏；release 又把 writer slot 主动交出。
