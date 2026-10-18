@@ -1082,6 +1082,17 @@ never fell back to the size rule) and returned nothing for one lone old head
 table followed by any number of small ones; minors stopped for good and the
 only one left was the >32-table trim, which hit the same branch.
 
+Behind another partition's major the probe waits. A minor waiting for the
+PS-wide compaction permit parks this partition's maintenance task, so no tick,
+probe or reclaim runs here meanwhile (the reclaim is a minor and needs the
+permit too). Once the permit is free, the probe still runs only on a tick that
+finds no minor window, which takes until the minors have worked off the tables
+that piled up. Measured with one permit, a 60 s held major and a flush every
+300 ms: nothing during the hold, then the reclaim 53-57 s after it, against
+0.3-3 s with no hold (`crates/manager/tests/minor_waits_behind_major.rs`, an
+experiment). A partition whose minors never catch up with its flushes was not
+measured.
+
 Regressions: `compact_policy::tests` (the lone-head shape picks a window),
 `crates/manager/tests/system_minor_compaction_triggers.rs` (60 quick flushes
 stay under 16 tables — 60 without the flush request; a mostly dead head extent

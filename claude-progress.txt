@@ -1,3 +1,10 @@
+Date: 2026-10-18
+TaskStatus: completed
+Task scope: user — run the experiment for BUG-MAINT-LOOP-STARVED-BY-MINORS (two partitions + a slow major).
+Current summary: `crates/manager/tests/minor_waits_behind_major.rs`: one PS, `major_compact_parallelism=1`, reclaim probe every 5 s; B gets a mostly dead row head extent, sealed only after A's major parks on the test hold (minors paused and drained first, so only A's major can be the parked one); B flushes every 300 ms. During a 60 s hold B ran no minor and no reclaim (its maintenance task waits on the permit; the reclaim is a minor too); after the release the head was reclaimed 53-57 s later after ~175 minors, control without the hold 0.3-3 s (three runs each). The delay is the probe's own gate (it runs only on a tick with no minor window) staying shut until the minors work off the piled-up tables: bounded for this shape. Review (opus) corrected the doc's account of the delay (queued requests collapse into one minor) and the parked-compaction check; both fixed.
+Main gaps: not measured — sustained contention where a partition's minors never catch up with its flushes, so a window may exist at every tick. Entry kept open with the result in its notes; the user decides whether to run that or close it.
+Next steps: user decision on BUG-MAINT-LOOP-STARVED-BY-MINORS; otherwise BUG-LEASE-DRAIN-DROPS-WRITE-SLOTS.
+
 Date: 2026-10-17 (11)
 TaskStatus: completed
 Task scope: user — (1) fix BUG-FUSE-CACHED-META-AFTER-LEASE-LOSS window (c) without a discriminating test (user decision); (2) re-judge BUG-EN-TRUNCATE-GUARD-FAILS-OPEN.
