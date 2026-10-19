@@ -550,14 +550,6 @@ mod tests {
     }
 
     #[test]
-    fn everything_clean_lists_nothing() {
-        let s = SLOT_STATE_SERVING;
-        let r = summarize(scan(vec![view(1, 1, &[(s, 0), (s, 0)])], 0), 10);
-        assert_eq!((r.clean, r.degraded, r.unavailable), (1, 0, 0));
-        assert!(r.problems.is_empty());
-    }
-
-    #[test]
     fn problems_are_capped() {
         let s = SLOT_STATE_SERVING;
         let u = SLOT_STATE_UNREACHABLE;

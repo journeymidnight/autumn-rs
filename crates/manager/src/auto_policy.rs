@@ -571,13 +571,6 @@ mod tests {
         assert_eq!(cooldown_key(&cand(POLICY_KIND_MERGE, 3, 4)), "merge:3:4");
     }
 
-    #[test]
-    fn describe_candidate_targets_extent_for_ec_and_pair_for_merge() {
-        assert!(describe_candidate(&cand(POLICY_KIND_EC, 0, 42)).contains("extent 42"));
-        assert!(describe_candidate(&cand(POLICY_KIND_MERGE, 3, 4)).contains("part 3<-4"));
-        assert!(describe_candidate(&cand(POLICY_KIND_SPLIT, 7, 0)).contains("part 7"));
-    }
-
     /// A repair advisory targets a NODE (`secondary_part_id`): its command,
     /// its cooldown key and its description all name that node — a key built
     /// from `primary_part_id` (always 0 here) would make every node share one

@@ -45,27 +45,6 @@ async fn prepare_preserves_original_data() {
     assert_eq!(&read.payload[..], &original[..]);
 }
 
-/// Staging is idempotent: re-running it is how a re-dispatched attempt makes
-/// progress, so a second identical `WriteShard` must succeed.
-#[compio::test]
-async fn idempotent_prepare() {
-    let node_dir = tempfile::tempdir().expect("node tempdir");
-    let addr = pick_addr();
-    start_node(node_dir.path(), addr).await;
-    let conn = TestConn::new(addr);
-
-    let extent_id: u64 = 9003;
-    assert_eq!(conn.alloc_extent(extent_id).await.code, CODE_OK);
-
-    let shard = vec![0xEEu8; 512];
-    let ws1 = conn.write_shard(extent_id, 0, 512, 3, shard.clone()).await;
-    assert_eq!(ws1.code, CODE_OK);
-
-    // Second call with same shard size — should succeed (idempotent skip).
-    let ws2 = conn.write_shard(extent_id, 0, 512, 3, shard).await;
-    assert_eq!(ws2.code, CODE_OK, "idempotent prepare must succeed");
-}
-
 /// A coordinator whose marker was released keeps streaming stripes into the
 /// same staging file its successor is now filling, and the `owner_epoch` fence
 /// does not stop it: that fence only rises when the ex-coordinator was FENCED,

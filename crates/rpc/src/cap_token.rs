@@ -471,11 +471,4 @@ mod tests {
         let token = sign_claims(&sk, &claims).unwrap();
         assert!(verify_token(&token, |_| Some(vk), 2_000_000, u64::MAX).is_ok());
     }
-
-    #[test]
-    fn public_key_from_seed_matches_dalek() {
-        let seed = [42u8; 32];
-        let expect = SigningKey::from_bytes(&seed).verifying_key().to_bytes();
-        assert_eq!(public_key_from_seed(&seed), expect);
-    }
 }

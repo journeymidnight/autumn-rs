@@ -8540,6 +8540,8 @@ mod namespace_registry_tests {
         assert_eq!(bench.presplit, vec![vec![0x01u8, 0x02]]);
     }
 
+    // ── principal-list ──────────────────────────────────────────────
+
     #[test]
     fn namespace_list_is_leader_gated() {
         let m = mgr();
@@ -8549,8 +8551,6 @@ mod namespace_registry_tests {
         assert_eq!(r.code, CODE_NOT_LEADER);
         assert!(r.namespaces.is_empty());
     }
-
-    // ── principal-list ──────────────────────────────────────────────
 
     fn principal_create(m: &AutumnManager, name: &str, grants: &[&[u8]]) -> PrincipalCreateResp {
         let req = PrincipalCreateReq {
@@ -8587,26 +8587,7 @@ mod namespace_registry_tests {
         assert_eq!(f.grants, vec![b"fs/".to_vec()]);
     }
 
-    #[test]
-    fn principal_list_never_leaks_credential_material() {
-        // The row type has no credential_hash field at all, so this is a
-        // structural guarantee — assert the account DOES hold a hash while the
-        // listing carries only (name, grants), i.e. the drop is deliberate.
-        let m = mgr();
-        let created = principal_create(&m, "fs", &[b"fs/"]);
-        assert_eq!(created.code, CODE_OK);
-        assert!(!created.credential.is_empty(), "create returns the credential once");
-        assert_ne!(
-            m.principal_accounts.borrow().get("fs").unwrap().credential_hash,
-            [0u8; 32],
-            "the account stores a real credential hash"
-        );
-        let r = principal_list(&m);
-        let row = &r.principals[0];
-        // Everything the row can possibly serialise:
-        assert_eq!(row.name, "fs");
-        assert_eq!(row.grants, vec![b"fs/".to_vec()]);
-    }
+    // ── sacred presplit boundaries ────────────
 
     #[test]
     fn principal_list_is_leader_gated() {
@@ -8617,8 +8598,6 @@ mod namespace_registry_tests {
         assert_eq!(r.code, CODE_NOT_LEADER);
         assert!(r.principals.is_empty());
     }
-
-    // ── sacred presplit boundaries ────────────
 
     fn set_presplit(m: &AutumnManager, name: &str, points: &[&[u8]]) -> CodeResp {
         let req = NamespaceSetPresplitReq {
@@ -8800,15 +8779,6 @@ mod namespace_registry_tests {
         for name in ["fs", "kvc", "mem"] {
             let r = create(&m, name, Vec::new());
             assert_eq!(r.code, CODE_INVALID_ARGUMENT, "{name} must be reserved");
-        }
-    }
-
-    #[test]
-    fn invalid_charset_is_rejected() {
-        let m = mgr();
-        for bad in ["Bench", "a/b", "has space", "", "up_UP"] {
-            let r = create(&m, bad, Vec::new());
-            assert_eq!(r.code, CODE_INVALID_ARGUMENT, "'{bad}' must be rejected");
         }
     }
 

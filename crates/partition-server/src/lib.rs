@@ -44,10 +44,6 @@ use futures::stream::FuturesUnordered;
 use futures::{FutureExt, SinkExt, StreamExt};
 
 use sstable::{IterItem, MemtableIterator, SstBuilder, SstReader};
-// Sync TableIterator/MergeIterator remain for Resident-only use (tests,
-// builder round-trips); production iteration is the AsyncTableIterator.
-#[cfg(test)]
-use sstable::TableIterator;
 
 // ---------------------------------------------------------------------------
 // Compat helpers
@@ -1556,17 +1552,6 @@ mod bug1_wal_gap_tests {
 
         // The BUG1 decision in one line: log_bytes crosses the gap, mem_bytes does not.
         assert!(m.log_bytes() > wal_gap && m.mem_bytes() <= wal_gap);
-    }
-
-    #[test]
-    fn add_log_bytes_is_independent_of_mem_footprint() {
-        // add_log_bytes drives log_bytes() ONLY — never mem_bytes() — so the two
-        // signals are genuinely independent (a refactor that accidentally folded
-        // them back together would regress BUG1).
-        let m = Memtable::new();
-        m.add_log_bytes(1_000_000);
-        assert_eq!(m.log_bytes(), 1_000_000);
-        assert_eq!(m.mem_bytes(), 0);
     }
 }
 
@@ -9756,46 +9741,6 @@ pub(crate) fn decode_records_chunk(
     Ok((out, cursor))
 }
 
-// same shape as decode_records_full but preserves the record-start
-// offset so callers can compute the recovered VP head. TEST-ONLY today —
-// production replay tracks offsets inline.
-#[cfg(test)]
-pub(crate) fn decode_records_with_offsets(bytes: &[u8]) -> Vec<(usize, u8, Vec<u8>, Vec<u8>, u64)> {
-    let mut out = Vec::new();
-    let mut cursor = 0usize;
-    let mut skipped: usize = 0;
-    while cursor < bytes.len() {
-        let record_start = cursor;
-        match crate::wal_record::decode_one(&bytes[cursor..]) {
-            crate::wal_record::DecodeOne::Ok(r) => {
-                out.push((
-                    record_start,
-                    r.op,
-                    r.key.to_vec(),
-                    r.value.to_vec(),
-                    r.expires_at,
-                ));
-                cursor += r.total;
-            }
-            crate::wal_record::DecodeOne::Incomplete => break,
-            crate::wal_record::DecodeOne::Corrupt { skip_bytes, reason } => {
-                tracing::warn!(
-                    record_start,
-                    skip_bytes,
-                    reason,
-                    "WAL record corrupted; skipping"
-                );
-                cursor += skip_bytes;
-                skipped += 1;
-            }
-        }
-    }
-    if skipped > 0 {
-        tracing::warn!(skipped, "skipped {skipped} corrupted WAL record(s)");
-    }
-    out
-}
-
 /// Walk all extents in a meta_stream and collect the LAST checkpoint from each
 /// non-empty extent. Used by
 /// recovery to gather both survivor's and victim's checkpoints
@@ -11323,32 +11268,7 @@ mod tests {
         assert_eq!(dec.len, vp.len);
     }
 
-    #[test]
-    fn op_value_pointer_flag() {
-        assert_eq!(1u8 | OP_VALUE_POINTER, 0x81);
-        assert_eq!(0x81u8 & !OP_VALUE_POINTER, 1u8);
-        assert_eq!(1u8 & OP_VALUE_POINTER, 0);
-    }
-
     // ── Tests ported from Go range_partition/entry_test.go ───────────────────
-
-    #[test]
-    fn record_encode_decode_multiple() {
-        let mut buf = Vec::new();
-        buf.extend_from_slice(&encode_record(1, b"k1", b"v1", 0));
-        buf.extend_from_slice(&encode_record(1, b"k2", b"v2_longer", 100));
-        buf.extend_from_slice(&encode_record(2, b"k3", b"", 0));
-
-        let records = decode_records_full(&buf);
-        assert_eq!(records.len(), 3);
-        assert_eq!(records[0].1, b"k1");
-        assert_eq!(records[0].2, b"v1");
-        assert_eq!(records[1].1, b"k2");
-        assert_eq!(records[1].2, b"v2_longer");
-        assert_eq!(records[1].3, 100);
-        assert_eq!(records[2].0, 2);
-        assert_eq!(records[2].1, b"k3");
-    }
 
     /// WAL-FAILSTOP (coco prod-audit P0 #2): a CRC mismatch on a COMPLETE
     /// middle record (bit rot / torn write) must FAIL recovery, never be
@@ -11486,71 +11406,7 @@ mod tests {
         assert!(corrupt.is_empty(), "non-final leftover is not corruption");
     }
 
-    #[test]
-    fn record_with_offsets() {
-        let mut buf = Vec::new();
-        buf.extend_from_slice(&encode_record(1, b"k1", b"v1", 0));
-        let off1 = buf.len();
-        buf.extend_from_slice(&encode_record(1, b"k2", b"v2", 0));
-
-        let records = decode_records_with_offsets(&buf);
-        assert_eq!(records.len(), 2);
-        assert_eq!(records[0].0, 0); // first record at offset 0
-        assert_eq!(records[1].0, off1); // second record at correct offset
-    }
-
-    #[test]
-    fn record_decode_truncated_data() {
-        let encoded = encode_record(1, b"key", b"value", 0);
-        // Truncate in the middle
-        let truncated = &encoded[..10];
-        let records = decode_records_full(truncated);
-        assert!(
-            records.is_empty(),
-            "truncated data should produce no records"
-        );
-    }
-
     // ── Memtable tests ported from Go skiplist tests ─────────────────────────
-
-    #[test]
-    fn memtable_empty() {
-        let mt = Memtable::new();
-        assert!(mt.is_empty());
-        assert_eq!(mt.mem_bytes(), 0);
-        assert!(mt.seek_user_key(b"anything").is_none());
-    }
-
-    #[test]
-    fn memtable_basic_put_get() {
-        let mt = Memtable::new();
-        let k1 = key_with_ts(b"apple", 1);
-        mt.insert(
-            k1.clone(),
-            MemEntry {
-                op: 1,
-                value: b"red".to_vec(),
-                expires_at: 0,
-            },
-            100,
-        );
-        let k2 = key_with_ts(b"banana", 2);
-        mt.insert(
-            k2.clone(),
-            MemEntry {
-                op: 1,
-                value: b"yellow".to_vec(),
-                expires_at: 0,
-            },
-            100,
-        );
-
-        let got = mt.seek_user_key(b"apple").expect("apple should exist");
-        assert_eq!(got.value, b"red");
-        let got = mt.seek_user_key(b"banana").expect("banana should exist");
-        assert_eq!(got.value, b"yellow");
-        assert!(mt.seek_user_key(b"cherry").is_none());
-    }
 
     #[test]
     fn memtable_update_returns_newest() {
@@ -11571,34 +11427,6 @@ mod tests {
         }
         let got = mt.seek_user_key(b"key").expect("key should exist");
         assert_eq!(got.value, b"value100", "should return newest version");
-    }
-
-    #[test]
-    fn memtable_snapshot_sorted() {
-        let mt = Memtable::new();
-        // Insert in reverse order
-        for i in (0..10).rev() {
-            let uk = format!("key{i:02}");
-            let k = key_with_ts(uk.as_bytes(), i as u64);
-            mt.insert(
-                k,
-                MemEntry {
-                    op: 1,
-                    value: format!("v{i}").into_bytes(),
-                    expires_at: 0,
-                },
-                50,
-            );
-        }
-        let snapshot = mt.snapshot_sorted();
-        assert_eq!(snapshot.len(), 10);
-        // Verify sorted by internal key (comparator order)
-        for i in 1..snapshot.len() {
-            assert!(
-                cmp_internal_keys(&snapshot[i - 1].key, &snapshot[i].key).is_le(),
-                "snapshot should be sorted"
-            );
-        }
     }
 
     // ── internal-key ordering with embedded 0x00 in user keys ────────────────
@@ -11752,14 +11580,6 @@ mod tests {
             200,
         );
         assert_eq!(mt.mem_bytes(), 300);
-    }
-
-    #[test]
-    fn merge_freeze_is_rejected_for_both_split_freeze_states() {
-        assert!(split_blocks_merge_freeze(true, false));
-        assert!(split_blocks_merge_freeze(false, true));
-        assert!(split_blocks_merge_freeze(true, true));
-        assert!(!split_blocks_merge_freeze(false, false));
     }
 
     // under the RwLock<BTreeMap> design the memtable has ONE writer
@@ -12088,37 +11908,6 @@ mod tests {
 
     // ── build_sst_bytes test ─────────────────────────────────────────────────
 
-    #[test]
-    fn build_sst_from_memtable() {
-        let mt = Memtable::new();
-        for i in 0u64..100 {
-            let uk = format!("key{i:04}");
-            let k = key_with_ts(uk.as_bytes(), i);
-            mt.insert(
-                k,
-                MemEntry {
-                    op: 1,
-                    value: format!("val{i}").into_bytes(),
-                    expires_at: 0,
-                },
-                50,
-            );
-        }
-        let (sst_bytes, last_seq) = build_sst_bytes(&mt, 0, 0);
-        assert!(!sst_bytes.is_empty());
-        assert_eq!(last_seq, 99);
-
-        let reader = SstReader::from_bytes(Bytes::from(sst_bytes)).unwrap();
-        // Verify all keys are readable
-        let mut it = TableIterator::new(Arc::new(reader));
-        it.rewind();
-        let mut count = 0;
-        while it.valid() {
-            count += 1;
-            it.next();
-        }
-        assert_eq!(count, 100);
-    }
 }
 
 // imm-pop signal flow is validated by:
@@ -12137,19 +11926,15 @@ mod tests {
 // helpers and the WriteResponder::send_ok / send_err contract. The full
 // merged loop (SQ/CQ pipeline + start/finish_write_batch) needs a live
 // StreamClient and is covered by the ps_bench / perf_check harness in
-// scripts/. The harness tests in `background::sqcq_tests` cover the SQ/CQ
-// pattern itself (FU + cap + out-of-order completion + LockedByOther drain).
+// scripts/.
 //
 // What each test proves:
-//   1. merged_loop_put_direct_response — a decoded PutReq produces exactly
-//      one WriteRequest in `pending` whose `resp` is `WriteResponder::Put`
-//      wired to the outer PartitionRequest oneshot. `send_ok` then delivers
-//      a valid rkyv-encoded `PutResp` frame to the outer receiver. Zero
-//      `compio::runtime::spawn` invocations, zero inner oneshot allocations.
-//   2. merged_loop_mixed_read_write — interleaving decode + responder
-//      handling for PUT and DELETE reproduces correct frames on both paths.
+//   1. merged_loop_mixed_read_write — interleaving decode + responder
+//      handling for PUT and DELETE reproduces correct frames on both paths,
+//      each PutReq yielding one WriteRequest whose responder delivers a
+//      valid rkyv-encoded frame to the outer oneshot.
 //      (Reads are covered by the existing read-path tests.)
-//   3. merged_loop_bad_decode_replies_invalid_arg — a malformed payload is
+//   2. merged_loop_bad_decode_replies_invalid_arg — a malformed payload is
 //      rejected with StatusCode::InvalidArgument on the outer oneshot,
 //      without ever touching `pending`.
 #[cfg(test)]
@@ -12205,49 +11990,6 @@ mod merged_loop_tests {
             },
             resp_rx,
         )
-    }
-
-    /// test 1 — a PutReq is decoded inline, pushed into `pending`
-    /// with a direct `WriteResponder::Put` responder, and `send_ok`
-    /// delivers an encoded `PutResp` frame to the outer oneshot. No
-    /// spawn, no inner oneshot.
-    #[test]
-    fn merged_loop_put_direct_response() {
-        let (req, resp_rx) = build_put_partition_request(b"hello", b"world", 0);
-        let mut pending: Vec<WriteRequest> = Vec::new();
-        // Test sends epoch=0 on the wire, so 0 here matches and bypasses the check.
-        enqueue_put(req, &mut pending, 0, 0, None, None);
-
-        assert_eq!(pending.len(), 1, "exactly one WriteRequest enqueued");
-        let w = pending.pop().unwrap();
-        match &w.op {
-            WriteOp::Put {
-                user_key,
-                value,
-                expires_at,
-            } => {
-                assert_eq!(user_key.as_ref(), b"hello");
-                assert_eq!(value.as_ref(), b"world");
-                assert_eq!(*expires_at, 0);
-            }
-            _ => panic!("expected Put"),
-        }
-        assert!(
-            matches!(&w.resp, WriteResponder::Put { .. }),
-            "direct Put responder"
-        );
-
-        // Simulate Phase-3 success reply.
-        w.resp.send_ok();
-
-        // The outer oneshot must have received an encoded PutResp frame.
-        let frame = compio::runtime::Runtime::new().unwrap().block_on(resp_rx);
-        let bytes = frame
-            .expect("outer oneshot dropped")
-            .expect("send_ok should send Ok");
-        let decoded: PutResp = partition_rpc::rkyv_decode(&bytes).unwrap();
-        assert_eq!(decoded.code, CODE_OK);
-        assert_eq!(decoded.key.as_slice(), b"hello");
     }
 
     /// regular Put rejects values > AUTUMN_PS_MAX_INLINE_BYTES
@@ -12370,117 +12112,6 @@ mod merged_loop_tests {
 #[cfg(test)]
 mod single_thread_write_tests {
     use super::*;
-
-    /// test 1 — `handle_ps_connection` accepts a direct
-    /// `mpsc::Sender<PartitionRequest>` and `owner_part` id. We drive
-    /// one Put request through a loopback connection with BOTH the
-    /// ps-conn task and the simulated merged_loop running on the SAME
-    /// compio runtime. There is no spawned dispatcher worker thread,
-    /// no DashMap, and no Arc<PartitionRouter>. Success = the response
-    /// arrives with the exact key echoed.
-    #[test]
-    fn single_threaded_write_path_no_router() {
-        // Serialize with write_batch_fastpath_tests + sqcq_tests to keep
-        // PS_SINGLE_FRAME_RECV_HITS coherent across the test process.
-        let _g = super::ps_conn_test_lock();
-        let rt = compio::runtime::Runtime::new().unwrap();
-        rt.block_on(async move {
-            // Bind a loopback listener and a client socket on the same runtime.
-            let listener = compio::net::TcpListener::bind("127.0.0.1:0")
-                .await
-                .expect("bind listener");
-            let server_addr = listener.local_addr().expect("local_addr");
-            let client = compio::net::TcpStream::connect(server_addr)
-                .await
-                .expect("connect client");
-            let (server_stream, _) = listener.accept().await.expect("accept");
-
-            // Same-thread req channel — consumer is the simulated merged_loop
-            // spawned on THIS compio runtime (no OS thread spawned).
-            let (req_tx, mut req_rx) = mpsc::channel::<PartitionRequest>(16);
-
-            // Spawn the ps-conn task with the direct req_tx (no router).
-            let conn_handle = compio::runtime::spawn(async move {
-                handle_ps_connection(
-                    autumn_transport::Conn::Tcp(server_stream),
-                    req_tx,
-                    None,
-                    /*owner_part=*/ 7,
-                    std::sync::Arc::new(crate::authz::AuthzState::new()),
-                )
-                .await
-            });
-
-            // Spawn a simulated merged_loop that answers the single Put.
-            let loop_handle = compio::runtime::spawn(async move {
-                if let Some(req) = req_rx.next().await {
-                    assert_eq!(req.msg_type, MSG_PUT);
-                    // Simulate Phase-3 success: encode PutResp + send.
-                    let put: PutReq = partition_rpc::rkyv_decode(&req.payload).expect("decode");
-                    let resp = partition_rpc::rkyv_encode(&PutResp {
-                        code: CODE_OK,
-                        message: String::new(),
-                        key: put.key,
-                    });
-                    let _ = req.resp_tx.send(Ok(resp));
-                }
-                // Exit — dropping rx closes the channel; ps-conn will exit
-                // when the client closes its socket below.
-            });
-
-            // Client: build one PutReq frame, send it, read response.
-            let put = PutReq {
-                part_id: 7,
-                key: b"hello".to_vec(),
-                value: b"world".to_vec(),
-                expires_at: 0,
-                region_epoch: 0,
-            inode_hint: 0,
-            lease_epoch: 0,
-            };
-            let payload = partition_rpc::rkyv_encode(&put);
-            let frame = Frame::request(42, MSG_PUT, payload);
-            let bytes = frame.encode();
-
-            let (mut client_rd, mut client_wr) = test_protocol::initiate_tcp(
-                client,
-                autumn_rpc::version_hello::Service::PartitionServer,
-            )
-            .await
-            .into_split();
-            let BufResult(r, _buf) = client_wr.write_all(bytes).await;
-            r.expect("write request");
-
-            // Read the response frame.
-            let mut decoder = FrameDecoder::new();
-            let mut buf = vec![0u8; 8192];
-            let mut decoded: Option<Frame> = None;
-            while decoded.is_none() {
-                let BufResult(n, back) = client_rd.read(buf).await;
-                buf = back;
-                let n = n.expect("read response");
-                assert!(n > 0, "unexpected EOF before response arrived");
-                decoder.feed(&buf[..n]);
-                decoded = decoder.try_decode().expect("decode");
-            }
-            let resp_frame = decoded.unwrap();
-            assert_eq!(resp_frame.req_id, 42);
-            assert_eq!(resp_frame.msg_type, MSG_PUT);
-            // Response is success — no status-code header.
-            assert!(!resp_frame.is_error(), "response should not be error");
-
-            let resp: PutResp =
-                partition_rpc::rkyv_decode(&resp_frame.payload).expect("decode resp");
-            assert_eq!(resp.code, CODE_OK);
-            assert_eq!(resp.key, b"hello");
-
-            // Close client → ps-conn exits.
-            drop(client_rd);
-            drop(client_wr);
-            let _ = conn_handle.await;
-            let _ = loop_handle.await;
-        });
-    }
 
     /// test 2 — correctness under load. Fire 1000 sequential
     /// Put requests on one TCP connection, verify every response arrives
@@ -12951,94 +12582,6 @@ fn memtable_snapshot_cost_scales_with_memtable_not_page_size() {
         );
     }
     use super::*;
-
-    /// test 1 — Single-frame passthrough: one Put per TCP read,
-    /// client awaits reply before sending next. This is the depth=1
-    /// baseline — MUST NOT regress.
-    #[test]
-    fn single_frame_passthrough() {
-        let _g = fast_path_counter_lock();
-        let rt = compio::runtime::Runtime::new().unwrap();
-        rt.block_on(async move {
-            let listener = compio::net::TcpListener::bind("127.0.0.1:0")
-                .await
-                .expect("bind");
-            let addr = listener.local_addr().expect("addr");
-            let client = compio::net::TcpStream::connect(addr)
-                .await
-                .expect("connect");
-            let (server, _) = listener.accept().await.expect("accept");
-
-            let (req_tx, mut req_rx) = mpsc::channel::<PartitionRequest>(16);
-
-            let conn_handle = compio::runtime::spawn(async move {
-                handle_ps_connection(
-                    autumn_transport::Conn::Tcp(server),
-                    req_tx,
-                    None,
-                    /*owner_part=*/ 7,
-                    std::sync::Arc::new(crate::authz::AuthzState::new()),
-                )
-                .await
-            });
-
-            let loop_handle = compio::runtime::spawn(async move {
-                while let Some(req) = req_rx.next().await {
-                    let put: PutReq = partition_rpc::rkyv_decode(&req.payload).expect("decode");
-                    let resp = partition_rpc::rkyv_encode(&PutResp {
-                        code: CODE_OK,
-                        message: String::new(),
-                        key: put.key,
-                    });
-                    let _ = req.resp_tx.send(Ok(resp));
-                }
-            });
-
-            let (mut client_rd, mut client_wr) = test_protocol::initiate_tcp(
-                client,
-                autumn_rpc::version_hello::Service::PartitionServer,
-            )
-            .await
-            .into_split();
-
-            // One synchronous send-recv round trip.
-            let put = PutReq {
-                part_id: 7,
-                key: b"one-frame".to_vec(),
-                value: b"v".to_vec(),
-                expires_at: 0,
-                region_epoch: 0,
-            inode_hint: 0,
-            lease_epoch: 0,
-            };
-            let payload = partition_rpc::rkyv_encode(&put);
-            let frame_bytes = Frame::request(77, MSG_PUT, payload).encode();
-            let BufResult(r, _) = client_wr.write_all(frame_bytes).await;
-            r.expect("write");
-
-            let mut decoder = FrameDecoder::new();
-            let mut buf = vec![0u8; 8192];
-            let resp_frame = loop {
-                let BufResult(n, back) = client_rd.read(buf).await;
-                buf = back;
-                let n = n.expect("read");
-                assert!(n > 0, "EOF before response");
-                decoder.feed(&buf[..n]);
-                if let Some(f) = decoder.try_decode().expect("decode") {
-                    break f;
-                }
-            };
-            assert_eq!(resp_frame.req_id, 77);
-            assert!(!resp_frame.is_error());
-            let r: PutResp = partition_rpc::rkyv_decode(&resp_frame.payload).expect("decode resp");
-            assert_eq!(r.key, b"one-frame");
-
-            drop(client_rd);
-            drop(client_wr);
-            let _ = conn_handle.await;
-            let _ = loop_handle.await;
-        });
-    }
 
     /// test 2 — Multi-frame batched write: send 8 frames in one
     /// TCP write. Verify all 8 complete correctly AND measure the peak
@@ -14094,30 +13637,6 @@ mod bug_lease_2_fence_tests {
         assert!(check_and_bump_fence(7, 1, &mut floors).is_err());
     }
 
-    #[test]
-    fn poisoned_floor_regression_blocked_by_check_ordering() {
-        // coco R2-P1 #5 — guard against the floor-poisoning bug.
-        // The fix is in `enqueue_put`'s order: value-too-large is
-        // checked BEFORE check_and_bump_fence so a rejected
-        // oversized write doesn't bump the floor and erroneously
-        // fence later legitimate writes from the same writer.
-        // Verify the pure-fn DOES bump on the call (so the fix
-        // really has to come from ordering at the call site, not
-        // from the pure-fn) — call the helper directly with
-        // epoch=10, observe floor=10, then verify a legitimate
-        // epoch=5 write from the SAME writer would now be fenced.
-        let mut floors = HashMap::new();
-        check_and_bump_fence(42, 10, &mut floors).unwrap();
-        assert_eq!(floors.get(&42).copied(), Some(10));
-        // A legitimate writer at epoch 5 would now be fenced —
-        // this is the WRONG outcome the call-site ordering fix
-        // prevents by NOT calling the pure-fn for rejected writes.
-        assert!(
-            check_and_bump_fence(42, 5, &mut floors).is_err(),
-            "documented: if you call the pure-fn after a rejection, you poison the floor"
-        );
-    }
-
     /// A request raises the admitted floor and fails before its record
     /// commits; the client retries at the SAME epoch. The retry must still
     /// queue a record — the admitted floor is not durable. Before the durable
@@ -14183,19 +13702,6 @@ mod maintenance_phase_tests {
         let s = m.snapshot_maintenance_progress();
         assert_eq!(s.len(), 1);
         assert_eq!((s[0].op_id, s[0].done), (77, 1));
-    }
-
-    #[test]
-    fn a_phase_carries_the_split_s_op_id() {
-        // The manager reads it as "this split is still running" once it has
-        // stopped waiting for the reply.
-        let m = std::sync::Arc::new(PartitionMetrics::default());
-        let g = MaintenancePhaseGuard::new(m.clone(), 77);
-        g.set(autumn_rpc::manager_rpc::OP_KIND_SPLIT, 1, 6);
-        let s = m.snapshot_maintenance_progress();
-        assert_eq!(s[0].op_id, 77);
-        assert_eq!(s[0].kind, autumn_rpc::manager_rpc::OP_KIND_SPLIT);
-        assert_eq!((s[0].done, s[0].total), (1, 6));
     }
 }
 

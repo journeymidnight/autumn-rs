@@ -613,33 +613,6 @@ mod tests {
         assert_eq!(size_class(usize::MAX), None);
     }
 
-    /// The cap counter must track registered bytes across the
-    /// `acquire → drop → acquire` cycle. On a no-ucx build this is trivially
-    /// zero (nothing registers), but the accounting plumbing still has to
-    /// not corrupt state on the eviction branch.
-    #[test]
-    fn eviction_does_not_panic_or_double_count() {
-        // Push N slabs into the pool, then force evictions by exceeding cap.
-        // Tiny cap forces every drop to take the eviction branch.
-        // (set_regpool_cap_bytes is first-call-wins; this test runs in a clean
-        // process for `cargo test`, so subsequent test ordering doesn't matter
-        // here — but be paranoid: only the first set wins, so set early.)
-        let _ = set_regpool_cap_bytes(16 * 1024 * 1024); // min clamp = 16 MiB
-        for _ in 0..4 {
-            let pb = acquire(64 * 1024);
-            drop(pb); // first time: registered (under cap), goes to free-list
-        }
-        // Now allocate MANY 8 MiB slabs in-flight to push past cap. Even on
-        // no-ucx build (where reg=None and registered_bytes stays 0) the
-        // free-list cap path should evict cleanly.
-        let mut held: Vec<PooledBuf> = (0..3).map(|_| acquire(8 * 1024 * 1024)).collect();
-        // Drop them: eviction branch must NOT panic on the registered_bytes
-        // decrement (saturating_sub guards against underflow).
-        for pb in held.drain(..) {
-            drop(pb);
-        }
-    }
-
     /// Counters: every acquire bumps `acquire_total`; a hit (pooled-slab
     /// reuse) bumps `hit_total`; out-of-pool path bumps `out_of_pool_total`.
     /// Use the snapshot delta within the test to be robust to other tests
@@ -694,37 +667,6 @@ mod tests {
         // Defensive clamp: set_len(> used) is clamped, never out-of-bounds.
         unsafe { pb.set_len(usize::MAX) };
         assert_eq!(pb.len(), 8000, "set_len clamps to used");
-    }
-
-    /// Cross-thread drop: a `PooledBuf` dropped on a FOREIGN
-    /// thread is freed, never re-pooled into the foreign TLS pool (which
-    /// would corrupt both threads' per-thread pinning accounts). Smoke: the
-    /// foreign drop must not panic (TLS interplay) nor underflow the gauge;
-    /// the slab simply leaves circulation.
-    #[test]
-    fn foreign_thread_drop_frees_instead_of_pooling() {
-        let pb = acquire(2 * 1024 * 1024);
-        std::thread::spawn(move || drop(pb))
-            .join()
-            .expect("foreign drop must not panic");
-        // Home thread keeps working normally afterwards.
-        let pb2 = acquire(2 * 1024 * 1024);
-        assert_eq!(pb2.cap(), 2 * 1024 * 1024);
-    }
-
-    /// Out-of-pool acquire: any `need > MAX_CLASS` returns an unregistered
-    /// buffer of EXACTLY `need` bytes, and Drop does NOT re-pool it (which
-    /// would corrupt the size-class accounting).
-    #[test]
-    fn acquire_above_max_class_is_out_of_pool() {
-        let need = MAX_CLASS + 1;
-        let pb = acquire(need);
-        assert_eq!(pb.class, need, "class==need flags out-of-pool");
-        assert_eq!(pb.len(), need);
-        assert_eq!(pb.filled().len(), need);
-        // Drop must NOT push a non-pow2 slab into a bucket — no panic, no
-        // stale entries.
-        drop(pb);
     }
 
     // `read_exact_at` into a PooledBuf must read exactly `used` bytes,

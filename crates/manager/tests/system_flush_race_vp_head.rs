@@ -113,7 +113,7 @@ fn flush_must_stamp_rotation_vp_not_claim_cursor() {
         // Crash (NON-graceful): drop the client; a same-id PS takes over via
         // owner-epoch fencing and the old server self-evicts on LockedByOther
         // WITHOUT a graceful flush — so the un-flushed tail is abandoned and must
-        // be rebuilt from the log replay window. Mirrors `system_crash_mid_flush`
+        // be rebuilt from the log replay window. Mirrors `system_ps_recovery`
         // / `system_crash_mid_compact`. We do NOT use
         // `start_partition_server_stoppable`: its graceful drain flushes every
         // imm, which would persist the tail and mask the loss.

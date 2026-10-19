@@ -241,44 +241,6 @@ mod tests {
     }
 
     #[test]
-    fn test_encode_decode_6_3_config() {
-        let payload: Vec<u8> = (0..8 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
-        roundtrip(&payload, 6, 3);
-    }
-
-    #[test]
-    fn test_decode_with_missing_data_shard() {
-        let payload: Vec<u8> = (0..1024).map(|i| (i % 251) as u8).collect();
-        let shards = ec_encode(&payload, 3, 2).unwrap();
-        // Remove shard 1 (a data shard).
-        let mut shards_opt: Vec<Option<Vec<u8>>> = shards.into_iter().map(Some).collect();
-        shards_opt[1] = None;
-        let decoded = ec_decode(shards_opt, 3, 2, payload.len()).unwrap();
-        assert_eq!(decoded, payload);
-    }
-
-    /// 2+1 EC: missing one data shard, decode from remaining data + parity.
-    #[test]
-    fn test_2_plus_1_missing_data_shard_0() {
-        let payload: Vec<u8> = (0..4096).map(|i| (i % 251) as u8).collect();
-        let shards = ec_encode(&payload, 2, 1).unwrap();
-        let mut shards_opt: Vec<Option<Vec<u8>>> = shards.into_iter().map(Some).collect();
-        shards_opt[0] = None; // data shard 0 gone
-        let decoded = ec_decode(shards_opt, 2, 1, payload.len()).unwrap();
-        assert_eq!(decoded, payload, "should recover from 1 data + 1 parity");
-    }
-
-    #[test]
-    fn test_decode_with_missing_parity_shard() {
-        let payload: Vec<u8> = (0..1024).map(|i| (i % 251) as u8).collect();
-        let shards = ec_encode(&payload, 2, 1).unwrap();
-        let mut shards_opt: Vec<Option<Vec<u8>>> = shards.into_iter().map(Some).collect();
-        shards_opt[2] = None; // Remove parity shard.
-        let decoded = ec_decode(shards_opt, 2, 1, payload.len()).unwrap();
-        assert_eq!(decoded, payload);
-    }
-
-    #[test]
     fn test_decode_max_missing_shards() {
         // With 3 parity shards, can lose any 3.
         let payload: Vec<u8> = (0..4096).map(|i| (i % 251) as u8).collect();

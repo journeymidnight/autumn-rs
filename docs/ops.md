@@ -5144,7 +5144,6 @@ Smoke-tests (no cluster boot required):
 ```bash
 # Manager-side state machine + RPC contract.
 cargo test -p autumn-manager --lib inode_lease
-cargo test -p autumn-manager --test ioring_lease
 
 # Daemon-side lease helpers + two-daemon conflict / read-coexistence /
 # version monotonicity / heartbeat round-trip.

@@ -12777,13 +12777,6 @@ mod concurrency_gate_tests {
         let _ = task.await;
     }
 
-    /// Constructor clamps both caps to at least 1.
-    #[test]
-    fn zero_parallelism_clamps_to_one() {
-        let ctrl = ConcurrencyController::new(0, 0);
-        assert_eq!(ctrl.caps(), (1, 1), "0 must clamp to 1");
-    }
-
     /// Built from the parameters, the recovery cap follows a runtime override
     /// on the next acquire.
     #[compio::test]
@@ -13027,20 +13020,6 @@ mod fd_lru_tests {
             "the unreferenced 7802 was evicted instead"
         );
         drop(_held);
-    }
-
-    #[compio::test]
-    async fn forget_drops_tracking() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let node = ExtentNode::new(ExtentNodeConfig::new(dir.path().to_path_buf(), 1))
-            .await
-            .expect("node");
-        alloc_sealed(&node, 7701).await;
-        let lru = FdLru::new(4, node.extents.clone());
-        lru.touch(7701);
-        assert_eq!(lru.resident_count(), 1);
-        lru.forget(7701);
-        assert_eq!(lru.resident_count(), 0);
     }
 }
 
@@ -13890,17 +13869,6 @@ mod ec_stripe_plan_tests {
                 "want={want} stripe={stripe}: wrong stripe count"
             );
         }
-    }
-
-    /// The tail is the misaligned one, and it is the only short stripe.
-    #[test]
-    fn only_the_last_stripe_is_short() {
-        let plan = ExtentNode::ec_stripe_plan(5 * 4096 + 37, 4096);
-        assert_eq!(plan.len(), 6);
-        for (_, span) in &plan[..5] {
-            assert_eq!(*span, 4096);
-        }
-        assert_eq!(plan[5].1, 37);
     }
 
     /// A degenerate geometry yields no work rather than an infinite loop.

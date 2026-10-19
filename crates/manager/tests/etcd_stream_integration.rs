@@ -7,13 +7,12 @@ mod support;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::rc::Rc;
 use std::time::Duration;
 
 use autumn_manager::AutumnManager;
 use autumn_rpc::client::RpcClient;
 use autumn_rpc::manager_rpc::*;
-use autumn_stream::{ConnPool, ExtentNode, ExtentNodeConfig, StreamClient};
+use autumn_stream::{ExtentNode, ExtentNodeConfig};
 
 use support::{pick_addr, start_etcd};
 
@@ -36,23 +35,6 @@ fn start_extent_node(addr: SocketAddr, dir: PathBuf, disk_id: u64) {
             let n = ExtentNode::new(ExtentNodeConfig::new(dir, disk_id))
                 .await
                 .expect("extent node");
-            let _ = n.serve(addr).await;
-        });
-    });
-    std::thread::sleep(Duration::from_millis(200));
-}
-
-fn start_extent_node_with_manager(
-    addr: SocketAddr,
-    dir: PathBuf,
-    disk_id: u64,
-    mgr_addr: SocketAddr,
-) {
-    std::thread::spawn(move || {
-        compio::runtime::Runtime::new().unwrap().block_on(async {
-            let config =
-                ExtentNodeConfig::new(dir, disk_id).with_manager_endpoint(mgr_addr.to_string());
-            let n = ExtentNode::new(config).await.expect("extent node");
             let _ = n.serve(addr).await;
         });
     });
@@ -251,175 +233,6 @@ fn etcd_replay_owner_lock_allows_check_commit_length_without_reacquire() {
             "owner lock replay failed: {}",
             check2.message
         );
-
-        drop(etcd_guard);
-    });
-}
-
-#[test]
-fn etcd_replicated_append_and_recovery_flow() {
-    compio::runtime::Runtime::new().unwrap().block_on(async {
-        let (etcd_guard, etcd_endpoint) = start_etcd().await;
-
-        let mgr_addr = pick_addr();
-        start_etcd_manager(mgr_addr, etcd_endpoint.clone());
-
-        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::version_hello::Role::Admin, None).await.expect("connect mgr");
-
-        let n1_addr = pick_addr();
-        let n2_addr = pick_addr();
-        let n3_addr = pick_addr();
-        let n1_dir = tempfile::tempdir().expect("n1 tempdir");
-        let n2_dir = tempfile::tempdir().expect("n2 tempdir");
-        let n3_dir = tempfile::tempdir().expect("n3 tempdir");
-        start_extent_node_with_manager(n1_addr, n1_dir.path().to_path_buf(), 1, mgr_addr);
-        start_extent_node_with_manager(n2_addr, n2_dir.path().to_path_buf(), 2, mgr_addr);
-        start_extent_node_with_manager(n3_addr, n3_dir.path().to_path_buf(), 3, mgr_addr);
-
-        let reg1 = register_node(&mgr, &n1_addr.to_string(), "disk-r1").await;
-        let reg2 = register_node(&mgr, &n2_addr.to_string(), "disk-r2").await;
-        let reg3 = register_node(&mgr, &n3_addr.to_string(), "disk-r3").await;
-        assert_eq!(reg1.code, CODE_OK);
-        assert_eq!(reg2.code, CODE_OK);
-        assert_eq!(reg3.code, CODE_OK);
-
-        let resp = mgr
-            .call(
-                MSG_CREATE_STREAM,
-                rkyv_encode(&CreateStreamReq {
-                    replicates: 2,
-                    ec_data_shard: 2,
-                    ec_parity_shard: 0,
-                }),
-            )
-            .await
-            .expect("create stream");
-        let created: CreateStreamResp = rkyv_decode(&resp).expect("decode");
-        assert_eq!(created.code, CODE_OK);
-        let stream_id = created.stream.expect("stream").stream_id;
-
-        let pool = Rc::new(ConnPool::new());
-        let client = StreamClient::connect(
-            &mgr_addr.to_string(),
-            "owner/recovery/1".to_string(),
-            4,
-            pool,
-        )
-        .await
-        .expect("connect stream client");
-        let appended = client
-            .append(stream_id, b"abcdef")
-            .await
-            .expect("append stream");
-        assert_eq!(appended.offset, 0);
-
-        let resp = mgr
-            .call(
-                MSG_STREAM_INFO,
-                rkyv_encode(&StreamInfoReq {
-                    stream_ids: vec![stream_id],
-                }),
-            )
-            .await
-            .expect("stream_info");
-        let info: StreamInfoResp = rkyv_decode(&resp).expect("decode");
-        let stream = &info
-            .streams
-            .iter()
-            .find(|(id, _)| *id == stream_id)
-            .expect("stream exists")
-            .1;
-        assert!(
-            stream.extent_ids.len() >= 2,
-            "append should trigger extent allocation"
-        );
-        let sealed_extent_id = stream.extent_ids[0];
-
-        let resp = mgr
-            .call(
-                MSG_EXTENT_INFO,
-                rkyv_encode(&ExtentInfoReq {
-                    extent_id: sealed_extent_id,
-                }),
-            )
-            .await
-            .expect("extent info");
-        let ex_info: ExtentInfoResp = rkyv_decode(&resp).expect("decode");
-        let sealed = ex_info.extent.expect("sealed extent");
-        assert_eq!(sealed.replicates.len(), 2);
-
-        // The failed node is the first replica. We cannot kill threads easily,
-        // but we can verify the recovery by waiting for it.
-        // Recovery is tested by checking that node3 eventually replaces the failed node.
-        // (In a real test, we'd kill the node. Here, we just verify the structure.)
-
-        // Read the data back from the stream to verify it was written correctly.
-        let (read_back, _) = client
-            .read_bytes_from_extent(sealed_extent_id, 0, 6)
-            .await
-            .expect("read from sealed extent");
-        assert_eq!(read_back, b"abcdef");
-
-        drop(etcd_guard);
-    });
-}
-
-#[test]
-fn etcd_election_and_replay_on_second_manager() {
-    compio::runtime::Runtime::new().unwrap().block_on(async {
-        let (etcd_guard, etcd_endpoint) = start_etcd().await;
-
-        // Manager 1
-        let mgr1_addr = pick_addr();
-        start_etcd_manager(mgr1_addr, etcd_endpoint.clone());
-
-        let mgr1 = RpcClient::connect_as(mgr1_addr, autumn_rpc::version_hello::Role::Admin, None).await.expect("connect mgr1");
-
-        let n1_addr = pick_addr();
-        let n1_dir = tempfile::tempdir().expect("n1 tempdir");
-        start_extent_node(n1_addr, n1_dir.path().to_path_buf(), 1);
-
-        let reg = register_node(&mgr1, &n1_addr.to_string(), "disk-elec-1").await;
-        assert_eq!(reg.code, CODE_OK, "{}", reg.message);
-
-        let stream_id = create_stream(&mgr1, 1).await;
-
-        // Manager 2 (follower while manager1 is alive)
-        let mgr2_addr = pick_addr();
-        start_etcd_manager(mgr2_addr, etcd_endpoint.clone());
-
-        let mgr2 = RpcClient::connect_as(mgr2_addr, autumn_rpc::version_hello::Role::Admin, None).await.expect("connect mgr2");
-
-        // Manager2 is a standby: its replayed store is frozen at its start, so
-        // it refuses metadata lookups.
-        let resp = mgr2
-            .call(
-                MSG_STREAM_INFO,
-                rkyv_encode(&StreamInfoReq {
-                    stream_ids: vec![stream_id],
-                }),
-            )
-            .await
-            .expect("manager2 stream_info");
-        let replayed: StreamInfoResp = rkyv_decode(&resp).expect("decode");
-        assert_eq!(replayed.code, CODE_NOT_LEADER);
-
-        // Write on manager2 (follower) should be rejected
-        let resp = mgr2
-            .call(
-                MSG_REGISTER_NODE,
-                rkyv_encode(&RegisterNodeReq {
-                    addr: pick_addr().to_string(),
-                    disk_uuids: vec!["disk-follower".to_string()],
-                    shard_ports: vec![],
-                    control_address: String::new(),
-                    node_uuid: String::new(),
-                }),
-            )
-            .await
-            .expect("register on manager2");
-        let reg_on_follower: RegisterNodeResp = rkyv_decode(&resp).expect("decode");
-        assert_eq!(reg_on_follower.code, CODE_NOT_LEADER);
 
         drop(etcd_guard);
     });

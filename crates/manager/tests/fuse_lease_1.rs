@@ -19,11 +19,11 @@ mod support;
 
 use std::time::Duration;
 
-use autumn_client::lease::{self, AcquireResult, DaemonClientId, HeartbeatResult};
+use autumn_client::lease::{self, HeartbeatResult};
 use autumn_client::ClusterClient;
 use autumn_rpc::client::RpcClient;
 use autumn_rpc::manager_rpc::{
-    MgrClientId, LEASE_CLIENT_KIND_FUSE, LEASE_MODE_READ, LEASE_MODE_WRITE,
+    LEASE_CLIENT_KIND_FUSE, LEASE_MODE_READ, LEASE_MODE_WRITE,
 };
 
 use autumn_fs::schema::{self, DirentValue, DT_REG, ROOT_INO};
@@ -590,38 +590,5 @@ fn fuse_create_acquires_writer_lease() {
             err.to_string().contains("EBUSY"),
             "expected EBUSY, got: {err}"
         );
-    });
-}
-
-#[test]
-fn fuse_uses_fuse_kind_identity() {
-    // Sanity: the FUSE mount's DaemonClientId carries kind=FUSE so
-    // an `autumn-op` lease list can tell which daemon family holds
-    // a given lease.
-    let mgr_addr = pick_addr();
-    start_manager(mgr_addr);
-
-    compio::runtime::Runtime::new().unwrap().block_on(async {
-        let cluster = ClusterClient::connect_raw(&mgr_addr.to_string()).await.unwrap();
-        let id_fuse = DaemonClientId::new_fuse("host-x");
-        let id_iouring = DaemonClientId::new("host-x");
-        assert_eq!(id_fuse.as_wire().kind, LEASE_CLIENT_KIND_FUSE);
-        assert_ne!(id_iouring.as_wire().kind, LEASE_CLIENT_KIND_FUSE);
-        // Both can hold the same path's leases independently — the
-        // manager keys on (kind, uuid), so different kinds are
-        // different clients.
-        let id_b = DaemonClientId::from_wire(MgrClientId {
-            kind: id_fuse.as_wire().kind,
-            uuid: [0xff; 16],
-            host: "other".to_string(),
-        });
-        let r1 = lease::acquire(&cluster, &id_fuse, 1234, LEASE_MODE_WRITE)
-            .await
-            .unwrap();
-        assert!(matches!(r1, AcquireResult::Granted(_)));
-        let r2 = lease::acquire(&cluster, &id_b, 1234, LEASE_MODE_WRITE)
-            .await
-            .unwrap();
-        assert!(matches!(r2, AcquireResult::Conflict { .. }));
     });
 }

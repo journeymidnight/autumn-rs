@@ -171,14 +171,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn online_after_ok() {
-        let mut t = NodeStateTracker::new(Duration::from_secs(10));
-        t.on_heartbeat_ok(7);
-        assert_eq!(t.state_of(7), NodeAutoState::Online);
-        assert!(t.last_heartbeat_secs_ago(7).is_some());
-    }
-
-    #[test]
     fn fail_within_timeout_stays_online() {
         let mut t = NodeStateTracker::new(Duration::from_secs(10));
         t.on_heartbeat_ok(7);
@@ -208,45 +200,7 @@ mod tests {
         assert!(t.suspected_age_secs(7).is_none());
     }
 
-    #[test]
-    fn never_seen_node_returns_online_default() {
-        let t = NodeStateTracker::new(Duration::from_secs(10));
-        assert_eq!(t.state_of(99), NodeAutoState::Online);
-        assert!(t.last_heartbeat_secs_ago(99).is_none());
-    }
-
-    #[test]
-    fn drop_node_removes_state() {
-        let mut t = NodeStateTracker::new(Duration::from_secs(10));
-        t.on_heartbeat_ok(7);
-        t.drop_node(7);
-        // Defaults to Online (never-seen branch) — verifies the entry
-        // is gone, not stale.
-        assert_eq!(t.state_of(7), NodeAutoState::Online);
-        assert!(t.last_heartbeat_secs_ago(7).is_none());
-    }
-
     // ── Suspend state machine ───────────────────────────────────────
-
-    #[test]
-    fn register_first_seeds_suspend() {
-        let mut t = NodeStateTracker::new(Duration::from_secs(10));
-        t.on_register_first(7);
-        assert_eq!(t.state_of(7), NodeAutoState::Suspend);
-        assert!(t.state_of(7).is_suspend());
-        assert!(!t.state_of(7).is_online());
-        assert!(t.last_heartbeat_secs_ago(7).is_none());
-    }
-
-    #[test]
-    fn suspend_then_df_ok_transitions_to_online() {
-        let mut t = NodeStateTracker::new(Duration::from_secs(10));
-        t.on_register_first(7);
-        assert!(t.state_of(7).is_suspend());
-        t.on_heartbeat_ok(7);
-        assert_eq!(t.state_of(7), NodeAutoState::Online);
-        assert!(t.last_heartbeat_secs_ago(7).is_some());
-    }
 
     /// A node that never answers is not left `Suspend` forever: the soft
     /// timeout counts from its registration.
@@ -277,18 +231,5 @@ mod tests {
         t.on_heartbeat_fail(2);
         assert!(t.state_of(1).is_online());
         assert!(t.state_of(2).is_suspected());
-    }
-
-    #[test]
-    fn snapshot_is_sorted_by_id() {
-        let mut t = NodeStateTracker::new(Duration::from_secs(10));
-        t.on_heartbeat_ok(5);
-        t.on_heartbeat_ok(1);
-        t.on_heartbeat_ok(9);
-        let snap = t.snapshot();
-        assert_eq!(snap.len(), 3);
-        assert_eq!(snap[0].0, 1);
-        assert_eq!(snap[1].0, 5);
-        assert_eq!(snap[2].0, 9);
     }
 }

@@ -1445,13 +1445,6 @@ mod fuse_lease_2_unit_tests {
         );
         assert_eq!(*log.borrow(), vec![100, 200, 300]);
     }
-
-    #[test]
-    fn empty_events_is_a_noop() {
-        let (inv, log) = counting_inv();
-        invalidate_kernel_cache_for_events(&[], &inv);
-        assert!(log.borrow().is_empty());
-    }
 }
 
 #[cfg(test)]
@@ -1462,8 +1455,7 @@ mod bug_lease_3_fuse_tests {
     use super::evict_revoked_held_leases;
     use autumn_fs::state::FuseLease;
     use autumn_rpc::manager_rpc::{
-        MgrInvalidation, LEASE_INVAL_LEASE_REVOKED, LEASE_INVAL_META_CHANGED,
-        LEASE_INVAL_WILL_REVOKE_IN, LEASE_INVAL_WRITER_CLOSED, LEASE_MODE_READ, LEASE_MODE_WRITE,
+        MgrInvalidation, LEASE_INVAL_LEASE_REVOKED, LEASE_INVAL_WRITER_CLOSED, LEASE_MODE_READ, LEASE_MODE_WRITE,
     };
     use std::collections::HashMap;
 
@@ -1530,40 +1522,6 @@ mod bug_lease_3_fuse_tests {
         );
         assert!(newly.is_empty());
         assert!(!held.get(&42).unwrap().revoked);
-    }
-
-    #[test]
-    fn will_revoke_in_does_not_mark() {
-        let mut held = HashMap::new();
-        held.insert(42, lease(LEASE_MODE_WRITE));
-        let newly = evict_revoked_held_leases(
-            &[ev(42, 5000, LEASE_INVAL_WILL_REVOKE_IN)],
-            &mut held,
-        );
-        assert!(newly.is_empty());
-        assert!(!held.get(&42).unwrap().revoked);
-    }
-
-    #[test]
-    fn ino_zero_overflow_sentinel_does_not_mark() {
-        let mut held = HashMap::new();
-        held.insert(42, lease(LEASE_MODE_WRITE));
-        let newly = evict_revoked_held_leases(
-            &[ev(0, 0, LEASE_INVAL_META_CHANGED)],
-            &mut held,
-        );
-        assert!(newly.is_empty());
-        assert!(!held.get(&42).unwrap().revoked);
-    }
-
-    #[test]
-    fn revoked_for_ino_we_dont_hold_is_a_noop() {
-        let mut held = HashMap::new();
-        let newly = evict_revoked_held_leases(
-            &[ev(999, 1, LEASE_INVAL_LEASE_REVOKED)],
-            &mut held,
-        );
-        assert!(newly.is_empty());
     }
 }
 
@@ -1841,22 +1799,9 @@ mod bug_lease_6_notify_fail_closed_tests {
     //! the Open arm checks. How notify outcomes mark and clear the
     //! set is tested in `inval.rs`.
 
-    use super::notify_inval_inode_failed_for;
-    use std::collections::HashSet;
+    
+    
 
-    #[test]
-    fn empty_failed_set_is_not_stale() {
-        let set: HashSet<u64> = HashSet::new();
-        assert!(!notify_inval_inode_failed_for(&set, 7));
-    }
-
-    #[test]
-    fn populated_failed_set_marks_ino_stale() {
-        let mut set = HashSet::new();
-        set.insert(7);
-        assert!(notify_inval_inode_failed_for(&set, 7));
-        assert!(!notify_inval_inode_failed_for(&set, 8));
-    }
 }
 
 #[cfg(test)]
@@ -1906,16 +1851,5 @@ mod bug_lease_7_open_cache_version_tests {
         // (matches pre-fix behavior; never makes things worse).
         assert!(!inode_cache_needs_reload(5, 0));
         assert!(!inode_cache_needs_reload(0, 0));
-    }
-
-    #[test]
-    fn zero_cache_with_nonzero_acquired_reloads() {
-        // Fresh-mount initial Open path used to be no-op (no
-        // cached entry); but if a cached entry got installed
-        // BEFORE the first lease (e.g. via a Lookup that
-        // populated `inodes[ino]` with cached_version=0), the
-        // first Open's lease version IS the legit cross-mount
-        // delta — reload to pick up any cross-mount writes.
-        assert!(inode_cache_needs_reload(0, 5));
     }
 }

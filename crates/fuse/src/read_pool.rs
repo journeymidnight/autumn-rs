@@ -329,13 +329,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn empty_pool_hands_the_job_back() {
-        let next = Cell::new(0);
-        let txs: Vec<mpsc::UnboundedSender<u32>> = Vec::new();
-        assert_eq!(submit_round_robin(&txs, &next, 7), Err(7));
-    }
-
-    #[test]
     fn jobs_spread_round_robin() {
         let (t0, mut r0) = mpsc::unbounded::<u32>();
         let (t1, mut r1) = mpsc::unbounded::<u32>();

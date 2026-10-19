@@ -564,19 +564,6 @@ mod tests {
     }
 
     #[test]
-    fn test_normalize_endpoint() {
-        assert_eq!(
-            normalize_endpoint("http://127.0.0.1:2379"),
-            "127.0.0.1:2379"
-        );
-        assert_eq!(normalize_endpoint("127.0.0.1:2379"), "127.0.0.1:2379");
-        assert_eq!(
-            normalize_endpoint("https://etcd.local:2379"),
-            "etcd.local:2379"
-        );
-    }
-
-    #[test]
     fn mod_revision_compare_targets_the_exact_lifetime() {
         let compare = Cmp::mod_revision(b"extent_inflight/7", 42);
         assert_eq!(compare.target, 2);

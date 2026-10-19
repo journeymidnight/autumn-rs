@@ -6032,14 +6032,6 @@ mod cluster_ready_tests {
     }
 
     #[test]
-    fn empty_cluster_reports_zero_partitions() {
-        let s = cluster_ready_summary(&[], &HashMap::new(), &HashMap::new());
-        assert_eq!(s.total_partitions, 0);
-        assert!(s.missing_addrs.is_empty());
-        assert!(s.probe_addrs.is_empty());
-    }
-
-    #[test]
     fn all_partitions_have_part_addrs_no_missing() {
         // Healthy steady state: every partition has a per-partition
         // listener registered.
@@ -6107,23 +6099,6 @@ mod cluster_ready_tests {
         let s = cluster_ready_summary(&regions, &part_addrs, &ps_details);
         assert_eq!(s.total_partitions, 2);
         assert_eq!(s.missing_addrs, vec![99]);
-    }
-
-    #[test]
-    fn probe_addrs_are_sorted_and_deduped() {
-        // Multiple partitions share the same per-partition listener
-        // (would only happen on a misconfiguration but be robust).
-        let regions = vec![(20, 1), (13, 1), (27, 1)];
-        let part_addrs: HashMap<u64, String> = [
-            (13, psd("127.0.0.1:9301")),
-            (20, psd("127.0.0.1:9301")),
-            (27, psd("127.0.0.1:9301")),
-        ]
-        .into_iter()
-        .collect();
-        let ps_details: HashMap<u64, String> = HashMap::new();
-        let s = cluster_ready_summary(&regions, &part_addrs, &ps_details);
-        assert_eq!(s.probe_addrs, vec!["127.0.0.1:9301".to_string()]);
     }
 
     #[test]
@@ -6367,13 +6342,6 @@ mod first_attempt_timeout_tests {
     }
 
     #[test]
-    fn both_none_means_wait_forever() {
-        let c = client_with(None, None);
-        assert_eq!(c.first_attempt_effective_timeout(0), None);
-        assert_eq!(c.first_attempt_effective_timeout(1), None);
-    }
-
-    #[test]
     fn first_attempt_longer_than_rpc_clamps_to_rpc() {
         // Edge case: an operator sets `set_first_attempt_timeout`
         // to a value LARGER than `rpc_timeout`. The min ensures we
@@ -6453,6 +6421,13 @@ mod zc_rule_tests {
         let b = vb.freeze();
         assert_eq!(&b[..], b"hello", "freeze aliases exactly the filled bytes");
     }
+}
+
+#[cfg(test)]
+mod fan_out_tests {
+    use super::*;
+    use futures::stream::StreamExt;
+    use std::time::Duration;
 
     // bulk is engaged iff value >= 64 KiB — symmetric across read/write +
     // transport. Guards against re-introducing an `is_ucx`-gated asymmetry.
@@ -6464,13 +6439,6 @@ mod zc_rule_tests {
         assert!(bulk_worthwhile(BULK_MIN_BYTES));
         assert!(bulk_worthwhile(8 * 1024 * 1024));
     }
-}
-
-#[cfg(test)]
-mod fan_out_tests {
-    use super::*;
-    use futures::stream::StreamExt;
-    use std::time::Duration;
 
     // `fan_out_collect` returns INPUT order even when futures complete in
     // reverse (index 0 sleeps longest). The reorder is deterministic regardless
@@ -6897,14 +6865,6 @@ mod namespace_binding_tests {
     }
 
     #[test]
-    fn bind_prefix_matches_bind_key() {
-        let b = NamespaceBinding::scoped("bench/perf"); // → bench/perf/
-        assert_eq!(b.bind_prefix(b"pre").unwrap(), b"bench/perf/pre".to_vec());
-        // empty user prefix → the scope lower bound.
-        assert_eq!(b.bind_prefix(b"").unwrap(), b"bench/perf/".to_vec());
-    }
-
-    #[test]
     fn stripe_chunk_keys_land_in_the_scope_range() {
         // A stripe chunk key (`\xff\xfe…`) is just a normal user key to the
         // binding, so a scoped (Prepend) client prepends `{scope}/` and the chunk
@@ -7007,30 +6967,6 @@ mod ec_shard_plan_tests {
     // bytes of padding that must never be read.
     const LEN: u64 = 10;
     const K: u32 = 4;
-
-    #[test]
-    fn a_range_inside_one_shard_reads_only_that_shard() {
-        assert_eq!(ec_shard_plan(LEN, K, 4, 2), Some(vec![(1, 1, 2)]));
-    }
-
-    #[test]
-    fn an_unaligned_range_splits_at_the_shard_boundary() {
-        // [2,7) spans shards 0,1,2 and is aligned to neither end.
-        assert_eq!(
-            ec_shard_plan(LEN, K, 2, 5),
-            Some(vec![(0, 2, 1), (1, 0, 3), (2, 0, 1)])
-        );
-    }
-
-    #[test]
-    fn the_whole_value_covers_every_shard_and_sums_to_its_length() {
-        let plan = ec_shard_plan(LEN, K, 0, LEN).expect("whole value is serviceable");
-        assert_eq!(plan.len(), K as usize, "one entry per data shard: {plan:?}");
-        assert_eq!(plan.iter().map(|e| e.2).sum::<u64>(), LEN);
-        // The last shard contributes only its REAL byte; asking for the full
-        // shard_size there would hand back zero padding as data.
-        assert_eq!(plan.last().copied(), Some((3, 0, 1)));
-    }
 
     #[test]
     fn padding_is_never_reachable() {

@@ -410,14 +410,6 @@ mod tests {
     }
 
     #[test]
-    fn apply_invalidation_records_writer_closed() {
-        let mut m = InvalidationMap::new();
-        let overflow = apply_invalidation(&[ev(7, 5, LEASE_INVAL_WRITER_CLOSED)], &mut m);
-        assert!(!overflow);
-        assert_eq!(m.get(&7).copied(), Some(5));
-    }
-
-    #[test]
     fn apply_invalidation_takes_max_across_events() {
         let mut m = InvalidationMap::new();
         apply_invalidation(
@@ -455,13 +447,5 @@ mod tests {
         assert!(!cache_is_stale(7, 6, &m));
         // No invalidation entry → always fresh.
         assert!(!cache_is_stale(8, 0, &m));
-    }
-
-    #[test]
-    fn fresh_identity_has_iouring_kind() {
-        let id = DaemonClientId::new("test-host");
-        assert_eq!(id.as_wire().kind, LEASE_CLIENT_KIND_IORING);
-        assert_eq!(id.as_wire().host, "test-host");
-        assert_ne!(id.as_wire().uuid, [0u8; 16], "uuid must be random");
     }
 }

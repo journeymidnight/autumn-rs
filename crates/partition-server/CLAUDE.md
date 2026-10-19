@@ -681,8 +681,8 @@ Invariants:
   `FetchMode::Window(8MiB)` (do_compact / split unique_user_keys — sequential bulk
   windows BYPASSING the cache, scan-resistant; one RPC per window; peak read memory
   = inputs × one window). The async API returns Result — a block-read error ABORTS
-  the compaction (never silently truncates merge output). Sync
-  TableIterator/MergeIterator remain Resident-only (tests, builder round-trips).
+  the compaction (never silently truncates merge output). The sync
+  TableIterator remains for Resident-only test use (builder round-trips).
 - Diag seq_opt/fullscan report miss on paged readers (diagnostic-only).
 - **A block that fails to decode (its CRC32C, or its structure) is read again
   from the other copies** (`SstReader::reread_block`), on both paths: a cache
@@ -1304,7 +1304,7 @@ needs inputs whose log extents are all already punched; not reproduced.
 ### `do_compact` Logic (streaming)
 ```
   1. Read lock: collect SstReaders for selected tables, newest first by list position
-  2. Create MergeIterator over TableIterators
+  2. Create AsyncMergeIterator over AsyncTableIterators
   3. Streaming merge loop (ONE in-progress SstBuilder + Vec<new_readers>):
        - Dedup: skip if same user_key already seen (newest wins)
        - Range filter: skip keys outside partition range
@@ -2548,10 +2548,11 @@ both.
 ### Iterators
 - `BlockIterator`: scan entries within one decoded block; `seek` via binary search
   over entry offsets.
-- `TableIterator`: spans all blocks; advances to next block when current exhausted.
-- `MergeIterator`: N-way merge of TableIterators; for duplicate internal keys, the
-  lower-index (newer) iterator wins; `next()` advances ALL iterators at the current
-  minimum key.
+- `AsyncTableIterator`: spans all blocks; advances to next block when current
+  exhausted. (A sync `TableIterator` exists for tests only.)
+- `AsyncMergeIterator`: N-way merge of AsyncTableIterators; for duplicate internal
+  keys, the lower-index (newer) iterator wins; `next()` advances ALL iterators at
+  the current minimum key.
 - `MemtableIterator`: a sorted `Vec` of memtable entries; `partition_point` for
   seek. It does NOT own a view of the whole memtable — what it holds is whatever
   the caller collected. The range path deliberately gives it a WINDOW (see
@@ -3139,8 +3140,8 @@ sequence → silent data loss.
   `recover_partition` `Err`s on it instead of discarding.
 
 Trigger is power-loss / bit-rot class (a process kill loses nothing un-fsynced + leaves
-the dirent). Test-only `decode_records_full` / `decode_records_with_offsets` keep the old
-skip (not on any production path).
+the dirent). The test-only `decode_records_full` keeps the old skip (not on any
+production path).
 
 ## Compio 0.19 runtime
 

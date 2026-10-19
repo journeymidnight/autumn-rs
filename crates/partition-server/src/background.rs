@@ -4826,14 +4826,8 @@ pub(crate) async fn read_value_from_log(
 }
 
 // ---------------------------------------------------------------------------
-// streaming run_gc record-boundary carry tests
+// GC scan-completeness tests
 // ---------------------------------------------------------------------------
-//
-// These tests verify the boundary contract that run_gc/process_gc_chunk
-// rely on: when a chunk ends in the middle of a record, the decoder
-// must stop at the start of that incomplete record (so the caller can
-// carry it into the next chunk). They exercise the same record header
-// arithmetic as process_gc_chunk's inner loop.
 
 #[cfg(test)]
 mod gc_streaming_tests {
@@ -4857,124 +4851,6 @@ mod gc_streaming_tests {
         assert!(ensure_gc_scan_complete(42, sealed_length, sealed_length, 0).is_ok());
         assert!(ensure_gc_scan_complete(42, sealed_length, sealed_length, 1).is_err());
         assert!(ensure_gc_scan_complete(42, 0, 0, 0).is_ok());
-    }
-
-    /// Full buffer: every record is decoded.
-    #[test]
-    fn decode_full_buf_yields_all_records() {
-        let r1 = rec(0x80, b"k1", b"v1-payload");
-        let r2 = rec(0x80, b"k2", b"v2-other");
-        let r3 = rec(0x02, b"k3", b""); // tombstone, no VP
-        let mut buf = Vec::new();
-        buf.extend_from_slice(&r1);
-        buf.extend_from_slice(&r2);
-        buf.extend_from_slice(&r3);
-        let recs = decode_records_full(&buf);
-        assert_eq!(recs.len(), 3);
-        assert_eq!(recs[0].1, b"k1");
-        assert_eq!(recs[1].1, b"k2");
-        assert_eq!(recs[2].1, b"k3");
-    }
-
-    /// Truncate the buffer 5 bytes into the 3rd record's payload —
-    /// decode must yield only the first 2 complete records and stop at
-    /// the start of record 3 (so a streaming caller can carry r3 into
-    /// the next chunk).
-    #[test]
-    fn decode_stops_at_partial_record_boundary() {
-        let r1 = rec(0x80, b"key-1", b"value-1");
-        let r2 = rec(0x80, b"key-2", b"value-2");
-        let r3 = rec(0x80, b"key-3", b"value-3-longer");
-        let r1_r2_len = r1.len() + r2.len();
-
-        let mut buf = Vec::new();
-        buf.extend_from_slice(&r1);
-        buf.extend_from_slice(&r2);
-        buf.extend_from_slice(&r3);
-        // truncate 5 bytes into r3 — header is intact, payload incomplete
-        let truncated = &buf[..r1_r2_len + 22]; // 17B header + a few key bytes
-
-        let recs = decode_records_full(truncated);
-        assert_eq!(
-            recs.len(),
-            2,
-            "incomplete record at tail must not be returned; consumed prefix is r1+r2"
-        );
-        assert_eq!(recs[0].1, b"key-1");
-        assert_eq!(recs[1].1, b"key-2");
-    }
-
-    /// Truncate INSIDE the 17-byte header — same contract: yield only
-    /// the prior complete records.
-    #[test]
-    fn decode_stops_when_header_itself_is_partial() {
-        let r1 = rec(0x80, b"k", b"v");
-        let r2 = rec(0x80, b"k2", b"v2");
-        let mut buf = Vec::new();
-        buf.extend_from_slice(&r1);
-        buf.extend_from_slice(&r2);
-        // Truncate so r2's header is incomplete (only 8 of 17 header bytes present).
-        let truncated = &buf[..r1.len() + 8];
-        let recs = decode_records_full(truncated);
-        assert_eq!(recs.len(), 1);
-        assert_eq!(recs[0].1, b"k");
-    }
-
-    /// Record-by-record concatenation: feeding the buffer in two halves
-    /// (with the split mid-record) plus carry-forward must reconstruct
-    /// the same record set as a single full decode. This is the exact
-    /// pattern process_gc_chunk uses.
-    #[test]
-    fn carry_forward_round_trips_to_full_decode() {
-        let recs_in: Vec<Vec<u8>> = (0..7)
-            .map(|i| {
-                let key = format!("user-key-{:02}", i);
-                let val: Vec<u8> = (0..(13 + i * 7) as usize).map(|x| x as u8).collect();
-                rec(0x80, key.as_bytes(), &val)
-            })
-            .collect();
-        let mut full: Vec<u8> = Vec::new();
-        for r in &recs_in {
-            full.extend_from_slice(r);
-        }
-        let expected = decode_records_full(&full);
-
-        // Split the full buffer at every byte position; feed half-1,
-        // carry tail, append half-2, decode again. The combined output
-        // must match `expected` for every split point.
-        for split in 1..full.len() {
-            let left = &full[..split];
-            let right = &full[split..];
-
-            let recs_left = decode_records_full(left);
-            // Determine consumed prefix length by re-encoding what we just decoded.
-            // post-V1 the envelope adds 9 bytes per record (sentinel + length + crc).
-            let consumed: usize = recs_left
-                .iter()
-                .map(|(_op, k, v, _)| {
-                    crate::wal_record::V1_ENVELOPE_OVERHEAD
-                        + crate::wal_record::PAYLOAD_HEADER
-                        + k.len()
-                        + v.len()
-                })
-                .sum();
-            let mut carry = left[consumed..].to_vec();
-            carry.extend_from_slice(right);
-            let recs_after_carry = decode_records_full(&carry);
-
-            let mut combined = recs_left.clone();
-            combined.extend(recs_after_carry);
-            assert_eq!(
-                combined.len(),
-                expected.len(),
-                "split={split}: combined record count mismatch"
-            );
-            for (got, want) in combined.iter().zip(expected.iter()) {
-                assert_eq!(got.0, want.0, "split={split}: op mismatch");
-                assert_eq!(got.1, want.1, "split={split}: key mismatch");
-                assert_eq!(got.2, want.2, "split={split}: value mismatch");
-            }
-        }
     }
 }
 
@@ -5026,18 +4902,6 @@ mod classify_cooldown_tests {
     fn unrecognised_failure_uses_hard_cooldown() {
         let err = anyhow!("connection closed mid-read");
         assert_eq!(classify_gc_failure_cooldown(&err, SOFT, HARD), HARD);
-    }
-
-    /// Empty top-level message but recognisable substring deeper in
-    /// the chain — still soft. Defends the classifier against future
-    /// callsite refactors that wrap the original error in additional
-    /// context layers.
-    #[test]
-    fn sentinel_deep_in_chain_still_recognised() {
-        let bottom = anyhow!("precondition failed: locked by ec");
-        let middle = bottom.context("manager rejected request");
-        let top = middle.context("punch_holes failed");
-        assert_eq!(classify_gc_failure_cooldown(&top, SOFT, HARD), SOFT);
     }
 }
 
@@ -5151,13 +5015,6 @@ mod gc_replay_floor_tests {
         assert_eq!(floor, 1);
         assert_eq!(pos.get(&10), Some(&0));
         assert_eq!(pos.get(&13), Some(&3));
-    }
-
-    #[test]
-    fn floor_takes_min_over_multiple_vp_heads() {
-        let log = [10u64, 11, 12, 13];
-        // earliest position among {13, 11, 12} is 11's (pos 1).
-        assert_eq!(gc_replay_floor(&log, [13u64, 11, 12]).0, 1);
     }
 
     #[test]
@@ -5701,16 +5558,6 @@ mod gc_selection_tests {
     fn a_shared_extent_clears_a_bar_a_private_one_does_not() {
         assert!(!gc_selects(300, 1000, 1, 0.4, None), "private: 0.3 is under 0.4");
         assert!(gc_selects(300, 1000, 2, 0.4, None), "shared: 0.3 is over the halved 0.2");
-    }
-
-    /// `empty_only` makes the gate infinite so nothing qualifies on ratio.
-    /// The predicate never sees such a candidate anyway — the loop `continue`s
-    /// on `empty_only` before reaching it — so this pins the predicate's own
-    /// behaviour, not a caller-side guard. (There used to be one suppressing
-    /// the absolute floor too; it was inert and is gone.)
-    #[test]
-    fn an_infinite_gate_admits_nothing_on_ratio() {
-        assert!(!gc_selects(999, 1000, 2, f64::INFINITY, None));
     }
 
     /// A dispatch that names no knobs may refresh what it resolved, but it

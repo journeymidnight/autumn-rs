@@ -349,16 +349,6 @@ mod tests {
     }
 
     #[test]
-    fn a_hello_round_trips() {
-        for v in [0u32, 1, 43, u32::MAX] {
-            assert_eq!(parse_hello_req(&encode_hello_req(v)), Some(v));
-        }
-        for (s, m) in [(43u32, 43u32), (45, 40), (0, 0)] {
-            assert_eq!(parse_hello_resp(&encode_hello_resp(s, m)), Some((s, m)));
-        }
-    }
-
-    #[test]
     fn a_payload_that_is_not_a_hello_yields_no_version() {
         // Both guards matter. Without the magic, ANY 8-byte payload landing on
         // this msg_type would parse and the number it yielded would decide

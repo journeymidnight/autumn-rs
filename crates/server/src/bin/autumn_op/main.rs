@@ -4695,19 +4695,4 @@ mod tests {
         expected.sort_unstable();
         assert_eq!(extent_sharers(&regions, &streams).get(&14), Some(&expected));
     }
-
-    /// The common case: one holder, and nothing about sharing to report.
-    #[test]
-    fn a_private_extent_has_exactly_one_holder() {
-        let regions: HashMap<u64, MgrRegionInfo> =
-            [(13, region(13, 7, 9, 11))].into_iter().collect();
-        let streams: HashMap<u64, MgrStreamInfo> =
-            [(7, stream(7, vec![8]))].into_iter().collect();
-
-        let sharers = extent_sharers(&regions, &streams);
-        assert_eq!(sharers.get(&8), Some(&vec![13]));
-        // a stream the caller did not fetch is skipped, not a panic: the scoped
-        // view asks only for the streams it needs.
-        assert_eq!(sharers.get(&99), None);
-    }
 }

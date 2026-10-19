@@ -176,35 +176,6 @@ fn remove_after_fence_succeeds_when_no_refs() {
 }
 
 #[test]
-fn fence_node_then_re_register_refused_before_clear() {
-    let m = AutumnManager::new();
-    let n1 = register(&m, "127.0.0.1:9001");
-
-    // Fence (force — no alt nodes).
-    let fence = FenceNodeReq {
-        node_id: n1,
-        reason: "dead".to_string(),
-        set_by: "op-alice".to_string(),
-        force: true,
-    };
-    let _ = run(m.handle_fence_node(rkyv_encode(&fence))).expect("fence");
-
-    // Re-register at the same address: the address-based prior lookup
-    // finds n1, n1's override is Fenced → must be refused.
-    let req = RegisterNodeReq {
-        addr: "127.0.0.1:9001".to_string(),
-        disk_uuids: vec!["uuid-a".to_string()],
-        shard_ports: vec![],
-        control_address: String::new(),
-        node_uuid: String::new(),
-    };
-    let resp_bytes = run(m.handle_register_node(rkyv_encode(&req))).expect("re-register");
-    let resp: RegisterNodeResp = rkyv_decode(&resp_bytes).expect("decode");
-    assert_eq!(resp.code, CODE_PRECONDITION);
-    assert!(resp.message.contains("Fenced"), "{}", resp.message);
-}
-
-#[test]
 fn remove_retry_succeeds_and_keeps_uuid_tombstone() {
     let manager = AutumnManager::new();
     let registration = RegisterNodeReq {

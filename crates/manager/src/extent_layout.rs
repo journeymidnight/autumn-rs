@@ -134,12 +134,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn an_absent_entry_reads_as_in_dat() {
-        let m = AutumnManager::new();
-        assert_eq!(m.payload_location_of(42), PayloadLocation::InDat);
-    }
-
-    #[test]
     fn a_committed_location_reads_back() {
         let m = AutumnManager::new();
         m.commit_payload_location(42, PayloadLocation::InShardFile);

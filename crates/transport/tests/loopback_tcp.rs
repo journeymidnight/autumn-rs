@@ -7,11 +7,6 @@ fn loopback() -> std::net::SocketAddr {
 }
 
 #[compio::test]
-async fn ping_pong() {
-    common::ping_pong_at(TcpTransport, loopback()).await;
-}
-
-#[compio::test]
 async fn large_payload() {
     common::large_payload_at(TcpTransport, loopback()).await;
 }

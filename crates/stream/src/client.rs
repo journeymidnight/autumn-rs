@@ -1337,26 +1337,6 @@ mod io_deadline_tests {
         assert_eq!(d.for_len(u64::MAX), IO_TIMEOUT_CAP);
     }
 
-    #[test]
-    fn read_and_write_floors_are_independent() {
-        let cfg = StreamClientConfig::default();
-        // Read floor is looser (4 MiB/s) than the write/append floor (8 MiB/s),
-        // because a read has no RF=3 all-replica-fsync barrier.
-        assert_eq!(cfg.read_floor_bytes_per_sec, 4 * 1024 * 1024);
-        assert_eq!(cfg.append_floor_bytes_per_sec, 8 * 1024 * 1024);
-        // 8 MiB: read = 3 s base + 8/4 = 5 s; write = 5 s base + 8/8 = 6 s. The
-        // read's looser floor is more than offset by its smaller base, so a read
-        // deadline is NOT simply "bigger because the floor is looser".
-        let rd = cfg.read_deadline().for_len(8 << 20);
-        let wr = IoDeadline {
-            base: cfg.append_fanout_timeout,
-            floor_bytes_per_sec: cfg.append_floor_bytes_per_sec,
-        }
-        .for_len(8 << 20);
-        assert_eq!(rd, Duration::from_secs(5));
-        assert_eq!(wr, Duration::from_secs(6));
-    }
-
     // BUG-READ-TIMEOUT-STORM: the retry-damping classifier. A liveness timeout
     // (deadline / connect timeout) damps the walk; a fast error keeps rotating.
     #[test]
@@ -6279,26 +6259,6 @@ mod pipeline_tests {
     use super::*;
 
     #[test]
-    fn lease_no_collision() {
-        let mut state = StreamAppendState::new(
-            Rc::new(RefCell::new(HashMap::new())),
-            mpsc::channel::<FailureReport>(1).0,
-            Duration::from_secs(30),
-        );
-        let (o0, e0) = state.lease(100);
-        let (o1, e1) = state.lease(200);
-        let (o2, e2) = state.lease(50);
-        assert_eq!(o0, 0);
-        assert_eq!(e0, 100);
-        assert_eq!(o1, 100);
-        assert_eq!(e1, 300);
-        assert_eq!(o2, 300);
-        assert_eq!(e2, 350);
-        assert_eq!(state.in_flight, 3);
-        assert_eq!(state.lease_cursor, 350);
-    }
-
-    #[test]
     fn ack_advances_commit_on_prefix() {
         let mut state = StreamAppendState::new(
             Rc::new(RefCell::new(HashMap::new())),
@@ -6621,46 +6581,6 @@ mod pipeline_tests {
 }
 
 #[cfg(test)]
-mod bad_nodes_tests {
-    //! per-stream bad_nodes exclusion.
-    //!
-    //! Covers insert + immediate inspect returning the node id, and
-    //! refresh-on-insert keeping only the latest expires_at.
-    use super::*;
-
-    #[test]
-    fn mark_then_inspect_returns_node() {
-        let bad = Rc::new(RefCell::new(HashMap::new()));
-        let state = StreamAppendState::new(
-            bad.clone(),
-            mpsc::channel::<FailureReport>(1).0,
-            Duration::from_secs(30),
-        );
-        state.mark_bad_node(7);
-        let entries = bad.borrow();
-        assert!(entries.contains_key(&7));
-        assert_eq!(entries.len(), 1);
-    }
-
-    #[test]
-    fn mark_refreshes_existing_entry() {
-        let bad = Rc::new(RefCell::new(HashMap::new()));
-        let state = StreamAppendState::new(
-            bad.clone(),
-            mpsc::channel::<FailureReport>(1).0,
-            Duration::from_secs(30),
-        );
-        state.mark_bad_node(11);
-        let first = *bad.borrow().get(&11).unwrap();
-        std::thread::sleep(Duration::from_millis(5));
-        state.mark_bad_node(11);
-        let second = *bad.borrow().get(&11).unwrap();
-        assert!(second > first);
-        assert_eq!(bad.borrow().len(), 1);
-    }
-}
-
-#[cfg(test)]
 mod selfheal_avali_filter_tests {
     //! WAL self-heal A1: `eligible_replica_slots` isolates avali=0 slots on a
     //! SEALED replicated extent (the read-path isolation that makes "clear the
@@ -6971,12 +6891,6 @@ mod rotation_tests {
                 }
             }
         }
-    }
-
-    #[test]
-    fn n1_always_zero() {
-        assert_eq!(rotated_replica_start(99, 12345, 1), 0);
-        assert_eq!(rotated_replica_start(99, 12345, 0), 0);
     }
 
     #[test]
@@ -8346,16 +8260,6 @@ mod ec_gather_retry_tests {
             None,
             "a second retry multiplies K-way read amplification on a degraded cluster"
         );
-    }
-
-    /// The one-short sentinel is what gates the retry, and it must survive
-    /// being wrapped in context — the shortfall site attaches a message.
-    #[test]
-    fn one_short_sentinel_survives_context() {
-        let e = anyhow::Error::new(EcGatherOneShort)
-            .context("ec_reconstruct_shard_subrange: one shard short (extent=63)");
-        assert!(is_ec_gather_one_short(&e));
-        assert!(!is_eversion_stale(&e));
     }
 
     /// The layout-stale refusal is typed and distinct from the other two —

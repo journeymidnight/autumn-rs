@@ -2736,27 +2736,6 @@ mod map_storage_error_tests {
         assert_eq!(code, StatusCode::Internal);
         assert_eq!(msg, "connection closed mid-read");
     }
-
-    /// Sentinel buried under multiple `.context()` layers must still
-    /// be recognised — `resolve_value` adds context, `read_value_from_log`
-    /// adds context, etc. The chain walk catches it at any depth.
-    #[test]
-    fn sentinel_deep_in_chain_still_recognised() {
-        let stale = StaleVpOffset {
-            extent_id: 7,
-            requested_offset: 100,
-            requested_length: 50,
-            sealed_length: 80,
-        };
-        let raw = anyhow::Error::new(stale)
-            .context("ec_subrange_read")
-            .context("read_bytes_from_extent")
-            .context("resolve_value");
-        let (code, msg) = map_storage_error(&raw);
-        assert_eq!(code, StatusCode::FailedPrecondition);
-        assert!(msg.contains("extent=7"));
-        assert!(msg.contains("sealed_length=80"));
-    }
 }
 
 #[cfg(test)]

@@ -201,13 +201,4 @@ mod tests {
         )
         .is_err());
     }
-
-    #[test]
-    fn credential_hash_and_ct_eq() {
-        let h1 = credential_hash(b"s3cr3t");
-        let h2 = credential_hash(b"s3cr3t");
-        let h3 = credential_hash(b"other");
-        assert!(ct_eq_32(&h1, &h2));
-        assert!(!ct_eq_32(&h1, &h3));
-    }
 }

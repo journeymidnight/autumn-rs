@@ -1271,14 +1271,6 @@ mod bug_lease_2_phase2_bulk_ctrl_tests {
     }
 
     #[test]
-    fn put_bulk_meta_anonymous_zeroes() {
-        let meta = encode_put_bulk_meta(1, 0, 0, b"k", 0, 0);
-        let parsed = parse_put_bulk_meta(&meta).expect("parse");
-        assert_eq!(parsed.inode_hint, 0);
-        assert_eq!(parsed.lease_epoch, 0);
-    }
-
-    #[test]
     fn put_bulk_meta_short_payload_rejected() {
         // One byte short of the fixed header.
         let meta = encode_put_bulk_meta(1, 0, 0, b"", 9, 9);

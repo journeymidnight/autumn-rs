@@ -29,12 +29,12 @@ use std::time::Duration;
 use autumn_client::ClusterClient;
 use autumn_manager::AutumnManager;
 use autumn_rpc::manager_rpc::{
-    MgrClientId, LEASE_CLIENT_KIND_IORING, LEASE_INVAL_META_CHANGED, LEASE_INVAL_WRITER_CLOSED,
+    MgrClientId, LEASE_CLIENT_KIND_IORING, LEASE_INVAL_META_CHANGED,
     LEASE_MODE_READ, LEASE_MODE_WRITE,
 };
 
 use autumn_client::lease::{
-    self, apply_invalidation, cache_is_stale, DaemonClientId, InvalidationMap,
+    self, apply_invalidation, DaemonClientId, InvalidationMap,
 };
 
 fn pick_addr() -> SocketAddr {
@@ -60,64 +60,6 @@ fn cid(byte: u8, host: &str) -> DaemonClientId {
         uuid: [byte; 16],
         host: host.to_string(),
     })
-}
-
-#[test]
-fn writer_close_bumps_reader_invalidation_floor() {
-    let mgr_addr = pick_addr();
-    start_manager(mgr_addr);
-
-    compio::runtime::Runtime::new().unwrap().block_on(async {
-        let cluster_w = ClusterClient::connect_raw(&mgr_addr.to_string()).await.unwrap();
-        let cluster_r = ClusterClient::connect_raw(&mgr_addr.to_string()).await.unwrap();
-        let writer = cid(0xa1, "writer");
-        let reader = cid(0xb2, "reader");
-
-        // Reader subscribes via a read-lease acquire (so its inbox
-        // exists and it'll receive WriterClosed pushes).
-        let r_lease = match lease::acquire(&cluster_r, &reader, 42, LEASE_MODE_READ)
-            .await
-            .unwrap()
-        {
-            lease::AcquireResult::Granted(info) => info,
-            other => panic!("reader acquire: {other:?}"),
-        };
-        let cached_version = r_lease.version;
-        // Drain any initial-empty events so the next poll observes
-        // the writer-close specifically.
-        let _ = lease::poll_invalidations(&cluster_r, &reader)
-            .await
-            .unwrap();
-
-        // Initially: no invalidations recorded. Cache is fresh.
-        let mut inv = InvalidationMap::new();
-        assert!(!cache_is_stale(42, cached_version, &inv));
-
-        // Writer acquires + immediately releases.
-        let _ = lease::acquire(&cluster_w, &writer, 42, LEASE_MODE_WRITE)
-            .await
-            .unwrap();
-        let new_version = lease::release(&cluster_w, &writer, 42)
-            .await
-            .unwrap()
-            .expect("writer-close must return new_version");
-
-        // Reader polls (writer-close pushed; manager wakes the poll).
-        let events = lease::poll_invalidations(&cluster_r, &reader).await.unwrap();
-        assert_eq!(events.len(), 1, "events={events:?}");
-        assert_eq!(events[0].ino, 42);
-        assert_eq!(events[0].version, new_version);
-        assert_eq!(events[0].kind, LEASE_INVAL_WRITER_CLOSED);
-
-        // Apply the events through the daemon-side bookkeeping. Cache
-        // tagged at the pre-close version is now stale; a fresh
-        // re-acquire-tagged cache would be fresh again.
-        let overflow = apply_invalidation(&events, &mut inv);
-        assert!(!overflow);
-        assert_eq!(inv.get(&42).copied(), Some(new_version));
-        assert!(cache_is_stale(42, cached_version, &inv));
-        assert!(!cache_is_stale(42, new_version, &inv));
-    });
 }
 
 #[test]

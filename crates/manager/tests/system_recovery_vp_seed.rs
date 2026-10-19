@@ -52,7 +52,7 @@ fn recovery_seeds_tail_and_flushing_recovered_active_loses_nothing() {
 
         // Crash 1 → same-id takeover (NON-graceful: drop the client; the old
         // server self-evicts on LockedByOther without flushing — mirrors
-        // system_crash_mid_flush). Graceful shutdown would flush B, emptying the
+        // system_ps_recovery). Graceful shutdown would flush B, emptying the
         // recovered active memtable and skipping the exact path under test. ps2
         // recovers A+B by replaying the log from offset 0 (no checkpoint); the
         // recovered active now holds A+B, and recovery seeds p.vp to the committed

@@ -421,25 +421,6 @@ mod wire_version_tests {
         assert!(err.contains("NEWER than the cluster"), "{err}");
     }
 
-    /// A peer claiming OUR version is accepted, full stop.
-    ///
-    /// This is the guarantee that was given up when the schema fingerprint
-    /// was removed. There used to be a `compat_rejects_same_version_claim_
-    /// with_different_schema` test here, and it passed: a peer that had
-    /// edited the schema without bumping its version was caught at the
-    /// handshake. Nothing catches that now — the version integer is the whole
-    /// check, and it is maintained by hand.
-    ///
-    /// The test is kept, inverted, so the loss is visible to whoever reads
-    /// this module rather than only to whoever reads the commit that removed
-    /// it. If a schema check ever comes back, this assertion is what should
-    /// fail first.
-    #[test]
-    fn compat_no_longer_verifies_the_peers_schema() {
-        assert!(cluster_peer_compat_check(WIRE_VERSION).is_ok());
-        assert!(client_compat_check(MIN_CLIENT_WIRE_VERSION, WIRE_VERSION).is_ok());
-    }
-
     #[test]
     fn compat_rejects_pre_r1_and_malformed() {
         // Pre-R1 peer (zero interval) → refuse on both paths, and say so

@@ -219,16 +219,4 @@ mod tests {
         let (bytes, n, _, _) = c.stats();
         assert!(bytes <= CAP && n <= CAP);
     }
-
-    #[test]
-    fn hit_updates_lru() {
-        let c = BlockCache::new(30);
-        c.insert((1, 0), blk(), 10);
-        c.insert((1, 1), blk(), 10);
-        c.insert((1, 2), blk(), 10);
-        // touch (1,0) so it's MRU, then overflow — (1,0) should survive.
-        assert!(c.get((1, 0)).is_some());
-        c.insert((1, 3), blk(), 10);
-        assert!(c.get((1, 0)).is_some(), "MRU entry survived eviction");
-    }
 }

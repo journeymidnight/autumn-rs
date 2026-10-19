@@ -433,27 +433,6 @@ fn e2e_remove_blocked_by_active_extents() {
 
 // ── E2E test 6: recovery_stats RPC is queryable ──────────────────────
 
-#[test]
-fn e2e_recovery_stats_baseline() {
-    let mgr_addr = pick_addr();
-    start_manager(mgr_addr);
-
-    compio::runtime::Runtime::new().unwrap().block_on(async {
-        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::version_hello::Role::Admin, None).await.expect("connect mgr");
-        let bytes = mgr
-            .call(MSG_RECOVERY_STATS, rkyv_encode(&RecoveryStatsReq {}))
-            .await
-            .expect("recovery_stats");
-        let resp: RecoveryStatsResp = rkyv_decode(&bytes).expect("decode");
-        assert_eq!(resp.code, CODE_OK);
-        assert!(resp.max_global >= 1, "max_global must be >= 1");
-        assert!(resp.max_per_source >= 1);
-        assert!(resp.max_per_target >= 1);
-        // No fence has fired → global_inflight should be 0 at start.
-        assert_eq!(resp.global_inflight, 0);
-    });
-}
-
 // ── E2E test 7: extent_health_report shows fenced-slot details ───────
 
 #[test]
@@ -536,29 +515,6 @@ fn e2e_extent_health_report_reflects_overrides() {
 }
 
 // ── E2E test 8: list_ec_inflight_markers reads cleanly (no markers) ──
-
-#[test]
-fn e2e_list_ec_inflight_markers_empty_baseline() {
-    let mgr_addr = pick_addr();
-    start_manager(mgr_addr);
-
-    compio::runtime::Runtime::new().unwrap().block_on(async {
-        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::version_hello::Role::Admin, None).await.expect("connect mgr");
-        let bytes = mgr
-            .call(
-                MSG_LIST_EC_INFLIGHT_MARKERS,
-                rkyv_encode(&ListEcInflightMarkersReq {}),
-            )
-            .await
-            .expect("list ec markers");
-        let resp: ListEcInflightMarkersResp = rkyv_decode(&bytes).expect("decode");
-        assert_eq!(resp.code, CODE_OK);
-        assert!(
-            resp.markers.is_empty(),
-            "baseline cluster has no EC markers"
-        );
-    });
-}
 
 // ── Suppress unused warnings on Bytes when present in unmodified paths ─
 

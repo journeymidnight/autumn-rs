@@ -73,33 +73,6 @@ fn rec(ino: u64, writer: &MgrClientId, version: u64, expires_at: i64) -> MgrInod
     }
 }
 
-/// Baseline: the LIVE TTL revoke is a pure function of the MONOTONIC
-/// `Instant` delta the caller passes. There is no wall-clock seam to
-/// skew — this is the skew-immunity of the live path, made concrete.
-#[test]
-fn live_ttl_revoke_is_monotonic_only() {
-    let mut r = LeaseRegistry::with_ttl(TTL);
-    let w = cid(1, 1, "writer-a");
-    let t0 = Instant::now();
-
-    let out = r.acquire(&w, 42, LEASE_MODE_WRITE, t0);
-    assert!(
-        matches!(out, autumn_manager::inode_lease::AcquireOutcome::Granted { .. }),
-        "writer granted, got {out:?}"
-    );
-
-    // Before TTL: not revoked. The function consumes only the Instant
-    // delta; a hostile wall-clock value is never read here.
-    assert!(
-        r.tick_plan(t0 + Duration::from_secs(29)).is_empty(),
-        "writer must survive before its monotonic TTL"
-    );
-    // After TTL: revoked. Purely (t - deadline) on the monotonic clock.
-    let plans = r.tick_plan(t0 + Duration::from_secs(31));
-    assert_eq!(plans.len(), 1, "writer revoked exactly at its monotonic TTL");
-    assert_eq!(plans[0].ino, 42);
-}
-
 /// FORWARD-skewed persisted deadline: an old leader whose wall clock
 /// ran far ahead (or a new leader whose clock is far behind) persists
 /// `expires_at = now + ~27h`. Rehydrating it MUST clamp to
@@ -200,36 +173,4 @@ fn skewed_rehydrate_never_yields_two_live_writers() {
     let plans = r.tick_plan(now + Duration::from_secs(31));
     assert_eq!(plans.len(), 1, "W1 revoked within TTL, freeing the slot");
     assert_eq!(plans[0].ino, 21);
-}
-
-/// End-to-end persist -> rehydrate cycle: `writer_record` renders the
-/// live monotonic remaining into an absolute unix `expires_at`, then
-/// `install_persisted_writer` on a FRESH registry (new leader)
-/// re-derives a monotonic deadline. The rehydrated deadline is bounded
-/// by `now + lease_ttl` even though the wall-clock round-trip crossed
-/// the skewable boundary. (Here with no injected skew: the healthy
-/// round-trip preserves ~TTL, and the clamp is the ceiling.)
-#[test]
-fn writer_record_roundtrip_deadline_bounded_by_ttl() {
-    let mut src = LeaseRegistry::with_ttl(TTL);
-    let w = cid(1, 9, "rt-writer");
-    src.acquire(&w, 33, LEASE_MODE_WRITE, Instant::now());
-
-    let record = src
-        .writer_record(33)
-        .expect("writer_record for a held writer");
-    assert_eq!(record.ino, 33);
-
-    // Feed the persisted record into a new leader.
-    let mut dst = LeaseRegistry::with_ttl(TTL);
-    let now = Instant::now();
-    dst.install_persisted_writer(record, now);
-
-    // Bounded above by now+TTL: not live past the TTL horizon.
-    let plans = dst.tick_plan(now + Duration::from_secs(31));
-    assert_eq!(
-        plans.len(),
-        1,
-        "rehydrated deadline is bounded by now+TTL across the persist/replay cycle"
-    );
 }

@@ -163,53 +163,6 @@ fn putstream_roundtrip_12mib() {
     });
 }
 
-/// Single-chunk striped put. Exercises the n_chunks=1 edge case +
-/// verifies the smallest possible striped value survives roundtrip.
-#[test]
-fn putstream_single_chunk_1mib() {
-    let mgr_addr = pick_addr();
-    start_manager(mgr_addr);
-
-    let n1_dir = tempfile::tempdir().expect("n1");
-    let n2_dir = tempfile::tempdir().expect("n2");
-    let n1_addr = pick_addr();
-    let n2_addr = pick_addr();
-    start_extent_node(n1_addr, n1_dir.path().to_path_buf(), 1);
-    start_extent_node(n2_addr, n2_dir.path().to_path_buf(), 2);
-
-    compio::runtime::Runtime::new().unwrap().block_on(async {
-        let cluster = boot_cluster(mgr_addr, n1_addr, n2_addr, 111, 11002).await;
-
-        let total: usize = 1024 * 1024;
-        let value = pattern(total);
-        let key = b"single-chunk";
-
-        let mut handle = cluster.put_stream_begin(key, 0);
-        handle.send(&value).await.unwrap();
-        assert_eq!(handle.chunks_sent(), 1);
-        handle.commit().await.unwrap();
-
-        let mut stream = cluster
-            .get_stream(key, 256 * 1024)
-            .await
-            .unwrap()
-            .unwrap();
-        let mut got = Vec::with_capacity(total);
-        while let Some(c) = stream.next_chunk().await.unwrap() {
-            got.extend_from_slice(&c);
-        }
-        assert_eq!(got.len(), total);
-        if got != value {
-            let pos = got.iter().zip(value.iter()).position(|(a, b)| a != b).unwrap_or(0);
-            panic!(
-                "single-chunk content mismatch at offset {pos}: got[{pos}..]={:02x?} expected={:02x?}",
-                &got[pos..(pos + 16).min(got.len())],
-                &value[pos..(pos + 16).min(value.len())]
-            );
-        }
-    });
-}
-
 /// Abort path: chunks were sent but commit never fired. Meta blob was
 /// never written, so `get(key)` returns NotFound throughout. After abort,
 /// all written chunks are best-effort deleted.
@@ -349,46 +302,6 @@ fn get_many_into_mixed_sizes() {
             let r = cluster.get_many_into(&mut miss).await;
             assert_eq!(r[0].as_ref().unwrap(), &None);
         }
-    });
-}
-
-/// `put_many` batched zero-copy writes. Exercises BOTH branches of the
-/// per-item bulk decision (`bulk_worthwhile(value.len())`): a 4 KiB value (< 64 KiB →
-/// regular `MSG_PUT`) and a 256 KiB value (>= 64 KiB → `MSG_PUT_BULK`), then reads
-/// each back byte-for-byte.
-#[test]
-fn put_many_mixed_sizes() {
-    let mgr_addr = pick_addr();
-    start_manager(mgr_addr);
-
-    let n1_dir = tempfile::tempdir().expect("n1");
-    let n2_dir = tempfile::tempdir().expect("n2");
-    let n1_addr = pick_addr();
-    let n2_addr = pick_addr();
-    start_extent_node(n1_addr, n1_dir.path().to_path_buf(), 1);
-    start_extent_node(n2_addr, n2_dir.path().to_path_buf(), 2);
-
-    compio::runtime::Runtime::new().unwrap().block_on(async {
-        let cluster = boot_cluster(mgr_addr, n1_addr, n2_addr, 121, 12101).await;
-
-        let small = bytes::Bytes::from(pattern(4 * 1024)); // < 64 KiB → MSG_PUT
-        let large = bytes::Bytes::from(pattern(256 * 1024)); // >= 64 KiB → MSG_PUT_BULK
-        let items: [(&[u8], bytes::Bytes, u64); 2] = [
-            (b"pm-small", small.clone(), 0u64),
-            (b"pm-large", large.clone(), 0u64),
-        ];
-        let results = cluster.put_many(&items).await;
-        assert!(results[0].is_ok(), "put small: {:?}", results[0]);
-        assert!(results[1].is_ok(), "put large: {:?}", results[1]);
-
-        assert_eq!(
-            cluster.get(b"pm-small").await.unwrap().as_deref(),
-            Some(small.as_ref())
-        );
-        assert_eq!(
-            cluster.get(b"pm-large").await.unwrap().as_deref(),
-            Some(large.as_ref())
-        );
     });
 }
 

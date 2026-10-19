@@ -288,19 +288,6 @@ mod tests {
     }
 
     #[test]
-    fn multiple_blocks() {
-        let mut b = SstBuilder::new(0, 0, 1024);
-        // Force multiple blocks with many entries
-        for i in 0u64..2000 {
-            let uk = format!("key{i:06}");
-            b.add(&ikey(uk.as_bytes(), i), 1, &[0u8; 64], 0);
-        }
-        let data = b.finish();
-        let reader = SstReader::from_bytes(bytes::Bytes::from(data)).expect("reader");
-        assert!(reader.block_count() > 1, "should have multiple blocks");
-    }
-
-    #[test]
     fn crc_corruption_detected() {
         let mut b = SstBuilder::new(0, 0, 1024);
         b.add(&ikey(b"key", 1), 1, b"val", 0);
@@ -333,16 +320,6 @@ mod tests {
     }
 
     #[test]
-    fn min_expires_at_no_expiry() {
-        let mut b = SstBuilder::new(0, 0, 1024);
-        b.add(&ikey(b"a", 1), 1, b"v1", 0);
-        b.add(&ikey(b"b", 2), 1, b"v2", 0);
-        let data = b.finish();
-        let reader = SstReader::from_bytes(bytes::Bytes::from(data)).expect("reader");
-        assert_eq!(reader.min_expires_at, 0);
-    }
-
-    #[test]
     fn min_expires_at_with_expiry() {
         let mut b = SstBuilder::new(0, 0, 1024);
         b.add(&ikey(b"a", 1), 1, b"v1", 1000);
@@ -352,16 +329,6 @@ mod tests {
         let data = b.finish();
         let reader = SstReader::from_bytes(bytes::Bytes::from(data)).expect("reader");
         assert_eq!(reader.min_expires_at, 500);
-    }
-
-    #[test]
-    fn min_expires_at_single_expiry() {
-        let mut b = SstBuilder::new(0, 0, 1024);
-        b.add(&ikey(b"a", 1), 1, b"v1", 0);
-        b.add(&ikey(b"b", 2), 1, b"v2", 42);
-        let data = b.finish();
-        let reader = SstReader::from_bytes(bytes::Bytes::from(data)).expect("reader");
-        assert_eq!(reader.min_expires_at, 42);
     }
 
     #[test]

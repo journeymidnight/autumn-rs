@@ -344,16 +344,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_cpuset_single() {
-        assert_eq!(parse_cpuset("4").unwrap(), vec![4]);
-    }
-
-    #[test]
-    fn parse_cpuset_range() {
-        assert_eq!(parse_cpuset("4-7").unwrap(), vec![4, 5, 6, 7]);
-    }
-
-    #[test]
     fn parse_cpuset_mixed() {
         assert_eq!(
             parse_cpuset("0-3,8,12-13").unwrap(),

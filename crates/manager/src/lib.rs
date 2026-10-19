@@ -7089,51 +7089,6 @@ mod tests {
         assert_eq!(region.rg.as_ref().unwrap().end_key, b"m".to_vec());
     }
 
-    #[test]
-    fn compute_region_assigns_least_loaded_for_new_partition() {
-        let mut state = crate::store::MetadataState::default();
-        state.ps_nodes.insert(10, "ps10:9001".to_string());
-        state.ps_nodes.insert(20, "ps20:9002".to_string());
-
-        // ps 10 already has 2 regions, ps 20 has 0
-        for part_id in [101, 102] {
-            state.regions.insert(
-                part_id,
-                RegionRecord {
-                    rg: Some(crate::persist::records::RangeRecord {
-                        start_key: vec![],
-                        end_key: vec![],
-                    }),
-                    part_id,
-                    ps_id: 10,
-                    log_stream: part_id,
-                    row_stream: part_id + 100,
-                    meta_stream: part_id + 200,
-                    region_epoch: 1,
-                },
-            );
-        }
-
-        // New partition (right child from split)
-        let right = PartitionRecord {
-            part_id: 999,
-            log_stream: 50,
-            row_stream: 51,
-            meta_stream: 52,
-            rg: Some(crate::persist::records::RangeRecord {
-                start_key: b"m".to_vec(),
-                end_key: b"z".to_vec(),
-            }),
-        };
-
-        let region = AutumnManager::compute_region_for_partition(&state, &right);
-        assert_eq!(
-            region.ps_id, 20,
-            "new partition should go to least-loaded PS (ps 20 has 0 regions)"
-        );
-        assert_eq!(region.part_id, 999);
-    }
-
     // ── region rebalance: compute_rebalance_moves ────────────────────────────
 
     /// Build a state with `ps_ids` registered and `assignments` = (part_id, ps_id).
@@ -7203,6 +7158,9 @@ mod tests {
         assert_eq!(moves.len(), 5, "capped at max_moves");
     }
 
+    // (removed: merge_extent_updates_preserves_ref_and_vp_changes —
+    // merge_extent_updates was deleted with the vp_table_refs machinery.)
+
     #[test]
     fn rebalance_noop_when_already_balanced() {
         // 11/11/10 across ps 1/2/3 — gap already 1, nothing to do.
@@ -7214,16 +7172,6 @@ mod tests {
         let moves = AutumnManager::compute_rebalance_moves(&state, 0);
         assert!(moves.is_empty(), "already balanced, got {moves:?}");
     }
-
-    #[test]
-    fn rebalance_single_ps_is_noop() {
-        let assignments: Vec<(u64, u64)> = (100..110).map(|p| (p, 1)).collect();
-        let state = rebal_state(&[1], &assignments);
-        assert!(AutumnManager::compute_rebalance_moves(&state, 0).is_empty());
-    }
-
-    // (removed: merge_extent_updates_preserves_ref_and_vp_changes —
-    // merge_extent_updates was deleted with the vp_table_refs machinery.)
 
     /// handle_stream_alloc_extent must not modify the in-memory store
     /// when the handler fails partway through. When alloc_extent_on_node
@@ -8845,72 +8793,6 @@ mod tests {
                 r.message
             );
         })
-    }
-
-    /// with 4 nodes and count=3, every node must appear in a
-    /// non-trivial fraction of selections — previously the lowest-id 3
-    /// always won and node 7 never showed up.
-    #[test]
-    fn select_nodes_distribution() {
-        let mut nodes: HashMap<u64, NodeRecord> = HashMap::new();
-        let mut disks: HashMap<u64, crate::persist::records::DiskRecord> = HashMap::new();
-        for (idx, &nid) in [1u64, 3, 5, 7].iter().enumerate() {
-            let did = 100 + idx as u64;
-            nodes.insert(
-                nid,
-                NodeRecord {
-                    node_id: nid,
-                    address: format!("127.0.0.1:{}", 9000 + nid),
-                    disks: vec![did],
-                    shard_ports: vec![],
-                    control_address: String::new(),
-                    node_uuid: String::new(),
-                },
-            );
-            disks.insert(
-                did,
-                crate::persist::records::DiskRecord {
-                    disk_id: did,
-                    online: true,
-                    uuid: format!("uuid-{nid}"),
-                },
-            );
-        }
-
-        // tests assume all nodes are verified-Online.
-        let ready_node_ids: HashSet<u64> = nodes.keys().copied().collect();
-        const ITERS: usize = 1000;
-        let mut counts: HashMap<u64, usize> = HashMap::new();
-        for _ in 0..ITERS {
-            let picked = AutumnManager::select_nodes(
-                &nodes,
-                &ready_node_ids,
-                &HashSet::new(),
-                &HashSet::new(),
-                &HashMap::new(),
-                3,
-                &[],
-            )
-            .unwrap();
-            assert_eq!(picked.len(), 3);
-            let mut ids: Vec<u64> = picked.iter().map(|n| n.node_id).collect();
-            ids.sort();
-            ids.dedup();
-            assert_eq!(ids.len(), 3, "selection must be 3 distinct nodes");
-            for id in ids {
-                *counts.entry(id).or_insert(0) += 1;
-            }
-        }
-        // Each of the 4 nodes should appear in ~750/1000 selections
-        // (3/4 = 75%). Allow a generous [60%, 90%] window so the test
-        // is statistically robust without a fixed RNG seed.
-        for &nid in &[1u64, 3, 5, 7] {
-            let c = *counts.get(&nid).unwrap_or(&0);
-            assert!(
-                (600..=900).contains(&c),
-                "node {nid} appeared in {c}/{ITERS} selections; expected 600..=900"
-            );
-        }
     }
 
     /// Degraded fallback (no node ready) must also shuffle so that

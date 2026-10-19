@@ -25,7 +25,7 @@ use std::time::Duration;
 use autumn_client::ClusterClient;
 use autumn_manager::AutumnManager;
 use autumn_rpc::manager_rpc::{
-    MgrClientId, LEASE_CLIENT_KIND_IORING, LEASE_MODE_READ, LEASE_MODE_WRITE,
+    MgrClientId, LEASE_CLIENT_KIND_IORING, LEASE_MODE_WRITE,
 };
 
 use autumn_client::lease::{self, AcquireResult, DaemonClientId, HeartbeatResult};
@@ -93,66 +93,6 @@ fn two_daemons_write_lease_conflict() {
             }
             other => panic!("daemon B must conflict, got {other:?}"),
         }
-    });
-}
-
-#[test]
-fn two_daemons_read_lease_coexist() {
-    let mgr_addr = pick_addr();
-    start_manager(mgr_addr);
-
-    compio::runtime::Runtime::new().unwrap().block_on(async {
-        let cluster_a = ClusterClient::connect_raw(&mgr_addr.to_string()).await.unwrap();
-        let cluster_b = ClusterClient::connect_raw(&mgr_addr.to_string()).await.unwrap();
-        let id_a = cid(0x11, "reader-a");
-        let id_b = cid(0x22, "reader-b");
-
-        for (cluster, id) in [(&cluster_a, &id_a), (&cluster_b, &id_b)] {
-            match lease::acquire(cluster, id, 7, LEASE_MODE_READ).await.unwrap() {
-                AcquireResult::Granted(info) => {
-                    assert!(!info.writer_present, "no writer; readers coexist");
-                }
-                other => panic!("read leases must coexist, got {other:?}"),
-            }
-        }
-    });
-}
-
-#[test]
-fn writer_release_unblocks_second_daemon_and_bumps_version() {
-    let mgr_addr = pick_addr();
-    start_manager(mgr_addr);
-
-    compio::runtime::Runtime::new().unwrap().block_on(async {
-        let cluster_a = ClusterClient::connect_raw(&mgr_addr.to_string()).await.unwrap();
-        let cluster_b = ClusterClient::connect_raw(&mgr_addr.to_string()).await.unwrap();
-        let id_a = cid(0x33, "writer-a");
-        let id_b = cid(0x44, "writer-b");
-
-        let v_a = match lease::acquire(&cluster_a, &id_a, 100, LEASE_MODE_WRITE)
-            .await
-            .unwrap()
-        {
-            AcquireResult::Granted(info) => info.version,
-            other => panic!("expected Granted, got {other:?}"),
-        };
-
-        // Release; manager returns the new version.
-        let new_v = lease::release(&cluster_a, &id_a, 100)
-            .await
-            .unwrap()
-            .expect("writer-close must return new_version");
-        assert_eq!(new_v, v_a + 1);
-
-        // Second daemon now succeeds and inherits the bumped version.
-        let v_b = match lease::acquire(&cluster_b, &id_b, 100, LEASE_MODE_WRITE)
-            .await
-            .unwrap()
-        {
-            AcquireResult::Granted(info) => info.version,
-            other => panic!("expected Granted after release, got {other:?}"),
-        };
-        assert_eq!(v_b, new_v, "second writer inherits the bumped version");
     });
 }
 

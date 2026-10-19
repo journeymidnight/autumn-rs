@@ -7,6 +7,7 @@ use compio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use compio::BufResult;
 use std::net::SocketAddr;
 
+#[allow(dead_code)] // only loopback_ucx (ucx feature) uses it
 pub async fn ping_pong_at<T: AutumnTransport + Clone>(t: T, addr: SocketAddr) {
     round_trip_at(t, addr, 1024).await;
 }

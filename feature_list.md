@@ -1,6 +1,6 @@
 # autumn-rs feature list — OPEN backlog
 
-**Last updated:** 2026-10-18 (BUG-FENCE-LATE-DIAGNOSIS-STEPS-DOWN-NEW-TERM reproduced (a late fence diagnosis, and the old leader lease's keepalive failing later), fixed and removed: only the current term steps the process down)
+**Last updated:** 2026-10-19 (test-suite hygiene done and removed: stale ignores lifted, unfailable tests fixed, obsolete/duplicate/fine-grained tests deleted; follow-ups in F-TEST-FOLLOWUPS)
 
 **Rules:**
 - This file tracks the **OPEN backlog only**. A feature that reaches `passes: true`
@@ -14,16 +14,17 @@
 
 ## Active
 
-### F-TEST-SUITE-HYGIENE — 测试集体检：放开失效的 ignore、修不会红的测试、删重复/过时测试
-- **Trigger** (2026-10-19 用户："要不要过一遍所有的 test…覆盖率是多少"，随后"1,2,3 执行"): 5 个只读审查 agent 分片审了全部约 1950 个测试。覆盖率(行)：仅 unit 61.0%，unit+CI 集成 75.0%；fs/fuse/server(bins) 约 35%。发现三类问题：
-  1. 103 个 `#[ignore]` 从不在 CI 跑(CI 不带 `--ignored`)，其中绝大多数理由已失效（"需要 etcd"——CI 已装 etcd-server；"需要完整集群"——用的是 CI 已在跑的同一套进程内 harness）。`apply_done_atomicity` 就是这样静默坏掉的。另 `autumn-fuse` 被 CI 两条测试命令整体排除（64 个测试），而 CI 早已装 libfuse3-dev。
-  2. 约 25 个测试写法上不可能失败（例：`heartbeat_updates_timestamp` 心跳不刷新也绿；`sweep_leaves_fresh_markers_alone` 删掉年龄检查也绿；`check_listen_addr` 全路径 Ok 的 transport 测试；早退静默通过的 regpool 测试）。
-  3. 约 20 个测试测的是测试模块里自己的副本而非产品代码（`ps_sqcq_*` 模仿已不存在的 `background_write_loop_r1`；`resolve_value_inline_*` 测本地 `inline_subrange`），以及约 70 个重复/过时/死代码测试。
-- **Scope**:
-  - 批 1：去掉理由失效的 `#[ignore]`，本机实跑，坏的按根因修；只保留真正的手动开关（全量 chaos、>1 GiB、stress、benchmark）。CI 测试命令不再排除 `autumn-fuse`。量 CI 时长增量。
-  - 批 2：把不会失败的测试改成能红的，每个用消融证明（去掉被测逻辑 ⇒ 红）。
-  - 批 3：删除测副本、重复、过时、死代码的测试；删前核对保留下来的测试确实断言了同样的东西。顺手修审查发现的过时注释与漏项（如 `msg_type_constants_dont_collide` 漏 `MSG_COMPARE_PUT`/`MSG_COMPARE_WRITE`）。
-- **Acceptance**: (1) 除手动开关外无 `#[ignore]`，且这些测试在本机按 CI 命令全部通过；(2) 批 2 每个修过的测试都有消融变红记录；(3) 批 3 每个删除项都在提交说明或进度文件里写明由哪个测试覆盖；(4) 全量 `cargo test --workspace --tests`（CI 命令）通过，除下一条已知失败。
+### F-TEST-FOLLOWUPS — 测试集体检留下的缺口与疑点（未处理）
+- **Trigger** (2026-10-19，测试集体检的审查与删除过程中发现，均未在那次改动里处理):
+  - `system_gc_chunked_read` 从不 roll 日志，GC 实际没跑（应加 roll_tails，而不是删）。
+  - `AsyncMergeIterator` 没有自己的单测（同步 `MergeIterator` 只在测试里存在，已随其测试删除）；合并顺序只由上层 range/compaction 测试间接覆盖。
+  - 没有测试覆盖"超大 Put 不推高 inode fence floor"（`enqueue_put_rejects_oversized_value` 传的 floor 是 None）。
+  - `etcd_replay_owner_lock_allows_check_commit_length_without_reacquire` 用 `drop(mgr1)`，mgr1 仍是 leader，failover 重放没被走到。
+  - `auto_dispatch_merge_orchestrates_full_flow` 偶发失败：整文件跑 6 次红 1 次，`support::psr_get` 的 `.expect("get")` 拿到 RPC 错误；单跑 3/3 绿。
+  - 推断：`handle_check_commit_length` 没有 leader 检查，standby 会用冻结的 store 回答（与"standby 拒绝元数据查询"相悖），未核实。
+  - 推断：transport `many_concurrent_at` 用 `let _ = h.await` 丢弃任务结果，任务 panic 可能不会让测试失败，未核实。
+- **Scope**: 逐项核实；真缺口补测试（消融能红），真 bug 另立条目按根因修，偶发失败先复现再定位。
+- **Acceptance**: 每项写明结论（已补/已修/证伪）；补的测试消融变红。
 - `passes: false`
 
 ### BUG-CQ-FLUSH-TIMING-TEST — `cq_flushes_fast_ops_while_slow_op_runs` 在 HEAD 上本机 4/5 失败

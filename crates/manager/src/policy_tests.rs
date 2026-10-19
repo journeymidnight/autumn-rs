@@ -16,13 +16,6 @@ fn d() -> PolicyConfig {
     PolicyConfig::default()
 }
 
-/// compatibility: the old `POLICY_KIND_COMPACT` constant maps to
-/// `POLICY_KIND_MAJOR_COMPACT` (same wire value 3). Existing tests use
-/// the major-compact path; re-export under both names to keep them
-/// compiling without churn.
-#[allow(dead_code)]
-const POLICY_KIND_COMPACT: u8 = POLICY_KIND_MAJOR_COMPACT;
-
 const GIB: u64 = 1024 * 1024 * 1024;
 
 fn fill_window(eng: &mut PolicyEngine, part_id: u64, n: usize, load: PartitionLoad, base_ts: i64) {
@@ -690,7 +683,7 @@ fn compact_advisory_fires_on_sustained_pending() {
     let out = eng.compute_maintenance_advisory(now);
     let cs: Vec<_> = out
         .iter()
-        .filter(|c| c.kind == POLICY_KIND_COMPACT)
+        .filter(|c| c.kind == POLICY_KIND_MAJOR_COMPACT)
         .collect();
     assert_eq!(cs.len(), 1);
     assert_eq!(cs[0].primary_part_id, 9);
@@ -714,7 +707,7 @@ fn compact_advisory_respects_cooldown_and_inflight() {
         now - d().required_buckets as i64 * d().bucket_sec,
     );
     let out = eng.compute_maintenance_advisory(now);
-    assert!(out.iter().all(|c| c.kind != POLICY_KIND_COMPACT));
+    assert!(out.iter().all(|c| c.kind != POLICY_KIND_MAJOR_COMPACT));
     let _ = d().compact_cooldown_sec;
 
     let mut eng2 = PolicyEngine::default();
@@ -731,7 +724,7 @@ fn compact_advisory_respects_cooldown_and_inflight() {
         now - d().required_buckets as i64 * d().bucket_sec,
     );
     let out2 = eng2.compute_maintenance_advisory(now);
-    assert!(out2.iter().all(|c| c.kind != POLICY_KIND_COMPACT));
+    assert!(out2.iter().all(|c| c.kind != POLICY_KIND_MAJOR_COMPACT));
 }
 
 #[test]

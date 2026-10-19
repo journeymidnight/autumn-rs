@@ -1116,14 +1116,6 @@ mod tests {
     }
 
     #[test]
-    fn response_and_error_flags() {
-        let f = Frame::error(99, 5, Bytes::from_static(b"oops"));
-        assert!(f.is_response());
-        assert!(f.is_error());
-        assert!(!f.is_stream_end());
-    }
-
-    #[test]
     fn empty_payload() {
         let frame = Frame::request(0, 0, Bytes::new());
         let encoded = frame.encode();

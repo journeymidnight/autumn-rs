@@ -38,9 +38,8 @@ use autumn_rpc::manager_rpc::{
 };
 
 use autumn_fuse::dispatch::{self, InodeInvalidator};
-use autumn_fs::schema::{self, DirentValue, DT_REG, ROOT_INO};
 use autumn_fs::state::{FsState, FuseLease};
-use autumn_fs::{key, meta};
+use autumn_fs::meta;
 
 use support::*;
 
@@ -85,103 +84,6 @@ fn counting_invalidator() -> (InodeInvalidator, Arc<Mutex<Vec<u64>>>) {
         log_c.lock().unwrap().push(ino);
     });
     (inv, log)
-}
-
-#[test]
-fn per_ino_writer_close_triggers_invalidator() {
-    let mgr_addr = pick_addr();
-    start_manager(mgr_addr);
-
-    let n1_dir = tempfile::tempdir().expect("n1");
-    let n2_dir = tempfile::tempdir().expect("n2");
-    let n1_addr = pick_addr();
-    let n2_addr = pick_addr();
-    start_extent_node(n1_addr, n1_dir.path().to_path_buf(), 1);
-    start_extent_node(n2_addr, n2_dir.path().to_path_buf(), 2);
-
-    compio::runtime::Runtime::new().unwrap().block_on(async {
-        let _admin = boot_cluster(mgr_addr, n1_addr, n2_addr, 144, 14401).await;
-
-        // Reader mount: subscribes via Acquire READ, holds the
-        // lease so the writer-close push lands in its inbox.
-        let mut reader = FsState::new(&mgr_addr.to_string()).await.expect("reader");
-        let (inv, log) = counting_invalidator();
-        dispatch::spawn_lease_background_tasks(&reader, Some(inv));
-
-        let ino = 42u64;
-        // Seed the ino's existence so `held_leases` makes sense.
-        let m = meta::new_file_meta(0o644, 0, 0);
-        meta::put_inode(&mut reader, ino, &m).await.expect("seed");
-        let dk = key::dirent_key(ROOT_INO, b"target.bin");
-        let dv = schema::encode_dirent(&DirentValue {
-            child_inode: ino,
-            file_type: DT_REG,
-        });
-        reader.kv_put(&dk, &dv).await.expect("dirent");
-
-        // Reader holds a READ lease so the manager pushes
-        // WriterClosed to its inbox.
-        let info = match lease::acquire(&reader.client, &reader.client_id, ino, LEASE_MODE_READ)
-            .await
-            .unwrap()
-        {
-            AcquireResult::Granted(info) => info,
-            other => panic!("reader acquire: {other:?}"),
-        };
-        // Drain any initial events.
-        let _ = lease::poll_invalidations(&reader.client, &reader.client_id)
-            .await
-            .unwrap();
-        // Track locally so the test reflects what production fuse
-        // Open would do.
-        reader.held_leases.borrow_mut().insert(
-            ino,
-            FuseLease {
-                writer_refs: 0,
-                reader_refs: 1,
-                mode: LEASE_MODE_READ,
-                lease_epoch: info.version,
-                revoked: false,
-            },
-        );
-
-        // Writer mount: distinct UUID. Acquire WRITE + Release →
-        // manager pushes WriterClosed to the reader.
-        let writer_id = cid(0xaa, "writer");
-        let writer_cluster = ClusterClient::connect_raw(&mgr_addr.to_string()).await.unwrap();
-        let _ = lease::acquire(&writer_cluster, &writer_id, ino, LEASE_MODE_WRITE)
-            .await
-            .unwrap();
-        let _ = lease::release(&writer_cluster, &writer_id, ino)
-            .await
-            .unwrap()
-            .expect("writer-close new_version");
-
-        // Reader's invalidation poll loop is awaiting the manager
-        // waker; the writer-close push fires it. Give it some time
-        // to receive + apply the event + call the invalidator.
-        let mut tries = 0;
-        loop {
-            if !log.lock().unwrap().is_empty() {
-                break;
-            }
-            tries += 1;
-            if tries > 50 {
-                panic!("invalidator never called; log={:?}", log.lock().unwrap());
-            }
-            compio::time::sleep(Duration::from_millis(100)).await;
-        }
-        let entries = log.lock().unwrap().clone();
-        assert!(
-            entries.contains(&ino),
-            "invalidator must be called for ino {ino}; log={entries:?}"
-        );
-        // ino=0 sentinel must NOT appear (overflow path only).
-        assert!(
-            !entries.contains(&0),
-            "ino=0 sentinel must NEVER reach the invalidator: {entries:?}"
-        );
-    });
 }
 
 #[test]

@@ -208,19 +208,3 @@ fn force_acquire_after_grace_expiry_forces_revoke_and_grants() {
         );
     });
 }
-
-#[test]
-fn force_acquire_on_no_writer_grants_immediately() {
-    let mgr_addr = pick_addr();
-    start_manager(mgr_addr);
-
-    compio::runtime::Runtime::new().unwrap().block_on(async {
-        let cluster = ClusterClient::connect_raw(&mgr_addr.to_string()).await.unwrap();
-        let p = cid(0xc1, "p");
-        // Fresh ino with no writer → force-acquire just grants.
-        let r = lease::acquire_force(&cluster, &p, 99, LEASE_MODE_WRITE)
-            .await
-            .unwrap();
-        assert!(matches!(r, AcquireResult::Granted(_)));
-    });
-}

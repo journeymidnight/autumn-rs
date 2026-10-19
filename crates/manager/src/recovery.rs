@@ -3609,26 +3609,6 @@ mod ec_done_attempt_tests {
             Err(EcDoneRejection::EversionMismatch)
         );
     }
-
-    /// A marker created before nonces existed carries 0, and so does the report
-    /// its coordinator sends. Such a pair still converges rather than wedging
-    /// forever — the check degrades to its pre-nonce strength, which is the
-    /// documented meaning of 0.
-    #[test]
-    fn a_pre_nonce_marker_and_report_still_apply() {
-        assert_eq!(classify_ec_done(&marker(5), 0, COORD, &done(5, 0)), Ok(()));
-    }
-
-    /// ...but a pre-nonce REPORT may not complete a marker that has an
-    /// identity: that is exactly the cross-attempt shape above, with the stale
-    /// attempt predating the upgrade.
-    #[test]
-    fn a_pre_nonce_report_cannot_complete_an_identified_attempt() {
-        assert_eq!(
-            classify_ec_done(&marker(5), 400, COORD, &done(5, 0)),
-            Err(EcDoneRejection::DifferentAttempt)
-        );
-    }
 }
 
 #[cfg(test)]

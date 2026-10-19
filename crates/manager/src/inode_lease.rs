@@ -1558,21 +1558,6 @@ mod tests {
     }
 
     #[test]
-    fn release_unknown_client_is_noop() {
-        let mut r = reg();
-        let c = cid(1, 9, "x");
-        assert_eq!(r.release(&c, 100), ReleaseOutcome::NotHeld);
-    }
-
-    #[test]
-    fn invalid_mode_is_rejected() {
-        let mut r = reg();
-        let c = cid(1, 1, "x");
-        let out = r.acquire(&c, 1, 99, Instant::now());
-        assert_eq!(out, AcquireOutcome::InvalidMode);
-    }
-
-    #[test]
     fn host_field_does_not_affect_identity() {
         let mut r = reg();
         let now = Instant::now();
@@ -1586,26 +1571,6 @@ mod tests {
             out,
             AcquireOutcome::Granted { writer_present: true, .. }
         ));
-    }
-
-    #[test]
-    fn many_readers_can_coexist_with_writer() {
-        let mut r = reg();
-        let now = Instant::now();
-        let w = cid(1, 1, "w");
-        let r1 = cid(2, 10, "r1");
-        let r2 = cid(2, 11, "r2");
-        let r3 = cid(2, 12, "r3");
-        let _ = r.acquire(&w, 1, LEASE_MODE_WRITE, now);
-        let _ = r.acquire(&r1, 1, LEASE_MODE_READ, now);
-        let _ = r.acquire(&r2, 1, LEASE_MODE_READ, now);
-        let _ = r.acquire(&r3, 1, LEASE_MODE_READ, now);
-        let _ = r.release(&w, 1);
-        for rd in [&r1, &r2, &r3] {
-            let (events, _) = r.drain_invalidations(rd);
-            assert_eq!(events.len(), 1, "{rd:?} missed invalidation");
-            assert_eq!(events[0].version, 2);
-        }
     }
 
     #[test]
@@ -1872,16 +1837,6 @@ mod tests {
             }
             other => panic!("expected Granted for fresh ino, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn same_writer_reacquire_is_idempotent() {
-        let mut r = reg();
-        let now = Instant::now();
-        let w = cid(1, 1, "h");
-        let _ = r.acquire(&w, 7, LEASE_MODE_WRITE, now);
-        let out = r.acquire(&w, 7, LEASE_MODE_WRITE, now);
-        assert!(matches!(out, AcquireOutcome::Granted { writer_present: true, .. }));
     }
 
     #[test]

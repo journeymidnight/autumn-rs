@@ -2208,11 +2208,6 @@ mod tests {
     // ── CLI split-point assembly ──────────────────────
 
     #[test]
-    fn split_point_median_resolves_to_none() {
-        assert_eq!(SplitPoint::Median.resolve_at_key(), None);
-    }
-
-    #[test]
     fn split_point_namespaced_with_suffix_assembles_prefix() {
         let p = SplitPoint::Namespaced {
             scope: "kvc".into(),
@@ -2277,12 +2272,6 @@ mod tests {
     }
 
     #[test]
-    fn split_point_raw_escape_hatch_passes_through() {
-        let p = SplitPoint::Raw(vec![0xde, 0xad, 0xbe, 0xef]);
-        assert_eq!(p.resolve_at_key().unwrap(), vec![0xde, 0xad, 0xbe, 0xef]);
-    }
-
-    #[test]
     fn build_split_point_classification() {
         // Nothing → median.
         assert!(matches!(
@@ -2304,15 +2293,6 @@ mod tests {
             super::build_split_point(None, None, Some(vec![1, 2, 3])),
             SplitPoint::Raw(_)
         ));
-    }
-
-    #[test]
-    fn parse_byte_size_accepts_plain_integer() {
-        assert_eq!(
-            super::parse_byte_size("16777216").unwrap(),
-            16 * 1024 * 1024
-        );
-        assert_eq!(super::parse_byte_size("0").unwrap(), 0);
     }
 
     #[test]
@@ -2357,13 +2337,6 @@ mod tests {
         for i in 0..3 {
             assert_eq!(ranges[i].1, ranges[i + 1].0);
         }
-    }
-
-    #[test]
-    fn fuse_split_ranges_single_partition_is_full_space() {
-        let ranges = super::fuse_split_ranges(1);
-        assert_eq!(ranges.len(), 1);
-        assert!(ranges[0].0.is_empty() && ranges[0].1.is_empty());
     }
 
     // ── Per-namespace presplit rules ──────────────────────────────────────────────

@@ -9,9 +9,8 @@
 //!    few hundred ms when a writer-close fires).
 //! 2. Empty long-poll eventually times out and returns Ok with no
 //!    events — the client retry loop is bounded.
-//! 3. Multiple consecutive events queue while the reader is parked
-//!    and all surface on the next poll (no events lost across the
-//!    long-poll cycle).
+//!
+//! Several events queued while parked: `ioring_lease_4.rs`.
 
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
@@ -137,47 +136,5 @@ fn long_poll_times_out_when_idle() {
             elapsed >= Duration::from_secs(8) && elapsed < Duration::from_secs(15),
             "idle long-poll should wait ~10 s, got {elapsed:?}"
         );
-    });
-}
-
-#[test]
-fn long_poll_returns_all_queued_events() {
-    let mgr_addr = pick_addr();
-    start_manager(mgr_addr);
-
-    compio::runtime::Runtime::new().unwrap().block_on(async {
-        let cluster = ClusterClient::connect_raw(&mgr_addr.to_string()).await.unwrap();
-        let reader = cid(0xd4, "reader-multi");
-        let w1 = cid(0xe5, "writer-1");
-        let w2 = cid(0xe6, "writer-2");
-
-        let _ = lease::acquire(&cluster, &reader, 100, LEASE_MODE_READ)
-            .await
-            .unwrap();
-        let _ = lease::acquire(&cluster, &reader, 200, LEASE_MODE_READ)
-            .await
-            .unwrap();
-        let _ = lease::poll_invalidations(&cluster, &reader)
-            .await
-            .unwrap();
-
-        // Queue two events BEFORE polling so they're both ready
-        // synchronously.
-        let _ = lease::acquire(&cluster, &w1, 100, LEASE_MODE_WRITE)
-            .await
-            .unwrap();
-        let _ = lease::release(&cluster, &w1, 100).await.unwrap();
-        let _ = lease::acquire(&cluster, &w2, 200, LEASE_MODE_WRITE)
-            .await
-            .unwrap();
-        let _ = lease::release(&cluster, &w2, 200).await.unwrap();
-
-        let events = lease::poll_invalidations(&cluster, &reader).await.unwrap();
-        // Both events must be in this single poll response — the
-        // long-poll handler drains the entire queue per call.
-        assert_eq!(events.len(), 2, "events={events:?}");
-        let inos: std::collections::BTreeSet<u64> = events.iter().map(|e| e.ino).collect();
-        assert!(inos.contains(&100));
-        assert!(inos.contains(&200));
     });
 }

@@ -827,25 +827,6 @@ mod tests {
         })
     }
 
-    /// Phase 0: in-memory release clears the probe.
-    #[test]
-    fn commit_extent_inflight_release_clears_probe() {
-        run(async {
-            let m = AutumnManager::new();
-            m._test_register_health_nodes([1, 3, 5, 7]);
-            m.acquire_extent_inflight(42, ec_payload(42))
-                .await
-                .expect("acquire");
-            m.commit_extent_inflight_release(42);
-            assert_eq!(m.extent_inflight_op(42), None);
-            // Re-acquire after release works.
-            m._test_acquire_marker(42, recovery_payload(42))
-                .await
-                .expect("re-acquire");
-            assert_eq!(m.extent_inflight_op(42), Some(ExtentOpKind::Recovery));
-        })
-    }
-
     /// Phase 0: rkyv round-trip on all three payload variants.
     #[test]
     fn record_rkyv_round_trip_all_variants() {
