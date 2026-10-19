@@ -19,6 +19,18 @@ jobs:
           # autumn-manager/fuse-tests pulls in autumn-fuse and fuser.
           # fuse3 provides fusermount3 for fuse_umount_exit's real mount.
           sudo apt-get install -y etcd-server protobuf-compiler libfuse3-dev fuse3
+          # Network-fault tests (etcd_resend_after_timeout, update_stream_ec_cas, ...)
+          # spawn toxiproxy-server and drive it with toxiproxy-cli.
+          v=2.12.0
+          base=https://github.com/Shopify/toxiproxy/releases/download/v$v
+          curl -fsSL -o /tmp/toxiproxy-server "$base/toxiproxy-server-linux-amd64"
+          curl -fsSL -o /tmp/toxiproxy-cli "$base/toxiproxy-cli-linux-amd64"
+          sha256sum -c - <<'SUMS'
+          556d891134a3c582dc1e1a3f7335fd55142e5965769855a00b944e13e48302fc  /tmp/toxiproxy-server
+          26c747024a3758a243c4449ff4f65634983fe98a0ab411d242cc9ff4561312b4  /tmp/toxiproxy-cli
+          SUMS
+          sudo install -m 0755 /tmp/toxiproxy-server /tmp/toxiproxy-cli /usr/local/bin/
+          toxiproxy-server --version
       - name: Build
         run: cargo build --workspace --exclude ucx-sys-mini
       - uses: actions/setup-node@v4
@@ -31,7 +43,7 @@ jobs:
           node crates/server/src/bin/autumn_dashboard/tests/policy_controls.js
           bash crates/server/src/bin/autumn_dashboard/tests/api_contract.sh
       - name: Unit tests
-        run: cargo test --workspace --lib --exclude ucx-sys-mini
+        run: cargo test --workspace --lib --exclude ucx-sys-mini --no-fail-fast
       - name: Integration tests
         # Bump RLIMIT_MEMLOCK + nofile on this shell's PID so the cargo test
         # subprocess inherits the bump. Integration tests spawn manager + EN
@@ -53,4 +65,4 @@ jobs:
           sudo prlimit --pid $$ --nofile=65536:65536 || true
           # diagnostic — confirm the new limits actually took
           cat /proc/$$/limits | grep -E 'locked|files'
-          cargo test --workspace --tests --exclude ucx-sys-mini --features autumn-manager/fuse-tests -- --test-threads=1
+          cargo test --workspace --tests --exclude ucx-sys-mini --features autumn-manager/fuse-tests --no-fail-fast -- --test-threads=1
