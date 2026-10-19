@@ -14,6 +14,24 @@
 
 ## Active
 
+### F-TEST-SUITE-HYGIENE — 测试集体检：放开失效的 ignore、修不会红的测试、删重复/过时测试
+- **Trigger** (2026-10-19 用户："要不要过一遍所有的 test…覆盖率是多少"，随后"1,2,3 执行"): 5 个只读审查 agent 分片审了全部约 1950 个测试。覆盖率(行)：仅 unit 61.0%，unit+CI 集成 75.0%；fs/fuse/server(bins) 约 35%。发现三类问题：
+  1. 103 个 `#[ignore]` 从不在 CI 跑(CI 不带 `--ignored`)，其中绝大多数理由已失效（"需要 etcd"——CI 已装 etcd-server；"需要完整集群"——用的是 CI 已在跑的同一套进程内 harness）。`apply_done_atomicity` 就是这样静默坏掉的。另 `autumn-fuse` 被 CI 两条测试命令整体排除（64 个测试），而 CI 早已装 libfuse3-dev。
+  2. 约 25 个测试写法上不可能失败（例：`heartbeat_updates_timestamp` 心跳不刷新也绿；`sweep_leaves_fresh_markers_alone` 删掉年龄检查也绿；`check_listen_addr` 全路径 Ok 的 transport 测试；早退静默通过的 regpool 测试）。
+  3. 约 20 个测试测的是测试模块里自己的副本而非产品代码（`ps_sqcq_*` 模仿已不存在的 `background_write_loop_r1`；`resolve_value_inline_*` 测本地 `inline_subrange`），以及约 70 个重复/过时/死代码测试。
+- **Scope**:
+  - 批 1：去掉理由失效的 `#[ignore]`，本机实跑，坏的按根因修；只保留真正的手动开关（全量 chaos、>1 GiB、stress、benchmark）。CI 测试命令不再排除 `autumn-fuse`。量 CI 时长增量。
+  - 批 2：把不会失败的测试改成能红的，每个用消融证明（去掉被测逻辑 ⇒ 红）。
+  - 批 3：删除测副本、重复、过时、死代码的测试；删前核对保留下来的测试确实断言了同样的东西。顺手修审查发现的过时注释与漏项（如 `msg_type_constants_dont_collide` 漏 `MSG_COMPARE_PUT`/`MSG_COMPARE_WRITE`）。
+- **Acceptance**: (1) 除手动开关外无 `#[ignore]`，且这些测试在本机按 CI 命令全部通过；(2) 批 2 每个修过的测试都有消融变红记录；(3) 批 3 每个删除项都在提交说明或进度文件里写明由哪个测试覆盖；(4) 全量 `cargo test --workspace --tests`（CI 命令）通过，除下一条已知失败。
+- `passes: false`
+
+### BUG-CQ-FLUSH-TIMING-TEST — `cq_flushes_fast_ops_while_slow_op_runs` 在 HEAD 上本机 4/5 失败
+- **Trigger** (2026-10-19，覆盖率全量跑时发现): `crates/stream/tests/extent_pipeline.rs` 要求首个读响应 < 0.5 × 64 MiB 持久 append 耗时，本机实测比值 0.50–0.55（首读约 180 ms，远非预期的微秒级）。无插桩、tmpdir 换真盘（/data05）结果相同。推断（未核实）：100 个读排在同一 TCP 连接上 64 MiB append 载荷之后，测的主要是发送时间，阈值贴着噪声。CI 是否同样红未知（本机 gh 未登录）。
+- **Scope**: 先在旧 commit（独立 worktree + 独立 target）上跑同一测试，区分代码回退与阈值过紧；再按根因修（产品代码回退则修代码；测试设计问题则改测量方式，让被测机制成为唯一解释）。
+- **Acceptance**: 根因写进本条；修后本机连跑 20 次全绿；若改测试，消融（把 handler 改回 burst 处理）仍能变红。
+- `passes: false`
+
 ### BUG-LEASE-HEARTBEAT-STALE-NOTHELD — 心跳快照期间重新 acquire 的 lease 会被迟到的 NotHeld 删掉（推断，未复现）
 - **Trigger** (2026-10-17 fuse_lease_loss 修复的 opus 评审): `lease_tasks.rs` 心跳循环先快照 `held_leases` 的 ino 再逐个 await 心跳 RPC；期间最后一次 release + 新 Open 可以重新 acquire 同一 ino，迟到的 `NotHeld` 把新条目删掉（现在还会多做一次失效）：后续写 EIO "no lease"，manager 那份新 lease 漏到 TTL 过期。
 - **Scope**: 先复现（心跳 RPC 前挂暂停点，期间 release+acquire）。坐实后：删条目前比较快照时的 `lease_epoch`，不同则不删。

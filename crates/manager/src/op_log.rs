@@ -202,9 +202,10 @@ mod tests {
 
     #[test]
     fn keys_sort_oldest_first() {
-        let a = op_log_key(1_000, 1);
-        let b = op_log_key(2_000, 1);
-        let c = op_log_key(2_000, 2);
+        // Different digit counts in both ts and seq: unpadded, they sort wrong.
+        let a = op_log_key(999, 9);
+        let b = op_log_key(1_000, 9);
+        let c = op_log_key(1_000, 10);
         let mut v = vec![c.clone(), a.clone(), b.clone()];
         v.sort();
         assert_eq!(v, vec![a, b, c], "ts then seq, lexically");

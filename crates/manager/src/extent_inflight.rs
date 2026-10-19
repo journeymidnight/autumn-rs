@@ -2225,15 +2225,26 @@ mod tests {
         })
     }
 
-    /// sweep does NOT release markers younger than the threshold.
+    /// sweep does NOT release markers younger than the threshold. Uses a
+    /// Delete marker — the only kind the sweep releases by age.
     #[test]
     fn sweep_leaves_fresh_markers_alone() {
         run(async {
             let m = AutumnManager::new();
-            m._test_register_health_nodes([1, 3, 5, 7]);
-            m.acquire_extent_inflight(42, ec_payload(42))
+            m.acquire_extent_inflight(42, delete_payload(42))
                 .await
                 .expect("acquire");
+            m.delete_progress.borrow_mut().insert(
+                42,
+                crate::extent_delete::PendingDelete {
+                    extent_id: 42,
+                    pending_targets: vec![crate::extent_delete::DeleteTarget {
+                        addr: "127.0.0.1:9101".to_string(),
+                        node_uuid: String::new(),
+                    }],
+                    attempts: 0,
+                },
+            );
 
             // Sweep with `now` matching the marker's started_at — age = 0,
             // way below any sensible threshold.
@@ -2245,8 +2256,8 @@ mod tests {
             assert_eq!(released, 0, "fresh marker must not be released");
             assert_eq!(
                 m.extent_inflight_op(42),
-                Some(ExtentOpKind::ConvertToEc),
-                "fresh ConvertToEc marker survives the sweep"
+                Some(ExtentOpKind::Delete),
+                "fresh Delete marker survives the sweep"
             );
         })
     }

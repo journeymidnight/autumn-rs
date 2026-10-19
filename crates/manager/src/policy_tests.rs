@@ -738,26 +738,24 @@ fn compact_advisory_respects_cooldown_and_inflight() {
 fn maintenance_advisory_partial_window_no_trigger() {
     let mut eng = PolicyEngine::default();
     let now = 1_700_000_000;
-    // Only 2 of --policy-required-buckets at high debt; rest is at zero.
-    eng.metrics.entry(7).or_default().push(
-        now - 2 * d().bucket_sec,
+    // `gc_advisory_fires_on_sustained_debt` with one bucket fewer: only the
+    // history guard keeps it quiet.
+    let n = d().required_buckets - 1;
+    fill_window(
+        &mut eng,
+        7,
+        n,
         PartitionLoad {
             part_id: 7,
             gc_debt_bytes: d().gc_debt_high + 1024,
             ..Default::default()
         },
-    );
-    eng.metrics.entry(7).or_default().push(
-        now - d().bucket_sec,
-        PartitionLoad {
-            part_id: 7,
-            gc_debt_bytes: 0,
-            ..Default::default()
-        },
+        now - n as i64 * d().bucket_sec,
     );
     let out = eng.compute_maintenance_advisory(now);
-    assert!(out.is_empty());
+    assert!(out.is_empty(), "{out:?}");
 }
+
 
 // ── Stage D: hot/cold advisory ─────────────────────────────────────
 
@@ -1102,7 +1100,9 @@ fn ec_advisory_skips_empty_extents() {
     let mut state = MetadataState::default();
     mk_stream(&mut state, 104, (3, 1), &[1006]);
     mk_extent(&mut state, 1006, 0, false);
-    let eng = PolicyEngine::default();
+    let mut eng = PolicyEngine::default();
+    // With no size floor, only the empty-extent check can skip it.
+    eng.config.ec_min_extent_bytes = 0;
     let out = eng.compute_ec_advisory(&state, &|_, _| true, 0);
     assert!(out.is_empty(), "sealed_length=0 should be skipped: {out:?}");
 }

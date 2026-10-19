@@ -6661,8 +6661,11 @@ mod tests {
                 slot_cap: 0,
             });
             m.handle_register_ps(req).await.unwrap();
-
-            compio::time::sleep(Duration::from_millis(10)).await;
+            // Register already stamps the PS; backdate it so only the
+            // heartbeat can make it fresh again.
+            m.ps_last_heartbeat
+                .borrow_mut()
+                .insert(55, Instant::now() - Duration::from_secs(60));
 
             let req = rkyv_encode(&HeartbeatPsReq {
                 ps_id: 55,
@@ -6674,7 +6677,7 @@ mod tests {
 
             let hb = m.ps_last_heartbeat.borrow();
             let recorded = hb.get(&55).expect("timestamp recorded");
-            assert!(recorded.elapsed() < Duration::from_millis(500));
+            assert!(recorded.elapsed() < Duration::from_secs(10));
         })
     }
 
