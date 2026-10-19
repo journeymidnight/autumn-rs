@@ -177,6 +177,39 @@ impl Classes {
     }
 }
 
+impl AutumnManager {
+    /// Register `ids` (when not yet known) with one disk each (`id * 10`) and
+    /// bring each one `Online`, i.e. class `Health`. Public for integration
+    /// tests: an EC target on an unregistered node is `Fence` and refused.
+    #[doc(hidden)]
+    pub fn _test_register_health_nodes(&self, ids: impl IntoIterator<Item = u64>) {
+        for node_id in ids {
+            self.store
+                .inner
+                .borrow_mut()
+                .nodes
+                .entry(node_id)
+                .or_insert_with(|| crate::persist::records::NodeRecord {
+                    node_id,
+                    address: format!("127.0.0.1:{}", 9100 + node_id),
+                    disks: vec![node_id * 10],
+                    shard_ports: vec![],
+                    control_address: String::new(),
+                    node_uuid: String::new(),
+                });
+            let disk_id = node_id * 10;
+            self.store.inner.borrow_mut().disks.entry(disk_id).or_insert_with(|| {
+                crate::persist::records::DiskRecord {
+                    disk_id,
+                    online: true,
+                    uuid: format!("disk-{disk_id}"),
+                }
+            });
+            self.node_states.borrow_mut().on_heartbeat_ok(node_id);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -233,38 +266,6 @@ impl Classes {
             nodes: ids.into_iter().map(|id| (id, NodeClass::Health)).collect(),
             faulted: faulted.into_iter().collect(),
             full: HashSet::new(),
-        }
-    }
-}
-
-#[cfg(test)]
-impl AutumnManager {
-    /// Register `ids` (when not yet known) with one disk each (`id * 10`) and
-    /// bring each one `Online`, i.e. class `Health`.
-    pub(crate) fn _test_register_health_nodes(&self, ids: impl IntoIterator<Item = u64>) {
-        for node_id in ids {
-            self.store
-                .inner
-                .borrow_mut()
-                .nodes
-                .entry(node_id)
-                .or_insert_with(|| crate::persist::records::NodeRecord {
-                    node_id,
-                    address: format!("127.0.0.1:{}", 9100 + node_id),
-                    disks: vec![node_id * 10],
-                    shard_ports: vec![],
-                    control_address: String::new(),
-                    node_uuid: String::new(),
-                });
-            let disk_id = node_id * 10;
-            self.store.inner.borrow_mut().disks.entry(disk_id).or_insert_with(|| {
-                crate::persist::records::DiskRecord {
-                    disk_id,
-                    online: true,
-                    uuid: format!("disk-{disk_id}"),
-                }
-            });
-            self.node_states.borrow_mut().on_heartbeat_ok(node_id);
         }
     }
 }

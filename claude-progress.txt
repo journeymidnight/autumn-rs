@@ -1,3 +1,10 @@
+Date: 2026-10-19
+TaskStatus: completed
+Task scope: user — make the ignored `apply_done_atomicity` etcd tests pass on HEAD.
+Current summary: all three failed at `acquire_extent_inflight` with `EC target: node 1 is Fence`: the tests target nodes 1/3/5/7 but never registered them, and since node classes an unregistered node is Fence (the unit tests were updated then, this ignored file was missed). `_test_register_health_nodes` is now `#[doc(hidden)] pub` and each test registers its targets. The two failure-path tests now pin their error (`NotLeader`; marker-revision CAS `Precondition`) instead of `is_err()`, since apply's own node-class gate would otherwise pass them for the wrong reason. Ablation: without the leader-key deposition the deposed-leader test is red (`Ok(())`). Green: the 3 ignored tests, `cargo test -p autumn-manager --lib` (510). Review (opus): no blocking findings; the variant pinning came from it.
+Main gaps: none.
+Next steps: pick from feature_list.md.
+
 Date: 2026-10-18 (5)
 TaskStatus: completed
 Task scope: user — BUG-FENCE-LATE-DIAGNOSIS-STEPS-DOWN-NEW-TERM (continue).

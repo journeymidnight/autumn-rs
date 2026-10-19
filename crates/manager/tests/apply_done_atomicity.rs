@@ -8,6 +8,8 @@
 //! 2. Failure path: with a deposed leader (leader fence breaks), the
 //!    txn is atomically rejected — etcd shows the original
 //!    `extent_inflight/<id>` still present AND no `extents/<id>` write.
+//! 3. A byte-identical marker reissued after the first is released is a
+//!    new attempt: the old apply loses the marker-revision CAS.
 //!
 //! Requires the `etcd` binary on `$PATH` (or override via
 //! `AUTUMN_TEST_ETCD_BIN`). Marked `#[ignore]` per repo convention.
@@ -15,12 +17,16 @@
 mod support;
 
 use autumn_manager::extent_inflight::{ExtentOpPayload, EXTENT_INFLIGHT_PREFIX};
+use autumn_common::AppError;
 use autumn_manager::AutumnManager;
 use autumn_rpc::manager_rpc::{MgrEcDispatchInflight, MgrExtentInfo};
 
 use support::start_etcd;
 
 const LEADER_KEY: &str = "autumn-rs/stream-manager/leader";
+
+/// The conversion's targets; each must be registered, or the marker is refused.
+const TARGET_NODES: [u64; 4] = [1, 3, 5, 7];
 
 fn extent_inflight_key(eid: u64) -> String {
     format!("{}{}", EXTENT_INFLIGHT_PREFIX, eid)
@@ -47,7 +53,7 @@ fn make_pre_ec_extent(extent_id: u64) -> MgrExtentInfo {
 fn make_dispatch_record(extent_id: u64) -> MgrEcDispatchInflight {
     MgrEcDispatchInflight {
         extent_id,
-        target_nodes: vec![1, 3, 5, 7],
+        target_nodes: TARGET_NODES.to_vec(),
         extra_disk_ids: vec![70],
         data_shards: 3,
         new_eversion: 4,
@@ -65,6 +71,7 @@ fn apply_ec_conversion_done_atomic_success() {
         let m = AutumnManager::new_with_etcd(vec![etcd_endpoint.clone()], support::manager_identity())
             .await
             .expect("manager with etcd");
+        m._test_register_health_nodes(TARGET_NODES);
 
         // Pre-populate the in-memory extent. `apply_ec_conversion_done`
         // reads from in-memory and writes the updated copy to etcd.
@@ -99,7 +106,7 @@ fn apply_ec_conversion_done_atomic_success() {
         );
 
         // Apply the conversion — the atomic put-and-delete txn.
-        m.apply_ec_conversion_done(extent_id, vec![1, 3, 5, 7], vec![70], 3, 4)
+        m.apply_ec_conversion_done(extent_id, TARGET_NODES.to_vec(), vec![70], 3, 4)
             .await
             .expect("apply");
 
@@ -139,6 +146,7 @@ fn apply_ec_conversion_done_atomic_failure_under_deposed_leader() {
         let m = AutumnManager::new_with_etcd(vec![etcd_endpoint.clone()], support::manager_identity())
             .await
             .expect("manager with etcd");
+        m._test_register_health_nodes(TARGET_NODES);
 
         let extent_id: u64 = 4210;
         m._test_seed_persisted_extent(extent_id, make_pre_ec_extent(extent_id))
@@ -173,10 +181,10 @@ fn apply_ec_conversion_done_atomic_failure_under_deposed_leader() {
         // M1 still believes it's the leader (cell hasn't flipped). The
         // apply must fail atomically — neither effect lands.
         let res = m
-            .apply_ec_conversion_done(extent_id, vec![1, 3, 5, 7], vec![70], 3, 4)
+            .apply_ec_conversion_done(extent_id, TARGET_NODES.to_vec(), vec![70], 3, 4)
             .await;
         assert!(
-            res.is_err(),
+            matches!(res, Err(AppError::NotLeader)),
             "I3: apply must fail atomically under deposed leader; got {res:?}"
         );
 
@@ -214,6 +222,7 @@ fn identical_reissued_marker_has_new_identity_and_rejects_old_apply() {
         let manager = AutumnManager::new_with_etcd(vec![etcd_endpoint.clone()], support::manager_identity())
             .await
             .expect("manager with etcd");
+        manager._test_register_health_nodes(TARGET_NODES);
         let extent_id = 4211;
         manager
             ._test_seed_persisted_extent(extent_id, make_pre_ec_extent(extent_id))
@@ -248,9 +257,12 @@ fn identical_reissued_marker_has_new_identity_and_rejects_old_apply() {
         );
 
         let result = manager
-            .apply_ec_conversion_done(extent_id, vec![1, 3, 5, 7], vec![70], 3, 4)
+            .apply_ec_conversion_done(extent_id, TARGET_NODES.to_vec(), vec![70], 3, 4)
             .await;
-        assert!(result.is_err(), "the old apply must lose the marker revision CAS");
+        assert!(
+            matches!(&result, Err(AppError::Precondition(m)) if m.contains("inflight marker")),
+            "the old apply must lose the marker revision CAS; got {result:?}"
+        );
 
         let marker_after = aux.get(&marker_key).await.expect("read marker after refusal");
         assert_eq!(marker_after.kvs.len(), 1, "the successor marker was deleted");
