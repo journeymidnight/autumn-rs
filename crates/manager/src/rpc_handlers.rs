@@ -7620,20 +7620,10 @@ impl AutumnManager {
                 // deadline. Other shapes (reader heartbeat,
                 // writer-not-me cases) leave etcd alone.
                 //
-                // coco R2-P0 #1 (round 2, 2026-06-06): the original
-                // BUG-LEASE-1 fix used a BLIND `put_msgs_txn` —
-                // between our in-memory `heartbeat()` mutation and
-                // the etcd put, a concurrent `ReleaseLease` could
-                // have deleted the etcd record, or a force-revoke +
-                // new acquire could have overwritten it with a
-                // DIFFERENT writer's record. The blind put would
-                // then resurrect (release case) or overwrite (new
-                // writer case) that change. The fix is
-                // `EtcdMirror::read_then_cas_put`: read the current
-                // record, CAS-put against it. If CAS fails (record
-                // changed since our read) — silently skip; the
-                // in-memory deadline is still good and the next
-                // heartbeat reads the fresh state.
+                // The etcd write is awaited after the in-memory renewal, so
+                // a release or a force-preempt can land in between;
+                // `refresh_writer_record` writes only while the stored
+                // record is still this writer's at this version.
                 if writer_present {
                     let is_writer = {
                         let reg = self.inode_leases.borrow();
@@ -7652,28 +7642,27 @@ impl AutumnManager {
                             .writer_record(req.ino)
                             .expect("writer just heartbeated successfully");
                         let key = format!("{}{}", crate::INODE_LEASES_PREFIX, req.ino);
-                        let value = rkyv_encode(&record).to_vec();
+                        {
+                            use std::sync::atomic::Ordering::Relaxed;
+                            let hold = &crate::HEARTBEAT_REFRESH_TEST_HOLD;
+                            if hold.compare_exchange(1, 2, Relaxed, Relaxed).is_ok() {
+                                while hold.load(Relaxed) == 2 {
+                                    compio::time::sleep(Duration::from_millis(5)).await;
+                                }
+                            }
+                        }
                         if let Some(etcd) = &self.etcd {
-                            match etcd.read_then_cas_put(&key, value).await {
+                            match etcd.refresh_writer_record(&key, &record).await {
                                 Ok(true) => {
                                     // Refresh landed; failover-safe.
                                 }
                                 Ok(false) => {
-                                    // CAS conflict OR record deleted.
-                                    // Concurrent Release / new-writer
-                                    // Acquire raced us. In-memory
-                                    // state already reflects this via
-                                    // the writer-still-me check above
-                                    // → if the writer slot is empty
-                                    // or no longer ours, our
-                                    // `is_writer` check would have
-                                    // returned false. So this path is
-                                    // "etcd diverged from our memory
-                                    // momentarily" — next heartbeat
-                                    // will reconcile.
+                                    // Released or taken over since the
+                                    // renewal: the record belongs to
+                                    // whoever changed it.
                                     tracing::debug!(
                                         ino = req.ino,
-                                        "BUG-LEASE-1 R2-P0 #1: heartbeat etcd CAS skipped (concurrent change); next heartbeat will retry"
+                                        "heartbeat lease refresh skipped: the record changed hands"
                                     );
                                 }
                                 Err(e) => {

@@ -267,6 +267,12 @@ async fn fenced_txn_test_hold(success: &[autumn_etcd::proto::RequestOp]) {
 #[doc(hidden)]
 pub static DIAGNOSE_FENCE_TEST_HOLD: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
+/// Test-only failpoint, same protocol: the first writer-heartbeat refresh
+/// after arming parks after its in-memory renewal, before reading the etcd
+/// record, until the test stores 0.
+#[doc(hidden)]
+pub static HEARTBEAT_REFRESH_TEST_HOLD: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
 /// The leader key as `diagnose_fence` found it: ours at `fence_rev`, or ours
 /// at a newer revision (a bump settled an uncertain attempt meanwhile).
 enum Fence {
@@ -633,47 +639,47 @@ impl EtcdMirror {
     /// path: conflicting ops proceed concurrently and only a genuine conflict
     /// retries (the per-stream-lock attempt blocked alloc behind slow GC/split
     /// under kill and lost writes — see claude-progress.txt Item 3).
-    /// BUG-LEASE-1 R2-P0 #1 (coco arch review round 2, 2026-06-06):
-    /// "read-then-CAS-put" used by the heartbeat refresh path. The
-    /// raw `put_msgs_txn` path the original BUG-LEASE-1 fix used
-    /// was an unconditional blind write — between
-    /// `LeaseRegistry::heartbeat()` (which sets in-memory deadline)
-    /// and the etcd put, a concurrent `ReleaseLease` could have
-    /// deleted the etcd record, or a force-revoke + new-writer
-    /// acquire could have overwritten it with a different writer.
-    /// The blind put would then resurrect / overwrite that change.
+    /// Refresh a writer's lease record for its heartbeat, only while the
+    /// stored record is still that writer's at that version. Between the
+    /// in-memory renewal and this write, a release can delete the record and
+    /// a force-preempt can replace it with the next writer's; either must
+    /// stand. Comparing against the stored value alone is not enough: a
+    /// record replaced before the read becomes the baseline and is
+    /// overwritten. The CAS on the read value covers a change between the
+    /// read and the txn.
     ///
-    /// This helper does the safe form: read the current etcd value
-    /// for `key`, build a CAS-put that's gated on
-    /// `Cmp::value(key) == baseline`. If the record was deleted
-    /// or changed since our read, the txn returns `Ok(false)` →
-    /// `Precondition` → caller treats as "skip, next heartbeat
-    /// will retry". The leader fence is still threaded via the
-    /// underlying `txn_fenced`.
-    ///
-    /// Returns: `Ok(true)` if the CAS-put committed, `Ok(false)`
-    /// if a concurrent change beat us (caller should NOT treat
-    /// this as an error — in-memory state is still authoritative).
-    /// `Err` for genuine etcd / network / not-leader failures.
-    async fn read_then_cas_put(&self, key: &str, new_value: Vec<u8>) -> Result<bool, AppError> {
-        // Read the current record. If absent, the record was deleted
-        // (release happened) — skip the put.
+    /// `Ok(false)`: the record is gone or no longer this writer's — skip;
+    /// memory stays authoritative. `Err`: etcd / not-leader failure.
+    async fn refresh_writer_record(
+        &self,
+        key: &str,
+        record: &autumn_rpc::manager_rpc::MgrInodeLeaseRecord,
+    ) -> Result<bool, AppError> {
         let resp = self
             .client
             .get(key.as_bytes())
             .await
             .map_err(|e| AppError::Internal(e.to_string()))?;
-        let baseline = match resp.kvs.first() {
-            Some(kv) => kv.value.clone(),
-            None => return Ok(false),
+        let Some(kv) = resp.kvs.first() else {
+            return Ok(false);
         };
-        // CAS-put: only succeeds if etcd value still matches baseline.
-        let extra_cmp = vec![autumn_etcd::Cmp::value(key.as_bytes(), baseline.as_slice())];
-        let ops = vec![autumn_etcd::Op::put(key.as_bytes(), &new_value)];
-        match self.txn_fenced(extra_cmp, ops, vec![]).await? {
-            true => Ok(true),
-            false => Ok(false),
+        let stored: autumn_rpc::manager_rpc::MgrInodeLeaseRecord = match autumn_rpc::manager_rpc::rkyv_decode(&kv.value) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(key, error = %e, "undecodable lease record; heartbeat leaves it alone");
+                return Ok(false);
+            }
+        };
+        if stored.writer.kind != record.writer.kind
+            || stored.writer.uuid != record.writer.uuid
+            || stored.version != record.version
+        {
+            return Ok(false);
         }
+        let extra_cmp = vec![autumn_etcd::Cmp::value(key.as_bytes(), kv.value.as_slice())];
+        let value = rkyv_encode(record).to_vec();
+        let ops = vec![autumn_etcd::Op::put(key.as_bytes(), &value)];
+        self.txn_fenced(extra_cmp, ops, vec![]).await
     }
 
     async fn put_delete_txn_cas(

@@ -2359,6 +2359,11 @@ Invariants (enforced by code structure):
   are memory-only. Failover rehydrates writers (`install_persisted_writer`, clamping the
   deadline to the TTL against clock skew); reader-set loss is benign (daemons invalidate
   everything on subscribe reconnect).
+  A writer heartbeat refreshes its record (`refresh_writer_record`) only while the
+  stored record is still that writer's at that version: the etcd write is awaited after
+  the in-memory renewal, and a release or a force-preempt landing in between must stand.
+  A CAS on the value read alone took a record replaced before the read as its baseline
+  and wrote the old writer back (`heartbeat_refresh_never_overwrites_the_next_writers_record`).
 - **L4** `tick(now)` captures the reader set BEFORE evicting expired readers (order:
   writer revoke → reader expiry → drop-empty-inode → push invalidations) so a reader
   expiring on the writer's TTL boundary still gets the push.
