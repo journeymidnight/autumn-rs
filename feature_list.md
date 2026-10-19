@@ -20,6 +20,7 @@
   - `AsyncMergeIterator` 没有自己的单测（同步 `MergeIterator` 只在测试里存在，已随其测试删除）；合并顺序只由上层 range/compaction 测试间接覆盖。
   - 没有测试覆盖"超大 Put 不推高 inode fence floor"（`enqueue_put_rejects_oversized_value` 传的 floor 是 None）。
   - `etcd_replay_owner_lock_allows_check_commit_length_without_reacquire` 用 `drop(mgr1)`，mgr1 仍是 leader，failover 重放没被走到。
+  - GitHub CI（4 vCPU、非 root）上 `system_roll_tails_live_writer` 失败（2026-10-19）；本机 4 核、非 root、2 核 10 次均绿，缺 CI 日志，原因未知。
   - 推断：`handle_check_commit_length` 没有 leader 检查，standby 会用冻结的 store 回答（与"standby 拒绝元数据查询"相悖），未核实。
   - 推断：transport `many_concurrent_at` 用 `let _ = h.await` 丢弃任务结果，任务 panic 可能不会让测试失败，未核实。
 - **Scope**: 逐项核实；真缺口补测试（消融能红），真 bug 另立条目按根因修，偶发失败先复现再定位。

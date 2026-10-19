@@ -19,6 +19,9 @@ jobs:
           # autumn-manager/fuse-tests pulls in autumn-fuse and fuser.
           # fuse3 provides fusermount3 for fuse_umount_exit's real mount.
           sudo apt-get install -y etcd-server protobuf-compiler libfuse3-dev fuse3
+          # autumn-fuse mounts with auto_unmount, which implies allow_other; the
+          # runner is not root, so fusermount3 refuses it without this.
+          echo user_allow_other | sudo tee -a /etc/fuse.conf >/dev/null
           # Network-fault tests (etcd_resend_after_timeout, update_stream_ec_cas, ...)
           # spawn toxiproxy-server and drive it with toxiproxy-cli.
           v=2.12.0

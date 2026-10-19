@@ -1,3 +1,10 @@
+Date: 2026-10-19 (4)
+TaskStatus: not_completed
+Task scope: user — GitHub CI: 4 targets failed (fuse_umount_exit, system_roll_tails_live_writer, cpuset_pinning, op_info_open_extent_shard).
+Current summary: three fixed, each reproduced under runner conditions first (4 cores via taskset, non-root via runuser nobody): fuse_umount_exit — AutoUnmount makes fuser add allow_other, which non-root fusermount3 refuses without user_allow_other (CI now sets it; ops.md notes it); cpuset_pinning needed 6 cores — PS now reuses EN cores (4 total), ablation still red; op_info_open_extent_shard needed 8 cores — 3 shards keep the open log extent (id 10) on shard 1, ablation still red.
+Main gaps: system_roll_tails_live_writer fails on CI but not locally (4 cores, non-root, 2 cores x10 all green); needs the CI log.
+Next steps: get that test's failure output from the CI log.
+
 Date: 2026-10-19 (3)
 TaskStatus: completed
 Task scope: user — GitHub CI red on missing toxiproxy-server; then fix BUG-LEASE-HEARTBEAT-CAS-OVERWRITE and the two flaky tests.

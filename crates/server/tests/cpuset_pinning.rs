@@ -189,13 +189,14 @@ fn cpuset_moves_threads_off_a_narrower_launcher_mask() {
     )
     .expect("parse own Cpus_allowed_list");
     assert!(
-        allowed.len() >= 6,
-        "this test needs 6 allowed cores (launcher + 2 EN shards + 1 single-shard EN + P-log + P-sst), have {allowed:?}"
+        allowed.len() >= 4,
+        "this test needs 4 allowed cores (a launcher core + 3 for the --cpusets), have {allowed:?}"
     );
-    // Take the LAST six allowed cores: the launcher core must not be in any
-    // --cpuset, and each work unit gets its own.
-    let c = &allowed[allowed.len() - 6..];
-    let (launcher, en_a, en_b, en_single, p_log, p_sst) = (c[0], c[1], c[2], c[3], c[4], c[5]);
+    // The LAST four allowed cores: the launcher's is in no --cpuset. Every
+    // check is within one process, so the PS may reuse the ENs' cores.
+    let c = &allowed[allowed.len() - 4..];
+    let (launcher, en_a, en_b, en_single) = (c[0], c[1], c[2], c[3]);
+    let (p_log, p_sst) = (en_b, en_single);
 
     // Declared before every child, so it drops after they are killed — on a
     // failed assertion too.

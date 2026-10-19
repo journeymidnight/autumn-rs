@@ -8,7 +8,7 @@
 //! renders as 0 B — while the cluster overview, fed by the PS's own
 //! shard-routed probe, counts its bytes.
 //!
-//! Topology: in-memory manager, one 8-shard EN, one PS, replication 1.
+//! Topology: in-memory manager, one 3-shard EN, one PS, replication 1.
 
 use std::net::TcpListener;
 use std::process::{Child, Command, Stdio};
@@ -20,7 +20,7 @@ const PARTITION_SERVER_BIN: &str = env!("CARGO_BIN_EXE_autumn-ps");
 const AUTUMN_OP_BIN: &str = env!("CARGO_BIN_EXE_autumn-op");
 const AUTUMN_CLIENT_BIN: &str = env!("CARGO_BIN_EXE_autumn-client");
 
-const EN_SHARDS: u32 = 8;
+const EN_SHARDS: u32 = 3;
 
 fn cluster_secret_file() -> &'static std::path::Path {
     static FILE: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();

@@ -1324,7 +1324,9 @@ on normally. Only a reboot or a host-side `umount -l` clears it. We lost five
 nodes to exactly this shape. `MountOption::AutoUnmount` (now always set, see
 `crates/fuse/src/main.rs`) is what closes it — fusermount3 drops the mount as
 soon as the daemon's fd closes, SIGKILL included. **Do not run a build without
-that fix under `Bidirectional`.**
+that fix under `Bidirectional`.** AutoUnmount makes fuser add `allow_other`, so a
+daemon running as non-root needs `user_allow_other` in `/etc/fuse.conf` (as root,
+as in our images, it does not).
 
 The single-container form above avoids this escape entirely: nothing propagates,
 so nothing can outlive the pod. That is the second reason to prefer it.
