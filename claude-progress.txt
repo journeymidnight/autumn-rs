@@ -1,3 +1,10 @@
+Date: 2026-10-19 (3)
+TaskStatus: completed
+Task scope: user — GitHub CI red on missing toxiproxy-server; then fix BUG-LEASE-HEARTBEAT-CAS-OVERWRITE and the two flaky tests.
+Current summary: a843aacf installs toxiproxy 2.12.0 in CI (sha256-pinned) and adds --no-fail-fast (the five toxiproxy tests were never ignored, so CI had been red there all along). Heartbeat bug reproduced with a failpoint (old writer's refresh parked after its in-memory renewal; a force-preempt granted meanwhile; the refresh wrote the old writer back); fixed by refresh_writer_record (write only while the stored record is this writer's at this version), ablation red. cq_flushes test: the reads never shared the append's connection (empty pool, 101 concurrent connects), so it measured nothing; primed the pool, burst ablation now 1.00 vs SQ/CQ 0.68-0.79, threshold 0.9, 20/20 green. Merge reopen polls panicked on a reset connection (ps_get .expect); try_ps_get/try_psr_get in all eight such loops. Reviewed (fable); its serial-guard finding applied.
+Main gaps: F-TEST-FOLLOWUPS (remaining items).
+Next steps: watch the next GitHub CI run (more failures may surface now that --no-fail-fast reports every target).
+
 Date: 2026-10-19 (2)
 TaskStatus: completed
 Task scope: user — test-suite review: how much is covered, and remove/fix tests that are stale, too fine-grained, or cannot fail ("1,2,3 执行", then "过时或过于细碎的也删").

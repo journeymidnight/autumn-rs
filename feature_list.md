@@ -1,6 +1,6 @@
 # autumn-rs feature list — OPEN backlog
 
-**Last updated:** 2026-10-19 (test-suite hygiene done and removed: stale ignores lifted, unfailable tests fixed, obsolete/duplicate/fine-grained tests deleted; follow-ups in F-TEST-FOLLOWUPS)
+**Last updated:** 2026-10-19 (heartbeat lease refresh no longer overwrites the next writer; cq timing test and merge reopen polls fixed; all three removed)
 
 **Rules:**
 - This file tracks the **OPEN backlog only**. A feature that reaches `passes: true`
@@ -20,24 +20,10 @@
   - `AsyncMergeIterator` 没有自己的单测（同步 `MergeIterator` 只在测试里存在，已随其测试删除）；合并顺序只由上层 range/compaction 测试间接覆盖。
   - 没有测试覆盖"超大 Put 不推高 inode fence floor"（`enqueue_put_rejects_oversized_value` 传的 floor 是 None）。
   - `etcd_replay_owner_lock_allows_check_commit_length_without_reacquire` 用 `drop(mgr1)`，mgr1 仍是 leader，failover 重放没被走到。
-  - `auto_dispatch_merge_orchestrates_full_flow` 偶发失败：整文件跑 6 次红 1 次，`support::psr_get` 的 `.expect("get")` 拿到 RPC 错误；单跑 3/3 绿。
   - 推断：`handle_check_commit_length` 没有 leader 检查，standby 会用冻结的 store 回答（与"standby 拒绝元数据查询"相悖），未核实。
   - 推断：transport `many_concurrent_at` 用 `let _ = h.await` 丢弃任务结果，任务 panic 可能不会让测试失败，未核实。
 - **Scope**: 逐项核实；真缺口补测试（消融能红），真 bug 另立条目按根因修，偶发失败先复现再定位。
 - **Acceptance**: 每项写明结论（已补/已修/证伪）；补的测试消融变红。
-- `passes: false`
-
-### BUG-CQ-FLUSH-TIMING-TEST — `cq_flushes_fast_ops_while_slow_op_runs` 在 HEAD 上本机 4/5 失败
-- **Trigger** (2026-10-19，覆盖率全量跑时发现): `crates/stream/tests/extent_pipeline.rs` 要求首个读响应 < 0.5 × 64 MiB 持久 append 耗时，本机实测比值 0.50–0.55（首读约 180 ms，远非预期的微秒级）。无插桩、tmpdir 换真盘（/data05）结果相同。推断（未核实）：100 个读排在同一 TCP 连接上 64 MiB append 载荷之后，测的主要是发送时间，阈值贴着噪声。CI 是否同样红未知（本机 gh 未登录）。
-- **Scope**: 先在旧 commit（独立 worktree + 独立 target）上跑同一测试，区分代码回退与阈值过紧；再按根因修（产品代码回退则修代码；测试设计问题则改测量方式，让被测机制成为唯一解释）。
-- **Acceptance**: 根因写进本条；修后本机连跑 20 次全绿；若改测试，消融（把 handler 改回 burst 处理）仍能变红。
-- `passes: false`
-
-### BUG-LEASE-HEARTBEAT-CAS-OVERWRITE — 心跳刷新 etcd 记录用"先读再 CAS"，读之前被换掉的记录会被旧 writer 覆盖（推断，未在真实交错下复现）
-- **Trigger** (2026-10-19，测试集体检时把 `bug_lease_1_r2_heartbeat_cas` 改成真能走到 `read_then_cas_put` 后发现): `read_then_cas_put`（`crates/manager/src/lib.rs`）以**自己读到的**值作 CAS 基线，只防"读与 txn 之间"的变化。心跳在内存里续约后，若并发的 force-revoke + 新 writer acquire 的 etcd 写在心跳的 GET 之前落地，GET 读到的就是新 writer 的记录，CAS 以它为基线成功，把旧 writer 的记录写回去。已证实的部分：在 etcd 里从外部把记录换成别的值再心跳，记录被覆盖（测试曾按此写成，断言红）。未证实：同一 manager 内的真实交错能否在 GET 期间完成另一次 acquire 的 etcd 写。
-- **影响有界**: 新 writer 下一次心跳会以被覆盖的记录为基线 CAS 写回自己的记录，所以错误记录只存活一个心跳周期，只有恰在其中发生 failover 才会重放错的 writer。
-- **Scope**: 先用暂停点在心跳的 GET 期间插入一次 force-revoke + acquire 复现；坐实后基线改为"内存里上一次写下的本 writer 记录"（或比较 mod_revision，或解码读到的记录、不是本 writer 就跳过），而不是现读的值。`rpc_handlers.rs` 心跳处理里"CAS 能挡住 force-revoke + 新 acquire 的覆盖"那段注释与此不符，修时一并改。
-- **Acceptance**: 复现用例修前红、修后绿；消融（改回现读基线）变红。
 - `passes: false`
 
 ### BUG-LEASE-HEARTBEAT-STALE-NOTHELD — 心跳快照期间重新 acquire 的 lease 会被迟到的 NotHeld 删掉（推断，未复现）
