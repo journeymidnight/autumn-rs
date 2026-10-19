@@ -8,8 +8,7 @@
 //! to return `CODE_NOT_LEADER` until the manager re-acquires.
 //!
 //! Requires the `etcd` binary on `$PATH` (or override via
-//! `AUTUMN_TEST_ETCD_BIN`). Marked `#[ignore]` to follow the repo
-//! convention for etcd-dependent tests so CI without etcd skips them.
+//! `AUTUMN_TEST_ETCD_BIN`).
 
 mod support;
 
@@ -39,7 +38,6 @@ fn start_etcd_manager(mgr_addr: SocketAddr, etcd_endpoint: String) {
 // ── deposed leader's writes are fence-rejected ──────────────────
 
 #[test]
-#[ignore] // requires embedded etcd (go runtime)
 fn deposed_leader_etcd_writes_are_fenced() {
     compio::runtime::Runtime::new().unwrap().block_on(async {
         let (_etcd_guard, etcd_endpoint) = start_etcd().await;

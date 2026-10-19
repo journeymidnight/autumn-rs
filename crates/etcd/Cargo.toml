@@ -21,6 +21,7 @@ http-body = "1"
 
 [dev-dependencies]
 compio = { workspace = true, features = ["net", "time", "io-compat", "macros"] }
+tempfile = "3"
 tracing-subscriber = "0.3"
 
 [lints]

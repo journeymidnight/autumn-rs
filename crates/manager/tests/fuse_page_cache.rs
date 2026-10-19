@@ -112,7 +112,6 @@ fn keeps(flags: u32) -> bool {
 }
 
 #[test]
-#[ignore]
 fn page_cache_survives_reopen_until_another_mount_rewrites_the_file() {
     let mgr_addr = pick_addr();
     start_manager(mgr_addr);
@@ -151,7 +150,6 @@ fn page_cache_survives_reopen_until_another_mount_rewrites_the_file() {
 }
 
 #[test]
-#[ignore]
 fn an_open_under_a_held_lease_keeps_the_cache_unless_an_invalidation_failed() {
     let mgr_addr = pick_addr();
     start_manager(mgr_addr);
@@ -182,7 +180,6 @@ fn an_open_under_a_held_lease_keeps_the_cache_unless_an_invalidation_failed() {
 }
 
 #[test]
-#[ignore]
 fn forgetting_the_inode_forgets_what_its_pages_held() {
     let mgr_addr = pick_addr();
     start_manager(mgr_addr);
@@ -218,7 +215,6 @@ fn forgetting_the_inode_forgets_what_its_pages_held() {
 /// the size this mount reports must be the new one — even though it still holds
 /// an fd and has the inode cached.
 #[test]
-#[ignore]
 fn getattr_reports_an_append_made_by_another_mount_while_an_fd_is_open() {
     let mgr_addr = pick_addr();
     start_manager(mgr_addr);
@@ -263,7 +259,6 @@ fn getattr_reports_an_append_made_by_another_mount_while_an_fd_is_open() {
 /// Bytes this mount wrote are in its page cache under its own write lease:
 /// the next open must keep them rather than read them all back.
 #[test]
-#[ignore]
 fn a_file_this_mount_wrote_stays_cached_on_the_next_open() {
     let mgr_addr = pick_addr();
     start_manager(mgr_addr);
@@ -292,7 +287,6 @@ fn a_file_this_mount_wrote_stays_cached_on_the_next_open() {
 /// flush clears `dirty` before its put lands). Adopting the smaller KV size is
 /// the data loss `meta::get_inode_uncached` describes.
 #[test]
-#[ignore]
 fn a_mark_never_shrinks_the_size_of_a_file_this_mount_is_writing() {
     let mgr_addr = pick_addr();
     start_manager(mgr_addr);

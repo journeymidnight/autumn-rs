@@ -13,9 +13,8 @@
 //! byte-exact. Fails if the append path's extents aren't at the same keys the
 //! cold scan/read use.
 //!
-//! Driven directly through `FsState` (the kernel FUSE mount layer is unchanged).
-//! `#[ignore]` — needs a live cluster (manager + 2 EN + PS), same as
-//! `system_fuse_read.rs`.
+//! Driven directly through `FsState` (the kernel FUSE mount layer is unchanged)
+//! on an in-process cluster (manager + 2 EN + PS).
 
 mod support;
 
@@ -68,7 +67,6 @@ async fn boot_cluster(
 }
 
 #[test]
-#[ignore]
 fn cold_remount_reads_back_written_extents() {
     let mgr_addr = pick_addr();
     start_manager(mgr_addr);
@@ -133,7 +131,6 @@ fn cold_remount_reads_back_written_extents() {
 /// PyO3 binding does) and the mount's bounded batches resumed at arbitrary
 /// offsets, including offsets that land inside and exactly on a page edge.
 #[test]
-#[ignore]
 fn readdir_pages_past_one_range_page() {
     let mgr_addr = pick_addr();
     start_manager(mgr_addr);
@@ -206,7 +203,6 @@ fn readdir_pages_past_one_range_page() {
 /// must refuse it rather than stamp the current version over them — which it
 /// did, on a live conversion, before this check.
 #[test]
-#[ignore]
 fn an_unstamped_populated_tree_is_refused_not_stamped() {
     let mgr_addr = pick_addr();
     start_manager(mgr_addr);

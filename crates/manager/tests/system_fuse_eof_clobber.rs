@@ -55,7 +55,6 @@ async fn boot_cluster(
 }
 
 #[test]
-#[ignore]
 fn eof_read_must_not_clobber_unpublished_size() {
     let mgr_addr = pick_addr();
     start_manager(mgr_addr);

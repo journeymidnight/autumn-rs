@@ -41,8 +41,7 @@
 //! (the same host/template as `system_ps_failover_chaos.rs`). Build first:
 //!   cargo build --release -p autumn-ps
 //! Run:
-//!   cargo test -p autumn-manager --test system_sigstop_zombie_writer \
-//!       -- --ignored --nocapture
+//!   cargo test -p autumn-manager --test system_sigstop_zombie_writer -- --nocapture
 
 mod support;
 
@@ -337,7 +336,6 @@ async fn get_bounded(
 }
 
 #[test]
-#[ignore] // requires the built autumn-ps binary; boots a full subprocess cluster
 fn sigstop_zombie_writer_g1() {
     let mgr_addr = pick_addr();
     start_manager(mgr_addr);

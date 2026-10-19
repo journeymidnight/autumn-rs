@@ -139,6 +139,7 @@ dependencies = [
  "hyper",
  "prost",
  "send_wrapper",
+ "tempfile",
  "tracing",
  "tracing-subscriber",
 ]

@@ -80,7 +80,6 @@ where
 }
 
 #[test]
-#[ignore] // requires a real etcd binary on PATH
 fn managers_hold_their_ids_and_the_leader_keeps_the_membership() {
     compio::runtime::Runtime::new().unwrap().block_on(async {
         let (_etcd_guard, endpoint) = start_etcd().await;

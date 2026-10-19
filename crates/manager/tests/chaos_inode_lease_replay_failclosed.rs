@@ -15,7 +15,7 @@
 //! `new_with_etcd` runs `replay_from_etcd().await?` before anything else, so a
 //! corrupt writer lease makes construction itself fail.
 //!
-//! Requires the `etcd` binary on `$PATH`. Marked `#[ignore]` per repo convention.
+//! Requires the `etcd` binary on `$PATH`.
 
 mod support;
 
@@ -25,7 +25,6 @@ use autumn_rpc::manager_rpc::{rkyv_encode, MgrClientId, MgrInodeLeaseRecord};
 use support::start_etcd;
 
 #[test]
-#[ignore] // requires embedded etcd (go runtime)
 fn malformed_inode_lease_replay_fails_closed() {
     compio::runtime::Runtime::new().unwrap().block_on(async {
         let (_etcd_guard, etcd_endpoint) = start_etcd().await;
@@ -83,7 +82,6 @@ fn malformed_inode_lease_replay_fails_closed() {
 /// keys on `rec.ino`, so it would install the writer under the wrong inode and
 /// leave the KEY's inode writer-less (a second-writer hazard). Must fail-loud.
 #[test]
-#[ignore] // requires embedded etcd (go runtime)
 fn inode_lease_key_payload_ino_mismatch_fails_closed() {
     compio::runtime::Runtime::new().unwrap().block_on(async {
         let (_etcd_guard, etcd_endpoint) = start_etcd().await;

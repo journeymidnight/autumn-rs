@@ -91,8 +91,9 @@ Single-threaded compio (`Rc<RefCell<GrpcChannel>>`). Not Send/Sync — matches t
 # Unit tests (no external deps)
 cargo test -p autumn-etcd --lib
 
-# Integration tests (requires etcd at 127.0.0.1:2379)
-cargo test -p autumn-etcd --test integration
+# Concurrent-caller regression (spawns its own etcd: `etcd` on $PATH, or
+# AUTUMN_TEST_ETCD_BIN)
+cargo test -p autumn-etcd --test concurrent_calls
 ```
 
 ## Runtime compatibility

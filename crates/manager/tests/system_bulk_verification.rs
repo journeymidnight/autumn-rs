@@ -82,7 +82,6 @@ fn bulk_write_crash_restart_all_data_intact() {
 }
 
 #[test]
-#[ignore] // compound test
 fn bulk_mixed_ops_split_restart_verify() {
     let mgr_addr = pick_addr();
     start_manager(mgr_addr);

@@ -205,7 +205,6 @@ fn key_for(part_idx: usize, i: u32) -> Vec<u8> {
 }
 
 #[test]
-#[ignore] // requires built binaries; boots a full cluster
 fn ps_kill_migrates_partitions() {
     let mgr_addr = pick_addr();
     start_manager(mgr_addr);
@@ -300,7 +299,6 @@ fn ps_kill_migrates_partitions() {
 }
 
 #[test]
-#[ignore] // requires built binaries; boots a full cluster
 fn ps_kill_during_write_storm() {
     let mgr_addr = pick_addr();
     start_manager(mgr_addr);

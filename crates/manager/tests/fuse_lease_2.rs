@@ -89,7 +89,6 @@ fn counting_invalidator() -> (InodeInvalidator, Arc<Mutex<Vec<u64>>>) {
 }
 
 #[test]
-#[ignore]
 fn per_ino_writer_close_triggers_invalidator() {
     let mgr_addr = pick_addr();
     start_manager(mgr_addr);
@@ -187,7 +186,6 @@ fn per_ino_writer_close_triggers_invalidator() {
 }
 
 #[test]
-#[ignore]
 fn multiple_distinct_inos_each_get_invalidated() {
     // The per-ino invalidator must fire for EACH distinct ino in
     // an event batch — production case: a reader subscribes to N

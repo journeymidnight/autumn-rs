@@ -89,7 +89,6 @@ async fn namespace_list(mgr: &RpcClient) -> NamespaceListResp {
 }
 
 #[test]
-#[ignore] // requires embedded etcd
 fn bootstrap_persists_leader_gates_and_successor_replay_rehydrates() {
     compio::runtime::Runtime::new().unwrap().block_on(async {
         let (_etcd_guard, etcd_endpoint) = start_etcd().await;

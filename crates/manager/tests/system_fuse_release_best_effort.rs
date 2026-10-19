@@ -44,7 +44,6 @@ use autumn_fuse::dispatch;
 use support::*;
 
 #[test]
-#[ignore]
 fn release_must_not_consume_the_sticky_flush_error() {
     let mgr_addr = pick_addr();
     start_manager(mgr_addr);
@@ -196,7 +195,6 @@ fn release_must_not_consume_the_sticky_flush_error() {
 /// in `dispatch.rs` and the acquire below is Granted instead of Conflict — the
 /// writer slot is gone while this mount still owes the cluster a size.
 #[test]
-#[ignore]
 fn a_failed_last_writer_flush_keeps_the_write_lease() {
     let mgr_addr = pick_addr();
     start_manager(mgr_addr);

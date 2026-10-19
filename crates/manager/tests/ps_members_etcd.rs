@@ -116,7 +116,6 @@ async fn connect_leader(addr: SocketAddr) -> std::rc::Rc<RpcClient> {
 }
 
 #[test]
-#[ignore] // requires a real etcd binary on PATH
 fn an_evicted_ps_stays_expected_across_a_leader_change_until_removed() {
     compio::runtime::Runtime::new().unwrap().block_on(async {
         let (_etcd_guard, etcd_endpoint) = start_etcd().await;
@@ -190,7 +189,6 @@ fn an_evicted_ps_stays_expected_across_a_leader_change_until_removed() {
 /// (a standby answers heartbeats NOT_LEADER). Healthy PSes stay; a silent one
 /// goes after the window; one the old leader evicted is not brought back.
 #[test]
-#[ignore] // requires a real etcd binary on PATH
 fn a_standby_promoted_late_keeps_the_heartbeating_fleet() {
     compio::runtime::Runtime::new().unwrap().block_on(async {
         let (_etcd_guard, etcd_endpoint) = start_etcd().await;

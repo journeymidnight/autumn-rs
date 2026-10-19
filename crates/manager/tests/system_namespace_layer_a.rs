@@ -10,8 +10,8 @@
 //!    a Prepend-bound client's striped chunk keys land INSIDE
 //!    `[{scope}/, {scope}0)`, not in a global `\xff\xfe…` space.
 //!
-//! Both need EN binaries + a real PS, so they are `#[ignore]` (run explicitly),
-//! mirroring `system_putstream.rs`.
+//! Both run on an in-process cluster (ENs + a real PS), like
+//! `system_putstream.rs`.
 
 mod support;
 
@@ -54,7 +54,6 @@ async fn ns_create(mgr: &RpcClient, name: &str) {
 }
 
 #[test]
-#[ignore] // needs EN binaries + a real PS
 fn layer_a_rejects_unregistered_namespace_put() {
     let mgr_addr = pick_addr();
     start_memory_manager(mgr_addr);
@@ -123,7 +122,6 @@ fn layer_a_rejects_unregistered_namespace_put() {
 /// `--config-poll-secs` (an hour here). A namespace that really does not exist
 /// still ends in `NamespaceUnknown`.
 #[test]
-#[ignore] // needs EN binaries + a real PS
 fn a_namespace_created_after_the_ps_started_is_writable_at_once() {
     // Process-wide: the other tests of this binary create no namespace after
     // their PS started, so the long poll does not touch them.
@@ -171,7 +169,6 @@ fn a_namespace_created_after_the_ps_started_is_writable_at_once() {
 }
 
 #[test]
-#[ignore] // needs EN binaries + a real PS
 fn putstream_chunks_land_in_scope_range() {
     let mgr_addr = pick_addr();
     start_manager(mgr_addr); // no namespace registered → Layer-A OFF (not under test)

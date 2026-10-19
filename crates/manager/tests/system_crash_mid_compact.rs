@@ -80,7 +80,6 @@ fn crash_during_compaction_no_data_loss() {
 }
 
 #[test]
-#[ignore] // compound test
 fn crash_during_compaction_then_successful_compact() {
     let mgr_addr = pick_addr();
     start_manager(mgr_addr);

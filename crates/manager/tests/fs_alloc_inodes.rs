@@ -138,7 +138,6 @@ fn start_etcd_manager(mgr_addr: SocketAddr, etcd_endpoint: String) {
 /// with NOT_LEADER — never grant (the double-grant a second live allocator
 /// produced under the legacy client-side RMW).
 #[test]
-#[ignore] // requires embedded etcd
 fn etcd_counter_is_cas_backed_and_follower_refuses() {
     compio::runtime::Runtime::new().unwrap().block_on(async {
         let (_etcd_guard, etcd_endpoint) = start_etcd().await;
@@ -203,7 +202,6 @@ fn etcd_counter_is_cas_backed_and_follower_refuses() {
 /// Every one must be granted, disjointly: the leader's own concurrent grants
 /// must not use up each other's CAS attempts.
 #[test]
-#[ignore] // requires embedded etcd
 fn a_burst_of_allocators_is_all_granted() {
     compio::runtime::Runtime::new().unwrap().block_on(async {
         let (_etcd_guard, etcd_endpoint) = start_etcd().await;

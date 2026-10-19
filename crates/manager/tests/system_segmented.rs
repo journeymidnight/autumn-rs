@@ -92,7 +92,6 @@ async fn read_all(st: &mut FsState, ino: u64, len: usize) -> Vec<u8> {
 }
 
 #[test]
-#[ignore]
 fn segmented_files_splice_read_page_and_reclaim() {
     let mgr_addr = pick_addr();
     start_manager(mgr_addr);
@@ -209,7 +208,6 @@ fn segmented_files_splice_read_page_and_reclaim() {
 /// tombstone waits, the sweep defers, and once the holder lets go the sweep
 /// reclaims every data object, the inode and the tombstone.
 #[test]
-#[ignore]
 fn reclaim_waits_for_other_holders() {
     use autumn_client::lease::{self, AcquireResult, DaemonClientId};
     let mgr_addr = pick_addr();
@@ -268,7 +266,6 @@ fn reclaim_waits_for_other_holders() {
 /// A file unlinked while THIS session holds it keeps its data until the
 /// session lets go (the FUSE last close), then loses all of it.
 #[test]
-#[ignore]
 fn unlinked_while_open_here_is_reclaimed_at_last_close() {
     let mgr_addr = pick_addr();
     start_manager(mgr_addr);
@@ -315,7 +312,6 @@ fn unlinked_while_open_here_is_reclaimed_at_last_close() {
 /// for the sweep before anything is written, so an object that is never
 /// published is still found.
 #[test]
-#[ignore]
 fn a_path_truncate_takes_its_own_lease() {
     use autumn_client::lease::{self, AcquireResult, DaemonClientId};
     let mgr_addr = pick_addr();
@@ -380,7 +376,6 @@ fn a_path_truncate_takes_its_own_lease() {
 /// clip of the stale map, once published, would have the reclaim that
 /// follows delete the other session's objects.
 #[test]
-#[ignore]
 fn a_path_truncate_reads_the_map_under_its_lease() {
     let mgr_addr = pick_addr();
     start_manager(mgr_addr);

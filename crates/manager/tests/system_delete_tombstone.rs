@@ -148,7 +148,6 @@ fn delete_compaction_removes_tombstones() {
 }
 
 #[test]
-#[ignore] // compound test
 fn delete_before_split_correct_in_both_children() {
     let mgr_addr = pick_addr();
     start_manager(mgr_addr);

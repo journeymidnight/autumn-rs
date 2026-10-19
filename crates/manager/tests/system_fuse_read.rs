@@ -65,7 +65,6 @@ async fn boot_cluster(
 }
 
 #[test]
-#[ignore]
 fn variable_length_extents() {
     let mgr_addr = pick_addr();
     start_manager(mgr_addr);
@@ -204,7 +203,6 @@ fn variable_length_extents() {
 /// the newly appended extents. Visibility is still bounded by the WRITER
 /// flushing: bytes sitting in its 64 MiB write buffer are nobody else's yet.
 #[test]
-#[ignore]
 fn a_second_mount_sees_appended_data_on_a_linear_read() {
     let mgr_addr = pick_addr();
     start_manager(mgr_addr);

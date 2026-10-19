@@ -67,7 +67,6 @@ async fn read_name(st: &mut FsState, parent: u64, name: &str) -> Option<Vec<u8>>
 }
 
 #[test]
-#[ignore]
 fn publish_conditions_replace_delete_and_dead_sessions() {
     let mgr_addr = pick_addr();
     start_manager(mgr_addr);
@@ -196,7 +195,6 @@ fn publish_conditions_replace_delete_and_dead_sessions() {
 /// drop a name from that inode again at recovery: with a second hard link
 /// that second drop deletes a file another name still reaches.
 #[test]
-#[ignore]
 fn a_retire_whose_swap_lost_leaves_a_linked_inode_alone() {
     let mgr_addr = pick_addr();
     start_manager(mgr_addr);
@@ -242,7 +240,6 @@ fn a_retire_whose_swap_lost_leaves_a_linked_inode_alone() {
 /// A dead session behind more live ones than one page of session records
 /// (a large gateway fleet: 8 workers each) is still found and recovered.
 #[test]
-#[ignore]
 fn a_dead_session_behind_a_page_of_live_ones_is_recovered() {
     let mgr_addr = pick_addr();
     start_manager(mgr_addr);
@@ -327,7 +324,6 @@ async fn data_keys(st: &mut FsState) -> Vec<Vec<u8>> {
 /// put — declared up front or raised as the body grows — and end at the
 /// exact length; an abort with puts still in flight must leave nothing.
 #[test]
-#[ignore]
 fn a_streamed_object_records_ahead_of_its_writes() {
     let mgr_addr = pick_addr();
     start_manager(mgr_addr);

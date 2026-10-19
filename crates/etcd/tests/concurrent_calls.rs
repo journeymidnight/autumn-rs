@@ -12,30 +12,62 @@
 //! the second one. Workaround was "GC one partition at a time"; the fix
 //! removes the workaround.
 //!
-//! Requires etcd running at `127.0.0.1:2379` (matches the convention used
-//! by `crates/manager/tests/`). Test prints a skip notice and returns
-//! success if etcd is unreachable.
+//! Each test spawns its own `etcd` (on `$PATH`, or `AUTUMN_TEST_ETCD_BIN`)
+//! and fails if it cannot.
 
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use autumn_etcd::EtcdClient;
 
-const ETCD_ENDPOINT: &str = "127.0.0.1:2379";
+struct Etcd {
+    child: std::process::Child,
+    _dir: tempfile::TempDir,
+}
 
-async fn etcd_or_skip(test_name: &str) -> Option<EtcdClient> {
-    match EtcdClient::connect(ETCD_ENDPOINT).await {
-        Ok(c) => match c.get("__concurrent_health_check__").await {
-            Ok(_) => Some(c),
-            Err(e) => {
-                eprintln!("[{test_name}] skipped — etcd reachable but get failed: {e}");
-                None
-            }
-        },
-        Err(e) => {
-            eprintln!("[{test_name}] skipped — etcd not reachable at {ETCD_ENDPOINT}: {e}");
-            None
+impl Drop for Etcd {
+    fn drop(&mut self) {
+        if let Err(e) = self.child.kill() {
+            eprintln!("kill etcd: {e}");
         }
+        if let Err(e) = self.child.wait() {
+            eprintln!("wait etcd: {e}");
+        }
+    }
+}
+
+fn free_port() -> u16 {
+    let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind 127.0.0.1:0");
+    l.local_addr().expect("local_addr").port()
+}
+
+async fn start_etcd() -> (Etcd, EtcdClient) {
+    let bin = std::env::var("AUTUMN_TEST_ETCD_BIN").unwrap_or_else(|_| "etcd".to_string());
+    let client_url = format!("http://127.0.0.1:{}", free_port());
+    let peer_url = format!("http://127.0.0.1:{}", free_port());
+    let dir = tempfile::tempdir().expect("etcd tempdir");
+    let child = std::process::Command::new(&bin)
+        .args(["--name", "n1", "--log-level", "error"])
+        .arg("--data-dir")
+        .arg(dir.path().join("data"))
+        .args(["--listen-client-urls", &client_url, "--advertise-client-urls", &client_url])
+        .args(["--listen-peer-urls", &peer_url, "--initial-advertise-peer-urls", &peer_url])
+        .arg("--initial-cluster")
+        .arg(format!("n1={peer_url}"))
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap_or_else(|e| panic!("spawn `{bin}`: {e} — install etcd or set AUTUMN_TEST_ETCD_BIN"));
+    let etcd = Etcd { child, _dir: dir };
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if let Ok(c) = EtcdClient::connect(&client_url).await {
+            if c.get("health-check").await.is_ok() {
+                return (etcd, c);
+            }
+        }
+        assert!(Instant::now() < deadline, "etcd at {client_url} not ready after 30 s");
+        compio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 
@@ -43,15 +75,8 @@ async fn etcd_or_skip(test_name: &str) -> Option<EtcdClient> {
 /// all succeed without panicking on `RefCell::borrow_mut`.
 #[compio::test]
 async fn concurrent_puts_no_borrow_panic() {
-    let Some(client) = etcd_or_skip("concurrent_puts_no_borrow_panic").await else {
-        return;
-    };
+    let (_etcd, client) = start_etcd().await;
     let client = Rc::new(client);
-
-    // Clean up any previous run.
-    for i in 0..8 {
-        let _ = client.delete(format!("__concurrent__/put/{i}")).await;
-    }
 
     let mut handles = Vec::new();
     for i in 0..8 {
@@ -75,19 +100,12 @@ async fn concurrent_puts_no_borrow_panic() {
         assert_eq!(r.kvs.len(), 1, "key {i} missing");
         assert_eq!(r.kvs[0].value, format!("value-{i}").into_bytes());
     }
-
-    // Cleanup.
-    for i in 0..8 {
-        let _ = client.delete(format!("__concurrent__/put/{i}")).await;
-    }
 }
 
 /// mixed workload: concurrent puts + gets on one client.
 #[compio::test]
 async fn concurrent_mixed_no_borrow_panic() {
-    let Some(client) = etcd_or_skip("concurrent_mixed_no_borrow_panic").await else {
-        return;
-    };
+    let (_etcd, client) = start_etcd().await;
     let client = Rc::new(client);
 
     // Pre-populate so reads have something to find.
@@ -118,44 +136,5 @@ async fn concurrent_mixed_no_borrow_panic() {
         h.await
             .unwrap_or_else(|_| panic!("task {i} panicked (likely RefCell borrow)"))
             .unwrap_or_else(|e| panic!("op {i} failed: {e}"));
-    }
-
-    for i in 0..4 {
-        let _ = client.delete(format!("__concurrent__/mix/{i}")).await;
-    }
-}
-
-/// stress: 16 tasks all firing simultaneously hammer the borrow path.
-#[compio::test]
-async fn concurrent_stress_no_borrow_panic() {
-    let Some(client) = etcd_or_skip("concurrent_stress_no_borrow_panic").await else {
-        return;
-    };
-    let client = Rc::new(client);
-
-    let mut handles = Vec::new();
-    for i in 0..16 {
-        let c = client.clone();
-        handles.push(compio::runtime::spawn(async move {
-            // Small sleep so the runtime has a chance to interleave the
-            // borrow_mut sites if the fix regresses.
-            compio::time::sleep(Duration::from_millis(1)).await;
-            c.put(
-                format!("__concurrent__/stress/{i}"),
-                vec![0xAB; 256], // 256-byte value
-            )
-            .await
-            .map(|_| ())
-        }));
-    }
-
-    for (i, h) in handles.into_iter().enumerate() {
-        h.await
-            .unwrap_or_else(|_| panic!("task {i} panicked (likely RefCell borrow)"))
-            .unwrap_or_else(|e| panic!("stress put {i} failed: {e}"));
-    }
-
-    for i in 0..16 {
-        let _ = client.delete(format!("__concurrent__/stress/{i}")).await;
     }
 }

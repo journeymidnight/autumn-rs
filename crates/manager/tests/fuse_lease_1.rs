@@ -13,8 +13,7 @@
 //!
 //! Drives `dispatch::handle_request` directly through the bridge
 //! channel rather than through a real `fuser` mount — same code
-//! path, no kernel involvement, fits the existing `#[ignore]`'d
-//! cluster-boot pattern.
+//! path, no kernel involvement, on an in-process cluster.
 
 mod support;
 
@@ -102,7 +101,6 @@ async fn dispatch_release(state: &mut FsState, ino: u64, flags: i32) -> anyhow::
 }
 
 #[test]
-#[ignore]
 fn fuse_two_mounts_write_lease_conflict_and_release_unblocks() {
     let mgr_addr = pick_addr();
     start_manager(mgr_addr);
@@ -186,7 +184,6 @@ fn fuse_two_mounts_write_lease_conflict_and_release_unblocks() {
 }
 
 #[test]
-#[ignore]
 fn fuse_read_only_opens_coexist() {
     let mgr_addr = pick_addr();
     start_manager(mgr_addr);
@@ -232,7 +229,6 @@ fn fuse_read_only_opens_coexist() {
 }
 
 #[test]
-#[ignore]
 fn fuse_refcount_only_last_release_fires_releaselease() {
     let mgr_addr = pick_addr();
     start_manager(mgr_addr);
@@ -309,7 +305,6 @@ fn fuse_refcount_only_last_release_fires_releaselease() {
 /// Ablation: restore the `slot.mode != req_mode` refusal in `dispatch`'s Open
 /// arm and the READ open below fails with "lease mode mismatch".
 #[test]
-#[ignore]
 fn fuse_write_open_then_read_open_in_same_mount_coexist() {
     let mgr_addr = pick_addr();
     start_manager(mgr_addr);
@@ -388,7 +383,6 @@ fn fuse_write_open_then_read_open_in_same_mount_coexist() {
 /// writing process would hold the inode's single writer slot for as long as it
 /// stayed open, and every other mount's writer would get EBUSY.
 #[test]
-#[ignore]
 fn fuse_last_writer_close_downgrades_and_frees_the_writer_slot() {
     let mgr_addr = pick_addr();
     start_manager(mgr_addr);
@@ -455,7 +449,6 @@ fn fuse_last_writer_close_downgrades_and_frees_the_writer_slot() {
 /// open — that downgrade goes through `lease::release`, which bumps the inode
 /// version and pushes `WriterClosed` to every registered reader.
 #[test]
-#[ignore]
 fn fuse_remote_reader_coexists_with_a_local_dual_open_and_sees_writer_closed() {
     let mgr_addr = pick_addr();
     start_manager(mgr_addr);
@@ -543,7 +536,6 @@ async fn dispatch_create(
 }
 
 #[test]
-#[ignore]
 fn fuse_create_acquires_writer_lease() {
     // Regression for coco P1 #1: `FsRequest::Create` used to
     // bypass the lease layer entirely, so a freshly-created
@@ -602,7 +594,6 @@ fn fuse_create_acquires_writer_lease() {
 }
 
 #[test]
-#[ignore]
 fn fuse_uses_fuse_kind_identity() {
     // Sanity: the FUSE mount's DaemonClientId carries kind=FUSE so
     // an `autumn-op` lease list can tell which daemon family holds

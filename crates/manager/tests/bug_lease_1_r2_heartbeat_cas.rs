@@ -57,7 +57,6 @@ async fn etcd_has_inode_lease(etcd_endpoint: &str, ino: u64) -> bool {
 }
 
 #[test]
-#[ignore] // requires embedded etcd
 fn r2_p0_1_heartbeat_after_release_must_not_resurrect_etcd_record() {
     compio::runtime::Runtime::new().unwrap().block_on(async {
         let (_etcd_guard, etcd_endpoint) = start_etcd().await;

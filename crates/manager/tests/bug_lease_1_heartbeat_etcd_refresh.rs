@@ -57,7 +57,6 @@ async fn read_etcd_lease_record(
 }
 
 #[test]
-#[ignore] // requires embedded etcd
 fn p0_1_heartbeat_persists_etcd_expires_at() {
     compio::runtime::Runtime::new().unwrap().block_on(async {
         let (_etcd_guard, etcd_endpoint) = start_etcd().await;

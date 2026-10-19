@@ -195,7 +195,6 @@ fn merge_split_round_trip_keys_intact() {
 
 /// Refusal: non-adjacent partitions cannot merge.
 #[test]
-#[ignore] // requires cluster startup
 fn merge_refuses_non_adjacent_partitions() {
     let mgr_addr = pick_addr();
     start_manager(mgr_addr);
@@ -234,7 +233,6 @@ fn merge_refuses_non_adjacent_partitions() {
 
 /// Refusal: self-merge is rejected immediately.
 #[test]
-#[ignore] // requires cluster startup
 fn merge_refuses_self_merge() {
     let mgr_addr = pick_addr();
     start_manager(mgr_addr);
@@ -408,7 +406,6 @@ fn merge_preserves_value_pointer_resolution() {
 /// merge — but `last_op_at` is a hint to the policy engine, NOT a hard
 /// gate on manual triggers. Manual split should always work.
 #[test]
-#[ignore]
 fn merge_then_split_again_round_trip() {
     let mgr_addr = pick_addr();
     start_manager(mgr_addr);
@@ -729,7 +726,6 @@ fn auto_dispatch_merge_orchestrates_full_flow() {
 /// `client policy` → `client merge` instead.
 #[cfg(any())]
 #[test]
-#[ignore]
 fn auto_merge_fires_via_policy_tick_loop_fast_mode() {
     use autumn_manager::policy::PolicyConfig;
     use autumn_manager::AutumnManager;
@@ -826,7 +822,6 @@ fn auto_merge_fires_via_policy_tick_loop_fast_mode() {
 /// `auto_dispatch_split_dispatches_msg_split_part` below.
 #[cfg(any())]
 #[test]
-#[ignore]
 fn auto_split_fires_via_policy_tick_loop_fast_mode() {
     use autumn_manager::policy::PolicyConfig;
     use autumn_manager::AutumnManager;
@@ -914,7 +909,6 @@ fn auto_split_fires_via_policy_tick_loop_fast_mode() {
 /// auto-split smoke: invoke `force_auto_split` and verify the
 /// manager dispatches MSG_SPLIT_PART to the owning PS via conn_pool.
 #[test]
-#[ignore]
 fn auto_dispatch_split_dispatches_msg_split_part() {
     use autumn_manager::AutumnManager;
 
@@ -1196,7 +1190,6 @@ fn orchestrated_merge_zero_loss_concurrent_writes() {
 /// invariants: split/merge metadata mutations, log_stream extent
 /// splice, region_sync reload, multi-step seq_number monotonicity.)
 #[test]
-#[ignore]
 fn split_merge_split_with_interleaved_writes() {
     let mgr_addr = pick_addr();
     start_manager(mgr_addr);

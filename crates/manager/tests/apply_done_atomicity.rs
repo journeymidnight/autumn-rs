@@ -12,7 +12,7 @@
 //!    new attempt: the old apply loses the marker-revision CAS.
 //!
 //! Requires the `etcd` binary on `$PATH` (or override via
-//! `AUTUMN_TEST_ETCD_BIN`). Marked `#[ignore]` per repo convention.
+//! `AUTUMN_TEST_ETCD_BIN`).
 
 mod support;
 
@@ -62,7 +62,6 @@ fn make_dispatch_record(extent_id: u64) -> MgrEcDispatchInflight {
 }
 
 #[test]
-#[ignore] // requires embedded etcd (go runtime)
 fn apply_ec_conversion_done_atomic_success() {
     compio::runtime::Runtime::new().unwrap().block_on(async {
         let (_etcd_guard, etcd_endpoint) = start_etcd().await;
@@ -138,7 +137,6 @@ fn apply_ec_conversion_done_atomic_success() {
 }
 
 #[test]
-#[ignore] // requires embedded etcd (go runtime)
 fn apply_ec_conversion_done_atomic_failure_under_deposed_leader() {
     compio::runtime::Runtime::new().unwrap().block_on(async {
         let (_etcd_guard, etcd_endpoint) = start_etcd().await;
@@ -215,7 +213,6 @@ fn apply_ec_conversion_done_atomic_failure_under_deposed_leader() {
 }
 
 #[test]
-#[ignore] // requires embedded etcd (go runtime)
 fn identical_reissued_marker_has_new_identity_and_rejects_old_apply() {
     compio::runtime::Runtime::new().unwrap().block_on(async {
         let (_etcd_guard, etcd_endpoint) = start_etcd().await;

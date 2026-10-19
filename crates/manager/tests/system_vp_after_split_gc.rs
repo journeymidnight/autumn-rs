@@ -124,7 +124,6 @@ fn vp_resolvable_after_split_and_one_child_gc() {
 }
 
 #[test]
-#[ignore] // compound test
 fn vp_freed_after_both_children_compact_and_gc() {
     let mgr_addr = pick_addr();
     start_manager(mgr_addr);

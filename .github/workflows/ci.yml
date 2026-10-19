@@ -17,9 +17,10 @@ jobs:
         run: |
           sudo apt-get update
           # autumn-manager/fuse-tests pulls in autumn-fuse and fuser.
-          sudo apt-get install -y etcd-server protobuf-compiler libfuse3-dev
+          # fuse3 provides fusermount3 for fuse_umount_exit's real mount.
+          sudo apt-get install -y etcd-server protobuf-compiler libfuse3-dev fuse3
       - name: Build
-        run: cargo build --workspace --exclude autumn-fuse --exclude ucx-sys-mini
+        run: cargo build --workspace --exclude ucx-sys-mini
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
@@ -30,7 +31,7 @@ jobs:
           node crates/server/src/bin/autumn_dashboard/tests/policy_controls.js
           bash crates/server/src/bin/autumn_dashboard/tests/api_contract.sh
       - name: Unit tests
-        run: cargo test --workspace --lib --exclude autumn-fuse --exclude ucx-sys-mini
+        run: cargo test --workspace --lib --exclude ucx-sys-mini
       - name: Integration tests
         # Bump RLIMIT_MEMLOCK + nofile on this shell's PID so the cargo test
         # subprocess inherits the bump. Integration tests spawn manager + EN
@@ -52,4 +53,4 @@ jobs:
           sudo prlimit --pid $$ --nofile=65536:65536 || true
           # diagnostic — confirm the new limits actually took
           cat /proc/$$/limits | grep -E 'locked|files'
-          cargo test --workspace --tests --exclude autumn-fuse --exclude ucx-sys-mini --features autumn-manager/fuse-tests -- --test-threads=1
+          cargo test --workspace --tests --exclude ucx-sys-mini --features autumn-manager/fuse-tests -- --test-threads=1

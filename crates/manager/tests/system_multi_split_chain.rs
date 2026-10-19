@@ -131,7 +131,6 @@ fn split_compact_split_preserves_all_data() {
 }
 
 #[test]
-#[ignore] // compound test
 fn split_chain_with_writes_between_splits() {
     let mgr_addr = pick_addr();
     start_manager(mgr_addr);

@@ -48,7 +48,6 @@ async fn put_with_fence(
 }
 
 #[test]
-#[ignore] // requires full cluster
 fn p0_2_storage_fencing_phase1() {
     let mgr_addr = pick_addr();
     start_manager(mgr_addr);
@@ -122,7 +121,6 @@ fn p0_2_storage_fencing_phase1() {
 /// runs FIRST, so the floor stays at the legitimate writer's
 /// epoch and their next write passes.
 #[test]
-#[ignore]
 fn p0_2_oversized_rejected_write_must_not_poison_floor() {
     let mgr_addr = pick_addr();
     start_manager(mgr_addr);

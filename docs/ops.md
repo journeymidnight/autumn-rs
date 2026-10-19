@@ -1554,7 +1554,7 @@ coherent (fresh-read + `forget`-on-release). Behavior-preservation gate for the
 `cargo test -p autumn-manager --test system_fuse_read --test fuse_lease_1
 --test fuse_lease_2 --test system_fuse_eof_clobber
 --test system_fuse_flush_error_sticky --test system_fuse_release_best_effort
--- --ignored --test-threads=1`.
+-- --test-threads=1`.
 
 Build the server binaries FIRST — `cargo build -p autumn-server --bins`. Two of
 these tests spawn `target/debug/autumn-ps` as a child process, and `crates/manager`
@@ -3041,7 +3041,7 @@ A newly promoted manager gives every PS it replays a fresh 10 s heartbeat window
 however long it waited as a standby. The test (needs `etcd` on `PATH`; ~45 s):
 
 ```bash
-cargo test -p autumn-manager --test ps_members_etcd -- --ignored
+cargo test -p autumn-manager --test ps_members_etcd
 ```
 
 On a cluster: leave the standby up longer than 10 s, then kill the leader. In the
@@ -3823,7 +3823,7 @@ what it started.
 
 ```bash
 # PS-failover chaos (2 PSes, kill one -> partitions must migrate, zero loss):
-cargo test -p autumn-manager --test system_ps_failover_chaos -- --ignored
+cargo test -p autumn-manager --test system_ps_failover_chaos
 # system_chaos itself: in-process manager, real subprocess ENs + etcd +
 # toxiproxy, and the PS as a real `autumn-ps` child (log: <log dir>/ps-91.log).
 # Two nemesis actions restart it: `psterm` (SIGTERM -> drain -> exit -> start
@@ -4908,10 +4908,10 @@ the tenant's card.
 
 Byte correctness is a separate question from throughput, and `perf-check` does
 not check it — it never compares what it read against what it wrote. Cover a new
-write path with an ignored system test that reads every value back:
+write path with a system test that reads every value back:
 
 ```bash
-cargo test -p autumn-manager --test system_putstream -- --include-ignored put_many
+cargo test -p autumn-manager --test system_putstream put_many
 #   → put_many_small_values_take_the_batched_bulk_path ... ok
 #   → put_many_mixed_size_duplicate_key_keeps_last_input ... ok   (same key, small + bulk value, last input wins)
 ```
@@ -4919,15 +4919,17 @@ cargo test -p autumn-manager --test system_putstream -- --include-ignored put_ma
 ## Test matrix
 
 ```bash
-cargo test --workspace --exclude autumn-fuse --lib          # all crate unit tests
+cargo test --workspace --exclude ucx-sys-mini --lib         # all crate unit tests
 cargo test -p autumn-stream --lib                            # stream layer only
 cargo test -p autumn-partition-server --lib                  # partition server only
 cargo test -p autumn-manager                                 # integration (needs etcd)
 ```
 
 Manager integration tests under `crates/manager/tests/` cover split / merge / chaos / crash
-recovery. Some are gated with `#[ignore]` because they take minutes; use
-`cargo test --release -- --ignored` to run the slow set.
+recovery, and all run in CI except three opt-ins marked `#[ignore]`: the full
+chaos harness (`system_chaos`), the >1 GiB GC-floor test
+(`system_gc_floor_durable_ckpt`) and the fence/flush stress
+(`fence_flush_invariant`). Run one by name with `-- --ignored`.
 
 GC data-integrity regression (full VP-identity liveness — a superseded older
 version of a key in the same sealed extent must NOT revive over the newer one):
@@ -5159,13 +5161,13 @@ cargo test -p autumn-manager --test ioring_lease_4
 # BUG-LEASE-2 storage fencing (needs built binaries; boots a cluster):
 # Phase 1 — stale-epoch MSG_PUT rejected with CODE_FENCED; anonymous
 # (inode_hint=0) writes bypass.
-cargo test -p autumn-manager --test bug_lease_2_storage_fencing -- --ignored
+cargo test -p autumn-manager --test bug_lease_2_storage_fencing
 # Phase 2 — the floor SURVIVES a PS kill -9 + restart, on both recovery
 # paths (WAL OP_FENCE_BUMP replay; TableLocations.fence_floors checkpoint
 # after a flush), and MSG_PUT_BULK (the fuse/ioring large-write path) is
 # fenced too. Manual check: write at epoch 1 then 5 for one ino, kill
 # the PS, restart, retry epoch 1 → must get CODE_FENCED.
-cargo test -p autumn-manager --test bug_lease_2_phase2_persistence -- --ignored
+cargo test -p autumn-manager --test bug_lease_2_phase2_persistence
 ```
 
 Daemon manual exercise (against a real cluster):
@@ -5822,7 +5824,7 @@ AUTUMN_TEST_ZEROCOPY=1 cargo test -p autumn-stream --test prepared_append
 cargo build -p autumn-server --bins
 cargo test -p autumn-manager --test system_fuse_read --test system_fuse_eof_clobber \
   --test system_fuse_flush_error_sticky --test system_fuse_release_best_effort \
-  -- --ignored --test-threads=1
+  -- --test-threads=1
 ```
 
 For UCX, run prepared_append with `--features autumn-rpc/ucx` and

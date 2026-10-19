@@ -60,7 +60,6 @@ async fn get(c: &ClusterClient, k: &[u8]) -> Option<Vec<u8>> {
 }
 
 #[test]
-#[ignore] // requires built binaries + full cluster
 fn compare_write_conditions_fences_and_persists_a_bump_from_a_failed_compare() {
     let mgr_addr = pick_addr();
     start_manager(mgr_addr);

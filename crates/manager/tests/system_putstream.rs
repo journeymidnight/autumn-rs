@@ -65,7 +65,6 @@ async fn boot_cluster(
 }
 
 #[test]
-#[ignore]
 fn putstream_roundtrip_12mib() {
     let mgr_addr = pick_addr();
     start_manager(mgr_addr);
@@ -167,7 +166,6 @@ fn putstream_roundtrip_12mib() {
 /// Single-chunk striped put. Exercises the n_chunks=1 edge case +
 /// verifies the smallest possible striped value survives roundtrip.
 #[test]
-#[ignore]
 fn putstream_single_chunk_1mib() {
     let mgr_addr = pick_addr();
     start_manager(mgr_addr);
@@ -216,7 +214,6 @@ fn putstream_single_chunk_1mib() {
 /// never written, so `get(key)` returns NotFound throughout. After abort,
 /// all written chunks are best-effort deleted.
 #[test]
-#[ignore]
 fn putstream_abort_drops_chunks() {
     let mgr_addr = pick_addr();
     start_manager(mgr_addr);
@@ -250,7 +247,6 @@ fn putstream_abort_drops_chunks() {
 /// the auto-detect path: small value put via regular `put` is yielded
 /// in a single `next_chunk` call.
 #[test]
-#[ignore]
 fn get_stream_inline_value_passthrough() {
     let mgr_addr = pick_addr();
     start_manager(mgr_addr);
@@ -281,7 +277,6 @@ fn get_stream_inline_value_passthrough() {
 /// decodes the small reply) and a 256 KiB value (received into the pool), both
 /// through `MSG_GET_BULK`, plus a missing key (`Ok(None)`).
 #[test]
-#[ignore]
 fn get_many_into_mixed_sizes() {
     let mgr_addr = pick_addr();
     start_manager(mgr_addr);
@@ -362,7 +357,6 @@ fn get_many_into_mixed_sizes() {
 /// regular `MSG_PUT`) and a 256 KiB value (>= 64 KiB → `MSG_PUT_BULK`), then reads
 /// each back byte-for-byte.
 #[test]
-#[ignore]
 fn put_many_mixed_sizes() {
     let mgr_addr = pick_addr();
     start_manager(mgr_addr);
@@ -408,7 +402,6 @@ fn put_many_mixed_sizes() {
 /// purpose: with uniform lengths a cursor bug that skipped or double-counted
 /// would still land on a value boundary and read as correct.
 #[test]
-#[ignore]
 fn put_many_small_values_take_the_batched_bulk_path() {
     let mgr_addr = pick_addr();
     start_manager(mgr_addr);
@@ -495,7 +488,6 @@ fn put_many_small_values_take_the_batched_bulk_path() {
 /// no test noticed because nothing exercised `get_many` across a topology
 /// change.
 #[test]
-#[ignore]
 fn get_many_recovers_from_a_stale_epoch_after_a_split() {
     let mgr_addr = pick_addr();
     start_manager(mgr_addr);
@@ -584,7 +576,6 @@ fn get_many_recovers_from_a_stale_epoch_after_a_split() {
 /// absent keys returns correct `found`/`value_length`; `delete_many` removes the
 /// present keys (verified gone via `get`).
 #[test]
-#[ignore]
 fn delete_many_and_head_many() {
     let mgr_addr = pick_addr();
     start_manager(mgr_addr);

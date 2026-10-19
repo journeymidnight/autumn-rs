@@ -59,7 +59,6 @@ fn states(v: &[FleetMember]) -> Vec<(u64, u8)> {
 }
 
 #[test]
-#[ignore] // requires a real etcd binary on PATH
 fn status_counts_against_the_expected_fleet() {
     compio::runtime::Runtime::new().unwrap().block_on(async {
         let (_etcd_guard, endpoint) = start_etcd().await;

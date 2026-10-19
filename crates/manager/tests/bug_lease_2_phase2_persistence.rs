@@ -116,7 +116,6 @@ async fn put_bulk_with_fence(
 }
 
 #[test]
-#[ignore] // requires built binaries + full cluster
 fn p2_fence_floor_survives_ps_restart_via_wal_replay() {
     let mgr_addr = pick_addr();
     start_manager(mgr_addr);
@@ -193,7 +192,6 @@ fn p2_fence_floor_survives_ps_restart_via_wal_replay() {
 }
 
 #[test]
-#[ignore] // requires built binaries + full cluster
 fn p2_fence_floor_survives_ps_restart_via_checkpoint() {
     let mgr_addr = pick_addr();
     start_manager(mgr_addr);

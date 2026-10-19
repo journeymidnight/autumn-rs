@@ -38,7 +38,7 @@ cd "$(git rev-parse --show-toplevel)"   # repo root
 ```sh
 cargo test -p autumn-manager --test node_lifecycle --test system_chaos --test system_review_takeover_fence --test system_review_remove_retry -- --test-threads=1
 cargo test -p autumn-partition-server --lib gc_streaming_tests
-cargo test -p autumn-manager --test apply_done_atomicity -- --ignored --test-threads=1
+cargo test -p autumn-manager --test apply_done_atomicity -- --test-threads=1
 ```
 
 需要本机回环监听权限及 PATH 上的 `etcd`（或设置 `AUTUMN_TEST_ETCD_BIN`）。测试的临时数据由各用例创建和清理，源码和配置均在当前仓库。

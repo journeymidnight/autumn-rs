@@ -6,8 +6,6 @@
 //! so a standby's replayed regions are not observable over the wire.
 //!
 //! These tests spawn the `etcd` binary (override via `AUTUMN_TEST_ETCD_BIN`).
-//! Marked `#[ignore]` so CI without etcd skips them — run explicitly:
-//!   cargo test -p autumn-manager --test system_manager_failover -- --ignored
 
 mod support;
 
@@ -90,7 +88,6 @@ async fn fail_over(
 // ── Manager failover preserves full state ───────────────────────
 
 #[test]
-#[ignore] // requires embedded etcd (go runtime)
 fn manager_failover_preserves_streams_and_partitions() {
     compio::runtime::Runtime::new().unwrap().block_on(async {
         let (_etcd_guard, etcd_endpoint) = start_etcd().await;
@@ -205,7 +202,6 @@ fn manager_failover_preserves_streams_and_partitions() {
 // ── Manager crash during split — state consistent ───────────────
 
 #[test]
-#[ignore] // requires embedded etcd (go runtime)
 fn manager_crash_during_split_state_consistent() {
     compio::runtime::Runtime::new().unwrap().block_on(async {
         let (_etcd_guard, etcd_endpoint) = start_etcd().await;

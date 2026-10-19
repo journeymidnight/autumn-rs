@@ -32,7 +32,6 @@ use autumn_fs::{meta, read, write};
 use support::*;
 
 #[test]
-#[ignore]
 fn a_logging_only_caller_must_not_eat_the_sticky_flush_error() {
     let mgr_addr = pick_addr();
     start_manager(mgr_addr);
@@ -136,7 +135,6 @@ fn a_logging_only_caller_must_not_eat_the_sticky_flush_error() {
 ///
 /// PRE-FIX (barrier classified `ToApplication`): red at the survival assertion.
 #[test]
-#[ignore]
 fn the_read_after_write_barrier_must_not_eat_the_sticky_flush_error() {
     let mgr_addr = pick_addr();
     start_manager(mgr_addr);
@@ -247,7 +245,6 @@ fn the_read_after_write_barrier_must_not_eat_the_sticky_flush_error() {
 ///
 /// PRE-FIX (either site classified `ToApplication`): red at that site's assert.
 #[test]
-#[ignore]
 fn the_write_path_flushes_must_not_eat_the_sticky_flush_error() {
     let mgr_addr = pick_addr();
     start_manager(mgr_addr);

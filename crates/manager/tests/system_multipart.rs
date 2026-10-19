@@ -91,7 +91,6 @@ fn object_keys(st: &FsState, d: u64, len: u64) -> Vec<Vec<u8>> {
 }
 
 #[test]
-#[ignore]
 fn multipart_complete_is_metadata_only_and_races_resolve() {
     let mgr_addr = pick_addr();
     start_manager(mgr_addr);

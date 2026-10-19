@@ -29,7 +29,6 @@ use autumn_stream::{ConnPool, StreamClient};
 use support::*;
 
 #[test]
-#[ignore] // requires a real etcd binary on PATH
 fn the_sweep_reclaims_a_tail_the_dead_writer_never_punched() {
     let n1_dir = tempfile::tempdir().expect("n1 tmpdir");
     let n2_dir = tempfile::tempdir().expect("n2 tmpdir");
