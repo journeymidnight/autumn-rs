@@ -1,8 +1,8 @@
-//! System test — seal during active writes, client retry.
+//! System test — appends after a manager seal land on the new tail.
 //!
-//! Tests that when a stream's tail extent is sealed (via stream_alloc_extent),
-//! the StreamClient's cached tail becomes stale. After invalidating the cache,
-//! subsequent appends land on the new extent.
+//! The stream's tail is sealed through the manager (`stream_alloc_extent`),
+//! and a client that loads the stream afterwards appends to the new extent.
+//! The stale-tail retry of a client that kept appending is not exercised here.
 
 mod support;
 
@@ -15,7 +15,7 @@ use autumn_stream::{ConnPool, StreamClient};
 use support::*;
 
 #[test]
-fn seal_during_active_writes_client_retries() {
+fn appends_after_a_manager_seal_land_on_the_new_tail() {
     let mgr_addr = pick_addr();
     start_manager(mgr_addr);
 
@@ -85,10 +85,6 @@ fn seal_during_active_writes_client_retries() {
             .await
             .expect("stream_info after seal");
         assert_eq!(info.extent_ids.len(), 2, "should have 2 extents after seal");
-
-        // Invalidate the StreamClient's cached tail so it reloads from manager.
-        // This simulates what happens when the client detects an eversion mismatch.
-        sc.invalidate_extent_cache(original_extent);
 
         // Create a fresh StreamClient to verify writes go to the new extent
         let sc2 = StreamClient::connect(

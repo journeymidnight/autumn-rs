@@ -79,8 +79,10 @@ fn concurrent_writers_crash_no_data_loss() {
     });
 }
 
+/// Puts racing a split: every put the PS acknowledged is readable from the
+/// child that owns its key. Split freezes the source while it captures the
+/// tails, so a put is either refused or lands before the capture.
 #[test]
-#[ignore] // compound test
 fn concurrent_writers_during_split() {
     let mgr_addr = pick_addr();
     start_manager(mgr_addr);
@@ -120,22 +122,27 @@ fn concurrent_writers_during_split() {
         let split_ps = RpcClient::connect(ps_addr).await.expect("connect split");
         let write_ps = RpcClient::connect(ps_addr).await.expect("connect writer");
 
-        let split_handle = compio::runtime::spawn(async move {
-            split_ps
-                .call(
-                    partition_rpc::MSG_SPLIT_PART,
-                    partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq { part_id: 902, at_key: None, op_id: 0 }),
-                )
-                .await
-                .expect("split")
-        });
-
+        // The writer runs until the split has answered. Only puts that land
+        // before the freeze can be acked (during it they are refused, after
+        // it they are out of the left's range), so the split starts once one
+        // has been.
+        let split_done = std::rc::Rc::new(std::cell::Cell::new(false));
+        let writer_stop = split_done.clone();
+        let acked = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        let writer_acked = acked.clone();
         let write_handle = compio::runtime::spawn(async move {
             let mut written = Vec::new();
-            for i in 0u32..20 {
-                let key = format!("concurrent-{i:02}");
-                let val = format!("cv-{i:02}");
-                if let Ok(_) = write_ps
+            for i in 0u32.. {
+                if writer_stop.get() {
+                    break;
+                }
+                // Above every `pre-*` key, so these land in the right child:
+                // the one that replays the copied log only up to the
+                // captured length.
+                let key = format!("q-concurrent-{i:05}");
+                let val = format!("cv-{i:05}");
+                // A refused put (frozen, or no longer in range) is not acked.
+                if let Ok(bytes) = write_ps
                     .call(
                         partition_rpc::MSG_PUT,
                         partition_rpc::rkyv_encode(&partition_rpc::PutReq {
@@ -151,13 +158,34 @@ fn concurrent_writers_during_split() {
                     )
                     .await
                 {
-                    written.push(key)
+                    let resp: partition_rpc::PutResp =
+                        partition_rpc::rkyv_decode(&bytes).expect("decode put");
+                    if resp.code == partition_rpc::CODE_OK {
+                        written.push((key, val));
+                        writer_acked.set(written.len());
+                    }
                 }
             }
             written
         });
 
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while acked.get() == 0 {
+            assert!(std::time::Instant::now() < deadline, "no put acked before the split");
+            compio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let split_handle = compio::runtime::spawn(async move {
+            split_ps
+                .call(
+                    partition_rpc::MSG_SPLIT_PART,
+                    partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq { part_id: 902, at_key: None, op_id: 0 }),
+                )
+                .await
+                .expect("split")
+        });
+
         let split_resp_bytes = split_handle.await.expect("split task panicked");
+        split_done.set(true);
         let sr: partition_rpc::SplitPartResp =
             partition_rpc::rkyv_decode(&split_resp_bytes).expect("decode");
         assert_eq!(
@@ -202,57 +230,13 @@ fn concurrent_writers_during_split() {
             assert_eq!(resp.value, format!("pv-{i:02}").as_bytes(), "{key} wrong");
         }
 
-        // **KNOWN BUG — split-during-writes loses acknowledged data**
-        //
-        // Empirically up to ~65% of writes acknowledged during a
-        // concurrent split are missing from BOTH children. Root cause:
-        // unlike merge, split has no orchestrator-driven
-        // FREEZE phase. `handle_split_part` runs PS-local under the
-        // partition thread but doesn't halt incoming writes — a Put
-        // that lands AFTER the split's commit_length capture but
-        // BEFORE the manager's atomic txn commits gets acked into the
-        // OLD log_stream tail extent, whose post-seal commit_length
-        // is captured at the pre-Put value. The RIGHT child's
-        // duplicated stream inherits the smaller sealed_length, so
-        // vp_head replay skips those bytes. The LEFT child also
-        // narrowed its range, so keys >= mid_key fall out of range
-        // even if they ARE in the recovered log.
-        //
-        // Production impact: only manual `autumn-op split` against an
-        // actively-written partition exhibits this. Auto-split
-        // gates on QPS thresholds + cooldowns so it rarely fires on
-        // a hot writer; admin-driven split is a planned op where the
-        // operator pauses writes is the typical workflow.
-        //
-        // Fix design (deferred follow-up): port the merge
-        // orchestrator pattern to split — `handle_split_partition`
-        // wraps the atomic txn with MSG_SPLIT_FREEZE flush+drain on
-        // the source PS, then captures commit_length under the
-        // freeze. Bound the wallclock overhead to ~2 s.
-        //
-        // For now this assertion is informational-only: the test
-        // measures the loss but doesn't fail. A real fix should
-        // re-enable a strict bound (≤ 20%, matching the merge
-        // tolerance).
-        let total = concurrent_keys.len();
-        let mut missing = 0usize;
-        for key in &concurrent_keys {
+        eprintln!("acked {} puts around the split", concurrent_keys.len());
+        for (key, val) in &concurrent_keys {
             let kb = key.as_bytes();
-            let left_head = psr_head(&router, 902, kb).await;
-            let right_head = psr_head(&router, right_id, kb).await;
-            if !(left_head.found || right_head.found) {
-                missing += 1;
-            }
+            let part_id = if kb < mid_key.as_slice() { 902 } else { right_id };
+            let resp = psr_get(&router, part_id, kb).await;
+            assert_eq!(resp.value, val.as_bytes(), "acked {key} lost across the split");
         }
-        let lost_pct = if total > 0 {
-            (missing as f64 / total as f64) * 100.0
-        } else {
-            0.0
-        };
-        eprintln!(
-            "split-during-writes: {} acked, {} lost ({:.1}%) — KNOWN BUG, see code comment",
-            total, missing, lost_pct
-        );
 
         // Compact both, re-verify pre-split keys
         ps_compact(&ps, 902).await;

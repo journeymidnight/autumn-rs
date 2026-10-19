@@ -218,7 +218,6 @@ fn merge_refuses_non_adjacent_partitions() {
         let ps_addr = pick_addr();
         start_partition_server(81, mgr_addr, ps_addr);
         let _ps = RpcClient::connect_as(ps_addr, autumn_rpc::version_hello::Role::Admin, None).await.unwrap();
-        let router = PsRouter::new(mgr_addr, ps_addr);
         compio::time::sleep(Duration::from_millis(800)).await;
 
         let resp = merge_partitions(&mgr, 2001, 2002).await;
@@ -253,7 +252,6 @@ fn merge_refuses_self_merge() {
         let ps_addr = pick_addr();
         start_partition_server(82, mgr_addr, ps_addr);
         let _ps = RpcClient::connect_as(ps_addr, autumn_rpc::version_hello::Role::Admin, None).await.unwrap();
-        let router = PsRouter::new(mgr_addr, ps_addr);
         compio::time::sleep(Duration::from_millis(500)).await;
 
         let resp = merge_partitions(&mgr, 3001, 3001).await;
@@ -269,16 +267,7 @@ fn merge_refuses_self_merge() {
 /// Merge with large values that go through ValuePointer. After merge,
 /// the survivor's SSTs (including those imported from victim) must
 /// still resolve their VPs against the spliced log_stream's extents.
-///
-/// **Disabled — exposes a separate pre-existing VP+compact bug.**
-/// PRE-SPLIT (no merge involved) `psr_get` of an 8 KiB value put +
-/// flushed + compacted returns the value prepended with 5 bytes of the
-/// MVCC suffix tail (`0xff 0xff 0xff 0xff 0xfe` for seq=1). Reproducing
-/// against `main` without any merge code path. Out of scope —
-/// tracked as a VP-encoding regression for separate investigation. The
-/// `#[test]` attribute is removed so `cargo test --ignored` doesn't
-/// surface this as a regression.
-#[allow(dead_code)]
+#[test]
 fn merge_preserves_value_pointer_resolution() {
     let mgr_addr = pick_addr();
     start_manager(mgr_addr);
@@ -304,7 +293,7 @@ fn merge_preserves_value_pointer_resolution() {
         // Write 6 large values (8 KiB each) → above the 4 KiB VP threshold,
         // so each becomes a ValuePointer in the SST. 3 keys < 'm' (left
         // half), 3 keys >= 'm' (right half).
-        let big_val = vec![0xab; 8 * 1024];
+        let big_val: Vec<u8> = (0..8 * 1024).map(|i| (i % 251) as u8).collect();
         for i in 0u8..3 {
             psr_put(&router, 4001, format!("a-{:02}", i).as_bytes(), &big_val).await;
             psr_put(&router, 4001, format!("n-{:02}", i).as_bytes(), &big_val).await;

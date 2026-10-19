@@ -54,7 +54,7 @@ fn list_node_states_starts_suspend() {
 }
 
 #[test]
-fn fence_persists_override_and_audit_records_op() {
+fn fence_sets_the_override_with_its_reason_and_setter() {
     let m = AutumnManager::new();
     let n1 = register(&m, "127.0.0.1:9001");
 

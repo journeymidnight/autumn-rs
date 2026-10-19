@@ -794,12 +794,15 @@ fn recovery_from_meta_and_row_streams() {
 
         upsert_partition(&mgr, 611, log_stream, row_stream, meta_stream, b"a", b"z").await;
 
-        // First PS: write one flushed key + one WAL-only key.
+        // First PS: write one flushed key + one WAL-only key. The flushed
+        // value is above VALUE_THROTTLE (4 KiB), so the SST holds a pointer
+        // into the log stream rather than the bytes.
         let ps1_addr = pick_addr();
         start_partition_server(42, mgr_addr, ps1_addr);
 
+        let streamed: Vec<u8> = (0..64 * 1024).map(|i| (i % 251) as u8).collect();
         let ps1 = RpcClient::connect_as(ps1_addr, autumn_rpc::version_hello::Role::Admin, None).await.expect("connect ps1");
-        ps_put(&ps1, 611, b"a-streamed", &vec![b'S'; 4 * 1024]).await;
+        ps_put(&ps1, 611, b"a-streamed", &streamed).await;
         ps_flush(&ps1, 611).await;
         ps_put(&ps1, 611, b"a-wal-only", b"small").await;
 
@@ -813,11 +816,7 @@ fn recovery_from_meta_and_row_streams() {
         let ps2 = RpcClient::connect_as(ps2_addr, autumn_rpc::version_hello::Role::Admin, None).await.expect("connect ps2");
 
         let v1 = ps_get(&ps2, 611, b"a-streamed").await;
-        assert_eq!(
-            v1.value.len(),
-            4 * 1024,
-            "stream-backed SST key survives restart"
-        );
+        assert!(v1.value == streamed, "stream-backed SST key survives restart");
 
         let v2 = ps_get(&ps2, 611, b"a-wal-only").await;
         assert_eq!(v2.value, b"small", "WAL-only key survives restart");
@@ -1044,8 +1043,11 @@ fn compaction_preserves_value_pointers() {
     });
 }
 
+/// Overwritten values survive major compaction + GC. Everything here lands
+/// in one open log extent, which GC never reclaims — reclaim itself is
+/// `system_gc_multiversion_same_extent`.
 #[test]
-fn gc_reclaims_log_stream_extents() {
+fn overwritten_values_survive_compaction_and_gc() {
     let (mgr_addr, n1_addr, n2_addr, _n1_dir, _n2_dir) = setup_infra_f030(117);
 
     compio::runtime::Runtime::new().unwrap().block_on(async {

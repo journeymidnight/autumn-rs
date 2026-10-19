@@ -32,6 +32,13 @@
 - **Acceptance**: 根因写进本条；修后本机连跑 20 次全绿；若改测试，消融（把 handler 改回 burst 处理）仍能变红。
 - `passes: false`
 
+### BUG-LEASE-HEARTBEAT-CAS-OVERWRITE — 心跳刷新 etcd 记录用"先读再 CAS"，读之前被换掉的记录会被旧 writer 覆盖（推断，未在真实交错下复现）
+- **Trigger** (2026-10-19，测试集体检时把 `bug_lease_1_r2_heartbeat_cas` 改成真能走到 `read_then_cas_put` 后发现): `read_then_cas_put`（`crates/manager/src/lib.rs`）以**自己读到的**值作 CAS 基线，只防"读与 txn 之间"的变化。心跳在内存里续约后，若并发的 force-revoke + 新 writer acquire 的 etcd 写在心跳的 GET 之前落地，GET 读到的就是新 writer 的记录，CAS 以它为基线成功，把旧 writer 的记录写回去。已证实的部分：在 etcd 里从外部把记录换成别的值再心跳，记录被覆盖（测试曾按此写成，断言红）。未证实：同一 manager 内的真实交错能否在 GET 期间完成另一次 acquire 的 etcd 写。
+- **影响有界**: 新 writer 下一次心跳会以被覆盖的记录为基线 CAS 写回自己的记录，所以错误记录只存活一个心跳周期，只有恰在其中发生 failover 才会重放错的 writer。
+- **Scope**: 先用暂停点在心跳的 GET 期间插入一次 force-revoke + acquire 复现；坐实后基线改为"内存里上一次写下的本 writer 记录"（或比较 mod_revision，或解码读到的记录、不是本 writer 就跳过），而不是现读的值。`rpc_handlers.rs` 心跳处理里"CAS 能挡住 force-revoke + 新 acquire 的覆盖"那段注释与此不符，修时一并改。
+- **Acceptance**: 复现用例修前红、修后绿；消融（改回现读基线）变红。
+- `passes: false`
+
 ### BUG-LEASE-HEARTBEAT-STALE-NOTHELD — 心跳快照期间重新 acquire 的 lease 会被迟到的 NotHeld 删掉（推断，未复现）
 - **Trigger** (2026-10-17 fuse_lease_loss 修复的 opus 评审): `lease_tasks.rs` 心跳循环先快照 `held_leases` 的 ino 再逐个 await 心跳 RPC；期间最后一次 release + 新 Open 可以重新 acquire 同一 ino，迟到的 `NotHeld` 把新条目删掉（现在还会多做一次失效）：后续写 EIO "no lease"，manager 那份新 lease 漏到 TTL 过期。
 - **Scope**: 先复现（心跳 RPC 前挂暂停点，期间 release+acquire）。坐实后：删条目前比较快照时的 `lease_epoch`，不同则不删。

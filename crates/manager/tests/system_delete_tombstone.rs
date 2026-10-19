@@ -75,8 +75,10 @@ fn delete_survives_crash_and_recovery() {
     });
 }
 
+/// Deleted keys stay gone across a major compaction and a restart. That the
+/// compaction drops the tombstones is `system_compact_settles_deletes`.
 #[test]
-fn delete_compaction_removes_tombstones() {
+fn deleted_keys_stay_gone_across_compaction_and_restart() {
     let mgr_addr = pick_addr();
     start_manager(mgr_addr);
 
@@ -116,7 +118,7 @@ fn delete_compaction_removes_tombstones() {
         }
         ps_flush(&ps1, 902).await;
 
-        // Major compaction should remove tombstones
+        // Major compaction
         ps_compact(&ps1, 902).await;
         compio::time::sleep(Duration::from_millis(2000)).await;
 
@@ -130,7 +132,7 @@ fn delete_compaction_removes_tombstones() {
         // Deleted keys gone
         for i in 0u32..10 {
             let resp = ps_head(&ps2, 902, format!("key-{i:02}").as_bytes()).await;
-            assert!(!resp.found, "key-{i:02} should be gone after compaction");
+            assert!(!resp.found, "key-{i:02} should stay deleted");
         }
         // Surviving keys intact
         for i in 10u32..20 {
