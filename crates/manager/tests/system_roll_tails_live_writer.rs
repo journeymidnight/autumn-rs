@@ -425,7 +425,9 @@ fn in_flight_roll_racing_split_commit_child_still_opens() {
             let router = &router;
             async move {
                 match router.try_client_for(right_part).await {
-                    Ok(c) => ps_get(&c, right_part, b"t000").await.code == partition_rpc::CODE_OK,
+                    Ok(c) => try_ps_get(&c, right_part, b"t000")
+                        .await
+                        .is_ok_and(|r| r.code == partition_rpc::CODE_OK),
                     Err(_) => false,
                 }
             }

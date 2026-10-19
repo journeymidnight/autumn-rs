@@ -452,6 +452,16 @@ pub struct GetResult {
 
 /// Get a key's value through `MSG_GET_BULK`, the read every client uses.
 pub async fn ps_get(ps: &RpcClient, part_id: u64, key: &[u8]) -> GetResult {
+    try_ps_get(ps, part_id, key).await.expect("get")
+}
+
+/// `ps_get` that returns the transport error instead of panicking — for loops
+/// waiting out a partition reopen, where a reset connection means "not yet".
+pub async fn try_ps_get(
+    ps: &RpcClient,
+    part_id: u64,
+    key: &[u8],
+) -> Result<GetResult, autumn_rpc::RpcError> {
     let resp = ps
         .call_into_pooled(
             partition_rpc::MSG_GET_BULK,
@@ -463,13 +473,12 @@ pub async fn ps_get(ps: &RpcClient, part_id: u64, key: &[u8]) -> GetResult {
                 region_epoch: 0, // test helper: skip epoch check
             }),
         )
-        .await
-        .expect("get");
-    GetResult {
+        .await?;
+    Ok(GetResult {
         code: resp.code,
         message: resp.message,
         value: resp.buf.filled().to_vec(),
-    }
+    })
 }
 
 /// Flush a partition's memtable.
@@ -820,6 +829,13 @@ pub async fn psr_put(router: &PsRouter, part_id: u64, key: &[u8], value: &[u8]) 
 pub async fn psr_get(router: &PsRouter, part_id: u64, key: &[u8]) -> GetResult {
     let c = router.client_for(part_id).await;
     ps_get(&c, part_id, key).await
+}
+
+/// `psr_get` for loops waiting out a reopen: an unroutable partition or a
+/// reset connection is an `Err`, not a panic.
+pub async fn try_psr_get(router: &PsRouter, part_id: u64, key: &[u8]) -> Result<GetResult, String> {
+    let c = router.try_client_for(part_id).await?;
+    try_ps_get(&c, part_id, key).await.map_err(|e| e.to_string())
 }
 
 /// Routed `ps_flush` — partition-aware.

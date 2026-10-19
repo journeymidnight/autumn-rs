@@ -244,9 +244,12 @@ async fn assert_all_readable(c: &Cluster, merged: bool, acked: &[(u64, String)])
     // The old survivor instance answers [a,m) from its own tables until the
     // reopen; a victim-range read on the survivor proves the reopen happened.
     let reopened = poll_until_async(Duration::from_secs(60), Duration::from_millis(250), || async {
-        psr_get(&c.router, home(VICTIM), b"m/pre-00").await.code == partition_rpc::CODE_OK
-            && psr_get(&c.router, home(SURVIVOR), b"a/pre-00").await.code
-                == partition_rpc::CODE_OK
+        try_psr_get(&c.router, home(VICTIM), b"m/pre-00")
+            .await
+            .is_ok_and(|r| r.code == partition_rpc::CODE_OK)
+            && try_psr_get(&c.router, home(SURVIVOR), b"a/pre-00")
+                .await
+                .is_ok_and(|r| r.code == partition_rpc::CODE_OK)
     })
     .await;
     assert!(reopened, "partitions never served the baseline again");

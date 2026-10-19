@@ -159,7 +159,7 @@ async fn wait_serving(router: &PsRouter, key: &[u8]) {
     let started = Instant::now();
     loop {
         if let Ok(c) = router.try_client_for(SURVIVOR).await {
-            if ps_get(&c, SURVIVOR, key).await.code == CODE_OK {
+            if try_ps_get(&c, SURVIVOR, key).await.is_ok_and(|r| r.code == CODE_OK) {
                 return;
             }
         }

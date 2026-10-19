@@ -209,7 +209,10 @@ async fn wait_serving(router: &PsRouter, key: &str) {
     let started = Instant::now();
     loop {
         if let Ok(c) = router.try_client_for(SURVIVOR).await {
-            if ps_get(&c, SURVIVOR, key.as_bytes()).await.code == partition_rpc::CODE_OK {
+            if try_ps_get(&c, SURVIVOR, key.as_bytes())
+                .await
+                .is_ok_and(|r| r.code == partition_rpc::CODE_OK)
+            {
                 return;
             }
         }

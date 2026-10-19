@@ -150,7 +150,7 @@ fn a_minor_compaction_after_a_merge_keeps_the_newest_version_visible() {
         let deadline = Instant::now() + Duration::from_secs(90);
         let merged = loop {
             if let Ok(c) = router.try_client_for(SURVIVOR).await {
-                if ps_get(&c, SURVIVOR, KEY).await.code == CODE_OK {
+                if try_ps_get(&c, SURVIVOR, KEY).await.is_ok_and(|r| r.code == CODE_OK) {
                     break c;
                 }
             }

@@ -141,7 +141,7 @@ fn a_tied_last_seq_does_not_move_a_minor_output_past_a_newer_table() {
         let deadline = Instant::now() + Duration::from_secs(90);
         let merged = loop {
             if let Ok(c) = router.try_client_for(SURVIVOR).await {
-                if ps_get(&c, SURVIVOR, KEY).await.code == CODE_OK {
+                if try_ps_get(&c, SURVIVOR, KEY).await.is_ok_and(|r| r.code == CODE_OK) {
                     break c;
                 }
             }

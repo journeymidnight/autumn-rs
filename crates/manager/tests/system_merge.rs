@@ -423,7 +423,9 @@ fn auto_dispatch_merge_orchestrates_full_flow() {
         assert!(
             poll_until_async(Duration::from_secs(20), Duration::from_millis(200), || async {
                 match router.try_client_for(s).await {
-                    Ok(c) => ps_get(&c, s, b"p-1-00000").await.code == partition_rpc::CODE_OK,
+                    Ok(c) => try_ps_get(&c, s, b"p-1-00000")
+                        .await
+                        .is_ok_and(|r| r.code == partition_rpc::CODE_OK),
                     Err(_) => false,
                 }
             })
@@ -869,7 +871,9 @@ fn merge_refuses_unseparated_cow_child(compact_survivor_first: bool) {
         // key reading OK is what proves the reopen.
         assert!(
             poll_until_async(Duration::from_secs(15), Duration::from_millis(250), || async {
-                psr_get(&router, survivor, K).await.code == partition_rpc::CODE_OK
+                try_psr_get(&router, survivor, K)
+                    .await
+                    .is_ok_and(|r| r.code == partition_rpc::CODE_OK)
             })
             .await,
             "the survivor never reopened over the merged range"
