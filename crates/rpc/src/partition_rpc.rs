@@ -1163,8 +1163,11 @@ mod msg_type_tests {
 
     #[test]
     fn msg_type_constants_dont_collide() {
+        // Every `pub const MSG_*` above; a new opcode goes here too.
         let all = [
             MSG_PUT,
+            MSG_COMPARE_PUT,
+            MSG_COMPARE_WRITE,
             MSG_DELETE,
             MSG_HEAD,
             MSG_RANGE,

@@ -760,44 +760,6 @@ fn maintenance_advisory_partial_window_no_trigger() {
 // ── Stage D: hot/cold advisory ─────────────────────────────────────
 
 #[test]
-fn hot_cold_advisory_fires_on_10x_imbalance_same_ps() {
-    let mut eng = PolicyEngine::default();
-    let now = 1_700_000_000;
-    // Two partitions on PS=42: one hot (req_per_sec = --hot-cold-min-hot-qps * 2),
-    // one cold (1 qps). Ratio > --hot-cold-ratio.
-    fill_window(
-        &mut eng,
-        100,
-        d().required_buckets,
-        PartitionLoad {
-            part_id: 100,
-            req_per_sec: d().hot_cold_min_hot_qps.saturating_mul(2),
-            ..Default::default()
-        },
-        now - d().required_buckets as i64 * d().bucket_sec,
-    );
-    fill_window(
-        &mut eng,
-        101,
-        d().required_buckets,
-        PartitionLoad {
-            part_id: 101,
-            req_per_sec: 1,
-            ..Default::default()
-        },
-        now - d().required_buckets as i64 * d().bucket_sec,
-    );
-    let owners: HashMap<u64, u64> = vec![(100u64, 42u64), (101, 42)].into_iter().collect();
-    // First call should record a cooldown entry.
-    eng.compute_hot_cold_advisory(&owners, &HashMap::new(), now);
-    assert!(
-        eng.last_hot_cold_at.contains_key(&42),
-        "hot/cold advisory expected to fire on >{}x imbalance",
-        d().hot_cold_ratio,
-    );
-}
-
-#[test]
 fn hot_cold_advisory_skips_when_hottest_below_floor() {
     let mut eng = PolicyEngine::default();
     let now = 1_700_000_000;

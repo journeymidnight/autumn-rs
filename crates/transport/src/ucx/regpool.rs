@@ -727,35 +727,6 @@ mod tests {
         drop(pb);
     }
 
-    #[test]
-    fn acquire_release_reuses_same_class() {
-        // Needs a UCX context; only run when the test bind is configured.
-        if std::env::var("AUTUMN_UCX_TEST_BIND").is_err() {
-            return;
-        }
-        let p1 = acquire(200_000); // class 256K
-        let cap1 = p1.class;
-        let ptr1 = p1.filled().as_ptr();
-        assert_eq!(cap1, 256 * 1024);
-        assert!(p1.reg().is_some());
-        drop(p1);
-        // Re-acquire the same class → should reuse the pooled slab (same ptr).
-        let p2 = acquire(250_000);
-        assert_eq!(p2.class, 256 * 1024);
-        assert_eq!(p2.filled().as_ptr(), ptr1, "expected slab reuse");
-    }
-
-    #[test]
-    fn dest_mut_len_matches_need() {
-        if std::env::var("AUTUMN_UCX_TEST_BIND").is_err() {
-            return;
-        }
-        let mut p = acquire(1000);
-        assert_eq!(p.dest_mut().len(), 1000);
-        assert_eq!(p.class, 4096);
-        assert_eq!(p.len(), 1000);
-    }
-
     // `read_exact_at` into a PooledBuf must read exactly `used` bytes,
     // NOT the full slab `class`. `used=5000` rounds to `class=8192`; a file of
     // 5000 bytes would EOF-error if the read targeted the whole 8192-slab.

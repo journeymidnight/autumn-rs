@@ -5099,7 +5099,7 @@ fn checkpoint_check_reports_an_sst_outside_the_row_stream() {
 }
 
 #[test]
-#[ignore]
+#[ignore = "full chaos harness; run by scripts/*_chaos.sh"]
 fn chaos_real_kill_split_merge_ec_fence_no_data_loss() {
     // Opt-in tracing: silent unless RUST_LOG is set (EnvFilter then applies
     // it). Lets a chaos run surface in-process PS / stream-layer internals

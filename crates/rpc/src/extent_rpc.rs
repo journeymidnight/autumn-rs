@@ -1352,19 +1352,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn delete_extent_req_round_trip() {
-        let req = DeleteExtentReq {
-            extent_id: 0xdead_beef_cafe_0042,
-            node_uuid: "uuid-target-node".to_string(),
-        };
-        let bytes = rkyv_encode(&req);
-        let decoded: DeleteExtentReq = rkyv_decode(&bytes).expect("decode");
-        assert_eq!(decoded.extent_id, req.extent_id);
-        assert_eq!(decoded.node_uuid, req.node_uuid);
-
-    }
-
-    #[test]
     fn fence_extent_req_round_trip() {
         let req = FenceExtentReq {
             extent_id: 0x0102_0304_0506_0708,
@@ -1397,18 +1384,6 @@ mod tests {
 
         // Truncated (empty) response is a decode error, not a panic.
         assert!(FenceExtentResp::decode(Bytes::new()).is_err());
-    }
-
-    #[test]
-    fn delete_extent_resp_uses_generic_code_resp() {
-        let resp = CodeResp {
-            code: CODE_OK,
-            message: String::new(),
-        };
-        let bytes = rkyv_encode(&resp);
-        let decoded: CodeResp = rkyv_decode(&bytes).expect("decode");
-        assert_eq!(decoded.code, CODE_OK);
-        assert!(decoded.message.is_empty());
     }
 
     /// rkyv_decode rejects malformed input via bytecheck instead of UB.

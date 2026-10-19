@@ -182,10 +182,6 @@ impl MgrExtentInflightRecord {
     }
 }
 
-// Phase 0: API is wired but not yet called by any production handler.
-// Phase 1 migrates EC convert; Phase 2 migrates
-// recovery + delete. Until those land, the methods are exercised only by
-// the unit tests below.
 #[allow(dead_code)]
 impl AutumnManager {
     /// Compose the etcd key for a given extent_id.
@@ -203,9 +199,6 @@ impl AutumnManager {
     ///
     /// In-memory mode (no etcd): the in-memory shadow alone is consulted;
     /// useful for unit tests.
-    ///
-    /// **Phase 0 note:** this function is NOT yet called by any production
-    /// handler. It's added now so later phases only swap call sites.
     pub async fn acquire_extent_inflight(
         &self,
         extent_id: u64,
@@ -590,10 +583,6 @@ impl AutumnManager {
     /// retry queue); ConvertToEc is WARN-only and Recovery is not swept — see
     /// the loop's docstring.
     pub(crate) async fn sweep_stale_inflight_once(&self, now: i64, threshold_secs: i64) -> usize {
-        // Recovery markers release faster (see
-        // `recovery_stale_threshold_secs`). `.min(threshold_secs)` so a caller
-        // (unit test) passing an even-shorter general threshold still wins —
-        // recovery is never released LATER than the general threshold.
         // Snapshot stale candidates under a single ledger borrow so we
         // don't hold the borrow across the await.
         let stale: Vec<(u64, ExtentOpKind, i64)> = self
@@ -781,20 +770,6 @@ mod tests {
 
     fn run<F: std::future::Future<Output = T>, T>(f: F) -> T {
         compio::runtime::Runtime::new().unwrap().block_on(f)
-    }
-
-    /// Phase 0: acquire on an empty extent succeeds; in-memory shadow
-    /// reflects the op kind.
-    #[test]
-    fn acquire_extent_inflight_succeeds_when_empty() {
-        run(async {
-            let m = AutumnManager::new();
-            m._test_register_health_nodes([1, 3, 5, 7]);
-            m.acquire_extent_inflight(42, ec_payload(42))
-                .await
-                .expect("acquire");
-            assert_eq!(m.extent_inflight_op(42), Some(ExtentOpKind::ConvertToEc));
-        })
     }
 
     /// Phase 0: second acquire on the same extent is refused with
@@ -2193,36 +2168,6 @@ mod tests {
         assert!(!m.delete_target_is_fence(&target("u-2")), "maintenance is waited for");
         assert!(m.delete_target_is_fence(&target("u-gone")));
         assert!(!m.delete_target_is_fence(&target("")));
-    }
-
-    /// stale ConvertToEc marker is WARN-only across multiple
-    /// sweep ticks — never auto-released. Operator must manually
-    /// remediate via Python ops tooling.
-    #[test]
-    fn sweep_excludes_convert_to_ec_from_auto_release() {
-        run(async {
-            let m = AutumnManager::new();
-            m._test_register_health_nodes([1, 3, 5, 7]);
-            m.acquire_extent_inflight(77, ec_payload(77))
-                .await
-                .expect("acquire");
-
-            let now_future = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs() as i64
-                + 7200;
-            // Sweep multiple times — ConvertToEc must survive every tick.
-            for _ in 0..3 {
-                let released = m.sweep_stale_inflight_once(now_future, 1).await;
-                assert_eq!(released, 0, "ConvertToEc must never count toward released");
-                assert_eq!(
-                    m.extent_inflight_op(77),
-                    Some(ExtentOpKind::ConvertToEc),
-                    "stale ConvertToEc marker survives every sweep tick"
-                );
-            }
-        })
     }
 
     /// sweep does NOT release markers younger than the threshold. Uses a

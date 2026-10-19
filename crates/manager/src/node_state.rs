@@ -280,17 +280,6 @@ mod tests {
     }
 
     #[test]
-    fn re_register_skips_suspend_via_heartbeat_ok() {
-        let mut t = NodeStateTracker::new(Duration::from_secs(10));
-        // Simulate a node already known and verified.
-        t.on_register_first(7);
-        t.on_heartbeat_ok(7);
-        // Operator re-runs `register-node` — handler uses on_heartbeat_ok.
-        t.on_heartbeat_ok(7);
-        assert_eq!(t.state_of(7), NodeAutoState::Online);
-    }
-
-    #[test]
     fn snapshot_is_sorted_by_id() {
         let mut t = NodeStateTracker::new(Duration::from_secs(10));
         t.on_heartbeat_ok(5);

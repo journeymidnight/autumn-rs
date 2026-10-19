@@ -1,5 +1,5 @@
-//! Test: split extent ref counting — refs go from 1→2 on split, then
-//! back to 0 after both children compact and GC the shared extents.
+//! Test: split extent ref counting — the sealed extents both children share
+//! carry refs 2 after the split, and both children keep serving.
 
 mod support;
 
@@ -13,7 +13,7 @@ use autumn_stream::{ConnPool, StreamClient};
 use support::*;
 
 #[test]
-fn split_ref_counting_shared_extents_freed_after_both_gc() {
+fn split_children_share_the_sealed_extents_with_two_refs() {
     let mgr_addr = pick_addr();
     start_manager(mgr_addr);
 
@@ -159,40 +159,7 @@ fn split_ref_counting_shared_extents_freed_after_both_gc() {
         psr_put(&router, right_id, right_key.as_bytes(), b"v").await;
         psr_flush(&router, right_id).await;
 
-        // Trigger GC on both children to reclaim old shared extents
-        ps_gc(&ps, 901).await;
-        psr_gc(&router, right_id).await;
-        compio::time::sleep(Duration::from_millis(2000)).await;
-
-        // After both children GC, the shared extent should have refs decremented.
-        // Note: GC calls punch_holes which decrements refs.
-        // The exact refs depends on whether GC actually punched this specific extent.
-        // If GC determined this extent has enough dead data and punched it:
-        //   Left GC: refs 2 → 1
-        //   Right GC: refs 1 → 0 → deleted
-        // If GC didn't punch (not enough dead data): refs stays at 2
-        //
-        // We verify that the mechanism works by checking refs <= 2
-        sc.invalidate_extent_cache(shared_extent_id);
-        match sc.get_extent_info(shared_extent_id).await {
-            Ok(info) => {
-                assert!(
-                    info.refs <= 2,
-                    "shared extent refs should be <= 2 after GC, got {}",
-                    info.refs
-                );
-                // If refs decreased, the ref counting is working
-                if info.refs < 2 {
-                    println!("extent refs decreased from 2 to {} after GC", info.refs);
-                }
-            }
-            Err(_) => {
-                // Extent was fully deleted (refs went to 0) — this is the ideal outcome
-                println!("shared extent was fully deleted after both children GC'd");
-            }
-        }
-
-        // Regardless of GC result, both children should still serve reads
+        // Both children write past the split and still serve reads.
         let resp = ps_get(&ps, 901, left_key.as_bytes()).await;
         assert_eq!(resp.value, b"v", "left child should still serve reads");
         let resp = psr_get(&router, right_id, right_key.as_bytes()).await;

@@ -25,13 +25,12 @@
 
 mod support;
 
-use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use autumn_client::lease::{self, AcquireResult, DaemonClientId, InvalidationMap};
+use autumn_client::lease::{self, AcquireResult, DaemonClientId};
 use autumn_client::ClusterClient;
 use autumn_rpc::client::RpcClient;
 use autumn_rpc::manager_rpc::{
@@ -283,18 +282,4 @@ fn multiple_distinct_inos_each_get_invalidated() {
             "ino=0 sentinel never reaches the invalidator"
         );
     });
-}
-
-#[test]
-fn no_invalidator_supplied_does_not_panic() {
-    // Pure regression: `spawn_lease_background_tasks(state, None)`
-    // must not crash when an event arrives. Production headless
-    // builds + e2e fixtures that don't need kernel-cache
-    // eviction pass `None` here.
-    let _registry = RefCell::new(InvalidationMap::new());
-    // The actual poll loop needs a manager + cluster, which the
-    // other tests cover. This test just confirms the type signature
-    // accepts `None` and the binding compiles + the closure
-    // construction is None-tolerant.
-    let _none: Option<InodeInvalidator> = None;
 }

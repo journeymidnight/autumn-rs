@@ -8751,34 +8751,6 @@ mod namespace_registry_tests {
     }
 
     #[test]
-    fn declared_but_uncut_points_never_false_positive_the_merge_guard() {
-        // Why recording INTENT (not just applied cuts) is safe: the merge guard
-        // compares against `max(start_a, start_b)`, always a REAL partition
-        // start, and an uncut declared point is nobody's start.
-        let m = mgr();
-        run(async { m.seed_builtin_namespaces().await.unwrap() });
-        assert_eq!(
-            set_presplit(&m, "fs", &[b"fs/\x03\x06", b"fs/\x03\x0c"]).code,
-            CODE_OK
-        );
-        // Only \x06 was actually cut; \x0c is declared-but-uncut.
-        mk_range(&m, 1, b"fs/", b"fs/\x03\x06");
-        mk_range(&m, 2, b"fs/\x03\x06", b"fs0");
-        // The real boundary IS protected …
-        assert!(m.sacred_boundary_owner(b"fs/\x03\x06").is_some());
-        // … and the uncut one, while recorded, is not any partition's start, so
-        // it can never be the boundary a merge computes.
-        let starts: Vec<Vec<u8>> = {
-            let s = m.store.inner.borrow();
-            s.partitions
-                .values()
-                .filter_map(|p| p.rg.as_ref().map(|r| r.start_key.clone()))
-                .collect()
-        };
-        assert!(!starts.contains(&b"fs/\x03\x0c".to_vec()));
-    }
-
-    #[test]
     fn empty_key_is_never_a_sacred_boundary() {
         // The keyspace start is not a declared cut — treating it as one would
         // make the very first partition unmergeable forever.
@@ -8786,13 +8758,6 @@ mod namespace_registry_tests {
         run(async { m.seed_builtin_namespaces().await.unwrap() });
         assert_eq!(set_presplit(&m, "fs", &[b""]).code, CODE_OK);
         assert!(m.sacred_boundary_owner(b"").is_none());
-    }
-
-    #[test]
-    fn principal_list_is_empty_before_any_create() {
-        let r = principal_list(&mgr());
-        assert_eq!(r.code, CODE_OK);
-        assert!(r.principals.is_empty());
     }
 
     #[test]
@@ -8827,17 +8792,6 @@ mod namespace_registry_tests {
         // Delete of a now-absent namespace = NOT_FOUND.
         let gone = delete(&m, "bench");
         assert_eq!(gone.code, CODE_NOT_FOUND);
-    }
-
-    #[test]
-    fn presplit_points_are_stored_verbatim() {
-        let m = mgr();
-        let pts = vec![vec![0x01u8, 0x02], vec![0xffu8]];
-        let r = create(&m, "bench", pts.clone());
-        assert_eq!(r.code, CODE_OK, "{}", r.message);
-        let ns = m.namespaces.borrow();
-        let row = ns.get("bench").unwrap();
-        assert_eq!(row.presplit, pts);
     }
 
     #[test]

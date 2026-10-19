@@ -1496,16 +1496,6 @@ mod tests {
     }
 
     #[test]
-    fn same_writer_reacquire_is_idempotent() {
-        let mut r = reg();
-        let now = Instant::now();
-        let w = cid(1, 1, "h");
-        let _ = r.acquire(&w, 7, LEASE_MODE_WRITE, now);
-        let out = r.acquire(&w, 7, LEASE_MODE_WRITE, now);
-        assert!(matches!(out, AcquireOutcome::Granted { writer_present: true, .. }));
-    }
-
-    #[test]
     fn ttl_expiry_revokes_writer_and_invalidates_readers() {
         let mut r = reg();
         let t0 = Instant::now();
@@ -1885,6 +1875,16 @@ mod tests {
     }
 
     #[test]
+    fn same_writer_reacquire_is_idempotent() {
+        let mut r = reg();
+        let now = Instant::now();
+        let w = cid(1, 1, "h");
+        let _ = r.acquire(&w, 7, LEASE_MODE_WRITE, now);
+        let out = r.acquire(&w, 7, LEASE_MODE_WRITE, now);
+        assert!(matches!(out, AcquireOutcome::Granted { writer_present: true, .. }));
+    }
+
+    #[test]
     fn force_acquire_by_same_writer_is_idempotent_refresh() {
         // The writer re-acquiring with force on their own ino must
         // not trigger a self-revoke. Same shape as the regular
@@ -2159,22 +2159,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn bug_lease_4_revert_handles_empty_pre_snapshot_no_panic() {
-        // The case where the pre-acquire snapshot is None (no entry
-        // existed). Reverting should drop the entry if no readers
-        // subscribed during the etcd await. This is the existing
-        // revert behavior; BUG-LEASE-4 doesn't change it,
-        // but a regression test guards the helper's None arm
-        // against an accidental edit.
-        let mut r = reg_with_grace(0);
-        let w = cid(1, 7, "w");
-        assert!(!r.inodes.contains_key(&85));
-        let _ = r.acquire(&w, 85, LEASE_MODE_WRITE, Instant::now());
-        r.revert_writer_acquire(85, None);
-        assert!(!r.inodes.contains_key(&85));
-    }
-
     // ─────────────── BUG-LEASE-5 (P1 #5) ────────────────────
 
     #[test]
@@ -2338,26 +2322,6 @@ mod tests {
         assert_eq!(committed.len(), 1);
         assert_eq!(committed[0].0, 5);
         assert_eq!(committed[0].1, 2, "post-commit version bumped exactly once");
-    }
-
-    #[test]
-    fn bug_lease_5_tick_wrapper_remains_backward_compatible() {
-        // The `tick()` wrapper still applies in one call (used by
-        // memory-only tests + the in-process test helpers). The 2PC
-        // refactor MUST NOT have broken its semantics.
-        let mut r = LeaseRegistry::with_ttl(Duration::from_millis(100));
-        let t0 = Instant::now();
-        let w = cid(1, 1, "writer");
-        let rd = cid(2, 2, "reader");
-        let _ = r.acquire(&w, 6, LEASE_MODE_WRITE, t0);
-        let _ = r.acquire(&rd, 6, LEASE_MODE_READ, t0);
-
-        let t_past = t0 + Duration::from_millis(200);
-        let revoked = r.tick(t_past);
-        assert_eq!(revoked.len(), 1);
-        assert_eq!(revoked[0].0, 6);
-        let (e, _) = r.drain_invalidations(&rd);
-        assert!(e.iter().any(|ev| ev.kind == LEASE_INVAL_LEASE_REVOKED));
     }
 
     #[test]

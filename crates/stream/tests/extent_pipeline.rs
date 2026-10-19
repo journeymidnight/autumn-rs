@@ -104,7 +104,7 @@ async fn appends_to_different_extents_run_concurrently() {
 }
 
 #[compio::test]
-async fn seal_rejects_subsequent_appends() {
+async fn a_stale_owner_epoch_append_is_refused_and_the_connection_stays_usable() {
     // OwnerEpoch fencing (ACL that runs on every append batch future): once
     // owner_epoch is bumped, late-arriving lower-owner_epoch appends must be
     // rejected. Proves the per-submit ACL path is still firing.

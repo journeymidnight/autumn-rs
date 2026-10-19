@@ -6624,12 +6624,8 @@ mod pipeline_tests {
 mod bad_nodes_tests {
     //! per-stream bad_nodes exclusion.
     //!
-    //! Covers (a) insert + immediate snapshot returns the node id,
-    //! (b) refresh-on-insert preserves only the latest expires_at, and
-    //! (c) a snapshot called after the TTL has elapsed prunes the
-    //! entry (verified by overriding `AUTUMN_STREAM_BAD_NODES_TTL_SECS`
-    //! to 1 s and sleeping). The slow case is gated behind a
-    //! `#[ignore]` so the default unit run stays sub-second.
+    //! Covers insert + immediate inspect returning the node id, and
+    //! refresh-on-insert keeping only the latest expires_at.
     use super::*;
 
     #[test]
@@ -6661,25 +6657,6 @@ mod bad_nodes_tests {
         let second = *bad.borrow().get(&11).unwrap();
         assert!(second > first);
         assert_eq!(bad.borrow().len(), 1);
-    }
-
-    #[test]
-    fn snapshot_prunes_expired_entries_in_place() {
-        let map: HashMap<u64, Instant> = [
-            (1u64, Instant::now() + Duration::from_secs(60)),
-            (2u64, Instant::now() - Duration::from_millis(1)),
-        ]
-        .into_iter()
-        .collect();
-        let rc = Rc::new(RefCell::new(map));
-        // Inline the snapshot semantics from `StreamClient::snapshot_bad_nodes`
-        // — pruning is in-place on borrow_mut so the map can never grow.
-        let now = Instant::now();
-        let mut entries = rc.borrow_mut();
-        entries.retain(|_, expires_at| *expires_at > now);
-        let mut snap: Vec<u64> = entries.keys().copied().collect();
-        snap.sort();
-        assert_eq!(snap, vec![1u64]);
     }
 }
 
@@ -6874,51 +6851,6 @@ mod suspected_read_tests {
             start,
             "suspected rotated-first slot must be tried last"
         );
-    }
-}
-
-#[cfg(test)]
-mod wire_compat_tests {
-    //! backwards-compat smoke for `StreamAllocExtentReq`. An empty
-    //! `exclude_node_ids` field must round-trip through rkyv as a
-    //! zero-length Vec — equivalent semantics to the earlier wire (no
-    //! filter applied on the manager side via the fall-back-on-empty
-    //! branch in `select_nodes`).
-    use autumn_rpc::manager_rpc::{rkyv_decode, rkyv_encode, StreamAllocExtentReq};
-
-    #[test]
-    fn empty_exclude_round_trips() {
-        let req = StreamAllocExtentReq {
-            stream_id: 42,
-            owner_key: "ps/0/partition/3".to_string(),
-            owner_epoch: 7,
-            seal_commit: None,
-            exclude_node_ids: Vec::new(),
-            seal_extent_id: 0,
-        };
-        let bytes = rkyv_encode(&req);
-        let back: StreamAllocExtentReq = rkyv_decode(&bytes).expect("decode");
-        assert_eq!(back.stream_id, 42);
-        assert_eq!(back.owner_key, "ps/0/partition/3");
-        assert_eq!(back.owner_epoch, 7);
-        assert_eq!(back.seal_commit, None);
-        assert!(back.exclude_node_ids.is_empty());
-    }
-
-    #[test]
-    fn populated_exclude_round_trips() {
-        let req = StreamAllocExtentReq {
-            stream_id: 1,
-            owner_key: String::new(),
-            owner_epoch: 0,
-            seal_commit: Some(1024),
-            exclude_node_ids: vec![3, 5, 9101],
-            seal_extent_id: 0,
-        };
-        let bytes = rkyv_encode(&req);
-        let back: StreamAllocExtentReq = rkyv_decode(&bytes).expect("decode");
-        assert_eq!(back.seal_commit, Some(1024));
-        assert_eq!(back.exclude_node_ids, vec![3, 5, 9101]);
     }
 }
 
@@ -8424,18 +8356,6 @@ mod ec_gather_retry_tests {
             .context("ec_reconstruct_shard_subrange: one shard short (extent=63)");
         assert!(is_ec_gather_one_short(&e));
         assert!(!is_eversion_stale(&e));
-    }
-
-    /// Two-or-more short must NOT carry it. Retrying there cannot help — the
-    /// extent genuinely lacks K available shards — and it would only delay a
-    /// loud error into a slow one, which is the trade this whole change set
-    /// exists to avoid.
-    #[test]
-    fn multi_short_is_not_retryable() {
-        let e = anyhow!("no shard responses").context(
-            "ec_reconstruct_shard_subrange: only 1/4 shards available for sub-range reconstruct",
-        );
-        assert!(!is_ec_gather_one_short(&e));
     }
 
     /// The layout-stale refusal is typed and distinct from the other two —

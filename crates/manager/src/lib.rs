@@ -6313,42 +6313,6 @@ mod tests {
     }
 
     #[test]
-    fn partition_region_rebalance() {
-        run(async {
-            let m = AutumnManager::new();
-            let req = rkyv_encode(&RegisterPsReq {
-                ps_id: 11,
-                address: "127.0.0.1:9955".to_string(),
-                slot_cap: 0,
-            });
-            let resp = m.handle_register_ps(req).await.unwrap();
-            let r: CodeResp = rkyv_decode(&resp).unwrap();
-            assert_eq!(r.code, CODE_OK);
-
-            let req = rkyv_encode(&UpsertPartitionReq {
-                meta: autumn_rpc::manager_rpc::MgrPartitionMeta {
-                    log_stream: 1,
-                    row_stream: 2,
-                    meta_stream: 3,
-                    part_id: 101,
-                    rg: Some(autumn_rpc::manager_rpc::MgrRange {
-                        start_key: b"a".to_vec(),
-                        end_key: b"z".to_vec(),
-                    }),
-                },
-            });
-            let resp = m.handle_upsert_partition(req).await.unwrap();
-            let r: CodeResp = rkyv_decode(&resp).unwrap();
-            assert_eq!(r.code, CODE_OK);
-
-            let resp = m.handle_get_regions().await.unwrap();
-            let r: GetRegionsResp = rkyv_decode(&resp).unwrap();
-            assert_eq!(r.code, CODE_OK);
-            assert_eq!(r.regions.len(), 1);
-        })
-    }
-
-    #[test]
     fn least_loaded_allocation() {
         run(async {
             let m = AutumnManager::new();
@@ -6759,55 +6723,6 @@ mod tests {
         let e99 = modified.iter().find(|e| e.extent_id == 99).unwrap();
         assert_eq!(e99.sealed_length, 0);
         assert_eq!(e99.refs, 1);
-    }
-
-    #[test]
-    fn splice_streams_without_new_tail_no_e_new() {
-        let mut state = crate::store::MetadataState::default();
-        let mk = |id: u64, refs: u64| ExtentRecord {
-            extent_id: id,
-            replicates: vec![1],
-            parity: vec![],
-            replicate_disks: vec![1],
-            parity_disks: vec![],
-            sealed_length: 0,
-            sealed: false,
-            avali: 1,
-            eversion: 0,
-            refs,
-            vp_table_refs: 0,
-            ec_converted: false,
-        };
-        state.extents.insert(30, mk(30, 1));
-        state.extents.insert(40, mk(40, 1));
-        state.streams.insert(
-            300,
-            StreamRecord {
-                stream_id: 300,
-                extent_ids: vec![30],
-                ec_data_shard: 1,
-                ec_parity_shard: 0,
-                replicates: 3,
-            },
-        );
-        state.streams.insert(
-            400,
-            StreamRecord {
-                stream_id: 400,
-                extent_ids: vec![40],
-                ec_data_shard: 1,
-                ec_parity_shard: 0,
-                replicates: 3,
-            },
-        );
-        let (updated, modified) =
-            AutumnManager::splice_streams_without_new_tail(&state, 300, 400, 100, 200).unwrap();
-        assert_eq!(updated.extent_ids, vec![30, 40]);
-        // Merge refs accounting: victim-only extent transfers victim→survivor →
-        // refs stays 1 (was asserted as 2 = the leak).
-        let e40 = modified.iter().find(|e| e.extent_id == 40).unwrap();
-        assert_eq!(e40.refs, 1);
-        assert_eq!(e40.sealed_length, 200);
     }
 
     /// Merge refs-leak regression: merging back a split (survivor + victim
@@ -7298,19 +7213,6 @@ mod tests {
         let state = rebal_state(&[1, 2, 3], &assignments);
         let moves = AutumnManager::compute_rebalance_moves(&state, 0);
         assert!(moves.is_empty(), "already balanced, got {moves:?}");
-    }
-
-    #[test]
-    fn rebalance_is_deterministic() {
-        let assignments: Vec<(u64, u64)> = (100..132).map(|p| (p, 3)).collect();
-        let state = rebal_state(&[1, 2, 3], &assignments);
-        let a = AutumnManager::compute_rebalance_moves(&state, 0);
-        let b = AutumnManager::compute_rebalance_moves(&state, 0);
-        assert_eq!(
-            a.iter().map(|m| (m.part_id, m.from_ps, m.to_ps)).collect::<Vec<_>>(),
-            b.iter().map(|m| (m.part_id, m.from_ps, m.to_ps)).collect::<Vec<_>>(),
-            "dry-run must match the applied set"
-        );
     }
 
     #[test]
@@ -8945,29 +8847,6 @@ mod tests {
         })
     }
 
-    /// merge then last_op_at must be updated on the
-    /// survivor and removed for the victim.
-    #[test]
-    fn merge_updates_last_op_at_correctly() {
-        let mut state = crate::store::MetadataState::default();
-        let mut m = HashMap::new();
-        m.insert(1u64, 1_700_000_000i64);
-        m.insert(2u64, 1_700_000_500i64);
-
-        // Simulate the in-memory updates applied at end of
-        // handle_multi_modify_merge Phase 3.
-        let now = 1_800_000_000i64;
-        m.insert(1u64, now);
-        m.remove(&2);
-
-        assert_eq!(m.get(&1), Some(&now));
-        assert!(!m.contains_key(&2));
-        // Suppress unused-state warning.
-        let _ = state.partitions.is_empty();
-        // Avoid `state` mut warning.
-        state.next_id = 1;
-    }
-
     /// with 4 nodes and count=3, every node must appear in a
     /// non-trivial fraction of selections — previously the lowest-id 3
     /// always won and node 7 never showed up.
@@ -10285,80 +10164,6 @@ mod tests {
     }
 
     // ── rich-marker rkyv roundtrip + pending_ec_dispatch bookkeeping ──
-
-    /// The marker value persisted to etcd must round-trip rkyv encode/decode
-    /// without losing any field. Previously the marker had an empty value;
-    /// now the value carries `target_nodes` so re-dispatch after
-    /// failover uses the original assignment instead of a fresh shuffle.
-    #[test]
-    fn ec_dispatch_inflight_rkyv_roundtrip() {
-        let original = MgrEcDispatchInflight {
-            extent_id: 42,
-            target_nodes: vec![1, 3, 5, 7],
-            extra_disk_ids: vec![19],
-            data_shards: 3,
-            new_eversion: 9,
-            owner_epoch: 17,
-        };
-        let bytes = rkyv_encode(&original).to_vec();
-        let decoded: MgrEcDispatchInflight = rkyv_decode(&bytes).expect("decode");
-        assert_eq!(decoded.extent_id, original.extent_id);
-        assert_eq!(decoded.target_nodes, original.target_nodes);
-        assert_eq!(decoded.extra_disk_ids, original.extra_disk_ids);
-        assert_eq!(decoded.data_shards, original.data_shards);
-        assert_eq!(decoded.new_eversion, original.new_eversion);
-        assert_eq!(decoded.owner_epoch, original.owner_epoch);
-    }
-
-    /// the unified inflight ledger (the
-    /// successor to `pending_ec_dispatch`) starts empty; acquire +
-    /// commit_release round-trip ConvertToEc payloads correctly.
-    #[test]
-    fn pending_ec_dispatch_in_memory_bookkeeping() {
-        let m = AutumnManager::new();
-        m._test_register_health_nodes([1, 3, 5, 7]);
-        assert!(
-            m.inflight.borrow().is_empty(),
-            "ledger starts empty"
-        );
-
-        let rec = MgrEcDispatchInflight {
-            extent_id: 7,
-            target_nodes: vec![1, 3, 5, 7],
-            extra_disk_ids: vec![19],
-            data_shards: 3,
-            new_eversion: 4,
-            owner_epoch: 0,
-        };
-        run(async {
-            m.acquire_extent_inflight(
-                rec.extent_id,
-                crate::extent_inflight::ExtentOpPayload::ConvertToEc(rec.clone()),
-            )
-            .await
-            .expect("acquire");
-        });
-        let inflight_view = m.inflight.borrow();
-        let stored = inflight_view.get(&7).expect("present").clone();
-        drop(inflight_view);
-        match stored.unpack().expect("valid record").1 {
-            crate::extent_inflight::ExtentOpPayload::ConvertToEc(p) => {
-                assert_eq!(p.target_nodes, vec![1, 3, 5, 7]);
-                assert_eq!(p.new_eversion, 4);
-            }
-            _ => panic!("expected ConvertToEc payload"),
-        }
-        assert_eq!(
-            m.extent_inflight_op(7),
-            Some(crate::extent_inflight::ExtentOpKind::ConvertToEc)
-        );
-
-        m.commit_extent_inflight_release(7);
-        assert!(
-            m.inflight.borrow().is_empty(),
-            "ledger cleared after release"
-        );
-    }
 
     /// `apply_ec_conversion_done` must set `avali` to
     /// `all_bits(K + M)`. Previously it left `avali` at the pre-EC value

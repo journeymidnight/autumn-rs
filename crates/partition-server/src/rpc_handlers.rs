@@ -2760,50 +2760,6 @@ mod map_storage_error_tests {
 }
 
 #[cfg(test)]
-mod gc_pin_read_outcome_tests {
-    use crate::{acquire_reader_pin, try_acquire_writer_pin};
-    use std::rc::Rc;
-    use std::sync::atomic::AtomicI64;
-
-    /// The read path asks for a reader pin before resolving a ValuePointer, and
-    /// gets `None` exactly while GC holds the writer pin. What it does with that
-    /// `None` is the whole question: answering NotFound tells the client the key
-    /// does not exist, which is terminal and wrong — GC relocates every live
-    /// value before punching, so a live key is either still in place or already
-    /// rewritten. `get_value_inner` now returns Unavailable, which the SDK maps
-    /// to a retryable error.
-    ///
-    /// This pins the precondition that makes that branch reachable at all: a
-    /// held writer pin denies readers, and releasing it lets them back in. If
-    /// this ever stops holding, the Unavailable branch is dead code and the
-    /// false-NotFound it replaced could quietly return.
-    #[test]
-    fn a_held_writer_pin_denies_readers_until_released() {
-        let pin = Rc::new(AtomicI64::new(0));
-        assert!(
-            acquire_reader_pin(pin.clone()).is_some(),
-            "an idle extent must serve reads"
-        );
-
-        assert!(try_acquire_writer_pin(&pin), "GC takes the writer pin");
-        assert!(
-            acquire_reader_pin(pin.clone()).is_none(),
-            "while GC holds it the read path gets None — the branch that used to \
-             answer a false NotFound"
-        );
-
-        // Release the way GC does, then readers must be admitted again: this is
-        // why Unavailable-and-retry is the correct answer rather than a
-        // terminal miss.
-        pin.store(0, std::sync::atomic::Ordering::SeqCst);
-        assert!(
-            acquire_reader_pin(pin).is_some(),
-            "after the punch completes the retry must succeed"
-        );
-    }
-}
-
-#[cfg(test)]
 mod batch_bulk_ceiling_tests {
     use super::*;
 

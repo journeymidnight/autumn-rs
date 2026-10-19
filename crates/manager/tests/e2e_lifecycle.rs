@@ -94,23 +94,6 @@ async fn remove(mgr: &RpcClient, node_id: u64) -> RemoveNodeResp {
     rkyv_decode(&bytes).expect("decode remove")
 }
 
-async fn query_audit(mgr: &RpcClient, op: u8, node_id: u64) -> Vec<MgrAuditEntry> {
-    let req = QueryAuditLogReq {
-        op_filter: op,
-        node_id_filter: node_id,
-        since_ts_s: 0,
-        until_ts_s: 0,
-        limit: 100,
-    };
-    let bytes = mgr
-        .call(MSG_QUERY_AUDIT_LOG, rkyv_encode(&req))
-        .await
-        .expect("query_audit_log");
-    let resp: QueryAuditLogResp = rkyv_decode(&bytes).expect("decode query");
-    assert_eq!(resp.code, CODE_OK);
-    resp.entries
-}
-
 // ── E2E test 1: a phantom node becomes Suspected ─────────────────
 //
 // A registered node with no EN listening starts `Suspend` and, silent past
@@ -445,51 +428,6 @@ fn e2e_remove_blocked_by_active_extents() {
         // We don't assert id1 is the victim — manager's select_nodes
         // shuffles. The point is: at least ONE extent is blocking.
         let _ = id1; // silence unused warning if id1 isn't the victim
-    });
-}
-
-// ── E2E test 5: audit log captures admin ops ─────────────────────────
-
-#[test]
-fn e2e_audit_log_captures_admin_ops() {
-    let mgr_addr = pick_addr();
-    start_manager(mgr_addr);
-
-    compio::runtime::Runtime::new().unwrap().block_on(async {
-        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::version_hello::Role::Admin, None).await.expect("connect mgr");
-
-        let n1_addr = pick_addr();
-        let n1 = register_node(&mgr, &n1_addr.to_string(), "uuid-1")
-            .await
-            .node_id;
-
-        // Fence + clear → 2 audit entries on n1.
-        let _ = fence(&mgr, n1, "first fence", true).await;
-        let req = ClearNodeOverrideReq {
-            node_id: n1,
-            set_by: "e2e".to_string(),
-        };
-        let _ = mgr
-            .call(MSG_CLEAR_NODE_OVERRIDE, rkyv_encode(&req))
-            .await
-            .unwrap();
-
-        // In-memory mode (no etcd) returns empty — audit is etcd-backed.
-        // We still call the RPC and verify the wire works.
-        let entries = query_audit(&mgr, 0, n1).await;
-        // Either etcd is configured (entries.len() == 2) or it isn't
-        // (entries.len() == 0). Both are valid wire-level outcomes.
-        assert!(
-            entries.len() <= 10,
-            "audit returned too many entries (expected 0 or 2): {}",
-            entries.len()
-        );
-        // If etcd persisted, verify the expected ops landed.
-        if entries.len() == 2 {
-            let ops: Vec<u8> = entries.iter().map(|e| e.op).collect();
-            assert!(ops.contains(&AUDIT_OP_FENCE_NODE));
-            assert!(ops.contains(&AUDIT_OP_CLEAR_NODE_OVERRIDE));
-        }
     });
 }
 

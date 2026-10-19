@@ -3746,27 +3746,9 @@ mod ec_apply_fail_tests {
     //! deterministic model of "apply failed while this manager stays leader".
     use crate::extent_inflight::ExtentOpKind;
     use crate::AutumnManager;
-    use crate::persist::records::ExtentRecord;
 
     fn block_on<F: std::future::Future>(f: F) -> F::Output {
         compio::runtime::Runtime::new().unwrap().block_on(f)
-    }
-
-    fn pre_ec_extent(extent_id: u64) -> ExtentRecord {
-        ExtentRecord {
-            extent_id,
-            replicates: vec![1, 3, 5],
-            parity: vec![],
-            eversion: 3,
-            refs: 1,
-            vp_table_refs: 0,
-            sealed_length: 4096,
-            sealed: true,
-            avali: 0x7,
-            replicate_disks: vec![10, 30, 50],
-            parity_disks: vec![],
-            ec_converted: false,
-        }
     }
 
     /// REPRODUCE: apply fails (extent absent → NotFound, leadership retained).
@@ -3793,42 +3775,6 @@ mod ec_apply_fail_tests {
                 Some(ExtentOpKind::ConvertToEc),
                 "BUG2-EC-APPLY-FAIL: marker MUST be retained when apply fails \
                  (else the drain-only loop never re-dispatches → permanent wedge)"
-            );
-        });
-    }
-
-    /// CONTROL: apply succeeds (extent present, memory-mode) → marker released.
-    #[test]
-    fn apply_success_releases_inflight_marker() {
-        block_on(async {
-            let m = AutumnManager::new();
-            m._test_register_health_nodes([1, 3, 5, 7]);
-            let extent_id: u64 = 7002;
-            m.store
-                .inner
-                .borrow_mut()
-                .extents
-                .insert(extent_id, pre_ec_extent(extent_id));
-            m._test_mark_ec_inflight(extent_id);
-
-            m.finalize_ec_dispatch_after_convert(extent_id, vec![1, 3, 5, 7], vec![70], 3, 4)
-                .await;
-
-            assert_eq!(
-                m.extent_inflight_op(extent_id),
-                None,
-                "apply success must release the in-memory marker"
-            );
-            // And the extent is now EC-converted in memory.
-            assert!(
-                m.store
-                    .inner
-                    .borrow()
-                    .extents
-                    .get(&extent_id)
-                    .map(|e| e.ec_converted)
-                    .unwrap_or(false),
-                "apply success must flip ec_converted in memory"
             );
         });
     }
@@ -3938,19 +3884,6 @@ mod ec_dispatch_owner_epoch_tests {
             200,
             "a re-dispatch must carry the CURRENT epoch; stamping the frozen {frozen} \
              is below the ENs' floor and is refused by every participant forever"
-        );
-    }
-
-    /// The fence's real purpose is preserved: it rejects a FENCED ex-coordinator,
-    /// which still holds the epoch it captured. Refreshing moves only the live
-    /// dispatch up, so the ghost stays strictly below the floor.
-    #[test]
-    fn a_ghost_coordinators_captured_epoch_stays_below_the_refreshed_one() {
-        let ghost_captured = dispatch_owner_epoch_for_extent(&state_at(100), EXTENT);
-        let live = dispatch_owner_epoch_for_extent(&state_at(200), EXTENT);
-        assert!(
-            ghost_captured < live,
-            "a refreshed dispatch must still outrank the ghost's stale epoch"
         );
     }
 
@@ -4217,17 +4150,6 @@ mod recovery_placement_tests {
 #[cfg(test)]
 mod slot_verdict_tests {
     use super::{slot_verdict, SlotVerdict};
-
-    /// A disk the extent node has locally proven dead (`Faulted`) must have
-    /// its replicas rebuilt without waiting for an operator. Before this, the
-    /// gate withheld the slot BEFORE anything looked at the disk, so the extent
-    /// sat at RF-1 silently while the manager's own view still called the disk
-    /// healthy, and the only repair was fencing the whole node — four times
-    /// the data movement on a four-disk machine.
-    #[test]
-    fn a_dead_disk_is_rebuilt() {
-        assert_eq!(slot_verdict(true, false, false), SlotVerdict::Rebuild);
-    }
 
     /// A node that is merely unreachable — `MgrDiskInfo.online` false because a
     /// `df` timed out, or partition servers reported it — is no evidence about

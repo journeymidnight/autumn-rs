@@ -402,8 +402,7 @@ pub fn cache_is_stale(ino: u64, lease_epoch: u64, inv: &InvalidationMap) -> bool
 mod tests {
     use super::*;
     use autumn_rpc::manager_rpc::{
-        LEASE_CLIENT_KIND_FUSE, LEASE_INVAL_LEASE_REVOKED, LEASE_INVAL_META_CHANGED,
-        LEASE_INVAL_WRITER_CLOSED,
+        LEASE_INVAL_LEASE_REVOKED, LEASE_INVAL_META_CHANGED, LEASE_INVAL_WRITER_CLOSED,
     };
 
     fn ev(ino: u64, version: u64, kind: u8) -> autumn_rpc::manager_rpc::MgrInvalidation {
@@ -464,19 +463,5 @@ mod tests {
         assert_eq!(id.as_wire().kind, LEASE_CLIENT_KIND_IORING);
         assert_eq!(id.as_wire().host, "test-host");
         assert_ne!(id.as_wire().uuid, [0u8; 16], "uuid must be random");
-    }
-
-    #[test]
-    fn from_wire_preserves_arbitrary_kind() {
-        // The from_wire constructor is the only path tests use to
-        // simulate a fuse-daemon identity; assert it preserves kind.
-        let wire = MgrClientId {
-            kind: LEASE_CLIENT_KIND_FUSE,
-            uuid: [42u8; 16],
-            host: "fake".to_string(),
-        };
-        let id = DaemonClientId::from_wire(wire);
-        assert_eq!(id.as_wire().kind, LEASE_CLIENT_KIND_FUSE);
-        assert_eq!(id.as_wire().uuid, [42u8; 16]);
     }
 }

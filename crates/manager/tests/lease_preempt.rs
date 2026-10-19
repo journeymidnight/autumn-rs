@@ -82,14 +82,15 @@ fn force_acquire_pushes_will_revoke_to_current_writer() {
             other => panic!("expected RevokePending, got {other:?}"),
         }
 
-        // w's next poll surfaces WillRevokeIn.
+        // w's next poll surfaces exactly one WillRevokeIn.
         let events = lease::poll_invalidations(&cluster_w, &w).await.unwrap();
-        let wri = events
+        let wri: Vec<_> = events
             .iter()
-            .find(|e| e.kind == LEASE_INVAL_WILL_REVOKE_IN)
-            .expect("WillRevokeIn must be pushed to the current writer");
-        assert_eq!(wri.ino, 50);
-        assert!(wri.version > 0, "version carries grace ms; must be > 0");
+            .filter(|e| e.kind == LEASE_INVAL_WILL_REVOKE_IN)
+            .collect();
+        assert_eq!(wri.len(), 1, "one WillRevokeIn for the current writer: {events:?}");
+        assert_eq!(wri[0].ino, 50);
+        assert!(wri[0].version > 0, "version carries grace ms; must be > 0");
     });
 }
 

@@ -54,6 +54,7 @@ pub async fn many_concurrent_at<T: AutumnTransport + Clone>(t: T, addr: SocketAd
     let _ = server.await;
 }
 
+#[allow(dead_code)] // loopback_ucx has no half-close test
 pub async fn half_close_at<T: AutumnTransport + Clone>(t: T, addr: SocketAddr) {
     let mut listener = t.bind(addr).await.unwrap();
     let bound = listener.local_addr().unwrap();

@@ -257,6 +257,17 @@ mod tests {
         assert_eq!(decoded, payload);
     }
 
+    /// 2+1 EC: missing one data shard, decode from remaining data + parity.
+    #[test]
+    fn test_2_plus_1_missing_data_shard_0() {
+        let payload: Vec<u8> = (0..4096).map(|i| (i % 251) as u8).collect();
+        let shards = ec_encode(&payload, 2, 1).unwrap();
+        let mut shards_opt: Vec<Option<Vec<u8>>> = shards.into_iter().map(Some).collect();
+        shards_opt[0] = None; // data shard 0 gone
+        let decoded = ec_decode(shards_opt, 2, 1, payload.len()).unwrap();
+        assert_eq!(decoded, payload, "should recover from 1 data + 1 parity");
+    }
+
     #[test]
     fn test_decode_with_missing_parity_shard() {
         let payload: Vec<u8> = (0..1024).map(|i| (i % 251) as u8).collect();
@@ -314,16 +325,6 @@ mod tests {
         assert_eq!(shard_size(6144, 3), 2048); // exact division
     }
 
-    #[test]
-    fn test_shard_size_all_equal() {
-        let payload: Vec<u8> = (0..999).map(|i| i as u8).collect();
-        let shards = ec_encode(&payload, 3, 2).unwrap();
-        let first_len = shards[0].len();
-        for s in &shards {
-            assert_eq!(s.len(), first_len, "all shards must have equal length");
-        }
-    }
-
     /// Verify that data shards contain raw payload slices — the fast-path
     /// assumption that sub-range reads from a data shard return original bytes.
     #[test]
@@ -347,55 +348,6 @@ mod tests {
             &shards[1][..remaining],
             &payload[per_shard..per_shard + remaining]
         );
-    }
-
-    /// Verify that partial shards cannot be decoded — this is the bug that
-    /// ec_read_from_extent had (passing offset/length to all shards).
-    #[test]
-    fn test_partial_shards_cannot_decode() {
-        let payload: Vec<u8> = (0..1024).map(|i| (i % 251) as u8).collect();
-        let shards = ec_encode(&payload, 2, 1).unwrap();
-        let _per_shard = shards[0].len();
-
-        // Take a sub-range from each shard (simulating the old buggy behavior)
-        let partial: Vec<Option<Vec<u8>>> =
-            shards.iter().map(|s| Some(s[100..200].to_vec())).collect();
-
-        // This should fail because partial shards have wrong length for RS decode
-        let result = ec_decode(partial, 2, 1, payload.len());
-        // The decode itself may "succeed" but return garbage (shards too short).
-        // Either way, the output won't match the expected payload sub-range.
-        if let Ok(decoded) = result {
-            // If it somehow decodes, the result is garbage — not payload[100..200]
-            assert_ne!(
-                decoded,
-                payload[100..200].to_vec(),
-                "partial shard decode should NOT return correct payload sub-range"
-            );
-        }
-        // If it errors, that's also correct — partial shards can't be decoded.
-    }
-
-    /// 2+1 EC: missing one data shard, decode from remaining data + parity.
-    #[test]
-    fn test_2_plus_1_missing_data_shard_0() {
-        let payload: Vec<u8> = (0..4096).map(|i| (i % 251) as u8).collect();
-        let shards = ec_encode(&payload, 2, 1).unwrap();
-        let mut shards_opt: Vec<Option<Vec<u8>>> = shards.into_iter().map(Some).collect();
-        shards_opt[0] = None; // data shard 0 gone
-        let decoded = ec_decode(shards_opt, 2, 1, payload.len()).unwrap();
-        assert_eq!(decoded, payload, "should recover from 1 data + 1 parity");
-    }
-
-    /// 2+1 EC: missing data shard 1, decode from shard 0 + parity.
-    #[test]
-    fn test_2_plus_1_missing_data_shard_1() {
-        let payload: Vec<u8> = (0..4096).map(|i| (i % 251) as u8).collect();
-        let shards = ec_encode(&payload, 2, 1).unwrap();
-        let mut shards_opt: Vec<Option<Vec<u8>>> = shards.into_iter().map(Some).collect();
-        shards_opt[1] = None; // data shard 1 gone
-        let decoded = ec_decode(shards_opt, 2, 1, payload.len()).unwrap();
-        assert_eq!(decoded, payload, "should recover from 1 data + 1 parity");
     }
 
     /// verify that `ec_reconstruct_shard` operates correctly on

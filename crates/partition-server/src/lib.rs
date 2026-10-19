@@ -11237,83 +11237,6 @@ mod tests {
     }
 
     #[test]
-    fn compio_timer_in_spawn() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        use std::sync::Arc;
-
-        let fired = Arc::new(AtomicBool::new(false));
-        let fired2 = fired.clone();
-
-        compio::runtime::Runtime::new().unwrap().block_on(async {
-            compio::runtime::spawn(async move {
-                compio::time::sleep(Duration::from_millis(100)).await;
-                fired2.store(true, Ordering::SeqCst);
-            })
-            .detach();
-
-            // Main task sleeps longer to give spawned task time
-            compio::time::sleep(Duration::from_millis(500)).await;
-        });
-
-        assert!(
-            fired.load(Ordering::SeqCst),
-            "spawned timer should have fired"
-        );
-    }
-
-    /// The recover_partition retry loop must propagate errors after
-    /// exhausting retries, not silently skip extents. This test validates the
-    /// pattern: succeed after transient failures, or fail hard after 10 attempts.
-    #[test]
-    fn retry_loop_propagates_after_exhaustion() {
-        let max_retries = 10u32;
-
-        // Case 1: succeeds on the 5th attempt (transient failure → recovery).
-        let succeed_on = 5u32;
-        let mut attempt = 0u32;
-        let result: Result<Vec<u8>> = loop {
-            match if attempt < succeed_on - 1 {
-                Err(anyhow::anyhow!("transient"))
-            } else {
-                Ok(vec![1, 2, 3])
-            } {
-                Ok(d) => break Ok(d),
-                Err(e) => {
-                    attempt += 1;
-                    if attempt >= max_retries {
-                        break Err(anyhow::anyhow!("failed after {} attempts: {}", attempt, e));
-                    }
-                }
-            }
-        };
-        assert!(result.is_ok(), "should succeed after transient failures");
-        assert_eq!(result.unwrap(), vec![1, 2, 3]);
-
-        // Case 2: all 10 attempts fail → error propagated (not silent skip).
-        let mut attempt = 0u32;
-        let result: Result<Vec<u8>> = loop {
-            match Err::<Vec<u8>, _>(anyhow::anyhow!("persistent failure")) {
-                Ok(d) => break Ok(d),
-                Err(e) => {
-                    attempt += 1;
-                    if attempt >= max_retries {
-                        break Err(anyhow::anyhow!("failed after {} attempts: {}", attempt, e));
-                    }
-                }
-            }
-        };
-        assert!(
-            result.is_err(),
-            "should propagate error after exhausting retries"
-        );
-        let msg = result.unwrap_err().to_string();
-        assert!(
-            msg.contains("failed after 10 attempts"),
-            "error message should include attempt count: {msg}"
-        );
-    }
-
-    #[test]
     fn mvcc_key_encoding() {
         use std::cmp::Ordering;
 
@@ -11410,35 +11333,6 @@ mod tests {
     // ── Tests ported from Go range_partition/entry_test.go ───────────────────
 
     #[test]
-    fn record_encode_decode_roundtrip() {
-        let encoded = encode_record(1, b"key", b"hello world", 0);
-        let records = decode_records_full(&encoded);
-        assert_eq!(records.len(), 1);
-        let (op, key, value, expires_at) = &records[0];
-        assert_eq!(*op, 1);
-        assert_eq!(key, b"key");
-        assert_eq!(value, b"hello world");
-        assert_eq!(*expires_at, 0);
-    }
-
-    #[test]
-    fn record_encode_decode_with_expiry() {
-        let encoded = encode_record(1, b"ttl_key", b"ttl_val", 1700000000);
-        let records = decode_records_full(&encoded);
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].3, 1700000000);
-    }
-
-    #[test]
-    fn record_encode_decode_delete() {
-        let encoded = encode_record(2, b"del_key", b"", 0);
-        let records = decode_records_full(&encoded);
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].0, 2); // op=delete
-        assert!(records[0].2.is_empty()); // empty value
-    }
-
-    #[test]
     fn record_encode_decode_multiple() {
         let mut buf = Vec::new();
         buf.extend_from_slice(&encode_record(1, b"k1", b"v1", 0));
@@ -11454,16 +11348,6 @@ mod tests {
         assert_eq!(records[1].3, 100);
         assert_eq!(records[2].0, 2);
         assert_eq!(records[2].1, b"k3");
-    }
-
-    #[test]
-    fn record_encode_decode_big_value() {
-        let big_val = vec![0xAB; 1024 * 1024]; // 1MB
-        let encoded = encode_record(1, b"bigkey", &big_val, 0);
-        let records = decode_records_full(&encoded);
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0].2.len(), 1024 * 1024);
-        assert_eq!(records[0].2[0], 0xAB);
     }
 
     /// WAL-FAILSTOP (coco prod-audit P0 #2): a CRC mismatch on a COMPLETE
@@ -11600,57 +11484,6 @@ mod tests {
         assert_eq!(recs.len(), 1, "only A decodes; B's chopped tail is carry");
         assert!(consumed < want_p, "leftover carried to next chunk");
         assert!(corrupt.is_empty(), "non-final leftover is not corruption");
-    }
-
-    /// Regression test for GC data loss bug: WAL records for large values
-    /// must have OP_VALUE_POINTER flag in op so that GC's `run_gc` can
-    /// identify them. Without the flag, GC skips all entries → moved=0
-    /// → punches extent → live VP data lost.
-    #[test]
-    fn wal_vp_flag_for_large_values() {
-        let small_val = vec![0u8; 100]; // < VALUE_THROTTLE (4KB)
-        let large_val = vec![0u8; VALUE_THROTTLE + 1]; // > VALUE_THROTTLE
-
-        // Simulate what the write path does:
-        // small value → op=1, large value → op=1|OP_VALUE_POINTER
-        let small_op: u8 = if small_val.len() > VALUE_THROTTLE {
-            1 | OP_VALUE_POINTER
-        } else {
-            1
-        };
-        let large_op: u8 = if large_val.len() > VALUE_THROTTLE {
-            1 | OP_VALUE_POINTER
-        } else {
-            1
-        };
-
-        assert_eq!(small_op, 1, "small value should NOT have VP flag");
-        assert_eq!(
-            large_op,
-            1 | OP_VALUE_POINTER,
-            "large value MUST have VP flag"
-        );
-
-        // Encode WAL records with the correct op
-        let mut buf = Vec::new();
-        buf.extend_from_slice(&encode_record(small_op, b"small_key", &small_val, 0));
-        buf.extend_from_slice(&encode_record(large_op, b"large_key", &large_val, 0));
-
-        let records = decode_records_full(&buf);
-        assert_eq!(records.len(), 2);
-
-        // GC uses this check to identify VP entries:
-        let (op0, _, _, _) = &records[0];
-        let (op1, _, _, _) = &records[1];
-        assert_eq!(
-            op0 & OP_VALUE_POINTER,
-            0,
-            "small value WAL record should be skipped by GC"
-        );
-        assert!(
-            op1 & OP_VALUE_POINTER != 0,
-            "large value WAL record MUST be detected by GC"
-        );
     }
 
     #[test]
@@ -12286,54 +12119,6 @@ mod tests {
         }
         assert_eq!(count, 100);
     }
-
-    // ── resolve_value sub-range tests (inline values, no StreamClient) ──
-
-    /// Test the inline sub-range slicing logic directly (no StreamClient needed).
-    fn inline_subrange(data: &[u8], offset: u32, length: u32) -> Vec<u8> {
-        let v = data.to_vec();
-        if offset == 0 && length == 0 {
-            return v;
-        }
-        let start = (offset as usize).min(v.len());
-        let end = if length == 0 {
-            v.len()
-        } else {
-            (start + length as usize).min(v.len())
-        };
-        v[start..end].to_vec()
-    }
-
-    #[test]
-    fn resolve_value_inline_full() {
-        assert_eq!(inline_subrange(b"hello world", 0, 0), b"hello world");
-    }
-
-    #[test]
-    fn resolve_value_inline_subrange() {
-        assert_eq!(inline_subrange(b"hello world", 6, 5), b"world");
-    }
-
-    #[test]
-    fn resolve_value_inline_subrange_clamp() {
-        // length exceeds data → clamped to end
-        assert_eq!(inline_subrange(b"hello", 3, 100), b"lo");
-    }
-
-    #[test]
-    fn resolve_value_inline_offset_past_end() {
-        assert_eq!(inline_subrange(b"hello", 999, 0), b"");
-    }
-
-    #[test]
-    fn resolve_value_inline_offset_zero_length_nonzero() {
-        assert_eq!(inline_subrange(b"hello world", 0, 5), b"hello");
-    }
-
-    #[test]
-    fn resolve_value_inline_middle_slice() {
-        assert_eq!(inline_subrange(b"0123456789", 3, 4), b"3456");
-    }
 }
 
 // imm-pop signal flow is validated by:
@@ -12367,11 +12152,6 @@ mod tests {
 //   3. merged_loop_bad_decode_replies_invalid_arg — a malformed payload is
 //      rejected with StatusCode::InvalidArgument on the outer oneshot,
 //      without ever touching `pending`.
-//
-// A live-loop LockedByOther drain test is covered by
-// `background::sqcq_tests::ps_sqcq_locked_by_other_drains_cleanly` — the
-// merged loop reuses the same `handle_completion` primitive, same
-// `FuturesUnordered`, same break-on-flag exit condition.
 #[cfg(test)]
 mod merged_loop_tests {
     use super::*;
@@ -12945,74 +12725,6 @@ mod partition_listener_tests {
 
         let port = port_rx.recv().expect("bind port reported");
         (port, shutdown_tx, join)
-    }
-
-    /// test 1 — one partition thread binds its own listener on
-    /// an OS-assigned port; a client connects to that port and issues a
-    /// Put; the response round-trips correctly. Verifies the "thread
-    /// owns its listener" architectural property.
-    #[test]
-    fn n1_single_partition_listener() {
-        let owner_part: u64 = 42;
-        let (port, shutdown_tx, join) = spawn_partition_listener(owner_part);
-
-        // Client: open a TCP connection and send one Put on a separate
-        // compio runtime (matching what autumn-client does in perf-check).
-        std::thread::spawn(move || {
-            compio::runtime::Runtime::new()
-                .unwrap()
-                .block_on(async move {
-                    let addr: std::net::SocketAddr =
-                        format!("127.0.0.1:{port}").parse().expect("parse addr");
-                    let stream = compio::net::TcpStream::connect(addr)
-                        .await
-                        .expect("connect");
-                    let (mut rd, mut wr) = test_protocol::initiate_tcp(
-                        stream,
-                        autumn_rpc::version_hello::Service::PartitionServer,
-                    )
-                    .await
-                    .into_split();
-
-                    let put = PutReq {
-                        part_id: owner_part,
-                        key: b"k_n1".to_vec(),
-                        value: b"v_n1".to_vec(),
-                        expires_at: 0,
-                        region_epoch: 0,
-                    inode_hint: 0,
-                    lease_epoch: 0,
-                    };
-                    let payload = partition_rpc::rkyv_encode(&put);
-                    let frame = Frame::request(1, MSG_PUT, payload).encode();
-                    let BufResult(r, _) = wr.write_all(frame).await;
-                    r.expect("write");
-
-                    let mut decoder = FrameDecoder::new();
-                    let mut buf = vec![0u8; 4096];
-                    let resp_frame = loop {
-                        let BufResult(n, back) = rd.read(buf).await;
-                        buf = back;
-                        let n = n.expect("read");
-                        assert!(n > 0, "EOF before response");
-                        decoder.feed(&buf[..n]);
-                        if let Some(f) = decoder.try_decode().expect("decode") {
-                            break f;
-                        }
-                    };
-                    assert_eq!(resp_frame.req_id, 1);
-                    assert!(!resp_frame.is_error(), "unexpected error response");
-                    let resp: PutResp =
-                        partition_rpc::rkyv_decode(&resp_frame.payload).expect("decode resp");
-                    assert_eq!(resp.code, CODE_OK);
-                    assert_eq!(resp.key, b"k_n1");
-                });
-        })
-        .join()
-        .expect("client thread");
-
-        drop(shutdown_tx);
-        let _ = join.join();
     }
 
     /// test 2 — four partition threads bind four distinct ports;
@@ -14238,148 +13950,13 @@ fn memtable_snapshot_cost_scales_with_memtable_not_page_size() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// tests — split serialisation gates
-// ---------------------------------------------------------------------------
-
-#[cfg(test)]
-mod maintenance_gate_tests {
-    use super::CompactionGate;
-    use std::sync::atomic::Ordering;
-
-    // Verify that a second acquire waits while a first permit is held, then
-    // succeeds immediately after the first permit is dropped.
-    #[test]
-    fn split_serialises_with_compact_gate() {
-        let gate = CompactionGate::new(1);
-
-        // Simulate "compaction in progress": manually bump inflight.
-        gate.inflight.fetch_add(1, Ordering::Release);
-        assert_eq!(
-            gate.inflight.load(Ordering::Acquire),
-            1,
-            "gate should show inflight=1"
-        );
-
-        // A split trying to acquire should fail CAS (at-cap).
-        let cur = gate.inflight.load(Ordering::Acquire);
-        assert!(cur >= gate.max_parallel, "gate should be at capacity");
-
-        // Simulate compaction finishing.
-        gate.inflight.fetch_sub(1, Ordering::Release);
-        assert_eq!(
-            gate.inflight.load(Ordering::Acquire),
-            0,
-            "gate should be free after compaction"
-        );
-
-        // Now split's CAS should succeed.
-        let cur = gate.inflight.load(Ordering::Acquire);
-        assert!(
-            cur < gate.max_parallel,
-            "gate should be acquirable for split"
-        );
-    }
-
-    // Verify that gc_gate (per-partition) has the same acquire/release semantics.
-    #[test]
-    fn gc_releases_gate_after_holes_loop() {
-        let gc_gate = CompactionGate::new(1);
-
-        // Simulate GC holding the gate.
-        gc_gate.inflight.fetch_add(1, Ordering::Release);
-        assert_eq!(
-            gc_gate.inflight.load(Ordering::Acquire),
-            1,
-            "gc_gate should show inflight=1 while GC runs"
-        );
-
-        // Split cannot acquire.
-        assert!(gc_gate.inflight.load(Ordering::Acquire) >= gc_gate.max_parallel);
-
-        // GC loop exits: drop permit.
-        gc_gate.inflight.fetch_sub(1, Ordering::Release);
-        assert_eq!(
-            gc_gate.inflight.load(Ordering::Acquire),
-            0,
-            "gc_gate should be free after holes loop"
-        );
-    }
-
-    // D-r6: gc_concurrency_gate folded into AdmissionController.
-    // Cross-partition concurrent-GC behaviour now exercised by
-    // `admission_tests::admission_acquire_compact_and_gc_concurrency_caps`.
-}
-
 #[cfg(test)]
 mod invalidate_plumbing_tests {
-    //! regression guards for the two coco-audit findings (Bug #1 split
-    //! → P-sst RowAppendReq missed invalidate; Bug #2 P-sst readiness
-    //! handshake).
-    //!
-    //! Bug #1 v1 attempt (lazy `Cell<bool>` flag piggybacked on
-    //! `FlushReq.invalidate_row_stream` + `RowAppendReq.invalidate_row_stream`)
-    //! was found racy by coco /arch GPT-5.5 in a second-pass review: with
-    //! P-sst's `FuturesUnordered` cap=2, the post-split fetch-and-clear
-    //! pattern let a queued `FlushReq(invalidate=false)` (flag already taken
-    //! by an earlier `RowAppendReq(invalidate=true)`) enter P-sst's FU
-    //! ALONGSIDE the invalidating request — the FlushReq's append could land
-    //! on the stale per-stream worker BEFORE the RowAppendReq's invalidate
-    //! ran. v3 final replaces the lazy flag with a SYNCHRONOUS P-log →
-    //! P-sst barrier (`RowInvalidateBarrierReq`): `handle_split_part` sends
-    //! it BETWEEN `commit_length` capture and `multi_modify_split` (inside
-    //! the critical section guarded by per-partition `compact_gate` +
-    //! PS-wide `acquire_compact` + per-partition `gc_gate` +
-    //! `frozen_for_split`). The pre-seal placement is REQUIRED for clean
-    //! abort: barrier failure leaves the manager not yet committed.
-    //! P-sst drains its FuturesUnordered to ZERO, calls
-    //! `sst_sc.invalidate_stream(...)`, and ACKs; only then does split
-    //! call `multi_modify_split`, then release its gates. BOTH the send and
-    //! the ACK are bounded by separate timers (5 s + 10 s, total well under
-    //! `FREEZE_TTL`'s 30 s backstop) so a wedged P-sst can't extend the
-    //! window past TTL and let stale `commit_length` reach
-    //! `multi_modify_split`. Race window structurally closed.
-    //!
-    //! Bug #2 fix (P-sst readiness handshake) is unchanged from v1.
+    //! The P-log → P-sst `RowInvalidateBarrierReq` that a split sends between
+    //! its `commit_length` capture and `multi_modify_split`: a failed
+    //! seal/roll must come back as an error, never as an ACK.
     use super::*;
     use futures::channel::{mpsc, oneshot};
-
-    /// Bug #1 v2 wire regression: `RowInvalidateBarrierReq` survives the
-    /// per-partition barrier channel round trip with `row_stream_id` and
-    /// `resp_tx` intact. If a future refactor removes the message or
-    /// breaks the destructure pattern (the actual class of the original
-    /// bug — there was no message and the flag was lazy), the destructure
-    /// in this test fails to compile.
-    #[test]
-    fn row_invalidate_barrier_req_round_trips() {
-        let rt = compio::runtime::Runtime::new().expect("rt");
-        rt.block_on(async {
-            let (tx, mut rx) = mpsc::channel::<RowInvalidateBarrierReq>(1);
-            let (resp_tx, resp_rx) = oneshot::channel::<Result<()>>();
-            let req = RowInvalidateBarrierReq {
-                row_stream_id: 42,
-                seal_and_roll: false,
-                resp_tx,
-            };
-            tx.clone().send(req).await.expect("send");
-            let recv = rx.next().await.expect("recv");
-            let RowInvalidateBarrierReq {
-                row_stream_id,
-                seal_and_roll: _,
-                resp_tx: recv_resp_tx,
-            } = recv;
-            assert_eq!(row_stream_id, 42);
-            // Round-trip the ACK as well — handle_split_part awaits this
-            // oneshot before releasing gates.
-            let _ = recv_resp_tx.send(Ok(()));
-            assert!(
-                matches!(resp_rx.await, Ok(Ok(()))),
-                "barrier ACK oneshot must round-trip — \
-                 handle_split_part blocks here before releasing \
-                 compact_gate / gc_gate / frozen_for_split."
-            );
-        });
-    }
 
     #[test]
     fn row_roll_barrier_propagates_failure() {
@@ -14408,63 +13985,6 @@ mod invalidate_plumbing_tests {
             assert!(
                 result.expect("worker must ACK").is_err(),
                 "a failed seal/roll must never be acknowledged as success"
-            );
-        });
-    }
-
-    /// Bug #1 v2 ordering regression: with the priority-biased
-    /// `select_with_strategy`, an `Invalidate` SQ message wins against a
-    /// concurrently-ready `Flush` / `RowAppend` message. This is defensive
-    /// — at the moment `handle_split_part` sends the barrier, the gates
-    /// already keep upstream producers silent — but the bias keeps the
-    /// design race-free under future refactors that might relax those
-    /// gates.
-    #[test]
-    fn invalidate_wins_priority_select() {
-        use futures::stream::PollNext;
-        let rt = compio::runtime::Runtime::new().expect("rt");
-        rt.block_on(async {
-            // Two streams: high-priority `inv` + low-priority `other`.
-            let (mut inv_tx, inv_rx) = mpsc::channel::<u8>(1);
-            let (mut other_tx, other_rx) = mpsc::channel::<u8>(1);
-            // Preload BOTH streams so polling either is ready immediately;
-            // the strategy must pick `inv` (Left).
-            inv_tx.send(0xFF).await.unwrap();
-            other_tx.send(0x01).await.unwrap();
-            let mut combined =
-                futures::stream::select_with_strategy(inv_rx, other_rx, |_: &mut ()| {
-                    PollNext::Left
-                });
-            let picked = combined.next().await.expect("at least one ready");
-            assert_eq!(
-                picked, 0xFF,
-                "priority-biased select must pick the invalidate \
-                 stream (Left) ahead of any flush / row_append on the \
-                 Right — defensive ordering guarantee for future refactors."
-            );
-        });
-    }
-
-    /// Bug #2 regression: `spawn_sst_thread`'s readiness channel surfaces
-    /// thread-abort as `Err(_canceled)` rather than hanging the open path.
-    /// Previously `spawn_sst_thread` returned `Ok(JoinHandle)` as soon as the
-    /// OS thread spawn succeeded; runtime / `StreamClient` init failures
-    /// inside the thread logged + returned, leaving P-log with a Sender
-    /// targeting a dead Receiver. Simulated here by dropping the sender
-    /// without sending — the same wire shape as a thread aborting mid-init.
-    #[test]
-    fn bulk_ready_signal_dropped_returns_canceled_not_hang() {
-        let rt = compio::runtime::Runtime::new().expect("rt");
-        rt.block_on(async {
-            let (ready_tx, ready_rx) = oneshot::channel::<Result<()>>();
-            drop(ready_tx);
-            let result = ready_rx.await;
-            assert!(
-                result.is_err(),
-                "a dropped ready channel must surface as Canceled so \
-                 the open_partition path can return Err — otherwise the \
-                 partition wedged on first flush with a Sender to a dead \
-                 Receiver."
             );
         });
     }

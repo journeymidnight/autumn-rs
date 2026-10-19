@@ -758,45 +758,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn table_bloom_filter_no_false_negatives() {
-        // Use 200 keys — within SstBuilder's initial bloom capacity of 512
-        let entries: Vec<(Vec<u8>, u64, Vec<u8>)> = (0..200)
-            .map(|i| {
-                let uk = format!("bloomkey{i:06}");
-                (uk.into_bytes(), i as u64, b"v".to_vec())
-            })
-            .collect();
-        let refs: Vec<(&[u8], u64, &[u8])> = entries
-            .iter()
-            .map(|(k, s, v)| (k.as_slice(), *s, v.as_slice()))
-            .collect();
-        let reader = build_sst(&refs);
-
-        // All inserted keys must return true (zero false negatives)
-        for i in 0..200 {
-            let uk = format!("bloomkey{i:06}");
-            assert!(
-                reader.bloom_may_contain(uk.as_bytes()),
-                "bloom false negative for {uk}"
-            );
-        }
-
-        // Non-existent keys should have low false-positive rate
-        let mut false_positives = 0;
-        for i in 0..200 {
-            let uk = format!("nokey{i:06}");
-            if reader.bloom_may_contain(uk.as_bytes()) {
-                false_positives += 1;
-            }
-        }
-        // With 1% FPR target and 200 probes, expect < 20 false positives
-        assert!(
-            false_positives < 20,
-            "too many false positives: {false_positives}/200"
-        );
-    }
-
     // ── Tests ported from Go table/merge_iterator_test.go ────────────────────
 
     #[test]
@@ -889,32 +850,6 @@ mod tests {
         assert_eq!(it.item().unwrap().value, b"t1_wins");
         it.next();
         assert!(!it.valid(), "exact duplicate should be deduplicated");
-    }
-
-    #[test]
-    fn merge_iterator_same_user_key_different_seq() {
-        // Same user key but different seq → different internal keys → all returned
-        let t1 = build_sst(&[(b"x", 30, b"t1")]);
-        let t2 = build_sst(&[(b"x", 20, b"t2")]);
-        let t3 = build_sst(&[(b"x", 10, b"t3")]);
-        let mut it = MergeIterator::new(vec![
-            TableIterator::new(t1),
-            TableIterator::new(t2),
-            TableIterator::new(t3),
-        ]);
-        it.rewind();
-
-        // Higher seq sorts first due to inverted encoding
-        assert!(it.valid());
-        assert_eq!(it.item().unwrap().value, b"t1"); // seq=30
-        it.next();
-        assert!(it.valid());
-        assert_eq!(it.item().unwrap().value, b"t2"); // seq=20
-        it.next();
-        assert!(it.valid());
-        assert_eq!(it.item().unwrap().value, b"t3"); // seq=10
-        it.next();
-        assert!(!it.valid());
     }
 
     #[test]

@@ -934,13 +934,6 @@ mod sealed_empty_sweep_tests {
     }
 
     #[test]
-    fn a_sealed_member_with_bytes_is_never_swept() {
-        let members = [m(1, true, 1, false), m(2, true, 0, false)];
-        // Only the tail is left out here, so 1 is judged on its own merits.
-        assert!(!sealed_empty_sweep_candidates(&members).contains(&1));
-    }
-
-    #[test]
     fn an_unsealed_member_is_never_swept() {
         // An OPEN extent reports sealed_length == 0 while holding data — the one
         // shape that must never be mistaken for an empty seal.

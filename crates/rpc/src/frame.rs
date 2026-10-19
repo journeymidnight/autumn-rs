@@ -856,7 +856,7 @@ mod tests {
     /// `cargo test --release -p autumn-rpc --lib replica_crc_cpu_benchmark
     ///  -- --ignored --nocapture`
     #[test]
-    #[ignore]
+    #[ignore = "benchmark: run with --release"]
     fn replica_crc_cpu_benchmark() {
         use std::{hint::black_box, time::Instant};
         // One 29-byte AppendReq header + the payload, as `launch_append` builds

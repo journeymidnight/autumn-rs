@@ -4928,8 +4928,9 @@ cargo test -p autumn-manager                                 # integration (need
 Manager integration tests under `crates/manager/tests/` cover split / merge / chaos / crash
 recovery, and all run in CI except three opt-ins marked `#[ignore]`: the full
 chaos harness (`system_chaos`), the >1 GiB GC-floor test
-(`system_gc_floor_durable_ckpt`) and the fence/flush stress
-(`fence_flush_invariant`). Run one by name with `-- --ignored`.
+(`system_gc_floor_durable_ckpt`) and the append benchmark (`append_benchmark`,
+run by `scripts/benchmark_append_stream.sh`). Run one by name with
+`-- --ignored`.
 
 GC data-integrity regression (full VP-identity liveness — a superseded older
 version of a key in the same sealed extent must NOT revive over the newer one):

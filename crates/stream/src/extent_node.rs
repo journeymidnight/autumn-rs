@@ -12838,22 +12838,6 @@ mod wire_fence_tests {
         assert_eq!(decoded.attempt_nonce, 6_000_000_001);
         assert_eq!(decoded.payload.as_ref(), b"shard-bytes");
     }
-
-    #[test]
-    fn write_shard_req_revision_zero_is_no_fence_marker() {
-        let original = WriteShardReq {
-            extent_id: 1,
-            shard_index: 0,
-            sealed_length: 0,
-            eversion: 1,
-            owner_epoch: 0,
-            shard_offset: 0,
-            attempt_nonce: 0,
-            payload: Bytes::new(),
-        };
-        let decoded = WriteShardReq::decode(original.encode()).unwrap();
-        assert_eq!(decoded.owner_epoch, 0, "zero owner_epoch marker preserved");
-    }
 }
 
 #[cfg(test)]

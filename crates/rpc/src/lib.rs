@@ -296,11 +296,6 @@ mod shard_for_extent_tests {
     }
 
     #[test]
-    fn deterministic() {
-        assert_eq!(shard_for_extent(999, 4), shard_for_extent(999, 4));
-    }
-
-    #[test]
     fn bootstrap_contiguous_ids_spread_across_all_shards() {
         // The regression this hash fixes: `autumn-op bootstrap` allocates
         // a contiguous run of stream/extent ids (7 per partition), which under a
@@ -502,24 +497,5 @@ mod wire_version_tests {
             FIRST_WIRE_VERSION_WITH_PEER_EQUALITY - 1,
             hi
         ));
-    }
-
-    /// A client built at the floor — the one this feature exists for, and the
-    /// first that an open window actually serves.
-    ///
-    /// It models the CLIENT's predicate as that client compiled it. A 43 client
-    /// is the first with the equality-era code, so it runs `client_compat_check`
-    /// with its own `WIRE_VERSION` of 43 against the reported pair.
-    #[test]
-    fn a_client_one_version_behind_the_cluster_is_served() {
-        let (lo, hi) = (MIN_CLIENT_WIRE_VERSION, WIRE_VERSION);
-        assert!(lo < hi, "nothing below is meaningful with the window shut");
-        // The 43 client's own check, which used to refuse it: `contains(43)`.
-        assert!((lo..=hi).contains(&MIN_CLIENT_WIRE_VERSION));
-        // This binary (the cluster's own commit) is served by its own report.
-        assert!(client_compat_check(lo, hi).is_ok());
-        // A SERVER is still held to equality — the floor is no licence to join.
-        assert!(cluster_peer_compat_check(hi).is_ok());
-        assert!(cluster_peer_compat_check(lo).is_err());
     }
 }

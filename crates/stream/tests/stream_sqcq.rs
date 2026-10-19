@@ -20,7 +20,6 @@ use autumn_manager::AutumnManager;
 use autumn_rpc::client::RpcClient;
 use autumn_rpc::manager_rpc::*;
 use autumn_stream::{ConnPool, ExtentNode, ExtentNodeConfig, StreamClient};
-use futures::future::join_all;
 
 fn pick_addr() -> SocketAddr {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -297,64 +296,6 @@ fn worker_handles_back_pressure() {
                 .await
                 .expect("commit length");
             assert_eq!(cl, (N * PAYLOAD) as u64);
-        });
-}
-
-/// Test 3: CQ advances commit on out-of-order completion.
-///
-/// We can't easily control which replica ack arrives first (ExtentNode
-/// processes the TCP stream sequentially per connection).  Instead, we
-/// indirectly validate the BTreeMap prefix logic by issuing many tiny
-/// concurrent appends and checking the final commit_length on the replica
-/// matches the total bytes leased.  This would fail if the BTreeMap
-/// advance had a missing wakeup, left a gap, or skipped acks.
-///
-/// Combined with the lease-ordering assertion in Test 1, this verifies the
-/// worker's state machine preserves R3's ack semantics under full SQ/CQ
-/// overlap.
-#[test]
-fn cq_advances_commit_on_out_of_order_completion() {
-    let (mgr_addr, n_addr) = spawn_stack();
-
-    compio::runtime::Runtime::new()
-        .unwrap()
-        .block_on(async move {
-            let stream_id = setup_stream(mgr_addr, n_addr).await;
-            let pool = Rc::new(ConnPool::new());
-            let client = StreamClient::connect(
-                &mgr_addr.to_string(),
-                "owner/sqcq/ooo".to_string(),
-                256 * 1024 * 1024,
-                pool,
-            )
-            .await
-            .expect("stream client");
-
-            // 30 concurrent small appends — the worker will lease them all in
-            // stream-order (serialised inside the actor), but their 3-replica
-            // joins complete in whatever order the replicas return.  With only
-            // 1 replica here completion order matches submission order, but
-            // the BTreeMap code path still runs and must produce contiguous
-            // advance.
-            const N: usize = 30;
-            const PAYLOAD: usize = 100;
-            let futs: Vec<_> = (0..N)
-                .map(|_| {
-                    let client = client.clone();
-                    let payload = vec![b'q'; PAYLOAD];
-                    async move { client.append(stream_id, &payload).await }
-                })
-                .collect();
-            let results = join_all(futs).await;
-            for r in &results {
-                let _ = r.as_ref().expect("append");
-            }
-            let total = (N * PAYLOAD) as u64;
-            let cl = client
-                .commit_length(stream_id)
-                .await
-                .expect("commit length");
-            assert_eq!(cl, total, "commit advanced through entire prefix");
         });
 }
 

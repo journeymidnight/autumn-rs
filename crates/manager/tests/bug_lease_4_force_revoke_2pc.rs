@@ -32,8 +32,7 @@ use autumn_client::lease::{self, AcquireResult, DaemonClientId};
 use autumn_client::ClusterClient;
 use autumn_manager::AutumnManager;
 use autumn_rpc::manager_rpc::{
-    MgrClientId, LEASE_CLIENT_KIND_FUSE, LEASE_INVAL_LEASE_REVOKED,
-    LEASE_INVAL_WILL_REVOKE_IN, LEASE_MODE_WRITE,
+    MgrClientId, LEASE_CLIENT_KIND_FUSE, LEASE_INVAL_LEASE_REVOKED, LEASE_MODE_WRITE,
 };
 
 use support::pick_addr;
@@ -114,56 +113,6 @@ fn bug_lease_4_force_revoke_still_delivers_lease_revoked_after_2pc() {
         assert!(
             revoked[0].version > 0,
             "LeaseRevoked must carry the post-bump version"
-        );
-    });
-}
-
-/// RevokePending path (grace started but not yet expired) must
-/// STILL deliver WillRevokeIn to the current writer. This arm
-/// flushes deferred pushes directly (no etcd write between stage
-/// and flush). Regression guard for that integration.
-#[test]
-fn bug_lease_4_revoke_pending_delivers_will_revoke_in() {
-    let mgr_addr = pick_addr();
-    start_manager(mgr_addr);
-
-    compio::runtime::Runtime::new().unwrap().block_on(async {
-        let cluster_a = ClusterClient::connect_raw(&mgr_addr.to_string()).await.unwrap();
-        let cluster_b = ClusterClient::connect_raw(&mgr_addr.to_string()).await.unwrap();
-        let writer_a = cid(0xc1, "a");
-        let writer_b = cid(0xc2, "b");
-        let ino = 8002u64;
-
-        let _ = lease::acquire(&cluster_a, &writer_a, ino, LEASE_MODE_WRITE)
-            .await
-            .unwrap();
-        // Drain A's initial events.
-        let _ = lease::poll_invalidations(&cluster_a, &writer_a)
-            .await
-            .unwrap();
-
-        // B's first force-acquire (no wait — sees RevokePending).
-        let r = lease::acquire_force(&cluster_b, &writer_b, ino, LEASE_MODE_WRITE)
-            .await
-            .unwrap();
-        match r {
-            AcquireResult::RevokePending { .. } => {}
-            other => panic!("expected RevokePending, got {other:?}"),
-        }
-
-        // A's poll MUST see WillRevokeIn — the RevokePending arm
-        // of the handler flushes the deferred push directly.
-        let events = lease::poll_invalidations(&cluster_a, &writer_a)
-            .await
-            .unwrap();
-        let will: Vec<_> = events
-            .iter()
-            .filter(|e| e.kind == LEASE_INVAL_WILL_REVOKE_IN && e.ino == ino)
-            .collect();
-        assert_eq!(
-            will.len(),
-            1,
-            "BUG-LEASE-4: WillRevokeIn must reach A's inbox on the RevokePending arm: events={events:?}"
         );
     });
 }

@@ -231,7 +231,6 @@ async fn nemesis_loop(
 // ─── The test ─────────────────────────────────────────────────────────
 
 #[test]
-#[ignore]
 fn fence_flush_invariant() {
     // ── Manager (in-process, memory-only) ──
     let mgr_addr = pick_addr();

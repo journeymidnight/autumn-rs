@@ -42,6 +42,7 @@ fn batch_count(iter: usize, total_blocks: usize, batch_size: usize, num_reqs: us
 }
 
 #[test]
+#[ignore = "benchmark: 20k durable appends; run via scripts/benchmark_append_stream.sh"]
 fn benchmark_append_stream_throughput() {
     let ops = env_usize("APPEND_BENCH_OPS", 20_000);
     let payload_size = env_usize("APPEND_BENCH_PAYLOAD", 4096);

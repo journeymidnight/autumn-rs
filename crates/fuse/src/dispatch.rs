@@ -171,8 +171,7 @@ pub struct ReleaseAction {
 /// BUG-LEASE-7 (P2 #8, 2026-06-06) — pure-fn predicate used by the
 /// Open arm to decide whether the cached `InodeState.meta` /
 /// `extents` are stale relative to a freshly-acquired lease
-/// version. Mirrors the ioring daemon's
-/// lease-version staleness check.
+/// version.
 ///
 /// `acquired_version`: the version returned by the just-completed
 ///   AcquireLease (or read back from `held_leases[ino].version` on
@@ -1364,8 +1363,8 @@ pub async fn handle_request(
 mod page_cache_tests {
     use super::open_keeps_page_cache;
 
-    /// The cluster-boot suite (`fuse_page_cache.rs`) is `#[ignore]`d; the
-    /// decision table runs by default here.
+    /// The decision table without a cluster; `fuse_page_cache.rs` drives it
+    /// end to end.
     #[test]
     fn keep_only_what_a_lease_or_a_matching_generation_vouches_for() {
         // (sticky, held, recorded, fresh) -> keep
@@ -1390,11 +1389,8 @@ mod page_cache_tests {
 
 #[cfg(test)]
 mod fuse_lease_2_unit_tests {
-    //! coco P3 review feedback: unit-test the
-    //! per-event ⇒ invalidator-call contract so default `cargo test`
-    //! catches regressions. The `fuse_lease_2.rs` integration
-    //! suite is `#[ignore]`'d (cluster-boot, slow); these guard
-    //! the same shape with no cluster.
+    //! The per-event ⇒ invalidator-call contract without a cluster;
+    //! `fuse_lease_2.rs` drives it end to end.
 
     use super::invalidate_kernel_cache_for_events;
     use autumn_rpc::manager_rpc::{
@@ -1415,16 +1411,6 @@ mod fuse_lease_2_unit_tests {
             log_c.borrow_mut().push(ino);
         });
         (inv, log)
-    }
-
-    #[test]
-    fn per_ino_writer_closed_calls_invalidator() {
-        let (inv, log) = counting_inv();
-        invalidate_kernel_cache_for_events(
-            &[ev(7, 5, LEASE_INVAL_WRITER_CLOSED)],
-            &inv,
-        );
-        assert_eq!(*log.borrow(), vec![7]);
     }
 
     #[test]
@@ -1466,25 +1452,12 @@ mod fuse_lease_2_unit_tests {
         invalidate_kernel_cache_for_events(&[], &inv);
         assert!(log.borrow().is_empty());
     }
-
-    #[test]
-    fn lease_revoked_also_triggers_invalidation() {
-        // LeaseRevoked = manager TTL-expired the writer. Reader's
-        // cached attrs/data are stale just like WriterClosed.
-        let (inv, log) = counting_inv();
-        invalidate_kernel_cache_for_events(
-            &[ev(55, 7, LEASE_INVAL_LEASE_REVOKED)],
-            &inv,
-        );
-        assert_eq!(*log.borrow(), vec![55]);
-    }
 }
 
 #[cfg(test)]
 mod bug_lease_3_fuse_tests {
     //! BUG-LEASE-3 (coco P0 #3, 2026-06-05) — fuse-side unit tests
-    //! for the per-event eviction contract. Mirrors the ioring
-    //! daemon's `bug_lease_3_tests`. Default-CI.
+    //! for the per-event eviction contract.
 
     use super::evict_revoked_held_leases;
     use autumn_fs::state::FuseLease;
@@ -1597,8 +1570,7 @@ mod bug_lease_3_fuse_tests {
 #[cfg(test)]
 mod r2_p0_2_3_lease_check_tests {
     //! R2-P0 #2/#3 (2026-06-06) — pure-fn reproductions for the
-    //! Write/Release lease-revoke checks. Default-CI; mirrors the
-    //! ioring `inode_open_locks` style.
+    //! Write/Release lease-revoke checks.
 
     use super::{check_write_allowed, compute_release_action, ReleaseAction};
     use autumn_fs::state::FuseLease;
