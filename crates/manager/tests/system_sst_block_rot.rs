@@ -280,12 +280,22 @@ fn a_compaction_reads_around_a_rotted_replica() {
         rot_first_half(&dat);
 
         ps_compact(&ps, PART).await;
+        // The compaction's read reports the rotted copy, and the rebuild that
+        // follows can defer its row-stream cut until a later compaction
+        // ("next compaction cuts again"), so compact again while waiting.
         let start = Instant::now();
+        let mut last_compact = Instant::now();
         while stream_extents(&mgr, row).await.contains(&extent) {
             assert!(
                 start.elapsed() < Duration::from_secs(60),
                 "the compaction never replaced the rotted extent's SSTs"
             );
+            if last_compact.elapsed() > Duration::from_secs(2) {
+                if let Err(e) = try_ps_compact(&ps, PART).await {
+                    assert!(e.contains("busy"), "compact failed: {e}");
+                }
+                last_compact = Instant::now();
+            }
             compio::time::sleep(Duration::from_millis(200)).await;
         }
         read_all(&ps, PART, "after compacting around a rotted copy").await;

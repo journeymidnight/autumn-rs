@@ -570,7 +570,8 @@ pub async fn ps_put_ttl(ps: &RpcClient, part_id: u64, key: &[u8], value: &[u8], 
     panic!("ps_put_ttl({part_id}) failed after retries: {last_err}");
 }
 
-pub async fn ps_compact(ps: &RpcClient, part_id: u64) {
+/// Queue a major compaction; `Err` carries a refusal (e.g. "compaction busy").
+pub async fn try_ps_compact(ps: &RpcClient, part_id: u64) -> Result<(), String> {
     let resp = ps
         .call(
             partition_rpc::MSG_MAINTENANCE,
@@ -591,12 +592,17 @@ pub async fn ps_compact(ps: &RpcClient, part_id: u64) {
         .expect("compact");
     let r: partition_rpc::MaintenanceResp =
         partition_rpc::rkyv_decode(&resp).expect("decode MaintenanceResp");
-    assert_eq!(
-        r.code,
-        partition_rpc::CODE_OK,
-        "compact failed: {}",
-        r.message
-    );
+    if r.code == partition_rpc::CODE_OK {
+        Ok(())
+    } else {
+        Err(r.message)
+    }
+}
+
+pub async fn ps_compact(ps: &RpcClient, part_id: u64) {
+    if let Err(e) = try_ps_compact(ps, part_id).await {
+        panic!("compact failed: {e}");
+    }
 }
 
 /// Trigger GC.
