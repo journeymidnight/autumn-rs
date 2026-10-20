@@ -2,7 +2,7 @@
 # kvcache_chaos.sh — data-plane INTERFACE chaos: the python kvcache L3
 # backend (sglang HiCache path, no sglang needed) under failover.
 #
-# Boots a 2-PS cluster (tcp), runs python/autumn_kvcache/tests/
+# Boots a 2-PS cluster (tcp), runs the adapters repo's tests/
 # chaos_workload.py (continuous batch_set_v1 + readback-verify through the
 # python bridge), and injects faults:
 #   K1: kill -9 the partition-holding PS → migration; the workload's OK
@@ -59,10 +59,16 @@ parts_on() { local out; out=$("${AOC[@]}" info 2>/dev/null); [ -n "$out" ] || re
     printf '%s\n' "$out" | grep -oE 'ps 127\.0\.0\.1:[0-9]+' \
         | grep -oE '[0-9]+$' | awk -v b="$1" '$1>=b && $1<b+50' | wc -l; }
 
+# The python adapters live in their OWN repo now (autumn_kvcache); this script
+# still owns the cluster + fault injection, so it needs to be pointed at them.
+KVCACHE_DIR="${AUTUMN_KVCACHE_DIR:-$ROOT/../autumn_kvcache}"
+[ -f "$KVCACHE_DIR/tests/chaos_workload.py" ] \
+    || fail "adapters repo not found at $KVCACHE_DIR (set AUTUMN_KVCACHE_DIR)"
+
 # ── workload (python L3 backend) ────────────────────────────────────────────
 say "starting kvcache python workload"
 : > "$WORK/manifest.txt"
-( cd "$ROOT/python/autumn_kvcache" && \
+( cd "$KVCACHE_DIR" && \
   AUTUMN_KVCACHE_ENDPOINT="$MGR" CHAOS_STOP_FILE="$WORK/stop" CHAOS_MANIFEST="$WORK/manifest.txt" \
   python3 -m tests.chaos_workload > "$WORK/workload.log" 2>&1 ) &
 WL_PID=$!
@@ -124,7 +130,7 @@ mm=$(grep -c "^MISMATCH" "$WORK/workload.log") || mm=0
 [ "${mm:-0}" = "0" ] || fail "in-run MISMATCH lines: $mm (ACKed pages corrupted)"
 
 say "final verify: fresh process re-reads every manifested round"
-if ( cd "$ROOT/python/autumn_kvcache" && \
+if ( cd "$KVCACHE_DIR" && \
      AUTUMN_KVCACHE_ENDPOINT="$MGR" python3 -m tests.chaos_workload --verify "$WORK/manifest.txt" \
      > "$WORK/verify.log" 2>&1 ); then
     say "final verify: $(tail -1 "$WORK/verify.log")"

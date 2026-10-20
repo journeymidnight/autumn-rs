@@ -175,10 +175,11 @@ byte-identically to local disk on vLLM and SGLang, with no engine patches.
 
 ### Inference KV cache — sglang / vLLM
 
-`python/autumn_kvcache` plugs into the HiCache L3 storage-backend interface —
-the cluster becomes the shared L3 tier behind GPU/CPU cache levels, so prefix
-caches survive restarts and are shared across inference instances. Setup +
-design: [`python/autumn_kvcache/README.md`](python/autumn_kvcache/README.md).
+The [`autumn_kvcache`](https://github.com/journalmidnight/autumn_kvcache)
+adapters plug into the HiCache L3 storage-backend interface — the cluster
+becomes the shared L3 tier behind GPU/CPU cache levels, so prefix caches
+survive restarts and are shared across inference instances. They live in their
+own repository; this one ships the client they are built on.
 
 ### LanceDB — vector tables over S3
 

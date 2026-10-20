@@ -439,8 +439,12 @@ kubectl -n autumn run kv --image=autumn-rs:latest --restart=Never -it --rm \
   --command -- bash -lc '
     M=$(getent hosts autumn-manager | awk "{print \$1}")
     echo hi > /tmp/v
-    autumn-client --manager $M:9001 put k /tmp/v
-    autumn-client --manager $M:9001 get k'
+    # --namespace is required for every KV command. With authz enabled add
+    # --credential-file <the .cred for that family> to BOTH commands below,
+    # or they answer "permission denied: key requires a capability token";
+    # mount the credential into the pod and give its path here.
+    autumn-client --manager $M:9001 --namespace kvc put k /tmp/v
+    autumn-client --manager $M:9001 --namespace kvc get k'
 ```
 
 Verification on kind/minikube: build and deploy as above; `kubectl -n autumn get
@@ -3248,7 +3252,7 @@ segment ALONE distinguishes models even if the fingerprint ever degrades
 (2026-08-11: keys now read `qwen7b_<fp>_0_1`, not the old collision-prone
 `model-cfg_<fp>_0_1`). The 12-hex fingerprint carries the model's real identity
 (arch shape + weights source + optional `model_id`; see
-`python/autumn_kvcache/autumn_kvcache/_identity.py`). Before both, every model
+`autumn_kvcache/_identity.py`, in the autumn_kvcache repo). Before both, every model
 served via the fixed local config dir shared ONE model scope and cross-read KV
 (live 2026-07: Qwen2.5-7B/32B both under `kvc/model-cfg_0_1/`).
 
@@ -3281,7 +3285,7 @@ a source — orphaned old-scope keys reclaim exactly as below.
 
 ```bash
 # Offline unit tests (no cluster / engine / native module):
-cd python/autumn_kvcache && uv run --with pytest python -m pytest tests/test_model_identity.py -q
+cd ../autumn_kvcache && uv run --with pytest python -m pytest tests/test_model_identity.py -q
 
 # Manual verify on a live deployment: the connector logs its model scope +
 # identity sources at startup — two DIFFERENT models must log two different scopes:

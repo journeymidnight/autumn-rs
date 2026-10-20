@@ -29,7 +29,7 @@ wire key = {ns}/[relative]
 | namespace | 相对 key 形态 | 位置 |
 |---|---|---|
 | `fs/` | 裸类型字节：`[0x01][ino BE]`（inode meta）、`[0x02][parent BE][name]`（dirent）、`[0x03][lane][ino BE][off BE]`（条带数据）、`[0x04][field]`（superblock，含 `stripe_geom` 与 `rmtomb/` unlink 墓碑） | `crates/fuse/src/key.rs` |
-| `kvc/` | `{model}[_{fingerprint}][_{tp}][_pp{pp}]/…/{sha256-hex}/{layer}` | `python/autumn_kvcache/autumn_kvcache/_keys.py` |
+| `kvc/` | `{model}[_{fingerprint}][_{tp}][_pp{pp}]/…/{sha256-hex}/{layer}` | `autumn_kvcache/_keys.py` (the autumn_kvcache repo) |
 | `mem/` | 保留的内置通用 namespace；应用自行定义相对 key | `autumn-client` |
 | 其余（`bench/`、`gallery/`、用户自建） | 任意字节 | `autumn-op namespace-create` |
 
