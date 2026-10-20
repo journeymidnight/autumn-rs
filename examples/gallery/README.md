@@ -55,7 +55,7 @@ Files live in the cluster's KV store under these key conventions:
 
 | Key pattern | Holds |
 |---|---|
-| `<filename>` | Original image / PDF / text upload (inline value); for a *transient* video original, the 28-byte stripe-meta blob — see below |
+| `<filename>` | Original image / PDF / text upload (inline value); for a *transient* video original, the 45-byte stripe-meta blob — see below |
 | `\xff\xfe…` (reserved) | Striped video chunks (`autumn-client` `put_stream` namespace; one 4 MiB chunk per key) |
 | `.thumb/320/<filename>` | Cached 320 px-wide JPEG thumbnail |
 | `.hls/<filename>/index.m3u8` | HLS playlist for a transcoded video |

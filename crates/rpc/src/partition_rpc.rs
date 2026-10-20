@@ -66,7 +66,7 @@ pub const MSG_GET_DISCARDS: u8 = 0x48;
 // while old binaries with handlers may still be in flight in production
 // rolling deploys. Stripe-write is now pure client-side (Ceph
 // striperados pattern): each chunk is a normal Put under a reserved
-// 0xff-prefixed key namespace, and the user key holds a 29-byte Meta
+// 0xff-prefixed key namespace, and the user key holds a 45-byte Meta
 // blob. See `crates/client/src/lib.rs::PutStreamHandle` + `GetStream`.
 //
 //   pub const MSG_PUT_BEGIN:  u8 = 0x49;  // RESERVED (was multipart upload)
@@ -639,7 +639,7 @@ pub const CODE_ERROR: u8 = 4;
 /// `AUTUMN_PS_MAX_INLINE_BYTES` cap. Caller should split the value into
 /// chunks and stripe-write via `ClusterClient::put_stream_begin`
 /// (client-side striperados — chunks are normal Puts to a
-/// reserved-namespace key + a 29-byte Meta blob at the user key).
+/// reserved-namespace key + a 45-byte Meta blob at the user key).
 pub const CODE_VALUE_TOO_LARGE: u8 = 5;
 //
 // CODE 6 was `CODE_UPLOAD_NOT_FOUND` for the server-side
@@ -953,7 +953,7 @@ pub struct RollTailsResp {
 // Stripe-write is now pure client-side (Ceph striperados pattern):
 // `ClusterClient::put_stream_begin` returns a `PutStreamHandle` that
 // writes each chunk via plain `MSG_PUT` to a reserved-namespace key,
-// then writes a 29-byte Meta blob to the user key as the atomic
+// then writes a 45-byte Meta blob to the user key as the atomic
 // commit point.
 
 /// Maintenance operations.

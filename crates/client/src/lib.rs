@@ -5500,21 +5500,14 @@ impl ClusterClient {
     /// Begin a striped (Ceph-striperados-style) put. Returns a
     /// handle that takes value bytes via `send` and finalises via
     /// `commit`. Internals (no new server RPCs):
-    ///   - each `send(chunk)` writes `chunk` to a deterministic chunk
-    ///     key under a reserved `\xff\xfe`-prefixed namespace via the
-    ///     existing `put` RPC
-    ///   - `commit` writes a 28-byte `Meta` blob to `key` (magic +
-    ///     version + total_bytes + chunk_count + chunk_size + crc32c)
-    ///     — its presence is the atomic linearisation point: until
-    ///     `commit` returns, `get(key)` returns NotFound and orphan
-    ///     chunks are invisible
-    ///   - `abort` best-effort deletes the partial chunks
-    ///
-    /// Replaces the deprecated server-side multipart upload
-    /// (`MSG_PUT_BEGIN/CHUNK/COMMIT/ABORT` + multi-fragment ValuePointer +
-    /// GC active rewrite). Total simplification: ~1500 server-side
-    /// lines deleted, ~200 client-side lines added; behaviour from the
-    /// caller's perspective is identical.
+    ///   - the handle draws a random upload id; each `send(chunk)` writes
+    ///     `chunk` to a chunk key of that upload under a reserved
+    ///     `\xff\xfe`-prefixed namespace via the existing `put` RPC
+    ///   - `commit` writes a 45-byte `Meta` blob (upload id + layout) to
+    ///     `key` — the linearisation point: until it lands, readers see the
+    ///     previous value (or NotFound), and then delete the replaced
+    ///     upload's chunks
+    ///   - `abort` best-effort deletes this upload's chunks
     ///
     /// `expires_at` is currently ignored — chunk-level TTL would
     /// require setting `expires_at` on each chunk's Put. Future work.
@@ -5522,6 +5515,7 @@ impl ClusterClient {
         PutStreamHandle {
             cluster: self,
             user_key: key.to_vec(),
+            upload_id: *uuid::Uuid::new_v4().as_bytes(),
             chunk_size: stripe_chunk_size(),
             next_chunk_index: 0,
             bytes_sent: 0,
@@ -5529,10 +5523,21 @@ impl ClusterClient {
         }
     }
 
+    /// The stripe meta stored at `key`, if its value is one. Reads at most one
+    /// byte past a meta's length, so a large inline value is not fetched.
+    async fn stripe_meta(&self, key: &[u8]) -> std::result::Result<Option<StripeMeta>, AutumnError> {
+        Ok(match self.get_range(key, 0, META_ENCODED_LEN as u32 + 1).await? {
+            Some(head) => match StripeMeta::decode(&head) {
+                StoredValue::Striped(meta) => Some(meta),
+                StoredValue::StripedV1 | StoredValue::Inline => None,
+            },
+            None => None,
+        })
+    }
+
     /// Open a streaming reader. Auto-detects:
-    ///   - **striped** values (key holds a 28-byte `Meta` blob with the
-    ///     magic) → reads chunks under the reserved chunk-key namespace
-    ///     and yields them via `next_chunk()`
+    ///   - **striped** values (key holds a stripe `Meta` blob) → reads the
+    ///     chunks of the upload it names and yields them via `next_chunk()`
     ///   - **inline** values (anything else, including a normal small
     ///     `put`) → yields the entire value in one `next_chunk()` call
     ///
@@ -5552,9 +5557,16 @@ impl ClusterClient {
             Some(b) => b,
             None => return Ok(None),
         };
-        let (inline, striped) = match StripeMeta::try_decode(&blob) {
-            Some(meta) => (None, Some(meta)),
-            None => (Some(blob), None),
+        let (inline, striped) = match StripeMeta::decode(&blob) {
+            StoredValue::Striped(meta) => (None, Some(meta)),
+            StoredValue::Inline => (Some(blob), None),
+            StoredValue::StripedV1 => {
+                return Err(AutumnError::InvalidArgument(
+                    "value is in the v1 stripe format, which is no longer read; \
+                     delete it and upload it again"
+                        .into(),
+                ))
+            }
         };
         Ok(Some(GetStream {
             cluster: self,
@@ -5569,24 +5581,20 @@ impl ClusterClient {
         }))
     }
 
-    /// Cascade-delete a striped value: read meta, delete all
-    /// chunks, delete meta. For non-striped keys this is just a regular
-    /// delete on the meta key (chunks don't exist). Idempotent on
-    /// already-deleted keys.
+    /// Delete a streamed value: the meta, then its upload's chunks. For a
+    /// non-striped key this is a plain delete. Idempotent on already-deleted
+    /// keys.
     ///
     /// Plain `delete()` (existing) only removes the meta key, leaving
     /// chunks orphan — use this method when the caller has been
     /// using `put_stream_begin` for the key.
     pub async fn delete_stream(&self, key: &[u8]) -> std::result::Result<(), AutumnError> {
-        if let Some(blob) = self.get(key).await? {
-            if let Some(meta) = StripeMeta::try_decode(&blob) {
-                for i in 0..meta.chunk_count as u64 {
-                    let ck = make_chunk_key(key, i);
-                    let _ = self.delete(&ck).await;
-                }
-            }
+        let meta = self.stripe_meta(key).await?;
+        self.delete(key).await?;
+        if let Some(meta) = meta {
+            delete_upload_chunks(self, key, &meta.upload_id, meta.chunk_count as u64).await;
         }
-        self.delete(key).await
+        Ok(())
     }
 
     /// Trigger partition split at the PS-chosen median split point (legacy).
@@ -5866,25 +5874,30 @@ pub struct GcAutoParams {
 // changes to the WAL / memtable / SSTable shape.
 //
 // Layout:
-//   - Meta object lives at the user's key. 28-byte fixed-shape blob with
-//     magic + version + total_bytes + chunk_count + chunk_size + crc32c.
-//     Its presence is the atomic linearisation point: if the meta is
-//     visible, the value is committed; if absent, any orphan chunks are
-//     invisible.
-//   - Chunks live at deterministic keys under a reserved 0xff-prefixed
-//     namespace so range scans of user prefixes don't see them.
+//   - Meta object lives at the user's key: magic + version + upload id +
+//     total_bytes + chunk_count + chunk_size + crc32c. Writing it is the
+//     linearisation point.
+//   - Chunks live under a reserved 0xff-prefixed namespace, keyed by user
+//     key + upload id + index. Each upload writes only its own chunks, so an
+//     uncommitted or aborted overwrite never touches the value readers see.
+//   - A published meta always has all its chunks: commit swaps the meta
+//     first and only then deletes the replaced upload's chunks;
+//     delete_stream deletes the meta before the chunks.
 
 /// meta object header magic + version, 9 bytes total. The last
 /// byte is the version; bumping the wire format means bumping that
-/// byte. Chosen to start with `0xfe 0xfd` so a casual `head` of a
-/// striped key returns a recognisable hex prefix in operator tooling.
-const META_MAGIC: [u8; 9] = *b"\xfeAUTSTRP\x01";
+/// byte.
+const META_MAGIC: [u8; 9] = *b"\xfeAUTSTRP\x02";
 const META_VERSION_BYTE_INDEX: usize = 8;
-const META_VERSION: u8 = 0x01;
-/// 9 (magic+version) + 8 (total_bytes) + 4 (chunk_count) + 4 (chunk_size)
-/// + 4 (crc32c) = 29 bytes. CRC covers magic+version+total_bytes+
-/// chunk_count+chunk_size i.e. the first 25 bytes.
-const META_ENCODED_LEN: usize = 29;
+const META_VERSION: u8 = 0x02;
+/// The first stripe format: no upload id, chunks shared between uploads of a
+/// key. Recognised only to refuse it.
+const META_VERSION_V1: u8 = 0x01;
+const META_V1_ENCODED_LEN: usize = 29;
+/// 9 (magic+version) + 16 (upload_id) + 8 (total_bytes) + 4 (chunk_count)
+/// + 4 (chunk_size) + 4 (crc32c) = 45 bytes. The CRC covers the first 41.
+const META_ENCODED_LEN: usize = 45;
+const META_CRC_AT: usize = 41;
 
 /// default chunk size for `put_stream_begin`. 4 MiB matches
 /// the inline-VP threshold ratio used by comparable
@@ -5899,28 +5912,29 @@ pub fn stripe_chunk_size() -> u32 {
 
 /// chunk-key namespace prefix. Starts with `\xff\xfe` so chunks
 /// sort AFTER all normal user keys; range scans within a user prefix
-/// naturally skip them. Followed by a 4-byte format tag (`acv1` =
-/// "Autumn Chunk v1") and a separator byte.
-const CHUNK_KEY_PREFIX: &[u8] = b"\xff\xfeacv1\xff";
+/// naturally skip them. Followed by a 4-byte format tag (`acv2` =
+/// "Autumn Chunk v2") and a separator byte.
+const CHUNK_KEY_PREFIX: &[u8] = b"\xff\xfeacv2\xff";
 
 /// encode a chunk key as
-/// `[CHUNK_KEY_PREFIX][user_key_len:u32 BE][user_key][chunk_index:u64 BE]`.
+/// `[CHUNK_KEY_PREFIX][user_key_len:u32 BE][user_key][upload_id:16][chunk_index:u64 BE]`.
 /// Length-prefixing the user key avoids ambiguity if it contains the
 /// separator pattern; BE encoding on the index keeps chunks of one
-/// stripe sorted in numerical order.
-pub(crate) fn make_chunk_key(user_key: &[u8], chunk_index: u64) -> Vec<u8> {
-    let mut k = Vec::with_capacity(CHUNK_KEY_PREFIX.len() + 4 + user_key.len() + 8);
+/// upload sorted in numerical order.
+pub(crate) fn make_chunk_key(user_key: &[u8], upload_id: &[u8; 16], chunk_index: u64) -> Vec<u8> {
+    let mut k = Vec::with_capacity(CHUNK_KEY_PREFIX.len() + 4 + user_key.len() + 16 + 8);
     k.extend_from_slice(CHUNK_KEY_PREFIX);
     k.extend_from_slice(&(user_key.len() as u32).to_be_bytes());
     k.extend_from_slice(user_key);
+    k.extend_from_slice(upload_id);
     k.extend_from_slice(&chunk_index.to_be_bytes());
     k
 }
 
-/// striped-value meta header. Fixed 28-byte layout makes
-/// `try_decode` cheap and unambiguous.
-#[derive(Debug, Clone, Copy)]
+/// striped-value meta header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct StripeMeta {
+    pub upload_id: [u8; 16],
     pub total_bytes: u64,
     pub chunk_count: u32,
     pub chunk_size: u32,
@@ -5930,45 +5944,71 @@ impl StripeMeta {
     fn encode(&self) -> [u8; META_ENCODED_LEN] {
         let mut buf = [0u8; META_ENCODED_LEN];
         buf[0..9].copy_from_slice(&META_MAGIC);
-        buf[9..17].copy_from_slice(&self.total_bytes.to_le_bytes());
-        buf[17..21].copy_from_slice(&self.chunk_count.to_le_bytes());
-        buf[21..25].copy_from_slice(&self.chunk_size.to_le_bytes());
-        let crc = crc32c::crc32c(&buf[0..25]);
-        buf[25..29].copy_from_slice(&crc.to_le_bytes());
+        buf[9..25].copy_from_slice(&self.upload_id);
+        buf[25..33].copy_from_slice(&self.total_bytes.to_le_bytes());
+        buf[33..37].copy_from_slice(&self.chunk_count.to_le_bytes());
+        buf[37..41].copy_from_slice(&self.chunk_size.to_le_bytes());
+        let crc = crc32c::crc32c(&buf[..META_CRC_AT]);
+        buf[META_CRC_AT..].copy_from_slice(&crc.to_le_bytes());
         buf
     }
 
-    /// try to interpret `blob` as a stripe meta. Returns None if
-    /// length, magic, or CRC don't match — the caller treats the blob
-    /// as an inline value in that case.
-    ///
-    /// False-positive analysis: the magic is 8 bytes (~64 bits), the
-    /// CRC is 32 bits over magic + total_bytes + chunk_count +
-    /// chunk_size, AND length must be exactly 28. The probability that
-    /// a user-supplied 28-byte value matches all three by accident is
-    /// negligible (~2^-96). A user could MALICIOUSLY craft a 28-byte
-    /// value that matches; the SDK handles "missing chunks" gracefully
-    /// (returns NotFound or a clean error).
-    pub(crate) fn try_decode(blob: &[u8]) -> Option<Self> {
-        if blob.len() != META_ENCODED_LEN {
-            return None;
+    /// Classify a stored value. Anything whose length, magic or CRC doesn't
+    /// match is inline. False positives need the exact length, the 8-byte
+    /// magic and a 32-bit CRC to match by accident (~2^-96).
+    pub(crate) fn decode(blob: &[u8]) -> StoredValue {
+        let magic_ok = |len: usize| {
+            blob.len() == len
+                && blob[..META_VERSION_BYTE_INDEX] == META_MAGIC[..META_VERSION_BYTE_INDEX]
+        };
+        let crc_ok = |at: usize| {
+            u32::from_le_bytes(blob[at..at + 4].try_into().expect("4 bytes"))
+                == crc32c::crc32c(&blob[..at])
+        };
+        if magic_ok(META_V1_ENCODED_LEN)
+            && blob[META_VERSION_BYTE_INDEX] == META_VERSION_V1
+            && crc_ok(META_V1_ENCODED_LEN - 4)
+        {
+            return StoredValue::StripedV1;
         }
-        if blob[0..META_VERSION_BYTE_INDEX] != META_MAGIC[0..META_VERSION_BYTE_INDEX] {
-            return None;
+        if !magic_ok(META_ENCODED_LEN)
+            || blob[META_VERSION_BYTE_INDEX] != META_VERSION
+            || !crc_ok(META_CRC_AT)
+        {
+            return StoredValue::Inline;
         }
-        if blob[META_VERSION_BYTE_INDEX] != META_VERSION {
-            return None;
-        }
-        let stored_crc = u32::from_le_bytes(blob[25..29].try_into().ok()?);
-        let computed_crc = crc32c::crc32c(&blob[0..25]);
-        if stored_crc != computed_crc {
-            return None;
-        }
-        Some(StripeMeta {
-            total_bytes: u64::from_le_bytes(blob[9..17].try_into().ok()?),
-            chunk_count: u32::from_le_bytes(blob[17..21].try_into().ok()?),
-            chunk_size: u32::from_le_bytes(blob[21..25].try_into().ok()?),
+        StoredValue::Striped(StripeMeta {
+            upload_id: blob[9..25].try_into().expect("16 bytes"),
+            total_bytes: u64::from_le_bytes(blob[25..33].try_into().expect("8 bytes")),
+            chunk_count: u32::from_le_bytes(blob[33..37].try_into().expect("4 bytes")),
+            chunk_size: u32::from_le_bytes(blob[37..41].try_into().expect("4 bytes")),
         })
+    }
+}
+
+pub(crate) enum StoredValue {
+    Striped(StripeMeta),
+    /// The first stripe format, whose chunks carry no upload id. Not read:
+    /// taken as inline it would return the meta bytes as the value. Overwrite
+    /// and delete leave its chunks behind.
+    StripedV1,
+    Inline,
+}
+
+/// Best-effort delete of one upload's first `count` chunks. Called only once
+/// no meta names the upload, so a failure leaves orphans, never a damaged value.
+async fn delete_upload_chunks(
+    cluster: &ClusterClient,
+    user_key: &[u8],
+    upload_id: &[u8; 16],
+    count: u64,
+) {
+    let keys: Vec<Vec<u8>> = (0..count).map(|i| make_chunk_key(user_key, upload_id, i)).collect();
+    let refs: Vec<&[u8]> = keys.iter().map(Vec::as_slice).collect();
+    for (i, r) in cluster.delete_many(&refs).await.into_iter().enumerate() {
+        if let Err(e) = r {
+            tracing::warn!(chunk = i, error = %e, "stripe chunk delete failed; chunk is orphaned");
+        }
     }
 }
 
@@ -6481,72 +6521,67 @@ mod fan_out_tests {
 mod stripe_meta_tests {
     use super::*;
 
-    #[test]
-    fn meta_roundtrip() {
-        let m = StripeMeta {
+    fn meta() -> StripeMeta {
+        StripeMeta {
+            upload_id: [7; 16],
             total_bytes: 12 * 1024 * 1024,
             chunk_count: 4,
             chunk_size: 3 * 1024 * 1024,
-        };
-        let encoded = m.encode();
+        }
+    }
+
+    fn is_inline(blob: &[u8]) -> bool {
+        matches!(StripeMeta::decode(blob), StoredValue::Inline)
+    }
+
+    #[test]
+    fn meta_roundtrip() {
+        let encoded = meta().encode();
         assert_eq!(encoded.len(), META_ENCODED_LEN);
-        let dec = StripeMeta::try_decode(&encoded).expect("decode");
-        assert_eq!(dec.total_bytes, m.total_bytes);
-        assert_eq!(dec.chunk_count, m.chunk_count);
-        assert_eq!(dec.chunk_size, m.chunk_size);
+        match StripeMeta::decode(&encoded) {
+            StoredValue::Striped(m) => assert_eq!(m, meta()),
+            _ => panic!("not decoded as striped"),
+        }
     }
 
     #[test]
-    fn meta_rejects_wrong_length() {
-        assert!(StripeMeta::try_decode(&[0u8; 28]).is_none());
-        assert!(StripeMeta::try_decode(&[0u8; 30]).is_none());
-        assert!(StripeMeta::try_decode(b"hello world").is_none());
+    fn non_meta_blobs_are_inline() {
+        assert!(is_inline(&[0u8; META_ENCODED_LEN - 1]));
+        assert!(is_inline(&[0u8; META_ENCODED_LEN + 1]));
+        assert!(is_inline(b"hello world"));
+        let mut bad_magic = meta().encode();
+        bad_magic[0] ^= 0x01;
+        assert!(is_inline(&bad_magic));
+        let mut bad_crc = meta().encode();
+        bad_crc[30] ^= 0x01;
+        assert!(is_inline(&bad_crc));
     }
 
     #[test]
-    fn meta_rejects_bad_magic() {
-        let m = StripeMeta {
-            total_bytes: 100,
-            chunk_count: 1,
-            chunk_size: 100,
-        };
-        let mut e = m.encode();
-        e[0] ^= 0x01;
-        assert!(StripeMeta::try_decode(&e).is_none());
+    fn a_v1_meta_is_recognised() {
+        // magic + version 1 + total_bytes + chunk_count + chunk_size + crc.
+        let mut v1 = [0u8; META_V1_ENCODED_LEN];
+        v1[..8].copy_from_slice(&META_MAGIC[..8]);
+        v1[8] = META_VERSION_V1;
+        v1[9..17].copy_from_slice(&100u64.to_le_bytes());
+        let crc = crc32c::crc32c(&v1[..25]);
+        v1[25..].copy_from_slice(&crc.to_le_bytes());
+        assert!(matches!(StripeMeta::decode(&v1), StoredValue::StripedV1));
     }
 
     #[test]
-    fn meta_rejects_corrupted_crc() {
-        let m = StripeMeta {
-            total_bytes: 100,
-            chunk_count: 1,
-            chunk_size: 100,
-        };
-        let mut e = m.encode();
-        // Flip a bit in the body — CRC will mismatch
-        e[12] ^= 0x01;
-        assert!(StripeMeta::try_decode(&e).is_none());
-    }
-
-    #[test]
-    fn chunk_key_disambiguates_user_keys() {
-        // user_key "ab" + index 5 vs "abc" + index 5 must encode
-        // distinctly (length-prefix prevents ambiguity).
-        let k1 = make_chunk_key(b"ab", 5);
-        let k2 = make_chunk_key(b"abc", 5);
-        assert_ne!(k1, k2);
-        // Both must start with the reserved prefix.
-        assert!(k1.starts_with(CHUNK_KEY_PREFIX));
-        assert!(k2.starts_with(CHUNK_KEY_PREFIX));
+    fn chunk_keys_are_distinct_per_key_and_upload() {
+        // Length-prefixing keeps "ab" and "abc" apart.
+        assert_ne!(make_chunk_key(b"ab", &[1; 16], 5), make_chunk_key(b"abc", &[1; 16], 5));
+        assert_ne!(make_chunk_key(b"k", &[1; 16], 0), make_chunk_key(b"k", &[2; 16], 0));
+        assert!(make_chunk_key(b"k", &[1; 16], 0).starts_with(CHUNK_KEY_PREFIX));
     }
 
     #[test]
     fn chunk_keys_sort_by_index() {
-        let k0 = make_chunk_key(b"key", 0);
-        let k1 = make_chunk_key(b"key", 1);
-        let k_big = make_chunk_key(b"key", u64::MAX);
-        assert!(k0 < k1);
-        assert!(k1 < k_big);
+        let k = |i| make_chunk_key(b"key", &[1; 16], i);
+        assert!(k(0) < k(1));
+        assert!(k(1) < k(u64::MAX));
     }
 }
 
@@ -6571,6 +6606,7 @@ enum PutStreamState {
 pub struct PutStreamHandle<'a> {
     cluster: &'a ClusterClient,
     user_key: Vec<u8>,
+    upload_id: [u8; 16],
     chunk_size: u32,
     next_chunk_index: u64,
     bytes_sent: u64,
@@ -6614,18 +6650,20 @@ impl<'a> PutStreamHandle<'a> {
         // The chunk key `\xff\xfe…++user_key` is a normal user key to the binding:
         // a scoped (Prepend) client prepends the scope prefix so chunks land in
         // the scope range; Raw writes the legacy global chunk space.
-        let chunk_key = make_chunk_key(&self.user_key, self.next_chunk_index);
+        let chunk_key = make_chunk_key(&self.user_key, &self.upload_id, self.next_chunk_index);
         self.cluster.put(&chunk_key, chunk).await?;
         self.next_chunk_index = self.next_chunk_index.saturating_add(1);
         self.bytes_sent = self.bytes_sent.saturating_add(chunk.len() as u64);
         Ok(self.bytes_sent)
     }
 
-    /// Finalise the upload. Writes a meta blob to the user key — its
-    /// presence is the atomic linearisation point. Until this returns
-    /// successfully, `get(key)` returns NotFound and orphan chunks
-    /// stay invisible. After this returns, `get` / `get_stream` /
-    /// `head` / `delete_stream` see the assembled value.
+    /// Finalise the upload. Writes a meta blob naming this upload to the user
+    /// key — the linearisation point. Until it lands, readers see the previous
+    /// value (or NotFound). Then deletes the chunks of the upload it replaced;
+    /// a reader still on that upload gets `PreconditionFailed`.
+    ///
+    /// Two commits racing on one key can both read the same predecessor; the
+    /// earlier one's chunks are then orphaned (never served: no meta names them).
     pub async fn commit(mut self) -> std::result::Result<(), AutumnError> {
         if self.state != PutStreamState::Open {
             return Err(AutumnError::InvalidArgument(format!(
@@ -6642,40 +6680,47 @@ impl<'a> PutStreamHandle<'a> {
             )));
         }
         let meta = StripeMeta {
+            upload_id: self.upload_id,
             total_bytes: self.bytes_sent,
             chunk_count: self.next_chunk_index as u32,
             chunk_size: self.chunk_size,
         };
         let blob = meta.encode();
+        let replaced = match self.cluster.stripe_meta(&self.user_key).await {
+            Ok(m) => m,
+            Err(e) => {
+                self.state = PutStreamState::Aborted;
+                return Err(e);
+            }
+        };
         match self.cluster.put(&self.user_key, &blob).await {
             Ok(()) => {
                 self.state = PutStreamState::Committed;
+                if let Some(old) = replaced {
+                    delete_upload_chunks(self.cluster, &self.user_key, &old.upload_id, old.chunk_count as u64).await;
+                }
                 Ok(())
             }
             Err(e) => {
-                // The chunks are now orphan. We don't auto-clean here
-                // (`commit` already failed; the user can retry or call
-                // `delete_stream` after a successful retry).
+                // The put may still have applied (OutcomeUnknown), so this
+                // upload's chunks are kept; if it did not, they are orphans.
                 self.state = PutStreamState::Aborted;
                 Err(e)
             }
         }
     }
 
-    /// Discard the in-progress upload by best-effort deleting any
-    /// already-written chunks. The meta blob was never written, so
-    /// `get(key)` already returns NotFound.
+    /// Discard the in-progress upload by best-effort deleting this upload's
+    /// chunks. Its meta was never written, so readers keep seeing the
+    /// previous value.
     ///
-    /// Failures during chunk delete are swallowed — orphans become a
-    /// background-sweep concern rather than blocking the abort path.
+    /// A failed chunk delete is logged and leaves an orphan rather than
+    /// blocking the abort path.
     pub async fn abort(mut self) -> std::result::Result<(), AutumnError> {
         if self.state != PutStreamState::Open {
             return Ok(());
         }
-        for i in 0..self.next_chunk_index {
-            let ck = make_chunk_key(&self.user_key, i);
-            let _ = self.cluster.delete(&ck).await;
-        }
+        delete_upload_chunks(self.cluster, &self.user_key, &self.upload_id, self.next_chunk_index).await;
         self.state = PutStreamState::Aborted;
         Ok(())
     }
@@ -6691,7 +6736,7 @@ impl<'a> Drop for PutStreamHandle<'a> {
                 "PutStreamHandle dropped without commit/abort; meta blob \
                  was not written so the value is invisible to readers, but \
                  {} chunks are now orphan under the reserved namespace and \
-                 require a background sweep or `delete_stream` retry to clean",
+                 require a background sweep to clean",
                 self.next_chunk_index
             );
         }
@@ -6763,10 +6808,17 @@ impl<'a> GetStream<'a> {
             if self.next_chunk_index >= meta.chunk_count as u64 {
                 return Ok(None);
             }
-            let ck = make_chunk_key(&self.user_key, self.next_chunk_index);
+            let ck = make_chunk_key(&self.user_key, &meta.upload_id, self.next_chunk_index);
             let chunk = match self.cluster.get(&ck).await? {
                 Some(c) => c,
                 None => {
+                    let upload_id = meta.upload_id;
+                    let current = self.cluster.stripe_meta(&self.user_key).await?;
+                    if current.map(|m| m.upload_id) != Some(upload_id) {
+                        return Err(AutumnError::PreconditionFailed(
+                            "streamed value was replaced or deleted while being read".into(),
+                        ));
+                    }
                     return Err(AutumnError::ServerError(format!(
                         "striped chunk {} missing for key — value may have been \
                          partially deleted; call delete_stream + re-upload",
@@ -6870,7 +6922,7 @@ mod namespace_binding_tests {
         // binding, so a scoped (Prepend) client prepends `{scope}/` and the chunk
         // lands INSIDE the scope range (Layer-A / authz / presplit cover it). No
         // special chunk path is needed under Prepend-only.
-        let chunk = make_chunk_key(b"userkey", 3);
+        let chunk = make_chunk_key(b"userkey", &[0; 16], 3);
         let b = NamespaceBinding::scoped("bench/perf"); // → bench/perf/
         assert!(b.bind_key(&chunk).unwrap().starts_with(b"bench/perf/"));
         // Raw: passthrough (legacy global chunk space).

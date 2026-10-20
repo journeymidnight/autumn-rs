@@ -1,6 +1,6 @@
 # autumn-rs feature list — OPEN backlog
 
-**Last updated:** 2026-10-20 (review.md full-repo review N1–N7 filed: five P1, two P2; T3/T4 and test follow-ups annotated)
+**Last updated:** 2026-10-20 (BUG-PUTSTREAM-OVERWRITE-NOT-ATOMIC fixed and removed; review N2–N7 open: four P1, two P2)
 
 **Rules:**
 - This file tracks the **OPEN backlog only**. A feature that reaches `passes: true`
@@ -13,12 +13,6 @@
 ---
 
 ## Active
-
-### BUG-PUTSTREAM-OVERWRITE-NOT-ATOMIC — 流式覆盖复用旧 chunk key：未 commit 就改变旧值，abort 删掉旧值（P1）
-- **Trigger** (review.md N1，2026-10-20 全仓审查，公开 API 复现): `make_chunk_key`（`crates/client/src/lib.rs`）只含 user key 和 chunk index，没有 upload/generation 身份。对已提交的 key 再次 `put_stream_begin` + `send`，在 commit 前另一个客户端 `get_stream` 已读到新内容；随后 `abort` 删除同一组 chunk，旧 manifest 仍在，读报 `striped chunk 0 missing`。顺序操作即可复现，无需故障。多 chunk 覆盖还可能读到新旧混合。影响 `ClusterClient::put_stream_begin` / `get_stream` 及其入口；S3 的 `autumn_fs::multipart` 是另一套实现，不在本条。
-- **Scope**: 先用审查附录的 probe 复现。每次上传用独立 generation/object id，chunk key 与 manifest 同时带该身份；新 manifest 发布前不触碰旧 generation；abort 只清本次上传；旧 generation 的回收要考虑已开始的 reader。
-- **Acceptance**: 旧值已提交时开始覆盖、逐 chunk 暂停，另一 reader 始终读到完整旧值；abort 后旧值完整；commit 后新 reader 读到完整新值；两个 uploader 交错不混 chunk。修前红、修后绿，消融（去掉 generation）变红。
-- `passes: false`
 
 ### BUG-LEASE-GRANT-STALE-TXN — 同一任期内迟到的 AcquireLease 事务覆盖后来的 writer（P1）
 - **Trigger** (review.md N2，真实 etcd + 现有 `FENCED_TXN_TEST_HOLD_*` 暂停点复现): `handle_acquire_lease` 先在内存授予并捕获 record，再经 `put_msgs_txn` 持久化，事务只比 leader key。W 的第一次 acquire 停在 etcd put 前 → W 重试成功 → W release → X acquire 成功（etcd 为 X，版本 …777）→ 放行 W 的第一次事务：仍返回成功，etcd 写回 W、版本退到 …776。不需要换主或 force-preempt。后续换主会恢复错误持有者。`refresh_writer_record`（2bc0ae0d）只修了 heartbeat，没有覆盖 grant。

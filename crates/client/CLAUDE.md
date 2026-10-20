@@ -160,6 +160,17 @@ the API suffix.
 
 All three route through the plain `put`/`get`/`delete` (see the binding invariant above).
 
+Each upload draws a random 16-byte upload id; its chunk keys and the 45-byte meta
+both carry it, so an uncommitted or aborted overwrite never touches the chunks the
+current meta names, and two uploaders never share a chunk. Invariant: a published
+meta always has all its chunks — `commit` swaps the meta, then deletes the replaced
+upload's chunks; `delete_stream` deletes the meta, then the chunks. A reader whose
+upload was replaced under it gets `PreconditionFailed` (it re-reads the meta on a
+missing chunk), never the new bytes. Two commits racing on one key can both read the
+same predecessor; the earlier one's chunks are then orphaned (no meta names them). The v1
+meta (no upload id) is refused by `get_stream`; overwrite or `delete` it and its old
+chunks are left behind. Test: `system_putstream::a_stream_overwrite_is_invisible_until_commit`.
+
 ## Public API — batched operations
 
 All batch APIs are thin wrappers over the `fan_out` / `fan_out_collect` primitive; per-op

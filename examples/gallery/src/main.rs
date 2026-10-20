@@ -756,7 +756,7 @@ fn run_transcode_blocking(input_path: &std::path::Path) -> Result<Vec<(String, V
 /// Uses the streaming reader (`get_stream`) rather than `head` + `get_range`:
 /// large videos are stored striped (a chunk-per-`stripe_chunk_size` under a
 /// reserved namespace plus a tiny meta blob at `key`), so `head(key)` would
-/// report the 28-byte meta length and `get_range(key, …)` would read the meta
+/// report the 45-byte meta length and `get_range(key, …)` would read the meta
 /// bytes — not the video. `get_stream` auto-detects striped vs inline and
 /// yields the assembled value sequentially, which is exactly the access
 /// pattern a full-file transcode download needs. Memory stays O(chunk).

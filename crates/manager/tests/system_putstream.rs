@@ -3,7 +3,7 @@
 //!
 //! The client SDK now implements striping in pure ClusterClient code (Ceph
 //! striperados pattern): each chunk is a normal `Put` to a deterministic
-//! reserved-namespace key, and `commit` writes a 29-byte meta blob to the
+//! reserved-namespace key, and `commit` writes a 45-byte meta blob to the
 //! user's key. No new server RPCs, no multi-frag VP, no GC rewrite.
 //!
 //! Tests verify:
@@ -113,7 +113,7 @@ fn putstream_roundtrip_12mib() {
         assert_eq!(handle.chunks_sent(), 4);
         handle.commit().await.expect("commit");
 
-        // Post-commit: cluster.get(key) returns the 29-byte meta blob
+        // Post-commit: cluster.get(key) returns the 45-byte meta blob
         // (not the assembled value — that's get_stream's job per the
         // explicit-namespace contract). Length check is enough.
         let meta_blob = cluster
@@ -121,7 +121,7 @@ fn putstream_roundtrip_12mib() {
             .await
             .expect("get post-commit")
             .expect("None");
-        assert_eq!(meta_blob.len(), 29, "meta blob is fixed 29 bytes");
+        assert_eq!(meta_blob.len(), 45, "meta blob is fixed 45 bytes");
         // Meta starts with the magic byte 0xfe.
         assert_eq!(meta_blob[0], 0xfe);
 
@@ -592,5 +592,137 @@ fn put_many_mixed_size_duplicate_key_keeps_last_input() {
         assert_eq!(cluster.get(b"pm-dup-c").await.unwrap().as_deref(), Some(mid.as_ref()));
         assert_eq!(cluster.get(b"pm-dup-other").await.unwrap().as_deref(), Some(large.as_ref()));
         assert_eq!(cluster.get(b"pm-dup-other2").await.unwrap().as_deref(), Some(small.as_ref()));
+    });
+}
+
+/// Read a whole streamed value through `client` (a reader independent of the
+/// writer), as runs of equal bytes: `"A*49152"`, or `"B*16384 A*32768"` when
+/// mixed.
+async fn read_stream(client: &ClusterClient, key: &[u8]) -> Option<String> {
+    try_read_stream(client, key).await.expect("read_stream")
+}
+
+async fn try_read_stream(
+    client: &ClusterClient,
+    key: &[u8],
+) -> Result<Option<String>, autumn_client::AutumnError> {
+    let Some(mut stream) = client.get_stream(key, 1 << 20).await? else {
+        return Ok(None);
+    };
+    let mut out = Vec::new();
+    while let Some(c) = stream.next_chunk().await? {
+        out.extend_from_slice(&c);
+    }
+    Ok(Some(runs(&out)))
+}
+
+fn runs(v: &[u8]) -> String {
+    v.chunk_by(|a, b| a == b)
+        .map(|r| format!("{}*{}", r[0] as char, r.len()))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Every stripe chunk key in the (raw) keyspace.
+async fn chunk_keys(client: &ClusterClient) -> usize {
+    let r = client.range(b"\xff\xfe", b"", 10_000).await.expect("range");
+    assert!(!r.has_more);
+    r.entries.len()
+}
+
+/// An overwrite of a committed streamed value must not change what readers see
+/// until its commit, an abort must leave the old value whole, and two
+/// interleaved uploaders must not mix chunks. Replaced and aborted chunks must
+/// not stay behind.
+#[test]
+fn a_stream_overwrite_is_invisible_until_commit() {
+    let mgr_addr = pick_addr();
+    start_manager(mgr_addr);
+
+    let n1_dir = tempfile::tempdir().expect("n1");
+    let n2_dir = tempfile::tempdir().expect("n2");
+    let n1_addr = pick_addr();
+    let n2_addr = pick_addr();
+    start_extent_node(n1_addr, n1_dir.path().to_path_buf(), 1);
+    start_extent_node(n2_addr, n2_dir.path().to_path_buf(), 2);
+
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        let writer = boot_cluster(mgr_addr, n1_addr, n2_addr, 114, 11005).await;
+        let reader = ClusterClient::connect_raw(&mgr_addr.to_string()).await.unwrap();
+        let key = b"replaced";
+        const CHUNK: usize = 16 * 1024;
+        let value = |fill: u8| vec![fill; 3 * CHUNK];
+        let whole = |fill: u8| Some(runs(&value(fill)));
+        let upload = |fill: u8| {
+            let mut h = writer.put_stream_begin(key, 0).with_chunk_size(CHUNK as u32);
+            async move {
+                for c in value(fill).chunks(CHUNK) {
+                    h.send(c).await.unwrap();
+                }
+                h
+            }
+        };
+
+        upload(b'A').await.commit().await.unwrap();
+        assert_eq!(read_stream(&reader, key).await, whole(b'A'));
+
+        // Each sent chunk of an uncommitted overwrite is invisible.
+        let mut h = writer.put_stream_begin(key, 0).with_chunk_size(CHUNK as u32);
+        for c in value(b'B').chunks(CHUNK) {
+            h.send(c).await.unwrap();
+            assert_eq!(read_stream(&reader, key).await, whole(b'A'), "uncommitted chunk visible");
+        }
+        h.abort().await.unwrap();
+        assert_eq!(read_stream(&reader, key).await, whole(b'A'), "abort damaged the old value");
+        assert_eq!(chunk_keys(&writer).await, 3, "abort left chunks behind");
+
+        // A reader part-way through the value it opened when the commit
+        // replaced it is told so; it never gets the new value's bytes.
+        let mut open = reader.get_stream(key, 1 << 20).await.unwrap().unwrap();
+        assert_eq!(open.next_chunk().await.unwrap().unwrap(), vec![b'A'; CHUNK]);
+        // Reads racing the upload and its commit see the old or the new value
+        // whole, or are told it was replaced under them.
+        let committed = std::cell::Cell::new(false);
+        let commit = async {
+            upload(b'C').await.commit().await.unwrap();
+            committed.set(true);
+        };
+        let watch = async {
+            let mut reads = 0;
+            while !committed.get() {
+                match try_read_stream(&reader, key).await {
+                    Ok(v) => assert!(v == whole(b'A') || v == whole(b'C'), "read {v:?}"),
+                    Err(autumn_client::AutumnError::PreconditionFailed(_)) => {}
+                    Err(e) => panic!("read racing the commit failed: {e}"),
+                }
+                reads += 1;
+            }
+            reads
+        };
+        let ((), reads) = futures::join!(commit, watch);
+        assert!(reads > 1, "no read overlapped the upload");
+        assert!(matches!(
+            open.next_chunk().await,
+            Err(autumn_client::AutumnError::PreconditionFailed(_))
+        ));
+        assert_eq!(read_stream(&reader, key).await, whole(b'C'));
+        assert_eq!(chunk_keys(&writer).await, 3, "replaced chunks left behind");
+
+        // Two uploaders interleaved chunk by chunk.
+        let mut d = writer.put_stream_begin(key, 0).with_chunk_size(CHUNK as u32);
+        let mut e = writer.put_stream_begin(key, 0).with_chunk_size(CHUNK as u32);
+        for (cd, ce) in value(b'D').chunks(CHUNK).zip(value(b'E').chunks(CHUNK)) {
+            d.send(cd).await.unwrap();
+            e.send(ce).await.unwrap();
+        }
+        d.commit().await.unwrap();
+        assert_eq!(read_stream(&reader, key).await, whole(b'D'));
+        e.commit().await.unwrap();
+        assert_eq!(read_stream(&reader, key).await, whole(b'E'));
+        assert_eq!(chunk_keys(&writer).await, 3, "replaced chunks left behind");
+
+        writer.delete_stream(key).await.unwrap();
+        assert_eq!(read_stream(&reader, key).await, None);
+        assert_eq!(chunk_keys(&writer).await, 0);
     });
 }

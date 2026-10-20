@@ -1737,10 +1737,10 @@ AC=(autumn-client --manager 127.0.0.1:9001 --namespace bench)
 
 # 14 x 1.2 GiB seals the first log extent at 16.0 GB.
 for i in $(seq 1 14); do "${AC[@]}" put-stream key$i 1.2GiB-file; done
-"${AC[@]}" put-stream key1 other-file   # overwrite 2 of them => 2.4 GiB dead
+"${AC[@]}" put-stream key1 other-file   # overwrite 2 of them: old chunks deleted => 2.4 GiB dead
 "${AC[@]}" put-stream key2 other-file
 "${AC[@]}" put-stream key20 any-file    # push the WAL past a flush boundary
-"${AO[@]}" compact <PART> --wait        # superseded VPs become discards
+"${AO[@]}" compact <PART> --wait        # deleted chunk VPs become discards
 
 "${AO[@]}" info --part <PART> --full    # discards: extent N = 2576980376
 autumn-op df                            # WAL debt: 2.4 GB dead
@@ -1803,7 +1803,7 @@ for i in $(seq 1 270); do "${AC[@]}" del big$i; done
 ```
 
 Do NOT use `put-stream` for this: `autumn-client del` on a streamed key deletes
-only its 28-byte head and leaves every chunk key live.
+only its 45-byte head and leaves every chunk key live.
 
 Expected, measured on a 3-EN cluster (270 × 64 MiB + 200 small keys, all
 deleted): the SETTLE compaction ~4.5 min after the last delete
@@ -3434,7 +3434,7 @@ $AO scrub EXT_ID... | --part PART_ID | --all [--wait]
 #   "compact part N: ... output=..." and `$AC ls --prefix p/` must return
 #   correct entries, while PS RSS stays bounded during both (read side =
 #   8MiB windows, not Σ SST bytes). Striped keys (put-stream) byte-compare
-#   via `$AC get-stream --out F KEY` (plain `get` returns the 29-byte
+#   via `$AC get-stream --out F KEY` (plain `get` returns the 45-byte
 #   stripe meta by design).
 # u64 offset widening — extents may exceed 4 GiB (default seal 16 GiB)
 # PS flag: autumn-ps --max-extent-size-bytes N   (default 16 GiB, clamp [1,64] GiB)

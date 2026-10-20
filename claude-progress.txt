@@ -1,3 +1,9 @@
+Date: 2026-10-20 (2)
+TaskStatus: completed
+Task scope: user — fix BUG-PUTSTREAM-OVERWRITE-NOT-ATOMIC (reproduce first).
+Current summary: reproduced with system_putstream::a_stream_overwrite_is_invisible_until_commit (an independent reader saw an uncommitted overwrite's chunk: chunk keys had no upload identity, so a re-upload wrote and abort deleted the committed value's chunks). Fix: each upload draws a 16-byte upload id carried by its chunk keys (`acv2`) and by a 45-byte v2 meta; commit swaps the meta then deletes the replaced upload's chunks (delete_many); delete_stream deletes the meta then the chunks; a reader whose upload was replaced gets PreconditionFailed. v1 metas are refused by get_stream (no dual read). Ablations red: no upload id (mixed read), no reclaim, reclaim before the meta swap (racing reader: chunk missing). Green: autumn-client lib 62, system_putstream 12 (x8), system_namespace_layer_a, workspace + gallery build clean. Review (fable): no high; stale 29-byte docs fixed, chunk deletes batched.
+Main gaps: two commits racing on one key orphan the earlier one's chunks (accepted, documented); existing v1 striped values must be re-uploaded.
+Next steps: remaining review items N2–N5 (P1) in feature_list.md.
 Date: 2026-10-20
 TaskStatus: completed
 Task scope: user — GitHub CI: fuse_umount_exit, system_roll_tails_live_writer, cpuset_pinning, op_info_open_extent_shard failed.

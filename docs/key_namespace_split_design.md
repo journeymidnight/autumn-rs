@@ -90,9 +90,10 @@ CLAUDE.md）。反例：grant = `mem/app7/` 而 app builder 又自吐 `app7/…`
 
 ### 1.4 大值条带的 chunk key
 
-`make_chunk_key(user_key, idx)` = `CHUNK_KEY_PREFIX ++ len(user_key) ++
-user_key ++ idx`，它产出的是一个**相对 key**，再经 binding 前缀化 →
-`{ns}/ ++ \xff\xfe… ++ user_key ++ idx`。这样条带 body 落在本 ns 区间内：
+`make_chunk_key(user_key, upload_id, idx)` = `CHUNK_KEY_PREFIX ++ len(user_key) ++
+user_key ++ upload_id ++ idx`（`upload_id` 每次上传随机 16 字节，覆盖与 abort
+只碰本次上传的 chunk），它产出的是一个**相对 key**，再经 binding 前缀化 →
+`{ns}/ ++ \xff\xfe… ++ user_key ++ upload_id ++ idx`。这样条带 body 落在本 ns 区间内：
 Layer-A 放行、Layer-B 覆盖、presplit 区间涵盖。代价是本 ns 内的 range 扫描会
 看到自己的 chunk key（`\xff\xfe` 排在本 ns 尾部），需要 caller 侧过滤。
 
