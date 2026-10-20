@@ -4450,6 +4450,13 @@ with the peer address, its declared role and versions; grep for
 `refused a version mismatch` to find the stale binary (servers built before the
 handshake's rename log it as `PROTOCOL_HELLO refused a version mismatch`).
 
+After the Hello, a client connection to the manager or an extent node, and a
+partition-server client until a CLIENT_AUTH succeeds while authz is on, may
+only send frames up to 1 MiB: a larger header drops the connection before the
+server reserves anything for it (logged at DEBUG as `payload too large`, so
+`RUST_LOG=debug` to see it). Peer and admin connections, authenticated clients
+and every client of a PS with authz off are not limited. Check: `cargo test -p autumn-manager --test frame_limit_admission`.
+
 `autumn-op` connects as an ADMIN peer, so it needs the exact `WIRE_VERSION` of
 the manager it talks to: during a wire-changing rollout use the old release's
 `autumn-op` until the manager is replaced and the new one afterwards (step 5

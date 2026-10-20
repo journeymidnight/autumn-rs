@@ -221,6 +221,10 @@ impl AutumnManager {
         )
         .await?;
         let mut decoder = FrameDecoder::new();
+        // A client sends the manager only small control messages.
+        if protocol.role == autumn_rpc::version_hello::Role::Client {
+            decoder.set_max_payload(autumn_rpc::frame::CLIENT_CONTROL_MAX_PAYLOAD);
+        }
         let mut buf = vec![0u8; 64 * 1024];
         let (resp_tx, mut resp_rx) = futures::channel::mpsc::unbounded::<Bytes>();
 

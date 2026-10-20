@@ -32,12 +32,6 @@
 - **Acceptance**: 在递减前、递减后、删 pending 前后分别恢复，重复恢复任意次，`alias` 都能逐字节读到旧版本；单链接的旧 inode 最终可回收。修前红、修后绿。
 - `passes: false`
 
-### BUG-RPC-UNVALIDATED-FRAME-RESERVE — RPC 只收到 10 字节头就按声明长度预留内存（P2）
-- **Trigger** (review.md N7，真实 decoder 验证分配行为，未制造 OOM): `FrameDecoder::try_decode`（`crates/rpc/src/frame.rs`）在收到 body、校验 ctrl 长度/CRC 之前，按头里的 `payload_len` 对整帧 `reserve`；`payload_len` 是 u32 且 `MAX_PAYLOAD_LEN = u32::MAX`，上限检查不拒绝任何声明。喂 10 字节、声明 64 MiB，容量即达 67,108,874 字节；理论上限约 4 GiB/连接。opcode 与 CLIENT_AUTH 检查在解码之后，不能保护这次分配；完成 Client 角色握手的连接即可触发，多连接放大。
-- **Scope**: reserve 前按 service/opcode/连接阶段实施实际长度和并发内存预算；未完成业务鉴权的连接用更小的合法消息上限；分段接收，不凭未验证的头一次申请整帧。上限要容纳 recovery 分块等合法大请求。注意性能：热路径的大帧（append/bulk）不能因此多一次拷贝。
-- **Acceptance**: 大声明短 body、非法 ctrl 长度、无 token、并发慢连接都受预算约束；合法 bulk/append/recovery 帧照常通过；断言容量/内存边界，不以"没有 OOM"为唯一标准。
-- `passes: false`
-
 ### F-TEST-FOLLOWUPS — 测试集体检留下的缺口与疑点（未处理）
 - **Trigger** (2026-10-19，测试集体检的审查与删除过程中发现，均未在那次改动里处理):
   - `system_gc_chunked_read` 从不 roll 日志，GC 实际没跑（应加 roll_tails，而不是删）。

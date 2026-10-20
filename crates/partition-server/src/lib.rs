@@ -5229,6 +5229,65 @@ pub(crate) struct ConnGateState {
     pub protocol: Option<autumn_rpc::version_hello::Negotiated>,
 }
 
+#[cfg(test)]
+mod frame_limit_tests {
+    use super::ConnGateState;
+    use autumn_rpc::frame::{CLIENT_CONTROL_MAX_PAYLOAD, MAX_PAYLOAD_LEN};
+    use autumn_rpc::version_hello::{Negotiated, Role, Service};
+
+    fn conn(role: Role) -> ConnGateState {
+        ConnGateState {
+            principal: None,
+            protocol: Some(Negotiated {
+                role,
+                service: Service::PartitionServer,
+                remote_wire: autumn_rpc::WIRE_VERSION,
+                min_client: autumn_rpc::MIN_CLIENT_WIRE_VERSION,
+                max_client: autumn_rpc::WIRE_VERSION,
+                declared_version: autumn_rpc::WIRE_VERSION,
+            }),
+        }
+    }
+
+    /// Only an unauthenticated client of an authz cluster is held to a
+    /// control message.
+    #[test]
+    fn an_unauthenticated_client_may_only_send_control_messages() {
+        let authz = crate::authz::AuthzState::new();
+        assert_eq!(conn(Role::Client).frame_limit(&authz), MAX_PAYLOAD_LEN, "authz off");
+        authz.install(&autumn_rpc::manager_rpc::GetAuthzConfigResp {
+            code: 0,
+            message: String::new(),
+            enabled: true,
+            public_keys: vec![],
+            namespaces: vec![],
+            token_ttl_secs: 0,
+            clock_skew_secs: 0,
+            cluster_id: String::new(),
+        });
+        assert!(authz.is_enabled());
+        assert_eq!(conn(Role::Client).frame_limit(&authz), CLIENT_CONTROL_MAX_PAYLOAD);
+        assert_eq!(conn(Role::Peer).frame_limit(&authz), MAX_PAYLOAD_LEN);
+    }
+}
+
+impl ConnGateState {
+    /// Largest frame this connection may send now: a client that has not
+    /// bound a principal while authz is on may only authenticate, so its
+    /// headers must not make the decoder reserve more than a control message.
+    fn frame_limit(&self, authz: &crate::authz::AuthzState) -> u32 {
+        let client = self
+            .protocol
+            .as_ref()
+            .is_some_and(|p| p.role == autumn_rpc::version_hello::Role::Client);
+        if client && authz.is_enabled() && self.principal.is_none() {
+            autumn_rpc::frame::CLIENT_CONTROL_MAX_PAYLOAD
+        } else {
+            autumn_rpc::frame::MAX_PAYLOAD_LEN
+        }
+    }
+}
+
 /// Checks the negotiated role before business DTO decoding, then preserves
 /// existing CLIENT_AUTH and key-prefix/expiry authorization. The bootstrap
 /// itself completes before this gate or the business decoder is reached.
@@ -5502,6 +5561,8 @@ async fn push_frames_to_inflight(
     conn: &mut ConnGateState,
 ) -> Result<()> {
     loop {
+        // Per frame: a CLIENT_AUTH just pushed lifts the limit for the next.
+        decoder.set_max_payload(conn.frame_limit(authz));
         match decoder.try_decode().map_err(|e| anyhow!(e))? {
             Some(frame) if frame.req_id != 0 => {
                 // Back-pressure: drain one completion if we're at cap.
@@ -5646,6 +5707,7 @@ async fn handle_ps_connection(
                 PsReadBurst::Err { e } => return Err(e.into()),
                 PsReadBurst::Data { window, mut reader } => {
                     decoder.finish_read(window);
+                    decoder.set_max_payload(conn_state.frame_limit(&authz));
 
                     // recv any LARGE bulk-write tail(s) at the
                     // front straight into a PooledBuf (UCX Stream unpack / TCP
@@ -5670,15 +5732,16 @@ async fn handle_ps_connection(
                     // prevent the next request from entering this connection.
                     let first = decoder.try_decode().map_err(|e| anyhow!(e))?;
                     if let Some(frame) = first {
-                        let more = decoder.try_decode().map_err(|e| anyhow!(e))?;
                         #[cfg(test)]
-                        if more.is_none() && frame.req_id != 0 && inflight.is_empty() {
+                        if decoder.front_frame_remaining().is_none_or(|rest| rest > 0)
+                            && frame.req_id != 0
+                            && inflight.is_empty()
+                        {
                             PS_SINGLE_FRAME_RECV_HITS
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         }
-                        // Fall back: push the first frame (if it had a
-                        // req_id) and any second frame we decoded,
-                        // then drain whatever else is buffered.
+                        // Pushed before anything after it is decoded: a
+                        // CLIENT_AUTH here changes the next frame's limit.
                         if frame.req_id != 0 {
                             push_one_frame_to_inflight(
                                 frame,
@@ -5690,20 +5753,6 @@ async fn handle_ps_connection(
                                 &mut conn_state,
                                 &mut tx_bufs,
                             );
-                        }
-                        if let Some(second) = more {
-                            if second.req_id != 0 {
-                                push_one_frame_to_inflight(
-                                    second,
-                                    &req_tx,
-                                    &part,
-                                    owner_part,
-                                    &mut inflight,
-                                    &authz,
-                                    &mut conn_state,
-                                    &mut tx_bufs,
-                                );
-                            }
                         }
                     }
                     // Drain any remaining frames + apply back-pressure.
@@ -5791,6 +5840,7 @@ async fn handle_ps_connection(
                     PsReadBurst::Err { e } => return Err(e.into()),
                     PsReadBurst::Data { window, mut reader } => {
                         decoder.finish_read(window);
+                        decoder.set_max_payload(conn_state.frame_limit(&authz));
                         // recv large bulk-write tails into
                         // pooled buffers first (UCX registered / TCP owned read).
                         drain_bulk_writes(
@@ -13822,6 +13872,94 @@ mod authz_enforcement_tests {
             assert!(n > 0, "EOF before response");
             decoder.feed(&buf[..n]);
         }
+    }
+
+    /// Through the real connection loop on an authz partition server: a 2 MiB
+    /// frame (a PING, answered before any partition) drops a client that has
+    /// not authenticated, before its body is reserved; a peer gets its reply,
+    /// and so does a client that sent CLIENT_AUTH ahead of it in one write.
+    #[test]
+    fn an_unauthenticated_client_s_large_frame_drops_the_connection() {
+        use autumn_rpc::version_hello::{initiate, Hello, Role, Service};
+        let _g = super::ps_conn_test_lock();
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let sk = SigningKey::from_bytes(&[7u8; 32]);
+            let authz = std::sync::Arc::new(crate::authz::AuthzState::new());
+            authz.install(&GetAuthzConfigResp {
+                code: 0,
+                message: String::new(),
+                enabled: true,
+                public_keys: vec![AuthzPublicKey {
+                    kid: 1,
+                    ed25519_pub: sk.verifying_key().to_bytes().to_vec(),
+                    disabled: false,
+                }],
+                namespaces: vec![b"fs/".to_vec()],
+                token_ttl_secs: 3600,
+                clock_skew_secs: 60,
+                cluster_id: "cluster-test".to_string(),
+            });
+            let listener = compio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let big = Frame::request(9, autumn_rpc::MSG_TYPE_PING, Bytes::from(vec![0u8; 2 << 20])).encode();
+            let auth = Frame::request(
+                8,
+                MSG_CLIENT_AUTH,
+                partition_rpc::rkyv_encode(&ClientAuthReq { token: mint(&sk, vec![b"fs/".to_vec()]) }),
+            )
+            .encode();
+            // Writes `ahead` then the large frame in one write; the req ids of
+            // the replies read until the connection ends or both arrive.
+            let replies = |role: Role, ahead: Option<Bytes>| {
+                let (authz, listener, big) = (authz.clone(), &listener, big.clone());
+                async move {
+                    let client = compio::net::TcpStream::connect(addr).await.unwrap();
+                    let (server, _) = listener.accept().await.unwrap();
+                    let (req_tx, _req_rx) = mpsc::channel::<PartitionRequest>(8);
+                    compio::runtime::spawn(handle_ps_connection(
+                        autumn_transport::Conn::Tcp(server),
+                        req_tx,
+                        None,
+                        1,
+                        authz,
+                    ))
+                    .detach();
+                    let (mut rd, mut wr) = autumn_transport::Conn::Tcp(client).into_split();
+                    let negotiated = initiate(&mut rd, &mut wr, Hello::current(role), Some(Service::PartitionServer))
+                        .await
+                        .unwrap();
+                    autumn_rpc::peer_auth::initiate(&mut rd, &mut wr, &negotiated, autumn_rpc::peer_auth::installed())
+                        .await
+                        .unwrap();
+                    let mut out = ahead.map(|a| a.to_vec()).unwrap_or_default();
+                    out.extend_from_slice(&big);
+                    let BufResult(r, _) = wr.write_all(out).await;
+                    r.unwrap();
+                    let (mut decoder, mut ids, mut buf) = (FrameDecoder::new(), Vec::new(), vec![0u8; 64 * 1024]);
+                    let wanted = if role == Role::Client { 2 } else { 1 };
+                    while ids.len() < wanted {
+                        while let Some(f) = decoder.try_decode().unwrap() {
+                            ids.push(f.req_id);
+                        }
+                        if ids.len() >= wanted {
+                            break;
+                        }
+                        let read = rd.read(buf);
+                        let BufResult(n, back) =
+                            compio::time::timeout(Duration::from_secs(10), read).await.expect("neither reply nor close");
+                        buf = back;
+                        match n {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => decoder.feed(&buf[..n]),
+                        }
+                    }
+                    ids
+                }
+            };
+            assert_eq!(replies(Role::Client, None).await, Vec::<u32>::new(), "unauthenticated client");
+            assert_eq!(replies(Role::Peer, None).await, vec![9], "peer");
+            assert_eq!(replies(Role::Client, Some(auth)).await, vec![8, 9], "authenticated client");
+        });
     }
 
     /// A client outside the window is refused BY THE SERVER, before its write

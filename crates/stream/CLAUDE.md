@@ -303,6 +303,10 @@ N×cap under 65535). Default cap 4096; flag `--fd-cache-cap`.
 
 ### Connection handling & batch optimization (true SQ/CQ)
 
+A Client connection (direct reads, CLIENT_AUTH) has its decoder capped at
+`CLIENT_CONTROL_MAX_PAYLOAD` (1 MiB): a header announcing more drops it before the
+announced body is reserved. Peer connections are not capped (appends and copies).
+
 `handle_connection` is ONE compio task per TCP connection running a **true
 SQ/CQ** loop: a persistent read future (SQ) and an inline `FuturesUnordered` of
 in-flight batch I/O futures (CQ) are polled concurrently via

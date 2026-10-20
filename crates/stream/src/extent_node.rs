@@ -5639,6 +5639,10 @@ impl ExtentNode {
         // Bound by CLIENT_AUTH on a Client connection (see `client_gate`).
         let mut principal: Option<autumn_rpc::cap_token::BoundPrincipal> = None;
         let mut decoder = FrameDecoder::new();
+        // A client only reads here: its requests are small control messages.
+        if protocol.role == autumn_rpc::version_hello::Role::Client {
+            decoder.set_max_payload(autumn_rpc::frame::CLIENT_CONTROL_MAX_PAYLOAD);
+        }
 
         let cap = en_params().inflight_cap.get();
         let mut inflight: FuturesUnordered<

@@ -2250,6 +2250,15 @@ loop retries every 5 s.
 It verifies a capability token ONCE per connection and enforces a byte prefix + `exp`
 check per request — it NEVER calls the manager to enforce.
 
+Until a CLIENT_AUTH succeeds on a Client connection while authz is on, its frames
+are capped at `CLIENT_CONTROL_MAX_PAYLOAD` (1 MiB, `ConnGateState::frame_limit`, set
+after each read and before each decode in `push_frames_to_inflight`): every PS
+client opcode is keyed and refused anonymously anyway, and the decoder reserves a
+frame's whole announced length from its header (crates/rpc/CLAUDE.md "Receiving
+into the decoder"). The idle read branch pushes its first frame before decoding the
+next, so a pipelined CLIENT_AUTH lifts the cap for the frame behind it
+(`an_unauthenticated_client_s_large_frame_drops_the_connection`).
+
 **OPT-IN.** `AuthzState.is_enabled()` is a single relaxed `AtomicBool` load; false (no
 signing key configured cluster-wide) ⇒ the whole gate is skipped, so fuse / kvcache /
 dev pay nothing. `enabled` flips true only after the config poll installs a keyring.

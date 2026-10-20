@@ -60,6 +60,13 @@ pub const CTRL_OVERHEAD: usize = CTRL_PREFIX_LEN + CRC_LEN;
 /// Individual services should enforce their own practical limits.
 pub const MAX_PAYLOAD_LEN: u32 = u32::MAX;
 
+/// The largest payload a client connection may send where all it may send is
+/// a small control message: to the manager, to an extent node, and to a
+/// partition server before CLIENT_AUTH while authz is on
+/// (`FrameDecoder::set_max_payload`). A header declaring more is refused
+/// before anything is reserved for it.
+pub const CLIENT_CONTROL_MAX_PAYLOAD: u32 = 1 << 20;
+
 // Flag bits. Bit 3 (0x08) is RESERVED — it was FLAG_CRC before wire v28, when
 // CRC presence was optional; protection is now structural, so the bit is gone.
 pub const FLAG_RESPONSE: u8 = 0x01;
@@ -242,11 +249,8 @@ impl Frame {
 /// producer nobody bounded still emits a wrapped header — that is the failure
 /// this file cannot fix on its own, and the reason the bound belongs upstream.
 ///
-/// Bounded by `MAX_PAYLOAD_LEN`, the same constant the DECODER rejects on
-/// (`FrameError::PayloadTooLarge`), not by a second copy of `u32::MAX`. The two
-/// sides have to agree, and the decoder's bound is documented as one that will
-/// be lowered to a practical cap — at which point an encoder comparing against
-/// the type's maximum would happily build frames its own peer refuses.
+/// Bounded by `MAX_PAYLOAD_LEN`, the decoder's default bound
+/// (`FrameError::PayloadTooLarge`), not by a second copy of `u32::MAX`.
 ///
 /// It COMPUTES `wire_payload_len` rather than taking it, which is what makes
 /// one check enough: the payload always contains the ctrl, so a ctrl too large
@@ -435,13 +439,23 @@ pub type ReadWindow = compio::buf::Slice<BytesMut>;
 /// Decode state machine for reading frames from a byte stream.
 pub struct FrameDecoder {
     buf: BytesMut,
+    /// Largest payload accepted. A frame's whole length is reserved from its
+    /// header alone (so a large frame is received in place), so an untrusted
+    /// connection's limit bounds what one header can make this reserve.
+    max_payload: u32,
 }
 
 impl FrameDecoder {
     pub fn new() -> Self {
         Self {
             buf: BytesMut::with_capacity(64 * 1024),
+            max_payload: MAX_PAYLOAD_LEN,
         }
+    }
+
+    /// Refuse frames whose payload exceeds `max` (`FrameError::PayloadTooLarge`).
+    pub fn set_max_payload(&mut self, max: u32) {
+        self.max_payload = max;
     }
 
     /// Feed new data into the decoder buffer. Copies `data`; a receive loop
@@ -492,6 +506,10 @@ impl FrameDecoder {
     /// Bytes still missing from the front frame once its header is buffered.
     pub fn front_frame_remaining(&self) -> Option<usize> {
         let (_, _, _, payload_len) = self.peek_header()?;
+        if payload_len > self.max_payload {
+            // Refused by `try_decode`; nothing to receive in place.
+            return Some(0);
+        }
         Some((HEADER_LEN + payload_len as usize).saturating_sub(self.buf.len()))
     }
 
@@ -509,14 +527,8 @@ impl FrameDecoder {
 
         let payload_len = u32::from_le_bytes(self.buf[6..10].try_into().unwrap());
 
-        // Defensive bound, deliberately kept even though it is always false
-        // today (`MAX_PAYLOAD_LEN == u32::MAX`, and `payload_len` is a u32). It
-        // becomes load-bearing the moment `MAX_PAYLOAD_LEN` is lowered to a real
-        // practical cap — at which point removing it would be a silent
-        // regression. `#[allow]` rather than delete so that future-proofing
-        // stays in place.
-        #[allow(clippy::absurd_extreme_comparisons)]
-        if payload_len > MAX_PAYLOAD_LEN {
+        // Before the reserve below: the header is all that has arrived.
+        if payload_len > self.max_payload {
             return Err(FrameError::PayloadTooLarge(payload_len));
         }
         let payload_len = payload_len as usize;
@@ -615,6 +627,9 @@ impl FrameDecoder {
         let Some((req_id, msg_type, flags, payload_len)) = self.peek_header() else {
             return Ok(None);
         };
+        if payload_len > self.max_payload {
+            return Err(FrameError::PayloadTooLarge(payload_len));
+        }
         let payload_len = payload_len as usize;
         if payload_len < CTRL_OVERHEAD {
             return Err(FrameError::Malformed("payload shorter than ctrl_len+crc"));
@@ -675,7 +690,7 @@ impl Default for FrameDecoder {
 
 #[derive(Debug, thiserror::Error)]
 pub enum FrameError {
-    #[error("payload too large: {0} bytes (max {MAX_PAYLOAD_LEN})")]
+    #[error("payload too large: {0} bytes for this connection")]
     PayloadTooLarge(u32),
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
@@ -691,6 +706,37 @@ pub enum FrameError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A header declaring more than the decoder's limit is refused from the
+    /// header alone: nothing is reserved for the body it announces.
+    #[test]
+    fn a_header_over_the_limit_reserves_nothing() {
+        use compio::buf::IntoInner;
+        let announce = |decoder: &mut FrameDecoder| {
+            let mut head = [0u8; HEADER_LEN];
+            head[0] = 1;
+            head[6..10].copy_from_slice(&(64u32 << 20).to_le_bytes());
+            decoder.feed(&head);
+        };
+        let mut open = FrameDecoder::new();
+        announce(&mut open);
+        assert!(open.try_decode().unwrap().is_none());
+        assert!(open.read_window(1).into_inner().capacity() >= 64 << 20, "the default reserves the frame");
+
+        let mut limited = FrameDecoder::new();
+        limited.set_max_payload(CLIENT_CONTROL_MAX_PAYLOAD);
+        announce(&mut limited);
+        assert_eq!(limited.front_frame_remaining(), Some(0));
+        assert!(matches!(limited.try_decode(), Err(FrameError::PayloadTooLarge(n)) if n == 64 << 20));
+        assert!(matches!(limited.peek_bulk_prologue(), Err(FrameError::PayloadTooLarge(_))));
+        let window = limited.read_window(64 * 1024);
+        assert!(window.into_inner().capacity() < 1 << 20, "a refused header reserved its body");
+
+        let mut ok = FrameDecoder::new();
+        ok.set_max_payload(CLIENT_CONTROL_MAX_PAYLOAD);
+        ok.feed(&Frame::request(7, 1, Bytes::from(vec![9u8; 4096])).encode());
+        assert_eq!(ok.try_decode().unwrap().unwrap().payload.len(), 4096);
+    }
 
     /// Stand-in for a transport read: store `data` at the window start.
     fn receive(window: &mut ReadWindow, data: &[u8]) -> *const u8 {

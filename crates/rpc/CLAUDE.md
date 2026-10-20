@@ -182,6 +182,20 @@ Window policy — each rule removes a copy that was measured, not guessed:
   new one while earlier frames still share it.
 - `try_decode` reserves an incomplete frame's remaining length, so a window of
   `front_frame_remaining()` receives the rest in place.
+- That reserve is driven by the header alone, before the body or its CRC has
+  arrived, so a connection that may only send small control messages gets a
+  limit (`set_max_payload(CLIENT_CONTROL_MAX_PAYLOAD)`, 1 MiB): a Client
+  connection to the manager or an extent node, and a PS Client until a
+  CLIENT_AUTH succeeds while authz is on (`ConnGateState::frame_limit`). A
+  header over the limit is `PayloadTooLarge` (the connection drops) and
+  `front_frame_remaining` reports 0, so nothing is reserved for it. Peer/Admin
+  connections (cluster secret) and authenticated PS clients are not limited:
+  their frames reach gigabytes and keep the in-place receive. Not bounded:
+  many authenticated connections together (no global receive budget), and any
+  client of a PS with authz off. Tests:
+  `frame::tests::a_header_over_the_limit_reserves_nothing`,
+  `crates/manager/tests/frame_limit_admission.rs` (manager and EN, client vs
+  peer), PS `an_unauthenticated_client_s_large_frame_drops_the_connection`.
 - The extent node passes `max(512 KiB, front_frame_remaining())`. The part of a
   large frame that arrived in the window before its header was parsed is
   copied once by `try_decode`'s reserve: per replica ~0.45x (TCP) / ~0.19x (UCX)
