@@ -1,6 +1,6 @@
 # autumn-rs feature list — OPEN backlog
 
-**Last updated:** 2026-10-19 (heartbeat lease refresh no longer overwrites the next writer; cq timing test and merge reopen polls fixed; all three removed)
+**Last updated:** 2026-10-20 (review.md full-repo review N1–N7 filed: five P1, two P2; T3/T4 and test follow-ups annotated)
 
 **Rules:**
 - This file tracks the **OPEN backlog only**. A feature that reaches `passes: true`
@@ -14,6 +14,48 @@
 
 ## Active
 
+### BUG-PUTSTREAM-OVERWRITE-NOT-ATOMIC — 流式覆盖复用旧 chunk key：未 commit 就改变旧值，abort 删掉旧值（P1）
+- **Trigger** (review.md N1，2026-10-20 全仓审查，公开 API 复现): `make_chunk_key`（`crates/client/src/lib.rs`）只含 user key 和 chunk index，没有 upload/generation 身份。对已提交的 key 再次 `put_stream_begin` + `send`，在 commit 前另一个客户端 `get_stream` 已读到新内容；随后 `abort` 删除同一组 chunk，旧 manifest 仍在，读报 `striped chunk 0 missing`。顺序操作即可复现，无需故障。多 chunk 覆盖还可能读到新旧混合。影响 `ClusterClient::put_stream_begin` / `get_stream` 及其入口；S3 的 `autumn_fs::multipart` 是另一套实现，不在本条。
+- **Scope**: 先用审查附录的 probe 复现。每次上传用独立 generation/object id，chunk key 与 manifest 同时带该身份；新 manifest 发布前不触碰旧 generation；abort 只清本次上传；旧 generation 的回收要考虑已开始的 reader。
+- **Acceptance**: 旧值已提交时开始覆盖、逐 chunk 暂停，另一 reader 始终读到完整旧值；abort 后旧值完整；commit 后新 reader 读到完整新值；两个 uploader 交错不混 chunk。修前红、修后绿，消融（去掉 generation）变红。
+- `passes: false`
+
+### BUG-LEASE-GRANT-STALE-TXN — 同一任期内迟到的 AcquireLease 事务覆盖后来的 writer（P1）
+- **Trigger** (review.md N2，真实 etcd + 现有 `FENCED_TXN_TEST_HOLD_*` 暂停点复现): `handle_acquire_lease` 先在内存授予并捕获 record，再经 `put_msgs_txn` 持久化，事务只比 leader key。W 的第一次 acquire 停在 etcd put 前 → W 重试成功 → W release → X acquire 成功（etcd 为 X，版本 …777）→ 放行 W 的第一次事务：仍返回成功，etcd 写回 W、版本退到 …776。不需要换主或 force-preempt。后续换主会恢复错误持有者。`refresh_writer_record`（2bc0ae0d）只修了 heartbeat，没有覆盖 grant。
+- **Scope**: 先用附录 probe 复现。为同一 inode 的租约 grant/release/expiry 建立一致的条件提交：比较操作所属 writer/version/记录 revision，事务后内存提交或回滚同样核对身份；或只串行化同 inode 的生命周期操作（不能全局阻塞）。同一范围待验证：`handle_release_lease` 的 delete、`inode_lease_revoke_loop` 的批量 delete 缺 writer-record compare；`revert_writer_acquire` 同任期内可能恢复过时快照。
+- **Acceptance**: 原样跑上述时序，X 的持久记录与内存持有者始终一致，旧事务不能复活 W；再换主 X 仍有效；覆盖响应延迟、提交前延迟、失败回滚、release 与 revoke 交错。修前红、修后绿，消融变红。
+- `passes: false`
+
+### BUG-FS-CREATE-NOT-CONDITIONAL — 同名 create/mkdir 先查后写，并发创建出两个 inode（P1）
+- **Trigger** (review.md N3，两个 `FsState` 并发复现): `dir::create` / `dir::mkdir`（`crates/fs/src/dir.rs`）在 `kv_exists` 看到名字不存在后各自分配 inode，再用无条件 `kv_put(dirent)` 互相覆盖；两次调用都返回成功（Ok(2)、Ok(1002)），落败的 inode 失去名字，写入仍成功但路径找不到。`kv_exists(...).await.unwrap_or(false)` 还把读失败当成不存在。入口：FUSE Create、Python create。
+- **Scope**: 先复现。dirent 用 create-only CAS 发布，结果未知时 read-back 判定；不得把存储错误当作不存在；落败的 inode 要可靠清理，父目录 nlink/mtime 更新避免丢失更新（`publish::ensure_dirs` 的条件创建可作参考）。
+- **Acceptance**: 多会话同名 create/mkdir 只有一个新 inode 发布成功，其余按语义返回已存在或复用同一 inode；注入存在性读错误不覆盖已有目录项；落败的 inode/数据不泄漏。修前红、修后绿。
+- `passes: false`
+
+### BUG-FS-RENAME-OVER-NONEMPTY-DIR — rename 覆盖非空目录不拒绝，目标子树失去入口（P1）
+- **Trigger** (review.md N4，共享 FS API 复现，无并发无故障): `dir::rename`（`crates/fs/src/dir.rs`）的目标检查只处理"与源同 inode"和"目标是非目录需回收"；目标是目录时不检查是否为空，也不完整校验源/目标类型。`/srcdir` rename 到含 `precious` 的 `/dstdir` 返回 Ok，`dstdir` 指向源 inode，原目标 inode 及其子树从根不可达。独立于已知的"rename 跨 key 非原子"限制。
+- **Scope**: 先复现。修改任何 key 前完成目标类型与目录非空等检查，且检查结果在实际提交时仍有效（跨客户端单加一次 `is_empty` 仍有 TOCTOU，需要目录级协调或版本条件）。
+- **Acceptance**: 非空目录目标、文件覆盖目录、目录覆盖文件都拒绝且源/目标不变；空目录合法替换正确维护父目录引用；同 inode rename 仍是 no-op。修前红、修后绿。
+- `passes: false`
+
+### BUG-FS-RETIRE-RECOVERY-DOUBLE-DECREMENT — Retire 恢复重复减 nlink，删掉仍被硬链接引用的 inode（P1）
+- **Trigger** (review.md N5，重建崩溃边界持久状态后执行真实恢复；`crates/fs/CLAUDE.md` 已记为已知限制): 正常 retire 先减旧 inode 的 nlink、后删 pending record；两步之间崩溃（或删 pending 失败后会话结束），恢复看到目录项指向 successor，又调 `drop_name_of` 再减一次。复现：`object`、`alias` 两个名字指向旧 inode，publish 新版本到 `object` 后 nlink 2→1，放回崩溃窗口内应存在的 `PendingOp::Retire` 并释放 session lease，另一个 `FsState` 跑 `recover_dead_sessions`：`alias` 还在，inode 已被删。现有 `a_retire_whose_swap_lost_leaves_a_linked_inode_alone` 测的是 swap 未获胜的情形。
+- **Scope**: 先复现。把 retire 操作 id/已应用标记与 inode 引用变更放进同一个条件更新，让恢复能判断这次递减是否已应用；只看 dirent 是否等于 successor 不够，单纯调换两次写的顺序会产生相反的泄漏窗口。
+- **Acceptance**: 在递减前、递减后、删 pending 前后分别恢复，重复恢复任意次，`alias` 都能逐字节读到旧版本；单链接的旧 inode 最终可回收。修前红、修后绿。
+- `passes: false`
+
+### BUG-CHECK-COMMIT-LENGTH-NO-LEADER-GATE — standby 能成功回答 CheckCommitLength（P2）
+- **Trigger** (review.md N6，同一 manager 实例 `set_leader(false)` 后经真实 RPC 验证；此前在 F-TEST-FOLLOWUPS 中是推断): `handle_check_commit_length`（`crates/manager/src/rpc_handlers.rs`）解码后直接用本地 owner lock、stream、extent 和节点表，没有 `ensure_leader`，外层 dispatch 也不补。standby 上 `StreamInfo` 返回 NOT_LEADER，而 `CheckCommitLength` 返回 OK、end=4096；sealed 分支不访问 EN 即成功。调用方会把 standby 的旧 tail/长度当成功结果，无法按 NOT_LEADER 轮换。
+- **Scope**: 在读本地 owner/stream 状态前加与该权威查询语义一致的 leader gate（若要允许 leaderless 缓存服务，需明确期限与安全条件）。同时修正 `etcd_replay_owner_lock_allows_check_commit_length_without_reacquire`：`drop(mgr1)` 只关客户端，旧 manager 仍在跑，不能证明 failover 重放（见 F-TEST-FOLLOWUPS）。
+- **Acceptance**: 真实 leader/standby 集群里 leader roll tail / 推进 owner epoch 后，standby 对该 RPC 返回 NOT_LEADER，客户端轮换后拿到新 tail；去掉 gate 时该测试变红。
+- `passes: false`
+
+### BUG-RPC-UNVALIDATED-FRAME-RESERVE — RPC 只收到 10 字节头就按声明长度预留内存（P2）
+- **Trigger** (review.md N7，真实 decoder 验证分配行为，未制造 OOM): `FrameDecoder::try_decode`（`crates/rpc/src/frame.rs`）在收到 body、校验 ctrl 长度/CRC 之前，按头里的 `payload_len` 对整帧 `reserve`；`payload_len` 是 u32 且 `MAX_PAYLOAD_LEN = u32::MAX`，上限检查不拒绝任何声明。喂 10 字节、声明 64 MiB，容量即达 67,108,874 字节；理论上限约 4 GiB/连接。opcode 与 CLIENT_AUTH 检查在解码之后，不能保护这次分配；完成 Client 角色握手的连接即可触发，多连接放大。
+- **Scope**: reserve 前按 service/opcode/连接阶段实施实际长度和并发内存预算；未完成业务鉴权的连接用更小的合法消息上限；分段接收，不凭未验证的头一次申请整帧。上限要容纳 recovery 分块等合法大请求。注意性能：热路径的大帧（append/bulk）不能因此多一次拷贝。
+- **Acceptance**: 大声明短 body、非法 ctrl 长度、无 token、并发慢连接都受预算约束；合法 bulk/append/recovery 帧照常通过；断言容量/内存边界，不以"没有 OOM"为唯一标准。
+- `passes: false`
+
 ### F-TEST-FOLLOWUPS — 测试集体检留下的缺口与疑点（未处理）
 - **Trigger** (2026-10-19，测试集体检的审查与删除过程中发现，均未在那次改动里处理):
   - `system_gc_chunked_read` 从不 roll 日志，GC 实际没跑（应加 roll_tails，而不是删）。
@@ -26,6 +68,7 @@
 - **Scope**: 逐项核实；真缺口补测试（消融能红），真 bug 另立条目按根因修，偶发失败先复现再定位。
 - **Acceptance**: 每项写明结论（已补/已修/证伪）；补的测试消融变红。
 - `passes: false`
+- **notes** (2026-10-20): review.md N6 已坐实 `handle_check_commit_length` 缺 leader gate，另立 BUG-CHECK-COMMIT-LENGTH-NO-LEADER-GATE（含修正 `etcd_replay_owner_lock_...` 测试）；review.md 4.2 也确认 `system_gc_chunked_read` 不建立可 GC 的 sealed log 前置条件。
 
 ### BUG-LEASE-HEARTBEAT-STALE-NOTHELD — 心跳快照期间重新 acquire 的 lease 会被迟到的 NotHeld 删掉（推断，未复现）
 - **Trigger** (2026-10-17 fuse_lease_loss 修复的 opus 评审): `lease_tasks.rs` 心跳循环先快照 `held_leases` 的 ino 再逐个 await 心跳 RPC；期间最后一次 release + 新 Open 可以重新 acquire 同一 ino，迟到的 `NotHeld` 把新条目删掉（现在还会多做一次失效）：后续写 EIO "no lease"，manager 那份新 lease 漏到 TTL 过期。
@@ -46,6 +89,7 @@
 - **Scope**: 改用可终止 runtime 或 SIGKILL 子进程并等待退出；compact/flush 用 durable/checkpoint barrier。
 - **Acceptance**: 证明旧服务退出、故障发生于指定窗口；重启验证 ACK 数据和 tombstone。
 - `passes: false`
+- **notes** (2026-10-20): review.md（新版全仓审查）4.2 仍列为待补：crash/restart 测试应记录旧进程/线程退出、checkpoint 位点、重启后的 pid/runtime 身份；已核实的反例是 `etcd_replay_owner_lock_allows_check_commit_length_without_reacquire`（`drop(RpcClient)` 当 kill）。注意：同 psid 接管类测试（旧 PS 因 owner epoch 被围栏、LockedByOther 自退且不 flush）是真实的非优雅崩溃，不在此列。
 
 ### F-REVIEW-T4-CHAOS-GATES — P2 chaos 覆盖与历史验收
 - **Trigger**: review.md T4；动作零成功、ignored 未运行、未知结果抹掉已 ACK 历史。
@@ -58,6 +102,7 @@
   断言因此没有意义。同日 merge 加了分离闸门，E7b 前补了"两侧 compact + 等 `has_overlap=0`"
   （否则 freeze 直接拒、manager kill 落空），**这一步未实跑**。另：该脚本开机时 `kill -9` 本机
   所有 `autumn-*`/`etcd` 进程，多租户机器上会杀掉别的工作树的进程。
+- **notes** (2026-10-20): review.md 4.2 仍列为待补：全动作长时 chaos、硬盘故障、断电、跨机 UCX、真实 FUSE mount 都未在 CI 运行；动作要有非零成功/完成计数，历史 checker 要保留已 ACK 写入。CI 现已跑全部非 opt-in 测试并装 toxiproxy、fuse3。
 
 ### F-COMPIO-UPGRADE — 升级运行时并分阶段验证 TCP 内核 CPU 降耗
 - **Trigger** (2026-09-14，用户要求记录升级计划): 当前 compio 0.18.0 /
