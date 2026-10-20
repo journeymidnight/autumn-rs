@@ -227,7 +227,7 @@ pub(crate) struct EtcdMirror {
 }
 
 /// Test-only failpoint: while armed with a key prefix, the first fenced txn
-/// that puts a key under it (taking the prefix) parks after taking its fence
+/// that puts or deletes a key under it (taking the prefix) parks after taking its fence
 /// revision and before it is sent (a request still in flight) until
 /// disarmed. Always compiled; production pays one relaxed load per attempt.
 #[doc(hidden)]
@@ -245,9 +245,12 @@ async fn fenced_txn_test_hold(success: &[autumn_etcd::proto::RequestOp]) {
     }
     {
         let mut prefix = FENCED_TXN_TEST_HOLD_PREFIX.lock().unwrap_or_else(|e| e.into_inner());
+        use autumn_etcd::proto::RequestOpInner as Op;
         let hit = !prefix.is_empty()
-            && success.iter().any(|op| {
-                matches!(&op.request, Some(autumn_etcd::proto::RequestOpInner::RequestPut(p)) if p.key.starts_with(prefix.as_bytes()))
+            && success.iter().any(|op| match &op.request {
+                Some(Op::RequestPut(p)) => p.key.starts_with(prefix.as_bytes()),
+                Some(Op::RequestDeleteRange(d)) => d.key.starts_with(prefix.as_bytes()),
+                _ => false,
             });
         if !hit {
             return;
@@ -1240,6 +1243,8 @@ pub struct AutumnManager {
     /// `crates/manager/src/inode_lease.rs` and
     /// `docs/fs_lease_design.md`.
     pub(crate) inode_leases: crate::inode_lease::SharedRegistry,
+    /// Orders the lease operations that write `inode_leases/<ino>`.
+    pub(crate) inode_lease_turns: crate::inode_lease::InodeTurns,
     /// the manager's Ed25519 signing keyring (KDC private
     /// material), loaded once from `--auth-signing-key-file`. `None` = authz
     /// disabled (opt-in; fuse/kvcache/dev unaffected). Set at startup only.
@@ -1382,6 +1387,7 @@ impl AutumnManager {
                     Duration::from_millis(params.inode_revoke_grace_ms.get()),
                 ),
             )),
+            inode_lease_turns: Default::default(),
             // authz OFF unless the binary loads a signing-key file.
             authz_keyring: Rc::new(RefCell::new(None)),
             principal_accounts: Rc::new(RefCell::new(HashMap::new())),

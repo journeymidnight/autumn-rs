@@ -1,6 +1,6 @@
 # autumn-rs feature list — OPEN backlog
 
-**Last updated:** 2026-10-20 (BUG-PUTSTREAM-OVERWRITE-NOT-ATOMIC fixed and removed; review N2–N7 open: four P1, two P2)
+**Last updated:** 2026-10-20 (BUG-LEASE-GRANT-STALE-TXN fixed and removed; review N3–N7 open: three P1, two P2)
 
 **Rules:**
 - This file tracks the **OPEN backlog only**. A feature that reaches `passes: true`
@@ -13,12 +13,6 @@
 ---
 
 ## Active
-
-### BUG-LEASE-GRANT-STALE-TXN — 同一任期内迟到的 AcquireLease 事务覆盖后来的 writer（P1）
-- **Trigger** (review.md N2，真实 etcd + 现有 `FENCED_TXN_TEST_HOLD_*` 暂停点复现): `handle_acquire_lease` 先在内存授予并捕获 record，再经 `put_msgs_txn` 持久化，事务只比 leader key。W 的第一次 acquire 停在 etcd put 前 → W 重试成功 → W release → X acquire 成功（etcd 为 X，版本 …777）→ 放行 W 的第一次事务：仍返回成功，etcd 写回 W、版本退到 …776。不需要换主或 force-preempt。后续换主会恢复错误持有者。`refresh_writer_record`（2bc0ae0d）只修了 heartbeat，没有覆盖 grant。
-- **Scope**: 先用附录 probe 复现。为同一 inode 的租约 grant/release/expiry 建立一致的条件提交：比较操作所属 writer/version/记录 revision，事务后内存提交或回滚同样核对身份；或只串行化同 inode 的生命周期操作（不能全局阻塞）。同一范围待验证：`handle_release_lease` 的 delete、`inode_lease_revoke_loop` 的批量 delete 缺 writer-record compare；`revert_writer_acquire` 同任期内可能恢复过时快照。
-- **Acceptance**: 原样跑上述时序，X 的持久记录与内存持有者始终一致，旧事务不能复活 W；再换主 X 仍有效；覆盖响应延迟、提交前延迟、失败回滚、release 与 revoke 交错。修前红、修后绿，消融变红。
-- `passes: false`
 
 ### BUG-FS-CREATE-NOT-CONDITIONAL — 同名 create/mkdir 先查后写，并发创建出两个 inode（P1）
 - **Trigger** (review.md N3，两个 `FsState` 并发复现): `dir::create` / `dir::mkdir`（`crates/fs/src/dir.rs`）在 `kv_exists` 看到名字不存在后各自分配 inode，再用无条件 `kv_put(dirent)` 互相覆盖；两次调用都返回成功（Ok(2)、Ok(1002)），落败的 inode 失去名字，写入仍成功但路径找不到。`kv_exists(...).await.unwrap_or(false)` 还把读失败当成不存在。入口：FUSE Create、Python create。

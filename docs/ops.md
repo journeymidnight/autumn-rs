@@ -5134,6 +5134,12 @@ Landed so far:
   and starts versions at 1 again.
   Check: `cargo test -p autumn-manager --features fuse-tests --test
   fuse_lease_restart` (needs `etcd` on `PATH`).
+- **Lease records written in order** — a write grant, a writer close and
+  the TTL sweep of one inode take turns, and an expired writer is not renewed
+  by its heartbeat, so a slow etcd write cannot land after a later one and
+  leave `inode_leases/<ino>` naming a holder the leader no longer has (a
+  failover would hand the inode to that record). Check: `cargo test -p
+  autumn-manager --test lease_grant_stale_txn` (needs `etcd` on `PATH`, ~40 s).
 - **Close-to-open coherence** — `OpenedExtents.lease_version` populated
   from the AcquireLease response; per-session `InvalidationMap`
   bumped by the poll loop. Read SQE arm calls `cache_is_stale`

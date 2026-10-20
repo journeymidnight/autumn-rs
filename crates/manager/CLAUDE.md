@@ -2364,6 +2364,15 @@ Invariants (enforced by code structure):
   the in-memory renewal, and a release or a force-preempt landing in between must stand.
   A CAS on the value read alone took a record replaced before the read as its baseline
   and wrote the old writer back (`heartbeat_refresh_never_overwrites_the_next_writers_record`).
+  Every grant of the writer slot (WRITE, REPLACE, EXCLUSIVE), a writer close and the
+  TTL sweep of one inode take turns (`InodeTurns`, per leader term and inode): a grant
+  changes memory before its etcd write, so without them a late grant or sweep delete
+  left etcd naming a holder memory did not have. The sweep re-plans under its turns; a
+  request whose wait spans a term change answers NOT_LEADER (the old term's txns cannot
+  commit, the new one may still be replaying). An expired writer's heartbeat answers
+  NotHeld rather than renewing it under the sweep. `tests/lease_grant_stale_txn.rs`
+  (failpoint `FENCED_TXN_TEST_HOLD_*`, which also holds deletes; each part ablated →
+  its test red).
 - **L4** `tick(now)` captures the reader set BEFORE evicting expired readers (order:
   writer revoke → reader expiry → drop-empty-inode → push invalidations) so a reader
   expiring on the writer's TTL boundary still gets the push.

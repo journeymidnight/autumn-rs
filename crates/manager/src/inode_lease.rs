@@ -820,6 +820,12 @@ impl LeaseRegistry {
         };
 
         if state.writer.as_ref() == Some(&me) {
+            // An expired lease is not renewed: the sweep may be deleting its
+            // record, and a renewal it cannot see would leave memory holding
+            // a writer etcd does not. The client reports it revoked.
+            if state.writer_expires_at.is_some_and(|d| d <= now) {
+                return HeartbeatOutcome::NotHeld;
+            }
             state.writer_expires_at = Some(now + ttl);
             return HeartbeatOutcome::Renewed {
                 version: state.version,
@@ -962,14 +968,10 @@ impl LeaseRegistry {
 
     /// BUG-LEASE-5 (P1 #5) — 2PC commit phase for writer revokes.
     /// Applies the in-memory mutation (clear writer / bump version /
-    /// queue invalidations) for each plan. **Re-validates** that
-    /// each plan's writer is still expired — a concurrent heartbeat
-    /// during the etcd-delete await may have refreshed the writer
-    /// (rare but possible if the loop's leader check + etcd RTT
-    /// overlap with a writer heartbeat). On race-skip: the etcd
-    /// record was unnecessarily deleted; the next heartbeat will
-    /// CAS-fail on read-not-found and the next AcquireLease
-    /// re-persists. Documented but accepted residual.
+    /// queue invalidations) for each plan, if its writer is still
+    /// expired. A WRITE grant of a planned inode waits for the sweep's
+    /// turn and an expired writer's heartbeat is refused, so the deadline
+    /// is not expected to move here; a writer whose deadline did is kept.
     ///
     /// Returns `(ino, new_version)` pairs that ACTUALLY committed
     /// (i.e. excludes race-skipped plans).
@@ -1190,11 +1192,66 @@ fn epoch_seconds_now() -> i64 {
 /// `Rc<RefCell<LeaseRegistry>>`.
 pub type SharedRegistry = Rc<RefCell<LeaseRegistry>>;
 
+/// One turn at a time per inode for the lease operations that write its
+/// record: a grant changes memory before its etcd write, so two of them in
+/// flight on one inode could commit in the other order and leave etcd
+/// naming a holder memory no longer has. Other inodes never wait. Turns
+/// belong to a leader term: a txn of an earlier term cannot commit in a
+/// later one, so a later term does not wait for it.
+#[derive(Clone, Default)]
+pub struct InodeTurns(Rc<RefCell<HashMap<(i64, u64), std::sync::Arc<futures::lock::Mutex<()>>>>>);
+
+pub struct InodeTurn {
+    turns: InodeTurns,
+    key: (i64, u64),
+    guard: Option<futures::lock::OwnedMutexGuard<()>>,
+}
+
+impl InodeTurns {
+    pub async fn take(&self, term: i64, ino: u64) -> InodeTurn {
+        let key = (term, ino);
+        let lock = self.0.borrow_mut().entry(key).or_default().clone();
+        let guard = lock.lock_owned().await;
+        InodeTurn { turns: self.clone(), key, guard: Some(guard) }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.0.borrow().len()
+    }
+}
+
+impl Drop for InodeTurn {
+    fn drop(&mut self) {
+        drop(self.guard.take());
+        // A waiter holds its own clone of the lock, so a count of one is
+        // the map's: nobody is waiting.
+        let mut map = self.turns.0.borrow_mut();
+        if map.get(&self.key).is_some_and(|l| std::sync::Arc::strong_count(l) == 1) {
+            map.remove(&self.key);
+        }
+    }
+}
+
 // ───────────────────── manager background loop ─────────────────────
 
 use crate::AutumnManager;
 
 impl AutumnManager {
+    /// The leader term inode-lease turns are taken in (0 without etcd).
+    fn lease_term(&self) -> i64 {
+        self.etcd.as_ref().map_or(0, |e| e.term())
+    }
+
+    /// This inode's turn in the current term; `None` if the term changed
+    /// while waiting — the request was admitted by a term that is over, and
+    /// the next one may still be replaying.
+    pub(crate) async fn take_inode_turn(&self, ino: u64) -> Option<InodeTurn> {
+        let term = self.lease_term();
+        let turn = self.inode_lease_turns.take(term, ino).await;
+        (self.lease_term() == term).then_some(turn)
+    }
+
     /// Per-second sweep of writer-TTL deadlines.
     /// Revoked writers etcd-delete the persisted record under
     /// `inode_leases/<ino>`; reader-side invalidations were already
@@ -1216,6 +1273,27 @@ impl AutumnManager {
             let plans = {
                 let reg = self.inode_leases.borrow();
                 reg.tick_plan(now)
+            };
+
+            // A grant or release in flight on a planned inode goes first;
+            // the plan is then made again under the turns.
+            let mut turns = Vec::new();
+            let plans = if plans.is_empty() {
+                plans
+            } else {
+                let mut inos: Vec<u64> = plans.iter().map(|p| p.ino).collect();
+                inos.sort_unstable();
+                let term = self.lease_term();
+                for &ino in &inos {
+                    turns.push(self.inode_lease_turns.take(term, ino).await);
+                }
+                if self.lease_term() != term {
+                    continue;
+                }
+                let reg = self.inode_leases.borrow();
+                let mut plans = reg.tick_plan(now);
+                plans.retain(|p| inos.binary_search(&p.ino).is_ok());
+                plans
             };
 
             if plans.is_empty() {
@@ -1282,6 +1360,30 @@ mod tests {
             uuid: [n; 16],
             host: host.to_string(),
         }
+    }
+
+    /// An inode's entry lives only while someone holds or waits for its
+    /// turn, and a waiter gets it once the holder is done.
+    #[test]
+    fn inode_turns_order_one_inode_and_forget_it_after() {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let turns = InodeTurns::default();
+            let first = turns.take(1, 7).await;
+            let other = turns.take(1, 8).await;
+            // A later term does not wait for an earlier one.
+            drop(turns.take(2, 7).await);
+            let waiter = compio::runtime::spawn({
+                let turns = turns.clone();
+                async move { drop(turns.take(1, 7).await) }
+            });
+            compio::time::sleep(Duration::from_millis(20)).await;
+            assert!(!waiter.is_finished(), "a second turn on one inode was granted at once");
+            drop(first);
+            waiter.await.unwrap();
+            assert_eq!(turns.len(), 1);
+            drop(other);
+            assert_eq!(turns.len(), 0);
+        });
     }
 
     fn reg() -> LeaseRegistry {
@@ -2182,15 +2284,10 @@ mod tests {
     }
 
     #[test]
-    fn bug_lease_5_tick_commit_skips_writer_who_heartbeated_during_etcd_await() {
-        // Race-skip path: between tick_plan and tick_commit_revokes,
-        // the writer's deadline was refreshed by a heartbeat. The
-        // commit phase MUST NOT revoke (the writer is no longer
-        // expired); the corresponding etcd record would have been
-        // unnecessarily deleted, and the next heartbeat's CAS-fail
-        // pattern recovers eventually (heartbeat re-persists are
-        // currently disabled — see comments — but the in-memory
-        // state stays consistent).
+    fn an_expired_writer_s_heartbeat_does_not_renew_it() {
+        // The sweep has planned the expired writer and is deleting its
+        // record; a heartbeat now must not renew the writer in memory, or
+        // memory keeps a writer whose record the delete removes.
         let mut r = LeaseRegistry::with_ttl(Duration::from_millis(100));
         let t0 = Instant::now();
         let w = cid(1, 1, "writer");
@@ -2199,21 +2296,9 @@ mod tests {
         let t_past = t0 + Duration::from_millis(200);
         let plans = r.tick_plan(t_past);
         assert_eq!(plans.len(), 1);
-
-        // Simulate: while etcd-delete was in flight, the writer
-        // heartbeated and refreshed the deadline.
-        let _ = r.heartbeat(&w, 3, t_past);
-        // Now the writer's deadline > t_past, so commit must skip.
-
-        let committed = r.tick_commit_revokes(&plans, t_past);
-        assert!(
-            committed.is_empty(),
-            "BUG-LEASE-5 race-skip: refreshed writer MUST NOT be revoked on commit; got {committed:?}"
-        );
-        // The writer slot is still set + version untouched.
-        let entry = r.inodes.get(&3).unwrap();
-        assert!(entry.writer.is_some());
-        assert_eq!(entry.version, 1);
+        assert!(matches!(r.heartbeat(&w, 3, t_past), HeartbeatOutcome::NotHeld));
+        assert_eq!(r.tick_commit_revokes(&plans, t_past).len(), 1);
+        assert!(r.inodes.get(&3).is_none_or(|e| e.writer.is_none()));
     }
 
     #[test]

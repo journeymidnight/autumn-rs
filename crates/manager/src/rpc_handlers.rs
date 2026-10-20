@@ -7344,6 +7344,24 @@ impl AutumnManager {
             }));
         }
 
+        // A WRITE grant writes its record after changing memory: it holds
+        // the inode's turn until the write settles, so no other grant or
+        // release of the inode commits around it (`InodeTurns`). REPLACE and
+        // EXCLUSIVE share the writer slot and take it too: re-acquired by its
+        // holder, either moves the slot's deadline under the sweep.
+        let writer_slot = matches!(req.mode, LEASE_MODE_WRITE | LEASE_MODE_REPLACE | LEASE_MODE_EXCLUSIVE);
+        let _turn = if writer_slot && self.etcd.is_some() {
+            let Some(turn) = self.take_inode_turn(req.ino).await else {
+                return Ok(rkyv_encode(&AcquireLeaseResp {
+                    code: CODE_NOT_LEADER,
+                    message: "leader term changed".to_string(),
+                    lease: None,
+                }));
+            };
+            Some(turn)
+        } else {
+            None
+        };
         let now = Instant::now();
         // coco P1 #6 + BUG-LEASE-4 (P1 #4): snapshot
         // the pre-acquire InodeLeaseState BEFORE mutating so an
@@ -7527,10 +7545,26 @@ impl AutumnManager {
         // reload again. The reordered shape: preview the release →
         // delete etcd if it's a writer-close → only then commit the
         // memory mutate.
-        let preview = self
+        let mut preview = self
             .inode_leases
             .borrow()
             .preview_release(&req.client, req.ino);
+        // A writer close deletes the record: it waits for a grant of the
+        // inode still writing it, then looks again.
+        let _turn = match preview {
+            crate::inode_lease::ReleaseOutcome::WriterClosed { .. } if self.etcd.is_some() => {
+                let Some(turn) = self.take_inode_turn(req.ino).await else {
+                    return Ok(rkyv_encode(&ReleaseLeaseResp {
+                        code: CODE_NOT_LEADER,
+                        message: "leader term changed".to_string(),
+                        new_version: None,
+                    }));
+                };
+                preview = self.inode_leases.borrow().preview_release(&req.client, req.ino);
+                Some(turn)
+            }
+            _ => None,
+        };
 
         if let crate::inode_lease::ReleaseOutcome::WriterClosed { .. } = preview {
             let key = format!("{}{}", crate::INODE_LEASES_PREFIX, req.ino);
