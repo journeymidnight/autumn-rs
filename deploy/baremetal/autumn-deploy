@@ -766,7 +766,13 @@ _provision_credential() {
     for spec in "fs fs/" "kvc kvc/"; do
         read -r p grant <<< "$spec"
         cred="$AUTHZ_LOCAL_DIR/$p.cred"
-        hex="$(awk '/^credential:/{print $2}' "$cred" 2>/dev/null)"
+        # `|| true` is load-bearing: on a first-ever start $cred does not exist
+        # yet, awk exits 2, and a bare assignment adopts that status, so
+        # `set -e` killed the whole start right here — after _bootstrap and
+        # before _start_ps, silently, leaving a cluster with 0 PS. (2>/dev/null
+        # hides awk's message, not its exit status.) An empty hex is the normal
+        # first-run case and the principal-create path below handles it.
+        hex="$(awk '/^credential:/{print $2}' "$cred" 2>/dev/null || true)"
         if [[ -n "$hex" ]] && "${ao[@]}" mint-token --principal "$p" \
                 --credential "$hex" >/dev/null 2>&1; then
             log "authz: $p credential valid on this cluster → $cred"

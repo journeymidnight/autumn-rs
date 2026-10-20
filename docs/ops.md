@@ -286,7 +286,14 @@ cd deploy/baremetal
 ./autumn-deploy -t topology-singlehost.conf start
 ../../target/release/autumn-op --cluster-secret-file ~/.autumn-deploy/cluster.secret \
     --manager 127.0.0.1:9001 info                                # 3 nodes, 1 partition
-AC="../../target/release/autumn-client --manager 127.0.0.1:9001"
+# KV commands need BOTH a --namespace (every write declares its scope) and a
+# credential (the data plane rejects a connection with no capability token:
+# "permission denied: key requires a capability token"). `start` mints the
+# per-family credentials; the principal travels inside the file, so there is no
+# --principal flag. $HOME, not ~: a tilde does not expand inside double quotes
+# and is not re-expanded out of $AC, so the client would get a literal path.
+AC="../../target/release/autumn-client --manager 127.0.0.1:9001 --namespace kvc \
+    --credential-file $HOME/.autumn-deploy/authz/kvc.cred"
 echo hello | $AC put mykey /dev/stdin && $AC get mykey            # → hello
 ./autumn-deploy -t topology-singlehost.conf stop
 ./autumn-deploy -t topology-singlehost.conf start                # must SKIP bootstrap
