@@ -1,267 +1,453 @@
-# GC / Compact / Recovery / Fence / Remove 代码审查
+# autumn-rs 全仓代码审查
 
-- 审查日期：2026-09-19。
-- 基线：main，commit c6a4a8239dbfa39a05667194d907897d2ea2a3fb；开始时工作区干净。
-- “Remoe” 按 Remove 理解，覆盖节点退役及 extent 物理删除。
-- 本次交付为审查报告，不修改产品实现。范围是当前代码的正确性与测试有效性，不是单个 commit 的 diff review。
+审查日期：2026-10-19 至 2026-10-20（America/Los_Angeles）。基线：`346dc802729a348b8e10d463b38c5f662d2b96a5`，分支 `main`。
 
-**结论：现有保护和回归测试已经覆盖不少历史故障，但不能据此认定极端情况已覆盖。当前仍有 GC 提前 EOF 后误 punch、Recovery 跨 attempt 接受旧完成、takeover fence 失败后继续服务、Remove 漏查 Recovery 目标等高风险缺口。主 chaos 还有确定性的空验证：写入存活探测遗漏 namespace，全部跳过；“物理回收”只检查 etcd metadata 消失。**
+**结论：发现 7 项当前实现问题，其中 5 项 P1、2 项 P2。全部取得了运行证据，但证据强度不同：3 项通过正常公开 API 复现，1 项用现有事务暂停点复现，1 项重建崩溃边界的持久状态后调用真实恢复逻辑，1 项设置 standby 状态后验证真实 RPC 响应，1 项直接验证解码器分配行为。应优先修复流式覆盖、租约旧事务和文件命名/恢复问题。**
 
-以下区分三种证据：**运行确认**指实际执行了公开 API、原始测试或源码函数；**代码确认**指调用链和分支可直接证实，但未跑完整故障时序；**待验证**指仍有额外前提，不能作为已复现的数据损失结论。
+已有 9 月报告中的 GC 完整扫描、Recovery nonce/CAS、takeover fence 和 Remove 保护已经补齐，不能继续将旧 R1–R7 作为本基线的未修复缺陷。本报告替代旧的当前结论；旧报告全文可用 `git show 346dc802:review.md` 查看。旧编号对照保留在第 5 节。
 
-## 1. 优先修复的问题
+本次交付是审查报告，未修复产品实现。审查通过 CLI 完成，测试只启动本地临时集群和 etcd，没有操作线上集群。
 
-### R1 — [P1] GC 接受提前 EOF，未读满 sealed length 也会 punch
+## 1. 问题总表
 
-**位置：** [background.rs:3394](crates/partition-server/src/background.rs#L3394)、[background.rs:3447](crates/partition-server/src/background.rs#L3447)、[background.rs:3486](crates/partition-server/src/background.rs#L3486)；读侧 [extent_node.rs:2665](crates/stream/src/extent_node.rs#L2665)、[client.rs:5032](crates/stream/src/client.rs#L5032)。
+P1：数据完整性、持久状态正确性或正常操作造成命名空间丢失，优先修复。P2：条件触发的可用性/资源风险或控制面契约错误。严重性不等于“已发生线上事故”。
 
-run_gc 已有 CRC 错误即终止、尾部不完整 record 即拒绝 punch 的保护，但没有检查扫描总长度：
+| 编号 | 等级 | 问题 | 本轮证据 | 状态 |
+|---|---|---|---|---|
+| N1 | P1 | SDK 流式覆盖复用旧 chunk key，未 commit 即改变旧值，abort 删除旧值 | 两个客户端、真实 PS/EN，公开 API 复现 | 当前缺陷 |
+| N2 | P1 | 同一 leader 任期内，迟到的 AcquireLease 事务覆盖后续 writer | 真实 etcd，既有暂停点，直接调用真实 handler | 当前缺陷 |
+| N3 | P1 | create/mkdir 先检查后无条件写，同名并发创建出不同 inode | 两个 FsState 并发 create，均成功且 inode 不同 | 当前缺陷 |
+| N4 | P1 | rename 不检查目标目录非空，成功移除整个目标子树的入口 | 真实目录和文件，经共享 FS API 复现 | 当前缺陷 |
+| N5 | P1 | Retire 恢复重复递减 nlink，删除仍被另一个硬链接引用的 inode | 重建精确崩溃边界状态，执行真实恢复 | 文档已有记录，本轮坐实 |
+| N6 | P2 | CheckCommitLength 没有 leader gate，standby 返回成功元数据 | 同一实例普通查询拒绝、该查询成功 | 从 backlog 推断升级为行为确认 |
+| N7 | P2 | RPC 仅收到 10 字节头即按声明长度预留内存，实际上限约 4 GiB | 64 MiB 长度头使容量达到 67,108,874 字节 | 分配行为已确认，未制造 OOM |
 
-1. 请求扫描权威 sealed_length=L 的 extent。
-2. 普通 MSG_READ_BYTES 按 EN 本地文件长度截取；短副本可以返回 CODE_OK 和空 payload。read_replicated_with_failover 对 Ok 直接返回，不继续尝试好副本。
-3. run_gc 看到 chunk.is_empty() 就 break；如果停在 record 边界或 offset=0，carry 为空，后面的校验也通过。
-4. flush_gc_batch 后直接 punch_holes，扫描遗漏的 live VP 没有搬迁。最后一个 stream 引用被移除时，好副本也会被删除。
+## 2. 详细发现
 
-**影响：** 单副本截短原本可以由其他副本恢复，却可能经 GC 变成不可恢复的数据损失。refs/VP identity/replay floor 均不能替代“完整扫描”的证明。
+### N1 — [P1] 流式覆盖在 commit 前修改旧版本，abort 破坏已提交数据
 
-**验证：** 已用真实 EN 的 append → test_seal_durable → 截短 .dat → 新 EN 加载同目录 → RPC read 验证前提：请求 8192 字节，返回 code=0、bytes=0、end=0；测试保留了真实 seal 生成的 checksum sidecar。空读不覆盖完整 checksum block，不会被内容校验挡住。尚未运行完整 PS GC → 物理删除 → GET 丢失的集成复现。
+**位置：** [client send](crates/client/src/lib.rs#L6607)、[chunk key](crates/client/src/lib.rs#L5911)、[abort](crates/client/src/lib.rs#L6671)、[put_stream_begin](crates/client/src/lib.rs#L5521)。
 
-**建议：** 对 sealed extent 的每个 GC read 要求返回量等于本次 want，提前 EOF/短读必须换副本或中止；punch 前再要求 cur==sealed_length 且 carry 为空。复用 PS WAL replay 已有的 committed window/short-read 判断思路（[lib.rs:9056](crates/partition-server/src/lib.rs#L9056)）。
+`make_chunk_key` 只包含 user key 和 chunk index，没有 upload/generation 身份。第二次对同一 key 开始流式写时，`send` 直接覆盖第一次已发布的 chunk。旧 manifest 仍指向这些位置，因此 manifest 的最终 put 不能构成整值原子发布。`abort` 随后删除的也是同一组 key。
 
-**应补测试：** extent 含 live VP，截短一个副本到 0 及完整 record 边界；固定读路由命中短副本；ForceGC 后断言完整搬迁或拒绝 punch，再杀 PS、重开并逐字节验证。故障要在已有 checksum 和没有 checksum 两种状态各测一次。
+**运行结果：**
 
-**状态（2026-10-05）：已修并有端到端验收。** run_gc 每个 chunk 要求读满 want、punch 前要求 scanned==sealed_length 且无尾部残片（`ensure_gc_scan_complete`）。`crates/manager/tests/system_gc_truncated_replica.rs`：两副本都截短（空 / record 边界 / record 中间）× 有无 `.ck`，重启 EN 使其按截短文件应答短 OK，强制 GC 必须拒绝、E0 留在 log stream；还原文件后 GC 完整搬迁并 punch，逐字节验证，再 SIGKILL PS 重开后复验。消融（短读 break + 去掉完整性检查）5 例全红于“GC punched E0 from a truncated replica”。注意：存活的 EN 对截短的 `.dat` 返回内部错误而非短 OK（内存长度更长），所以只截文件不重启复现不了本条。
+1. 对 `review-stream` 发送 `AAAA` 并成功 commit。
+2. 再次 begin，发送 `BBBB`，尚未 commit。
+3. 另一个客户端 `get_stream().next_chunk()` 已返回 `BBBB`。
+4. 第二次上传 abort 后，旧 manifest 仍存在，读取报 `striped chunk 0 missing`。
 
-### R2 — [P1] Recovery 的“attempt identity”实际只比较节点组合，存在 ABA
+全程没有故障注入、并发调度要求或进程崩溃；顺序操作就能复现。多 chunk 的覆盖还可能暴露新旧混合内容。影响的是 `ClusterClient::put_stream_begin`/`get_stream` 和使用它们的入口；S3 的 `autumn_fs::multipart` 是另一套实现，本项不套用到它。
 
-**位置：** [recovery.rs:200](crates/manager/src/recovery.rs#L200)、[recovery.rs:892](crates/manager/src/recovery.rs#L892)、[extent_rpc.rs:839](crates/rpc/src/extent_rpc.rs#L839)、[extent_node.rs:9130](crates/stream/src/extent_node.rs#L9130)。
+**建议：** 每次上传使用独立 generation/object ID，chunk key 与 manifest 同时携带该身份；新 manifest 发布之前不触碰旧 generation；abort 只清理本次上传。旧 generation 回收还需考虑已开始的 reader，不能在换 manifest 后立即删除其仍在读的内容。
 
-classify_recovery_completion 的 Apply 条件仅为 live marker 的 (node_id, replace_id) 与 done 相同。RecoveryTask.start_time 未参与比较；done 没有 nonce、复制时的 eversion 或 payload layout。相比之下，EC 完成会校验 coordinator、eversion 和 attempt_nonce。
+**回归验收：** 在旧值已提交时开始覆盖，逐 chunk 暂停，另一个 reader 始终读到完整旧值；abort 后旧值仍完整；commit 后新 reader 读到完整新值；两个 uploader 交错不能混合 chunk。既有 `system_putstream` 的新 key roundtrip/abort 场景不覆盖本例。
 
-可达的危险交错是：旧任务 A 从复制布局重建；其 marker 因 executor Suspected 或 source unfence 被释放；extent 转 EC；再次为同一 replace_id 派到同一目标形成任务 B；A 的完成消息晚到。只要目标当前不是其他 slot 的成员，节点组合与 duplicate-node guard 都通过，旧的完整 .dat 可以被当成当前布局要求的 shard。
+### N2 — [P1] AcquireLease 只有 leader fence，没有 inode 版本 CAS
 
-EN 侧已经在跑某个 extent 的恢复时也仅凭 extent_id 返回“already running”，没有证明正在执行的任务等于本次 assignment/attempt；这进一步弱化了重派发的身份契约。
+**位置：** [handle_acquire_lease](crates/manager/src/rpc_handlers.rs#L7386)、[无条件 put helper](crates/manager/src/lib.rs#L593)、[fenced_txn](crates/manager/src/lib.rs#L398)。
 
-**验证：** 从当前源码原样提取 classify_recovery_completion 并用 rustc 运行，相同节点组合的旧完成对新 marker 返回 Apply。完整“释放 → EC → 同目标重派 → 旧 done”时序未运行；数据损失后果属于代码推导。
+handler 在内存中先获得 writer 并捕获 record，再通过 `put_msgs_txn` 持久化。事务只检查 leader key；同一任期内其他请求对该 inode 的更新不会让旧事务失效。事务返回成功后，handler 也不重新检查 inode 的 writer/version。
 
-**建议：** 将现有 inflight 创建 revision/nonce 贯穿 RequireRecoveryReq、EN 去重、RecoveryTaskDone 和 apply。marker 同时固定源 eversion、slot 和 payload location；应用时比较这些条件。仅比较秒级 start_time 不足以解决同秒重派和进程重启的 ABA。
+**使用真实 etcd 和现有 `FENCED_TXN_TEST_HOLD_*` 暂停点复现的时序：**
 
-**应补测试：** A、B 保持相同 extent/target/replace，nonce 不同；延迟 A 的 done 到 B 已创建后，断言 A 被拒、B marker 保留。再加入复制→EC 及相同目标重启两种布局/生命周期变化。
+1. W 的第一次 acquire 已更新内存，在发送 etcd put 前暂停。
+2. W 重试 acquire，成功持久化并收到成功响应。
+3. W release 成功。
+4. X acquire 成功，etcd 中 writer 为 X，版本 `1099511627777`。
+5. 恢复 W 的第一次事务：仍返回成功，etcd 被写回 W，版本降为 `1099511627776`。
 
-### R3 — [P1] takeover fence 全部失败后仍继续打开分区
+本例不需要换主、force-preempt 或直接修改 etcd 记录。暂停点只控制真实事务的发送顺序。已确认的是持久记录被旧请求覆盖；本轮没有继续运行“换主重放 → 文件数据损失”的端到端链路。根据 replay 安装持久 writer 的路径，后续换主会恢复错误持有者，现有 PS fence 可能表现为旧 writer 被拒写，而不能据此说这个持久记录错误无害。
 
-**位置：** [lib.rs:6036](crates/partition-server/src/lib.rs#L6036)、[lib.rs:6088](crates/partition-server/src/lib.rs#L6088)、[client.rs:4253](crates/stream/src/client.rs#L4253)。
+**建议：** 对每个 inode 的 lease grant/release/expiry 引入一致的条件提交协议：比较操作所属 writer/version/记录 revision；事务后内存提交或回滚同样验证身份。也可以选择只串行化同 inode 的生命周期操作，但不应全局阻塞所有 inode。仅加 leader 任期检查不能解决本例。
 
-fence_tail 在没有任何副本确认 fence 时正确返回 Err，但调用方重试三次后只 warn，接着 recover_partition 并进入正常服务。没有一个持久化 fence 成功时，“all-replica ACK 至少碰到一个已 fenced 副本”的安全论证不成立。
+**相邻未独立复现的窗口：** `handle_release_lease` 的 delete、`inode_lease_revoke_loop` 的批量 delete 也缺少 writer-record compare；`revert_writer_acquire` 在同任期内仍可能恢复已过时的快照。它们属于同一修复范围的待验证分支，不另计已复现问题。近期 `refresh_writer_record` 修复仅保护 heartbeat，未覆盖 grant。
 
-**触发：** 新 PS 获取 epoch；旧 PS 暂停；故障只挡住 takeover 的 FENCE_EXTENT 请求，或者恰好在整个 fence 重试窗口断开并在 replay 前恢复。新 PS 完成 replay 后，旧 PS 恢复并用旧 epoch 向未被 fenced 的 EN 写入。在旧 PS 自我驱逐前，写可能获 ACK，但新 PS 已越过 replay 窗口。
+**回归验收：** 原样运行上述时序，X 的 durable record 与内存 holder 始终一致；旧事务不得成功复活 W；再换主确认 X 仍有效。同时覆盖响应延迟、提交前延迟、失败回滚、release 与 revoke 的交错。
 
-**证据：** 失败后继续 open 的代码已确认；未运行 selective-fence-drop 的端到端复现。现有 system_sigstop_zombie_writer 测了正常 eager fence，但不能证明“fence 失败”分支安全。
+### N3 — [P1] 同名 create/mkdir 缺少条件发布
 
-**建议：** 没有取得必要的持久化 fence 证明时，保持分区不可服务并重试打开。错误码与监控应明确表示 takeover 尚未完成。对于已封存 tail 等可安全豁免的情况，单独给出可验证条件。
+**位置：** [create](crates/fs/src/dir.rs#L298)、[mkdir](crates/fs/src/dir.rs#L252)；入口：[FUSE Create](crates/fuse/src/dispatch.rs#L569)、[Python create](python/src/fs.rs#L356)。
 
-**应补测试：** 只丢弃新 PS 的 FENCE_EXTENT，允许 commit probe、replay read 和旧 PS append；新 PS 不得宣布打开成功。恢复网络后再验证它能完成 takeover，旧 epoch 始终不能得到新的成功写 ACK。
+两个客户端均可在 `kv_exists` 时看到名字不存在，分别分配 inode，再用无条件 `kv_put(dirent)` 互相覆盖。新 inode 的文件租约无法保护此竞争，因为竞争发生在父目录的同一个名字上，而两次创建的 inode 不同。此外，`kv_exists(...).await.unwrap_or(false)` 把检查失败当作不存在，遇到读失败也可能覆盖既有名字。
 
-### R4 — [P1] Remove 漏查 Recovery 目标；晚到完成可重新引用已删除节点
+**运行结果：** 两个独立 `FsState` 用 `futures::join!` 对同一 parent/name 执行 `dir::create`，分别返回 `Ok(2)` 与 `Ok(1002)`；两者都以为创建成功，目录只能保留最后一个 inode。后续对失去名字的 inode 写入可以成功，但无法通过预期路径找到。复现覆盖 create；mkdir 的相同先读后写模式由代码确认。
 
-**位置：** [rpc_handlers.rs:6487](crates/manager/src/rpc_handlers.rs#L6487)、[rpc_handlers.rs:6511](crates/manager/src/rpc_handlers.rs#L6511)、[recovery.rs:251](crates/manager/src/recovery.rs#L251)、[recovery.rs:465](crates/manager/src/recovery.rs#L465)、[recovery.rs:1159](crates/manager/src/recovery.rs#L1159)。
+**建议：** 用 create-only CAS 发布 dirent，并对结果未知的情况 read-back 判定；拒绝把存储错误转换成不存在。竞争失败的 inode 需要可靠清理，父目录 nlink/mtime 更新也需避免丢失更新。`publish::ensure_dirs` 已有条件创建，可作为局部参考，但不等于解决父目录全部一致性问题。
 
-Remove 的 blocker 只有当前 extent 成员及 ConvertToEc.target_nodes。Recovery 目标在 apply 前本来就不是 extent 成员，所以不会被这两项捕获。
+**回归验收：** 多会话竞争同名 create/mkdir 只能有一个新 inode 发布成功；其他调用按 API 语义返回存在冲突或复用同一 inode；注入 existence-read 错误不得覆盖已有目录项；同时检查落败 inode/数据是否泄漏。
 
-同时，release_recovery_markers_for_dead_executors 只看节点不存在/Suspected，没有看 Fenced；redispatch_pinned_recovery 只看 Online。因此，一个仍正常响应 df 的恢复目标被 Fence 后，已有任务仍保留并可以继续报告完成。
+### N4 — [P1] rename 覆盖非空目录时不拒绝
 
-**运行确认：** 构造 extent 42、Recovery(source→target)，Fence target 后调用真实 handle_remove_node：返回 CODE_OK，blocker 两个列表均为空，target 已从节点表删除；随后 acquire 相同 extent 的 marker 仍返回“already has an in-flight op”。证明 Remove 成功时确实留下了指向已移除节点的 Recovery marker。
+**位置：** [rename 目标检查及替换](crates/fs/src/dir.rs#L465)。
 
-**后果边界：** 如果 node_health_loop 已缓存该节点/df，而 done 在 Remove 后、下一次 executor-release 前应用，apply_recovery_done 没有重新校验 target 仍注册、未 decommissioned、磁盘仍属于它，会把 slot 写向已删除节点。这个最终交错未运行；若下一 tick 先清掉 marker，完成会被拒，不是每次 Remove 都会损坏布局。
+目标检查只处理“与源为同一个 inode”和“目标是非目录时需回收”。目标是目录时，没有检查其是否为空，也没有完整校验源/目标类型。之后仍删除源名并无条件覆盖目标名。
 
-**建议：** Remove 检查所有会新增成员的 marker，至少 Recovery.node_id；Fence 对已有目标任务明确取消或排空语义；apply 在同一个提交条件里检查目标身份和节点状态。单靠预先扫描不能解决 Remove 与新 dispatch/apply 的并发窗口，应使用共享串行化或 etcd compare。
+**运行结果：** 创建 `/srcdir`、`/dstdir/precious` 后，`rename(srcdir, dstdir)` 返回 `Ok(())`。`dstdir` 此后指向源 inode 3，原目标 inode 4 及 `precious` 失去从根目录到达的路径。这是命名空间内容丢失；本轮未声称这些旧 inode 的物理字节已被删除。
 
-**应补测试：** Recovery 进行中 Fence 并 Remove 其目标；让 Remove、已接收 df、done apply 以两种顺序执行。断言拒绝 Remove 或原子结束任务，任何时候 extent 不得引用已 tombstone 的 node/disk。
+此问题在无并发、无故障时即可发生，独立于 crate 文档承认的“rename 非原子”限制。文件/目录类型不匹配的覆盖也应同步检查；本轮运行复现的是非空目录覆盖。
 
-### R5 — [P1] Recovery apply 的事务只做 leader fence，没有锁定所校验的 marker/extent 版本
+**建议：** 修改任何 key 前完成目标类型、目录非空等语义检查，并让检查结果在实际提交时仍有效。跨客户端情况下，单纯增加一次 `is_empty` 查询仍有 TOCTOU，需要目录级协调或版本条件。
 
-**位置：** [recovery.rs:1247](crates/manager/src/recovery.rs#L1247)、[lib.rs:376](crates/manager/src/lib.rs#L376)、[extent_inflight.rs:210](crates/manager/src/extent_inflight.rs#L210)。
+**回归验收：** 非空目录目标、文件覆盖目录、目录覆盖文件均拒绝且源/目标数据不变；空目录合法替换正确维护父目录引用；同 inode rename 仍保持 no-op。
 
-apply_recovery_done 在内存中检查 marker、克隆 extent，然后执行 put_and_delete_txn。该 helper 的额外 compare 为空，仅验证 leader 身份；事务无条件覆盖 extents/<id>、删除 extent_inflight/<id>，await 返回后也无条件安装内存副本并释放 marker。
+### N5 — [P1，已知未修] Retire 恢复重复减 nlink
 
-**危险窗口：** 同一个 leader 上，apply 在发送事务前被延迟；recovery_dispatch 先释放旧 marker，并取得另一个 assignment 或 EC marker；旧 apply 随后提交，就能删除后继 marker。leader fence 在这个场景始终通过。即使旧事务已提交、只是响应延迟，之后的无条件内存安装/释放也需要验证所持 attempt 没有变更。
+**位置：** [retire](crates/fs/src/publish.rs#L433)、[drop_name_of](crates/fs/src/publish.rs#L506)、[恢复 Retire](crates/fs/src/publish.rs#L712)。已有说明：[FS 已知限制](crates/fs/CLAUDE.md#L605)。
 
-**证据：** 缺少 compare 和 after-await identity 检查已由代码确认；本轮未完成真实 etcd 响应重排复现。此项与 R2 独立：R2 是处理前误认旧 done，R5 是校验通过以后被异步窗口改变状态。
+正常 retire 先递减旧 inode 的 nlink，之后才删除 pending record。若在两步之间崩溃，或 pending delete 失败后会话结束，恢复看到目录项指向 successor，又调用 `drop_name_of`，把同一次名字移除重复计算。
 
-**建议：** 在同一 etcd 事务比较 marker 的创建 revision/nonce 和 extent 的 baseline，成功后按相同 nonce 安装内存状态。可参考 abandon_ec_marker 已有的 record compare + after-await nonce 检查，而不是增加无条件重试。
+**运行验证方式及边界：**
 
-**应补测试：** 用 barrier 卡住 apply 的 etcd 请求/响应，释放 A 并创建 B，再恢复 A；B 的 marker 和 extent 状态必须保持。现有 apply_done_atomicity 测的是 EC 成功/leader 被罢免后的原子性，没有覆盖同 leader 的这一窗口。
+- 用真实 publish 和 hardlink API 创建 old inode 的 `object`、`alias` 两个名字。
+- publish 新版本到 `object` 后，读取持久旧 inode，确认 nlink 已从 2 变为 1。
+- 放回那条本应在崩溃窗口内仍存在的 `PendingOp::Retire`，释放 session lease；这只重建“已减引用、未删 pending”的状态，没有伪造 nlink 或删除 inode。
+- 另一个 `FsState` 执行真实 `recover_dead_sessions`：`recovered=1`，`alias_exists=true`，`inode_exists=false`。
 
-### R6 — [P2] 非 force 的 Fence 检查没有证明存在可用恢复目标
+本轮是崩溃边界状态复现，没有实际在机器断电/SIGKILL 窗口里抓取状态。结果证明恢复逻辑对该真实可达状态不幂等。现有 `a_retire_whose_swap_lost_leaves_a_linked_inode_alone` 检查的是 swap 未获胜，不是 swap 获胜且引用已减的情况。
 
-**位置：** [rpc_handlers.rs:6441](crates/manager/src/rpc_handlers.rs#L6441)、[recovery.rs:550](crates/manager/src/recovery.rs#L550)。
+**建议：** 将 retire operation ID/应用标记与 inode 引用变更放到同一个条件更新里，让 replay 能判断该次递减是否已应用。仅根据当前 dirent 是否等于 successor 不能判断引用是否已经减过；简单调整两次写的顺序也会产生相反的泄漏窗口。
 
-check_capacity_for_fence 累加了 data_to_migrate，却只检查“其他节点有 online disk”。它不排除该 extent 的现有成员，不检查其他节点是否 Fenced/Maintenance/Suspected，也不比较所需空间与 free bytes。函数注释所说的默认 1.2 倍空间检查并未实现。
+**回归验收：** 在递减前、递减后、pending 删除前后分别恢复，重复恢复任意次数，`alias` 仍可逐字节读到旧版本；单链接的旧 inode 最终可回收。
 
-**运行确认：** RF2 extent 已占用仅有的两个节点，调用 force=false Fence 一个成员仍返回 CODE_OK；Recovery 的目标选择排除全部现有成员，实际无 spare，无法完成退役。system_recovery_loop_drives 的 no-spare 测试也明确说明这种恢复不会前进。
+### N6 — [P2] standby 可以成功回答 CheckCommitLength
 
-**建议：** 至少按相同 placement/occupied 条件验证每个受影响 extent 有合法目标；空间估算要考虑 per-shard size 和实际 headroom。若产品本意仅提供极弱检查，应修正接口语义/说明，不能让 non-force 给出容量已检查的印象。
+**位置：** [handle_check_commit_length](crates/manager/src/rpc_handlers.rs#L2197)、[dispatch](crates/manager/src/rpc_handlers.rs#L320)。
 
-### R7 — [P2] Remove 成功后重试返回“必须先 Fence”，不满足 lost-reply 幂等语义
+该 handler 解码后直接使用本地 owner lock、stream、extent 和节点表，没有 `ensure_leader`/适用的路由服务检查。外层 dispatch 也不补这个检查。owner epoch 比较只对冻结的本地 store 有效，不能证明当前元数据仍权威。
 
-**位置：** [rpc_handlers.rs:6492](crates/manager/src/rpc_handlers.rs#L6492)、[rpc_handlers.rs:6594](crates/manager/src/rpc_handlers.rs#L6594)。
+**运行结果：** 构建 stream、owner lock 和 sealed-tail 元数据，在同一个 manager 实例 `set_leader(false)` 后通过真实 RPC 查询：
 
-第一次 Remove 成功会删除 override 并写 decommissioned tombstone；第二次请求首先检查 override，直接返回 CODE_PRECONDITION，没有读取“同一节点已经移除”的终态。
+```text
+StreamInfo:       code=5 (NOT_LEADER)
+CheckCommitLength: code=0 (OK), end=4096
+```
 
-**运行确认：** 相同 RemoveNodeReq 第一次 code=0；重试 code=3，message="node 3 must be Fenced before remove"。如果第一次响应丢失，调用方会把已完成退役看成未完成；不能靠 clear override 补救，否则会解除 tombstone。
+这验证 handler 的拒绝契约缺口；sealed length 是测试显式设定的状态，本轮未模拟真实两 manager 换主、roll tail 后的写入损坏。可推导的影响是调用方把 standby 的旧 tail/长度当成功结果，无法触发按 NOT_LEADER 轮换。尤其 sealed 分支不访问 EN 就立即成功。
 
-**建议：** 对匹配的 decommissioned 终态返回幂等成功/明确 AlreadyRemoved，不改变 tombstone。补一条“事务落地但响应丢失，重发相同 Remove”的测试；现有 system_lost_reply_idempotency 覆盖 alloc/split/punch，没有 Remove。
+**建议：** 在读本地 owner/stream 状态前加入与该权威查询语义一致的 leader gate；若允许 leaderless 缓存服务，需要明确其期限与位点安全条件，不能直接无条件放行。
 
-## 2. Chaos / 回归测试本身的问题
+**回归验收：** 真实 leader/standby 集群，在 leader 上 roll tail/推进 owner epoch，standby 对该 RPC 返回 NOT_LEADER，客户端轮换后取得新 tail。修正旧 `etcd_replay_owner_lock_allows_check_commit_length_without_reacquire`：`drop(mgr1)` 只关闭客户端连接，并未停止旧 manager，不能证明 failover replay。
 
-### T1 — [P1，测试可信度] 写入存活探测遗漏 mem/，当前拓扑下全部跳过
+### N7 — [P2] RPC 声明长度在鉴权和 CRC 检查前驱动大块预分配
 
-**位置：** [system_chaos.rs:579](crates/manager/tests/system_chaos.rs#L579)、[system_chaos.rs:2783](crates/manager/tests/system_chaos.rs#L2783)、[system_chaos.rs:3836](crates/manager/tests/system_chaos.rs#L3836)。
+**位置：** [FrameDecoder::try_decode](crates/rpc/src/frame.rs#L510)、[MAX_PAYLOAD_LEN](crates/rpc/src/frame.rs#L61)、[manager decode 循环](crates/manager/src/rpc_handlers.rs#L250)。
 
-writer 使用 mem/b000000、mem/q000000，初始分区为 [mem/a, mem/z)。verify_write_liveness 却生成 b000000/q000000；前者小于 mem/a，后者大于 mem/z，没有任何候选落在范围内，直接 continue。split/merge 后的子范围仍位于该范围内，问题不会自行消失。最终函数返回空 errors，被打印为“write-liveness errors=0”。
+`payload_len` 是 u32，`MAX_PAYLOAD_LEN` 也是 `u32::MAX`，所以当前长度上限检查不会拒绝任何声明。只要拿到 10 字节头，未收到 body、未校验 ctrl 长度/CRC，`reserve(total - len)` 就会按整帧大小申请容量。业务 opcode 和 CLIENT_AUTH 检查在解码之后，不能保护这次分配。
 
-**运行确认：** 按源码候选格式枚举，在完整范围及 [mem/a,mem/m)、[mem/m,mem/z) 中候选数均为 0。
+**运行结果：** 给真实 decoder 喂 10 字节、声明 64 MiB payload，`try_decode` 返回“等待更多数据”，buffer capacity 已为 `67,108,874`。本轮没有申请 4 GiB 或主动触发 OOM；reserve 的容量不等于立即驻留同量物理内存，实际是否被 OOM kill 取决于 allocator/OS/cgroup 和后续数据。
 
-**修复与验收：** 与 writer 共用 namespaced key builder，并断言实际 probe 的分区数和 ACK 数。再让 PS 保持 GET 可用、拒绝所有 PUT；checker 必须报错。还应修正“50 次 8 KiB 会触发 rotation/flush”的注释：即使前缀修好，当前 make_value 对未识别 key 产出 256 B；修好后 50×8 KiB 也不等于证明触发 flush，应显式等待 flush/append 计数。
+业务帧路径需要先完成版本握手；不是说握手本身可以用这个头绕过。完成 Client 角色握手不等于完成业务 token 认证，因此在开放客户端连接的服务上，凭证校验也不能拦住此资源消耗。多连接和持续发送 body 会放大风险。
 
-### T2 — [P1，测试可信度] “物理回收成功”只检查 etcd extent 消失
+**建议：** 在 reserve 前按 service/opcode/连接阶段实施实际长度和并发内存预算；未完成业务鉴权的连接使用更小的合法消息上限；分段接收避免单凭未验证头一次申请整帧。上限需容纳现有 recovery 分块等合法大请求，不能随意统一降到一个很小常量。
 
-**位置：** [system_chaos.rs:3140](crates/manager/tests/system_chaos.rs#L3140)、[system_chaos.rs:3285](crates/manager/tests/system_chaos.rs#L3285)、[extent_delete.rs:163](crates/manager/src/extent_delete.rs#L163)。
+**回归验收：** 大声明、短 body、非法 ctrl 长度、无 token、并发慢连接均受预算约束；合法 bulk/append/recovery 帧仍通过。断言内存/容量边界，不以“没有 OOM”作为唯一成功标准。
 
-read_extent_id_set 只读取 extents/；before/mid/after 的差集只能证明 manager metadata 删除。真实 unlink 是之后由 Delete marker/primary retry/persisted retry 驱动的。即使 EN 的 DELETE 永远失败，metadata 仍可以消失。
+## 3. 覆盖范围及已有保护
 
-此外，该 helper 将 etcd 连接/读取错误转为空集合：after 快照读取失败可能被解释为“全部回收”。随后独立 accounting 的一次成功快照并不能反证这个回收数量是假的。gc_reclaimed 使用时间窗口差集，也不能区分 ForceGC 与同窗口的 sealed-empty sweep、row/meta truncate。
+这是围绕正确性、崩溃恢复、并发、鉴权和资源边界的跨模块审查，不是逐行形式证明。以下写明实查内容和没有执行的平台验证。
 
-**修复与验收：** 快照失败返回 Err；记录明确的候选 extent 与各副本文件路径，等待这些 .dat/.meta/.shard/.cksum 实际消失，并检查 Delete/persisted-retry 状态。注入“DELETE RPC 永久拒绝”时，回收检查必须失败，即使 extents/<id> 已不存在。磁盘占用总量只能作为辅助，不代替逐 extent 判定。
+| 模块 | 实查重点 | 结论/边界 |
+|---|---|---|
+| manager / etcd | leader term、事务不确定结果、lease 生命周期、Recovery/EC apply、Fence/Remove、元数据查询 gate | N2/N6；Recovery 独立 nonce、marker revision 和 extent baseline CAS 已存在；etcd 不盲目重发不确定 txn |
+| partition-server | takeover、seal/replay、fence floor、GC 完整扫描、checkpoint/replay floor、SST iterator/compaction 入口、authz gate | 已修旧 R1/R3；定向跑截短副本 GC；本轮未确认新的 KV 层 ACK 数据丢失 |
+| stream / EN | append/commit/fence、复制/EC 恢复、checksum、分块复制、直读鉴权、后台循环 | 核心库测试和 Recovery 集成覆盖；未执行断电、真实多盘坏盘和跨机 RDMA |
+| client | 写入结果分类、conditional retry、batch 重发、region epoch、直读回退、stripe streaming | N1；条件写遇 OutcomeUnknown 停止重试的保护已存在并有定向测试 |
+| fs / fuse / Python FS | create/rename/link、lease slot、publish/recover、segment/multipart、前端调用关系 | N3–N5；共享 FS core 已实跑；本机未执行真实 FUSE mount、Python 扩展构建/模型服务 |
+| RPC / transport | 握手/role、frame 长度与 CRC、TCP zerocopy buffer 生命周期、UCX pending/orphan/注册内存路径 | N7；TCP/通用库测试通过；UCX 仅静态检查，不能用 macOS TCP 测试认证其内存安全 |
+| S3 / dashboard | S3 发布条件、multipart 状态与清理、listing 结构、管理入口和鉴权边界 | S3 底层 publish/multipart 实跑；未跑 HTTP 全接口和浏览器 UI；边界见下文 |
+| params / 启动 / 部署 / CI | 参数范围、PS/EN cpuset 初始化、EN shard 数、Kubernetes requests、测试执行命令与故障模型 | 参数库测试通过；不以源码推断现网 CPU 亲和性或吞吐瓶颈 |
 
-### T3 — [P2] 多个 crash/restart 测试没有停止旧进程/运行时
+### 已知设计限制，仍需在使用范围中体现
 
-**位置：** [system_crash_mid_compact.rs:58](crates/manager/tests/system_crash_mid_compact.rs#L58)、[system_crash_mid_flush.rs:46](crates/manager/tests/system_crash_mid_flush.rs#L46)、[system_ps_recovery.rs:60](crates/manager/tests/system_ps_recovery.rs#L60)、[support/mod.rs:162](crates/manager/tests/support/mod.rs#L162)。
+1. **EN 直读只验身份，不验 key grant 范围。** [实现](crates/stream/src/extent_node.rs#L1732) 与 [设计说明](docs/data_plane_authz_design.md#L208) 一致：合法 principal 若知道/猜中 extent 坐标，仍可读取 grant 外数据。这里按明确的现有安全边界记录，不伪装成新发现。若需求是不可信租户隔离，需要带范围和有效期的签名 descriptor 或等价服务端授权。
+2. **S3 网关无 SigV4 验证。** [入口说明](crates/server/src/bin/autumn_s3/main.rs#L1) 明确写出忽略 Authorization；不能把后端已启用 authz 等同于每个 S3 caller 各有身份。etcd auth/TLS 也是 backlog 中尚未实现的功能。
+3. **rename 仍是跨 key 非原子操作。** [实现](crates/fs/src/dir.rs#L481) 先删旧名再写新名。独立于 N4，崩溃/写失败可使源暂时或永久失去名字。发布 pending 恢复只检查原位置，发布后 rename 走再恢复存在误回收风险；crate guide 已记录，本轮未额外复现该链路。
+4. **租约缓存的迟到 NotHeld 风险未消除。** `lease_tasks` 快照只带 ino，处理回复时未核对 lease epoch；backlog 已指出通常 FIFO 连接下不可直接构造，换主/连接轮换才可能形成必要重排。本轮不把静态窗口写成已确认生产缺陷。
+5. **UCX 取消后缓冲区留在 orphan 列表。** 代码为避免提前释放而保留 buffer，等 UCX completion 后回收。长期不完成请求的资源上限及真实 RDMA 错误恢复需要实机验证；没有依据宣称出现 UAF，也没有运行证明其长时间 RSS 有界。
 
-这些测试 drop(ps1) 丢弃的是 RpcClient，start_partition_server 启动的 detached thread 继续服务/心跳。再次启动相同 ps_id 得到的是两个活 PS 的竞争，不是 crash 后恢复。compact 测试还只发 maintenance、sleep 100 ms，没有同步点证明 kill 位于输出落盘与 checkpoint 提交之间。
+### 性能审查结论
 
-stream/tests/extent_restart_recovery 也使用 detached serve；结束一个局部作用域不等于结束同一个 compio runtime 上的服务 task。它能验证从文件重新 load 的部分行为，但不能作为进程退出/未完成 I/O 丢失的证据。
+本轮没有做 perf benchmark，不给出“CPU 已到极限”或“能达到 270K IOPS”的推断。源码能确认的约束是：PS 默认前台限流是每 partition `30,000 IOPS`，`ps_inflight_cap=8`、`conn_inflight_cap=4`；SDK 的 bulk 选择阈值为 64 KiB。压测结果需要连同运行时 override、连接数和 partition 分布解读。
 
-**修复与验收：** SIGKILL 子进程或使用真正丢弃 runtime 的 killable helper，并等待退出。设置“输出 SST 已 durable、checkpoint 未提交”等 barrier 后 kill。stoppable helper 的 graceful drain 对正常停机有价值，但不能覆盖断电/硬崩溃窗口。
+当前 PS `--cpuset` 是先限制启动线程 CPU mask、子线程继承的进程运行范围，代码没有为每个 partition 固定唯一 core；EN shard 数则直接由 cpuset 大小决定，并对 shard 线程 pin core。这与 Kubernetes `requests.cpu` 的数值是不同配置层。本轮只核对源码，未读取 pod 的实际 affinity/cgroup。
 
-### T4 — [P2] 全动作、极端故障和持续一致性没有形成验收门槛
+## 4. 测试可信度及验证记录
 
-**位置：** [system_chaos.rs:1890](crates/manager/tests/system_chaos.rs#L1890)、[system_chaos.rs:4055](crates/manager/tests/system_chaos.rs#L4055)、[ci.yml:70](.github/workflows/ci.yml#L70)、[decommission_chaos.sh:55](scripts/decommission_chaos.sh#L55)。
+### 4.1 实际运行
 
-- 主测试默认 30 s、动作间隔 3 s，共 13 个动作；即便每个动作瞬时完成，也跑不完一轮。shuffled round-robin 保证的是有足够时间时尝试，不保证每轮成功执行。
-- 动作失败/超时计为 skipped；启用动作整轮成功次数为零只输出 NOTE，没有通用失败条件。某些 rot/recovery 检查有额外非空保护，但不是所有动作都有。
-- decommission_chaos.sh 显式覆盖 AUTUMN_CHAOS_ACTIONS，却没有列入 corrupt，因此其“FULL action set”已不准确。
-- 主 chaos 的 manager 与单个 PS 是 in-process，nemesis 杀的是 EN；Remove 是停止 workload 后的可选终态阶段。不能覆盖 manager failover × Recovery apply、PS crash × Compact/GC commit、在线 Remove × Recovery 目标。
-- reader_loop 只校验 value 形状，不检查历史顺序；writer 对 timeout 将整个 key 从 expected 删除。它能做停止写入后的最终值校验，不能证明中途无 stale read、无 lost update、无非法回滚。未知结果应记录为允许分支，而不抹掉此前已确认的历史。
-- 主 workload 只有 256 B/8 KiB PUT/GET；不含 delete、TTL、同 key 多 writer，也无法替代多 GiB extent、EC stripe、GC carry 的边界矩阵。
-- CI 没有 --ignored 或专用 chaos job，也没有安装 toxiproxy；主 chaos、leader_fence、部分大 GC/故障用例被 ignore，编译到不等于运行过。
+环境：本机 macOS，Rust `1.98.1` / Cargo `1.98.1`，本地 etcd，TCP，`--offline --locked`。初次基础库执行因沙箱拒绝 bind 出现 12 个 `Operation not permitted`；使用允许本地端口的执行环境重跑后全部通过。这些不计为代码失败。
 
-**建议：** 明确区分 smoke、定向故障和长跑；关键动作记录 attempted/accepted/entered/completed，并对每轮指定的必需路径做非零断言。为两故障重叠设计可控 barrier，不依赖更长 sleep。保留 invocation/response 历史以校验允许的并发结果。
+| 基础库 | passed | ignored |
+|---|---:|---:|
+| client | 63 | 0 |
+| common | 15 | 0 |
+| etcd | 3 | 0 |
+| fs | 27 | 0 |
+| manager | 468 | 0 |
+| params | 9 | 0 |
+| partition-server | 230 | 1 |
+| rpc | 88 | 1 |
+| stream | 199 | 0 |
+| transport | 8 | 0 |
+| 合计 | **1,110** | **2** |
 
-## 3. 已有的有效保护与覆盖边界
+命令：
 
-下面是源码/断言层面的覆盖判断；除验证记录中列明的 10 个既有用例，不能理解为本轮已跑绿。
+```bash
+cargo test --offline --locked --lib --no-fail-fast \
+  -p autumn-common -p autumn-params -p autumn-rpc -p autumn-etcd \
+  -p autumn-client -p autumn-fs -p autumn-manager \
+  -p autumn-partition-server -p autumn-stream -p autumn-transport
+```
 
-| 场景 / 不变量 | 已有实现或测试证据 | 本次判断与缺口 |
-| --- | --- | --- |
-| GC 只处理已 seal extent，避免 stale open cache 当空 extent | authoritative_sealed；system_split_forcegc_stale_cache | 有针对性保护，R1 是另一条短读窗口 |
-| GC 不覆盖同 extent 内同 key 的新版本 | 完整 VP identity；system_gc_multiversion_same_extent | 有回归覆盖 |
-| GC vs seq 已分配但未入 memtable 的 PUT | inflight_write_keys；system_gc_inflight_wal_put | 有 barrier，覆盖精确窗口 |
-| GC replay floor 与 durable checkpoint | gc_replay_floor / gc_floor_raise_to_durable_ckpt；system_gc_floor_durable_ckpt | 有专门验收，重用例被 ignore；需硬崩溃交叉验证 |
-| Compact 使用输入 SST vp_head，不跨过未 flush WAL | compaction_output_vp_head；system_compact_unflushed_vp_head | 关键保护存在；已实现 imm rotation 时保存 vp_head，不应把旧注释中的已修复问题重新报成缺陷 |
-| Compact 输出发布和并发 flush 顺序 | 输出插回旧表位置；snapshot→send 无 await；对应 publisher/order 测试 | 正常发布顺序有保护；不能替代 checkpoint 写失败/硬崩溃测试 |
-| 腐化 WAL / SST lookup 错误 | process_gc_chunk fail-stop；paged SST lookup Err 中止 GC | 防止解析失败误删；不覆盖合法空响应 |
-| Recovery 成功、重复派发、丢 completion、partial .dat | system_extent_recovery 的对应测试 | 覆盖复制路径；R2 的同 assignment 新 attempt 未覆盖 |
-| 真正驱动 recovery loop / 无 spare 的对照 | system_recovery_loop_drives | 有非空触发断言，比只测 predicate 更强 |
-| Fence/unfence 后 marker 与 limiter 释放 | extent_inflight/recovery 的单测与 tick 测试 | 已有 source unfence 回归；目标节点被 Fence/Remove 不等价 |
-| EN Delete 与当前 Recovery 互斥 | delete_recovery_race | 本轮运行通过；注入 marker 测 handler，不代表验证复制中途 kill/delete 全流程 |
-| leader fence 与 metadata 原子提交 | leader_fence、apply_done_atomicity | 专项存在，部分 ignore；未证明 R5 同 leader 时序 |
-| PS SIGKILL / SIGSTOP zombie | system_ps_failover_chaos、system_sigstop_zombie_writer | 独立专项存在；主 chaos 无该组合，fence 全失败缺口仍在 |
-| 2/3 副本同时丢失、EC 超容错 | system_correlated_2of3_loss | 独立专项存在；主 nemesis 有 healthy budget，不能声称主 chaos 覆盖 |
-| 非对称网络分区 | system_asym_partition_grayfail | 专项存在；需要核对是否验证修复与持续可用性，文件中的 reproduce 注释不是通过证明 |
-| ENOSPC / 单盘 media fault | enospc_chaos.sh；主 chaos 每 EN 多目录 | 独立 ENOSPC 场景存在；主 chaos 多目录共用文件系统，不等于单盘 Full/Faulted。feature_list 明确盘级注入未完成 |
-| Remove 与身份 tombstone | node_lifecycle、terminal decommission | 9 个 smoke 本轮通过；并发目标、lost reply、真正 tombstone 后再启动的组合不足 |
-| GC 空间回收 | verify_gc_reclaim、physical_deletion 专项 | 专项与主 checker 要分开看；主 checker 当前不能证明物理 unlink |
+另运行 11 个既有集成目标，**60 passed、0 failed、0 ignored**；数字包括各目标重复编入的公共 support 测试和 child 入口，不能解释为 60 个独立故障场景。
 
-## 4. 仍需定向验证的边界，不算已确认生产事故
+| 集成目标 | passed |
+|---|---:|
+| apply_done_atomicity | 6 |
+| fence_same_process_reelection | 4 |
+| leader_step_down_stale_term | 5 |
+| recovery_attempt | 5 |
+| system_gc_truncated_replica | 7 |
+| system_multipart | 4 |
+| system_publish | 7 |
+| system_review_remove_retry | 4 |
+| system_review_takeover_fence | 4 |
+| system_status_connection_reuse | 4 |
+| write_outcome_settled | 10 |
 
-### 4.1 merge 后 replay cursor 全部不可解析时，global max_seq fallback 的前提
+命令：
 
-[lib.rs:8824](crates/partition-server/src/lib.rs#L8824) 只为 vp_extent_id 仍在 log 的 checkpoint 建 source region；全失效时退到 global max_seq（8851），replay 在 9196 丢弃 ts<=extent_dedup 的记录。数值模型很清楚：survivor SST max=100、victim SST max=1000，survivor 尚未 flush 的 seq=101 会被 global=1000 跳过。
+```bash
+cargo test --offline --locked --no-fail-fast -p autumn-manager \
+  --test apply_done_atomicity --test recovery_attempt \
+  --test system_review_takeover_fence --test system_review_remove_retry \
+  --test system_gc_truncated_replica --test system_publish --test system_multipart \
+  --test system_status_connection_reuse --test write_outcome_settled \
+  --test leader_step_down_stale_term --test fence_same_process_reelection \
+  -- --test-threads=1
+```
 
-**没有将它列成已确认 P1 的原因：** 正常 handle_merge_partitions 会 freeze/drain/flush 两边；上述“pre-merge source 存在未 checkpoint 记录”的形状不能直接假定仍可从正常流程形成。代码注释承认该 residual，但注释本身不是可达性证明。应针对 raw multi_modify_merge、checkpoint 失败、旧状态迁移、sealed-empty cursor 回收建立真实时序，再决定修复方案；不要仅凭数值模型宣称日常 merge 必丢数据。
-
-### 4.2 Recovery marker 清理失败后的内存 / etcd 分裂
-
-[recovery.rs:850](crates/manager/src/recovery.rs#L850) 的 release_recovery_marker_best_effort 在 etcd 删除失败后仍清内存，并声称 stale sweep 会清掉 etcd marker；但 [extent_inflight.rs:575](crates/manager/src/extent_inflight.rs#L575) 已明确排除 Recovery，且扫描的是内存 marker。若这些 stale-layout/extent-removed 分支可达，再遇到一次 etcd 错误，重派发的 create_revision==0 CAS 会一直失败，直到 leader replay。需要把可达分支与一次性 etcd 故障连起来复现，不能将它当成有定时自愈保证。
-
-### 4.3 Compact checkpoint 失败与后续 GC 的 durable 集合
-
-do_compact 在 save_table_locs_raw 前已经换掉 p.tables/p.sst_readers；失败后 caller 只记录 FAILED，未回滚或停止分区。旧 WAL 通常仍能恢复，因此“内存先换表”本身不等于数据损失。应验证失败后下一次 GC 使用新 SST replay floor 时，搬迁 WAL、旧 durable checkpoint 与后续 row truncate 是否始终构成完整恢复链；尤其是 GC relocation 和前台写入的 seq/append/flush 顺序。当前假 crash 测试不能回答这一点。
-
-## 5. 建议的 chaos 验收矩阵
-
-修复验证应先用可控 barrier 得到固定失败，再加入随机组合；每项都要求关掉对应修复后测试确实变红。
-
-| 优先级 | 场景 | 必须观测的结果 |
-| --- | --- | --- |
-| 第一批 | GC 读到 0 / record 边界短读，其他副本完整 | 完整搬迁或不 punch；重启后 live key 全部正确 |
-| 第一批 | Recovery A 释放，B 同节点组合重新创建，延迟 A done | A 不 apply、不删除 B marker；B 成功后校验 payload 类型与内容 |
-| 第一批 | 新 owner 的所有 FENCE_EXTENT 被阻断，旧 owner 随后恢复 | fence 未完成不 serving；任何 stale write 都无成功 ACK |
-| 第一批 | 正在恢复的 target 被 Fence/Remove，df done 同时到达 | 节点删除和完成应用没有 dangling node/disk 引用 |
-| 第一批 | 同 leader 延迟 etcd apply，期间 release/reacquire marker | marker nonce、extent 版本 CAS 生效；内存与 etcd 一致 |
-| 第一批 | T1 checker 对一个 GET 正常、PUT 全失败的 PS | 必须实际探测且报错，不得 0 probe 通过 |
-| 第一批 | EN DELETE 永远拒绝，manager metadata 已删 | 物理回收 checker 必须失败，并指出残留文件/重试项 |
-| 第二批 | Remove 事务成功但响应丢失；manager 随后换 leader | 重试得到终态成功，tombstone 保留，旧 UUID 重注册拒绝 |
-| 第二批 | Compact 输出一半 / SST durable / checkpoint 前后分别 SIGKILL | 重启后所有 ACK 值及 tombstone 正确，未发布输出最终回收 |
-| 第二批 | GC relocation durable、punch 前后分别杀 PS/manager | 旧新 VP 至少一条可恢复链，refs 与 memberships 正确 |
-| 第二批 | 同 EN 一块盘 EIO/EACCES，其他盘继续写 | 仅坏盘 slot 重建；节点不被误判整机退出；健康盘不迁移 |
-| 第二批 | 恢复/压缩目标盘 ENOSPC，释放空间后重试 | 不假成功、不永久占 marker；重试收敛，无残留半成品被 adopt |
-| 第二批 | 2/3 replica loss、EC 剩 K 与 K-1、最后一份腐化 | 容错内恢复；超容错明确报错，不能伪装 NotFound/健康 |
-| 第二批 | PUT/DELETE/TTL、同 key 多 writer、timeout 后再写 | 历史允许未知结果，但任何已 ACK 的顺序约束不能被抹掉 |
-| 第三批 | 0/1 byte、VP 阈值两侧、WAL 跨 chunk、EC stripe 边界、16 GiB extent | 精确长度与 checksum，内存有界；不以调小 chunk 替代全部大尺寸验证 |
-| 第三批 | 真跨主机 TCP/UCX，网络单向故障 × PS failover × Recovery | 固定时序与随机 seed 都留完整历史，明确实际走到的传输路径 |
-
-## 6. 本轮实际验证与限制
-
-### 已执行
-
-1. 读取当前产品调用链、相关测试、CI、chaos 脚本及仓库故障记录；引用均以本次 HEAD 为准。
-2. 源码 classify_recovery_completion 的原样提取探针：旧 done + 新 marker 同 assignment → Apply。
-3. namespaced range 与 liveness 候选枚举：三个范围均为 0 候选。
-4. 独立 Cargo 探针直接依赖当前 manager/stream/rpc 源码，绕开 manager 测试的 FUSE dev-dependency：
-   - Remove 带活 Recovery target 返回 CODE_OK，marker 留存。
-   - 同 Remove 重试返回 CODE_PRECONDITION。
-   - 无 spare 的 force=false Fence 返回 CODE_OK。
-5. 原始测试文件通过独立 manifest 运行：node_lifecycle **9/9 通过**；delete_recovery_race **1/1 通过**。没有改写原测试断言。
-6. 真实 EN 短读探针 **1/1 通过**，此处“通过”表示确认当前缺陷前提：durable sealed 8192 B，截短并重新 load 后，普通 read 回 CODE_OK/0 B。
+审查临时 probe 共运行 7 个 harness test：4 个审查 test（其中一个包含 4 个 FS/SDK 场景）和共享 support 模块附带的 3 个测试。**probe 使用断言确认缺陷存在，所以其绿色结果不是“实现正确”。** 复现源代码保留在附录，未把“断言错误行为”的测试加入正常 CI。
 
 关键原始输出：
 
-~~~text
-OLD_DONE_SAME_ASSIGNMENT_NEW_ATTEMPT: Apply
-LIVENESS_PROBE_CANDIDATES b'mem/a' b'mem/z' 0
-REMOVE_WITH_LIVE_RECOVERY: code=0 ext_blockers=[] marker_blockers=[] target_exists=false
-RECOVERY_MARKER_AFTER_REMOVE: Err(Precondition("extent 42 already has an in-flight op (in-memory)"))
-REMOVE_RETRY_AFTER_SUCCESS: code=3 message=node 3 must be Fenced before remove
-FENCE_NO_SPARE_FORCE_FALSE: code=0 message=
-SEALED_TRUNCATED_READ: code=0 requested=8192 bytes=0 end=0
-~~~
+```text
+PROBE stream: before_commit=[66, 66, 66, 66], after_abort=Err(ServerError("striped chunk 0 missing for key — value may have been partially deleted; call delete_stream + re-upload"))
+PROBE create: a=Ok(2), b=Ok(1002)
+PROBE rename: result=Ok(()), current=3, source=3, old_target=4
+PROBE retire: recovered=1, alias_exists=true, inode_exists=false
+PROBE follower: stream_info_code=5, commit_length_code=0, end=4096
+PROBE lease: retry=0, successor=0, late=0, stored_old=true, old_epoch=1099511627776, successor_epoch=1099511627777
+PROBE frame: received=10, announced=67108864, allocated_capacity=67108874
+```
 
-探针、独立 manifest 与提取源码保留在本机 /private/tmp/autumn-review-deuwr8gx；临时目录不是长期测试交付物。可复查：
+本地完整日志：`/tmp/autumn-review-tests-unrestricted.log`、`/tmp/autumn-review-probes.log`、`/tmp/autumn-review-integration.log`。它们是本机临时证据，关键结果已纳入本文件。
 
-~~~sh
-cargo run --manifest-path /private/tmp/autumn-review-deuwr8gx/Cargo.toml --offline --target-dir /Users/dongmao.zhang/upstream/autumn-rs/target
-cargo test --manifest-path /private/tmp/autumn-review-deuwr8gx/Cargo.toml --offline --target-dir /Users/dongmao.zhang/upstream/autumn-rs/target --test review_node_lifecycle --test review_delete_recovery_race --test review_short_read -- --nocapture --test-threads=1
-/private/tmp/autumn-review-deuwr8gx/identity
-~~~
+### 4.2 仍需补齐的测试
 
-### 未完成的验证
+- `system_gc_chunked_read` 的负载只有约 64 KiB 日志，不 roll tail，随后只是 compact/gc/读回。源码显示它没有建立“存在可 GC 的 sealed log”前置条件，也不检查实际搬迁/punch，不能证明 GC chunk carry 被执行。这一项已在 backlog 中；需要在目标 chunk 路径加可观察门槛，并让移除 carry 逻辑时失败。
+- `etcd_replay_owner_lock_allows_check_commit_length_without_reacquire` 用 `drop(RpcClient)` 模拟 kill；旧 manager 仍运行，结合 N6 会形成假阳性。需要真实停止旧 runtime，等待新 leader，明确验证重放后的 owner 状态。
+- **T3（沿用旧编号）：** crash/restart 测试应分别记录旧进程/线程退出、checkpoint 位点、重启 pid/runtime 身份。不能把断开客户端连接当作服务崩溃。本轮核实了上述具体反例，没有断言所有历史 T3 用例仍有缺陷。
+- **T4（沿用旧编号）：** CI 有普通 workspace unit/integration 门槛，但本轮没有运行全动作长时间 chaos、硬盘故障、断电、跨机 UCX、真实 FUSE mount；不能把本轮 1,110 个基础测试和有限集成目标等价成这些验证。动作应有非零成功/完成计数，历史 checker 应保留已 ACK 写入。
 
-- 原始 cargo test -p autumn-manager --lib recovery_completion --offline 编译失败：fuser 需要 pkg-config/FUSE，本机缺失；不是测试断言失败。
-- H200-1 只读连接尝试在跳板机遭到 Permission denied (gssapi-with-mic)，未进入 dongmao-autumn，也未在远端运行测试或修改集群。
-- 本机没有 toxiproxy-server，本轮未运行完整 system_chaos，也没有运行有 loop mount/清集群行为的 ENOSPC 脚本。
-- 独立 manifest 引用的是当前产品源码，首次复制 workspace lock 后为较小依赖图重新解析，部分传递依赖版本有变化；它用于验证具体代码分支，不能冒充完全相同 workspace lock 的 CI 运行。
-- 没有做掉电、真实 media EIO、UCX 或跨主机故障验证；没有声称已用完整 e2e 复现 R1–R5 的最终数据损失。
+## 5. 旧报告 R/T 编号复核
 
-**验收建议：先关闭 R1–R5 和 T1–T2，再以实际故障进入次数、重启后的 ACK 数据、slot/refs/membership 一致性及逐副本物理回收为门槛评估 chaos。单纯增加 seed 数或延长运行时间不能修复 checker 的空验证。**
+| 旧编号 | 原问题 | 本基线复核 |
+|---|---|---|
+| R1 | GC 提前 EOF 后 punch | 已有 `ensure_gc_scan_complete` 及逐块精确长度检查；本轮跑截短副本集成 |
+| R2 | Recovery 相同 node/replace 的 ABA | 已校验 `RecoveryAttempt` 和非零 nonce；本轮跑 `recovery_attempt` |
+| R3 | takeover fence 全失败后仍 open | 现在三次失败直接返回 Err；本轮跑 selective fence 失败测试 |
+| R4 | Remove 忽略 Recovery 目标 | lifecycle 锁、marker/target 身份检查及异常节点取消已存在；相关库测试和 Recovery 集成通过 |
+| R5 | Recovery apply 没有 marker/extent CAS | 走 `commit_inflight_extent`，比较 marker revision、extent baseline、目标身份；本轮跑 `apply_done_atomicity` |
+| R6 | non-force Fence 不检查合法 spare/容量 | 当前已有合法目标、占用与容量检查；相关 manager unit 通过；未做现网容量模拟 |
+| R7 | Remove 丢回复后重试不幂等 | 已有终态处理；本轮跑 manager runtime 重启后的 Remove 重试 |
+| T1 | chaos liveness key 不在 namespace，全部跳过 | 已使用 `mem/` 范围内 probe 并检查实际探测/ACK 数；静态复核，未跑完整 chaos |
+| T2 | “物理回收”只看 etcd | 已有 `wait_for_physical_reclaim`，检查副本和 sidecar、删除重试状态；静态复核，未跑完整 chaos |
+| T3/T4 | 假 crash / chaos 验收不足 | 仍需逐项处理，见第 4.2 节；不机械继承旧报告所有旧行号/判断 |
+
+## 6. 修复顺序与验收要求
+
+1. **先处理 N1/N2：** N1 用 generation 隔离每次上传；N2 为同 inode 的完整租约生命周期建立条件提交。两者修完都需用本报告时序验证修复前失败、修复后通过。
+2. **处理 N3/N4：** 共享 FS 命名操作加条件发布和目录语义验证，多会话测试优先；不能只在 FUSE callback 增加本地锁，因为 Python/S3/另一挂载同样会改后端。
+3. **处理 N5：** 修复恢复幂等性与持久状态设计，覆盖 hardlink 和多次恢复。把限制写在文档里不能代替保护仍可达的数据。
+4. **处理 N6/N7：** 补权威查询 gate 与实际接收内存预算；同时补失效的测试前置条件。
+5. **最后补平台验证：** Linux FUSE、真实 etcd failover、UCX/RDMA 和磁盘故障按各自条件执行。任何吞吐结论需记录二进制 revision、cpuset、运行时参数、part 分布和传输模式。
+
+没有在本轮做自动修复、提交或部署。未跟踪的已有恢复工具、examples 和临时浏览器目录未纳入基线发布判断。
+
+## 附录：本轮复现代码
+
+下面的代码在本基线编译运行。保存为临时 `crates/manager/tests/review_probe.rs` 后执行：
+
+```bash
+cargo test --offline --locked -p autumn-manager --test review_probe \
+  -- --nocapture --test-threads=1
+```
+
+需要允许本地 loopback 监听，并在 PATH 中有 etcd。只使用临时目录和动态本地端口。此文件依赖现有 `tests/support`，因此应放在上述位置；全局事务暂停点要求串行执行。**这些断言用于重现现存错误，修复后的回归测试必须改成断言正确行为。** 报告完成后临时测试已移出工作区；本机另留副本 `/tmp/autumn-review-probes.rs`。
+
+<details>
+<summary>展开完整 Rust 复现源代码</summary>
+
+```rust
+//! Temporary review probes: assertions deliberately describe the observed defects.
+mod support;
+use support::*;
+use std::{ffi::OsStr, time::{Duration, Instant}, sync::atomic::Ordering};
+use autumn_rpc::{client::RpcClient, manager_rpc::*};
+use autumn_client::lease::{self, DaemonClientId};
+use autumn_fs::{dir, key, meta, publish::{self, NewFile, Condition}, schema, state::FsState};
+
+#[test]
+fn stale_grant_overwrites_the_successor_in_same_term() {
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        let (_guard, endpoint) = start_etcd().await;
+        let manager = autumn_manager::AutumnManager::new_with_etcd(vec![endpoint.clone()], manager_identity()).await.unwrap();
+        let aux = autumn_etcd::EtcdClient::connect(&endpoint).await.unwrap();
+        let w = DaemonClientId::new_fuse("old").as_wire().clone();
+        let x = DaemonClientId::new_fuse("successor").as_wire().clone();
+        let ino = 76543;
+        let req = |client: MgrClientId| rkyv_encode(&AcquireLeaseReq {client, ino, mode: LEASE_MODE_WRITE, force: false});
+        use autumn_manager::{FENCED_TXN_TEST_HOLD_ARMED as ARMED, FENCED_TXN_TEST_HOLD_PREFIX as PREFIX, FENCED_TXN_TEST_PARKED as PARKED};
+        *PREFIX.lock().unwrap() = format!("inode_leases/{ino}");
+        let before = PARKED.load(Ordering::Relaxed);
+        ARMED.store(true, Ordering::Relaxed);
+        let a = manager.clone(); let payload = req(w.clone());
+        let old = compio::runtime::spawn(async move { a.handle_acquire_lease(payload).await });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while PARKED.load(Ordering::Relaxed) == before {
+            assert!(Instant::now() < deadline);
+            compio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let retried: AcquireLeaseResp = rkyv_decode(&manager.handle_acquire_lease(req(w.clone())).await.unwrap()).unwrap();
+        assert_eq!(retried.code, CODE_OK);
+        let release: ReleaseLeaseResp = rkyv_decode(&manager.handle_release_lease(rkyv_encode(&ReleaseLeaseReq {client: w.clone(), ino})).await.unwrap()).unwrap();
+        assert_eq!(release.code, CODE_OK);
+        let next: AcquireLeaseResp = rkyv_decode(&manager.handle_acquire_lease(req(x.clone())).await.unwrap()).unwrap();
+        assert_eq!(next.code, CODE_OK);
+        let k = format!("inode_leases/{ino}");
+        let record: MgrInodeLeaseRecord = rkyv_decode(&aux.get(k.as_bytes()).await.unwrap().kvs[0].value).unwrap();
+        assert_eq!(record.writer.uuid, x.uuid);
+        ARMED.store(false, Ordering::Relaxed);
+        let late: AcquireLeaseResp = rkyv_decode(&old.await.unwrap().unwrap()).unwrap();
+        let record: MgrInodeLeaseRecord = rkyv_decode(&aux.get(k.as_bytes()).await.unwrap().kvs[0].value).unwrap();
+        eprintln!("PROBE lease: retry={}, successor={}, late={}, stored_old={}, old_epoch={}, successor_epoch={}", retried.code, next.code, late.code, record.writer.uuid == w.uuid, record.version, next.lease.unwrap().version);
+        assert_eq!(late.code, CODE_OK);
+        assert_eq!(record.writer.uuid, w.uuid, "expected to reproduce stale overwrite");
+    });
+}
+
+async fn publish_bytes(s: &mut FsState, name: &[u8], bytes: &[u8]) -> u64 {
+    let mut f = NewFile::begin(s, 1, name).await.unwrap();
+    f.write(s, bytes).await.unwrap();
+    f.finish(s).await.unwrap();
+    let ino = f.ino;
+    f.publish(s, Condition::None).await.unwrap();
+    ino
+}
+
+#[test]
+fn filesystem_namespace_and_recovery_probes() {
+    let (mgr_addr, n1, n2, _d1, _d2) = setup_two_node_infra(231);
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        let mgr = RpcClient::connect(mgr_addr).await.unwrap();
+        register_two_nodes(&mgr, n1, n2, 231).await;
+        let (log, row, meta_stream) = create_three_streams(&mgr).await;
+        upsert_partition(&mgr, 23101, log, row, meta_stream, b"", b"\xff\xff\xff\xff").await;
+        let ps = pick_addr();
+        start_partition_server(231, mgr_addr, ps);
+        let mut a = FsState::new(&mgr_addr.to_string()).await.unwrap();
+        meta::ensure_root(&mut a).await.unwrap();
+        let mut b = FsState::new(&mgr_addr.to_string()).await.unwrap();
+        let mut committed = a.client.put_stream_begin(b"review-stream", 0);
+        committed.send(b"AAAA").await.unwrap();
+        committed.commit().await.unwrap();
+        let mut replacement = a.client.put_stream_begin(b"review-stream", 0);
+        replacement.send(b"BBBB").await.unwrap();
+        let mut reader = b.client.get_stream(b"review-stream", 4096).await.unwrap().unwrap();
+        let before_commit = reader.next_chunk().await.unwrap().unwrap();
+        assert_eq!(before_commit, b"BBBB");
+        replacement.abort().await.unwrap();
+        let mut reader = b.client.get_stream(b"review-stream", 4096).await.unwrap().unwrap();
+        let after_abort = reader.next_chunk().await;
+        eprintln!("PROBE stream: before_commit={before_commit:?}, after_abort={after_abort:?}");
+        assert!(after_abort.is_err());
+        let (one, two) = futures::join!(dir::create(&mut a, 1, OsStr::new("raced"), 0o644), dir::create(&mut b, 1, OsStr::new("raced"), 0o644));
+        eprintln!("PROBE create: a={:?}, b={:?}", one.as_ref().map(|v| v.0), two.as_ref().map(|v| v.0));
+        assert!(one.is_ok() && two.is_ok(), "expected two successful creates");
+        assert_ne!(one.unwrap().0, two.unwrap().0);
+        let (src, _) = dir::mkdir(&mut a, 1, OsStr::new("srcdir"), 0o755).await.unwrap();
+        let (dst, _) = dir::mkdir(&mut a, 1, OsStr::new("dstdir"), 0o755).await.unwrap();
+        dir::create(&mut a, dst, OsStr::new("precious"), 0o644).await.unwrap();
+        let renamed = dir::rename(&mut a, 1, OsStr::new("srcdir"), 1, OsStr::new("dstdir")).await;
+        let named = dir::lookup(&mut b, 1, OsStr::new("dstdir")).await.unwrap().0;
+        eprintln!("PROBE rename: result={renamed:?}, current={named}, source={src}, old_target={dst}");
+        assert!(renamed.is_ok()); assert_eq!(named, src);
+
+        let old = publish_bytes(&mut a, b"object", b"old data").await;
+        dir::link(&mut a, old, 1, OsStr::new("alias")).await.unwrap();
+        let new = publish_bytes(&mut a, b"object", b"new data").await;
+        let old_meta = meta::get_inode_uncached(&mut a, old).await.unwrap().0;
+        assert_eq!(old_meta.nlink, 1);
+        let session = a.session.unwrap();
+        // Exact durable state at the crash boundary: nlink already reduced,
+        // retirement record not yet deleted. No fabricated inode contents.
+        a.kv_put(&key::pending_key(session, old), &schema::encode_pending(&schema::PendingOp::Retire {parent: 1, name: b"object".to_vec(), ino: old, successor: Some(new)})).await.unwrap();
+        lease::release(&a.client, &a.client_id, session).await.unwrap();
+        let recovered = publish::recover_dead_sessions(&mut b).await.unwrap();
+        let alias = b.kv_get_opt(&key::dirent_key(1, b"alias")).await.unwrap();
+        let inode = b.kv_get_opt(&key::inode_key(old)).await.unwrap();
+        eprintln!("PROBE retire: recovered={recovered}, alias_exists={}, inode_exists={}", alias.is_some(), inode.is_some());
+        assert!(alias.is_some() && inode.is_none());
+    });
+}
+
+#[test]
+fn unvalidated_frame_header_reserves_announced_body() {
+    use compio::buf::IntoInner;
+    let mut decoder = autumn_rpc::frame::FrameDecoder::new();
+    let mut head = [0u8; 10]; head[0] = 1;
+    head[6..10].copy_from_slice(&(64u32 * 1024 * 1024).to_le_bytes());
+    decoder.feed(&head);
+    assert!(decoder.try_decode().unwrap().is_none());
+    let cap = decoder.read_window(1).into_inner().capacity();
+    eprintln!("PROBE frame: received=10, announced=67108864, allocated_capacity={cap}");
+    assert!(cap >= 64 * 1024 * 1024);
+}
+
+#[test]
+fn follower_returns_success_for_commit_length() {
+    let n1 = pick_addr(); let n2 = pick_addr();
+    let d1 = tempfile::tempdir().unwrap(); let d2 = tempfile::tempdir().unwrap();
+    start_extent_node(n1, d1.path().into(), 241);
+    start_extent_node(n2, d2.path().into(), 242);
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        let addr = pick_addr();
+        let m = autumn_manager::AutumnManager::new();
+        m._test_disable_background_tasks();
+        let serving = m.clone();
+        let server = compio::runtime::spawn(async move { serving.serve(addr).await });
+        wait_accepting_async(addr, "review manager").await;
+        let c = RpcClient::connect_as(addr, autumn_rpc::version_hello::Role::Admin, None).await.unwrap();
+        register_two_nodes(&c, n1, n2, 241).await;
+        let sid = create_stream(&c, 2).await;
+        let info: StreamInfoResp = rkyv_decode(&c.call(MSG_STREAM_INFO, rkyv_encode(&StreamInfoReq {stream_ids: vec![sid]})).await.unwrap()).unwrap();
+        let (_, mut extent) = info.extents[0].clone();
+        extent.sealed = true; extent.sealed_length = 4096;
+        m._test_seed_extent(extent.extent_id, extent);
+        let lock: AcquireOwnerLockResp = rkyv_decode(&c.call(MSG_ACQUIRE_OWNER_LOCK, rkyv_encode(&AcquireOwnerLockReq {owner_key: "review-owner".into()})).await.unwrap()).unwrap();
+        m.set_leader(false);
+        let regular: StreamInfoResp = rkyv_decode(&c.call(MSG_STREAM_INFO, rkyv_encode(&StreamInfoReq {stream_ids: vec![sid]})).await.unwrap()).unwrap();
+        let stale: CheckCommitLengthResp = rkyv_decode(&c.call(MSG_CHECK_COMMIT_LENGTH, rkyv_encode(&CheckCommitLengthReq {stream_id: sid, owner_key: "review-owner".into(), owner_epoch: lock.owner_epoch})).await.unwrap()).unwrap();
+        eprintln!("PROBE follower: stream_info_code={}, commit_length_code={}, end={}", regular.code, stale.code, stale.end);
+        assert_eq!(regular.code, CODE_NOT_LEADER);
+        assert_eq!(stale.code, CODE_OK);
+        assert_eq!(stale.end, 4096);
+        drop(server);
+    });
+}
+```
+
+</details>
