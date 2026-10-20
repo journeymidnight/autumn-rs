@@ -43,7 +43,7 @@ fn start_etcd_manager(mgr_addr: SocketAddr, etcd_endpoint: String) {
             let _ = manager.serve(mgr_addr).await;
         });
     });
-    std::thread::sleep(Duration::from_millis(400));
+    support::wait_accepting(mgr_addr, "start_etcd_manager");
 }
 
 async fn read_etcd_lease_record(

@@ -37,7 +37,7 @@ fn start_manager_with_split_timeout(addr: SocketAddr) {
             let _ = m.serve(addr).await;
         });
     });
-    std::thread::sleep(Duration::from_millis(200));
+    support::wait_accepting(addr, "start_manager_with_split_timeout");
 }
 
 struct Cluster {

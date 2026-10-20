@@ -50,7 +50,7 @@ fn start_node(
                 }
             });
     });
-    std::thread::sleep(Duration::from_millis(200));
+    support::wait_accepting(addr, "start_node");
     (flag, handle)
 }
 
@@ -69,7 +69,7 @@ fn start_fast_policy_manager(addr: SocketAddr, grace_secs: u64) {
             }
         });
     });
-    std::thread::sleep(Duration::from_millis(200));
+    support::wait_accepting(addr, "start_fast_policy_manager");
 }
 
 /// Append one record to a fresh RF 3 stream and seal it with every member
@@ -594,7 +594,7 @@ fn start_etcd_manager_stoppable(
             }
         });
     });
-    std::thread::sleep(Duration::from_millis(300));
+    support::wait_accepting(mgr_addr, "start_etcd_manager_stoppable");
     (flag, handle)
 }
 

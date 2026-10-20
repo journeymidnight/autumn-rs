@@ -19,8 +19,9 @@
 //! Multi-daemon coherence over actual ring buffers + cache
 //! invalidation is covered separately.
 
+mod support;
+
 use std::net::SocketAddr;
-use std::time::Duration;
 
 use autumn_client::ClusterClient;
 use autumn_manager::AutumnManager;
@@ -44,7 +45,7 @@ fn start_manager(addr: SocketAddr) {
             let _ = manager.serve(addr).await;
         });
     });
-    std::thread::sleep(Duration::from_millis(200));
+    support::wait_accepting(addr, "start_manager");
 }
 
 /// Build a `DaemonClientId` with a fixed UUID so test assertions

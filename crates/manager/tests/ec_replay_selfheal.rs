@@ -21,6 +21,8 @@
 //! call, and this test pins the cheaper half because it is the one that can be
 //! driven deterministically.
 
+mod support;
+
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -80,7 +82,7 @@ fn start_manager(addr: SocketAddr) {
             let _ = manager.serve(addr).await;
         });
     });
-    std::thread::sleep(Duration::from_millis(200));
+    support::wait_accepting(addr, "start_manager");
 }
 
 enum NodeCmd {
@@ -124,7 +126,7 @@ fn start_extent_node_with_cmds(
             }
         });
     });
-    std::thread::sleep(Duration::from_millis(200));
+    support::wait_accepting(addr, "start_extent_node_with_cmds");
     tx
 }
 

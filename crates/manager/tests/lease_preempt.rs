@@ -15,6 +15,8 @@
 //! `acquire_with_preempt_wait` with a budget that comfortably
 //! covers the grace window.
 
+mod support;
+
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
@@ -40,7 +42,7 @@ fn start_manager(addr: SocketAddr) {
             let _ = manager.serve(addr).await;
         });
     });
-    std::thread::sleep(Duration::from_millis(200));
+    support::wait_accepting(addr, "start_manager");
 }
 
 fn cid(byte: u8, host: &str) -> DaemonClientId {

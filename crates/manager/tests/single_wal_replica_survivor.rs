@@ -59,7 +59,7 @@ fn start_node(
             }
         });
     });
-    std::thread::sleep(Duration::from_millis(200));
+    support::wait_accepting(addr, "start_node");
     (flag, handle)
 }
 

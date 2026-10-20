@@ -32,7 +32,7 @@ fn start_stoppable_etcd_manager(mgr_addr: SocketAddr, etcd_endpoint: String) -> 
             }
         });
     });
-    std::thread::sleep(Duration::from_millis(200));
+    support::wait_accepting(mgr_addr, "start_stoppable_etcd_manager");
     flag
 }
 

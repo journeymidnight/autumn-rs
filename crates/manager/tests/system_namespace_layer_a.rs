@@ -37,7 +37,7 @@ fn start_memory_manager(mgr_addr: SocketAddr) {
             let _ = manager.serve(mgr_addr).await;
         });
     });
-    std::thread::sleep(Duration::from_millis(200));
+    support::wait_accepting(mgr_addr, "start_memory_manager");
 }
 
 async fn ns_create(mgr: &RpcClient, name: &str) {

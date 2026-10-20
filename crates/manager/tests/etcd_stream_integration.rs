@@ -26,7 +26,7 @@ fn start_etcd_manager(mgr_addr: SocketAddr, etcd_endpoint: String) {
             let _ = manager.serve(mgr_addr).await;
         });
     });
-    std::thread::sleep(Duration::from_millis(300));
+    support::wait_accepting(mgr_addr, "start_etcd_manager");
 }
 
 fn start_extent_node(addr: SocketAddr, dir: PathBuf, disk_id: u64) {
@@ -38,7 +38,7 @@ fn start_extent_node(addr: SocketAddr, dir: PathBuf, disk_id: u64) {
             let _ = n.serve(addr).await;
         });
     });
-    std::thread::sleep(Duration::from_millis(200));
+    support::wait_accepting(addr, "start_extent_node");
 }
 
 async fn register_node(mgr: &RpcClient, addr: &str, disk_uuid: &str) -> RegisterNodeResp {

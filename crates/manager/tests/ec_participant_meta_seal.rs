@@ -1,3 +1,5 @@
+mod support;
+
 /// EC conversion participants must end up with a SEALED `.meta`, not only a
 /// payload-location byte.
 ///
@@ -38,7 +40,7 @@ fn start_manager(addr: SocketAddr) {
             let _ = manager.serve(addr).await;
         });
     });
-    std::thread::sleep(Duration::from_millis(200));
+    support::wait_accepting(addr, "start_manager");
 }
 
 enum NodeCmd {
@@ -82,7 +84,7 @@ fn start_extent_node_with_cmds(
             }
         });
     });
-    std::thread::sleep(Duration::from_millis(200));
+    support::wait_accepting(addr, "start_extent_node_with_cmds");
     tx
 }
 

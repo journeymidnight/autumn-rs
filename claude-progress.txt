@@ -1,10 +1,9 @@
-Date: 2026-10-19 (4)
-TaskStatus: not_completed
-Task scope: user — GitHub CI: 4 targets failed (fuse_umount_exit, system_roll_tails_live_writer, cpuset_pinning, op_info_open_extent_shard).
-Current summary: three fixed, each reproduced under runner conditions first (4 cores via taskset, non-root via runuser nobody): fuse_umount_exit — AutoUnmount makes fuser add allow_other, which non-root fusermount3 refuses without user_allow_other (CI now sets it; ops.md notes it); cpuset_pinning needed 6 cores — PS now reuses EN cores (4 total), ablation still red; op_info_open_extent_shard needed 8 cores — 3 shards keep the open log extent (id 10) on shard 1, ablation still red.
-Main gaps: system_roll_tails_live_writer fails on CI but not locally (4 cores, non-root, 2 cores x10 all green); needs the CI log.
-Next steps: get that test's failure output from the CI log.
-
+Date: 2026-10-20
+TaskStatus: completed
+Task scope: user — GitHub CI: fuse_umount_exit, system_roll_tails_live_writer, cpuset_pinning, op_info_open_extent_shard failed.
+Current summary: 2044ae5f fixed the first, third and fourth (non-root FUSE mount needs user_allow_other; tests sized for 4 cores); CI then passed. With gh logged in, the CI log showed system_roll_tails_live_writer failing `connect ps: ConnectionRefused` right after start_partition_server, which slept a fixed 300 ms while the PS binds only after registering, syncing regions and opening partitions. Reproduced by delaying the PS start 1 s (old helper red at the same line, new green). Every in-process start helper (support + ~30 tests' local copies) now waits until its port accepts (support::wait_accepting, 60 s, names the service); two system_merge tests whose manager runs on the test's own runtime use spawn_partition_server + wait_accepting_async (a blocking wait starved that manager — found in review, reproduced by the full suite). Full manager suite: 1184 passed; failures were the two predicted deadlocks (fixed, rerun green) and a_compaction_reads_around_a_rotted_replica (~1 in 10, separate commit).
+Main gaps: none from this task.
+Next steps: watch the next CI run.
 Date: 2026-10-19 (3)
 TaskStatus: completed
 Task scope: user — GitHub CI red on missing toxiproxy-server; then fix BUG-LEASE-HEARTBEAT-CAS-OVERWRITE and the two flaky tests.

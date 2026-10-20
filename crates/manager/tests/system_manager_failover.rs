@@ -48,7 +48,7 @@ fn start_etcd_manager_stoppable(
             }
         });
     });
-    std::thread::sleep(Duration::from_millis(300));
+    support::wait_accepting(mgr_addr, "start_etcd_manager_stoppable");
     (flag, handle)
 }
 

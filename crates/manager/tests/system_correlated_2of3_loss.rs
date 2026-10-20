@@ -29,6 +29,8 @@
 //! `system_chaos` `healthy_count()` guard that forbids compound kills lives in a
 //! different binary and does not gate this one.
 
+mod support;
+
 use std::net::SocketAddr;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -57,7 +59,7 @@ fn start_manager(addr: SocketAddr) {
             let _ = manager.serve(addr).await;
         });
     });
-    std::thread::sleep(Duration::from_millis(300));
+    support::wait_accepting(addr, "start_manager");
 }
 
 /// A killable extent node wired to the manager (so recovery / EC conversion can
@@ -101,7 +103,7 @@ fn start_en(addr: SocketAddr, dir: std::path::PathBuf, disk_id: u64, mgr_addr: S
             // + all conn tasks cancelled and sockets closed.
         });
     });
-    std::thread::sleep(Duration::from_millis(200));
+    support::wait_accepting(addr, "start_en");
     KillableEn {
         node_id: 0,
         addr,

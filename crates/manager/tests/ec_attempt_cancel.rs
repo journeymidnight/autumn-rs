@@ -2,6 +2,8 @@
 //! failed on a participant, the manager cancels the marker at once — not after
 //! a run of identical failures — and the op closes FAILED naming that node.
 
+mod support;
+
 use std::net::SocketAddr;
 use std::rc::Rc;
 use std::time::Duration;
@@ -26,7 +28,7 @@ fn start_manager(addr: SocketAddr) {
             let _ = manager.serve(addr).await;
         });
     });
-    std::thread::sleep(Duration::from_millis(200));
+    support::wait_accepting(addr, "start_manager");
 }
 
 fn start_extent_node(addr: SocketAddr, dir: std::path::PathBuf, disk_id: u64, mgr: &str) {
@@ -38,7 +40,7 @@ fn start_extent_node(addr: SocketAddr, dir: std::path::PathBuf, disk_id: u64, mg
             let _ = n.serve(addr).await;
         });
     });
-    std::thread::sleep(Duration::from_millis(200));
+    support::wait_accepting(addr, "start_extent_node");
 }
 
 async fn call<T: rkyv::Archive>(mgr: &RpcClient, msg: u8, payload: bytes::Bytes) -> T

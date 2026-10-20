@@ -23,6 +23,8 @@
 //! (autumn-stream, `placement_cleanup`), which hands the applier a sample taken
 //! before the staging on purpose.
 
+mod support;
+
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -49,7 +51,7 @@ fn start_manager(addr: SocketAddr) {
             let _ = manager.serve(addr).await;
         });
     });
-    std::thread::sleep(Duration::from_millis(200));
+    support::wait_accepting(addr, "start_manager");
 }
 
 enum NodeCmd {
@@ -95,7 +97,7 @@ fn start_extent_node(
             }
         });
     });
-    std::thread::sleep(Duration::from_millis(200));
+    support::wait_accepting(addr, "start_extent_node");
     tx
 }
 

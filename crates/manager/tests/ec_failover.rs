@@ -1,3 +1,5 @@
+mod support;
+
 /// EC failover integration test:
 ///   4 extent nodes, 3-replica write, seal → EC 2+1 conversion,
 ///   kill one node, verify read still works, verify recovery to 4th node.
@@ -24,7 +26,7 @@ fn start_manager(addr: SocketAddr) {
             let _ = manager.serve(addr).await;
         });
     });
-    std::thread::sleep(Duration::from_millis(200));
+    support::wait_accepting(addr, "start_manager");
 }
 
 fn start_extent_node(addr: SocketAddr, dir: std::path::PathBuf, disk_id: u64, mgr: &str) {
@@ -36,7 +38,7 @@ fn start_extent_node(addr: SocketAddr, dir: std::path::PathBuf, disk_id: u64, mg
             let _ = n.serve(addr).await;
         });
     });
-    std::thread::sleep(Duration::from_millis(200));
+    support::wait_accepting(addr, "start_extent_node");
 }
 
 async fn register_node(mgr: &RpcClient, addr: &str, disk: &str) -> RegisterNodeResp {

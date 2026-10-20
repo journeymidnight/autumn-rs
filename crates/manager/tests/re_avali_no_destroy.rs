@@ -22,6 +22,8 @@
 //! target holds, with the only other member unreachable. The refill cannot
 //! succeed. The question under test is what the target is left holding.
 
+mod support;
+
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -47,7 +49,7 @@ fn start_manager(addr: SocketAddr) {
             let _ = manager.serve(addr).await;
         });
     });
-    std::thread::sleep(Duration::from_millis(200));
+    support::wait_accepting(addr, "start_manager");
 }
 
 fn start_extent_node(addr: SocketAddr, dir: PathBuf, disk_id: u64, mgr: &str) {
@@ -60,7 +62,7 @@ fn start_extent_node(addr: SocketAddr, dir: PathBuf, disk_id: u64, mgr: &str) {
             let _ = n.serve(addr).await;
         });
     });
-    std::thread::sleep(Duration::from_millis(200));
+    support::wait_accepting(addr, "start_extent_node");
 }
 
 /// A node that can be KILLED: dropping its runtime tears down the listener and
@@ -89,7 +91,7 @@ fn start_killable_extent_node(
             }
         });
     });
-    std::thread::sleep(Duration::from_millis(200));
+    support::wait_accepting(addr, "start_killable_extent_node");
     kill
 }
 

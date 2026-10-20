@@ -1,3 +1,5 @@
+mod support;
+
 use std::net::SocketAddr;
 use std::rc::Rc;
 use std::time::Duration;
@@ -24,7 +26,7 @@ fn start_manager(mgr_addr: SocketAddr) {
             let _ = manager.serve(mgr_addr).await;
         });
     });
-    std::thread::sleep(Duration::from_millis(200));
+    support::wait_accepting(mgr_addr, "start_manager");
 }
 
 /// Start an extent node on its own thread and return its address.
@@ -37,7 +39,7 @@ fn start_extent_node(addr: SocketAddr, dir: std::path::PathBuf, disk_id: u64) {
             let _ = n.serve(addr).await;
         });
     });
-    std::thread::sleep(Duration::from_millis(200));
+    support::wait_accepting(addr, "start_extent_node");
 }
 
 /// Register a node with the manager via RPC.
@@ -217,7 +219,7 @@ fn start_partition_server(ps_id: u64, mgr_addr: SocketAddr, ps_addr: SocketAddr)
             let _ = ps.serve(ps_addr).await;
         });
     });
-    std::thread::sleep(Duration::from_millis(200));
+    support::wait_accepting(ps_addr, "start_partition_server");
 }
 
 // ---------------------------------------------------------------------------

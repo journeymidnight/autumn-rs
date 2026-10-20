@@ -13,7 +13,6 @@
 mod support;
 
 use std::net::SocketAddr;
-use std::time::Duration;
 
 use autumn_manager::AutumnManager;
 use autumn_rpc::client::RpcClient;
@@ -32,7 +31,7 @@ fn start_etcd_manager(mgr_addr: SocketAddr, etcd_endpoint: String) {
             let _ = manager.serve(mgr_addr).await;
         });
     });
-    std::thread::sleep(Duration::from_millis(400));
+    support::wait_accepting(mgr_addr, "start_etcd_manager");
 }
 
 // ── deposed leader's writes are fence-rejected ──────────────────

@@ -60,7 +60,7 @@ fn start_en_with_mgr(
             let _ = n.serve(addr).await;
         });
     });
-    std::thread::sleep(Duration::from_millis(200));
+    support::wait_accepting(addr, "start_en_with_mgr");
 }
 
 /// Stoppable EN with the manager endpoint wired. `.shutdown()` + join drops
@@ -90,7 +90,7 @@ fn start_en_with_mgr_stoppable(
             }
         });
     });
-    std::thread::sleep(Duration::from_millis(200));
+    support::wait_accepting(addr, "start_en_with_mgr_stoppable");
     (flag, handle)
 }
 

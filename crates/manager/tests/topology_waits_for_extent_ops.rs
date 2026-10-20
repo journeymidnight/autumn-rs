@@ -55,7 +55,7 @@ fn start_manager_with_markers(addr: SocketAddr) -> mpsc::Sender<Marker> {
             let _ = m.serve(addr).await;
         });
     });
-    std::thread::sleep(Duration::from_millis(200));
+    support::wait_accepting(addr, "start_manager_with_markers");
     tx
 }
 

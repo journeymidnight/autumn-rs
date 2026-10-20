@@ -12,6 +12,8 @@
 //!
 //! Several events queued while parked: `ioring_lease_4.rs`.
 
+mod support;
+
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
@@ -38,7 +40,7 @@ fn start_manager(addr: SocketAddr) {
             let _ = manager.serve(addr).await;
         });
     });
-    std::thread::sleep(Duration::from_millis(200));
+    support::wait_accepting(addr, "start_manager");
 }
 
 fn cid(byte: u8, host: &str) -> DaemonClientId {

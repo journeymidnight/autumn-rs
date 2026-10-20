@@ -56,7 +56,7 @@ fn start_stoppable_etcd_manager(mgr_addr: SocketAddr, etcd_endpoint: String) -> 
             // cancelled → the etcd lease is no longer renewed and expires.
         });
     });
-    std::thread::sleep(Duration::from_millis(200));
+    support::wait_accepting(mgr_addr, "start_stoppable_etcd_manager");
     flag
 }
 

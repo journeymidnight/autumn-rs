@@ -126,6 +126,28 @@ pub fn pick_stable_port_pair() -> u16 {
 
 // ── Component startup ─────────────────────────────────────────────────
 
+/// Block until `addr` accepts a TCP connection. A server started on a thread
+/// binds after its setup (manager registration, region sync, partition
+/// opens), which a slow runner can stretch well past any fixed sleep.
+pub fn wait_accepting(addr: SocketAddr, what: &str) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_err() {
+        assert!(std::time::Instant::now() < deadline, "{what} never accepted on {addr}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// `wait_accepting` that yields between probes, for a test whose manager runs
+/// as a task on the test's own runtime: blocking would starve it, and the
+/// server being waited for needs it to come up.
+pub async fn wait_accepting_async(addr: SocketAddr, what: &str) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_err() {
+        assert!(std::time::Instant::now() < deadline, "{what} never accepted on {addr}");
+        compio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 /// Start a manager (no etcd) on its own thread.
 pub fn start_manager(mgr_addr: SocketAddr) {
     start_manager_with(mgr_addr, autumn_params::manager::ManagerParams::default());
@@ -138,7 +160,7 @@ pub fn start_manager_with(mgr_addr: SocketAddr, params: autumn_params::manager::
             let _ = manager.serve(mgr_addr).await;
         });
     });
-    std::thread::sleep(Duration::from_millis(200));
+    wait_accepting(mgr_addr, "manager");
 }
 
 /// Start an extent node on its own thread.
@@ -151,7 +173,7 @@ pub fn start_extent_node(addr: SocketAddr, dir: std::path::PathBuf, disk_id: u64
             let _ = n.serve(addr).await;
         });
     });
-    std::thread::sleep(Duration::from_millis(200));
+    wait_accepting(addr, "extent node");
 }
 
 /// Like `start_extent_node`, but STOPPABLE: `.shutdown()` + join makes the
@@ -182,7 +204,7 @@ pub fn start_extent_node_stoppable(
             // closed. Subsequent connects get ECONNREFUSED.
         });
     });
-    std::thread::sleep(Duration::from_millis(200));
+    wait_accepting(addr, "extent node");
     (flag, handle)
 }
 
@@ -201,7 +223,7 @@ pub fn start_extent_node_stoppable(
 /// is a no-op for already-open partitions and `serve()` reinstates the
 /// same base_port (idempotent). See
 /// `crates/partition-server/src/lib.rs::bind_listen_addr`.
-pub fn start_partition_server(ps_id: u64, mgr_addr: SocketAddr, ps_addr: SocketAddr) {
+pub fn spawn_partition_server(ps_id: u64, mgr_addr: SocketAddr, ps_addr: SocketAddr) {
     std::thread::spawn(move || {
         compio::runtime::Runtime::new().unwrap().block_on(async {
             // Match production (`autumn-ps`): pass the advertise addr so
@@ -219,7 +241,12 @@ pub fn start_partition_server(ps_id: u64, mgr_addr: SocketAddr, ps_addr: SocketA
             let _ = ps.serve(ps_addr).await;
         });
     });
-    std::thread::sleep(Duration::from_millis(300));
+}
+
+/// `spawn_partition_server`, then wait until it accepts.
+pub fn start_partition_server(ps_id: u64, mgr_addr: SocketAddr, ps_addr: SocketAddr) {
+    spawn_partition_server(ps_id, mgr_addr, ps_addr);
+    wait_accepting(ps_addr, "partition server");
 }
 
 /// Like `start_partition_server`, but returns a `ShutdownFlag`: calling
@@ -266,7 +293,7 @@ pub fn start_partition_server_stoppable(
             let _ = ps.serve_until_shutdown(ps_addr, shutdown).await;
         });
     });
-    std::thread::sleep(Duration::from_millis(300));
+    wait_accepting(ps_addr, "partition server");
     (flag, handle)
 }
 
@@ -1449,13 +1476,8 @@ pub fn start_partition_server_killable(
     };
     // The PS binds its listener only after every assigned partition finishes
     // recovery, so a fixed sleep is not a reliable ready signal.
-    for _ in 0..600 {
-        if std::net::TcpStream::connect_timeout(&ps_addr, Duration::from_millis(200)).is_ok() {
-            return ps;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    panic!("autumn-ps {ps_id} never accepted on {ps_addr}");
+    wait_accepting(ps_addr, &format!("autumn-ps {ps_id}"));
+    ps
 }
 
 /// Failpoints a re-executed child PS arms before it connects. See `ChildPs`.
@@ -1625,7 +1647,7 @@ pub fn start_extent_node_with_manager(
             let _ = n.serve(addr).await;
         });
     });
-    std::thread::sleep(Duration::from_millis(200));
+    wait_accepting(addr, "extent node");
 }
 
 /// Controlled manager: real handlers and metadata, no autonomous df consumer.
@@ -1678,7 +1700,7 @@ pub fn start_recovery_manager(addr: SocketAddr) -> RecoveryManagerControl {
             }
         });
     });
-    std::thread::sleep(Duration::from_millis(100));
+    wait_accepting(addr, "manager");
     RecoveryManagerControl(tx)
 }
 

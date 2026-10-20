@@ -48,7 +48,7 @@ fn start_extent_node_with_manager(
             let _ = n.serve(addr).await;
         });
     });
-    std::thread::sleep(Duration::from_millis(200));
+    support::wait_accepting(addr, "start_extent_node_with_manager");
 }
 
 /// A 2 s suspected timeout, so the test does not wait 10 s + a tick.

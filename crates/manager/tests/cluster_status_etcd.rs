@@ -36,7 +36,7 @@ fn start_manager(mgr_addr: SocketAddr, etcd_endpoint: String, id: u64) -> Arc<At
             }
         });
     });
-    std::thread::sleep(Duration::from_millis(200));
+    support::wait_accepting(mgr_addr, "start_manager");
     stop
 }
 

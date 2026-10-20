@@ -43,7 +43,7 @@ fn start_manager(addr: SocketAddr, etcd: String) -> (Arc<AtomicBool>, Arc<Atomic
             }
         });
     });
-    std::thread::sleep(Duration::from_millis(200));
+    support::wait_accepting(addr, "start_manager");
     (stop, seen)
 }
 

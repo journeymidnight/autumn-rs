@@ -6,8 +6,9 @@
 //! covers the wire path — the SDK's version gate, the handler accepting the
 //! new modes, and a refusal arriving as `AcquireResult::Conflict`.
 
+mod support;
+
 use std::net::SocketAddr;
-use std::time::Duration;
 
 use autumn_client::lease::{self, AcquireResult, DaemonClientId};
 use autumn_client::ClusterClient;
@@ -29,7 +30,7 @@ fn start_manager(addr: SocketAddr) {
             let _ = AutumnManager::new().serve(addr).await;
         });
     });
-    std::thread::sleep(Duration::from_millis(200));
+    support::wait_accepting(addr, "start_manager");
 }
 
 async fn granted(c: &ClusterClient, id: &DaemonClientId, ino: u64, mode: u8) -> bool {

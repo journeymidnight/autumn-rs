@@ -312,7 +312,9 @@ fn auto_dispatch_merge_orchestrates_full_flow() {
         upsert_partition(&mgr, 6001, log, row, meta, b"a", b"z").await;
 
         let ps_addr = pick_addr();
-        start_partition_server(95, mgr_addr, ps_addr);
+        // The manager runs on this runtime: wait without blocking it.
+        spawn_partition_server(95, mgr_addr, ps_addr);
+        wait_accepting_async(ps_addr, "partition server").await;
         // Give the PS a moment to register + open partition.
         compio::time::sleep(Duration::from_millis(2000)).await;
         let _ps = RpcClient::connect_as(ps_addr, autumn_rpc::version_hello::Role::Admin, None).await.expect("connect ps");
@@ -475,7 +477,9 @@ fn auto_dispatch_split_dispatches_msg_split_part() {
         upsert_partition(&mgr, 7001, log, row, meta, b"a", b"z").await;
 
         let ps_addr = pick_addr();
-        start_partition_server(96, mgr_addr, ps_addr);
+        // The manager runs on this runtime: wait without blocking it.
+        spawn_partition_server(96, mgr_addr, ps_addr);
+        wait_accepting_async(ps_addr, "partition server").await;
         compio::time::sleep(Duration::from_millis(2000)).await;
         let _ps = RpcClient::connect_as(ps_addr, autumn_rpc::version_hello::Role::Admin, None).await.expect("connect ps");
         let router = PsRouter::new(mgr_addr, ps_addr);

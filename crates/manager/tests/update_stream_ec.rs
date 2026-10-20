@@ -1,6 +1,7 @@
+mod support;
+
 /// Integration tests for MSG_UPDATE_STREAM_EC (FOPS-03).
 use std::net::SocketAddr;
-use std::time::Duration;
 
 use autumn_manager::AutumnManager;
 use autumn_rpc::client::RpcClient;
@@ -20,7 +21,7 @@ fn start_manager(addr: SocketAddr) {
             let _ = manager.serve(addr).await;
         });
     });
-    std::thread::sleep(Duration::from_millis(200));
+    support::wait_accepting(addr, "start_manager");
 }
 
 fn start_extent_node(addr: SocketAddr, dir: std::path::PathBuf, disk_id: u64, mgr: &str) {
@@ -33,7 +34,7 @@ fn start_extent_node(addr: SocketAddr, dir: std::path::PathBuf, disk_id: u64, mg
             let _ = n.serve(addr).await;
         });
     });
-    std::thread::sleep(Duration::from_millis(200));
+    support::wait_accepting(addr, "start_extent_node");
 }
 
 async fn register_node(mgr: &RpcClient, addr: &str, disk: &str) {
