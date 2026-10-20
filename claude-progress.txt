@@ -1,3 +1,14 @@
+Date: 2026-10-20 (3)
+TaskStatus: not_completed
+Task scope: user — /loop "fix P1 and P2": review items N2–N7 in feature_list.md.
+Current summary: four committed and pushed, each reproduced first, ablation-red, reviewed by a fresh subagent (Fable until its limit, then Opus):
+  - 8044b465 BUG-LEASE-GRANT-STALE-TXN: per-(term, inode) turns for writer-slot grants, writer close and the TTL sweep; a wait spanning a term answers NOT_LEADER; an expired writer's heartbeat is NotHeld. tests/lease_grant_stale_txn.rs.
+  - 9bb40788 BUG-CHECK-COMMIT-LENGTH-NO-LEADER-GATE: strict leader gate (a stale manager's owner-fence refusal does not rotate the caller); replay test now really stops manager 1.
+  - 883fd75f BUG-RPC-UNVALIDATED-FRAME-RESERVE: FrameDecoder payload limit, 1 MiB for manager/EN clients and PS clients until CLIENT_AUTH under authz; PS idle branch no longer decodes a second frame before the first is processed.
+  - f58abd30 BUG-FS-RETIRE-RECOVERY-DOUBLE-DECREMENT: rbase/ record of the inode before a count-down; fenced count-down and tombstone.
+  Uncommitted, tested and reviewed: BUG-FS-CREATE-NOT-CONDITIONAL + BUG-FS-RENAME-OVER-NONEMPTY-DIR (crates/fs/src/dir.rs, tests/system_fs_namespace.rs, fs CLAUDE.md, ops.md, ledger entries BUG-FS-NLINK-RMW / F-FS-NAMESPACE-GAPS / F-PS-CONDITIONAL-WRITE-GROUP-COMMIT). Held for the user: 4 sessions creating in one directory drop ~35% (7026/6613 → 4652/4283 per s, ABAB); single session unchanged (2557/2284 → 2678/2303). Cause: the create-only dirent CAS; PS conditional writes commit alone (no group commit).
+Main gaps: user decision on N3/N4 (ship now vs PS conditional-write group commit first).
+Next steps: on "ship", commit the working tree as is (it builds; fs + manager targets green). Otherwise F-PS-CONDITIONAL-WRITE-GROUP-COMMIT first.
 Date: 2026-10-20 (2)
 TaskStatus: completed
 Task scope: user — fix BUG-PUTSTREAM-OVERWRITE-NOT-ATOMIC (reproduce first).
