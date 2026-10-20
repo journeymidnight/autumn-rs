@@ -7,7 +7,9 @@ mod support;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use autumn_manager::AutumnManager;
 use autumn_rpc::client::RpcClient;
@@ -15,6 +17,31 @@ use autumn_rpc::manager_rpc::*;
 use autumn_stream::{ExtentNode, ExtentNodeConfig};
 
 use support::{pick_addr, start_etcd};
+
+/// Like `start_etcd_manager`; setting the returned flag drops the manager's
+/// runtime (its listener and its leader lease's keepalive with it).
+fn start_stoppable_etcd_manager(mgr_addr: SocketAddr, etcd_endpoint: String) -> Arc<AtomicBool> {
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_t = stop.clone();
+    std::thread::spawn(move || {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let manager = AutumnManager::new_with_etcd(vec![etcd_endpoint], support::manager_identity())
+                .await
+                .expect("new manager with etcd");
+            compio::runtime::spawn(async move {
+                if let Err(e) = manager.serve(mgr_addr).await {
+                    eprintln!("manager serve: {e:#}");
+                }
+            })
+            .detach();
+            while !stop_t.load(Ordering::Acquire) {
+                compio::time::sleep(Duration::from_millis(50)).await;
+            }
+        });
+    });
+    support::wait_accepting(mgr_addr, "start_stoppable_etcd_manager");
+    stop
+}
 
 /// Start manager with etcd on its own thread, return addr.
 fn start_etcd_manager(mgr_addr: SocketAddr, etcd_endpoint: String) {
@@ -164,7 +191,7 @@ fn etcd_replay_owner_lock_allows_check_commit_length_without_reacquire() {
 
         // Manager 1
         let mgr1_addr = pick_addr();
-        start_etcd_manager(mgr1_addr, etcd_endpoint.clone());
+        let stop1 = start_stoppable_etcd_manager(mgr1_addr, etcd_endpoint.clone());
 
         let mgr1 = RpcClient::connect_as(mgr1_addr, autumn_rpc::version_hello::Role::Admin, None).await.expect("connect mgr1");
 
@@ -205,29 +232,35 @@ fn etcd_replay_owner_lock_allows_check_commit_length_without_reacquire() {
         let check1: CheckCommitLengthResp = rkyv_decode(&resp).expect("decode");
         assert_eq!(check1.code, CODE_OK, "{}", check1.message);
 
-        // Kill manager1 by dropping connection, wait
-        drop(mgr1);
-        std::thread::sleep(Duration::from_millis(250));
-
-        // Manager 2
+        // Manager 2 starts as a standby; manager 1 stops and its leader
+        // lease runs out, so manager 2 takes over and replays.
         let mgr2_addr = pick_addr();
         start_etcd_manager(mgr2_addr, etcd_endpoint.clone());
-
+        drop(mgr1);
+        stop1.store(true, Ordering::Release);
         let mgr2 = RpcClient::connect_as(mgr2_addr, autumn_rpc::version_hello::Role::Admin, None).await.expect("connect mgr2");
 
         // key point: do not reacquire owner lock on manager2
-        let resp = mgr2
-            .call(
-                MSG_CHECK_COMMIT_LENGTH,
-                rkyv_encode(&CheckCommitLengthReq {
-                    stream_id,
-                    owner_key,
-                    owner_epoch: owner_epoch,
-                }),
-            )
-            .await
-            .expect("check commit length on manager2");
-        let check2: CheckCommitLengthResp = rkyv_decode(&resp).expect("decode");
+        let start = Instant::now();
+        let check2 = loop {
+            let resp = mgr2
+                .call(
+                    MSG_CHECK_COMMIT_LENGTH,
+                    rkyv_encode(&CheckCommitLengthReq {
+                        stream_id,
+                        owner_key: owner_key.clone(),
+                        owner_epoch,
+                    }),
+                )
+                .await
+                .expect("check commit length on manager2");
+            let check: CheckCommitLengthResp = rkyv_decode(&resp).expect("decode");
+            if check.code != CODE_NOT_LEADER {
+                break check;
+            }
+            assert!(start.elapsed() < Duration::from_secs(40), "manager2 never took over");
+            compio::time::sleep(Duration::from_millis(200)).await;
+        };
         assert_eq!(
             check2.code, CODE_OK,
             "owner lock replay failed: {}",

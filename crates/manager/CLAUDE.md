@@ -2514,7 +2514,10 @@ write-lease conflicts. `AllocInodesReq.volume` stays on the frozen client surfac
 every mutating handler keeps. A standby's store is frozen at its replay (nothing
 resyncs it), and PS and EN act on these answers (a stream's tail, an extent's
 layout, node addresses), so a standby refuses them
-(`en_multi_manager_etcd::a_standby_refuses_metadata_lookups`). An
+(`en_multi_manager_etcd::a_standby_refuses_metadata_lookups`).
+`check_commit_length` is strictly leader-gated: it checks the caller's owner
+epoch, and a stale manager's fence refusal (unlike NOT_LEADER) does not move
+the caller on — a partition open listing a standby first retried it forever. An
 ex-leader inside its leaderless window still answers them, as stale as its
 routing; the epoch fences, not this gate, are what keep data safe. During an etcd outage the ex-leader's in-memory routing is
 the freshest in existence and nothing can supersede it (no election, no mutation), so

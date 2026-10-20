@@ -2197,6 +2197,18 @@ impl AutumnManager {
     pub(crate) async fn handle_check_commit_length(&self, payload: Bytes) -> HandlerResult {
         let req: CheckCommitLengthReq =
             rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+        // Strictly the leader's: a standby's or an ex-leader's owner locks are
+        // stale, and its owner-fence refusal does not send the caller on to the
+        // leader the way NOT_LEADER does (a partition open retried it forever).
+        if let Err(err) = self.ensure_leader() {
+            return Ok(rkyv_encode(&CheckCommitLengthResp {
+                code: Self::err_to_code(&err),
+                message: err.to_string(),
+                stream_info: None,
+                end: 0,
+                last_ex_info: None,
+            }));
+        }
 
         let (stream, ex, nodes) = {
             let s = self.store.inner.borrow();

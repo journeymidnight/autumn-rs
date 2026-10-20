@@ -528,8 +528,8 @@ a comma-separated list; each poll (authz and runtime config, and its reconcile,
 extent-info and recovery-validation calls) tries the addresses in turn, starting
 from the one that answered last, and moves on after a transport error (a
 timeout included) or a NOT_LEADER answer. A standby manager answers the stream,
-extent and node lookups NOT_LEADER: its metadata is what it replayed when it
-started. To check it on a two-manager cluster:
+extent and node lookups and the commit-length check NOT_LEADER: its metadata is
+what it replayed when it started. To check it on a two-manager cluster:
 
 ```bash
 # EN started with --manager m2:9001,m1:9001 (the standby first), m1 leading:

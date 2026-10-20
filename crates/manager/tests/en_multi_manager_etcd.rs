@@ -123,12 +123,13 @@ fn en_polls_reach_the_leader_through_a_manager_list() {
 /// extent node acts on (is this extent sealed? where is that node?) must come
 /// from the leader: a standby answers them NOT_LEADER and the caller moves on.
 ///
-/// Ablation: drop the routing gate from any of the three handlers.
+/// Ablation: drop the routing gate from any of the four handlers.
 #[test]
 fn a_standby_refuses_metadata_lookups() {
     use autumn_rpc::manager_rpc::{
-        rkyv_decode, rkyv_encode, ExtentInfoReq, ExtentInfoResp, NodesInfoResp, StreamInfoReq,
-        StreamInfoResp, CODE_NOT_LEADER, MSG_EXTENT_INFO, MSG_NODES_INFO, MSG_STREAM_INFO,
+        rkyv_decode, rkyv_encode, CheckCommitLengthReq, CheckCommitLengthResp, ExtentInfoReq,
+        ExtentInfoResp, NodesInfoResp, StreamInfoReq, StreamInfoResp, CODE_NOT_LEADER,
+        MSG_CHECK_COMMIT_LENGTH, MSG_EXTENT_INFO, MSG_NODES_INFO, MSG_STREAM_INFO,
     };
     compio::runtime::Runtime::new().unwrap().block_on(async {
         let (_etcd_guard, etcd) = start_etcd().await;
@@ -154,9 +155,12 @@ fn a_standby_refuses_metadata_lookups() {
                     .unwrap();
             let n: NodesInfoResp =
                 rkyv_decode(&call(MSG_NODES_INFO, bytes::Bytes::new()).await).unwrap();
-            [s.code, e.code, n.code]
+            let req = CheckCommitLengthReq { stream_id: 1, owner_key: "o".into(), owner_epoch: 1 };
+            let l: CheckCommitLengthResp =
+                rkyv_decode(&call(MSG_CHECK_COMMIT_LENGTH, rkyv_encode(&req)).await).unwrap();
+            [s.code, e.code, n.code, l.code]
         };
-        assert_eq!(codes(standby).await, [CODE_NOT_LEADER; 3]);
+        assert_eq!(codes(standby).await, [CODE_NOT_LEADER; 4]);
         assert!(codes(leader).await.iter().all(|c| *c != CODE_NOT_LEADER));
     });
 }

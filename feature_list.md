@@ -32,12 +32,6 @@
 - **Acceptance**: 在递减前、递减后、删 pending 前后分别恢复，重复恢复任意次，`alias` 都能逐字节读到旧版本；单链接的旧 inode 最终可回收。修前红、修后绿。
 - `passes: false`
 
-### BUG-CHECK-COMMIT-LENGTH-NO-LEADER-GATE — standby 能成功回答 CheckCommitLength（P2）
-- **Trigger** (review.md N6，同一 manager 实例 `set_leader(false)` 后经真实 RPC 验证；此前在 F-TEST-FOLLOWUPS 中是推断): `handle_check_commit_length`（`crates/manager/src/rpc_handlers.rs`）解码后直接用本地 owner lock、stream、extent 和节点表，没有 `ensure_leader`，外层 dispatch 也不补。standby 上 `StreamInfo` 返回 NOT_LEADER，而 `CheckCommitLength` 返回 OK、end=4096；sealed 分支不访问 EN 即成功。调用方会把 standby 的旧 tail/长度当成功结果，无法按 NOT_LEADER 轮换。
-- **Scope**: 在读本地 owner/stream 状态前加与该权威查询语义一致的 leader gate（若要允许 leaderless 缓存服务，需明确期限与安全条件）。同时修正 `etcd_replay_owner_lock_allows_check_commit_length_without_reacquire`：`drop(mgr1)` 只关客户端，旧 manager 仍在跑，不能证明 failover 重放（见 F-TEST-FOLLOWUPS）。
-- **Acceptance**: 真实 leader/standby 集群里 leader roll tail / 推进 owner epoch 后，standby 对该 RPC 返回 NOT_LEADER，客户端轮换后拿到新 tail；去掉 gate 时该测试变红。
-- `passes: false`
-
 ### BUG-RPC-UNVALIDATED-FRAME-RESERVE — RPC 只收到 10 字节头就按声明长度预留内存（P2）
 - **Trigger** (review.md N7，真实 decoder 验证分配行为，未制造 OOM): `FrameDecoder::try_decode`（`crates/rpc/src/frame.rs`）在收到 body、校验 ctrl 长度/CRC 之前，按头里的 `payload_len` 对整帧 `reserve`；`payload_len` 是 u32 且 `MAX_PAYLOAD_LEN = u32::MAX`，上限检查不拒绝任何声明。喂 10 字节、声明 64 MiB，容量即达 67,108,874 字节；理论上限约 4 GiB/连接。opcode 与 CLIENT_AUTH 检查在解码之后，不能保护这次分配；完成 Client 角色握手的连接即可触发，多连接放大。
 - **Scope**: reserve 前按 service/opcode/连接阶段实施实际长度和并发内存预算；未完成业务鉴权的连接用更小的合法消息上限；分段接收，不凭未验证的头一次申请整帧。上限要容纳 recovery 分块等合法大请求。注意性能：热路径的大帧（append/bulk）不能因此多一次拷贝。
@@ -57,6 +51,7 @@
 - **Acceptance**: 每项写明结论（已补/已修/证伪）；补的测试消融变红。
 - `passes: false`
 - **notes** (2026-10-20): review.md N6 已坐实 `handle_check_commit_length` 缺 leader gate，另立 BUG-CHECK-COMMIT-LENGTH-NO-LEADER-GATE（含修正 `etcd_replay_owner_lock_...` 测试）；review.md 4.2 也确认 `system_gc_chunked_read` 不建立可 GC 的 sealed log 前置条件。
+- **notes** (2026-10-20): 已修：`handle_check_commit_length` 加严格 leader gate；`etcd_replay_owner_lock_allows_check_commit_length_without_reacquire` 改为真正停掉 mgr1 并等 mgr2 接任（两项结论：已修）。
 
 ### BUG-LEASE-HEARTBEAT-STALE-NOTHELD — 心跳快照期间重新 acquire 的 lease 会被迟到的 NotHeld 删掉（推断，未复现）
 - **Trigger** (2026-10-17 fuse_lease_loss 修复的 opus 评审): `lease_tasks.rs` 心跳循环先快照 `held_leases` 的 ino 再逐个 await 心跳 RPC；期间最后一次 release + 新 Open 可以重新 acquire 同一 ino，迟到的 `NotHeld` 把新条目删掉（现在还会多做一次失效）：后续写 EIO "no lease"，manager 那份新 lease 漏到 TTL 过期。
