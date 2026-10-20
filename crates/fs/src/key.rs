@@ -317,6 +317,22 @@ pub fn parse_pending_key(key: &[u8]) -> Option<(u64, u64)> {
     }
 }
 
+/// The inode bytes a session read just before counting down a link of `ino`
+/// it retires: `[0x04]rbase/[session BE][ino BE]`. The count and the retire
+/// record cannot change in one write; with this, recovery can tell whether
+/// the count-down landed (the inode reads as these bytes less one link).
+pub fn retire_base_key(session: u64, ino: u64) -> Vec<u8> {
+    let mut k = retire_base_prefix(session);
+    k.extend_from_slice(&ino.to_be_bytes());
+    k
+}
+
+pub fn retire_base_prefix(session: u64) -> Vec<u8> {
+    let mut k = super_key(b"rbase/");
+    k.extend_from_slice(&session.to_be_bytes());
+    k
+}
+
 /// A multipart upload: `[0x04]mpu/[id BE]` → `schema::UploadRecord`.
 pub fn upload_key(id: u64) -> Vec<u8> {
     let mut k = upload_prefix();

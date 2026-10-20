@@ -74,7 +74,7 @@ on-disk format changes. The `read_plan` benchmark measures cached planning acros
 | `0x02` | 目录项 | `[0x02][parent: u64 BE][name]` | DirentValue (rkyv) |
 | `0x03` | 文件数据 extent | `[0x03][ino: u64 BE][logical_off: u64 BE]` | raw bytes ≤ 8 MiB (`MAX_EXTENT`) |
 | `0x03` | 条带 extent (striped) | `[0x03][lane: u8][ino BE][logical_off BE]` | raw bytes ≤ `MAX_EXTENT` |
-| `0x04` | FS 超级块 | `[0x04][field]` | varies（`next_inode` / `schema_version` / `stripe_geom` / `rmtomb/[ino]`）|
+| `0x04` | FS 超级块 | `[0x04][field]` | varies（`next_inode` / `schema_version` / `stripe_geom` / `rmtomb/[ino]` / `sess/` / `pend/` / `rbase/[S][ino]`）|
 
 **Namespace 绑定**：wire key = `fs/[type][fields]`（一棵全局树）。`autumn-fuse` /
 `autumnfs` / PyO3 `autumn.Fs` 都没有 scope 参数；`FsState` 用 `connect(mgr, "fs")` / `scoped("fs")`。多棵互隔离的树用不同
@@ -522,6 +522,20 @@ dirent 换过去——`If-None-Match: *`（期望不存在）和 `If-Match`（�
   `--sweep-interval-secs` 一次）。它翻完 `sess/` 的每一页：网关每台 9 个活会话（8 个 worker +
   回收线程），只读第一页（1024）时，约 113 台以上的网关集群会让排在后面的死会话永远没人恢复
   （`system_publish::a_dead_session_behind_a_page_of_live_ones_is_recovered`，只读一页即红）。
+  - **Retire 只减一次 nlink**：被替换（或 S3 删除）的旧 inode 若还有别的名字，`retire`
+    先把它当前的字节记到 `[0x04]rbase/[S][ino]`，再从这份字节 CAS 出 nlink−1（两次写都带
+    会话租约，会话被别人恢复后迟到的写被围栏挡掉）；然后先删 `pend/` 记录、再删 `rbase/`。
+    恢复看到 Retire 记录且名字已归 successor 时：有 `rbase/` → inode 正是"它减一"说明已减，
+    正是"它"就补减，都不是（崩溃后别人改过这个 inode）就不动（泄漏，不会删掉别的名字还指着
+    的 inode）；没有 `rbase/` → 还没开始减，照常减。恢复结束删掉该会话剩下的 `rbase/`。以前
+    "已减、未删记录"时崩溃会再减一次，nlink=2 时删掉另一个名字指着的 inode
+    （`system_publish::a_retire_is_recovered_once_from_every_crash_point`，恢复不看 `rbase/`
+    即红）。只剩一个名字时直接写墓碑（幂等），不写 `rbase/`——除非同一次 retire 先前的
+    尝试已写过（CAS 输给了别的改动），那份 `rbase/` 也会被删；崩溃留下它时恢复按它判定，
+    结果最多是泄漏。会话租约挡掉的是"被恢复后才醒来"的会话：它的 CAS 重试会读到恢复已减
+    过的 nlink=1 去写墓碑，正是这一下删掉别名还指着的数据（`system_publish::
+    a_stalled_session_s_retire_is_fenced_after_its_recovery`，failpoint
+    `RETIRE_TEST_HOLD`；墓碑与减计数不带租约即红）。
   每个活会话每轮一次 manager acquire（被拒即跳过）。活会话自己留下的记录（结果未知的交换）只在它死后才被
   处理。持有会话的一方必须跑租约心跳（`spawn_lease_background_tasks`），否则会话租约
   30 s 后过期，清扫方会接管并围栏掉它还在写的一切。
@@ -595,8 +609,7 @@ dirent 换过去——`If-None-Match: *`（期望不存在）和 `If-Match`（�
   它对该 inode 的租约之后——否则自己的 REPLACE 让接收方的 EXCLUSIVE 冲突，回收落到扫描。
   未设置（FUSE、Python、系统测试）时一律当场回收，`remove_unreachable_inode` 行为不变；
   死会话恢复的 Retire 分支也当场回收。`retire` 的当场回收失败只记 WARN、照常删掉 Retire
-  记录（以前错误会留下记录给会话恢复）：墓碑已经写好，扫描会找到它，恢复再走一遍反而会
-  踩到"已减 nlink 再减一次"那条已知限制。
+  记录：墓碑已经写好，扫描会找到它。
   交接只覆盖"现在就能回收"的情况，下面几种仍要靠周期扫描（`--sweep-interval-secs 0` 时本
   网关永远不回收，只能等别的开着扫描的网关）：别的 worker / 网关 / 挂载还持有的文件（交出后
   EXCLUSIVE 冲突，墓碑留着）；终态上传里仍有活会话 pending 的对象（`cleanup` 留下上传记录）；
@@ -604,8 +617,7 @@ dirent 换过去——`If-None-Match: *`（期望不存在）和 `If-Match`（�
   里的该 inode 不会被交出。
 - 已知限制：FUSE 的 unlink/rename 是无条件 KV 操作，与网关同名并发时后者赢；恢复按"dirent
   是否指向它"判定，发布者在 CAS 与删记录之间崩溃、且恢复前有人把该名 rename 走，会被误判为
-  未发布而撤销；`Retire` 在"已减 nlink、未删记录"时崩溃，恢复会再减一次，nlink=2 时即删掉
-  另一个链接还指着的 inode。`flush_inode` 在 `put_inode` 之前就清掉 `dirty`，FUSE_FLUSH 的
+  未发布而撤销；Retire 恢复遇到崩溃后被别人改过的 inode 不减 nlink（泄漏）。`flush_inode` 在 `put_inode` 之前就清掉 `dirty`，FUSE_FLUSH 的
   put 失败后 RELEASE 看不到失败，分段 inode 的缓存不会被丢——下次 Open 按版本重建能兜住，
   PyO3 会读到 strict 错误（不是零）。
 

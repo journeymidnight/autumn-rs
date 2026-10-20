@@ -1530,6 +1530,11 @@ client-reachable each item falls back to the proxy and the client logs one WARN.
 
 ## Python `autumn.Fs` — shared inode-layout binding
 
+A file replaced by an S3 PUT (or deleted) while another name still links it
+keeps that name readable whatever point its publisher dies at, and a publisher
+that wakes after another gateway recovered its session is fenced out. Check:
+`cargo test -p autumn-manager --test system_publish`.
+
 `autumn.Fs` is a PyO3 binding over the **same** `autumn-fs` crate the
 `autumn-fuse` mount runs on (inode/dirent/extent layout) — it's the programmatic
 file surface (the `autumn-s3` gateway reads model weights through it). Headless

@@ -26,12 +26,6 @@
 - **Acceptance**: 非空目录目标、文件覆盖目录、目录覆盖文件都拒绝且源/目标不变；空目录合法替换正确维护父目录引用；同 inode rename 仍是 no-op。修前红、修后绿。
 - `passes: false`
 
-### BUG-FS-RETIRE-RECOVERY-DOUBLE-DECREMENT — Retire 恢复重复减 nlink，删掉仍被硬链接引用的 inode（P1）
-- **Trigger** (review.md N5，重建崩溃边界持久状态后执行真实恢复；`crates/fs/CLAUDE.md` 已记为已知限制): 正常 retire 先减旧 inode 的 nlink、后删 pending record；两步之间崩溃（或删 pending 失败后会话结束），恢复看到目录项指向 successor，又调 `drop_name_of` 再减一次。复现：`object`、`alias` 两个名字指向旧 inode，publish 新版本到 `object` 后 nlink 2→1，放回崩溃窗口内应存在的 `PendingOp::Retire` 并释放 session lease，另一个 `FsState` 跑 `recover_dead_sessions`：`alias` 还在，inode 已被删。现有 `a_retire_whose_swap_lost_leaves_a_linked_inode_alone` 测的是 swap 未获胜的情形。
-- **Scope**: 先复现。把 retire 操作 id/已应用标记与 inode 引用变更放进同一个条件更新，让恢复能判断这次递减是否已应用；只看 dirent 是否等于 successor 不够，单纯调换两次写的顺序会产生相反的泄漏窗口。
-- **Acceptance**: 在递减前、递减后、删 pending 前后分别恢复，重复恢复任意次，`alias` 都能逐字节读到旧版本；单链接的旧 inode 最终可回收。修前红、修后绿。
-- `passes: false`
-
 ### F-TEST-FOLLOWUPS — 测试集体检留下的缺口与疑点（未处理）
 - **Trigger** (2026-10-19，测试集体检的审查与删除过程中发现，均未在那次改动里处理):
   - `system_gc_chunked_read` 从不 roll 日志，GC 实际没跑（应加 roll_tails，而不是删）。

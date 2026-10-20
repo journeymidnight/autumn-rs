@@ -506,7 +506,7 @@ async fn flush_appends(
 /// by unlink and rename-over-existing once the last dirent is gone, and
 /// replayed by `sweep_unlink_tombstones` after a crash. Idempotent.
 pub async fn remove_unreachable_inode(state: &mut FsState, ino: u64) -> Result<()> {
-    if tombstone_unreachable(state, ino).await? {
+    if tombstone_unreachable(state, ino, autumn_client::WriteLease::ANON).await? {
         reclaim_unreachable(state, ino).await?;
     }
     Ok(())
@@ -515,9 +515,10 @@ pub async fn remove_unreachable_inode(state: &mut FsState, ino: u64) -> Result<(
 /// Write the tombstone of an inode that just became unreachable. Returns
 /// whether its data can be reclaimed now: not while this session has it open
 /// — POSIX keeps an unlinked file's data until its last close, and that
-/// close reclaims it (`FsState::unlinked_open`).
-pub async fn tombstone_unreachable(state: &mut FsState, ino: u64) -> Result<bool> {
-    state.kv_put(&crate::key::unlink_tombstone_key(ino), b"1").await?;
+/// close reclaims it (`FsState::unlinked_open`). `lease` fences the write:
+/// a publishing session's, so a session recovered by another is refused.
+pub async fn tombstone_unreachable(state: &mut FsState, ino: u64, lease: autumn_client::WriteLease) -> Result<bool> {
+    state.kv_put_fenced(&crate::key::unlink_tombstone_key(ino), b"1", lease).await?;
     if state.held_leases.borrow().contains_key(&ino) {
         state.unlinked_open.insert(ino);
         return Ok(false);

@@ -430,18 +430,38 @@ async fn end_swap(state: &mut FsState, replacing: Option<u64>, recorded: bool, l
 
 /// The name no longer names `o`: drop the name from it, then its record.
 /// A failure leaves the record for the session's recovery.
+/// Test-only failpoint: 1 = armed; the next `retire` takes it (2) and parks
+/// before counting down until the test stores 0 — a session stalled between
+/// its swap and its retire. One relaxed CAS per retire.
+#[doc(hidden)]
+pub static RETIRE_TEST_HOLD: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
 async fn retire(state: &mut FsState, parent: u64, name: &[u8], o: u64, lease: WriteLease) {
-    let r = drop_name_of(state, o).await;
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        if RETIRE_TEST_HOLD.compare_exchange(1, 2, Relaxed, Relaxed).is_ok() {
+            while RETIRE_TEST_HOLD.load(Relaxed) == 2 {
+                compio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        }
+    }
+    let r = drop_name_of(state, o, lease).await;
     release_lease(state, o).await;
     match r {
-        Ok(reclaim) => {
+        Ok(dropped) => {
             // After the release: this client's REPLACE would stop a
             // background reclaimer, which is another client.
-            if reclaim {
+            if let Dropped::LastName { reclaim: true, .. } = dropped {
                 crate::extent::reclaim_now_or_later(state, o).await;
             }
+            // The record first: a base without one is ignored, a record
+            // without its base would count the link down again.
             if let Err(e) = state.kv_delete_fenced(&key::pending_key(lease.inode_hint, o), lease).await {
                 tracing::warn!(ino = o, error = %e, "dropping a retire record failed");
+            } else if dropped.wrote_base() {
+                if let Err(e) = state.kv_delete_fenced(&key::retire_base_key(lease.inode_hint, o), lease).await {
+                    tracing::warn!(ino = o, error = %e, "dropping a retire base failed; the session's recovery removes it");
+                }
             }
         }
         Err(e) => tracing::warn!(
@@ -499,23 +519,91 @@ pub async fn delete_name(
     }
 }
 
-/// A name of inode `ino` is gone: count it down, and once none remain
-/// tombstone the inode. Returns whether its data is the caller's to reclaim
-/// now (`extent::reclaim_now_or_later`); the tombstone keeps it found if
-/// that never happens.
-async fn drop_name_of(state: &mut FsState, ino: u64) -> Result<bool> {
-    let Some(bytes) = state.kv_get_opt(&key::inode_key(ino)).await? else {
-        return Ok(false);
-    };
-    let mut m = schema::decode_inode_meta(&bytes).map_err(|e| anyhow!("inode {ino}: {e}"))?;
-    if m.nlink <= 1 {
-        state.inodes.remove(&ino);
-        crate::extent::tombstone_unreachable(state, ino).await
-    } else {
-        m.nlink -= 1;
-        meta::put_inode(state, ino, &m).await?;
-        Ok(false)
+/// What dropping a name did to the inode.
+enum Dropped {
+    /// No inode any more.
+    Gone { wrote_base: bool },
+    /// It had more names: one fewer now, and its bytes from before are under
+    /// `retire_base_key`.
+    Counted,
+    /// That was its last name: tombstoned. `reclaim`: its data is the
+    /// caller's to reclaim now (`extent::reclaim_now_or_later`); the
+    /// tombstone keeps it found if that never happens. `wrote_base`: an
+    /// earlier try counted down against a base before losing its race.
+    LastName { reclaim: bool, wrote_base: bool },
+}
+
+impl Dropped {
+    fn wrote_base(&self) -> bool {
+        matches!(
+            self,
+            Dropped::Counted | Dropped::Gone { wrote_base: true } | Dropped::LastName { wrote_base: true, .. }
+        )
     }
+}
+
+/// A name of inode `ino`, retired by session `lease.inode_hint`, is gone:
+/// count it down, and once none remain tombstone the inode. The count-down
+/// is a compare-and-set from bytes recorded first, so a recovery can tell
+/// whether it landed (`finish_drop`). Both writes carry the session's lease:
+/// once another session has recovered this one, a late write of it is
+/// refused instead of counting the link down a second time.
+async fn drop_name_of(state: &mut FsState, ino: u64, lease: WriteLease) -> Result<Dropped> {
+    let k = key::inode_key(ino);
+    let mut wrote_base = false;
+    for _ in 0..16 {
+        let Some(before) = state.kv_get_opt(&k).await? else {
+            return Ok(Dropped::Gone { wrote_base });
+        };
+        let mut m = schema::decode_inode_meta(&before).map_err(|e| anyhow!("inode {ino}: {e}"))?;
+        if m.nlink <= 1 {
+            state.inodes.remove(&ino);
+            let reclaim = crate::extent::tombstone_unreachable(state, ino, lease).await?;
+            return Ok(Dropped::LastName { reclaim, wrote_base });
+        }
+        state.kv_put_fenced(&key::retire_base_key(lease.inode_hint, ino), &before, lease).await?;
+        wrote_base = true;
+        m.nlink -= 1;
+        let counted = state
+            .client
+            .compare_write(&k, Some(&before), Some(&schema::encode_inode_meta(&m)), lease)
+            .await
+            .map_err(|e| anyhow!("count down inode {ino}: {e}"))?;
+        if counted {
+            if let Some(is) = state.inodes.get_mut(&ino) {
+                is.meta = m;
+            }
+            return Ok(Dropped::Counted);
+        }
+    }
+    Err(anyhow!("inode {ino} kept changing while a name was dropped from it"))
+}
+
+/// Recovery's half of a count-down `drop_name_of` recorded as `before`: the
+/// inode reading `before` less one link means it landed; reading `before`,
+/// that it did not, and it is made now. Anything else means another client
+/// changed the inode since the session died, and whether this count-down
+/// is in it cannot be told: the count is left as it is, a leak rather than
+/// a link another name still needs.
+async fn finish_drop(state: &mut FsState, ino: u64, before: &[u8], lease: WriteLease) -> Result<()> {
+    let k = key::inode_key(ino);
+    let mut m = schema::decode_inode_meta(before).map_err(|e| anyhow!("retire base of {ino}: {e}"))?;
+    m.nlink = m.nlink.saturating_sub(1);
+    let after = schema::encode_inode_meta(&m);
+    for _ in 0..16 {
+        let Some(cur) = state.kv_get_opt(&k).await? else { return Ok(()) };
+        if cur == after {
+            return Ok(());
+        }
+        if cur != before {
+            tracing::warn!(ino, "inode changed since its retire was recorded; its link count is left as it is");
+            return Ok(());
+        }
+        if state.client.compare_write(&k, Some(before), Some(&after), lease).await.map_err(|e| anyhow!("count down inode {ino}: {e}"))? {
+            return Ok(());
+        }
+    }
+    Err(anyhow!("inode {ino} kept changing while its retire was recovered"))
 }
 
 async fn hold_replace(state: &mut FsState, ino: u64) -> std::result::Result<(), PublishError> {
@@ -716,8 +804,15 @@ pub(crate) async fn recover_session(state: &mut FsState, s: u64, lease: WriteLea
                     // exactly `successor`; any other holder retired `ino`
                     // itself, and dropping a name from it again could delete
                     // an inode another link still names.
-                    if holder == successor && drop_name_of(state, ino).await? {
-                        crate::extent::reclaim_unreachable(state, ino).await?;
+                    if holder == successor {
+                        match state.kv_get_opt(&key::retire_base_key(s, ino)).await? {
+                            Some(before) => finish_drop(state, ino, &before, lease).await?,
+                            None => {
+                                if let Dropped::LastName { reclaim: true, .. } = drop_name_of(state, ino, lease).await? {
+                                    crate::extent::reclaim_unreachable(state, ino).await?;
+                                }
+                            }
+                        }
                     }
                 }
                 PendingOp::Part { upload, part, data_ino } => {
@@ -728,6 +823,18 @@ pub(crate) async fn recover_session(state: &mut FsState, s: u64, lease: WriteLea
                     crate::multipart::recover_complete(state, s, upload, new_ino, lease).await?;
                 }
             }
+            state.kv_delete_fenced(k, lease).await?;
+        }
+        if !has_more {
+            break;
+        }
+    }
+    // Bases outlive their records only until here (`retire` deletes the
+    // record first).
+    let prefix = key::retire_base_prefix(s);
+    loop {
+        let (keys, has_more) = state.kv_range_page(&prefix, &prefix, 256).await?;
+        for k in &keys {
             state.kv_delete_fenced(k, lease).await?;
         }
         if !has_more {

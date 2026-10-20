@@ -403,3 +403,149 @@ fn a_streamed_object_records_ahead_of_its_writes() {
         assert_eq!(st.kv_get_opt(&key::inode_key(ino)).await.unwrap(), None);
     });
 }
+
+/// A session that replaced `object` — one of two names of an inode — and
+/// died somewhere in retiring the old inode. Recovery from each crash point
+/// leaves `alias` reading the old bytes, however often it runs: the drop of
+/// `object`'s name from the old inode lands exactly once. A single-name
+/// inode left the same way is reclaimed.
+#[test]
+fn a_retire_is_recovered_once_from_every_crash_point() {
+    let mgr_addr = pick_addr();
+    start_manager(mgr_addr);
+    let n1_dir = tempfile::tempdir().expect("n1");
+    let n2_dir = tempfile::tempdir().expect("n2");
+    let n1 = pick_addr();
+    let n2 = pick_addr();
+    start_extent_node(n1, n1_dir.path().to_path_buf(), 1);
+    start_extent_node(n2, n2_dir.path().to_path_buf(), 2);
+
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        let _admin = boot(mgr_addr, n1, n2, 154, 15401).await;
+        let mgr = mgr_addr.to_string();
+        let mut st = FsState::new(&mgr).await.expect("mount");
+        meta::ensure_root(&mut st).await.expect("init_root");
+        let body = pattern(1 << 20, 9);
+        let old = put(&mut st, 1, "object", &body, Condition::None).await.unwrap();
+        dir::link(&mut st, old, 1, std::ffi::OsStr::new("alias")).await.unwrap();
+        let two_names = st.kv_get_opt(&key::inode_key(old)).await.unwrap().unwrap();
+
+        // The crashed session: it published over `object`, which retired
+        // `old` (2 names → 1).
+        let mut dead = FsState::new(&mgr).await.expect("mount2");
+        let new = put(&mut dead, 1, "object", b"new data", Condition::None).await.unwrap();
+        let one_name = dead.kv_get_opt(&key::inode_key(old)).await.unwrap().unwrap();
+        assert_eq!(schema::decode_inode_meta(&one_name).unwrap().nlink, 1);
+        let live = dead.session.unwrap();
+        assert!(dead.kv_get_opt(&key::retire_base_key(live, old)).await.unwrap().is_none(), "the live retire left its base");
+        let op = schema::encode_pending(&schema::PendingOp::Retire { parent: 1, name: b"object".to_vec(), ino: old, successor: Some(new) });
+
+        // Each crash point as the durable state it leaves: (inode bytes,
+        // retire record, the record of the inode before the drop).
+        let points: [(&str, &[u8], bool, Option<&[u8]>); 4] = [
+            ("before the drop", &two_names, true, None),
+            ("drop recorded, not landed", &two_names, true, Some(&two_names)),
+            ("drop landed, record kept", &one_name, true, Some(&two_names)),
+            ("record deleted, drop record kept", &one_name, false, Some(&two_names)),
+        ];
+        let mut rescuer = FsState::new(&mgr).await.expect("mount3");
+        for (point, inode, record, base) in points {
+            // A session per point: recovery removes the one it recovers.
+            let lease = fresh_session(&mut dead).await;
+            let s = lease.inode_hint;
+            dead.kv_put(&key::inode_key(old), inode).await.unwrap();
+            if record {
+                dead.kv_put_fenced(&key::pending_key(s, old), &op, lease).await.unwrap();
+            }
+            if let Some(b) = base {
+                dead.kv_put_fenced(&key::retire_base_key(s, old), b, lease).await.unwrap();
+            }
+            lease::release(&dead.client, &dead.client_id, s).await.unwrap();
+            // Twice: a recovery that ran to the end and found nothing to do
+            // must change nothing either.
+            for _ in 0..2 {
+                publish::recover_dead_sessions(&mut rescuer).await.unwrap();
+            }
+            let m = meta::fetch_inode(&mut rescuer, old).await.unwrap_or_else(|e| panic!("{point}: inode gone: {e}"));
+            assert_eq!(m.nlink, 1, "{point}");
+            assert_eq!(read_name(&mut rescuer, 1, "alias").await.unwrap(), body, "{point}");
+            assert!(rescuer.kv_get_opt(&key::retire_base_key(s, old)).await.unwrap().is_none(), "{point}: drop record left");
+        }
+
+        // A single-name inode whose replacement swapped the name and died
+        // before retiring it: recovery reclaims it.
+        let solo = put(&mut st, 1, "solo", b"solo data", Condition::None).await.unwrap();
+        let (succ, _) = dir::create(&mut st, 1, std::ffi::OsStr::new("succ"), 0o644).await.unwrap();
+        let lease = fresh_session(&mut dead).await;
+        let s = lease.inode_hint;
+        let op = schema::encode_pending(&schema::PendingOp::Retire { parent: 1, name: b"solo".to_vec(), ino: solo, successor: Some(succ) });
+        dead.kv_put_fenced(&key::pending_key(s, solo), &op, lease).await.unwrap();
+        let named = dead.kv_get_opt(&key::dirent_key(1, b"solo")).await.unwrap().unwrap();
+        let swapped = schema::encode_dirent(&schema::DirentValue { child_inode: succ, file_type: schema::DT_REG });
+        assert!(dead.client.compare_put(&key::dirent_key(1, b"solo"), Some(&named), &swapped).await.unwrap());
+        lease::release(&dead.client, &dead.client_id, s).await.unwrap();
+        publish::recover_dead_sessions(&mut rescuer).await.unwrap();
+        assert!(rescuer.kv_get_opt(&key::inode_key(solo)).await.unwrap().is_none(), "the single-name inode was not reclaimed");
+    });
+}
+
+/// A new publishing session for `st`, forgetting the one it had.
+async fn fresh_session(st: &mut FsState) -> autumn_client::WriteLease {
+    if let Some(s) = st.session.take() {
+        st.held_leases.borrow_mut().remove(&s);
+    }
+    publish::session_lease(st).await.unwrap()
+}
+
+/// A session stalls between its swap and its retire, loses its lease, and is
+/// recovered by another session, which drops the replaced name itself. When
+/// the stalled session wakes, its own drop is refused by the fence: the old
+/// inode's other name still reads.
+#[test]
+fn a_stalled_session_s_retire_is_fenced_after_its_recovery() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let mgr_addr = pick_addr();
+    start_manager(mgr_addr);
+    let n1_dir = tempfile::tempdir().expect("n1");
+    let n2_dir = tempfile::tempdir().expect("n2");
+    let n1 = pick_addr();
+    let n2 = pick_addr();
+    start_extent_node(n1, n1_dir.path().to_path_buf(), 1);
+    start_extent_node(n2, n2_dir.path().to_path_buf(), 2);
+
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        let _admin = boot(mgr_addr, n1, n2, 155, 15501).await;
+        let mgr = mgr_addr.to_string();
+        let mut st = FsState::new(&mgr).await.expect("mount");
+        meta::ensure_root(&mut st).await.expect("init_root");
+        let body = pattern(1 << 20, 11);
+        let old = put(&mut st, 1, "object", &body, Condition::None).await.unwrap();
+        dir::link(&mut st, old, 1, std::ffi::OsStr::new("alias")).await.unwrap();
+
+        let mut stalled = FsState::new(&mgr).await.expect("mount2");
+        let mut rescuer = FsState::new(&mgr).await.expect("mount3");
+        let s = publish::session_lease(&mut stalled).await.unwrap().inode_hint;
+        let stalled_id = stalled.client_id.clone();
+        let cluster = rescuer.client.clone();
+        publish::RETIRE_TEST_HOLD.store(1, Relaxed);
+        let (published, ()) = futures::join!(put(&mut stalled, 1, "object", b"new data", Condition::None), async {
+            let start = std::time::Instant::now();
+            while publish::RETIRE_TEST_HOLD.load(Relaxed) != 2 {
+                assert!(start.elapsed() < Duration::from_secs(30), "the retire never reached the hold");
+                compio::time::sleep(Duration::from_millis(10)).await;
+            }
+            // Its lease gone (as if it had stopped heartbeating), the session
+            // is recovered; the recovery drops `object`'s name from `old`.
+            lease::release(&cluster, &stalled_id, s).await.unwrap();
+            assert!(publish::recover_dead_sessions(&mut rescuer).await.unwrap() >= 1);
+            publish::RETIRE_TEST_HOLD.store(0, Relaxed);
+        });
+        // Its swap had landed; what it does after is fenced.
+        if let Err(e) = published {
+            assert!(format!("{e:#}").contains("fenced"), "{e:#}");
+        }
+        let m = meta::fetch_inode(&mut rescuer, old).await.expect("the alias's inode was deleted");
+        assert_eq!(m.nlink, 1);
+        assert_eq!(read_name(&mut rescuer, 1, "alias").await.unwrap(), body);
+    });
+}
