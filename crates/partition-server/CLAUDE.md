@@ -3196,23 +3196,45 @@ an SDK client keeps its pre-merge connection and routing cache.
 
 ## Conditional metadata writes
 
-MSG_COMPARE_PUT runs inside the sole partition write actor. It drains previously
-admitted/in-flight writes before reading the visible MVCC value, then holds user
-write admission through its WAL append and ordered Phase 3 publication. This is
-partition-wide serialization for rare metadata commits; ordinary bulk writes keep
-their existing pipeline. The append uses the normal completion handler, including
-ownership-loss poisoning. The comparison lookup is bounded to 64 KiB + 1 and
+MSG_COMPARE_PUT runs inside the sole partition write actor, so conditional writes
+are compared in arrival order. The comparison reads the committed (MVCC-visible)
+value; a write applies to the memtable only once its batch commits. So when the
+key has a write still uncommitted — queued in `pending` (`WriteRequest::writes_key`)
+or in a batch in flight (`inflight_write_keys`, a hash: a collision only costs a
+wait) — the actor first commits everything admitted (the admission drain, which
+stops at a poisoning completion). A key nothing has written since its last commit
+— a new name, the usual case — waits for nothing. Either way the guarded write is
+then queued in `pending` and commits with the next group-commit batch, answering
+the client from there like a put (`compare_write_admit`). It used to append and
+await its own batch while holding the actor: concurrent creates then each paid a
+serialized append, and 4 sessions creating in one directory ran ~35% slower
+than with plain puts. Group-committed, the same creates run 10.4–10.9K/s when
+they skip the parent's mtime (the conditional write on that one busy key is what
+still serializes; the fs layer writes it at most once a second, see its guide).
+A comparison that fails is answered at once, or once a floor it raised is durable
+(`WriteResponder::Conflict`). A raised floor fences other writers from the moment
+it is admitted, before its record is durable — as for every fenced put; a crash
+in between loses only a floor that has refused writes, the fail-closed direction.
+Parking a request whose key is uncommitted instead of draining, so the actor keeps
+admitting others, was measured slower on that workload (5.2K vs 6.2K creates/s):
+most such requests are stale and fail after the wait anyway. Comparing against the
+newest queued value instead of draining is not sound: a batch can fail before
+anything is written while a later one commits, which would persist a write derived
+from one that never applied. The lookup is bounded to 64 KiB + 1 and
 checks epoch/range/freeze both before and after I/O. SST reads, expiry, tombstones
 and GC read pins use the existing GET core. A mismatch returns a body-level
 CODE_PRECONDITION, not a stale-routing frame error. Namespace/authz apply before
 admission. UUIDs in object metadata give the adapter an ABA-free ETag.
+Tests: `crates/manager/tests/compare_write_concurrency.rs` (one winner of 32
+creates, no increment lost by 8 read-CAS loops, a comparison sees a put sent just
+before it; without the uncommitted-key drain all three are red).
 
-MSG_COMPARE_WRITE shares that handler (`compare_write_inner`; MSG_COMPARE_PUT is
+MSG_COMPARE_WRITE shares that handler (`compare_write_admit`; MSG_COMPARE_PUT is
 the unfenced, value-only case of it). Order: epoch/range/freeze, then the fence
 check-and-bump, then the comparison, then the write — a misrouted request never
 raises a floor. A floor the request raised is persisted as an OP_FENCE_BUMP
 record whether or not the comparison holds, and a failed comparison is reported
-only after that record is durable (the reply rides the batch's last record).
+only after that record is durable (the reply rides the record).
 That makes a compare that cannot hold a pure, durable floor bump for the key's
 partition: a recovering owner uses it to fence out a dead owner's late writes.
 A conditional delete writes a tombstone through the same batch. Covered by

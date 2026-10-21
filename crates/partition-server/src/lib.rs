@@ -1923,6 +1923,12 @@ pub(crate) enum WriteResponder {
         accum: Rc<BatchPutAccumulator>,
         idx: usize,
     },
+    /// A conditional write whose comparison failed after it raised a fence
+    /// floor: answered with the conflict once the floor is durable.
+    Conflict {
+        outer: oneshot::Sender<HandlerResult>,
+        key: Vec<u8>,
+    },
     /// BUG-LEASE-2 Phase 2: responder for a `WriteOp::FenceBump` record.
     /// No client is waiting on it — the client's reply rides the admitted
     /// write's own responder. send_ok is a no-op; send_err only logs (the
@@ -1935,7 +1941,7 @@ impl WriteResponder {
     /// Reply success (batch committed). Encodes the appropriate RPC response
     /// frame bytes and forwards them to the outer ps-conn oneshot. Returns
     /// whether a client frame was answered — one admission slot released on
-    /// its connection: always for a Put or Delete, only on the last op of a
+    /// its connection: always for a Put, Delete or Conflict, only on the last op of a
     /// batch frame, never for a fence record. `CoalesceWindow` sizes the
     /// refill it waits for by that count.
     pub(crate) fn send_ok(self) -> bool {
@@ -1953,6 +1959,15 @@ impl WriteResponder {
                 let bytes = partition_rpc::rkyv_encode(&DeleteResp {
                     code: CODE_OK,
                     message: String::new(),
+                    key,
+                });
+                let _ = outer.send(Ok(bytes));
+                true
+            }
+            WriteResponder::Conflict { outer, key } => {
+                let bytes = partition_rpc::rkyv_encode(&PutResp {
+                    code: CODE_PRECONDITION,
+                    message: "compare_put conflict".to_string(),
                     key,
                 });
                 let _ = outer.send(Ok(bytes));
@@ -1979,7 +1994,9 @@ impl WriteResponder {
 
     fn send_status(self, status: StatusCode, msg: String) {
         let outer = match self {
-            WriteResponder::Put { outer, .. } | WriteResponder::Delete { outer, .. } => outer,
+            WriteResponder::Put { outer, .. }
+            | WriteResponder::Delete { outer, .. }
+            | WriteResponder::Conflict { outer, .. } => outer,
             WriteResponder::BatchPut { accum, idx } => {
                 accum.record(idx, partition_rpc::code_for_status(status));
                 return;
@@ -2020,6 +2037,7 @@ impl WriteResponder {
         let outer = match self {
             WriteResponder::Put { outer, .. } => outer,
             WriteResponder::Delete { outer, .. } => outer,
+            WriteResponder::Conflict { outer, .. } => outer,
             WriteResponder::BatchPut { .. } | WriteResponder::Fence => {
                 unreachable!("handled above")
             }
@@ -2034,6 +2052,15 @@ pub(crate) struct WriteRequest {
 }
 
 impl WriteRequest {
+    /// Whether this request writes the user key `key`.
+    fn writes_key(&self, key: &[u8]) -> bool {
+        match &self.op {
+            WriteOp::Put { user_key, .. } => user_key[..] == *key,
+            WriteOp::Delete { user_key } => user_key[..] == *key,
+            WriteOp::FenceBump { .. } => false,
+        }
+    }
+
     /// Bytes this request adds to a group-commit batch's `AppendReq`.
     ///
     /// EXACT, not an estimate: `MAX_WRITE_BATCH_BYTES` splits the batch on this
@@ -7708,36 +7735,53 @@ async fn handle_incoming_req(
     poisoned: &Rc<Cell<bool>>,
 ) {
     if req.msg_type == partition_rpc::MSG_COMPARE_PUT || req.msg_type == partition_rpc::MSG_COMPARE_WRITE {
-        // This actor owns user-write admission. Drain preceding writes and
-        // retain admission across the comparison and durable publication.
-        // Stop at a poisoning completion: awaiting the rest would let the
-        // connection tasks serve reads the reopen may contradict.
-        while !poisoned.get() {
-            let Some(c) = inflight.next().await else { break };
-            let id = part.borrow().part_id;
-            handle_completion(part, metrics, poisoned, id, c).await;
-        }
-        while !pending.is_empty() && !poisoned.get() {
-            match start_write_batch(part, take_byte_bounded_batch(pending)).await {
-                Ok(Some(mut flight)) => {
-                    let result = (&mut flight.phase2_fut).await;
-                    let id = part.borrow().part_id;
-                    handle_completion(
-                        part,
-                        metrics,
-                        poisoned,
-                        id,
-                        InflightCompletion {
-                            data: flight.data,
-                            phase2_result: result,
-                        },
-                    )
-                    .await;
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    let _ = req.resp_tx.send(Err((StatusCode::Internal, e.to_string())));
-                    return;
+        let cond = match rpc_handlers::decode_conditional(req.msg_type, &req.payload) {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = req.resp_tx.send(Err(e));
+                return;
+            }
+        };
+        // This actor owns user-write admission, so requests are compared in
+        // arrival order. The comparison reads committed state: a write to the
+        // key still queued or in flight is committed first (stopping at a
+        // poisoning completion: awaiting the rest would let the connection
+        // tasks serve reads the reopen may contradict). A key nothing has
+        // touched since its last commit — a new name, the common case — waits
+        // for nothing and its write joins the next batch.
+        let uncommitted = pending.iter().any(|w| w.writes_key(&cond.key))
+            || part
+                .borrow()
+                .inflight_write_keys
+                .contains_key(&background::inflight_key_hash(&cond.key));
+        if uncommitted {
+            while !poisoned.get() {
+                let Some(c) = inflight.next().await else { break };
+                let id = part.borrow().part_id;
+                handle_completion(part, metrics, poisoned, id, c).await;
+            }
+            while !pending.is_empty() && !poisoned.get() {
+                match start_write_batch(part, take_byte_bounded_batch(pending)).await {
+                    Ok(Some(mut flight)) => {
+                        let result = (&mut flight.phase2_fut).await;
+                        let id = part.borrow().part_id;
+                        handle_completion(
+                            part,
+                            metrics,
+                            poisoned,
+                            id,
+                            InflightCompletion {
+                                data: flight.data,
+                                phase2_result: result,
+                            },
+                        )
+                        .await;
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        let _ = req.resp_tx.send(Err((StatusCode::Internal, e.to_string())));
+                        return;
+                    }
                 }
             }
         }
@@ -7748,12 +7792,7 @@ async fn handle_incoming_req(
             )));
             return;
         }
-        let response = if req.msg_type == partition_rpc::MSG_COMPARE_WRITE {
-            rpc_handlers::compare_write(req.payload, part, metrics, poisoned).await
-        } else {
-            rpc_handlers::compare_put(req.payload, part, metrics, poisoned).await
-        };
-        let _ = req.resp_tx.send(response);
+        rpc_handlers::compare_write_admit(cond, part, pending, req.resp_tx).await;
         return;
     }
     // bump per-partition request counter for the policy engine.
