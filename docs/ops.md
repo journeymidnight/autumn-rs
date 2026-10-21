@@ -1557,7 +1557,11 @@ changing`). Directory times have one-second resolution: a create, unlink or link
 moves the parent's mtime and ctime only when they are not already in the current
 wall-clock second, as on a filesystem with 1 s timestamps (clients with skewed
 clocks write it every time). This holds for the mount and `autumn.Fs`; an S3 PUT
-does not touch its directory's times. Check: `cargo test -p autumn-manager --test system_fs_namespace`.
+does not touch its directory's times. A file's link count moves only by
+compare-and-set: an `ln` racing an `rm` of the same file from another client
+either leaves the new name reading the file or fails `ENOENT`, and a writer's
+flush or a `chmod` never puts back a link count another client changed. Check:
+`cargo test -p autumn-manager --test system_fs_namespace --test system_fs_links`.
 On a mount: `mkdir -p d/x s; mv -T s d` → `Directory not empty`, and `ls d/x`
 still works.
 

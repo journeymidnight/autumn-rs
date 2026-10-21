@@ -95,7 +95,7 @@ fn cold_remount_reads_back_written_extents() {
                 .await
                 .expect("mount1");
             meta::ensure_root(&mut state).await.expect("init_root");
-            meta::put_inode(&mut state, ino, &meta::new_file_meta(0o644, 0, 0))
+            meta::put_new_inode(&mut state, ino, &meta::new_file_meta(0o644, 0, 0))
                 .await
                 .expect("put_inode");
             let n = write::write(&mut state, ino, 0, &data).await.expect("write");

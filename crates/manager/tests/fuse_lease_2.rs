@@ -116,7 +116,7 @@ fn multiple_distinct_inos_each_get_invalidated() {
         // target this reader's inbox).
         for &ino in &inos {
             let m = meta::new_file_meta(0o644, 0, 0);
-            meta::put_inode(&mut reader, ino, &m).await.expect("seed");
+            meta::put_new_inode(&mut reader, ino, &m).await.expect("seed");
             let info = match lease::acquire(&reader.client, &reader.client_id, ino, LEASE_MODE_READ)
                 .await
                 .unwrap()

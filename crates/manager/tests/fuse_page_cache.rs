@@ -59,7 +59,7 @@ async fn mount(mgr_addr: std::net::SocketAddr) -> FsState {
 
 async fn seed_file(state: &mut FsState, name: &[u8], ino: u64) {
     let m = meta::new_file_meta(0o644, 0, 0);
-    meta::put_inode(state, ino, &m).await.expect("put_inode");
+    meta::put_new_inode(state, ino, &m).await.expect("put_inode");
     let dk = key::dirent_key(ROOT_INO, name);
     let dv = schema::encode_dirent(&DirentValue { child_inode: ino, file_type: DT_REG });
     state.kv_put(&dk, &dv).await.expect("put dirent");

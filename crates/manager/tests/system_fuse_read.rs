@@ -92,7 +92,7 @@ fn variable_length_extents() {
         // Create the inode (size 0), then write the whole file through the real
         // buffered write path so the extent keys are produced by the code.
         let m = meta::new_file_meta(0o644, 0, 0);
-        meta::put_inode(&mut state, ino, &m)
+        meta::put_new_inode(&mut state, ino, &m)
             .await
             .expect("put_inode");
         let n = write::write(&mut state, ino, 0, &data)
@@ -224,7 +224,7 @@ fn a_second_mount_sees_appended_data_on_a_linear_read() {
 
         let ino = 137u64;
         let m = meta::new_file_meta(0o644, 0, 0);
-        meta::put_inode(&mut writer, ino, &m).await.expect("put_inode");
+        meta::put_new_inode(&mut writer, ino, &m).await.expect("put_inode");
 
         // First generation: write + flush, so it is durable and visible.
         let first = pattern(1024 * 1024);

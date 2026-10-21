@@ -1,3 +1,9 @@
+Date: 2026-10-21 (2)
+TaskStatus: completed
+Task scope: user — BUG-FS-NLINK-RMW.
+Current summary: reproduced (tests/system_fs_links.rs: an unlink racing a link of the same file lost the new name's data in 29 of 40 rounds; a writer's flush and a whole-inode write from a stale copy put back a link count another session changed). Fix: link counts move only through `meta::change_links` (CAS on the stored bytes, fresh ctime, unfenced; refuses +1 on a gone or zero-count inode; the caller reaching 0 reclaims); `meta::put_inode` keeps the stored nlink (and a newer ctime) and refuses a gone inode, new inodes use `put_new_inode`; retire takes the last name's count to 0 before its tombstone; an unknown outcome is settled by re-reading (own value = landed, expected value = retry, anything else = error, count left high). Ablations red: put_inode not keeping nlink, +1 allowed at 0, retire without the 0 CAS, re-applying after an undecidable unknown (system_fs_links_lost_reply.rs, failpoint CHANGE_LINKS_TEST_LOST_REPLY). Small-file create+write+flush unchanged (2606/2841 vs 2506/2718 per s). Three fresh Opus reviews; one HIGH (double count-down after a lost reply) fixed with its ablation test.
+Main gaps: F-FS-NAMESPACE-GAPS (incl. a zero-count inode leak after an undecidable unknown, inferred).
+Next steps: pick from feature_list.md.
 Date: 2026-10-21
 TaskStatus: completed
 Task scope: user — finish review items N3/N4; first make PS conditional writes ride the group commit (user chose this over shipping the −35% concurrent-create regression), then the parent-mtime trade-off (user chose option 1: directory times at 1 s resolution).

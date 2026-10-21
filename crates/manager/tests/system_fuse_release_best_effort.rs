@@ -81,7 +81,7 @@ fn release_must_not_consume_the_sticky_flush_error() {
 
         let ino = 900u64;
         let m = meta::new_file_meta(0o644, 0, 0);
-        meta::put_inode(&mut state, ino, &m).await.expect("put_inode");
+        meta::put_new_inode(&mut state, ino, &m).await.expect("put_inode");
 
         // Warm the extent cache with one SUCCESSFUL flush, or the next flush
         // fails while PLANNING (the map scan needs the PS) and none is spawned.
@@ -227,7 +227,7 @@ fn a_failed_last_writer_flush_keeps_the_write_lease() {
 
         let ino = 901u64;
         let m = meta::new_file_meta(0o644, 0, 0);
-        meta::put_inode(&mut state, ino, &m).await.expect("put_inode");
+        meta::put_new_inode(&mut state, ino, &m).await.expect("put_inode");
 
         // The faststart shape: a write fd and a read fd on the same inode.
         let (tx, rx) = bridge::reply_channel::<(u64, u32)>();

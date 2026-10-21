@@ -71,7 +71,7 @@ fn a_logging_only_caller_must_not_eat_the_sticky_flush_error() {
 
         let ino = 800u64;
         let m = meta::new_file_meta(0o644, 0, 0);
-        meta::put_inode(&mut state, ino, &m).await.expect("put_inode");
+        meta::put_new_inode(&mut state, ino, &m).await.expect("put_inode");
 
         // Warm the extent cache with one SUCCESSFUL flush. Without this the
         // next flush fails while PLANNING (the extent-map scan needs the PS),
@@ -172,7 +172,7 @@ fn the_read_after_write_barrier_must_not_eat_the_sticky_flush_error() {
 
         let ino = 1000u64;
         let m = meta::new_file_meta(0o644, 0, 0);
-        meta::put_inode(&mut state, ino, &m).await.expect("put_inode");
+        meta::put_new_inode(&mut state, ino, &m).await.expect("put_inode");
 
         let warm = vec![0xCDu8; write_buf_cap()];
         write::write(&mut state, ino, 0, &warm).await.expect("warm write");
@@ -282,7 +282,7 @@ fn the_write_path_flushes_must_not_eat_the_sticky_flush_error() {
 
         let ino = 1100u64;
         let m = meta::new_file_meta(0o644, 0, 0);
-        meta::put_inode(&mut state, ino, &m).await.expect("put_inode");
+        meta::put_new_inode(&mut state, ino, &m).await.expect("put_inode");
 
         let warm = vec![0xCDu8; write_buf_cap()];
         write::write(&mut state, ino, 0, &warm).await.expect("warm write");

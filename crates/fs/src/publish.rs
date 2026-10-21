@@ -557,6 +557,20 @@ async fn drop_name_of(state: &mut FsState, ino: u64, lease: WriteLease) -> Resul
         };
         let mut m = schema::decode_inode_meta(&before).map_err(|e| anyhow!("inode {ino}: {e}"))?;
         if m.nlink <= 1 {
+            // Its count reaches 0 before its tombstone: a link racing in
+            // after that is refused (`meta::change_links`), not given a name
+            // over data about to go.
+            m.nlink = 0;
+            let after = schema::encode_inode_meta(&m);
+            if after != before
+                && !state
+                    .client
+                    .compare_write(&k, Some(&before), Some(&after), lease)
+                    .await
+                    .map_err(|e| anyhow!("count down inode {ino}: {e}"))?
+            {
+                continue;
+            }
             state.inodes.remove(&ino);
             let reclaim = crate::extent::tombstone_unreachable(state, ino, lease).await?;
             return Ok(Dropped::LastName { reclaim, wrote_base });
@@ -581,26 +595,31 @@ async fn drop_name_of(state: &mut FsState, ino: u64, lease: WriteLease) -> Resul
 
 /// Recovery's half of a count-down `drop_name_of` recorded as `before`: the
 /// inode reading `before` less one link means it landed; reading `before`,
-/// that it did not, and it is made now. Anything else means another client
-/// changed the inode since the session died, and whether this count-down
-/// is in it cannot be told: the count is left as it is, a leak rather than
-/// a link another name still needs.
-async fn finish_drop(state: &mut FsState, ino: u64, before: &[u8], lease: WriteLease) -> Result<()> {
+/// that it did not, and it is made now. A count already at 0 means a later
+/// try of the same drop took the last name and died before its tombstone:
+/// the tombstone is written now, and `true` asks the caller to reclaim.
+/// Anything else means another client changed the inode since the session
+/// died, and whether this count-down is in it cannot be told: the count is
+/// left as it is, a leak rather than a link another name still needs.
+async fn finish_drop(state: &mut FsState, ino: u64, before: &[u8], lease: WriteLease) -> Result<bool> {
     let k = key::inode_key(ino);
     let mut m = schema::decode_inode_meta(before).map_err(|e| anyhow!("retire base of {ino}: {e}"))?;
     m.nlink = m.nlink.saturating_sub(1);
     let after = schema::encode_inode_meta(&m);
     for _ in 0..16 {
-        let Some(cur) = state.kv_get_opt(&k).await? else { return Ok(()) };
+        let Some(cur) = state.kv_get_opt(&k).await? else { return Ok(false) };
         if cur == after {
-            return Ok(());
+            return Ok(false);
+        }
+        if schema::decode_inode_meta(&cur).map_err(|e| anyhow!("inode {ino}: {e}"))?.nlink == 0 {
+            return crate::extent::tombstone_unreachable(state, ino, lease).await;
         }
         if cur != before {
             tracing::warn!(ino, "inode changed since its retire was recorded; its link count is left as it is");
-            return Ok(());
+            return Ok(false);
         }
         if state.client.compare_write(&k, Some(before), Some(&after), lease).await.map_err(|e| anyhow!("count down inode {ino}: {e}"))? {
-            return Ok(());
+            return Ok(false);
         }
     }
     Err(anyhow!("inode {ino} kept changing while its retire was recovered"))
@@ -804,7 +823,11 @@ pub(crate) async fn recover_session(state: &mut FsState, s: u64, lease: WriteLea
                     // an inode another link still names.
                     if holder == successor {
                         match state.kv_get_opt(&key::retire_base_key(s, ino)).await? {
-                            Some(before) => finish_drop(state, ino, &before, lease).await?,
+                            Some(before) => {
+                                if finish_drop(state, ino, &before, lease).await? {
+                                    crate::extent::reclaim_unreachable(state, ino).await?;
+                                }
+                            }
                             None => {
                                 if let Dropped::LastName { reclaim: true, .. } = drop_name_of(state, ino, lease).await? {
                                     crate::extent::reclaim_unreachable(state, ino).await?;

@@ -193,6 +193,7 @@ key `[0x02][parent_ino BE][name]`，两个字段：`child_inode`、`file_type`
 | `readdir(ino)` | paginated Range(prefix=[0x02][ino BE]) + one batched get per page |
 | `getattr(ino)` | 1× Get inode |
 | `mkdir`/`create(parent, name)` | 1× Put inode + 1× CAS dirent (create-only) + 1× Get parent + 1× CAS parent (create: at most once a second per directory) |
+| `link`, `unlink` (file count) | 1× Get + 1× CAS inode (`change_links`); whole-inode writes (flush, truncate, setattr) also Get + CAS (one more round trip per dirty flush than the old put; an unknown outcome is settled by re-reading) |
 | `unlink(parent, name)` | 1× Get dirent + 1× CAS delete dirent + tombstone + N× Delete extent + 1× Delete inode + 1× Get + 1× CAS parent |
 | `rename(old, new)` | 3× Get dirent (+1 Range per check if the new name is a dir) + 1× CAS delete old + 1× CAS new + Get + CAS of each parent inode |
 | `read(ino, off, size)` | 每个重叠 extent 1× Get（sub-range，批量并发） |
@@ -411,8 +412,25 @@ called at all"，那正是这份记录存在要堵的洞。
   6.9K（同轮交替）；按秒跳过后 9.3K/8.4K 对改前 6.5K/6.3K。两者都在名字改完（提交点）
   之后，失败只记 WARN、不报错：报错会让已经发生的操作看起来失败（FUSE 一次只处理一个
   请求，退避还会卡住整个挂载），代价是 nlink 计数偏差（stat 看得到），不会让东西不可达。
-  以前是读-改-写，两个会话同一目录下 mkdir、或 mkdir 旁边 unlink，会丢 nlink。文件 inode
-  的 nlink 与目录的 setattr 仍是读-改-写（见 feature_list.md BUG-FS-NLINK-RMW）。
+  以前是读-改-写，两个会话同一目录下 mkdir、或 mkdir 旁边 unlink，会丢 nlink。
+- **inode 的链接计数只由 `meta::change_links` 改**（对存储字节 CAS，同时推进 ctime）：
+  link +1、unlink / rename 覆盖文件 / link 回滚 −1，把计数减到 0 的那一次负责回收；计数
+  已为 0 或 inode 已不存在时拒绝加链（ENOENT）。retire 的最后一个名字也先 CAS 到 0 再写
+  墓碑。整份写 inode（`meta::put_inode`：写入 flush、truncate、setattr）保留存储里的
+  nlink、对读到的字节 CAS，inode 已不存在就 ENOENT，不再把它写回来；新 inode 用
+  `put_new_inode`。条件写结果不明（`OutcomeUnknown`，例如 PS 换主时超时）不报错，重读后
+  判定：读回自己写的字节就算成功（`change_links` 每次写都带新 ctime，值唯一）；读回它
+  当时期望的字节说明没落地，再试；`change_links` 读到别的值就报错——那次可能已落地又被
+  别的写覆盖，再减一次会提前减到 0 回收有名字的文件，计数只能宁高勿低
+  （`system_fs_links_lost_reply`，failpoint `CHANGE_LINKS_TEST_LOST_REPLY`）。`put_inode`
+  不会重复生效（nlink 每次取当前值），读到别的值就重试；它也保留更新的 ctime。以前的
+  无条件 put 会被客户端重发，换成条件写后不重读就会让 flush / unlink 在一次抖动上失败。
+  `change_links` 不带写租约：链接计数是名字空间状态，挂载上已失效的写租约不能让已删了
+  名字的 unlink 卡在计数上（泄漏）。以前三处都是读-改-写：一个会话 unlink 唯一的名字、另一个会话同时
+  link 它，link 拿着旧计数把 inode 写回或挂上新名字，数据已被回收（40 轮里 29 轮新名字
+  悬空或读不出）；写入方 flush 缓存里的 meta 会把别的会话刚加的链接写回旧值，之后删掉
+  原名就回收了新名字的数据；目录 chmod 也会写回别的会话 mkdir 前的 nlink
+  （`crates/manager/tests/system_fs_links.rs`，各自去掉对应机制即红）。
 - **unlink / rmdir** 只删读到的那个目录项（`remove_name`，条件删除）：被别人删了就
   ENOENT，被 rename 或替换了就重读重来，不给别人的 inode 减 nlink，rmdir 也不删别人
   的 inode。
@@ -642,8 +660,7 @@ dirent 换过去——`If-None-Match: *`（期望不存在）和 `If-Match`（�
   EXCLUSIVE 冲突，墓碑留着）；终态上传里仍有活会话 pending 的对象（`cleanup` 留下上传记录）；
   心跳发现 pin 已丢（`NotHeld`）时直接从 `held_leases` 删掉、不经释放路径，`unlinked_open`
   里的该 inode 不会被交出。
-- 已知限制：FUSE 的 unlink / link / rename 覆盖对文件 inode 的 nlink 仍是读-改-写，与别的
-  会话同时改同一 inode 的链接时可能丢更新（BUG-FS-NLINK-RMW）；恢复按"dirent 是否指向它"
+- 已知限制：恢复按"dirent 是否指向它"
   判定，发布者在 CAS 与删记录之间崩溃、且恢复前有人把该名 rename 走，会被误判为未发布而
   撤销；Retire 恢复遇到崩溃后被别人改过的 inode 不减 nlink（泄漏）。`flush_inode` 在 `put_inode` 之前就清掉 `dirty`，FUSE_FLUSH 的
   put 失败后 RELEASE 看不到失败，分段 inode 的缓存不会被丢——下次 Open 按版本重建能兜住，

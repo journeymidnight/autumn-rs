@@ -334,7 +334,7 @@ async fn create_child(
     // kernel looked the name up before asking.
     let dk = key::dirent_key(parent, name.as_encoded_bytes());
     let ino = alloc_inode(state).await?;
-    put_inode(state, ino, &meta).await?;
+    put_new_inode(state, ino, &meta).await?;
     let dv = schema::encode_dirent(&DirentValue { child_inode: ino, file_type });
     let created = state
         .client
@@ -449,15 +449,11 @@ pub async fn unlink(state: &mut FsState, parent: u64, name: &OsStr) -> Result<()
         }
     }
     let dirent = removed.ok_or_else(|| anyhow!("EBUSY: the name kept changing"))?;
-    let mut meta = get_inode(state, dirent.child_inode).await?;
-    meta.nlink = meta.nlink.saturating_sub(1);
-    if meta.nlink == 0 {
+    if change_links(state, dirent.child_inode, -1).await?.nlink == 0 {
         // The inode just became UNREACHABLE — remove its data under an intent
         // tombstone so a crash mid-removal is replayed at next mount instead
         // of leaking the extents forever.
         crate::extent::remove_unreachable_inode(state, dirent.child_inode).await?;
-    } else {
-        put_inode(state, dirent.child_inode, &meta).await?;
     }
     touch_dir_mtime(state, parent).await;
     Ok(())
@@ -478,8 +474,10 @@ async fn remove_name(state: &mut FsState, dk: &[u8], v: &[u8]) -> Result<bool> {
 /// Persist the reference count before the name: a crash between those writes
 /// leaks a reference instead of letting unlink of the old name destroy a
 /// published file. Like existing rename/unlink this is not a multi-key txn.
+/// The count moves by compare-and-set, and an inode whose last name another
+/// session just dropped is refused (ENOENT) rather than named again.
 pub async fn link(state: &mut FsState, ino: u64, parent: u64, name: &OsStr) -> Result<InodeMeta> {
-    let mut inode = get_inode(state, ino).await?;
+    let inode = get_inode(state, ino).await?;
     if inode.mode & S_IFMT != S_IFREG {
         return Err(anyhow!("EPERM"));
     }
@@ -491,15 +489,7 @@ pub async fn link(state: &mut FsState, ino: u64, parent: u64, name: &OsStr) -> R
     if state.kv_get_opt(&key).await?.is_some() {
         return Err(anyhow!("EEXIST"));
     }
-    let previous = inode.clone();
-    inode.nlink = inode
-        .nlink
-        .checked_add(1)
-        .ok_or_else(|| anyhow!("EMLINK"))?;
-    let (secs, nanos) = now_ts();
-    inode.ctime_secs = secs;
-    inode.ctime_nsecs = nanos;
-    put_inode(state, ino, &inode).await?;
+    let inode = change_links(state, ino, 1).await?;
     let value = schema::encode_dirent(&DirentValue {
         child_inode: ino,
         file_type: DT_REG,
@@ -509,7 +499,11 @@ pub async fn link(state: &mut FsState, ino: u64, parent: u64, name: &OsStr) -> R
         // A retry after a lost ACK can see our own inode. Never decrement a
         // reference whose publication might already have succeeded.
         if state.kv_get_opt(&key).await?.as_deref() != Some(value.as_slice()) {
-            put_inode(state, ino, &previous).await?;
+            // Another session's unlink may have dropped the name this
+            // link counted on meanwhile.
+            if change_links(state, ino, -1).await?.nlink == 0 {
+                crate::extent::remove_unreachable_inode(state, ino).await?;
+            }
             return Err(anyhow!("EEXIST"));
         }
     }
@@ -646,13 +640,10 @@ async fn finish_rename(
         // still-reachable inode would let the sweep destroy a live file).
         Some(t) => {
             let dropped = async {
-                let mut target_meta = get_inode(state, t.child_inode).await?;
-                target_meta.nlink = target_meta.nlink.saturating_sub(1);
-                if target_meta.nlink == 0 {
-                    crate::extent::remove_unreachable_inode(state, t.child_inode).await
-                } else {
-                    put_inode(state, t.child_inode, &target_meta).await
+                if change_links(state, t.child_inode, -1).await?.nlink == 0 {
+                    crate::extent::remove_unreachable_inode(state, t.child_inode).await?;
                 }
+                anyhow::Ok(())
             }
             .await;
             if let Err(e) = dropped {

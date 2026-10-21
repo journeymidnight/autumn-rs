@@ -111,7 +111,7 @@ fn segmented_files_splice_read_page_and_reclaim() {
         let ino = 500u64;
         let mut m = meta::new_file_meta(0o644, 0, 0);
         m.segments = Some(SegmentMap::default());
-        meta::put_inode(&mut st, ino, &m).await.expect("create");
+        meta::put_new_inode(&mut st, ino, &m).await.expect("create");
         let mut model = Vec::new();
         let mib = 1 << 20;
 

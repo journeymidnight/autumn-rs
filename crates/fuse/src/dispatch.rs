@@ -503,7 +503,7 @@ pub async fn handle_request(
                 let (s, ns) = now_ts();
                 meta.ctime_secs = s;
                 meta.ctime_nsecs = ns;
-                put_inode(state, ino, &meta).await?;
+                let meta = put_inode(state, ino, &meta).await?;
                 Ok(inode_to_attr(ino, &meta))
             }
             .await;

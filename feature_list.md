@@ -1,6 +1,6 @@
 # autumn-rs feature list — OPEN backlog
 
-**Last updated:** 2026-10-21 (review items N2–N7 all fixed; conditional writes group-committed; follow-ups BUG-FS-NLINK-RMW, F-FS-NAMESPACE-GAPS)
+**Last updated:** 2026-10-21 (BUG-FS-NLINK-RMW fixed and removed; follow-up F-FS-NAMESPACE-GAPS)
 
 **Rules:**
 - This file tracks the **OPEN backlog only**. A feature that reaches `passes: true`
@@ -14,12 +14,6 @@
 
 ## Active
 
-### BUG-FS-NLINK-RMW — 文件 inode 的 nlink 与目录 setattr 仍是读-改-写（P1，推断）
-- **Trigger** (2026-10-20 N3/N4 修复的评审，推断，未复现): `dir::unlink` 的 nlink 递减（`get_inode` 缓存 + `put_inode` 或回收）、`dir::link` 的递增与回滚、`finish_rename` 替换文件分支、FUSE setattr 写目录 inode（`crates/fuse/src/dispatch.rs`）都是无条件读-改-写。推断时序：会话 A unlink n1、会话 B 同时 link 同一 inode 为 n2（nlink 1）：A 读到 1 后 B 写 2，A 回收 extents，B 的 put 让 n2 指向数据已删的 inode（跨会话丢数据）；目录 chmod/touch 可覆盖别的会话 mkdir 的 nlink。
-- **Scope**: 先复现。文件 nlink 改动走条件更新（与 `dir::cas_dir` 同理，写时带 `write_lease_for` 围栏，注意与本会话脏缓存 meta 的关系）；nlink 降到 0 的 CAS 胜出后才回收，link 遇 nlink=0 拒绝；目录 setattr 只改它要改的字段并 CAS。
-- **Acceptance**: 两会话 unlink/link 同一 inode 的并发用例修复前丢数据、修复后另一名字逐字节可读；目录 setattr 与并发 mkdir 后 nlink 正确；消融变红。
-- `passes: false`
-
 ### F-FS-NAMESPACE-GAPS — 命名空间跨会话剩余窗口（N3/N4 修复后留下）
 - **Trigger** (2026-10-20 N3/N4 修复与评审):
   - 替换空目录（rename 覆盖）与 rmdir：检查"为空"与删除/替换之间另一个会话往里建文件，那个文件失去入口。
@@ -28,6 +22,7 @@
 - **Scope**: 前两项需目录级协调（如目录版本/锁 key）后再做；CLI 改为调用 `autumn_fs::dir::mkdir`。
 - **Acceptance**: 各项给出结论（已修/证伪/接受并写进 `crates/fs/CLAUDE.md`）；修的项有消融变红的测试。
 - `passes: false`
+- **notes** (2026-10-21, BUG-FS-NLINK-RMW 修复的评审，推断未复现): `meta::change_links` 一次 −1 已落地把计数减到 0、回复丢失、随后 inode 又被别的会话整份写（计数仍 0）时，它按"结果不明"报错，没人写墓碑：该 inode 泄漏（数据不丢）。可考虑"读到计数 0 且不是自己发的值"时补墓碑。
 
 ### F-TEST-FOLLOWUPS — 测试集体检留下的缺口与疑点（未处理）
 - **Trigger** (2026-10-19，测试集体检的审查与删除过程中发现，均未在那次改动里处理):

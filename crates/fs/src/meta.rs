@@ -106,7 +106,7 @@ pub async fn ensure_root(state: &mut FsState) -> Result<bool> {
         return Ok(false);
     }
     let root_meta = new_dir_meta(0o755, unsafe { libc::getuid() }, unsafe { libc::getgid() });
-    put_inode(state, ROOT_INO, &root_meta).await?;
+    put_new_inode(state, ROOT_INO, &root_meta).await?;
     Ok(true)
 }
 
@@ -277,19 +277,142 @@ pub async fn get_inode_uncached(state: &mut FsState, ino: u64) -> Result<(InodeM
     Ok((fresh, changed))
 }
 
-/// Write inode metadata to KV store and update cache.
-pub async fn put_inode(state: &mut FsState, ino: u64, meta: &InodeMeta) -> Result<()> {
+/// Writes `meta` over inode `ino`'s stored metadata — every field but the
+/// link count, which only `change_links` moves: the stored count is kept, by
+/// a compare-and-set on the bytes read. A whole-inode write from a cached
+/// copy (a flush, a truncate, a setattr) used to put back a count another
+/// session had just changed, and an unlink then removed data a link still
+/// named. An inode that is gone stays gone (ENOENT). Fenced like any write
+/// under a held WRITE lease. Returns the inode as written.
+pub async fn put_inode(state: &mut FsState, ino: u64, meta: &InodeMeta) -> Result<InodeMeta> {
     let k = key::inode_key(ino);
-    let v = schema::encode_inode_meta(meta);
-    // BUG-LEASE-2 Phase 2: inode-meta updates under a held WRITE lease are
-    // fence-stamped too (size bumps from a revoked writer must not land).
     let lease = state.write_lease_for(ino);
-    state.kv_put_fenced(&k, &v, lease).await?;
-    // Update cache
+    for _ in 0..16 {
+        let Some(stored) = state.kv_get_opt(&k).await? else {
+            return Err(anyhow!("ENOENT: inode {ino} is gone"));
+        };
+        let current = schema::decode_inode_meta(&stored).map_err(|e| anyhow!("inode {ino}: {e}"))?;
+        let mut next = meta.clone();
+        next.nlink = current.nlink;
+        // Never older than a link change made since the caller's copy.
+        if (current.ctime_secs, current.ctime_nsecs) > (next.ctime_secs, next.ctime_nsecs) {
+            next.ctime_secs = current.ctime_secs;
+            next.ctime_nsecs = current.ctime_nsecs;
+        }
+        let bytes = schema::encode_inode_meta(&next);
+        // An attempt whose outcome is unknown is settled by reading again:
+        // these bytes read back means it landed, and an attempt still in
+        // flight expected bytes that are then gone.
+        let written = bytes == stored
+            || match state.client.compare_write(&k, Some(&stored), Some(&bytes), lease).await {
+                Ok(w) => w,
+                Err(autumn_client::AutumnError::OutcomeUnknown(_)) => false,
+                Err(e) => return Err(anyhow::Error::new(e).context("KV put")),
+            };
+        if written {
+            if let Some(is) = state.inodes.get_mut(&ino) {
+                is.meta = next.clone();
+            }
+            return Ok(next);
+        }
+    }
+    Err(anyhow!("EBUSY: inode {ino} kept changing"))
+}
+
+/// Writes the metadata of an inode nobody else can name yet (just
+/// allocated, or the root on a fresh volume).
+pub async fn put_new_inode(state: &mut FsState, ino: u64, meta: &InodeMeta) -> Result<()> {
+    let lease = state.write_lease_for(ino);
+    state.kv_put_fenced(&key::inode_key(ino), &schema::encode_inode_meta(meta), lease).await?;
     if let Some(is) = state.inodes.get_mut(&ino) {
         is.meta = meta.clone();
     }
     Ok(())
+}
+
+/// Moves inode `ino`'s link count by `delta` (and its ctime) with a
+/// compare-and-set on its stored bytes; the inode as written. Refuses
+/// (ENOENT) to add a link to an inode that is gone or has none left: its
+/// data is being removed. The caller that takes the count to 0 removes it.
+/// Not fenced: a link count is namespace state, like the name it follows,
+/// and a stale write lease of this mount must not strand a removed name's
+/// count.
+pub async fn change_links(state: &mut FsState, ino: u64, delta: i32) -> Result<InodeMeta> {
+    let k = key::inode_key(ino);
+    // An attempt whose outcome is unknown is settled by reading again. Each
+    // value sent carries a fresh ctime, so reading one back means that attempt
+    // landed; reading what it expected means none landed, and another try
+    // (expecting the same bytes) excludes it. Anything else may be a landing
+    // already overwritten by another writer: applying the change again could
+    // count a link down twice and reclaim a named file, so that is reported,
+    // a count left high rather than low.
+    let mut sent: Vec<(Vec<u8>, InodeMeta)> = Vec::new();
+    let mut unknown_expected: Option<Vec<u8>> = None;
+    for _ in 0..16 {
+        let Some(stored) = state.kv_get_opt(&k).await? else {
+            return Err(anyhow!("ENOENT: inode {ino} is gone"));
+        };
+        if let Some((_, m)) = sent.iter().find(|(v, _)| *v == stored) {
+            let m = m.clone();
+            note_links(state, ino, &m);
+            return Ok(m);
+        }
+        if unknown_expected.as_ref().is_some_and(|e| *e != stored) {
+            return Err(anyhow!("link count of inode {ino}: outcome unknown"));
+        }
+        let mut m = schema::decode_inode_meta(&stored).map_err(|e| anyhow!("inode {ino}: {e}"))?;
+        if delta > 0 && m.nlink == 0 {
+            return Err(anyhow!("ENOENT: inode {ino} has no link left"));
+        }
+        m.nlink = u32::try_from((m.nlink as i64 + delta as i64).max(0)).map_err(|_| anyhow!("EMLINK"))?;
+        let (s, ns) = now_ts();
+        m.ctime_secs = s;
+        m.ctime_nsecs = ns;
+        let value = schema::encode_inode_meta(&m);
+        let anon = autumn_client::WriteLease::ANON;
+        let result = state.client.compare_write(&k, Some(&stored), Some(&value), anon).await;
+        match lost_reply_for_test(result).await {
+            Ok(true) => {
+                note_links(state, ino, &m);
+                return Ok(m);
+            }
+            Ok(false) => {}
+            Err(autumn_client::AutumnError::OutcomeUnknown(_)) => {
+                sent.push((value, m));
+                unknown_expected = Some(stored);
+            }
+            Err(e) => return Err(anyhow::Error::new(e).context("KV put")),
+        }
+    }
+    Err(anyhow!("EBUSY: inode {ino} kept changing"))
+}
+
+/// Test-only failpoint: 1 = armed; the next `change_links` attempt that
+/// lands takes it (2), reports its outcome as unknown — a reply lost after
+/// the write — and parks until the test stores 0. One relaxed CAS per
+/// attempt.
+#[doc(hidden)]
+pub static CHANGE_LINKS_TEST_LOST_REPLY: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+async fn lost_reply_for_test(
+    result: std::result::Result<bool, autumn_client::AutumnError>,
+) -> std::result::Result<bool, autumn_client::AutumnError> {
+    use std::sync::atomic::Ordering::Relaxed;
+    if !matches!(result, Ok(true)) || CHANGE_LINKS_TEST_LOST_REPLY.compare_exchange(1, 2, Relaxed, Relaxed).is_err() {
+        return result;
+    }
+    while CHANGE_LINKS_TEST_LOST_REPLY.load(Relaxed) == 2 {
+        compio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    Err(autumn_client::AutumnError::OutcomeUnknown("lost reply (test)".into()))
+}
+
+fn note_links(state: &mut FsState, ino: u64, m: &InodeMeta) {
+    if let Some(is) = state.inodes.get_mut(&ino) {
+        is.meta.nlink = m.nlink;
+        is.meta.ctime_secs = m.ctime_secs;
+        is.meta.ctime_nsecs = m.ctime_nsecs;
+    }
 }
 
 /// Allocate a new inode number from the batch allocator.

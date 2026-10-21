@@ -76,7 +76,7 @@ fn eof_read_must_not_clobber_unpublished_size() {
 
         let ino = 700u64;
         let m = meta::new_file_meta(0o644, 0, 0);
-        meta::put_inode(&mut state, ino, &m).await.expect("put_inode");
+        meta::put_new_inode(&mut state, ino, &m).await.expect("put_inode");
 
         // Exactly one full buffer: the batch FLUSHES (extents land) while the
         // size covering them stays unpublished, because nothing fsyncs. This
