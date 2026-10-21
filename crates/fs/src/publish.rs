@@ -657,9 +657,7 @@ pub async fn ensure_dirs(
                 .map_err(|e| anyhow!("mkdir {}: {e}", String::from_utf8_lossy(comp)))?;
             if created {
                 // `..` of the new directory, as `dir::mkdir` counts it.
-                let mut pm = meta::get_inode(state, dir).await?;
-                pm.nlink += 1;
-                meta::put_inode(state, dir, &pm).await?;
+                crate::dir::update_dir(state, dir, |m| m.nlink += 1).await;
                 dir = ino;
                 break;
             }

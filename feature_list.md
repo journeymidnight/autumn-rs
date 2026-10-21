@@ -1,6 +1,6 @@
 # autumn-rs feature list — OPEN backlog
 
-**Last updated:** 2026-10-20 (BUG-LEASE-GRANT-STALE-TXN fixed and removed; review N3–N7 open: three P1, two P2)
+**Last updated:** 2026-10-21 (review items N2–N7 all fixed; conditional writes group-committed; follow-ups BUG-FS-NLINK-RMW, F-FS-NAMESPACE-GAPS)
 
 **Rules:**
 - This file tracks the **OPEN backlog only**. A feature that reaches `passes: true`
@@ -14,16 +14,19 @@
 
 ## Active
 
-### BUG-FS-CREATE-NOT-CONDITIONAL — 同名 create/mkdir 先查后写，并发创建出两个 inode（P1）
-- **Trigger** (review.md N3，两个 `FsState` 并发复现): `dir::create` / `dir::mkdir`（`crates/fs/src/dir.rs`）在 `kv_exists` 看到名字不存在后各自分配 inode，再用无条件 `kv_put(dirent)` 互相覆盖；两次调用都返回成功（Ok(2)、Ok(1002)），落败的 inode 失去名字，写入仍成功但路径找不到。`kv_exists(...).await.unwrap_or(false)` 还把读失败当成不存在。入口：FUSE Create、Python create。
-- **Scope**: 先复现。dirent 用 create-only CAS 发布，结果未知时 read-back 判定；不得把存储错误当作不存在；落败的 inode 要可靠清理，父目录 nlink/mtime 更新避免丢失更新（`publish::ensure_dirs` 的条件创建可作参考）。
-- **Acceptance**: 多会话同名 create/mkdir 只有一个新 inode 发布成功，其余按语义返回已存在或复用同一 inode；注入存在性读错误不覆盖已有目录项；落败的 inode/数据不泄漏。修前红、修后绿。
+### BUG-FS-NLINK-RMW — 文件 inode 的 nlink 与目录 setattr 仍是读-改-写（P1，推断）
+- **Trigger** (2026-10-20 N3/N4 修复的评审，推断，未复现): `dir::unlink` 的 nlink 递减（`get_inode` 缓存 + `put_inode` 或回收）、`dir::link` 的递增与回滚、`finish_rename` 替换文件分支、FUSE setattr 写目录 inode（`crates/fuse/src/dispatch.rs`）都是无条件读-改-写。推断时序：会话 A unlink n1、会话 B 同时 link 同一 inode 为 n2（nlink 1）：A 读到 1 后 B 写 2，A 回收 extents，B 的 put 让 n2 指向数据已删的 inode（跨会话丢数据）；目录 chmod/touch 可覆盖别的会话 mkdir 的 nlink。
+- **Scope**: 先复现。文件 nlink 改动走条件更新（与 `dir::cas_dir` 同理，写时带 `write_lease_for` 围栏，注意与本会话脏缓存 meta 的关系）；nlink 降到 0 的 CAS 胜出后才回收，link 遇 nlink=0 拒绝；目录 setattr 只改它要改的字段并 CAS。
+- **Acceptance**: 两会话 unlink/link 同一 inode 的并发用例修复前丢数据、修复后另一名字逐字节可读；目录 setattr 与并发 mkdir 后 nlink 正确；消融变红。
 - `passes: false`
 
-### BUG-FS-RENAME-OVER-NONEMPTY-DIR — rename 覆盖非空目录不拒绝，目标子树失去入口（P1）
-- **Trigger** (review.md N4，共享 FS API 复现，无并发无故障): `dir::rename`（`crates/fs/src/dir.rs`）的目标检查只处理"与源同 inode"和"目标是非目录需回收"；目标是目录时不检查是否为空，也不完整校验源/目标类型。`/srcdir` rename 到含 `precious` 的 `/dstdir` 返回 Ok，`dstdir` 指向源 inode，原目标 inode 及其子树从根不可达。独立于已知的"rename 跨 key 非原子"限制。
-- **Scope**: 先复现。修改任何 key 前完成目标类型与目录非空等检查，且检查结果在实际提交时仍有效（跨客户端单加一次 `is_empty` 仍有 TOCTOU，需要目录级协调或版本条件）。
-- **Acceptance**: 非空目录目标、文件覆盖目录、目录覆盖文件都拒绝且源/目标不变；空目录合法替换正确维护父目录引用；同 inode rename 仍是 no-op。修前红、修后绿。
+### F-FS-NAMESPACE-GAPS — 命名空间跨会话剩余窗口（N3/N4 修复后留下）
+- **Trigger** (2026-10-20 N3/N4 修复与评审):
+  - 替换空目录（rename 覆盖）与 rmdir：检查"为空"与删除/替换之间另一个会话往里建文件，那个文件失去入口。
+  - rename 发布新名结果不明且读回不是自己的值时报错不放回旧名：迟到的发布会让源有名、被替换的目标少减一次 nlink（泄漏）；读回恰好等于自己的值也可能是别的会话链接同一 inode 所致（需三方并发）。
+  - `autumnfs` CLI 的 mkdir（`crates/server/src/bin/autumnfs.rs`）自带一份实现，仍是无条件发布目录项与读-改-写父目录。
+- **Scope**: 前两项需目录级协调（如目录版本/锁 key）后再做；CLI 改为调用 `autumn_fs::dir::mkdir`。
+- **Acceptance**: 各项给出结论（已修/证伪/接受并写进 `crates/fs/CLAUDE.md`）；修的项有消融变红的测试。
 - `passes: false`
 
 ### F-TEST-FOLLOWUPS — 测试集体检留下的缺口与疑点（未处理）

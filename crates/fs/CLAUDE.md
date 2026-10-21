@@ -192,9 +192,9 @@ key `[0x02][parent_ino BE][name]`，两个字段：`child_inode`、`file_type`
 | `lookup(parent, name)` | 1× Get dirent + 1× Get inode |
 | `readdir(ino)` | paginated Range(prefix=[0x02][ino BE]) + one batched get per page |
 | `getattr(ino)` | 1× Get inode |
-| `mkdir`/`create(parent, name)` | 1× Put inode + 1× Put dirent + 1× Put parent inode (nlink) |
-| `unlink(parent, name)` | 1× Get dirent + 1× Delete dirent + tombstone + N× Delete extent + 1× Delete inode |
-| `rename(old, new)` | 1× Get old dirent + 1× Delete old dirent + 1× Put new dirent |
+| `mkdir`/`create(parent, name)` | 1× Put inode + 1× CAS dirent (create-only) + 1× Get parent + 1× CAS parent (create: at most once a second per directory) |
+| `unlink(parent, name)` | 1× Get dirent + 1× CAS delete dirent + tombstone + N× Delete extent + 1× Delete inode + 1× Get + 1× CAS parent |
+| `rename(old, new)` | 3× Get dirent (+1 Range per check if the new name is a dir) + 1× CAS delete old + 1× CAS new + Get + CAS of each parent inode |
 | `read(ino, off, size)` | 每个重叠 extent 1× Get（sub-range，批量并发） |
 | `write(ino, off, data)` | 缓冲后：对齐 1× Put / 非对齐 1× Get + 1× Put（RMW） |
 | `truncate(ino, 0)` | meta Put（commit）+ N× Delete extent |
@@ -398,9 +398,36 @@ called at all"，那正是这份记录存在要堵的洞。
   位置。`readdir_bounded` 限制单次返回条数：内核每次只取一个 reply buffer（约百项）
   再从末 offset 续读，若每次都读完剩余目录，大目录就是平方级的 get。offset 之前的
   名字只扫 key、不取 value；返回的条目用 `list_children` 一次 `get_many` 取 dirent。
-- **mkdir**：alloc inode + Put meta + Put dirent + parent nlink。
-- **rename**：Delete old dirent + Put new dirent（非原子，v1 限制；rename-over 见
-  UNLINK-1）。
+- **mkdir / create**：alloc inode + Put meta + 只在名字不存在时发布 dirent
+  （`compare_put(None)`，不先查：内核建之前已 lookup 过）+ 父目录 inode。两个会话
+  同名创建只有一个赢，另一个 EEXIST 并删掉自己写的 inode。
+- **父目录 inode** 的 nlink、mtime 对读到的字节 CAS（`cas_dir`）：改 nlink 的（mkdir、
+  rmdir、rename）冲突就重读重试，最多 16 次不睡（`update_dir`）；只改 mtime 的（create、
+  unlink、link）只试一次，输了就算——赢的那次改动晚于它开始；目录 mtime 已在当前这一
+  整秒内就不写（用户 2026-10-21 定：目录时间精度 1 秒，同 1 秒时间戳的文件系统：落在
+  新一秒的改动一定推进 mtime/ctime；存的 mtime 在别的秒——包括未来——就写，所以时钟
+  不齐的客户端之间会退化成每次都写，只慢不错）。每次都写父目录时，那一个 key 上的
+  条件写在 PS 上串行（必须先等前一次提交才能比较），4 会话同目录 create 6.2K/s 对改前
+  6.9K（同轮交替）；按秒跳过后 9.3K/8.4K 对改前 6.5K/6.3K。两者都在名字改完（提交点）
+  之后，失败只记 WARN、不报错：报错会让已经发生的操作看起来失败（FUSE 一次只处理一个
+  请求，退避还会卡住整个挂载），代价是 nlink 计数偏差（stat 看得到），不会让东西不可达。
+  以前是读-改-写，两个会话同一目录下 mkdir、或 mkdir 旁边 unlink，会丢 nlink。文件 inode
+  的 nlink 与目录的 setattr 仍是读-改-写（见 feature_list.md BUG-FS-NLINK-RMW）。
+- **unlink / rmdir** 只删读到的那个目录项（`remove_name`，条件删除）：被别人删了就
+  ENOENT，被 rename 或替换了就重读重来，不给别人的 inode 减 nlink，rmdir 也不删别人
+  的 inode。
+- **rename**：动 key 之前先查（`rename_onto`）：目标是文件则源须是文件，目标是目录则
+  源须是目录且目标为空（ENOTEMPTY / EISDIR / ENOTDIR），同 inode 是 no-op。以前目标
+  是目录时什么都不查，`/srcdir` 覆盖非空 `/dstdir` 返回 Ok，原目录子树从根不可达。
+  先条件删旧名（崩溃只丢名字，不会出现两个名字一个 nlink），再对检查时读到的目标值
+  条件发布新名；新名被别人改了就重读重查再发布，查不过或重试用完就放回旧名。删旧名
+  或发布新名结果不明时只认"读回来就是自己的值"，否则报错、不放回旧名（迟到的发布会
+  造成两个名字）——源 inode 可能没名字（泄漏，不丢数据），错误里写明。错误信息里不带
+  用户的名字：FUSE 按子串映射 errno。被替换的空目录删 inode，父目录
+  nlink 跟着改。仍非原子（v1 限制；rename-over 见 UNLINK-1）。
+  已知限制：目标目录"为空"的检查与替换之间，另一个会话往里建文件，那个文件会失去
+  入口——和 rmdir 的同一窗口，只有目录级协调才能关；只在跨会话并发时出现。
+  测试：`crates/manager/tests/system_fs_namespace.rs`。
 
 ## Per-session lease + 跨前端围栏
 
@@ -615,9 +642,10 @@ dirent 换过去——`If-None-Match: *`（期望不存在）和 `If-Match`（�
   EXCLUSIVE 冲突，墓碑留着）；终态上传里仍有活会话 pending 的对象（`cleanup` 留下上传记录）；
   心跳发现 pin 已丢（`NotHeld`）时直接从 `held_leases` 删掉、不经释放路径，`unlinked_open`
   里的该 inode 不会被交出。
-- 已知限制：FUSE 的 unlink/rename 是无条件 KV 操作，与网关同名并发时后者赢；恢复按"dirent
-  是否指向它"判定，发布者在 CAS 与删记录之间崩溃、且恢复前有人把该名 rename 走，会被误判为
-  未发布而撤销；Retire 恢复遇到崩溃后被别人改过的 inode 不减 nlink（泄漏）。`flush_inode` 在 `put_inode` 之前就清掉 `dirty`，FUSE_FLUSH 的
+- 已知限制：FUSE 的 unlink / link / rename 覆盖对文件 inode 的 nlink 仍是读-改-写，与别的
+  会话同时改同一 inode 的链接时可能丢更新（BUG-FS-NLINK-RMW）；恢复按"dirent 是否指向它"
+  判定，发布者在 CAS 与删记录之间崩溃、且恢复前有人把该名 rename 走，会被误判为未发布而
+  撤销；Retire 恢复遇到崩溃后被别人改过的 inode 不减 nlink（泄漏）。`flush_inode` 在 `put_inode` 之前就清掉 `dirty`，FUSE_FLUSH 的
   put 失败后 RELEASE 看不到失败，分段 inode 的缓存不会被丢——下次 Open 按版本重建能兜住，
   PyO3 会读到 strict 错误（不是零）。
 

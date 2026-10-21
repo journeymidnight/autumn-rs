@@ -241,6 +241,113 @@ pub async fn readdir_bounded(
     Ok(entries)
 }
 
+/// One read-modify-write of a directory's inode, compared-and-set against
+/// the bytes read. `Ok(false)`: another change landed in between.
+async fn cas_dir(state: &mut FsState, dir: u64, change: &impl Fn(&mut InodeMeta)) -> Result<bool> {
+    let k = key::inode_key(dir);
+    let old = state.kv_get_opt(&k).await?.ok_or_else(|| anyhow!("ENOENT: directory {dir}"))?;
+    let mut meta = schema::decode_inode_meta(&old).map_err(|e| anyhow!("inode {dir}: {e}"))?;
+    change(&mut meta);
+    let new = schema::encode_inode_meta(&meta);
+    if new == old {
+        return Ok(true);
+    }
+    let swapped = state
+        .client
+        .compare_put(&k, Some(&old), &new)
+        .await
+        .map_err(|e| anyhow!("KV compare_put: {e}"))?;
+    if swapped {
+        if let Some(is) = state.inodes.get_mut(&dir) {
+            is.meta = meta;
+        }
+    }
+    Ok(swapped)
+}
+
+/// Changes a directory's inode until the change lands, so two clients
+/// changing one directory (a subdirectory's link) do not lose each other's
+/// update. Callers have already changed a name — the commit point — so a
+/// directory that keeps changing, or a failed read, is logged, not returned:
+/// the count is then off (stat's nlink), nothing is unreachable.
+pub(crate) async fn update_dir(state: &mut FsState, dir: u64, change: impl Fn(&mut InodeMeta)) {
+    for _ in 0..16 {
+        match cas_dir(state, dir, &change).await {
+            Ok(true) => return,
+            Ok(false) => {}
+            Err(e) => {
+                tracing::warn!(dir, error = %e, "directory inode not updated after a name change");
+                return;
+            }
+        }
+    }
+    tracing::warn!(dir, "directory inode kept changing; not updated after a name change");
+}
+
+/// Sets a directory's mtime and ctime to now, unless its mtime already falls
+/// in the current wall-clock second: a burst of creates in one directory then
+/// does not put a write of it — a compare-and-set on its one busy key — on
+/// every create. Directory times thus have one-second resolution, as on a
+/// filesystem with 1 s timestamps: a change in a later second always moves
+/// them. One try: losing the race is fine, the change that won landed after
+/// this one started.
+async fn touch_dir_mtime(state: &mut FsState, dir: u64) {
+    let (s, ns) = now_ts();
+    let r = cas_dir(state, dir, &|m: &mut InodeMeta| {
+        if m.mtime_secs != s {
+            m.mtime_secs = s;
+            m.mtime_nsecs = ns;
+            m.ctime_secs = s;
+            m.ctime_nsecs = ns;
+        }
+    })
+    .await;
+    if let Err(e) = r {
+        tracing::warn!(dir, error = %e, "directory mtime not updated");
+    }
+}
+
+fn touch(m: &mut InodeMeta) {
+    let (s, ns) = now_ts();
+    m.mtime_secs = s;
+    m.mtime_nsecs = ns;
+    m.ctime_secs = s;
+    m.ctime_nsecs = ns;
+}
+
+/// A directory's link count moved by `delta`, never below its own two.
+fn add_links(m: &mut InodeMeta, delta: i64) {
+    m.nlink = (m.nlink as i64 + delta).max(2) as u32;
+}
+
+/// Writes a new inode and publishes it under `parent/name` only if the name
+/// is free: of two clients creating one name, one wins and the other gets
+/// EEXIST and removes the inode it wrote.
+async fn create_child(
+    state: &mut FsState,
+    parent: u64,
+    name: &OsStr,
+    meta: InodeMeta,
+    file_type: u8,
+) -> Result<u64> {
+    // No existence check first: the create-only publish decides, and the
+    // kernel looked the name up before asking.
+    let dk = key::dirent_key(parent, name.as_encoded_bytes());
+    let ino = alloc_inode(state).await?;
+    put_inode(state, ino, &meta).await?;
+    let dv = schema::encode_dirent(&DirentValue { child_inode: ino, file_type });
+    let created = state
+        .client
+        .compare_put(&dk, None, &dv)
+        .await
+        .map_err(|e| anyhow!("KV compare_put: {e}"))?;
+    if !created {
+        state.kv_delete(&key::inode_key(ino)).await?;
+        return Err(anyhow!("EEXIST"));
+    }
+    Ok(ino)
+}
+
 /// Create a directory. Returns `(ino, meta)` — the FUSE layer converts to
 /// `FileAttr` at the reply boundary (M1).
 pub async fn mkdir(
@@ -249,32 +356,13 @@ pub async fn mkdir(
     name: &OsStr,
     mode: u32,
 ) -> Result<(u64, InodeMeta)> {
-    let name_bytes = name.as_encoded_bytes();
-    let dk = key::dirent_key(parent, name_bytes);
-    if state.kv_exists(&dk).await.unwrap_or(false) {
-        return Err(anyhow!("EEXIST"));
-    }
-
-    let ino = alloc_inode(state).await?;
     let meta = new_dir_meta(mode, unsafe { libc::getuid() }, unsafe { libc::getgid() });
-    put_inode(state, ino, &meta).await?;
-
-    let dirent = DirentValue {
-        child_inode: ino,
-        file_type: DT_DIR,
-    };
-    let dv = schema::encode_dirent(&dirent);
-    state.kv_put(&dk, &dv).await?;
-
-    let mut parent_meta = get_inode(state, parent).await?;
-    parent_meta.nlink += 1;
-    let (s, ns) = now_ts();
-    parent_meta.mtime_secs = s;
-    parent_meta.mtime_nsecs = ns;
-    parent_meta.ctime_secs = s;
-    parent_meta.ctime_nsecs = ns;
-    put_inode(state, parent, &parent_meta).await?;
-
+    let ino = create_child(state, parent, name, meta.clone(), DT_DIR).await?;
+    update_dir(state, parent, |m| {
+        add_links(m, 1);
+        touch(m);
+    })
+    .await;
     *state.lookup_count.entry(ino).or_insert(0) += 1;
     Ok((ino, meta))
 }
@@ -295,66 +383,45 @@ pub async fn create(
     name: &OsStr,
     mode: u32,
 ) -> Result<(u64, InodeMeta)> {
-    let name_bytes = name.as_encoded_bytes();
-    let dk = key::dirent_key(parent, name_bytes);
-    if state.kv_exists(&dk).await.unwrap_or(false) {
-        return Err(anyhow!("EEXIST"));
-    }
-
-    let ino = alloc_inode(state).await?;
     let meta = new_file_meta(mode, unsafe { libc::getuid() }, unsafe { libc::getgid() });
-    put_inode(state, ino, &meta).await?;
-
-    let dirent = DirentValue {
-        child_inode: ino,
-        file_type: DT_REG,
-    };
-    let dv = schema::encode_dirent(&dirent);
-    state.kv_put(&dk, &dv).await?;
-
-    let mut parent_meta = get_inode(state, parent).await?;
-    let (s, ns) = now_ts();
-    parent_meta.mtime_secs = s;
-    parent_meta.mtime_nsecs = ns;
-    put_inode(state, parent, &parent_meta).await?;
-
+    let ino = create_child(state, parent, name, meta.clone(), DT_REG).await?;
+    touch_dir_mtime(state, parent).await;
     *state.lookup_count.entry(ino).or_insert(0) += 1;
     Ok((ino, meta))
 }
 
 /// Remove a directory (must be empty).
 pub async fn rmdir(state: &mut FsState, parent: u64, name: &OsStr) -> Result<()> {
-    let name_bytes = name.as_encoded_bytes();
-    let dk = key::dirent_key(parent, name_bytes);
-    let v = state.kv_get(&dk).await.map_err(|_| anyhow!("ENOENT"))?;
-    let dirent: DirentValue = schema::decode_dirent(&v).map_err(|e| anyhow!("{}", e))?;
-
-    if dirent.file_type != DT_DIR {
-        return Err(anyhow!("ENOTDIR"));
+    let dk = key::dirent_key(parent, name.as_encoded_bytes());
+    let mut removed = None;
+    for _ in 0..8 {
+        let v = state.kv_get_opt(&dk).await?.ok_or_else(|| anyhow!("ENOENT"))?;
+        let dirent: DirentValue = schema::decode_dirent(&v).map_err(|e| anyhow!("{}", e))?;
+        if dirent.file_type != DT_DIR {
+            return Err(anyhow!("ENOTDIR"));
+        }
+        let prefix = key::dirent_prefix(dirent.child_inode);
+        if !state.kv_range_keys(&prefix, &prefix, 1).await?.is_empty() {
+            return Err(anyhow!("ENOTEMPTY"));
+        }
+        // Only the name as read: one renamed or replaced meanwhile is not
+        // ours to remove, nor is its inode.
+        if remove_name(state, &dk, &v).await? {
+            removed = Some(dirent);
+            break;
+        }
     }
-
-    let prefix = key::dirent_prefix(dirent.child_inode);
-    let children = state.kv_range_keys(&prefix, &prefix, 1).await?;
-    if !children.is_empty() {
-        return Err(anyhow!("ENOTEMPTY"));
-    }
-
-    state.kv_delete(&dk).await?;
-    let ik = key::inode_key(dirent.child_inode);
-    state.kv_delete(&ik).await?;
-
-    let mut parent_meta = get_inode(state, parent).await?;
-    if parent_meta.nlink > 2 {
-        parent_meta.nlink -= 1;
-    }
-    let (s, ns) = now_ts();
-    parent_meta.mtime_secs = s;
-    parent_meta.mtime_nsecs = ns;
-    parent_meta.ctime_secs = s;
-    parent_meta.ctime_nsecs = ns;
-    put_inode(state, parent, &parent_meta).await?;
-
+    let dirent = removed.ok_or_else(|| anyhow!("EBUSY: the name kept changing"))?;
     state.inodes.remove(&dirent.child_inode);
+    // After the commit point (the name is gone): a failure leaks the inode.
+    if let Err(e) = state.kv_delete(&key::inode_key(dirent.child_inode)).await {
+        tracing::warn!(ino = dirent.child_inode, error = %e, "removed directory's inode not deleted");
+    }
+    update_dir(state, parent, |m| {
+        add_links(m, -1);
+        touch(m);
+    })
+    .await;
     Ok(())
 }
 
@@ -366,16 +433,22 @@ pub async fn rmdir(state: &mut FsState, parent: u64, name: &OsStr) -> Result<()>
 /// `extent::remove_unreachable_inode` (tombstoned so a crash mid-removal is
 /// replayed at next mount rather than leaking data KVs forever).
 pub async fn unlink(state: &mut FsState, parent: u64, name: &OsStr) -> Result<()> {
-    let name_bytes = name.as_encoded_bytes();
-    let dk = key::dirent_key(parent, name_bytes);
-    let v = state.kv_get(&dk).await.map_err(|_| anyhow!("ENOENT"))?;
-    let dirent: DirentValue = schema::decode_dirent(&v).map_err(|e| anyhow!("{}", e))?;
-    if dirent.file_type == DT_DIR {
-        return Err(anyhow!("EISDIR"));
+    let dk = key::dirent_key(parent, name.as_encoded_bytes());
+    // Remove the name as read, then decrement nlink: a name another client
+    // replaced meanwhile names an inode this unlink must not count down.
+    let mut removed = None;
+    for _ in 0..8 {
+        let v = state.kv_get_opt(&dk).await?.ok_or_else(|| anyhow!("ENOENT"))?;
+        let dirent: DirentValue = schema::decode_dirent(&v).map_err(|e| anyhow!("{}", e))?;
+        if dirent.file_type == DT_DIR {
+            return Err(anyhow!("EISDIR"));
+        }
+        if remove_name(state, &dk, &v).await? {
+            removed = Some(dirent);
+            break;
+        }
     }
-
-    // Delete dirent, then decrement nlink.
-    state.kv_delete(&dk).await?;
+    let dirent = removed.ok_or_else(|| anyhow!("EBUSY: the name kept changing"))?;
     let mut meta = get_inode(state, dirent.child_inode).await?;
     meta.nlink = meta.nlink.saturating_sub(1);
     if meta.nlink == 0 {
@@ -386,13 +459,17 @@ pub async fn unlink(state: &mut FsState, parent: u64, name: &OsStr) -> Result<()
     } else {
         put_inode(state, dirent.child_inode, &meta).await?;
     }
-
-    let mut parent_meta = get_inode(state, parent).await?;
-    let (s, ns) = now_ts();
-    parent_meta.mtime_secs = s;
-    parent_meta.mtime_nsecs = ns;
-    put_inode(state, parent, &parent_meta).await?;
+    touch_dir_mtime(state, parent).await;
     Ok(())
+}
+
+/// Deletes the name `dk` if it still holds `v`.
+async fn remove_name(state: &mut FsState, dk: &[u8], v: &[u8]) -> Result<bool> {
+    state
+        .client
+        .compare_write(dk, Some(v), None, autumn_client::WriteLease::ANON)
+        .await
+        .map_err(|e| anyhow!("KV compare_write: {e}"))
 }
 
 /// Add a name to a regular file. The directory entry is create-only so two
@@ -406,7 +483,7 @@ pub async fn link(state: &mut FsState, ino: u64, parent: u64, name: &OsStr) -> R
     if inode.mode & S_IFMT != S_IFREG {
         return Err(anyhow!("EPERM"));
     }
-    let mut parent_meta = get_inode(state, parent).await?;
+    let parent_meta = get_inode(state, parent).await?;
     if parent_meta.mode & S_IFMT != S_IFDIR {
         return Err(anyhow!("ENOTDIR"));
     }
@@ -436,14 +513,49 @@ pub async fn link(state: &mut FsState, ino: u64, parent: u64, name: &OsStr) -> R
             return Err(anyhow!("EEXIST"));
         }
     }
-    parent_meta.mtime_secs = secs;
-    parent_meta.mtime_nsecs = nanos;
-    put_inode(state, parent, &parent_meta).await?;
+    touch_dir_mtime(state, parent).await;
     *state.lookup_count.entry(ino).or_insert(0) += 1;
     Ok(inode)
 }
 
-/// Rename a file or directory.
+/// What a rename of `source` onto a name holding `target` does.
+enum Onto {
+    Free,
+    Replace(DirentValue),
+    /// Both names already name the source's inode.
+    Same,
+}
+
+/// The new name may hold nothing, a file (a file replaces it) or an empty
+/// directory (a directory replaces it); anything else is refused.
+async fn rename_onto(state: &mut FsState, source: &DirentValue, target: Option<&[u8]>) -> Result<Onto> {
+    let Some(tv) = target else { return Ok(Onto::Free) };
+    let t = schema::decode_dirent(tv).map_err(|e| anyhow!("{}", e))?;
+    // POSIX: two names of one inode (or one path twice) is a no-op (coco P1:
+    // treating the source as a replaced target destroyed its data).
+    if t.child_inode == source.child_inode {
+        return Ok(Onto::Same);
+    }
+    match (source.file_type == DT_DIR, t.file_type == DT_DIR) {
+        (true, false) => Err(anyhow!("ENOTDIR")),
+        (false, true) => Err(anyhow!("EISDIR")),
+        (true, true) => {
+            let prefix = key::dirent_prefix(t.child_inode);
+            if state.kv_range_keys(&prefix, &prefix, 1).await?.is_empty() {
+                Ok(Onto::Replace(t))
+            } else {
+                Err(anyhow!("ENOTEMPTY"))
+            }
+        }
+        (false, false) => Ok(Onto::Replace(t)),
+    }
+}
+
+/// Rename a file or directory; see `rename_onto` for what the new name may
+/// hold. Both names are compared-and-set against what was checked: the old
+/// name is removed first (a crash in between loses the name, never leaves
+/// two names on one link count), and a new name another client changed
+/// meanwhile is checked again before it is replaced.
 pub async fn rename(
     state: &mut FsState,
     old_parent: u64,
@@ -451,86 +563,127 @@ pub async fn rename(
     new_parent: u64,
     new_name: &OsStr,
 ) -> Result<()> {
-    let old_name_bytes = old_name.as_encoded_bytes();
-    let new_name_bytes = new_name.as_encoded_bytes();
-
-    let old_dk = key::dirent_key(old_parent, old_name_bytes);
-    let v = state.kv_get(&old_dk).await.map_err(|_| anyhow!("ENOENT"))?;
-    let old_dirent: DirentValue = schema::decode_dirent(&v).map_err(|e| anyhow!("{}", e))?;
-
-    // Remember an overwritten file target — its removal runs AFTER the
-    // dirent overwrite below makes it unreachable.
-    let new_dk = key::dirent_key(new_parent, new_name_bytes);
-    let mut replaced_file_ino: Option<u64> = None;
-    if let Ok(tv) = state.kv_get(&new_dk).await {
-        if let Ok(target_dirent) = schema::decode_dirent(&tv) {
-            // POSIX: when old and new resolve to the SAME file (same
-            // path, or two hard links of one inode), rename succeeds and
-            // performs NO other action (coco P1: treating the source's
-            // own inode as a "replaced target" decremented its nlink and
-            // — post-UNLINK-1 — destroyed its data).
-            if target_dirent.child_inode == old_dirent.child_inode {
-                return Ok(());
-            }
-            if target_dirent.file_type != DT_DIR {
-                replaced_file_ino = Some(target_dirent.child_inode);
-            }
+    let old_dk = key::dirent_key(old_parent, old_name.as_encoded_bytes());
+    let new_dk = key::dirent_key(new_parent, new_name.as_encoded_bytes());
+    let mut removed = None;
+    for _ in 0..8 {
+        let v = state.kv_get_opt(&old_dk).await?.ok_or_else(|| anyhow!("ENOENT"))?;
+        let source: DirentValue = schema::decode_dirent(&v).map_err(|e| anyhow!("{}", e))?;
+        let target = state.kv_get_opt(&new_dk).await?;
+        if let Onto::Same = rename_onto(state, &source, target.as_deref()).await? {
+            return Ok(());
+        }
+        let removed_now = remove_name(state, &old_dk, &v)
+            .await
+            .map_err(|e| anyhow!("rename: {e}; inode {} may have no name", source.child_inode))?;
+        if removed_now {
+            removed = Some((v, source));
+            break;
         }
     }
-
-    state.kv_delete(&old_dk).await?;
-
-    let dv = schema::encode_dirent(&old_dirent);
-    state.kv_put(&new_dk, &dv).await?;
-
-    // UNLINK-1: rename-over-existing drops the target's last name. The
-    // pre-fix code deleted the target INODE but never its EXTENTS — the
-    // POSIX atomic-save pattern (`write tmp; mv tmp file`) leaked the
-    // ENTIRE previous file content on every save. Now the target goes
-    // through the same tombstoned removal as unlink, placed AFTER the
-    // dirent overwrite (the unreachability point — a tombstone for a
-    // still-reachable inode would let the sweep destroy a live file).
-    if let Some(t_ino) = replaced_file_ino {
-        if let Ok(mut target_meta) = get_inode(state, t_ino).await {
-            target_meta.nlink = target_meta.nlink.saturating_sub(1);
-            if target_meta.nlink == 0 {
-                crate::extent::remove_unreachable_inode(state, t_ino).await?;
-            } else {
-                put_inode(state, t_ino, &target_meta).await?;
+    let Some((v, source)) = removed else {
+        return Err(anyhow!("EBUSY: the old name kept changing"));
+    };
+    let gone = |e| anyhow!("rename: {e}; inode {} may have no name", source.child_inode);
+    for _ in 0..8 {
+        let target = state.kv_get_opt(&new_dk).await.map_err(gone)?;
+        let replaced = match rename_onto(state, &source, target.as_deref()).await {
+            Ok(Onto::Free) => None,
+            Ok(Onto::Replace(t)) => Some(t),
+            // Refused now, or the new name came to name the source too: the
+            // old name goes back.
+            r @ (Ok(Onto::Same) | Err(_)) => {
+                let restored = state.client.compare_put(&old_dk, None, &v).await.map_err(|e| gone(e.into()))?;
+                if !restored {
+                    return Err(gone(anyhow!("its name was taken while it was being moved")));
+                }
+                return r.map(drop);
+            }
+        };
+        match state.client.compare_put(&new_dk, target.as_deref(), &v).await {
+            Ok(true) => {}
+            Ok(false) => continue,
+            // Landed unless the name reads otherwise; a request still in
+            // flight may land later, so it is not given back.
+            Err(e) => {
+                if state.kv_get_opt(&new_dk).await.map_err(gone)?.as_deref() != Some(v.as_slice()) {
+                    return Err(gone(anyhow!("outcome unknown: {e}")));
+                }
             }
         }
+        return finish_rename(state, old_parent, new_parent, source.file_type == DT_DIR, replaced).await;
+    }
+    // Every try lost to a definite conflict, so nothing was published.
+    if !state.client.compare_put(&old_dk, None, &v).await.map_err(|e| gone(e.into()))? {
+        return Err(gone(anyhow!("its name was taken while it was being moved")));
+    }
+    Err(anyhow!("EBUSY: the new name kept changing"))
+}
+
+/// After the new name points at the source — the commit point: removes what
+/// it replaced and updates both parents. A failure here is logged; it leaks
+/// what was replaced, the rename has happened.
+async fn finish_rename(
+    state: &mut FsState,
+    old_parent: u64,
+    new_parent: u64,
+    moved_dir: bool,
+    replaced: Option<DirentValue>,
+) -> Result<()> {
+    let mut replaced_dir = false;
+    match replaced {
+        Some(t) if t.file_type == DT_DIR => {
+            // Checked empty; nothing else names it now.
+            state.inodes.remove(&t.child_inode);
+            if let Err(e) = state.kv_delete(&key::inode_key(t.child_inode)).await {
+                tracing::warn!(ino = t.child_inode, error = %e, "replaced directory's inode not deleted");
+            }
+            replaced_dir = true;
+        }
+        // UNLINK-1: rename-over drops the target file's name. Its data goes
+        // through the same tombstoned removal as unlink, AFTER the dirent
+        // overwrite above (the unreachability point — a tombstone for a
+        // still-reachable inode would let the sweep destroy a live file).
+        Some(t) => {
+            let dropped = async {
+                let mut target_meta = get_inode(state, t.child_inode).await?;
+                target_meta.nlink = target_meta.nlink.saturating_sub(1);
+                if target_meta.nlink == 0 {
+                    crate::extent::remove_unreachable_inode(state, t.child_inode).await
+                } else {
+                    put_inode(state, t.child_inode, &target_meta).await
+                }
+            }
+            .await;
+            if let Err(e) = dropped {
+                tracing::warn!(ino = t.child_inode, error = %e, "replaced file's name not dropped from its inode");
+            }
+        }
+        None => {}
     }
 
-    let (s, ns) = now_ts();
+    // A moved directory's `..` leaves one parent for the other; a replaced
+    // directory's leaves the new parent.
+    let moved = moved_dir as i64;
+    let lost = replaced_dir as i64;
     if old_parent == new_parent {
-        let mut pmeta = get_inode(state, old_parent).await?;
-        pmeta.mtime_secs = s;
-        pmeta.mtime_nsecs = ns;
-        put_inode(state, old_parent, &pmeta).await?;
-    } else if old_dirent.file_type == DT_DIR {
-        let mut old_pmeta = get_inode(state, old_parent).await?;
-        old_pmeta.nlink = old_pmeta.nlink.saturating_sub(1);
-        old_pmeta.mtime_secs = s;
-        old_pmeta.mtime_nsecs = ns;
-        put_inode(state, old_parent, &old_pmeta).await?;
-
-        let mut new_pmeta = get_inode(state, new_parent).await?;
-        new_pmeta.nlink += 1;
-        new_pmeta.mtime_secs = s;
-        new_pmeta.mtime_nsecs = ns;
-        put_inode(state, new_parent, &new_pmeta).await?;
+        update_dir(state, old_parent, |m| {
+            add_links(m, -lost);
+            touch(m);
+        })
+        .await;
     } else {
-        let mut old_pmeta = get_inode(state, old_parent).await?;
-        old_pmeta.mtime_secs = s;
-        old_pmeta.mtime_nsecs = ns;
-        put_inode(state, old_parent, &old_pmeta).await?;
-
-        let mut new_pmeta = get_inode(state, new_parent).await?;
-        new_pmeta.mtime_secs = s;
-        new_pmeta.mtime_nsecs = ns;
-        put_inode(state, new_parent, &new_pmeta).await?;
+        update_dir(state, old_parent, |m| {
+            add_links(m, -moved);
+            touch(m);
+        })
+        .await;
+        update_dir(state, new_parent, |m| {
+            add_links(m, moved - lost);
+            touch(m);
+        })
+        .await;
     }
-
     Ok(())
 }
 

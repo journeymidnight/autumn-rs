@@ -1546,6 +1546,21 @@ keeps that name readable whatever point its publisher dies at, and a publisher
 that wakes after another gateway recovered its session is fenced out. Check:
 `cargo test -p autumn-manager --test system_publish`.
 
+Namespace operations are shared by the mount, `autumn.Fs` and the S3 gateway
+(`autumn_fs::dir`), so they hold across clients: two clients creating one name
+get one file and one `EEXIST`; `mv src dst` onto a non-empty directory fails
+`ENOTEMPTY` (a file onto a directory `EISDIR`, a directory onto a file
+`ENOTDIR`) with both sides unchanged; a `mkdir` and another client's `mkdir` or
+`rm` in the same directory do not overwrite each other's link count (under heavy
+contention an update can still be given up, logged as `directory inode kept
+changing`). Directory times have one-second resolution: a create, unlink or link
+moves the parent's mtime and ctime only when they are not already in the current
+wall-clock second, as on a filesystem with 1 s timestamps (clients with skewed
+clocks write it every time). This holds for the mount and `autumn.Fs`; an S3 PUT
+does not touch its directory's times. Check: `cargo test -p autumn-manager --test system_fs_namespace`.
+On a mount: `mkdir -p d/x s; mv -T s d` → `Directory not empty`, and `ls d/x`
+still works.
+
 `autumn.Fs` is a PyO3 binding over the **same** `autumn-fs` crate the
 `autumn-fuse` mount runs on (inode/dirent/extent layout) — it's the programmatic
 file surface (the `autumn-s3` gateway reads model weights through it). Headless

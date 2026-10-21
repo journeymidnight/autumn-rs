@@ -1,3 +1,12 @@
+Date: 2026-10-21
+TaskStatus: completed
+Task scope: user — finish review items N3/N4; first make PS conditional writes ride the group commit (user chose this over shipping the −35% concurrent-create regression), then the parent-mtime trade-off (user chose option 1: directory times at 1 s resolution).
+Current summary:
+  - a22c83a1 F-PS-CONDITIONAL-WRITE-GROUP-COMMIT: a conditional write drains only when its key has an uncommitted write, then its guarded write joins `pending` (group commit) and is answered on commit; failed comparisons answered at once or on the fence record (WriteResponder::Conflict). tests/compare_write_concurrency.rs (3 tests, all red without the uncommitted-key drain). Parking instead of draining measured slower (5.2K vs 6.2K); chaining on queued values rejected as unsound.
+  - this commit BUG-FS-CREATE-NOT-CONDITIONAL + BUG-FS-RENAME-OVER-NONEMPTY-DIR: create-only dirent publish, CAS'd parent updates, rename type/emptiness checks, conditional unlink/rmdir name removal, post-commit parent updates logged not failed; create/unlink/link move a directory's mtime/ctime once per wall-clock second. 4 sessions × 300 creates in one dir: 9.3K/8.4K/s vs 6.5K/6.3K before the fixes (ABAB, release).
+  Reviews: fresh Opus reviewer per change (Fable limit reached earlier); findings applied.
+Main gaps: BUG-FS-NLINK-RMW (file nlink / dir setattr read-modify-write, inferred), F-FS-NAMESPACE-GAPS (empty-dir check window, rename unknown-outcome target leak, autumnfs CLI mkdir).
+Next steps: BUG-FS-NLINK-RMW (reproduce first).
 Date: 2026-10-20 (3)
 TaskStatus: not_completed
 Task scope: user — /loop "fix P1 and P2": review items N2–N7 in feature_list.md.
