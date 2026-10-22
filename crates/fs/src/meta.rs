@@ -357,10 +357,17 @@ pub async fn change_links(state: &mut FsState, ino: u64, delta: i32) -> Result<I
             note_links(state, ino, &m);
             return Ok(m);
         }
+        let mut m = schema::decode_inode_meta(&stored).map_err(|e| anyhow!("inode {ino}: {e}"))?;
         if unknown_expected.as_ref().is_some_and(|e| *e != stored) {
+            // A count already at 0 has no name left and takes no new one:
+            // reclaiming it is the caller's (twice is harmless), whoever
+            // brought it there.
+            if delta < 0 && m.nlink == 0 {
+                note_links(state, ino, &m);
+                return Ok(m);
+            }
             return Err(anyhow!("link count of inode {ino}: outcome unknown"));
         }
-        let mut m = schema::decode_inode_meta(&stored).map_err(|e| anyhow!("inode {ino}: {e}"))?;
         if delta > 0 && m.nlink == 0 {
             return Err(anyhow!("ENOENT: inode {ino} has no link left"));
         }

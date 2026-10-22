@@ -194,7 +194,7 @@ fn main() -> Result<()> {
         match cmd {
             Cmd::Ls { path, long } => cmd_ls(&cluster, &path, long).await,
             Cmd::Stat { path } => cmd_stat(&cluster, &path).await,
-            Cmd::Mkdir { path } => cmd_mkdir(&cluster, &path).await,
+            Cmd::Mkdir { path } => cmd_mkdir(&mut state, &path).await,
             Cmd::Cat { path } => cmd_cat(&cluster, &path, p.direct_read.get()).await,
             Cmd::Put { local, remote } => {
                 cmd_put(&cluster, &local, &remote).await
@@ -203,7 +203,7 @@ fn main() -> Result<()> {
                 cmd_get(&cluster, &remote, &local, p.direct_read.get()).await
             }
             Cmd::Rm { path } => cmd_rm(&mut state, &path).await,
-            Cmd::Touch { path } => cmd_touch(&cluster, &path).await,
+            Cmd::Touch { path } => cmd_touch(&mut state, &path).await,
         }
     })
 }
@@ -298,28 +298,6 @@ fn new_file_meta() -> InodeMeta {
         gid: 0,
         size: 0,
         nlink: 1,
-        atime_secs: secs,
-        atime_nsecs: nsecs,
-        mtime_secs: secs,
-        mtime_nsecs: nsecs,
-        ctime_secs: secs,
-        ctime_nsecs: nsecs,
-        inline_data: None,
-        symlink_target: None,
-        stripe: None,
-        generation: 1,
-        segments: None,
-    }
-}
-
-fn new_dir_meta() -> InodeMeta {
-    let (secs, nsecs) = now_ts();
-    InodeMeta {
-        mode: ((libc::S_IFDIR as u32) | 0o755),
-        uid: 0,
-        gid: 0,
-        size: 0,
-        nlink: 2,
         atime_secs: secs,
         atime_nsecs: nsecs,
         mtime_secs: secs,
@@ -499,43 +477,26 @@ async fn cmd_stat(cluster: &ClusterClient, path: &str) -> Result<()> {
 
 // ─── mkdir ──────────────────────────────────────────────────────────────────
 
-async fn cmd_mkdir(cluster: &ClusterClient, path: &str) -> Result<()> {
-    let (parent_ino, mut parent_meta, leaf) = resolve_parent_leaf(cluster, path).await?;
-    if !is_dir(&parent_meta) {
-        bail!("parent is not a directory");
-    }
-    let dk = key::dirent_key(parent_ino, &leaf);
-    if cluster.get(&dk).await.map_err(|e| anyhow!("dirent get: {e}"))?.is_some() {
-        bail!("path already exists");
-    }
-    let new_ino = alloc_inode(cluster).await?;
-    let meta = new_dir_meta();
-    let dirent = DirentValue {
-        child_inode: new_ino,
-        file_type: DT_DIR,
-    };
-    // Order matters for crash recovery: inode FIRST (else a stale dirent would
-    // point at a missing ino on a crash between the puts). Parent nlink bump
-    // last (cheapest to leave stale — manifests only as an over-counted
-    // hard-link count on the parent, observable but harmless until rmdir
-    // refuses to drop it).
-    cluster
-        .put(&key::inode_key(new_ino), &schema::encode_inode_meta(&meta))
-        .await
-        .map_err(|e| anyhow!("put new dir inode: {e}"))?;
-    cluster
-        .put(&dk, &schema::encode_dirent(&dirent))
-        .await
-        .map_err(|e| anyhow!("put dirent: {e}"))?;
-    parent_meta.nlink += 1; // for the new dir's ".."
-    cluster
-        .put(
-            &key::inode_key(parent_ino),
-            &schema::encode_inode_meta(&parent_meta),
-        )
-        .await
-        .map_err(|e| anyhow!("update parent meta: {e}"))?;
+async fn cmd_mkdir(state: &mut FsState, path: &str) -> Result<()> {
+    let (parent, name) = resolve_parent_name(state, path).await?;
+    dir::mkdir(state, parent, std::ffi::OsStr::from_bytes(&name), 0o755).await?;
     Ok(())
+}
+
+/// The directory a path's last component lives in, and that component.
+async fn resolve_parent_name(state: &mut FsState, path: &str) -> Result<(u64, Vec<u8>)> {
+    let comps = split_path(path);
+    let Some((leaf, parents)) = comps.split_last() else {
+        bail!("the root has no parent");
+    };
+    let parent_path: Vec<String> = parents.iter().map(|c| String::from_utf8_lossy(c).into_owned()).collect();
+    let parent = dir::resolve(state, &format!("/{}", parent_path.join("/")))
+        .await?
+        .ok_or_else(|| anyhow!("ENOENT: {path}"))?;
+    if !is_dir(&meta::fetch_inode(state, parent).await?) {
+        bail!("ENOTDIR: the parent of {path} is not a directory");
+    }
+    Ok((parent, leaf.to_vec()))
 }
 
 // ─── cat / get ──────────────────────────────────────────────────────────────
@@ -825,37 +786,41 @@ async fn write_file_from_reader(
     stripe: Option<StripeLayout>,
 ) -> Result<u64> {
     let new_ino = alloc_inode(cluster).await?;
-    // Extents are published BEFORE the inode+dirent (they're keyed by the new
-    // ino, invisible until the dirent links it). If the upload fails partway —
-    // a read-source error mid-stream, a partial `put_many`, or the inode/dirent
-    // put — those extents become unreachable KV leaks (the manager-global inode
-    // is never reused). Track every written key and best-effort delete them +
-    // the inode key on any failure (coco P2). Harmless if a key isn't present.
+    // Extents and the inode are written BEFORE the dirent names them, so a
+    // failure up to the dirent leaves only unreachable keys: every written
+    // key and the inode key are deleted (the manager-global inode is never
+    // reused).
     let mut written: Vec<Vec<u8>> = Vec::new();
-    match publish_file(cluster, parent_ino, new_ino, leaf, data_reader, stripe, &mut written).await
-    {
-        Ok(()) => Ok(new_ino),
-        Err(e) => {
-            for k in &written {
-                let _ = cluster.delete(k).await;
+    let failed = match write_file_data(cluster, new_ino, data_reader, stripe, &mut written).await {
+        Err(e) => e,
+        // Only if the name is still free: a name taken meanwhile is kept.
+        Ok(()) => {
+            let dirent = schema::encode_dirent(&DirentValue { child_inode: new_ino, file_type: DT_REG });
+            match dir::compare_put_settled(cluster, &key::dirent_key(parent_ino, leaf), None, &dirent).await {
+                Ok(true) => return Ok(new_ino),
+                Ok(false) => anyhow!("destination already exists"),
+                // A copy may still land and name the inode: its keys stay.
+                Err(e) => return Err(e.context(format!("ino {new_ino} may be named; its keys are kept"))),
             }
-            let _ = cluster.delete(&key::inode_key(new_ino)).await;
-            Err(e)
+        }
+    };
+    for k in written.iter().chain([&key::inode_key(new_ino)]) {
+        if let Err(e) = cluster.delete(k).await {
+            eprintln!("ino {new_ino}: a key of the abandoned file not deleted (leaked): {e}");
         }
     }
+    Err(failed)
 }
 
-/// Stream `data_reader` into extents for `new_ino`, then publish the inode +
-/// dirent. Records every written extent key in `written` so the caller can
-/// clean up orphans on failure. `stripe` selects the extent key
+/// Stream `data_reader` into extents for `new_ino`, then write its inode.
+/// Records every written extent key in `written` so the caller can clean up
+/// orphans on failure. `stripe` selects the extent key
 /// layout: `Some` → lane-striped `[0x03][lane][ino][off]` (extents spread across
 /// lane partitions → parallel via batch_put's concurrent bulk fan-out); `None` →
 /// legacy `[0x03][ino][off]` (single partition).
-async fn publish_file(
+async fn write_file_data(
     cluster: &ClusterClient,
-    parent_ino: u64,
     new_ino: u64,
-    leaf: &[u8],
     mut data_reader: impl Read,
     stripe: Option<StripeLayout>,
     written: &mut Vec<Vec<u8>>,
@@ -972,14 +937,6 @@ async fn publish_file(
         .put(&key::inode_key(new_ino), &schema::encode_inode_meta(&meta))
         .await
         .map_err(|e| anyhow!("put inode: {e}"))?;
-    let dirent = DirentValue {
-        child_inode: new_ino,
-        file_type: DT_REG,
-    };
-    cluster
-        .put(&key::dirent_key(parent_ino, leaf), &schema::encode_dirent(&dirent))
-        .await
-        .map_err(|e| anyhow!("put dirent: {e}"))?;
     Ok(())
 }
 
@@ -1000,7 +957,7 @@ async fn declared_stripe_geom(cluster: &ClusterClient) -> Result<StripeLayout> {
 async fn cmd_put(cluster: &ClusterClient, local: &PathBuf, remote: &str) -> Result<()> {
     let (parent_ino, parent_meta, leaf) = resolve_parent_leaf(cluster, remote).await?;
     if !is_dir(&parent_meta) {
-        bail!("parent is not a directory");
+        bail!("ENOTDIR: the parent of {remote} is not a directory");
     }
     if cluster
         .get(&key::dirent_key(parent_ino, &leaf))
@@ -1032,26 +989,20 @@ async fn cmd_put(cluster: &ClusterClient, local: &PathBuf, remote: &str) -> Resu
     Ok(())
 }
 
-async fn cmd_touch(cluster: &ClusterClient, path: &str) -> Result<()> {
-    let (parent_ino, parent_meta, leaf) = resolve_parent_leaf(cluster, path).await?;
-    if !is_dir(&parent_meta) {
-        bail!("parent is not a directory");
-    }
-    let dk = key::dirent_key(parent_ino, &leaf);
-    if cluster.get(&dk).await.map_err(|e| anyhow!("dirent get: {e}"))?.is_some() {
-        // Already exists; update mtime by re-putting the inode meta.
-        let (ino, _, _, mut m) = resolve(cluster, path).await?;
+async fn cmd_touch(state: &mut FsState, path: &str) -> Result<()> {
+    let (parent, name) = resolve_parent_name(state, path).await?;
+    if let Some((ino, mut m)) = dir::lookup_opt(state, parent, std::ffi::OsStr::from_bytes(&name)).await? {
+        // Already exists: move its mtime (a whole-inode write keeps the
+        // stored link count).
         let (secs, nsecs) = now_ts();
         m.mtime_secs = secs;
         m.mtime_nsecs = nsecs;
-        cluster
-            .put(&key::inode_key(ino), &schema::encode_inode_meta(&m))
-            .await
-            .map_err(|e| anyhow!("update mtime: {e}"))?;
+        meta::put_inode(state, ino, &m).await?;
         return Ok(());
     }
+    let cluster = state.client.clone();
     // Empty file (never striped).
-    let ino = write_file_from_reader(cluster, parent_ino, &leaf, std::io::empty(), None).await?;
+    let ino = write_file_from_reader(&cluster, parent, &name, std::io::empty(), None).await?;
     println!("touched → ino {ino}");
     Ok(())
 }
@@ -1062,15 +1013,11 @@ async fn cmd_touch(cluster: &ClusterClient, path: &str) -> Result<()> {
 /// gets the same unlink as every other front-end: the tombstoned removal of
 /// an unreachable inode, and the reclaim of a segmented file's data objects.
 async fn cmd_rm(state: &mut FsState, path: &str) -> Result<()> {
-    let comps = split_path(path);
-    let Some((leaf, parents)) = comps.split_last() else {
+    if split_path(path).is_empty() {
         bail!("refusing to remove root");
-    };
-    let parent_path: Vec<String> = parents.iter().map(|c| String::from_utf8_lossy(c).into_owned()).collect();
-    let parent = dir::resolve(state, &format!("/{}", parent_path.join("/")))
-        .await?
-        .ok_or_else(|| anyhow!("ENOENT: {path}"))?;
-    let name = std::ffi::OsStr::from_bytes(leaf);
+    }
+    let (parent, leaf) = resolve_parent_name(state, path).await?;
+    let name = std::ffi::OsStr::from_bytes(&leaf);
     let (_, m) = dir::lookup_opt(state, parent, name)
         .await?
         .ok_or_else(|| anyhow!("ENOENT: {path}"))?;

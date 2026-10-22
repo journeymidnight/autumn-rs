@@ -11,7 +11,7 @@
 |------|------|
 | 内核挂载 | `autumn-fuse`（唯一依赖 fuser / libfuse 的 crate，见它的 CLAUDE.md）|
 | S3 网关 | `crates/server/src/bin/autumn_s3/` |
-| `autumnfs` CLI | `crates/server/src/bin/` |
+| `autumnfs` CLI | `crates/server/src/bin/` (mkdir / rm through `dir`, touch of an existing file through `meta::put_inode`; the parent must be a directory; a new file (put / touch) is published create-only via `dir::compare_put_settled`, its keys deleted when the publish is refused and kept when the outcome stays unknown — the same cross-session windows as rename apply) |
 | PyO3 `autumn.Fs` + fsspec facade | `python/src/fs.rs` |
 
 以前这些代码是 `autumn-fuse` 的 `core` feature；拆成独立 crate 是因为 S3 网关、Python
@@ -420,7 +420,8 @@ called at all"，那正是这份记录存在要堵的洞。
   nlink、对读到的字节 CAS，inode 已不存在就 ENOENT，不再把它写回来；新 inode 用
   `put_new_inode`。条件写结果不明（`OutcomeUnknown`，例如 PS 换主时超时）不报错，重读后
   判定：读回自己写的字节就算成功（`change_links` 每次写都带新 ctime，值唯一）；读回它
-  当时期望的字节说明没落地，再试；`change_links` 读到别的值就报错——那次可能已落地又被
+  当时期望的字节说明没落地，再试；`change_links` 读到别的值就报错（计数已是 0 且本次是 −1
+  时例外：没有名字也不会再有，由它回收）——那次可能已落地又被
   别的写覆盖，再减一次会提前减到 0 回收有名字的文件，计数只能宁高勿低
   （`system_fs_links_lost_reply`，failpoint `CHANGE_LINKS_TEST_LOST_REPLY`）。`put_inode`
   不会重复生效（nlink 每次取当前值），读到别的值就重试；它也保留更新的 ctime。以前的
@@ -438,13 +439,26 @@ called at all"，那正是这份记录存在要堵的洞。
   源须是目录且目标为空（ENOTEMPTY / EISDIR / ENOTDIR），同 inode 是 no-op。以前目标
   是目录时什么都不查，`/srcdir` 覆盖非空 `/dstdir` 返回 Ok，原目录子树从根不可达。
   先条件删旧名（崩溃只丢名字，不会出现两个名字一个 nlink），再对检查时读到的目标值
-  条件发布新名；新名被别人改了就重读重查再发布，查不过或重试用完就放回旧名。删旧名
-  或发布新名结果不明时只认"读回来就是自己的值"，否则报错、不放回旧名（迟到的发布会
-  造成两个名字）——源 inode 可能没名字（泄漏，不丢数据），错误里写明。错误信息里不带
-  用户的名字：FUSE 按子串映射 errno。被替换的空目录删 inode，父目录
+  条件发布新名；新名被别人改了就重读重查再发布，查不过或重试用完就放回旧名。发布新名
+  和放回旧名结果不明时重读判定（`compare_put_settled`）：读回自己的值算落地，读回期望
+  的旧值就再发一次（两份期望同一字节的写最多落地一个），读到别的值说明没落地也不可能
+  再落地。一次结果不明之后，后面那次的"比较失败"也要重读判定：可能正是被前一份迟到落地
+  的副本比掉的，当成没落地会把旧名放回，一个 nlink 两个名字（删其一即回收、另一名悬空）。
+  以前读到别的值就报错、源 inode 没有名字，迟到的发布再落地时被替换的目标没减 nlink
+  （`system_fs_links_lost_reply::a_rename_publish_of_unknown_outcome_is_settled` /
+  `a_late_landing_publish_is_not_taken_for_a_refusal`，failpoint `SETTLE_TEST_FAULT`）。删旧名结果不明仍报错（读到"没有"分不清是
+  自己删的还是别人 unlink 的），源 inode 可能没名字（泄漏，不丢数据），错误里写明。错误
+  信息里不带用户的名字：FUSE 按子串映射 errno。被替换的空目录删 inode，父目录
   nlink 跟着改。仍非原子（v1 限制；rename-over 见 UNLINK-1）。
-  已知限制：目标目录"为空"的检查与替换之间，另一个会话往里建文件，那个文件会失去
-  入口——和 rmdir 的同一窗口，只有目录级协调才能关；只在跨会话并发时出现。
+  已知限制（用户 2026-10-22 定为接受）：rmdir 或 rename 覆盖空目录时，"为空"的检查与
+  删除之间另一个会话往那个目录里建的名字会失去入口——create 返回成功、文件却不可见
+  （泄漏，数据留在 KV 里）。只在跨会话并发对同一目录 rmdir 与建名字时出现；要关闭需要
+  目录级协调（先标记目录"正在删除"再查空，建名字的路径发布后再查父目录）。读回恰好是
+  自己的值也可能是第三个会话把同一 inode 链接到同一名字所致，此时 rename 会按落地处理
+  （需三方以上并发，接受）。同理，副本落地后、重读前别的会话改了这个名字，重读会误导：
+  被 unlink 回到期望值就再发一次（名字可能指向已回收的 inode），被替换成别的值就按没落地
+  放回旧名（源多一个名字没计数）。要关闭需要 dirent 带版本或每次尝试的 nonce；以前这里
+  报错泄漏。
   测试：`crates/manager/tests/system_fs_namespace.rs`。
 
 ## Per-session lease + 跨前端围栏

@@ -1,6 +1,6 @@
 # autumn-rs feature list — OPEN backlog
 
-**Last updated:** 2026-10-21 (BUG-FS-NLINK-RMW fixed and removed; follow-up F-FS-NAMESPACE-GAPS)
+**Last updated:** 2026-10-22 (F-FS-NAMESPACE-GAPS concluded and removed)
 
 **Rules:**
 - This file tracks the **OPEN backlog only**. A feature that reaches `passes: true`
@@ -14,15 +14,11 @@
 
 ## Active
 
-### F-FS-NAMESPACE-GAPS — 命名空间跨会话剩余窗口（N3/N4 修复后留下）
-- **Trigger** (2026-10-20 N3/N4 修复与评审):
-  - 替换空目录（rename 覆盖）与 rmdir：检查"为空"与删除/替换之间另一个会话往里建文件，那个文件失去入口。
-  - rename 发布新名结果不明且读回不是自己的值时报错不放回旧名：迟到的发布会让源有名、被替换的目标少减一次 nlink（泄漏）；读回恰好等于自己的值也可能是别的会话链接同一 inode 所致（需三方并发）。
-  - `autumnfs` CLI 的 mkdir（`crates/server/src/bin/autumnfs.rs`）自带一份实现，仍是无条件发布目录项与读-改-写父目录。
-- **Scope**: 前两项需目录级协调（如目录版本/锁 key）后再做；CLI 改为调用 `autumn_fs::dir::mkdir`。
-- **Acceptance**: 各项给出结论（已修/证伪/接受并写进 `crates/fs/CLAUDE.md`）；修的项有消融变红的测试。
+### BUG-PY-FS-PARENT-NOT-DIR — `autumn.Fs.mkdir/create` 不查父 inode 是否目录（评审推断，未复现）
+- **Trigger** (2026-10-22 F-FS-NAMESPACE-GAPS 第二轮评审): fs 核心 `dir::create_child` 不查父 inode 类型（FUSE 由内核保证，CLI 已在 `resolve_parent_name` 查）；PyO3 `autumn.Fs.mkdir/create`（`python/src/fs.rs`）把调用方给的 parent ino 直接传进去。parent 是文件时：目录项挂在文件下，mkdir 还会把文件 nlink 抬到 2，文件永远回收不了。
+- **Scope**: 先用 Python API 复现。修在 binding（每次 create 多一次 inode 读）还是核心（FUSE 每次 create 也多一次读，除非用缓存的父 meta）由用户定。
+- **Acceptance**: 复现用例修复前文件下出现目录项/nlink 变 2，修复后返回 ENOTDIR 且不改任何 key；消融变红；FUSE create 吞吐不降。
 - `passes: false`
-- **notes** (2026-10-21, BUG-FS-NLINK-RMW 修复的评审，推断未复现): `meta::change_links` 一次 −1 已落地把计数减到 0、回复丢失、随后 inode 又被别的会话整份写（计数仍 0）时，它按"结果不明"报错，没人写墓碑：该 inode 泄漏（数据不丢）。可考虑"读到计数 0 且不是自己发的值"时补墓碑。
 
 ### F-TEST-FOLLOWUPS — 测试集体检留下的缺口与疑点（未处理）
 - **Trigger** (2026-10-19，测试集体检的审查与删除过程中发现，均未在那次改动里处理):

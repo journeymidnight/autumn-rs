@@ -587,31 +587,86 @@ pub async fn rename(
             // Refused now, or the new name came to name the source too: the
             // old name goes back.
             r @ (Ok(Onto::Same) | Err(_)) => {
-                let restored = state.client.compare_put(&old_dk, None, &v).await.map_err(|e| gone(e.into()))?;
-                if !restored {
+                if !compare_put_settled(&state.client, &old_dk, None, &v).await.map_err(gone)? {
                     return Err(gone(anyhow!("its name was taken while it was being moved")));
                 }
                 return r.map(drop);
             }
         };
-        match state.client.compare_put(&new_dk, target.as_deref(), &v).await {
-            Ok(true) => {}
-            Ok(false) => continue,
-            // Landed unless the name reads otherwise; a request still in
-            // flight may land later, so it is not given back.
-            Err(e) => {
-                if state.kv_get_opt(&new_dk).await.map_err(gone)?.as_deref() != Some(v.as_slice()) {
-                    return Err(gone(anyhow!("outcome unknown: {e}")));
-                }
-            }
+        if !compare_put_settled(&state.client, &new_dk, target.as_deref(), &v).await.map_err(gone)? {
+            continue;
         }
         return finish_rename(state, old_parent, new_parent, source.file_type == DT_DIR, replaced).await;
     }
     // Every try lost to a definite conflict, so nothing was published.
-    if !state.client.compare_put(&old_dk, None, &v).await.map_err(|e| gone(e.into()))? {
+    if !compare_put_settled(&state.client, &old_dk, None, &v).await.map_err(gone)? {
         return Err(gone(anyhow!("its name was taken while it was being moved")));
     }
     Err(anyhow!("EBUSY: the new name kept changing"))
+}
+
+/// Test-only failpoint for the next `compare_put_settled` attempt:
+/// `SETTLE_TEST_UNSENT` reports its outcome unknown without sending it;
+/// `SETTLE_TEST_LANDS_LATE` does the same, then sends it after the re-read,
+/// just before the next attempt — a copy held up behind a slow append.
+#[doc(hidden)]
+pub static SETTLE_TEST_FAULT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+#[doc(hidden)]
+pub const SETTLE_TEST_UNSENT: u8 = 1;
+#[doc(hidden)]
+pub const SETTLE_TEST_LANDS_LATE: u8 = 2;
+/// Set when a `SETTLE_TEST_LANDS_LATE` copy was sent and landed.
+#[doc(hidden)]
+pub static SETTLE_TEST_LATE_LANDED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Compare-and-sets the name `dk` from `expected` to `value`, settling an
+/// unknown outcome by reading again: `value` means it landed; `expected`
+/// means it has not, and the same compare-and-set goes again (of copies
+/// expecting the same bytes at most one lands); anything else means it did
+/// not and cannot. Once an attempt was unknown, a later attempt's refusal
+/// is settled the same way: it may have been refused by the earlier copy.
+/// This holds while no other session writes the name in the window; one
+/// that does can make the read-back mislead (fs CLAUDE.md, rename).
+pub async fn compare_put_settled(
+    client: &autumn_client::ClusterClient,
+    dk: &[u8],
+    expected: Option<&[u8]>,
+    value: &[u8],
+) -> Result<bool> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let (mut unsure, mut held) = (false, false);
+    for _ in 0..8 {
+        if std::mem::take(&mut held) {
+            let landed = client.compare_put(dk, expected, value).await.map_err(|e| anyhow!("KV compare_put: {e}"))?;
+            SETTLE_TEST_LATE_LANDED.store(landed, Relaxed);
+        }
+        let fault = match SETTLE_TEST_FAULT.load(Relaxed) {
+            0 => 0,
+            _ => SETTLE_TEST_FAULT.swap(0, Relaxed),
+        };
+        let sent = if fault != 0 {
+            held = fault == SETTLE_TEST_LANDS_LATE;
+            Err(autumn_client::AutumnError::OutcomeUnknown("not sent (test)".into()))
+        } else {
+            client.compare_put(dk, expected, value).await
+        };
+        match sent {
+            Ok(true) => return Ok(true),
+            Ok(false) if !unsure => return Ok(false),
+            Ok(false) | Err(autumn_client::AutumnError::OutcomeUnknown(_)) => {
+                unsure = true;
+                let now = client.get(dk).await.map_err(|e| anyhow!("KV get: {e}"))?;
+                if now.as_deref() == Some(value) {
+                    return Ok(true);
+                }
+                if now.as_deref() != expected {
+                    return Ok(false);
+                }
+            }
+            Err(e) => return Err(anyhow!("KV compare_put: {e}")),
+        }
+    }
+    Err(anyhow!("outcome unknown: the name never settled"))
 }
 
 /// After the new name points at the source — the commit point: removes what

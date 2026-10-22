@@ -62,12 +62,16 @@ async fn read_name(st: &mut FsState, name: &str) -> anyhow::Result<Option<Vec<u8
     Ok(Some(out))
 }
 
+/// The failpoints are process-wide.
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Session A unlinks one of two names; its count-down lands but the reply
 /// is lost (failpoint), and session B rewrites the inode (a chmod) before A
 /// looks again. A must not count down a second time: the other name keeps
 /// the file.
 #[test]
 fn a_lost_reply_is_not_counted_twice() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     use std::sync::atomic::Ordering::Relaxed;
     use autumn_fs::meta::CHANGE_LINKS_TEST_LOST_REPLY as HOLD;
     compio::runtime::Runtime::new().unwrap().block_on(async {
@@ -93,4 +97,88 @@ fn a_lost_reply_is_not_counted_twice() {
         assert_eq!(meta::fetch_inode(&mut b, ino).await.unwrap().nlink, 1);
         assert_eq!(read_name(&mut b, "n2").await.unwrap(), Some(body));
     });
+}
+
+/// Session A unlinks a file's only name; the count reaches 0 but the reply
+/// is lost, and session B rewrites the inode before A looks again. A cannot
+/// tell its own landing apart, but a count at 0 has no name left: the file
+/// is reclaimed, not leaked.
+#[test]
+fn a_lost_reply_at_zero_still_reclaims() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    use std::sync::atomic::Ordering::Relaxed;
+    use autumn_fs::meta::CHANGE_LINKS_TEST_LOST_REPLY as HOLD;
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        let (mgr, _dirs) = boot(250, 25001).await;
+        let (mut a, mut b) = (mount(&mgr).await, mount(&mgr).await);
+        let ino = put(&mut a, "only", &vec![0x44u8; 64 << 10]).await;
+        HOLD.store(1, Relaxed);
+        let (unlinked, ()) = futures::join!(dir::unlink(&mut a, 1, OsStr::new("only")), async {
+            let start = std::time::Instant::now();
+            while HOLD.load(Relaxed) != 2 {
+                assert!(start.elapsed() < Duration::from_secs(10), "the count-down never reached the hold");
+                compio::time::sleep(Duration::from_millis(5)).await;
+            }
+            let mut m = meta::fetch_inode(&mut b, ino).await.unwrap();
+            m.mode = (m.mode & !0o7777) | 0o600;
+            meta::put_inode(&mut b, ino, &m).await.unwrap();
+            HOLD.store(0, Relaxed);
+        });
+        unlinked.unwrap();
+        assert!(
+            b.kv_get_opt(&autumn_fs::key::inode_key(ino)).await.unwrap().is_none(),
+            "a nameless inode at count 0 was left behind"
+        );
+    });
+}
+
+/// Renames "from" to "to" with the failpoint `fault` set on the publish of
+/// the new name; the file ends with exactly the name "to".
+async fn rename_under_fault(base: u16, fault: u8) {
+    use std::sync::atomic::Ordering::Relaxed;
+    use autumn_fs::dir::SETTLE_TEST_FAULT;
+    let (mgr, _dirs) = boot(base, base as u64 * 100 + 1).await;
+    let mut a = mount(&mgr).await;
+    let body = vec![0x55u8; 4 << 10];
+    let ino = put(&mut a, "from", &body).await;
+    SETTLE_TEST_FAULT.store(fault, Relaxed);
+    dir::rename(&mut a, 1, OsStr::new("from"), 1, OsStr::new("to")).await.unwrap();
+    assert_eq!(SETTLE_TEST_FAULT.load(Relaxed), 0, "the failpoint never fired");
+    if fault == autumn_fs::dir::SETTLE_TEST_LANDS_LATE {
+        assert!(
+            autumn_fs::dir::SETTLE_TEST_LATE_LANDED.swap(false, Relaxed),
+            "the late copy never landed"
+        );
+    }
+    assert_eq!(dir::lookup_opt(&mut a, 1, OsStr::new("to")).await.unwrap().map(|(i, _)| i), Some(ino));
+    assert!(
+        dir::lookup_opt(&mut a, 1, OsStr::new("from")).await.unwrap().is_none(),
+        "the old name is back beside the new one"
+    );
+    assert_eq!(meta::fetch_inode(&mut a, ino).await.unwrap().nlink, 1);
+    assert_eq!(read_name(&mut a, "to").await.unwrap(), Some(body));
+}
+
+/// A rename whose publish of the new name comes back with an unknown
+/// outcome before it reached the server: the name still reads what was
+/// expected, so the rename sends it again and completes; the file is not
+/// left without a name.
+#[test]
+fn a_rename_publish_of_unknown_outcome_is_settled() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    compio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(rename_under_fault(251, autumn_fs::dir::SETTLE_TEST_UNSENT));
+}
+
+/// The unknown publish lands late, after the re-read and before the copy
+/// sent again, which is then refused by it: the refusal is settled by
+/// reading, so the rename completes instead of putting the old name back
+/// beside the new one (two names on a count of one).
+#[test]
+fn a_late_landing_publish_is_not_taken_for_a_refusal() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    compio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(rename_under_fault(252, autumn_fs::dir::SETTLE_TEST_LANDS_LATE));
 }

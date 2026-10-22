@@ -1,3 +1,14 @@
+Date: 2026-10-22
+TaskStatus: completed
+Task scope: user — F-FS-NAMESPACE-GAPS (four items).
+Current summary:
+  - empty-dir check window in rmdir / rename-over: accepted by the user, documented in crates/fs/CLAUDE.md (needs directory-level coordination to close).
+  - rename publish / restore of unknown outcome: `dir::compare_put_settled` re-reads (own value = landed, expected = send again, other = not landed); once an attempt was unknown, a later refusal is settled the same way (review HIGH: a late-landing copy refused the retry and the old name came back beside the new one). Tests a_rename_publish_of_unknown_outcome_is_settled / a_late_landing_publish_is_not_taken_for_a_refusal (failpoint SETTLE_TEST_FAULT), both red without their fix. Cross-session windows between a landing and the re-read accepted and documented.
+  - autumnfs CLI: mkdir / touch / rm through the fs core, parent must be a directory (review: mkdir under a file raised its nlink), put publishes create-only and deletes its keys only on a definite loss. tests/autumnfs_cli.rs (red without the parent check).
+  - zero-count leak after an undecidable unknown: `change_links` reclaims when it reads a count of 0 (a_lost_reply_at_zero_still_reclaims, red without).
+  Two fresh Opus reviews; the second's core finding (the Python binding passes a parent ino unchecked) predates this work and is filed as BUG-PY-FS-PARENT-NOT-DIR.
+Main gaps: BUG-PY-FS-PARENT-NOT-DIR (needs a user call on where the check goes).
+Next steps: pick from feature_list.md.
 Date: 2026-10-21 (2)
 TaskStatus: completed
 Task scope: user — BUG-FS-NLINK-RMW.
