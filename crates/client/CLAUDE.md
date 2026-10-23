@@ -352,12 +352,7 @@ failover via `rotate_manager` on connection error.
   (`ps_connecting`) and checks the cache again, so concurrent first requests
   share the first connect instead of each opening and handshaking their own
   (`connection_tests::concurrent_first_requests_open_one_connection`: 1 accept,
-  16 without). Not a correctness fix for conditional writes — those are
-  decided on the PS whatever the connection. A side effect: requests in flight
-  together reach the PS in send order, which holds only within one connection
-  (`compare_write_concurrency::a_comparison_sees_a_put_admitted_before_it`
-  sends a compare-put without waiting for the put before it, and failed 6–8
-  runs in 10 on a cold client). A waiter whose turn comes after a
+  16 without). A waiter whose turn comes after a
   connect failed while it waited returns that failure instead of dialling
   (`ConnectGate`; `waiters_share_a_failed_connect`: 8 calls to a host that never
   answers fail together after one dial, 7 dials without it). It matters where

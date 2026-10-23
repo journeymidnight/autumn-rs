@@ -2469,8 +2469,7 @@ impl ClusterClient {
         }
         // One connection per PS address: concurrent first requests wait for
         // the first connect instead of each opening (and handshaking) their
-        // own. Requests in flight together then also reach the PS in the order
-        // they were sent, which holds only within one connection.
+        // own.
         let gate = self.ps_connecting.borrow_mut().entry(ps_addr.to_string()).or_default().clone();
         let seen = gate.done.get();
         let _turn = gate.turn.lock().await;
