@@ -881,6 +881,8 @@ use std::sync::mpsc as smpsc;
 enum BatchOp {
     Get,
     Put,
+    /// Existence only; items carry no buffer.
+    Head,
 }
 
 /// One page of work. `ptr`/`len` address a pinned host page kept alive by the
@@ -900,7 +902,7 @@ struct BatchJob {
     op: BatchOp,
     items: Vec<WorkItem>,
     /// Relative TTL in seconds for a `Put` batch; `0` = no expiry. Ignored by
-    /// `Get`.
+    /// `Get` and `Head`.
     ttl_secs: u64,
     done: smpsc::Sender<Vec<bool>>,
 }
@@ -994,6 +996,11 @@ async fn run_job(client: &ClusterClient, op: BatchOp, items: Vec<WorkItem>, ttl_
             drop(pitems);
             results.iter().map(|r| r.is_ok()).collect()
         }
+        BatchOp::Head => {
+            let keys: Vec<&[u8]> = items.iter().map(|it| it.key.as_slice()).collect();
+            // An RPC error reads as absent, as `Client.batch_head` has it.
+            client.head_many(&keys).await.into_iter().map(|r| r.is_ok_and(|m| m.found)).collect()
+        }
     }
 }
 
@@ -1074,9 +1081,34 @@ impl BatchClient {
                                     return;
                                 }
                             };
+                            // Data jobs run one at a time; a probe runs at once beside
+                            // them, so it never queues behind a large put.
+                            let client = std::rc::Rc::new(client);
+                            let (data_tx, mut data_rx) = unbounded::<BatchJob>();
+                            let data_client = client.clone();
+                            compio::runtime::spawn(async move {
+                                while let Some(job) = data_rx.next().await {
+                                    let res = run_job(&data_client, job.op, job.items, job.ttl_secs, per_worker_cap, direct).await;
+                                    let _ = job.done.send(res);
+                                }
+                            })
+                            .detach();
                             while let Some(job) = job_rx.next().await {
-                                let res = run_job(&client, job.op, job.items, job.ttl_secs, per_worker_cap, direct).await;
-                                let _ = job.done.send(res);
+                                if let BatchOp::Head = job.op {
+                                    let probe_client = client.clone();
+                                    compio::runtime::spawn(async move {
+                                        let res = run_job(&probe_client, job.op, job.items, 0, per_worker_cap, direct).await;
+                                        let _ = job.done.send(res);
+                                    })
+                                    .detach();
+                                } else if let Err(e) = data_tx.unbounded_send(job) {
+                                    // The data task is gone (it panicked): answer the job
+                                    // failed, and say so — every later get / put on this
+                                    // worker fails the same way.
+                                    eprintln!("autumn BatchClient: worker data task gone; get/put on this worker fail");
+                                    let job = e.into_inner();
+                                    let _ = job.done.send(vec![false; job.items.len()]);
+                                }
                             }
                         });
                     })
@@ -1121,6 +1153,16 @@ impl BatchClient {
         self.run_batch(py, BatchOp::Put, keys, bufs, false, ttl_secs)
     }
 
+    /// Batched existence probe: list[bool] aligned to `keys` (an RPC error
+    /// reads as absent). Blocks with the GIL released, like `get_into`, so the
+    /// result crosses threads once — `Client.batch_head` crosses several, each
+    /// waiting for the GIL. Does not wait for a get / put job in flight on the
+    /// same client (its requests still share the partitions' connections).
+    fn exists(&self, py: Python<'_>, keys: Vec<Vec<u8>>) -> PyResult<Vec<bool>> {
+        let items = keys.into_iter().map(|key| WorkItem { key, ptr: 0, len: 0 }).collect();
+        Ok(self.run_items(py, BatchOp::Head, items, 0))
+    }
+
     fn n_workers(&self) -> usize {
         self.workers.len()
     }
@@ -1155,7 +1197,15 @@ impl BatchClient {
                 len: buf.item_count(),
             });
         }
+        let results = self.run_items(py, op, items, ttl_secs);
+        drop(bufs); // release pinned buffers only after all workers finished
+        Ok(results)
+    }
 
+    /// Shards `items` across the workers in order and waits for all of them
+    /// with the GIL released.
+    fn run_items(&self, py: Python<'_>, op: BatchOp, items: Vec<WorkItem>, ttl_secs: u64) -> Vec<bool> {
+        let n = items.len();
         let k = self.workers.len();
         // Split into k contiguous shards (preserves order on reassembly).
         let per = n.div_ceil(k).max(1);
@@ -1169,7 +1219,7 @@ impl BatchClient {
             shards.push(chunk);
         }
 
-        let results = py.allow_threads(|| {
+        py.allow_threads(|| {
             let mut dones: Vec<(smpsc::Receiver<Vec<bool>>, usize)> = Vec::with_capacity(shards.len());
             for (wi, chunk) in shards.into_iter().enumerate() {
                 let chunk_len = chunk.len();
@@ -1192,9 +1242,7 @@ impl BatchClient {
                 }
             }
             out
-        });
-        drop(bufs); // release pinned buffers only after all workers finished
-        Ok(results)
+        })
     }
 }
 
