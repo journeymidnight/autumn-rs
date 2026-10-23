@@ -348,6 +348,19 @@ failover via `rotate_manager` on connection error.
   `mgr_client()`'s skip a client whose `is_closed()` is true and open a fresh one,
   so a connection the rpc keepalive judged silent (autumn-rpc CLAUDE.md "Dead-peer
   detection") is replaced before the next call rather than failing it first.
+  A miss takes the address's connect lock (`ps_connecting`, one async mutex
+  per address) and checks the cache again: concurrent first requests share
+  one connection. Each used to open its own, so two requests sent back to back
+  could reach the PS on different connections, which the PS does not order
+  against each other (`compare_write_concurrency::a_comparison_sees_a_put_admitted_before_it`
+  failed 6–8 runs in 10; `connection_tests::concurrent_first_requests_open_one_connection`
+  counts 1 accept, 16 without the lock). A waiter whose turn comes after a
+  connect failed while it waited returns that failure instead of dialling
+  (`ConnectGate`; `waiters_share_a_failed_connect`: 8 calls to a host that never
+  answers fail together after one dial, 7 dials without it). It matters where
+  the connect timeout is shorter than the caller's deadline (retries,
+  `ps_call`); on a first attempt the two are equal, the holder is cut off
+  without recording, and the waiters' own deadlines end them together.
 - `resolve_key(key) → (part_id, ps_addr)` — route key to partition.
 - `resolve_part_id(part_id) → ps_addr` — resolve partition to PS.
 - `all_partitions() → Vec<(part_id, ps_addr)>` — list all partitions.

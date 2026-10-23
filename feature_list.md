@@ -27,20 +27,6 @@
 - **notes** (2026-10-24): exists 长尾（写入进行中 p99 500–800 ms）的根因不是 PS `conn_inflight_cap`（调到 64 不变），也不是 GIL、连接队列：io_uring 在提交系统调用里就地完成 socket 发送，16 MiB 页在回环上是内核里的 CPU 活，worker 线程 93% CPU 卡在 `submit_with_args`（gdb 25/25 采样），同一运行时上的探测只能等。对照：另一线程上的 client p99 12 ms；写 1 MiB 页长尾缩到 35 ms。修：BatchClient 多一个专门跑 exists 的线程（自己的运行时和连接），读写 worker 恢复串行 → 同 client 写入进行中 exists p99 12–13 ms、max 13 ms；消融（探测走读写 worker）p50 927 ms。
 - **notes** (2026-10-24，exists 长尾根因修正): 前面"专门 probe 线程"只对 TCP 的 io_uring 就地发送有效；UCX 上同 client 探测 p99 270 ms 的真因是 PS 每连接 4 个准入槽读写共用，同连接上 2–3 个 16 MiB put 占满后 HEAD 要等一次提交。修：RPC 客户端加 urgent 通道（读类请求先发）+ PS 连接的发送窗口（≥64 KiB 的未应答请求最多 3 个，`--ps-send-window`），probe 线程删掉，exists 回到同一 worker/同一 ClusterClient。同 client 写入进行中 exists p99 270 → 8.6 ms；perf-check 交替对照无一格变慢，UCX 单分区写 +30%。
 
-### F-COMPARE-PUT-BULK — 大 value 的条件写（put-if-absent 带 TTL、零拷贝）
-- **Trigger** (2026-10-24 用户): kvcache 写前要先 exists 去重；条件写 `MSG_COMPARE_PUT` 只收 ≤64 KiB 的内联 value、不带 TTL，大页只能"先探测再写"两趟。
-- **Scope**: 新 opcode，ctrl 为 rkyv（key、expected、expires_at），value 走 bulk 尾巴（与 `MSG_PUT_BULK` 同样收进池化缓冲）；PS 复用条件写的到达顺序比较，`expected = None` 只查存在不读 value；客户端按协商版本门控；`BatchClient.put_from(..., if_absent=True)`；adapter 用它代替写前探测。
-- **Acceptance**: 已存在的 key 不写、不追加日志，返回"已存在"；不存在的写入且带 TTL；大 value 不经 rkyv 拷贝；去掉存在性判定或 TTL 传递任一项测试变红；普通写性能不降；adapter 去重仍然生效。
-- `passes: false`
-- **notes** (2026-10-24): 已实现 `MSG_COMPARE_PUT_BULK`（wire 74，0x60）、`compare_put_bulk` / `put_many_if_absent`、`BatchClient.put_from(..., if_absent=True)`；`expected=None` 只查存在（`lookup_live`，与 HEAD 共用），已存在的 key 在排队前就被拒。消融：去掉存在性判定、去掉 TTL、去掉池化接收识别，各自对应测试变红。实测（UCX，8 rank × 64 × 16 MiB）：全新 key if-absent 3.00 GB/s vs 普通 put 3.07 GB/s（ABAB 中位，噪声内）；**全部已存在时 if-absent 350 ms vs 探测 1 ms**——value 照样整条传过去再被拒。所以 adapter 去重不换成它（读实例重写的页几乎都已存在），仍用 exists 探测；探测的长尾由快速通道解决。Scope 里"adapter 用它代替写前探测"因此不做，待用户确认。Fable 评审无 high；M1（超 64 MiB inline 上限时 PS 回帧级错误，客户端当路由错误整条重发 10 次）已改为回复体 `CODE_VALUE_TOO_LARGE`，消融红；条件写计入 req_count。未覆盖：已存在 key 不追加日志只由代码结构保证（测试只验值不变）。
-- **notes** (2026-10-24 用户): `BatchClient.put_from(if_absent)` 没有调用方，用户要求删掉（API 保持简洁）；已删，连同只为它服务的 `put_many_if_absent`。`compare_put_bulk` 保留，用户如要也删再说。
-
-### BUG-COMPARE-SEES-EARLIER-PUT-FLAKY — 同连接上紧跟在 put 后的 compare_put 有时看不到它（未定位）
-- **Trigger** (2026-10-24): `compare_write_concurrency::a_comparison_sees_a_put_admitted_before_it` 在 HEAD 3d14236e 上 8 次红 6 次（独立 worktree、独立 target），每次漏 1–8 个，常是连续编号（如 37–44）；本机当时负载 10–14。测试自 a22c83a1 引入，之后数据路径源码没变过，推断是时序相关、一直存在。
-- **Scope**: 先定位重排发生在哪一段：客户端两个 future 提交顺序（同一 join，put 先被 poll），还是 PS 连接任务里每帧一个 future 放进 `FuturesUnordered`、在 `conn_inflight_cap` 处排队后发往写 actor 的顺序；用请求 id / 到达写 actor 的顺序打日志区分。
-- **Acceptance**: 根因写明；该测试在负载下连续多轮全绿；去掉修复变红；写路径性能不降。
-- `passes: false`
-
 ### F-KVC-LOW-REPLICA — kvc 写 2 副本、封存后转 EC 2+1
 - **Trigger** (2026-10-23 用户): KV-cache 可重算，3 副本写放大不必要。
 - **Scope**: 现在 `bootstrap --replication` 对 log/row/meta 一视同仁、split 子分区继承父流参数，没有按 namespace / 分区设副本数的入口。kvc 范围的分区：日志流 2 副本打开、封存后转 EC 2+1；meta/row 流保持 3 副本。

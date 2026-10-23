@@ -1,9 +1,9 @@
 Date: 2026-10-24
-TaskStatus: not_completed
-Task scope: user — (1) bulk compare-put, (2) a fast lane for small reads on the shared PS connection without losing performance, (3) then the write-through kvc memory tier.
-Current summary: (1) pushed 95643a92. User 2026-10-24: BatchClient.put_from(if_absent) has no caller (the adapter keeps its exists probe: if-absent ships the value, 350 ms vs 1 ms on present pages) → removed with put_many_if_absent (Opus review clean); compare_put_bulk stays unless the user says otherwise. (2) done: RPC urgent lane + per-connection send window (3 large requests, under the PS's 4 admission slots); root cause measured (lane alone did not help: reads and writes share the PS's slots). exists p99 270 → 8.6 ms on UCX; perf-check interleaved A/B no cell slower, UCX one-partition writes +30%. Two Fable reviews (no high).
-Main gaps: adapter AUTUMN_REV bump + README `--auditwheel skip`; BUG-COMPARE-SEES-EARLIER-PUT-FLAKY; (3) not started.
-Next steps: the kvc memory tier.
+TaskStatus: completed
+Task scope: user — (1) bulk compare-put, (2) a fast lane for small reads on the shared PS connection without losing performance; then the compare-put ordering bug. (3) the kvc memory tier: user said not yet.
+Current summary: (1) 95643a92; the if_absent flag removed at the user's request (ea2324ac); compare_put_bulk kept (user: reasonable next to compare_put). (2) 02e5a31e: urgent lane + per-connection send window; exists p99 270 -> 8.6 ms on UCX, perf-check no cell slower. Adapter pinned to ea2324ac (autumn_kvcache 873fee0). Bug: concurrent first requests each opened a PS connection, so a put and a compare-put sent back to back could take different connections, which the PS does not order; fixed with a per-address connect lock in the SDK (warm-up control 10/10 vs 2/10; ablation 16 connections, 7/10 red).
+Main gaps: F-KVC-CACHE-TIER design waiting on the user.
+Next steps: whatever the user picks.
 
 Date: 2026-10-23 (3)
 TaskStatus: not_completed

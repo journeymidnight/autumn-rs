@@ -11,6 +11,7 @@ fn client(manager: String) -> ClusterClient {
         current_mgr: Cell::new(0),
         mgr_conn: Rc::new(RefCell::new(None)),
         ps_conns: RefCell::new(HashMap::new()),
+        ps_connecting: RefCell::new(HashMap::new()),
         en_pool: autumn_stream::ConnPool::with_role(autumn_rpc::version_hello::Role::Client),
         regions: RefCell::new(vec![]),
         ps_details: RefCell::new(HashMap::new()),
@@ -638,4 +639,48 @@ async fn en_credential_refusal_is_returned_without_fallback() {
         assert_eq!(en_calls.get(), 1, "ec_data_shards={ec_data_shards}: another node was tried");
         assert_eq!(proxy_calls.get(), 0, "ec_data_shards={ec_data_shards}: fell back to the proxy");
     }
+}
+
+/// Concurrent first requests to one PS share one connection: requests sent
+/// back to back must reach the PS in order, which holds only within a
+/// connection. Ablation: without the per-address connect lock, each opens its
+/// own.
+#[compio::test]
+async fn concurrent_first_requests_open_one_connection() {
+    let peer = Peer::start_as(Service::PartitionServer, respond).await;
+    let client = client("127.0.0.1:1".into());
+    let calls = (0..16).map(|_| client.ps_call(&peer.addr, ECHO, Bytes::new()));
+    for r in futures::future::join_all(calls).await {
+        r.unwrap();
+    }
+    assert_eq!(peer.accepts.get(), 1);
+}
+
+/// Requests waiting on a connect that fails take its failure: on a host that
+/// accepts and never answers, they fail together after one connect timeout
+/// instead of each dialling in turn. Ablation: without the shared failure the
+/// waiters dial one by one and the last ones run into their own deadline.
+#[compio::test]
+async fn waiters_share_a_failed_connect() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr").to_string();
+    let accepts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = accepts.clone();
+    std::thread::spawn(move || {
+        let mut held = Vec::new();
+        for sock in listener.incoming() {
+            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            held.push(sock);
+        }
+    });
+    let client = client("127.0.0.1:1".into());
+    client.set_first_attempt_timeout(Some(Duration::from_millis(300)));
+    let started = std::time::Instant::now();
+    let calls = (0..8).map(|_| client.ps_call(&addr, ECHO, Bytes::new()));
+    for r in futures::future::join_all(calls).await {
+        assert!(r.is_err());
+    }
+    let took = started.elapsed();
+    assert_eq!(accepts.load(std::sync::atomic::Ordering::SeqCst), 1, "one dial for all eight");
+    assert!(took < Duration::from_secs(1), "they failed together, not in turn: {took:?}");
 }

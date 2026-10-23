@@ -913,6 +913,20 @@ pub async fn fan_out_collect<Fut: std::future::Future>(
 // get fixed at the source, not papered over with bigger retries.
 pub(crate) const MAX_PS_REFRESHES: u32 = 10;
 
+/// One PS address's connect turn. A caller that waited for the turn while a
+/// connect failed takes that failure instead of dialling again: on a host that
+/// does not answer, each waiter would otherwise pay the whole connect timeout
+/// in turn. A connect cut off by its caller's own deadline records nothing;
+/// callers that arrived with it carry deadlines that end their wait too.
+#[derive(Default)]
+struct ConnectGate {
+    turn: futures::lock::Mutex<()>,
+    /// Connects finished at this address.
+    done: Cell<u64>,
+    /// The last failed connect: which `done` count it was, and its error.
+    failed: RefCell<Option<(u64, String)>>,
+}
+
 /// What a retry loop may assume about repeating a request.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum CallKind {
@@ -1159,6 +1173,8 @@ pub struct ClusterClient {
     mgr_conn: Rc<RefCell<Option<Rc<RpcClient>>>>,
     /// Cached PS RPC connections. Dropped on error, recreated on next use.
     ps_conns: RefCell<HashMap<String, Rc<RpcClient>>>,
+    /// One connect at a time per PS address (`get_ps_client_inner`).
+    ps_connecting: RefCell<HashMap<String, Rc<ConnectGate>>>,
     /// extent-node connections for redirect direct reads.
     en_pool: autumn_stream::ConnPool,
     /// Routing cache. Populated on `connect`, refreshed on `refresh_regions`.
@@ -1998,6 +2014,7 @@ impl ClusterClient {
             current_mgr: Cell::new(0),
             mgr_conn: Rc::new(RefCell::new(None)),
             ps_conns: RefCell::new(HashMap::new()),
+            ps_connecting: RefCell::new(HashMap::new()),
             en_pool: autumn_stream::ConnPool::with_role(autumn_rpc::version_hello::Role::Client),
             regions: RefCell::new(Vec::new()),
             ps_details: RefCell::new(HashMap::new()),
@@ -2450,6 +2467,34 @@ impl ClusterClient {
                 return Ok(c.clone());
             }
         }
+        // One connect per address at a time. Concurrent first requests used to
+        // open a connection each, so two requests sent back to back could reach
+        // the PS on different connections, which it does not order against
+        // each other: a compare-put then missed the put sent just before it.
+        let gate = self.ps_connecting.borrow_mut().entry(ps_addr.to_string()).or_default().clone();
+        let seen = gate.done.get();
+        let _turn = gate.turn.lock().await;
+        {
+            let conns = self.ps_conns.borrow();
+            if let Some(c) = conns.get(ps_addr).filter(|c| !c.is_closed()) {
+                return Ok(c.clone());
+            }
+        }
+        let failed = gate.failed.borrow().clone();
+        if let Some((at, why)) = failed.filter(|(at, _)| *at > seen) {
+            return Err(anyhow::Error::new(AutumnError::ConnectionError(format!(
+                "connect PS {ps_addr} failed while this request waited (connect {at}): {why}"
+            ))));
+        }
+        let outcome = self.connect_ps(ps_addr, token, gen).await;
+        gate.done.set(gate.done.get() + 1);
+        *gate.failed.borrow_mut() = outcome.as_ref().err().map(|e| (gate.done.get(), format!("{e:#}")));
+        outcome
+    }
+
+    /// Opens, greets and (with a credential) authenticates a PS connection,
+    /// and caches it unless the identity changed meanwhile.
+    async fn connect_ps(&self, ps_addr: &str, token: Option<Vec<u8>>, gen: u64) -> Result<Rc<RpcClient>> {
         let addr = parse_addr(ps_addr)?;
         let client = self
             .open_rpc(addr, autumn_rpc::version_hello::Service::PartitionServer)
@@ -2477,13 +2522,13 @@ impl ClusterClient {
                     resp.message
                 ));
             }
-            // Identity-switch guard (coco P2): if `set_principal_credential` ran
-            // during the connect + CLIENT_AUTH await, this conn is bound to the
-            // OLD principal — serve this in-flight call but DON'T cache it, so a
-            // later call rebinds under the new identity.
-            if self.auth_gen.get() != gen {
-                return Ok(client);
-            }
+        }
+        // Identity-switch guard (coco P2): if `set_principal_credential` ran
+        // during the connect, this conn is bound to the OLD principal (or to
+        // none) — serve this in-flight call but DON'T cache it, so a later call
+        // rebinds under the new identity.
+        if self.auth_gen.get() != gen {
+            return Ok(client);
         }
         self.ps_conns
             .borrow_mut()
@@ -4971,13 +5016,9 @@ impl ClusterClient {
         // A key with values in BOTH classes is routed here whole (`classes`
         // above), since the small groups have already been written by now.
         //
-        // CONNECTIONS (coco P3): in STEADY state each partition has one cached
-        // multiplexed conn that all groups reuse. On a COLD cache (first big write,
-        // or after a token-renewal `ps_conns.clear()`) concurrent groups to the same
-        // PS can race `get_ps_client` and briefly open up to `concurrency` conns
-        // before the cache converges — bounded, one-time, self-healing (a
-        // singleflight connect would remove even that; deferred as a conn-layer
-        // change).
+        // CONNECTIONS: each partition has one cached multiplexed conn that all
+        // groups reuse; on a cold cache the first group opens it and the others
+        // wait for it (`get_ps_client_inner`).
         let mut key_groups: std::collections::HashMap<&[u8], Vec<usize>> =
             std::collections::HashMap::new();
         for (pos, (_, k, _, _)) in bulk_only.iter().enumerate() {
@@ -6270,6 +6311,7 @@ mod first_attempt_timeout_tests {
                 current_mgr: Cell::new(0),
                 mgr_conn: Rc::new(RefCell::new(None)),
                 ps_conns: RefCell::new(HashMap::new()),
+                ps_connecting: RefCell::new(HashMap::new()),
                 en_pool: autumn_stream::ConnPool::with_role(
                     autumn_rpc::version_hello::Role::Client,
                 ),
