@@ -1,3 +1,9 @@
+Date: 2026-10-23 (2)
+TaskStatus: completed
+Task scope: user — how to tier KV-cache storage (engine L2 vs autumn L3); read the engines' code and measure before designing. A PS-side large-value read cache was started and dropped (user: a storage system should not carry a heavy read cache; 3FS and HDFS do not).
+Current summary: SGLang HiCache writes L3 in the background (unbounded queue; slow L3 pins L2 until new backups are skipped); vLLM looks up synchronously in the scheduler and loads fully before running. Measured (TCP, one host, 3 replicas on 3 disks): Qwen3-VL-32B on one H200 produces 2.22 GB/s of KV; autumn absorbs 0.36 GB/s with kvc unsplit (one partition per model) and 0.54-0.57 GB/s presplit 8 ways by hash; micro-bench box ceiling 0.96 GB/s write, 3.7 GB/s read, exists ~2 ms. Cross-instance hits: best_effort 0%, timeout 3%. kvc keys carry an uppercase model scope, so `presplit --namespace` refuses it; `presplit --namespace kvc --hash-prefix` works on an empty keyspace only.
+Main gaps: tiering decision open (durable-only L3 vs memory-first with selective persistence, Mooncake-style); write and read are each ~4-6x short of one GPU's KV rate.
+Next steps: user decides the tiering; candidates to cut write volume: fewer replicas for kvc, write_through_selective; UCX numbers not yet measured.
 Date: 2026-10-23
 TaskStatus: completed
 Task scope: user — BUG-PY-FS-PARENT-NOT-DIR (core check, user agreed) + S3/CLI judge directories from the dirent type.
