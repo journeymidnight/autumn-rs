@@ -570,7 +570,7 @@ overflows the frame.
 
 ## Wire version, and the two checks over it
 
-`WIRE_VERSION` (currently **73**) is the schema this binary speaks.
+`WIRE_VERSION` (currently **74**) is the schema this binary speaks.
 `MIN_CLIENT_WIRE_VERSION` (**43**) is the oldest CLIENT it serves. Both are maintained
 **BY HAND**. There is no schema fingerprint — hashing the sources byte for byte cost
 more than it caught (a translated comment once split a rolling cluster, and each false
@@ -915,6 +915,17 @@ and new bytes. PutResp CODE_PRECONDITION means comparison failed; region/ownersh
 errors retain frame-level status for routing refresh. Both values are capped at
 64 KiB; extract_part_id and both PS namespace/authz gates decode the new request.
 Every service and embedded client must be rebuilt together for wire 44.
+
+## Conditional put with a bulk value (wire 74)
+
+`MSG_COMPARE_PUT_BULK` (0x60): ctrl `ComparePutBulkReq` (part_id, region_epoch,
+key, optional expected, expires_at), the value as the frame's tail exactly like
+`MSG_PUT_BULK`, so it is not capped at 64 KiB and not copied through rkyv; the
+PS receives a large tail into a pooled buffer. Reply `PutResp` as for
+`MSG_COMPARE_PUT`. A new client-surface form: the ceiling rises to [43, 74],
+the floor stays; the SDK refuses to send it below
+`WIRE_VERSION_WITH_COMPARE_PUT_BULK`, since an older PS refuses the opcode on a
+client connection.
 
 ## Start an auto-policy in one write (wire 73)
 

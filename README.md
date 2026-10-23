@@ -133,7 +133,7 @@ A failed write is either **not applied** (every error but one) or
 **`OutcomeUnknown`**: it may have reached storage and may or may not count — read the key
 to find out; once read, the answer never changes. The SDK retries puts, deletes
 and batches by itself and returns `OutcomeUnknown` only when it still fails after
-an attempt that may have reached storage; a conditional write (`compare_put` / `compare_write`) returns it at once, since a
+an attempt that may have reached storage; a conditional write (`compare_put` / `compare_put_bulk` / `compare_write`) returns it at once, since a
 retry could report a conflict with its own first attempt.
 
 ### Files — POSIX mount (models, datasets, checkpoints)

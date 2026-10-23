@@ -2786,9 +2786,25 @@ impl ClusterClient {
     ) -> (std::result::Result<Bytes, AutumnError>, bool) {
         let mut any_applied = false;
         let result = self
-            .call_ps_for_key_attempts(kind, key, msg_type, build_payload, &mut any_applied)
+            .call_ps_for_key_attempts(kind, key, msg_type, build_payload, None, &mut any_applied)
             .await;
         (result, any_applied)
+    }
+
+    /// `call_ps_for_key` for a value-separable request: `build_ctrl` is the
+    /// ctrl and `value` rides after it as its own iovec, never copied.
+    async fn call_ps_for_key_bulk(
+        &self,
+        kind: CallKind,
+        key: &[u8],
+        msg_type: u8,
+        build_ctrl: impl Fn(u64, u64) -> Bytes,
+        value: &Bytes,
+    ) -> std::result::Result<Bytes, AutumnError> {
+        let mut any_applied = false;
+        self.call_ps_for_key_attempts(kind, key, msg_type, build_ctrl, Some(value), &mut any_applied)
+            .await
+            .map_err(|e| settle_write_error(kind, any_applied, e))
     }
 
     async fn call_ps_for_key_attempts(
@@ -2797,6 +2813,7 @@ impl ClusterClient {
         key: &[u8],
         msg_type: u8,
         build_payload: impl Fn(u64, u64) -> Bytes,
+        tail: Option<&Bytes>,
         any_applied: &mut bool,
     ) -> std::result::Result<Bytes, AutumnError> {
         let mut attempt: u32 = 0;
@@ -2812,10 +2829,12 @@ impl ClusterClient {
             // 30 s `rpc_timeout`. Subsequent attempts use the full
             // budget against the freshly-reconnected listener.
             let t = self.first_attempt_effective_timeout(attempt);
-            match self
-                .ps_call_with_timeout(&ps_addr, msg_type, build_payload(part_id, region_epoch), t)
-                .await
-            {
+            let payload = build_payload(part_id, region_epoch);
+            let outcome = match tail {
+                None => self.ps_call_with_timeout(&ps_addr, msg_type, payload, t).await,
+                Some(value) => self.ps_call_bulk_multi(&ps_addr, msg_type, payload, vec![value.clone()], t).await,
+            };
+            match outcome {
                 Ok(b) => return Ok(b),
                 Err(e) => {
                     let applied = kind != CallKind::Read && may_have_applied(&e);
@@ -3153,6 +3172,87 @@ impl ClusterClient {
         if response.code == partition_rpc::CODE_PRECONDITION { return Ok(false); }
         check_ps_code(response.code, &response.message)?;
         Ok(true)
+    }
+
+    /// `compare_put` for a value of any size up to the put cap, with an
+    /// absolute TTL (`expires_at`, 0 = none). The value is sent as a bulk tail,
+    /// so it is not copied; `expected` is still capped at 64 KiB. With
+    /// `expected = None` this is put-if-absent: the server checks only that
+    /// the key is there, and a present key is not written at all.
+    pub async fn compare_put_bulk(
+        &self, key: &[u8], expected: Option<&[u8]>, value: Bytes, expires_at: u64,
+    ) -> std::result::Result<bool, AutumnError> {
+        let negotiated = self.negotiated_cluster_wire.get();
+        if negotiated < autumn_rpc::WIRE_VERSION_WITH_COMPARE_PUT_BULK {
+            return Err(AutumnError::Unsupported(format!(
+                "compare_put_bulk needs cluster wire >= {}, negotiated {negotiated}",
+                autumn_rpc::WIRE_VERSION_WITH_COMPARE_PUT_BULK
+            )));
+        }
+        let cap = partition_rpc::MAX_COMPARE_PUT_BYTES;
+        if expected.is_some_and(|v| v.len() > cap) {
+            return Err(AutumnError::InvalidArgument(format!("compare_put_bulk expected exceeds {cap} bytes")));
+        }
+        if value.len() as u64 > CLIENT_PUT_HARD_CAP {
+            return Err(AutumnError::ValueTooLarge { size: value.len() as u64, cap: CLIENT_PUT_HARD_CAP });
+        }
+        let key = self.binding.bind_key(key)?;
+        self.compare_put_bulk_bound(&key, expected, value, expires_at).await
+    }
+
+    async fn compare_put_bulk_bound(
+        &self, key: &[u8], expected: Option<&[u8]>, value: Bytes, expires_at: u64,
+    ) -> std::result::Result<bool, AutumnError> {
+        let response = self
+            .call_ps_for_key_bulk(
+                CallKind::Conditional,
+                key,
+                partition_rpc::MSG_COMPARE_PUT_BULK,
+                |part_id, region_epoch| {
+                    rkyv_encode(&partition_rpc::ComparePutBulkReq {
+                        part_id,
+                        region_epoch,
+                        key: key.to_vec(),
+                        expected: expected.map(<[u8]>::to_vec),
+                        expires_at,
+                    })
+                },
+                &value,
+            )
+            .await?;
+        let response: PutResp = rkyv_decode(&response).map_err(AutumnError::ServerError)?;
+        match response.code {
+            partition_rpc::CODE_PRECONDITION => Ok(false),
+            partition_rpc::CODE_VALUE_TOO_LARGE => Err(AutumnError::ValueTooLarge { size: value.len() as u64, cap: 0 }),
+            code => check_ps_code(code, &response.message).map(|()| true),
+        }
+    }
+
+    /// Put-if-absent for a batch, each item `(key, value, expires_at)` sent as
+    /// `compare_put_bulk(key, None, ..)`, up to `batch_put_concurrency` in
+    /// flight. Result `i`: `Ok(true)` = written, `Ok(false)` = the key was
+    /// already there and nothing was written, `Err` = that item failed (an
+    /// RPC error may leave it unknown whether the write landed).
+    pub async fn put_many_if_absent(
+        &self,
+        items: &[(&[u8], Bytes, u64)],
+    ) -> Vec<std::result::Result<bool, AutumnError>> {
+        let negotiated = self.negotiated_cluster_wire.get();
+        if negotiated < autumn_rpc::WIRE_VERSION_WITH_COMPARE_PUT_BULK {
+            let why = format!(
+                "put_many_if_absent needs cluster wire >= {}, negotiated {negotiated}",
+                autumn_rpc::WIRE_VERSION_WITH_COMPARE_PUT_BULK
+            );
+            return items.iter().map(|_| Err(AutumnError::Unsupported(why.clone()))).collect();
+        }
+        let futs = items.iter().map(|(key, value, expires_at)| async move {
+            if value.len() as u64 > CLIENT_PUT_HARD_CAP {
+                return Err(AutumnError::ValueTooLarge { size: value.len() as u64, cap: CLIENT_PUT_HARD_CAP });
+            }
+            let key = self.binding.bind_key(key)?;
+            self.compare_put_bulk_bound(&key, None, value.clone(), *expires_at).await
+        });
+        fan_out_collect(futs, batch_put_concurrency()).await
     }
 
     /// Fenced conditional write: when the key's visible value equals

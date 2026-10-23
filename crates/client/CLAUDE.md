@@ -600,6 +600,16 @@ conflict and is not retried as stale routing. Transport outcomes can be ambiguou
 callers publishing UUID generations may read back their UUID to resolve a lost ACK.
 FUSE uses this for create-only directory-entry publication, never bulk payloads.
 
+compare_put_bulk(key, expected, value: Bytes, expires_at) (wire 74,
+`MSG_COMPARE_PUT_BULK`) sends the value as a bulk tail through
+`call_ps_for_key_bulk` (the key-routed retry loop with a tail), so it has no
+64 KiB cap and no copy, and carries a TTL; `expected` keeps the 64 KiB cap.
+`put_many_if_absent` fans it out with `expected = None` at
+`batch_put_concurrency`. Refused with `Unsupported` below
+`WIRE_VERSION_WITH_COMPARE_PUT_BULK`. A present key still costs the value's
+transfer, so it does not replace an `exists` probe for dedup of mostly-present
+pages (350 ms vs 1 ms for 8 x 64 x 16 MiB over UCX).
+
 compare_write(key, expected, value, lease) is the fenced form (wire 47): `value`
 None deletes, a non-anonymous lease is fence-checked before the comparison, and
 a raised floor persists even when the comparison fails. Refused client-side with

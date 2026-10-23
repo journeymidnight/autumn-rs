@@ -3230,7 +3230,22 @@ creates, no increment lost by 8 read-CAS loops, a comparison sees a put sent jus
 before it; without the uncommitted-key drain all three are red).
 
 MSG_COMPARE_WRITE shares that handler (`compare_write_admit`; MSG_COMPARE_PUT is
-the unfenced, value-only case of it). Order: epoch/range/freeze, then the fence
+the unfenced, value-only case of it). So does MSG_COMPARE_PUT_BULK (wire 74): an
+unfenced compare-put whose value is the frame's tail and which carries a TTL;
+`drain_bulk_writes` receives a large tail into a pooled buffer as for
+MSG_PUT_BULK, and `decode_conditional` turns all three into one `Conditional`
+(value as `Bytes`, so the tail is never copied; the 64 KiB cap stays on the inline
+forms and on `expected`). With `expected = None` the comparison is presence only
+(`lookup_live`, shared with HEAD): it resolves no value pointer, so a present
+large value is not read from the log and a GC pin on its extent does not matter.
+A present key's write is refused before anything is queued. A value over the
+inline cap is refused in the reply body (`CODE_VALUE_TOO_LARGE`, as
+`enqueue_put_bulk` does): as a frame error the client read it as a routing miss
+and re-sent the whole value ten times. Conditional writes count in `req_count`
+like every other request; the presence lookup records no read metrics. Tests:
+`crates/manager/tests/compare_put_bulk.rs` (red without the presence check,
+without the TTL, or with the oversized value refused as a frame error), `compare_put_bulk_tail_is_recvd_into_a_pooled_buffer` (red
+without the pooled-receive recognition). Order: epoch/range/freeze, then the fence
 check-and-bump, then the comparison, then the write — a misrouted request never
 raises a floor. A floor the request raised is persisted as an OP_FENCE_BUMP
 record whether or not the comparison holds, and a failed comparison is reported

@@ -4842,7 +4842,8 @@ fn spawn_ps_read(
 /// other incomplete frame receives the rest of itself in place.
 fn ps_read_window(decoder: &mut FrameDecoder, fixed: usize) -> autumn_rpc::ReadWindow {
     let len = match decoder.peek_header() {
-        Some((_, MSG_PUT_BULK | partition_rpc::MSG_BATCH_PUT_BULK, _, _)) | None => fixed,
+        Some((_, MSG_PUT_BULK | partition_rpc::MSG_BATCH_PUT_BULK | partition_rpc::MSG_COMPARE_PUT_BULK, _, _))
+        | None => fixed,
         Some(_) => decoder
             .front_frame_remaining()
             .map_or(fixed, |rest| rest.max(fixed)),
@@ -4877,9 +4878,10 @@ fn push_resp(tx_bufs: &mut Vec<Bytes>, done: (Bytes, Vec<Bytes>)) {
 /// is NOT an eligible large bulk write (the caller then runs the normal decode
 /// path on the remainder).
 ///
-/// BOTH bulk write shapes qualify: `MSG_PUT_BULK` (one value, fixed 44-byte
-/// binary meta then the key) and `MSG_BATCH_PUT_BULK` (rkyv ctrl, tail = every
-/// op's value back to back, sliced per op downstream). Recognising only the
+/// Three bulk write shapes qualify: `MSG_PUT_BULK` (one value, fixed 44-byte
+/// binary meta then the key), `MSG_COMPARE_PUT_BULK` (rkyv ctrl, one value)
+/// and `MSG_BATCH_PUT_BULK` (rkyv ctrl, tail = every op's value back to back,
+/// sliced per op downstream). Recognising only the
 /// single-value form left the batch path structurally slower than the per-item
 /// one it exists to beat: its tail is by definition the batch's whole value
 /// payload, so it is exactly the buffer worth keeping off the decoder.
@@ -4914,7 +4916,8 @@ async fn drain_bulk_writes(
             return Ok(());
         };
         let is_batch = msg_type == partition_rpc::MSG_BATCH_PUT_BULK;
-        if (msg_type != MSG_PUT_BULK && !is_batch) || req_id == 0 {
+        let rkyv_ctrl = is_batch || msg_type == partition_rpc::MSG_COMPARE_PUT_BULK;
+        if (msg_type != MSG_PUT_BULK && !rkyv_ctrl) || req_id == 0 {
             return Ok(()); // not a bulk write at the front → normal path
         }
         // Wait for the full prologue ([header][ctrl_len][meta+key][crc]) and
@@ -4932,8 +4935,8 @@ async fn drain_bulk_writes(
         if value_len < params().bulk_recv_min_bytes.get() {
             return Ok(()); // below threshold → the proven decode path
         }
-        // The single-value form caps at the inline limit (`enqueue_put_bulk`
-        // rejects above it, so recv'ing it would be wasted work). The BATCH
+        // The single-value forms cap at the inline limit (both reject above
+        // it, so recv'ing it would be wasted work). The BATCH
         // form has no equivalent ceiling: its tail is the SUM over ops, each of
         // which is individually capped downstream, and a batch of 256 x 32 KiB
         // legitimately exceeds any per-value limit. No ceiling is needed to
@@ -4943,12 +4946,11 @@ async fn drain_bulk_writes(
         if !is_batch && value_len > AUTUMN_PS_MAX_INLINE_BYTES_DEFAULT as usize {
             return Ok(());
         }
-        // Parse enough of the ctrl to route. The two forms carry it
-        // differently: the single-value form is a fixed 44-byte binary meta
-        // then the key, the batch form is a variable-length rkyv struct, so
-        // only the batch pays a decode — the same one `push_one_frame_to_inflight`
+        // Parse enough of the ctrl to route. `MSG_PUT_BULK` is a fixed 44-byte
+        // binary meta then the key; the other two are variable-length rkyv
+        // structs, so only they pay a decode — the same one `push_one_frame_to_inflight`
         // would have paid had this frame gone down the normal path.
-        let part_id = if is_batch {
+        let part_id = if rkyv_ctrl {
             let ctrl = decoder
                 .peek_ctrl(ctrl_len)
                 .expect("prologue verified => ctrl buffered");
@@ -7734,8 +7736,25 @@ async fn handle_incoming_req(
     metrics: &mut WriteLoopMetrics,
     poisoned: &Rc<Cell<bool>>,
 ) {
-    if req.msg_type == partition_rpc::MSG_COMPARE_PUT || req.msg_type == partition_rpc::MSG_COMPARE_WRITE {
-        let cond = match rpc_handlers::decode_conditional(req.msg_type, &req.payload) {
+    // bump per-partition request counter for the policy engine.
+    // fix MED-3: also bump the never-reset monotonic twin used by
+    // the maintenance scheduler's req_per_sec diff. Two atomic
+    // adds is ~5 ns total — cheap on the request hot path.
+    {
+        let p = part.borrow();
+        p.metrics
+            .req_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        p.metrics
+            .req_count_monotonic
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    if matches!(
+        req.msg_type,
+        partition_rpc::MSG_COMPARE_PUT | partition_rpc::MSG_COMPARE_WRITE | partition_rpc::MSG_COMPARE_PUT_BULK
+    ) {
+        let cond = match rpc_handlers::decode_conditional(req.msg_type, &req.payload, req.bulk_value) {
             Ok(c) => c,
             Err(e) => {
                 let _ = req.resp_tx.send(Err(e));
@@ -7794,19 +7813,6 @@ async fn handle_incoming_req(
         }
         rpc_handlers::compare_write_admit(cond, part, pending, req.resp_tx).await;
         return;
-    }
-    // bump per-partition request counter for the policy engine.
-    // fix MED-3: also bump the never-reset monotonic twin used by
-    // the maintenance scheduler's req_per_sec diff. Two atomic
-    // adds is ~5 ns total — cheap on the request hot path.
-    {
-        let p = part.borrow();
-        p.metrics
-            .req_count
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        p.metrics
-            .req_count_monotonic
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     // reject mutating ops while frozen-for-merge OR
@@ -13367,6 +13373,48 @@ fn memtable_snapshot_cost_scales_with_memtable_not_page_size() {
     /// removed.
     #[test]
     fn batch_put_bulk_tail_is_recvd_into_a_pooled_buffer() {
+        // Values are individually well under the 64 KiB threshold and add
+        // up well over it — the shape the batch bulk form exists for.
+        // Distinct lengths AND contents so a tail-cursor slip reads as one
+        // op holding its neighbour's bytes.
+        const N: usize = 24;
+        let values: Vec<Vec<u8>> = (0..N)
+            .map(|i| vec![(i % 251) as u8 + 1; 4096 + i * 64])
+            .collect();
+        let ops: Vec<partition_rpc::BatchPutBulkOp> = values
+            .iter()
+            .enumerate()
+            .map(|(i, v)| partition_rpc::BatchPutBulkOp {
+                inode_hint: 0,
+                lease_epoch: 0,
+                key: format!("fs/bpb-{i:03}").into_bytes(),
+                value_len: v.len() as u32,
+                expires_at: 0,
+            })
+            .collect();
+        let ctrl = partition_rpc::rkyv_encode(&partition_rpc::BatchPutBulkReq {
+            part_id: 11,
+            region_epoch: 0,
+            ops,
+        });
+        assert_tail_takes_pooled_recv(partition_rpc::MSG_BATCH_PUT_BULK, ctrl, values.concat());
+    }
+
+    /// The conditional bulk put's value is received like `MSG_PUT_BULK`'s.
+    #[test]
+    fn compare_put_bulk_tail_is_recvd_into_a_pooled_buffer() {
+        let ctrl = partition_rpc::rkyv_encode(&partition_rpc::ComparePutBulkReq {
+            part_id: 11,
+            region_epoch: 0,
+            key: b"fs/cpb".to_vec(),
+            expected: None,
+            expires_at: 0,
+        });
+        let tail: Vec<u8> = (0..1u32 << 20).map(|i| (i % 253) as u8).collect();
+        assert_tail_takes_pooled_recv(partition_rpc::MSG_COMPARE_PUT_BULK, ctrl, tail);
+    }
+
+    fn assert_tail_takes_pooled_recv(msg_type: u8, ctrl: Bytes, tail: Vec<u8>) {
         let _guard = fast_path_counter_lock();
         let rt = compio::runtime::Runtime::new().unwrap();
         rt.block_on(async move {
@@ -13393,43 +13441,12 @@ fn memtable_snapshot_cost_scales_with_memtable_not_page_size() {
                 .await
             });
 
-            // Values are individually well under the 64 KiB threshold and add
-            // up well over it — the shape the batch bulk form exists for.
-            // Distinct lengths AND contents so a tail-cursor slip reads as one
-            // op holding its neighbour's bytes.
-            const N: usize = 24;
-            let values: Vec<Vec<u8>> = (0..N)
-                .map(|i| vec![(i % 251) as u8 + 1; 4096 + i * 64])
-                .collect();
-            let ops: Vec<partition_rpc::BatchPutBulkOp> = values
-                .iter()
-                .enumerate()
-                .map(|(i, v)| partition_rpc::BatchPutBulkOp {
-                    inode_hint: 0,
-                    lease_epoch: 0,
-                    key: format!("fs/bpb-{i:03}").into_bytes(),
-                    value_len: v.len() as u32,
-                    expires_at: 0,
-                })
-                .collect();
-            let ctrl = partition_rpc::rkyv_encode(&partition_rpc::BatchPutBulkReq {
-                part_id: 11,
-                region_epoch: 0,
-                ops,
-            });
-            let tail: Vec<u8> = values.concat();
             assert!(
                 tail.len() > params().bulk_recv_min_bytes.get(),
                 "the tail must clear the threshold or this tests nothing"
             );
 
-            let head = autumn_rpc::frame::encode_vectored_head(
-                7001,
-                partition_rpc::MSG_BATCH_PUT_BULK,
-                0,
-                ctrl.len(),
-                tail.len(),
-            );
+            let head = autumn_rpc::frame::encode_vectored_head(7001, msg_type, 0, ctrl.len(), tail.len());
             let crc = autumn_rpc::frame::compute_ctrl_crc(&head, std::slice::from_ref(&ctrl));
             let mut wire = Vec::with_capacity(head.len() + ctrl.len() + 4 + tail.len());
             wire.extend_from_slice(&head);
@@ -13447,7 +13464,7 @@ fn memtable_snapshot_cost_scales_with_memtable_not_page_size() {
             r.expect("write");
 
             let req = req_rx.next().await.expect("request delivered");
-            assert_eq!(req.msg_type, partition_rpc::MSG_BATCH_PUT_BULK);
+            assert_eq!(req.msg_type, msg_type);
             assert_eq!(
                 req.payload.as_ref(),
                 ctrl.as_ref(),
@@ -13460,7 +13477,7 @@ fn memtable_snapshot_cost_scales_with_memtable_not_page_size() {
             assert_eq!(
                 after - before,
                 1,
-                "the batch tail must take the pooled recv path (before={before}, after={after})"
+                "the tail must take the pooled recv path (before={before}, after={after})"
             );
 
             // BOTH halves — the socket only closes when the last one drops, and

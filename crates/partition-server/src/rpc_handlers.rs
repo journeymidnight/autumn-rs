@@ -891,22 +891,80 @@ async fn get_value(
     get_value_inner(payload, part, false).await
 }
 
-/// Decodes `MSG_COMPARE_WRITE`, or `MSG_COMPARE_PUT` (a compare-write with a
-/// value and no fence).
-pub(crate) fn decode_conditional(msg_type: u8, payload: &Bytes) -> Result<CompareWriteReq, (StatusCode, String)> {
-    if msg_type == MSG_COMPARE_WRITE {
-        return rkyv_decode(payload).map_err(|e| (StatusCode::InvalidArgument, e));
+/// A decoded conditional write: `MSG_COMPARE_WRITE`, `MSG_COMPARE_PUT` (a
+/// value, no fence) or `MSG_COMPARE_PUT_BULK` (a value from the frame's tail
+/// and a TTL, no fence).
+pub(crate) struct Conditional {
+    pub(crate) part_id: u64,
+    pub(crate) region_epoch: u64,
+    pub(crate) key: Vec<u8>,
+    pub(crate) expected: Option<Vec<u8>>,
+    /// Some writes this value; None deletes the key.
+    pub(crate) value: Option<Bytes>,
+    pub(crate) expires_at: u64,
+    pub(crate) inode_hint: u64,
+    pub(crate) lease_epoch: u64,
+}
+
+pub(crate) fn decode_conditional(
+    msg_type: u8,
+    payload: &Bytes,
+    bulk_value: Option<Bytes>,
+) -> Result<Conditional, (StatusCode, String)> {
+    let invalid = |e| (StatusCode::InvalidArgument, e);
+    let too_large = || (StatusCode::InvalidArgument, "compare_put value exceeds 64 KiB".to_string());
+    let cond = match msg_type {
+        MSG_COMPARE_PUT_BULK => {
+            let req: ComparePutBulkReq = rkyv_decode(payload).map_err(invalid)?;
+            if req.expected.as_ref().is_some_and(|v| v.len() > MAX_COMPARE_PUT_BYTES) {
+                return Err(too_large());
+            }
+            // A tail below the bulk-receive threshold arrives with the frame.
+            // Its size is refused in the reply body (`compare_write_admit`).
+            let value = bulk_value.unwrap_or_default();
+            return Ok(Conditional {
+                part_id: req.part_id,
+                region_epoch: req.region_epoch,
+                key: req.key,
+                expected: req.expected,
+                value: Some(value),
+                expires_at: req.expires_at,
+                inode_hint: 0,
+                lease_epoch: 0,
+            });
+        }
+        MSG_COMPARE_WRITE => {
+            let req: CompareWriteReq = rkyv_decode(payload).map_err(invalid)?;
+            Conditional {
+                part_id: req.part_id,
+                region_epoch: req.region_epoch,
+                key: req.key,
+                expected: req.expected,
+                value: req.value.map(Bytes::from),
+                expires_at: 0,
+                inode_hint: req.inode_hint,
+                lease_epoch: req.lease_epoch,
+            }
+        }
+        _ => {
+            let req: ComparePutReq = rkyv_decode(payload).map_err(invalid)?;
+            Conditional {
+                part_id: req.part_id,
+                region_epoch: req.region_epoch,
+                key: req.key,
+                expected: req.expected,
+                value: Some(Bytes::from(req.value)),
+                expires_at: 0,
+                inode_hint: 0,
+                lease_epoch: 0,
+            }
+        }
+    };
+    if cond.value.as_ref().is_some_and(|v| v.len() > MAX_COMPARE_PUT_BYTES)
+        || cond.expected.as_ref().is_some_and(|v| v.len() > MAX_COMPARE_PUT_BYTES) {
+        return Err(too_large());
     }
-    let req: ComparePutReq = rkyv_decode(payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
-    Ok(CompareWriteReq {
-        part_id: req.part_id,
-        region_epoch: req.region_epoch,
-        key: req.key,
-        expected: req.expected,
-        value: Some(req.value),
-        inode_hint: 0,
-        lease_epoch: 0,
-    })
+    Ok(cond)
 }
 
 /// A conditional write, run by the partition write actor in arrival order.
@@ -916,12 +974,19 @@ pub(crate) fn decode_conditional(msg_type: u8, payload: &Bytes) -> Result<Compar
 /// answering `outer` from there like any put; a failed comparison is
 /// answered at once, or once a floor it raised is durable.
 pub(crate) async fn compare_write_admit(
-    req: CompareWriteReq,
+    req: Conditional,
     part: &Rc<RefCell<PartitionData>>,
     pending: &mut Vec<WriteRequest>,
     outer: futures::channel::oneshot::Sender<HandlerResult>,
 ) {
     let key = req.key.clone();
+    // In the body, as `enqueue_put_bulk` does: a frame-level error reads as a
+    // routing miss and the client would re-send the value until it gave up.
+    if let Some(len) = req.value.as_ref().map(Bytes::len).filter(|&n| n > AUTUMN_PS_MAX_INLINE_BYTES_DEFAULT as usize) {
+        let message = format!("value {len} bytes exceeds inline cap {AUTUMN_PS_MAX_INLINE_BYTES_DEFAULT}");
+        let _ = outer.send(Ok(rkyv_encode(&PutResp { code: CODE_VALUE_TOO_LARGE, message, key })));
+        return;
+    }
     let conflict = |key: Vec<u8>| PutResp { code: CODE_PRECONDITION, message: "compare_put conflict".into(), key };
     let (raised, matches) = match compare(&req, part).await {
         Ok(Compared::Decided { raised, matches }) => (raised, matches),
@@ -957,7 +1022,7 @@ pub(crate) async fn compare_write_admit(
         let resp = replier.take().expect("unused");
         pending.push(match req.value {
             Some(value) => WriteRequest {
-                op: WriteOp::Put { user_key: Bytes::from(key), value: Bytes::from(value), expires_at: 0 },
+                op: WriteOp::Put { user_key: Bytes::from(key), value, expires_at: req.expires_at },
                 resp,
             },
             None => WriteRequest { op: WriteOp::Delete { user_key: key }, resp },
@@ -970,11 +1035,7 @@ enum Compared {
     Fenced(String),
 }
 
-async fn compare(req: &CompareWriteReq, part: &Rc<RefCell<PartitionData>>) -> Result<Compared, (StatusCode, String)> {
-    if req.value.as_ref().is_some_and(|v| v.len() > MAX_COMPARE_PUT_BYTES)
-        || req.expected.as_ref().is_some_and(|v| v.len() > MAX_COMPARE_PUT_BYTES) {
-        return Err((StatusCode::InvalidArgument, "compare_put value exceeds 64 KiB".into()));
-    }
+async fn compare(req: &Conditional, part: &Rc<RefCell<PartitionData>>) -> Result<Compared, (StatusCode, String)> {
     let check = || {
         let p = part.borrow();
         check_region_epoch(p.part_id, p.region_epoch, req.region_epoch)?;
@@ -994,14 +1055,21 @@ async fn compare(req: &CompareWriteReq, part: &Rc<RefCell<PartitionData>>) -> Re
         Ok(raised) => raised,
         Err(message) => return Ok(Compared::Fenced(message)),
     };
-    let current = get_value(rkyv_encode(&GetReq {
-        part_id: req.part_id, key: req.key.clone(), offset: 0, length: MAX_COMPARE_PUT_BYTES as u32 + 1,
-        region_epoch: req.region_epoch,
-    }), part).await?;
-    let matches = match current {
-        GetOutcome::NotFound => req.expected.is_none(),
-        GetOutcome::Value(value) => req.expected.as_deref() == Some(value.as_ref()),
-        GetOutcome::Redirect { .. } => unreachable!("get_value does not redirect"),
+    let matches = match &req.expected {
+        // Absence needs no value read: a large value would otherwise be
+        // fetched from the log just to learn that it is there.
+        None => lookup_live(part, &req.key).await?.is_none(),
+        Some(expected) => {
+            let current = get_value(rkyv_encode(&GetReq {
+                part_id: req.part_id, key: req.key.clone(), offset: 0, length: MAX_COMPARE_PUT_BYTES as u32 + 1,
+                region_epoch: req.region_epoch,
+            }), part).await?;
+            match current {
+                GetOutcome::NotFound => false,
+                GetOutcome::Value(value) => expected.as_slice() == value.as_ref(),
+                GetOutcome::Redirect { .. } => unreachable!("get_value does not redirect"),
+            }
+        }
     };
     // A paged lookup can yield while maintenance freezes or splits the range.
     check()?;
@@ -1267,10 +1335,7 @@ pub(crate) async fn handle_head(
 ) -> HandlerResult {
     let req: HeadReq =
         partition_rpc::rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
-
-    // Borrow scoped to the epoch/range check + memtable lookups — released
-    // before any await (note 15).
-    let mut found = {
+    {
         let p = part.borrow();
         check_region_epoch(p.part_id, p.region_epoch, req.region_epoch)?;
         if !in_range(&p.rg, &req.key) {
@@ -1279,41 +1344,15 @@ pub(crate) async fn handle_head(
                 "key is out of range".to_string(),
             ));
         }
-        lookup_in_memtable(&p.active, &req.key).or_else(|| {
-            for imm in p.imm.iter().rev() {
-                if let Some(r) = lookup_in_memtable(imm, &req.key) {
-                    return Some(r);
-                }
-            }
-            None
-        })
-    };
-    // paged SST lookup awaits — `sst_lookup_paged_retry` snapshots +
-    // drops the borrow (note 15) and runs the same compaction-truncate
-    // single retry as get_value_inner.
-    if found.is_none() {
-        found = sst_lookup_paged_retry(part, &req.key).await?;
     }
-
-    let (op, raw_value, expires_at) = match found {
-        Some(v) => v,
-        None => {
-            return Ok(partition_rpc::rkyv_encode(&HeadResp {
-                code: CODE_NOT_FOUND,
-                message: "key not found".to_string(),
-                found: false,
-                value_length: 0,
-            }))
-        }
-    };
-    if op == crate::OP_TOMBSTONE || (expires_at > 0 && expires_at <= now_secs()) {
+    let Some((op, raw_value)) = lookup_live(part, &req.key).await? else {
         return Ok(partition_rpc::rkyv_encode(&HeadResp {
             code: CODE_NOT_FOUND,
             message: "key not found".to_string(),
             found: false,
             value_length: 0,
         }));
-    }
+    };
 
     let value_len = if op & OP_VALUE_POINTER != 0 && raw_value.len() >= VALUE_POINTER_SIZE {
         ValuePointer::decode(&raw_value[..VALUE_POINTER_SIZE]).len
@@ -1326,6 +1365,34 @@ pub(crate) async fn handle_head(
         message: String::new(),
         found: true,
         value_length: value_len,
+    }))
+}
+
+/// The newest entry for `key` — memtable, immutables, then SSTs — as
+/// `(op, raw value)`, or None when absent, deleted or expired. Resolves no
+/// value pointer. The caller has checked epoch and range.
+async fn lookup_live(
+    part: &Rc<RefCell<PartitionData>>,
+    key: &[u8],
+) -> Result<Option<(u8, Bytes)>, (StatusCode, String)> {
+    // Borrow released before the SST lookup's awaits (note 15).
+    let mut found = {
+        let p = part.borrow();
+        lookup_in_memtable(&p.active, key).or_else(|| {
+            for imm in p.imm.iter().rev() {
+                if let Some(r) = lookup_in_memtable(imm, key) {
+                    return Some(r);
+                }
+            }
+            None
+        })
+    };
+    if found.is_none() {
+        found = sst_lookup_paged_retry(part, key).await?;
+    }
+    Ok(found.and_then(|(op, raw_value, expires_at)| {
+        let gone = op == crate::OP_TOMBSTONE || (expires_at > 0 && expires_at <= now_secs());
+        (!gone).then_some((op, raw_value))
     }))
 }
 

@@ -1,3 +1,10 @@
+Date: 2026-10-24
+TaskStatus: not_completed
+Task scope: user — (1) bulk compare-put, (2) a fast lane for small reads on the shared PS connection without losing performance, (3) then the write-through kvc memory tier.
+Current summary: (1) done and pushed: MSG_COMPARE_PUT_BULK (wire 74), compare_put_bulk / put_many_if_absent, BatchClient.put_from(if_absent=True); presence-only comparison; Fable review (no high; M1 oversized value fixed with ablation). Measured: if-absent on present 16 MiB pages 350 ms vs exists probe 1 ms, so the adapter keeps its probe (needs the user's OK; F-COMPARE-PUT-BULK stays passes:false). (2) in progress: RpcClient Lane::Urgent (second queue, writer polls it first; unit test + ablation red) written, not yet wired into the SDK or measured.
+Main gaps: SDK routing of CallKind::Read to the urgent lane; BatchClient.exists back on the shared worker (scratchpad lib_samelient_ifabsent.rs); UCX same-client exists tail and perf-check no-drop measurement. BUG-COMPARE-SEES-EARLIER-PUT-FLAKY filed (pre-existing).
+Next steps: finish (2), review, commit; then (3).
+
 Date: 2026-10-23 (3)
 TaskStatus: not_completed
 Task scope: user — F-KVC-ADAPTER-WRITE-READ (dedup before write; why the in-engine fetch is slower), in journeymidnight/autumn_kvcache.

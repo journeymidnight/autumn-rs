@@ -881,6 +881,8 @@ use std::sync::mpsc as smpsc;
 enum BatchOp {
     Get,
     Put,
+    /// Put that leaves a key already present untouched.
+    PutIfAbsent,
     /// Existence only; items carry no buffer.
     Head,
 }
@@ -901,7 +903,7 @@ unsafe impl Send for WorkItem {}
 struct BatchJob {
     op: BatchOp,
     items: Vec<WorkItem>,
-    /// Relative TTL in seconds for a `Put` batch; `0` = no expiry. Ignored by
+    /// Relative TTL in seconds for a put batch; `0` = no expiry. Ignored by
     /// `Get` and `Head`.
     ttl_secs: u64,
     done: smpsc::Sender<Vec<bool>>,
@@ -1014,6 +1016,22 @@ async fn run_job(client: &ClusterClient, op: BatchOp, items: Vec<WorkItem>, ttl_
             let _ = cap; // unused — put_many no longer takes a concurrency arg
             let results = client.put_many(&pitems).await;
             drop(pitems);
+            results.iter().map(|r| r.is_ok()).collect()
+        }
+        BatchOp::PutIfAbsent => {
+            let expires_at = if ttl_secs == 0 { 0 } else { ClusterClient::ttl_to_expires_at(ttl_secs) };
+            // SAFETY: as in the `Put` arm.
+            let pitems: Vec<(&[u8], bytes::Bytes, u64)> = items
+                .iter()
+                .map(|it| {
+                    let page: &'static [u8] =
+                        unsafe { std::slice::from_raw_parts(it.ptr as *const u8, it.len) };
+                    (it.key.as_slice(), bytes::Bytes::from_static(page), expires_at)
+                })
+                .collect();
+            let results = client.put_many_if_absent(&pitems).await;
+            drop(pitems);
+            // Present already counts as stored.
             results.iter().map(|r| r.is_ok()).collect()
         }
         BatchOp::Head => {
@@ -1133,9 +1151,15 @@ impl BatchClient {
 
     /// Batched zero-copy put. Returns list[bool] aligned to `keys`. `ttl_secs`
     /// (default `0` = no expiry) applies one relative TTL to every key.
-    #[pyo3(signature = (keys, bufs, ttl_secs=0))]
-    fn put_from(&self, py: Python<'_>, keys: Vec<Vec<u8>>, bufs: Vec<PyBuffer<u8>>, ttl_secs: u64) -> PyResult<Vec<bool>> {
-        self.run_batch(py, BatchOp::Put, keys, bufs, false, ttl_secs)
+    /// `if_absent=True` writes only keys not already present (checked and
+    /// written in one request on the server); True then means written or
+    /// already there.
+    #[pyo3(signature = (keys, bufs, ttl_secs=0, if_absent=false))]
+    fn put_from(
+        &self, py: Python<'_>, keys: Vec<Vec<u8>>, bufs: Vec<PyBuffer<u8>>, ttl_secs: u64, if_absent: bool,
+    ) -> PyResult<Vec<bool>> {
+        let op = if if_absent { BatchOp::PutIfAbsent } else { BatchOp::Put };
+        self.run_batch(py, op, keys, bufs, false, ttl_secs)
     }
 
     /// Batched existence probe: list[bool] aligned to `keys` (an RPC error

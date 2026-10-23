@@ -234,6 +234,13 @@ pub const MAX_COMPARE_PUT_BYTES: usize = 64 * 1024;
 /// or later; an older partition server has no handler for it.
 pub const MSG_COMPARE_WRITE: u8 = 0x5E;
 
+/// `MSG_COMPARE_PUT` with a TTL and the value as a bulk tail
+/// (`ComparePutBulkReq` ctrl, value after the ctrl crc as in `MSG_PUT_BULK`),
+/// so a large value is neither size-capped nor copied through rkyv. Replied
+/// with `PutResp` like its sibling. Sent only to a cluster negotiated at
+/// `WIRE_VERSION_WITH_COMPARE_PUT_BULK` or later.
+pub const MSG_COMPARE_PUT_BULK: u8 = 0x60;
+
 /// One op inside a `BatchDeleteReq`. Carries its own fence identity because a
 /// batch may span inodes (a directory unlink walks many), exactly as
 /// `BatchPutOp` does.
@@ -738,6 +745,19 @@ pub struct ComparePutReq {
     pub value: Vec<u8>,
 }
 
+/// `MSG_COMPARE_PUT_BULK` ctrl; the value is the frame's tail. `expected` is
+/// still capped at `MAX_COMPARE_PUT_BYTES`.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct ComparePutBulkReq {
+    pub part_id: u64,
+    pub region_epoch: u64,
+    pub key: Vec<u8>,
+    /// None requires absence, Some requires exact visible-value equality.
+    pub expected: Option<Vec<u8>>,
+    /// Absolute unix seconds; 0 = no expiry.
+    pub expires_at: u64,
+}
+
 /// `MSG_COMPARE_WRITE` request. Replied with `PutResp`: `CODE_OK` when the
 /// write was applied, `CODE_PRECONDITION` when `expected` did not hold,
 /// `CODE_FENCED` when the stamped epoch is below the partition's floor.
@@ -1093,6 +1113,9 @@ pub fn extract_part_id(msg_type: u8, payload: &[u8]) -> u64 {
         MSG_COMPARE_WRITE => rkyv_decode::<CompareWriteReq>(payload)
             .map(|r| r.part_id)
             .unwrap_or(0),
+        MSG_COMPARE_PUT_BULK => rkyv_decode::<ComparePutBulkReq>(payload)
+            .map(|r| r.part_id)
+            .unwrap_or(0),
         MSG_PUT => rkyv_decode::<PutReq>(payload)
             .map(|r| r.part_id)
             .unwrap_or(0),
@@ -1168,6 +1191,7 @@ mod msg_type_tests {
             MSG_PUT,
             MSG_COMPARE_PUT,
             MSG_COMPARE_WRITE,
+            MSG_COMPARE_PUT_BULK,
             MSG_DELETE,
             MSG_HEAD,
             MSG_RANGE,
