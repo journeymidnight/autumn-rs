@@ -1053,15 +1053,14 @@ do_start() {
     # credential into $DATA_ROOT/authz/. Idempotent — an existing credential is
     # retained so restarts keep working. The example takes it as
     # `gallery --credential-file`.
-    # BUG-BENCH-NS-UNREGISTERED: register `bench` on EVERY cluster, not just an
-    # authz one. Layer-A is active whenever the namespace registry is non-empty —
-    # and bootstrap always seeds fs/kvc/mem — so it runs even with authz OFF and
-    # rejects any write whose first key segment is unregistered. perf-check and
-    # ycsb bind the scope `bench/perf`, so without this every bench write dies
-    # with NamespaceUnknown. Idempotent (already-exists is a no-op).
+    # Layer-A is active whenever the namespace registry is non-empty — and
+    # bootstrap always seeds fs/kvc/mem — so callers must create any additional
+    # application namespace before writing to it. The commands are printed here
+    # for discoverability, but namespace ownership stays with the operator.
     {
-        "$AO" --cluster-secret-file "$CLUSTER_SECRET_FILE" --manager "$MANAGER_ADDR" --transport "$TRANSPORT" \
-            namespace-create --name bench >/dev/null 2>&1 || true
+        echo "[cluster] namespaces are not created automatically; create them as needed:"
+        echo "[cluster]   $AO --cluster-secret-file $CLUSTER_SECRET_FILE --manager $MANAGER_ADDR --transport $TRANSPORT namespace-create --name bench"
+        echo "[cluster]   $AO --cluster-secret-file $CLUSTER_SECRET_FILE --manager $MANAGER_ADDR --transport $TRANSPORT namespace-create --name gallery"
         # Presplit the bench scope `bench/perf/` so the cut points
         # are where the bench keys actually are. The retired bootstrap presplit cut
         # raw hex points that `bench_user_starts` filtered out entirely, so every
@@ -1078,7 +1077,6 @@ do_start() {
     if [[ "${AUTUMN_AUTH:-0}" == "1" ]]; then
         local _az="$DATA_ROOT/authz"
         local _ao=( "$AO" --cluster-secret-file "$CLUSTER_SECRET_FILE" --manager "$MANAGER_ADDR" --transport "$TRANSPORT" )
-        "${_ao[@]}" namespace-create --name gallery >/dev/null 2>&1 || true
         local _spec _p _grant _out
         # (§8.8): per-family principals. Each app uses its own credential = least privilege by
         # default (no all-ns master key). Cred file = two-line `principal:`/
