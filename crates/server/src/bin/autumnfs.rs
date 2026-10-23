@@ -490,10 +490,10 @@ async fn resolve_parent_name(state: &mut FsState, path: &str) -> Result<(u64, Ve
         bail!("the root has no parent");
     };
     let parent_path: Vec<String> = parents.iter().map(|c| String::from_utf8_lossy(c).into_owned()).collect();
-    let parent = dir::resolve(state, &format!("/{}", parent_path.join("/")))
+    let (parent, file_type) = dir::resolve_typed(state, &format!("/{}", parent_path.join("/")))
         .await?
         .ok_or_else(|| anyhow!("ENOENT: {path}"))?;
-    if !is_dir(&meta::fetch_inode(state, parent).await?) {
+    if file_type != DT_DIR {
         bail!("ENOTDIR: the parent of {path} is not a directory");
     }
     Ok((parent, leaf.to_vec()))

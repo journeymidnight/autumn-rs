@@ -267,6 +267,8 @@ def main():
     s3.put_object(Bucket=b, Key=p + "emptydir/", Body=b"")
     ok(True, "a key ending in / creates a directory")
     ok(err_code(s3.put_object, Bucket=b, Key=p + "x//y", Body=b"z")[1] == "InvalidArgument", "an empty key component is InvalidArgument")
+    ok(err_code(s3.put_object, Bucket=b, Key=p + "small.txt/under", Body=b"z")[1] == "InvalidRequest",
+       "a key below an object is InvalidRequest")
     r = s3.list_objects_v2(Bucket=b, Prefix=p, Delimiter="/")
     names = sorted(c["Key"] for c in r.get("Contents", []))
     prefixes = sorted(c["Prefix"] for c in r.get("CommonPrefixes", []))

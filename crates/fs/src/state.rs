@@ -112,6 +112,11 @@ pub struct FsState {
     pub inode_batch_end: u64,
     /// FUSE lookup refcounts (separate from open_count).
     pub lookup_count: HashMap<u64, u64>,
+    /// Inodes this session has seen to be directories when adding a name
+    /// under them. A type never changes and an inode number is never
+    /// reused (the manager's persistent counter; a memory-only manager
+    /// restarts it), so an entry never goes stale; cleared when it grows large.
+    pub known_dirs: HashSet<u64>,
 
     // ── inode leases ──────────────────────────────────────────────────
     /// Per-mount daemon identity (kind = `LEASE_CLIENT_KIND_FUSE`,
@@ -303,6 +308,7 @@ impl FsState {
             next_inode: ROOT_INO + 1,
             inode_batch_end: ROOT_INO + 1, // will trigger batch alloc on first use
             lookup_count: HashMap::new(),
+            known_dirs: HashSet::new(),
             client_id: Rc::new(DaemonClientId::new_fuse(host)),
             held_leases: Rc::new(RefCell::new(HashMap::new())),
             invalidations: Rc::new(RefCell::new(InvalidationMap::new())),

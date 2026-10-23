@@ -1562,6 +1562,8 @@ compare-and-set: an `ln` racing an `rm` of the same file from another client
 either leaves the new name reading the file or fails `ENOENT`, and a writer's
 flush or a `chmod` never puts back a link count another client changed. Check:
 `cargo test -p autumn-manager --test system_fs_namespace --test system_fs_links`.
+A file given as a parent (a raw inode number through `autumn.Fs`) is refused
+`ENOTDIR` by mkdir, create, link and rename, and nothing is written under it.
 The `autumnfs` CLI goes through the same code: `mkdir` and `put` onto an existing
 name fail and change nothing, as do `mkdir` and `touch` under a file (ENOTDIR)
 (`cargo test -p autumn-server --test autumnfs_cli`).

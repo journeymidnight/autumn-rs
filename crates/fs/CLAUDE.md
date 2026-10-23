@@ -11,7 +11,7 @@
 |------|------|
 | 内核挂载 | `autumn-fuse`（唯一依赖 fuser / libfuse 的 crate，见它的 CLAUDE.md）|
 | S3 网关 | `crates/server/src/bin/autumn_s3/` |
-| `autumnfs` CLI | `crates/server/src/bin/` (mkdir / rm through `dir`, touch of an existing file through `meta::put_inode`; the parent must be a directory; a new file (put / touch) is published create-only via `dir::compare_put_settled`, its keys deleted when the publish is refused and kept when the outcome stays unknown — the same cross-session windows as rename apply) |
+| `autumnfs` CLI | `crates/server/src/bin/` (mkdir / rm through `dir`, touch of an existing file through `meta::put_inode`; the parent must be a directory, judged from its dirent (`dir::resolve_typed`) for mkdir / touch / rm and from its inode for put; a new file (put / touch) is published create-only via `dir::compare_put_settled`, its keys deleted when the publish is refused and kept when the outcome stays unknown — the same cross-session windows as rename apply) |
 | PyO3 `autumn.Fs` + fsspec facade | `python/src/fs.rs` |
 
 以前这些代码是 `autumn-fuse` 的 `core` feature；拆成独立 crate 是因为 S3 网关、Python
@@ -192,7 +192,7 @@ key `[0x02][parent_ino BE][name]`，两个字段：`child_inode`、`file_type`
 | `lookup(parent, name)` | 1× Get dirent + 1× Get inode |
 | `readdir(ino)` | paginated Range(prefix=[0x02][ino BE]) + one batched get per page |
 | `getattr(ino)` | 1× Get inode |
-| `mkdir`/`create(parent, name)` | 1× Put inode + 1× CAS dirent (create-only) + 1× Get parent + 1× CAS parent (create: at most once a second per directory) |
+| `mkdir`/`create(parent, name)` | 1× Put inode + 1× CAS dirent (create-only) + 1× Get parent + 1× CAS parent (create: at most once a second per directory); the parent's Get moves before the publish the first time this session meets that directory (`check_parent`) |
 | `link`, `unlink` (file count) | 1× Get + 1× CAS inode (`change_links`); whole-inode writes (flush, truncate, setattr) also Get + CAS (one more round trip per dirty flush than the old put; an unknown outcome is settled by re-reading) |
 | `unlink(parent, name)` | 1× Get dirent + 1× CAS delete dirent + tombstone + N× Delete extent + 1× Delete inode + 1× Get + 1× CAS parent |
 | `rename(old, new)` | 3× Get dirent (+1 Range per check if the new name is a dir) + 1× CAS delete old + 1× CAS new + Get + CAS of each parent inode |
@@ -402,6 +402,19 @@ called at all"，那正是这份记录存在要堵的洞。
 - **mkdir / create**：alloc inode + Put meta + 只在名字不存在时发布 dirent
   （`compare_put(None)`，不先查：内核建之前已 lookup 过）+ 父目录 inode。两个会话
   同名创建只有一个赢，另一个 EEXIST 并删掉自己写的 inode。
+- **父目录必须是目录**（`check_parent`，mkdir / create / link / rename 的新父目录）：
+  文件当父目录返回 ENOTDIR，什么都不写。挂载上内核已保证；直接传 inode 号的调用方
+  （PyO3 `autumn.Fs`）以前能在文件下建目录项，mkdir 还把文件 nlink 抬到 2、永不回收。
+  不另花一次读：本会话第一次碰到某目录时读它的 inode 并检查，这份字节就是随后父目录
+  CAS 的基线；之后记在 `FsState::known_dirs`（类型创建后不变、inode 号不复用，所以不会
+  过期；超过 65536 项清空），直接走原来的路径。只预读不缓存时，基线早于发布、同目录
+  并发下 CAS 更易失败：4 会话同目录 mkdir −5%；加缓存后 create 11.1K/s、mkdir 4.2K/s
+  与改前持平（release，ABAB 各 6 次）。测试 `system_fs_namespace::a_file_is_refused_as_a_parent`
+  （去掉检查则 mkdir 成功、变红）。
+- **路径上的类型取自目录项**：`DirentValue.file_type` 在每个写目录项的地方都设，
+  rename 原样拷贝，类型又不可变，所以和 inode 一致。`dir::resolve_typed` 返回最后一级
+  的类型；S3 的 `bucket_dir`、`publish::ensure_dirs` 和 autumnfs CLI 用它判断目录，
+  不读 inode：ensure_dirs 4 级已有路径 13.1K → 27.2K/s。
 - **父目录 inode** 的 nlink、mtime 对读到的字节 CAS（`cas_dir`）：改 nlink 的（mkdir、
   rmdir、rename）冲突就重读重试，最多 16 次不睡（`update_dir`）；只改 mtime 的（create、
   unlink、link）只试一次，输了就算——赢的那次改动晚于它开始；目录 mtime 已在当前这一

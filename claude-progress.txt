@@ -1,3 +1,10 @@
+Date: 2026-10-23
+TaskStatus: completed
+Task scope: user — BUG-PY-FS-PARENT-NOT-DIR (core check, user agreed) + S3/CLI judge directories from the dirent type.
+Current summary: `dir::check_parent` refuses a non-directory parent (ENOTDIR) for mkdir/create/link/rename; first meeting reads the parent before the publish and reuses the bytes as the CAS baseline, later meetings hit `FsState::known_dirs` (type immutable, inode numbers never reused). `dir::resolve_typed`; `ensure_dirs`, S3 `bucket_dir` and the CLI judge from `DirentValue.file_type`. Release ABAB x6: create 11042→11089/s, mkdir 4173→4204/s (pre-read without the cache was −5%), ensure_dirs 4 levels 13086→27249/s. Test a_file_is_refused_as_a_parent (ablations of both checks red); s3_write_check.py all pass incl. new "key below an object" check.
+  Fresh Fable review: no high findings; wording fixes applied.
+Main gaps: BUG-FS-DIR-NLINK-LOST-UNDER-CONTENTION (found by the benchmark, predates this change).
+Next steps: pick from feature_list.md.
 Date: 2026-10-22
 TaskStatus: completed
 Task scope: user — F-FS-NAMESPACE-GAPS (four items).

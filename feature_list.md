@@ -1,6 +1,6 @@
 # autumn-rs feature list — OPEN backlog
 
-**Last updated:** 2026-10-22 (F-FS-NAMESPACE-GAPS concluded and removed)
+**Last updated:** 2026-10-23 (BUG-PY-FS-PARENT-NOT-DIR fixed and removed; BUG-FS-DIR-NLINK-LOST-UNDER-CONTENTION found)
 
 **Rules:**
 - This file tracks the **OPEN backlog only**. A feature that reaches `passes: true`
@@ -14,10 +14,10 @@
 
 ## Active
 
-### BUG-PY-FS-PARENT-NOT-DIR — `autumn.Fs.mkdir/create` 不查父 inode 是否目录（评审推断，未复现）
-- **Trigger** (2026-10-22 F-FS-NAMESPACE-GAPS 第二轮评审): fs 核心 `dir::create_child` 不查父 inode 类型（FUSE 由内核保证，CLI 已在 `resolve_parent_name` 查）；PyO3 `autumn.Fs.mkdir/create`（`python/src/fs.rs`）把调用方给的 parent ino 直接传进去。parent 是文件时：目录项挂在文件下，mkdir 还会把文件 nlink 抬到 2，文件永远回收不了。
-- **Scope**: 先用 Python API 复现。修在 binding（每次 create 多一次 inode 读）还是核心（FUSE 每次 create 也多一次读，除非用缓存的父 meta）由用户定。
-- **Acceptance**: 复现用例修复前文件下出现目录项/nlink 变 2，修复后返回 ENOTDIR 且不改任何 key；消融变红；FUSE create 吞吐不降。
+### BUG-FS-DIR-NLINK-LOST-UNDER-CONTENTION — 同目录高并发 mkdir 父目录 nlink 少记（已复现，未修）
+- **Trigger** (2026-10-23 父目录类型检查的基准): 4 会话 × 300 次 mkdir 进同一目录，结束后父目录 nlink 比 2+1200 少 0–18（改前改后都有）。`update_dir` 对父 inode 的 CAS 连续冲突 16 次就放弃、只记 WARN（名字已发布，不报错）。
+- **Scope**: 先定位放弃次数与冲突分布；修法候选：退避重试直到落地（不能卡住 FUSE 单请求循环）、或把子目录计数从父 inode 拆出去（比如读时由目录项数推出 nlink）。性能不能降（同一基准 mkdir ~4.2K/s）。
+- **Acceptance**: 同一基准多轮 nlink 一个不少；去掉修复变红；mkdir 吞吐不降。
 - `passes: false`
 
 ### F-TEST-FOLLOWUPS — 测试集体检留下的缺口与疑点（未处理）

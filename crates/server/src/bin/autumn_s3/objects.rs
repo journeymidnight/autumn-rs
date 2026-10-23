@@ -74,10 +74,7 @@ pub async fn inode_meta(st: &mut FsState, ino: u64) -> Result<Option<InodeMeta>>
 
 /// The directory a bucket names, or `None` if there is no such bucket.
 pub async fn bucket_dir(st: &mut FsState, bucket: &str) -> Result<Option<u64>> {
-    let Some(ino) = dir::resolve(st, &format!("/{bucket}")).await? else {
-        return Ok(None);
-    };
-    Ok(inode_meta(st, ino).await?.filter(is_dir).map(|_| ino))
+    Ok(dir::resolve_typed(st, &format!("/{bucket}")).await?.filter(|&(_, t)| t == DT_DIR).map(|(ino, _)| ino))
 }
 
 /// Resolve an absolute autumn path to its inode, or `None` if absent.

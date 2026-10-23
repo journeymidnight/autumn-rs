@@ -246,3 +246,34 @@ fn creates_move_a_directory_s_mtime_once_a_second() {
 async fn raw(st: &mut FsState, ino: u64) -> Vec<u8> {
     st.kv_get_opt(&key::inode_key(ino)).await.unwrap().unwrap()
 }
+
+/// A file given as the parent (a caller passing raw inode numbers, which the
+/// kernel never does): mkdir, create, rename and link into it are refused
+/// ENOTDIR, and so is a path through it; no entry lands under it and its
+/// link count stays 1.
+#[test]
+fn a_file_is_refused_as_a_parent() {
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        let (mgr, _dirs) = boot(253, 25301).await;
+        let mut a = mount(&mgr).await;
+        let (f, _) = dir::create(&mut a, 1, OsStr::new("f"), 0o644).await.unwrap();
+        let (g, _) = dir::create(&mut a, 1, OsStr::new("g"), 0o644).await.unwrap();
+
+        let r = dir::mkdir(&mut a, f, OsStr::new("sub"), 0o755).await;
+        assert!(errno(&r).contains("ENOTDIR"), "mkdir: {}", errno(&r));
+        let r = dir::create(&mut a, f, OsStr::new("x"), 0o644).await;
+        assert!(errno(&r).contains("ENOTDIR"), "create: {}", errno(&r));
+        let r = dir::rename(&mut a, 1, OsStr::new("g"), f, OsStr::new("g")).await;
+        assert!(errno(&r).contains("ENOTDIR"), "rename: {}", errno(&r));
+        let r = dir::link(&mut a, g, f, OsStr::new("h")).await;
+        assert!(errno(&r).contains("ENOTDIR"), "link: {}", errno(&r));
+        let r = autumn_fs::publish::ensure_dirs(&mut a, 1, &[b"f", b"y"]).await;
+        assert!(matches!(r, Err(autumn_fs::publish::PublishError::NotAFile(ref n)) if n == "f"), "{r:?}");
+
+        let under = key::dirent_prefix(f);
+        assert!(a.kv_range_keys(&under, &under, 1).await.unwrap().is_empty(), "an entry landed under the file");
+        assert_eq!(links(&mut a, f).await, 1);
+        assert_eq!(named(&mut a, 1, "g").await, Some(g));
+        assert_eq!(links(&mut a, g).await, 1);
+    });
+}

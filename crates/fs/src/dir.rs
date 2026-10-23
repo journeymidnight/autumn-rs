@@ -58,7 +58,13 @@ pub async fn lookup(state: &mut FsState, parent: u64, name: &OsStr) -> Result<(u
 /// KV/routing error surfaces as `Err` (via the `kv_get_opt` barrier — a
 /// transient failure must NOT be mistaken for "path does not exist").
 pub async fn resolve(state: &mut FsState, path: &str) -> Result<Option<u64>> {
-    let mut ino = ROOT_INO;
+    Ok(resolve_typed(state, path).await?.map(|(ino, _)| ino))
+}
+
+/// `resolve`, with the last component's type (`DT_*`) taken from its
+/// directory entry, so no inode is read; the root is a directory.
+pub async fn resolve_typed(state: &mut FsState, path: &str) -> Result<Option<(u64, u8)>> {
+    let (mut ino, mut file_type) = (ROOT_INO, DT_DIR);
     for comp in path.split('/') {
         if comp.is_empty() || comp == "." {
             continue;
@@ -72,9 +78,9 @@ pub async fn resolve(state: &mut FsState, path: &str) -> Result<Option<u64>> {
             None => return Ok(None),
         };
         let dirent: DirentValue = schema::decode_dirent(&v).map_err(|e| anyhow!("{}", e))?;
-        ino = dirent.child_inode;
+        (ino, file_type) = (dirent.child_inode, dirent.file_type);
     }
-    Ok(Some(ino))
+    Ok(Some((ino, file_type)))
 }
 
 /// Dirent-key page size for directory scans.
@@ -241,11 +247,40 @@ pub async fn readdir_bounded(
     Ok(entries)
 }
 
+/// Before a name is added under `dir`: a file is refused (ENOTDIR; the
+/// kernel checks this on a mount, a caller passing raw inode numbers does
+/// not). The inode is read only the first time this session meets `dir`
+/// (`FsState::known_dirs`); the bytes read are the baseline of the
+/// directory's update afterwards, so the check costs no read of its own.
+async fn check_parent(state: &mut FsState, dir: u64) -> Result<Option<Vec<u8>>> {
+    const KNOWN_DIRS_CAP: usize = 1 << 16;
+    if dir == ROOT_INO || state.known_dirs.contains(&dir) {
+        return Ok(None);
+    }
+    let old = state
+        .kv_get_opt(&key::inode_key(dir))
+        .await?
+        .ok_or_else(|| anyhow!("ENOENT: directory {dir}"))?;
+    let m = schema::decode_inode_meta(&old).map_err(|e| anyhow!("inode {dir}: {e}"))?;
+    if m.mode & S_IFMT != S_IFDIR {
+        return Err(anyhow!("ENOTDIR"));
+    }
+    if state.known_dirs.len() >= KNOWN_DIRS_CAP {
+        state.known_dirs.clear();
+    }
+    state.known_dirs.insert(dir);
+    Ok(Some(old))
+}
+
 /// One read-modify-write of a directory's inode, compared-and-set against
-/// the bytes read. `Ok(false)`: another change landed in between.
-async fn cas_dir(state: &mut FsState, dir: u64, change: &impl Fn(&mut InodeMeta)) -> Result<bool> {
+/// `read` if given, else the bytes read now. `Ok(false)`: another change
+/// landed in between.
+async fn cas_dir(state: &mut FsState, dir: u64, read: Option<Vec<u8>>, change: &impl Fn(&mut InodeMeta)) -> Result<bool> {
     let k = key::inode_key(dir);
-    let old = state.kv_get_opt(&k).await?.ok_or_else(|| anyhow!("ENOENT: directory {dir}"))?;
+    let old = match read {
+        Some(b) => b,
+        None => state.kv_get_opt(&k).await?.ok_or_else(|| anyhow!("ENOENT: directory {dir}"))?,
+    };
     let mut meta = schema::decode_inode_meta(&old).map_err(|e| anyhow!("inode {dir}: {e}"))?;
     change(&mut meta);
     let new = schema::encode_inode_meta(&meta);
@@ -269,10 +304,11 @@ async fn cas_dir(state: &mut FsState, dir: u64, change: &impl Fn(&mut InodeMeta)
 /// changing one directory (a subdirectory's link) do not lose each other's
 /// update. Callers have already changed a name — the commit point — so a
 /// directory that keeps changing, or a failed read, is logged, not returned:
-/// the count is then off (stat's nlink), nothing is unreachable.
-pub(crate) async fn update_dir(state: &mut FsState, dir: u64, change: impl Fn(&mut InodeMeta)) {
+/// the count is then off (stat's nlink), nothing is unreachable. The first
+/// try compares against `read` if given.
+pub(crate) async fn update_dir(state: &mut FsState, dir: u64, mut read: Option<Vec<u8>>, change: impl Fn(&mut InodeMeta)) {
     for _ in 0..16 {
-        match cas_dir(state, dir, &change).await {
+        match cas_dir(state, dir, read.take(), &change).await {
             Ok(true) => return,
             Ok(false) => {}
             Err(e) => {
@@ -290,10 +326,10 @@ pub(crate) async fn update_dir(state: &mut FsState, dir: u64, change: impl Fn(&m
 /// every create. Directory times thus have one-second resolution, as on a
 /// filesystem with 1 s timestamps: a change in a later second always moves
 /// them. One try: losing the race is fine, the change that won landed after
-/// this one started.
-async fn touch_dir_mtime(state: &mut FsState, dir: u64) {
+/// this one started; so is comparing against `read`, read before it.
+async fn touch_dir_mtime(state: &mut FsState, dir: u64, read: Option<Vec<u8>>) {
     let (s, ns) = now_ts();
-    let r = cas_dir(state, dir, &|m: &mut InodeMeta| {
+    let r = cas_dir(state, dir, read, &|m: &mut InodeMeta| {
         if m.mtime_secs != s {
             m.mtime_secs = s;
             m.mtime_nsecs = ns;
@@ -357,8 +393,10 @@ pub async fn mkdir(
     mode: u32,
 ) -> Result<(u64, InodeMeta)> {
     let meta = new_dir_meta(mode, unsafe { libc::getuid() }, unsafe { libc::getgid() });
+    let read = check_parent(state, parent).await?;
     let ino = create_child(state, parent, name, meta.clone(), DT_DIR).await?;
-    update_dir(state, parent, |m| {
+    state.known_dirs.insert(ino);
+    update_dir(state, parent, read, |m| {
         add_links(m, 1);
         touch(m);
     })
@@ -384,8 +422,9 @@ pub async fn create(
     mode: u32,
 ) -> Result<(u64, InodeMeta)> {
     let meta = new_file_meta(mode, unsafe { libc::getuid() }, unsafe { libc::getgid() });
+    let read = check_parent(state, parent).await?;
     let ino = create_child(state, parent, name, meta.clone(), DT_REG).await?;
-    touch_dir_mtime(state, parent).await;
+    touch_dir_mtime(state, parent, read).await;
     *state.lookup_count.entry(ino).or_insert(0) += 1;
     Ok((ino, meta))
 }
@@ -413,11 +452,12 @@ pub async fn rmdir(state: &mut FsState, parent: u64, name: &OsStr) -> Result<()>
     }
     let dirent = removed.ok_or_else(|| anyhow!("EBUSY: the name kept changing"))?;
     state.inodes.remove(&dirent.child_inode);
+    state.known_dirs.remove(&dirent.child_inode);
     // After the commit point (the name is gone): a failure leaks the inode.
     if let Err(e) = state.kv_delete(&key::inode_key(dirent.child_inode)).await {
         tracing::warn!(ino = dirent.child_inode, error = %e, "removed directory's inode not deleted");
     }
-    update_dir(state, parent, |m| {
+    update_dir(state, parent, None, |m| {
         add_links(m, -1);
         touch(m);
     })
@@ -455,7 +495,7 @@ pub async fn unlink(state: &mut FsState, parent: u64, name: &OsStr) -> Result<()
         // of leaking the extents forever.
         crate::extent::remove_unreachable_inode(state, dirent.child_inode).await?;
     }
-    touch_dir_mtime(state, parent).await;
+    touch_dir_mtime(state, parent, None).await;
     Ok(())
 }
 
@@ -481,10 +521,7 @@ pub async fn link(state: &mut FsState, ino: u64, parent: u64, name: &OsStr) -> R
     if inode.mode & S_IFMT != S_IFREG {
         return Err(anyhow!("EPERM"));
     }
-    let parent_meta = get_inode(state, parent).await?;
-    if parent_meta.mode & S_IFMT != S_IFDIR {
-        return Err(anyhow!("ENOTDIR"));
-    }
+    let read = check_parent(state, parent).await?;
     let key = key::dirent_key(parent, name.as_encoded_bytes());
     if state.kv_get_opt(&key).await?.is_some() {
         return Err(anyhow!("EEXIST"));
@@ -507,7 +544,7 @@ pub async fn link(state: &mut FsState, ino: u64, parent: u64, name: &OsStr) -> R
             return Err(anyhow!("EEXIST"));
         }
     }
-    touch_dir_mtime(state, parent).await;
+    touch_dir_mtime(state, parent, read).await;
     *state.lookup_count.entry(ino).or_insert(0) += 1;
     Ok(inode)
 }
@@ -559,6 +596,7 @@ pub async fn rename(
 ) -> Result<()> {
     let old_dk = key::dirent_key(old_parent, old_name.as_encoded_bytes());
     let new_dk = key::dirent_key(new_parent, new_name.as_encoded_bytes());
+    let new_read = check_parent(state, new_parent).await?;
     let mut removed = None;
     for _ in 0..8 {
         let v = state.kv_get_opt(&old_dk).await?.ok_or_else(|| anyhow!("ENOENT"))?;
@@ -596,7 +634,7 @@ pub async fn rename(
         if !compare_put_settled(&state.client, &new_dk, target.as_deref(), &v).await.map_err(gone)? {
             continue;
         }
-        return finish_rename(state, old_parent, new_parent, source.file_type == DT_DIR, replaced).await;
+        return finish_rename(state, old_parent, new_parent, new_read, source.file_type == DT_DIR, replaced).await;
     }
     // Every try lost to a definite conflict, so nothing was published.
     if !compare_put_settled(&state.client, &old_dk, None, &v).await.map_err(gone)? {
@@ -676,6 +714,7 @@ async fn finish_rename(
     state: &mut FsState,
     old_parent: u64,
     new_parent: u64,
+    new_read: Option<Vec<u8>>,
     moved_dir: bool,
     replaced: Option<DirentValue>,
 ) -> Result<()> {
@@ -684,6 +723,7 @@ async fn finish_rename(
         Some(t) if t.file_type == DT_DIR => {
             // Checked empty; nothing else names it now.
             state.inodes.remove(&t.child_inode);
+            state.known_dirs.remove(&t.child_inode);
             if let Err(e) = state.kv_delete(&key::inode_key(t.child_inode)).await {
                 tracing::warn!(ino = t.child_inode, error = %e, "replaced directory's inode not deleted");
             }
@@ -713,18 +753,18 @@ async fn finish_rename(
     let moved = moved_dir as i64;
     let lost = replaced_dir as i64;
     if old_parent == new_parent {
-        update_dir(state, old_parent, |m| {
+        update_dir(state, old_parent, new_read, |m| {
             add_links(m, -lost);
             touch(m);
         })
         .await;
     } else {
-        update_dir(state, old_parent, |m| {
+        update_dir(state, old_parent, None, |m| {
             add_links(m, -moved);
             touch(m);
         })
         .await;
-        update_dir(state, new_parent, |m| {
+        update_dir(state, new_parent, new_read, |m| {
             add_links(m, moved - lost);
             touch(m);
         })

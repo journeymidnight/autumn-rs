@@ -19,7 +19,6 @@
 //! names. Without the fence, a paused owner could publish a name after the
 //! sweeper had judged it dead and deleted the inode's data.
 
-use std::ffi::OsStr;
 
 use anyhow::{anyhow, Result};
 use bytes::BytesMut;
@@ -29,7 +28,7 @@ use autumn_client::{ClusterClient, WriteLease};
 use autumn_rpc::manager_rpc::{LEASE_MODE_REPLACE, LEASE_MODE_WRITE};
 
 use crate::key;
-use crate::meta::{self, S_IFDIR, S_IFMT, S_IFREG};
+use crate::meta::{self, S_IFMT, S_IFREG};
 use crate::schema::{self, DirentValue, InodeMeta, PendingOp, SegmentMap, DT_DIR, DT_REG};
 use crate::segment;
 use crate::state::{FsState, FuseLease};
@@ -658,11 +657,14 @@ pub async fn ensure_dirs(
     let mut dir = root;
     for comp in components {
         loop {
-            if let Some((ino, m)) = crate::dir::lookup_opt(state, dir, OsStr::from_bytes_compat(comp)).await? {
-                if m.mode & S_IFMT != S_IFDIR {
+            // The entry's type is the inode's (fixed at creation), so the
+            // inode is not read.
+            if let Some(v) = state.kv_get_opt(&key::dirent_key(dir, comp)).await? {
+                let d = schema::decode_dirent(&v).map_err(|e| anyhow!("{}", e))?;
+                if d.file_type != DT_DIR {
                     return Err(PublishError::NotAFile(String::from_utf8_lossy(comp).into_owned()));
                 }
-                dir = ino;
+                dir = d.child_inode;
                 break;
             }
             let lease = session_lease(state).await?;
@@ -676,7 +678,7 @@ pub async fn ensure_dirs(
                 .map_err(|e| anyhow!("mkdir {}: {e}", String::from_utf8_lossy(comp)))?;
             if created {
                 // `..` of the new directory, as `dir::mkdir` counts it.
-                crate::dir::update_dir(state, dir, |m| m.nlink += 1).await;
+                crate::dir::update_dir(state, dir, None, |m| m.nlink += 1).await;
                 dir = ino;
                 break;
             }
@@ -685,17 +687,6 @@ pub async fn ensure_dirs(
         }
     }
     Ok(dir)
-}
-
-/// `OsStr` from raw name bytes on the platforms this builds for.
-trait OsStrCompat {
-    fn from_bytes_compat(b: &[u8]) -> &OsStr;
-}
-
-impl OsStrCompat for OsStr {
-    fn from_bytes_compat(b: &[u8]) -> &OsStr {
-        std::os::unix::ffi::OsStrExt::from_bytes(b)
-    }
 }
 
 /// Whether a meta describes a regular file.
