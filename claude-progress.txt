@@ -1,3 +1,9 @@
+Date: 2026-10-23 (3)
+TaskStatus: not_completed
+Task scope: user — F-KVC-ADAPTER-WRITE-READ (dedup before write; why the in-engine fetch is slower), in journeymidnight/autumn_kvcache.
+Current summary: root cause beyond speed: the sglang adapter received reads into get_data_page(flat=True), a COPY for MHA (all layouts), MLA layer_first and Mamba — reads reported hits and left the host pool untouched (silent stale KV). Fixed in autumn_kvcache 2b9f01b (local commit, not pushed): per-pool page codec (window / K-V halves zero-copy / copy via scratch + set_from_flat_data_page), layout-tagged keys except layer_first, batch-exists dedup before write; tests/test_page_layouts.py with sglang-faithful pools (ablations red: 9 tests without the codec, 7 without dedup); 83 passed under system python and the vLLM venv; live smoke + round trip correct. 128 x 16 MiB on a live cluster: read 0.79 s zero-copy / 0.98 s copy, repeated backup 3-5 ms. Not the SST: large values read equally fast from memtable and SST (SST hits confirmed). Fable review: no high; five medium/low fixed.
+Main gaps: engine end-to-end re-test (all 8 GPUs taken by another tenant's sglang); push of the adapter repo awaits the user; BUG-READ-SLOWER-AFTER-FLUSH (small values) recorded.
+Next steps: when a GPU frees, rerun the sequential cross-instance test (timeout policy) and the output-correctness check (A computes vs B served from L3).
 Date: 2026-10-23 (2)
 TaskStatus: completed
 Task scope: user — how to tier KV-cache storage; read the engines' code and measure before designing. A PS-side large-value read cache was started and dropped (user: storage should not carry a heavy read cache; 3FS and HDFS do not).

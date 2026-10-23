@@ -19,17 +19,25 @@
 - **Scope**: (1) 写前去重（批量 exists，只写不存在的页）；(2) 查清引擎内取数比微基准慢 2–5 倍的原因（拷贝？GIL？和写争用？）并修。
 - **Acceptance**: 同一负载（Qwen3-VL-32B、8K prompt、逐个请求、timeout 策略）跨实例命中接近 100%，每请求耗时低于重算；读实例不再重写已有页；去掉修复变差。
 - `passes: false`
+- **notes** (2026-10-23): 根因找到一个更重的：adapter 读到 `get_data_page(flat=True)` 上，而 sglang 的 MHA 三种布局、MLA layer_first、Mamba 的页都不是池的视图，flatten/cat 出来的是拷贝——读报命中、池没被写（静默错 KV），每批还白分配 2 GiB。SST 不是原因（大 value 在 memtable/SST 读速相同，已核实命中 SST）。修法在 autumn_kvcache：按池判定 整页视图 / K·V 两段视图（零拷贝）/ 拷贝（scratch + set_from_flat_data_page），非 layer_first 布局的 key 带布局名；写前批量 exists 去重。实测 128×16 MiB：读 0.79–0.98 s（原始微基准 1.2 s）、重复写 3–5 ms。引擎端到端待 GPU 空出来复测。
 
 ### F-KVC-LOW-REPLICA — kvc 写 2 副本、封存后转 EC 2+1
 - **Trigger** (2026-10-23 用户): KV-cache 可重算，3 副本写放大不必要。
 - **Scope**: 现在 `bootstrap --replication` 对 log/row/meta 一视同仁、split 子分区继承父流参数，没有按 namespace / 分区设副本数的入口。kvc 范围的分区：日志流 2 副本打开、封存后转 EC 2+1；meta/row 流保持 3 副本。
 - **Acceptance**: kvc 写入落 2 份、封存后为 EC 2+1；其他 namespace 不变；写带宽相对 3 副本提升可测；坏一块盘时的行为写进文档。
 - `passes: false`
+- **notes** (2026-10-23 用户): 按 namespace 设副本数比较难。替代：(1) KV-cache 单独一套集群，bootstrap 即 `--replication 2+0 --log-ec 2+1`，零代码；(2) 只在建 kvc 分区时指定日志流参数，之后 split 照常继承。倾向先 (1)。
 
 ### F-KVC-PARTITION-LAYOUT — PS 规划 8–16 分区，kvc 默认按哈希预切
 - **Trigger** (2026-10-23 用户 + 实测): 默认部署下一个模型的 KV 全在一个分区（实测写 0.36 GB/s）；kvc key 的模型标识带大写，`presplit --namespace` 拒收，只能 `presplit --namespace kvc --hash-prefix <model_scope>/kv/` 且只能切空键空间。
 - **Scope**: PS 分区数按 8–16 规划；kvc 按哈希预切做成部署的默认动作（模型标识事先不知道时怎么切要设计）。
 - **Acceptance**: 新部署的 kvc 写入无需人工就分散到 8–16 个分区；ops.md 写明。
+- `passes: false`
+
+### BUG-READ-SLOWER-AFTER-FLUSH — 小 value 读在 memtable 刷进 SST 后掉到约 40%（未定位）
+- **Trigger** (2026-09-28 实测 + 2026-10-23 用户): perf-check 4K 读随写入量双峰——写阶段没越过 256 MiB memtable 切换时读 1.2–1.4M ops/s、p99 0.13 ms，越过后 0.41–0.65M、p99 ~1 ms；表现为"写得越慢读越快"。用户怀疑 SST 读路径。
+- **Scope**: 先用固定 key 集、同一数据分别在 memtable / 刷盘后各读一遍（`compact` 会先刷），确认差距；再剖析 SST 点查（bloom、索引、block cache 命中、row stream 读）找根因。大 value 不受影响（2026-10-23 核实：16 MiB 页在 memtable 与 SST 读速相同，SST 命中计数确认）。
+- **Acceptance**: 根因写明；刷盘后 4K 读回到 memtable 读的合理比例（目标与证据一起给出）；perf-check 4K 读基线不再取决于写阶段写了多少。
 - `passes: false`
 
 ### F-KVC-CACHE-TIER — PS 之上的 kvc 专用薄缓存层（记录，暂缓）
