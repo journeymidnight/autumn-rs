@@ -72,14 +72,11 @@ dependencies = [
 name = "autumn-common"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "autumn-params",
- "autumn-rpc",
  "compio",
  "core_affinity",
  "futures",
  "libc",
- "serde",
  "thiserror",
  "tracing",
 ]
