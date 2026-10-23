@@ -1,6 +1,6 @@
 # autumn-rs feature list — OPEN backlog
 
-**Last updated:** 2026-10-23 (BUG-PY-FS-PARENT-NOT-DIR fixed and removed; BUG-FS-DIR-NLINK-LOST-UNDER-CONTENTION found)
+**Last updated:** 2026-10-23 (KV-cache tiering measured; four F-KVC-* entries)
 
 **Rules:**
 - This file tracks the **OPEN backlog only**. A feature that reaches `passes: true`
@@ -13,6 +13,30 @@
 ---
 
 ## Active
+
+### F-KVC-ADAPTER-WRITE-READ — KV-cache adapter 读写跑满（autumn_kvcache 仓库）
+- **Trigger** (2026-10-23 实测): autumn 单 rank 写 2.39 GB/s、读 1.79 GB/s（微基准），但 SGLang 里取 128 页（2 GiB）要 2–6 s，超过 timeout 预算，跨实例命中 0%；读实例预取失败后重算、把已在 L3 的页又写一遍（adapter 写前不查 exists），和读抢带宽。
+- **Scope**: (1) 写前去重（批量 exists，只写不存在的页）；(2) 查清引擎内取数比微基准慢 2–5 倍的原因（拷贝？GIL？和写争用？）并修。
+- **Acceptance**: 同一负载（Qwen3-VL-32B、8K prompt、逐个请求、timeout 策略）跨实例命中接近 100%，每请求耗时低于重算；读实例不再重写已有页；去掉修复变差。
+- `passes: false`
+
+### F-KVC-LOW-REPLICA — kvc 写 2 副本、封存后转 EC 2+1
+- **Trigger** (2026-10-23 用户): KV-cache 可重算，3 副本写放大不必要。
+- **Scope**: 现在 `bootstrap --replication` 对 log/row/meta 一视同仁、split 子分区继承父流参数，没有按 namespace / 分区设副本数的入口。kvc 范围的分区：日志流 2 副本打开、封存后转 EC 2+1；meta/row 流保持 3 副本。
+- **Acceptance**: kvc 写入落 2 份、封存后为 EC 2+1；其他 namespace 不变；写带宽相对 3 副本提升可测；坏一块盘时的行为写进文档。
+- `passes: false`
+
+### F-KVC-PARTITION-LAYOUT — PS 规划 8–16 分区，kvc 默认按哈希预切
+- **Trigger** (2026-10-23 用户 + 实测): 默认部署下一个模型的 KV 全在一个分区（实测写 0.36 GB/s）；kvc key 的模型标识带大写，`presplit --namespace` 拒收，只能 `presplit --namespace kvc --hash-prefix <model_scope>/kv/` 且只能切空键空间。
+- **Scope**: PS 分区数按 8–16 规划；kvc 按哈希预切做成部署的默认动作（模型标识事先不知道时怎么切要设计）。
+- **Acceptance**: 新部署的 kvc 写入无需人工就分散到 8–16 个分区；ops.md 写明。
+- `passes: false`
+
+### F-KVC-CACHE-TIER — PS 之上的 kvc 专用薄缓存层（记录，暂缓）
+- **Trigger** (2026-10-23 用户): 从性能看需要给 kvc 一层很薄的缓存：write-through、超大 CLOCK、选择性落盘，把所有节点的内存池化；放在 PS 层之上，PS 层以下保持原样（不在 PS 里加读缓存——存储不该带重读缓存，3FS/HDFS 都不做）。
+- **Scope**: 等 F-KVC-ADAPTER-WRITE-READ 读写跑满之后再定要不要做、怎么做（对标 Mooncake：内存先确认、eager 或淘汰时落盘）。
+- **Acceptance**: 先给设计，用户定了再立实现条目。
+- `passes: false`
 
 ### BUG-FS-DIR-NLINK-LOST-UNDER-CONTENTION — 同目录高并发 mkdir 父目录 nlink 少记（已复现，未修）
 - **Trigger** (2026-10-23 父目录类型检查的基准): 4 会话 × 300 次 mkdir 进同一目录，结束后父目录 nlink 比 2+1200 少 0–18（改前改后都有）。`update_dir` 对父 inode 的 CAS 连续冲突 16 次就放弃、只记 WARN（名字已发布，不报错）。

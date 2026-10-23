@@ -799,6 +799,12 @@ do_start() {
     # `start` / `restart` pass 0 and MUST NEVER clean etcd (data-safety).
     local fresh="${2:-0}"
     [[ "$replicas" =~ ^[0-9]+$ ]] && (( replicas >= 1 )) || die "replicas must be a positive integer"
+    # Checked before anything launches. `N` or `N+0`, as deploy/ takes it.
+    if [[ -n "${AUTUMN_REPLICATION:-}" ]]; then
+        local _repl="${AUTUMN_REPLICATION%+0}"
+        [[ "$_repl" =~ ^[1-9][0-9]*$ ]] && (( _repl <= replicas )) \
+            || die "AUTUMN_REPLICATION must be 1..$replicas (the node count), got '$AUTUMN_REPLICATION'"
+    fi
     # Sync the global to the count we're ACTUALLY launching. The dispatch may pass
     # a reused/persisted count that differs from the CLI-parsed global REPLICAS
     # (e.g. a bare `restart` reusing the snapshot). Without this, compute_affinity
@@ -984,13 +990,15 @@ do_start() {
         # safely; replaced the buggy two-adjacent-shard-only fast path).
         # See crates/stream/CLAUDE.md note 6 + the bug-history block.
         #
-        # Env overrides: AUTUMN_EC_LOG / AUTUMN_EC_ROW
+        # Env overrides: AUTUMN_REPLICATION (open-extent replica count, at most
+        # the node count) / AUTUMN_EC_LOG / AUTUMN_EC_ROW
         #   "off"  → disable EC for that stream (pure replication)
         #   "K+M"  → use that explicit EC shape (open replicates is
         #            still the meta replication factor; only the
         #            post-seal EC encoding shape changes)
         local log_ec_default row_ec_default meta_repl
         if (( replicas >= 3 )); then meta_repl=3; else meta_repl=$replicas; fi
+        [[ -n "${AUTUMN_REPLICATION:-}" ]] && meta_repl="${AUTUMN_REPLICATION%+0}"
         local _ec_default=""
         if (( replicas == 4 )); then
             _ec_default="3+1"
@@ -1103,7 +1111,7 @@ do_start() {
     save_cluster_config
 
     echo ""
-    echo "[cluster] ✓ cluster ready (replicas=$replicas)"
+    echo "[cluster] ✓ cluster ready (nodes=$replicas)"
     echo "[cluster]   manager  : $MANAGER_ADDR"
     echo "[cluster]   partition: ${BIND_HOST}:${PS_BASE_PORT}"
     echo "[cluster]   logs     : $LOG_DIR"

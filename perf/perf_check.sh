@@ -328,20 +328,38 @@ run_perf() {
         || echo "[perf-check] perf-check exited non-zero (mode=$mode parts=$parts depth=$depth size=$size_label)"
 }
 
+# cluster.sh creates no application namespace, so the bench creates `bench`
+# itself (an existing one is fine) and, with PARTS > 1, cuts `bench/perf` —
+# the scope its keys land in — then waits for the PS to open the pieces.
+prepare_bench_namespace() {
+    local mode="$1" parts="$2" out i
+    local ao=("$ROOT_DIR/target/release/autumn-op"
+        --cluster-secret-file "${AUTUMN_CLUSTER_SECRET_FILE:-$AUTUMN_DATA_ROOT/cluster.secret}"
+        --manager "${AUTUMN_BIND_HOST:-127.0.0.1}:9001" --transport "$mode")
+    if ! out="$("${ao[@]}" namespace-create --name bench 2>&1)" && [[ "$out" != *"already exists"* ]]; then
+        echo "[perf-check] namespace-create bench failed: $out"
+        return 1
+    fi
+    (( parts > 1 )) || return 0
+    "${ao[@]}" presplit --namespace bench/perf --count "$parts" \
+        || { echo "[perf-check] presplit bench/perf into $parts failed"; return 1; }
+    for (( i = 0; i < 240; i++ )); do
+        # Captured first: grep -q leaving early would break autumn-op's pipe.
+        out="$("${ao[@]}" info 2>/dev/null || true)"
+        grep -Eq '^  ps .* slots  ready' <<<"$out" && return 0
+        sleep 0.5
+    done
+    echo "[perf-check] the PS did not open the bench partitions in 120 s; last info:"
+    echo "$out"
+    return 1
+}
+
 start_cluster_for() {
     local mode="$1"
     local parts="$2"
-    # AUTUMN_BOOTSTRAP_PRESPLIT now means "presplit the BENCH namespace into N
-    # partitions" — cluster.sh applies it AFTER bootstrap via
-    # `presplit --namespace bench/perf --count N`. The old meaning
-    # (`bootstrap --presplit N:hexstring`) cut the RAW keyspace at points no
-    # `bench/perf/…` key ever reaches, so `bench_user_starts` filtered them all
-    # out and every N measured ONE partition (BUG-BENCH-NS-UNREGISTERED).
-    if (( parts > 1 )); then
-        export AUTUMN_BOOTSTRAP_PRESPLIT="${parts}:hexstring"
-    else
-        unset AUTUMN_BOOTSTRAP_PRESPLIT
-    fi
+    # The bench cuts its own namespace (prepare_bench_namespace), not cluster.sh,
+    # and keeps the baselines' replica count.
+    unset AUTUMN_BOOTSTRAP_PRESPLIT AUTUMN_REPLICATION
     if (( SKIP_CLUSTER == 0 )); then
         bash "$ROOT_DIR/cluster.sh" clean
         await_ports_clear
@@ -376,8 +394,11 @@ start_cluster_for() {
         AUTUMN_TRANSPORT="$mode" bash "$ROOT_DIR/cluster.sh" start 3 \
             "${cluster_3disk[@]}" \
             || { echo "[perf-check] FAILED to start cluster (mode=$mode parts=$parts)"; return 1; }
+        prepare_bench_namespace "$mode" "$parts"
     else
         echo "[perf-check] --skip-cluster: assuming cluster is already running in $mode mode"
+        # Its partitions are the operator's; only make sure the scope exists.
+        prepare_bench_namespace "$mode" 1
     fi
 }
 

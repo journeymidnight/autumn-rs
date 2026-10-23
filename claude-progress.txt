@@ -1,9 +1,9 @@
 Date: 2026-10-23 (2)
 TaskStatus: completed
-Task scope: user — how to tier KV-cache storage (engine L2 vs autumn L3); read the engines' code and measure before designing. A PS-side large-value read cache was started and dropped (user: a storage system should not carry a heavy read cache; 3FS and HDFS do not).
-Current summary: SGLang HiCache writes L3 in the background (unbounded queue; slow L3 pins L2 until new backups are skipped); vLLM looks up synchronously in the scheduler and loads fully before running. Measured (TCP, one host, 3 replicas on 3 disks): Qwen3-VL-32B on one H200 produces 2.22 GB/s of KV; autumn absorbs 0.36 GB/s with kvc unsplit (one partition per model) and 0.54-0.57 GB/s presplit 8 ways by hash; micro-bench box ceiling 0.96 GB/s write, 3.7 GB/s read, exists ~2 ms. Cross-instance hits: best_effort 0%, timeout 3%. kvc keys carry an uppercase model scope, so `presplit --namespace` refuses it; `presplit --namespace kvc --hash-prefix` works on an empty keyspace only.
-Main gaps: tiering decision open (durable-only L3 vs memory-first with selective persistence, Mooncake-style); write and read are each ~4-6x short of one GPU's KV rate.
-Next steps: user decides the tiering; candidates to cut write volume: fewer replicas for kvc, write_through_selective; UCX numbers not yet measured.
+Task scope: user — how to tier KV-cache storage; read the engines' code and measure before designing. A PS-side large-value read cache was started and dropped (user: storage should not carry a heavy read cache; 3FS and HDFS do not).
+Current summary: first measurements used a wrongly started cluster (cluster.sh default AUTUMN_EXTENT_SHARDS=1; perf_check uses 8) and are void. Correct setup (8 shards, --3disk, 2 replicas, kvc presplit 16 by hash, TTL): one rank writes 2.39 GB/s and reads 1.79 GB/s; Qwen3-VL-32B on one H200 produces 2.22 GB/s of KV. In SGLang the L3 write reaches ~1 GB/s and cross-instance hits are 0%: fetching 2 GiB takes 2-6 s in the engine (1.2 s in the micro-bench), past the 3 s budget, and the reading instance rewrites pages already in L3. perf_check.sh now creates its own `bench` namespace (cluster.sh stopped doing it in c309d30d); cluster.sh gains AUTUMN_REPLICATION.
+Main gaps: F-KVC-ADAPTER-WRITE-READ (next), F-KVC-LOW-REPLICA, F-KVC-PARTITION-LAYOUT, F-KVC-CACHE-TIER (recorded, deferred). Other chaos/perf scripts writing `bench` without creating it are likely broken since c309d30d (not fixed).
+Next steps: in autumn_kvcache, dedup before write, then find why the in-engine fetch is 2-5x slower than the micro-bench.
 Date: 2026-10-23
 TaskStatus: completed
 Task scope: user — BUG-PY-FS-PARENT-NOT-DIR (core check, user agreed) + S3/CLI judge directories from the dirent type.
