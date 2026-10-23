@@ -914,6 +914,10 @@ struct BatchWorker {
 #[pyclass]
 struct BatchClient {
     workers: Vec<BatchWorker>,
+    /// Runs `exists` on a thread of its own. On a data worker's thread a
+    /// probe waits while io_uring sends a put's pages inline in the submit
+    /// syscall (128 x 16 MiB: up to 0.8 s).
+    probe: BatchWorker,
     per_worker_cap: usize,
     /// captured from the process transport at construction. True ⟹
     /// zero-copy data path (writes always; reads above BULK_MIN_BYTES).
@@ -921,6 +925,22 @@ struct BatchClient {
     /// opt-in EN direct-read for the Get path (`get_many_direct`).
     /// Topology-dependent (client must reach EN data ports), default OFF.
     direct: bool,
+}
+
+/// A worker's ClusterClient, bound to the credential when there is one and
+/// checked against its scope at once (a mis-scoped credential fails here,
+/// not at the first op).
+async fn connect_worker_client(
+    endpoint: &str,
+    scope: &str,
+    cred: Option<(String, Vec<u8>)>,
+) -> Result<ClusterClient, String> {
+    let c = ClusterClient::connect(endpoint, scope).await.map_err(|e| e.to_string())?;
+    if let Some((p, cred)) = cred {
+        c.set_principal_credential(p, cred);
+        c.validate_credential_scope().await.map_err(|e| format!("credential scope invalid: {e}"))?;
+    }
+    Ok(c)
 }
 
 async fn run_job(client: &ClusterClient, op: BatchOp, items: Vec<WorkItem>, ttl_secs: u64, cap: usize, direct: bool) -> Vec<bool> {
@@ -1006,10 +1026,11 @@ async fn run_job(client: &ClusterClient, op: BatchOp, items: Vec<WorkItem>, ttl_
 
 #[pymethods]
 impl BatchClient {
-    /// Blocking constructor: spawn `n_workers` threads, each connecting its own
-    /// ClusterClient, and wait until all are ready. `per_worker_cap` bounds the
-    /// in-flight pipeline depth per worker (keep ≤ ~16-32 on UCX to dodge the
-    /// rendezvous cliff).
+    /// Blocking constructor: spawn `n_workers` data threads and one probe
+    /// thread (for `exists`), each connecting its own ClusterClient, and wait
+    /// until all are ready. `per_worker_cap` is accepted but not enforced: the
+    /// SDK's `batch_get_concurrency` / `batch_put_concurrency` bound each
+    /// worker's requests in flight.
     /// `scope` (keyword-only) is the REQUIRED key scope. `principal=` +
     /// `credential=` (bytes) bind EVERY worker's ClusterClient to that
     /// credential — required once `kvc/` is enforcement-enabled (the kvcache
@@ -1042,15 +1063,16 @@ impl BatchClient {
         // bulk flag. UCX → zero-copy (writes always; reads size-guarded).
         let is_ucx = IS_UCX.load(std::sync::atomic::Ordering::SeqCst);
         let result: Result<Vec<BatchWorker>, String> = py.allow_threads(|| {
-            let mut workers = Vec::with_capacity(n_workers);
-            for i in 0..n_workers {
+            let mut workers = Vec::with_capacity(n_workers + 1);
+            for i in 0..=n_workers {
                 let (job_tx, mut job_rx) = unbounded::<BatchJob>();
                 let (ready_tx, ready_rx) = smpsc::channel::<Result<(), String>>();
                 let endpoint = manager.clone();
                 let worker_cred = cred_pair.clone();
                 let worker_scope = scope.clone();
+                let name = if i == n_workers { "autumn-probe".to_string() } else { format!("autumn-batch-{i}") };
                 std::thread::Builder::new()
-                    .name(format!("autumn-batch-{i}"))
+                    .name(name)
                     .spawn(move || {
                         let rt = match compio::runtime::Runtime::new() {
                             Ok(rt) => rt,
@@ -1060,55 +1082,17 @@ impl BatchClient {
                             }
                         };
                         rt.block_on(async move {
-                            let client = match ClusterClient::connect(&endpoint, &worker_scope).await {
-                                Ok(c) => {
-                                    if let Some((p, cred)) = worker_cred {
-                                        c.set_principal_credential(p, cred);
-                                        // coco P2: run the SAME connect-time scope
-                                        // check as connect_with_credential — fail
-                                        // fast on a mis-scoped credential.
-                                        if let Err(e) = c.validate_credential_scope().await {
-                                            let _ = ready_tx
-                                                .send(Err(format!("credential scope invalid: {e}")));
-                                            return;
-                                        }
-                                    }
-                                    let _ = ready_tx.send(Ok(()));
-                                    c
-                                }
+                            let client = match connect_worker_client(&endpoint, &worker_scope, worker_cred).await {
+                                Ok(c) => c,
                                 Err(e) => {
-                                    let _ = ready_tx.send(Err(e.to_string()));
+                                    let _ = ready_tx.send(Err(e));
                                     return;
                                 }
                             };
-                            // Data jobs run one at a time; a probe runs at once beside
-                            // them, so it never queues behind a large put.
-                            let client = std::rc::Rc::new(client);
-                            let (data_tx, mut data_rx) = unbounded::<BatchJob>();
-                            let data_client = client.clone();
-                            compio::runtime::spawn(async move {
-                                while let Some(job) = data_rx.next().await {
-                                    let res = run_job(&data_client, job.op, job.items, job.ttl_secs, per_worker_cap, direct).await;
-                                    let _ = job.done.send(res);
-                                }
-                            })
-                            .detach();
+                            let _ = ready_tx.send(Ok(()));
                             while let Some(job) = job_rx.next().await {
-                                if let BatchOp::Head = job.op {
-                                    let probe_client = client.clone();
-                                    compio::runtime::spawn(async move {
-                                        let res = run_job(&probe_client, job.op, job.items, 0, per_worker_cap, direct).await;
-                                        let _ = job.done.send(res);
-                                    })
-                                    .detach();
-                                } else if let Err(e) = data_tx.unbounded_send(job) {
-                                    // The data task is gone (it panicked): answer the job
-                                    // failed, and say so — every later get / put on this
-                                    // worker fails the same way.
-                                    eprintln!("autumn BatchClient: worker data task gone; get/put on this worker fail");
-                                    let job = e.into_inner();
-                                    let _ = job.done.send(vec![false; job.items.len()]);
-                                }
+                                let res = run_job(&client, job.op, job.items, job.ttl_secs, per_worker_cap, direct).await;
+                                let _ = job.done.send(res);
                             }
                         });
                     })
@@ -1120,8 +1104,9 @@ impl BatchClient {
             }
             Ok(workers)
         });
-        let workers = result.map_err(PyRuntimeError::new_err)?;
-        Ok(BatchClient { workers, per_worker_cap, is_ucx, direct })
+        let mut workers = result.map_err(PyRuntimeError::new_err)?;
+        let probe = workers.pop().expect("the probe worker is the last one spawned");
+        Ok(BatchClient { workers, probe, per_worker_cap, is_ucx, direct })
     }
 
     /// Whether this client uses the zero-copy data path. This is now
@@ -1156,11 +1141,11 @@ impl BatchClient {
     /// Batched existence probe: list[bool] aligned to `keys` (an RPC error
     /// reads as absent). Blocks with the GIL released, like `get_into`, so the
     /// result crosses threads once — `Client.batch_head` crosses several, each
-    /// waiting for the GIL. Does not wait for a get / put job in flight on the
-    /// same client (its requests still share the partitions' connections).
+    /// waiting for the GIL. Runs on the client's probe thread, beside its gets
+    /// and puts.
     fn exists(&self, py: Python<'_>, keys: Vec<Vec<u8>>) -> PyResult<Vec<bool>> {
         let items = keys.into_iter().map(|key| WorkItem { key, ptr: 0, len: 0 }).collect();
-        Ok(self.run_items(py, BatchOp::Head, items, 0))
+        Ok(self.run_items(py, std::slice::from_ref(&self.probe), BatchOp::Head, items, 0))
     }
 
     fn n_workers(&self) -> usize {
@@ -1197,16 +1182,16 @@ impl BatchClient {
                 len: buf.item_count(),
             });
         }
-        let results = self.run_items(py, op, items, ttl_secs);
+        let results = self.run_items(py, &self.workers, op, items, ttl_secs);
         drop(bufs); // release pinned buffers only after all workers finished
         Ok(results)
     }
 
-    /// Shards `items` across the workers in order and waits for all of them
+    /// Shards `items` across `workers` in order and waits for all of them
     /// with the GIL released.
-    fn run_items(&self, py: Python<'_>, op: BatchOp, items: Vec<WorkItem>, ttl_secs: u64) -> Vec<bool> {
+    fn run_items(&self, py: Python<'_>, workers: &[BatchWorker], op: BatchOp, items: Vec<WorkItem>, ttl_secs: u64) -> Vec<bool> {
         let n = items.len();
-        let k = self.workers.len();
+        let k = workers.len();
         // Split into k contiguous shards (preserves order on reassembly).
         let per = n.div_ceil(k).max(1);
         let mut shards: Vec<Vec<WorkItem>> = Vec::with_capacity(k);
@@ -1225,7 +1210,7 @@ impl BatchClient {
                 let chunk_len = chunk.len();
                 let (done_tx, done_rx) = smpsc::channel::<Vec<bool>>();
                 let job = BatchJob { op, items: chunk, ttl_secs, done: done_tx };
-                if self.workers[wi].job_tx.unbounded_send(job).is_err() {
+                if workers[wi].job_tx.unbounded_send(job).is_err() {
                     // Worker dead: synthesize a failed chunk so output stays aligned.
                     let (tx, rx) = smpsc::channel::<Vec<bool>>();
                     let _ = tx.send(vec![false; chunk_len]);

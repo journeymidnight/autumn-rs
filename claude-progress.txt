@@ -2,8 +2,8 @@ Date: 2026-10-23 (3)
 TaskStatus: not_completed
 Task scope: user — F-KVC-ADAPTER-WRITE-READ (dedup before write; why the in-engine fetch is slower), in journeymidnight/autumn_kvcache.
 Current summary: (1) reads landed in a copy, not the host pool (silent stale KV) — fixed and pushed (autumn_kvcache 2b9f01b), dedup before write; (2) in-engine slowness = GIL convoy (each per-page torch call re-takes the GIL behind sglang's busy scheduler thread) — fixed and pushed (autumn_kvcache ee67575; Fable review: no high, findings applied): a numpy page-axis view of the pool, batch gather/scatter. Engine end-to-end (Qwen3-VL-32B, sequential requests, timeout prefetch): output identical to sglang's own L2 load (control); cross-instance hits 0-31% -> 93-96%; 2 GiB fetch 2.5-4 s -> 0.87-1.31 s; L3 write 2.08 GB/s with page_first_direct.
-Main gaps: per-request p50 still at or above recompute (1079 ms with 4 workers vs 976 ms); fetch bound by cold EN reads. BatchClient.exists added (autumn-rs python/), probes concurrent with data jobs. BUG-READ-SLOWER-AFTER-FLUSH open.
-Next steps: re-measure in-engine with the default single worker; UCX; the exists tail (PS conn_inflight_cap hypothesis); the kvc memory tier (cold EN reads are now the bound).
+Main gaps: per-request p50 still at or above recompute (1079 ms with 4 workers vs 976 ms); fetch bound by cold EN reads. BatchClient.exists added (autumn-rs python/), on a dedicated probe thread (the tail was io_uring sending a put inline on the shared worker thread). BUG-READ-SLOWER-AFTER-FLUSH open.
+Next steps: re-measure in-engine with the default single worker; UCX; the kvc memory tier (cold EN reads are now the bound).
 
 Date: 2026-10-23 (2)
 TaskStatus: completed
