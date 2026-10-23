@@ -21,6 +21,7 @@
 - `passes: false`
 - **notes** (2026-10-23): 根因找到一个更重的：adapter 读到 `get_data_page(flat=True)` 上，而 sglang 的 MHA 三种布局、MLA layer_first、Mamba 的页都不是池的视图，flatten/cat 出来的是拷贝——读报命中、池没被写（静默错 KV），每批还白分配 2 GiB。SST 不是原因（大 value 在 memtable/SST 读速相同，已核实命中 SST）。修法在 autumn_kvcache：按池判定 整页视图 / K·V 两段视图（零拷贝）/ 拷贝（scratch + set_from_flat_data_page），非 layer_first 布局的 key 带布局名；写前批量 exists 去重。实测 128×16 MiB：读 0.79–0.98 s（原始微基准 1.2 s）、重复写 3–5 ms。引擎端到端待 GPU 空出来复测。
 
+- **notes** (2026-10-23 晚，引擎端到端): 正确性已证：B 实例经 autumn 从 L3 读回的 KV 与 sglang 自己 L2 装回的逐 token 一致（对照 E）；与 GPU 前缀缓存的差异是 sglang L2 装回路径本身的数值差（不接 autumn 也有）。引擎内取数慢的根因是 GIL 护航：每页多个 torch 调用各自放/抢 GIL，调度线程忙时每次等 ~5 ms（单测加一个忙线程即复现 0.9→3.9 s）。修：池按"页轴"做成一个 numpy 跨步视图，零拷贝页取 numpy 切片，拷贝页整批 torch.index_select 收集 / numpy 花式赋值散布（sglang 设 torch 单线程，按此选型）。结果（Qwen3-VL-32B、逐个请求、timeout）：跨实例命中 0–31% → 93–96%，引擎内取 2 GiB 2.5–4 s → 0.87–1.31 s，读实例不再重写；写入 L3 page_first_direct 2.08 GB/s ≈ 产出。未达标项：每请求 p50 1463–1910 ms 仍慢于重算 976 ms（exists 在引擎里 200–250 ms，也是护航；TCP 单 worker）。
 ### F-KVC-LOW-REPLICA — kvc 写 2 副本、封存后转 EC 2+1
 - **Trigger** (2026-10-23 用户): KV-cache 可重算，3 副本写放大不必要。
 - **Scope**: 现在 `bootstrap --replication` 对 log/row/meta 一视同仁、split 子分区继承父流参数，没有按 namespace / 分区设副本数的入口。kvc 范围的分区：日志流 2 副本打开、封存后转 EC 2+1；meta/row 流保持 3 副本。
