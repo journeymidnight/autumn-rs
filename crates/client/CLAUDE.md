@@ -435,6 +435,14 @@ not applied. The retry loops take a `CallKind`:
   shows when the stop is removed.
 - `Read` (reads, admin calls): unchanged.
 
+Lanes: `CallKind::lane` sends `Read` (reads and admin calls through
+`call_ps_for_key` / `call_ps_for_part`: HEAD, GET_REDIRECT(_MANY), RANGE, maintenance) on
+the RPC client's urgent lane, and every PS connection gets
+`set_send_window(ps_send_window)` (3: one under the PS's 4 admission slots),
+so an `exists` probe overtakes queued large puts and finds a slot at the PS
+(rpc CLAUDE.md, "Two lanes and a send window"). The bulk GET requests
+(`call_into_pooled`) stay on the normal lane.
+
 Batch writes resend, one by one through `put_opts` / `delete_opts`, the ops whose
 status is `CODE_UNAVAILABLE` or `CODE_OUTCOME_UNKNOWN` (HBase's AsyncProcess resubmits
 failed actions); a failed resend of a `CODE_OUTCOME_UNKNOWN` op is `OutcomeUnknown`

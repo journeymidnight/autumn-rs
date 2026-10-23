@@ -328,6 +328,37 @@ over one TCP connection:
 - **CQ**: the `read_loop` task owns `ReadHalf`, decodes frames, dispatches to the
   matching entry in `Rc<RefCell<HashMap<u32, Pending>>>`.
 
+**Two lanes and a send window.** The writer drains two bounded queues and
+always takes the `Lane::Urgent` one first (`call_on` / `call_on_timeout`); a
+frame already being written is never interrupted, and each queue is FIFO. With
+`set_send_window(n)` (0 = off, the default) at most `n` LARGE normal-lane
+requests (≥ 64 KiB) are written and unanswered at once; the next large one
+waits in the writer (and the normal-lane messages behind it with it — FIFO
+holds) while urgent ones still go. Why both: a server that admits a few
+requests per connection (the PS, 4) and reads the rest in order leaves
+everything else in its transport, where nothing can overtake it — UCX accepts
+a stream send whether or not the peer reads. Measured on the kvcache load (one
+client putting 128 x 16 MiB pages over 16 partitions while it probes): the
+lane alone left the probe at p99 270 ms (it waited after leaving the client,
+behind puts that filled the PS's slots); a window of 3 made it p99 8.6 ms, and
+put throughput went UP (one partition 0.44–0.57 → 0.82 GB/s, 16 partitions
+2.32–2.63 → 2.54–2.74). perf-check A/B against the build without either
+(3 disks, 16 threads, depth 8, interleaved): every cell within noise (TCP one
+partition 8M write 782/720/680 vs 723/758/703 MB/s; 4K write and read at 8
+partitions on both transports), and UCX one-partition writes up (8M 502/471 →
+649/653, 256K 560/570 → 760/721). Slots are released by the response, matched by
+`req_id` in `read_loop` whether or not the caller still waits; the reader's
+exit opens the window. Keepalive pings take the urgent lane, so a full
+window cannot keep the UCX dead-peer clock (timed from the ping's write) from
+starting. Limits: only large frames are windowed, so a stream of small writes
+can still take the PS's spare slot; the SDK's window (3) is tied by hand to
+the PS's `--conn-inflight-cap` (4) — a cap at or under the window brings the
+wait back; a request the server never answers keeps its slot until the
+connection is replaced. Tests: `an_urgent_request_overtakes_queued_ones`
+(ablation red: urgent sent to the normal queue),
+`the_send_window_holds_large_requests_but_not_urgent_ones` (ablation red: the
+ping on the normal lane).
+
 Calls: `call`, `call_vectored` (vectored ctrl, zero-copy parts),
 `call_vectored_bulk` (ctrl parts + raw value after the crc — `MSG_PUT_BULK`),
 `call_timeout` / `call_vectored_timeout`, `send_frame` / `send_vectored`

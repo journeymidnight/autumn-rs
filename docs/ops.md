@@ -3265,6 +3265,41 @@ is no flag or future edit that can make it leak. A lost credential is re-minted
 The namespace-side counterpart is `namespace-list` (registry rows: name / prefix
 / presplit / created_at).
 
+## Reads ahead of large writes on one PS connection
+
+A client's reads to a partition (HEAD, which `BatchClient.exists` uses, and the
+redirect and range lookups) take the RPC client's urgent lane, and each PS
+connection holds at most `--ps-send-window` (client parameter, default 3, 0 =
+off) large requests (64 KiB and up) unanswered; further large ones wait in the
+client. Without the window a client putting large values filled the PS's 4
+admission slots per connection, and a probe from the same client waited for a
+put to commit. kvcache load, UCX, one BatchClient putting 128 x 16 MiB pages
+while it probes: `exists` p99 270 ms → 8.6 ms; 8 ranks of 16 MiB puts: one
+partition 0.44–0.57 → 0.82 GB/s, 16 partitions 2.32–2.63 → 2.54–2.74 GB/s.
+perf-check (interleaved against the build without it): no cell slower; UCX
+one-partition writes faster (8M ~490 → ~650 MB/s, 256K ~565 → ~740). Keep the
+window under the PS's `--conn-inflight-cap`.
+
+```bash
+cargo test -p autumn-rpc --lib an_urgent_request_overtakes_queued_ones
+cargo test -p autumn-rpc --lib the_send_window_holds_large_requests_but_not_urgent_ones
+python3 - <<'PY'
+import threading, time, numpy as np, autumn
+bc = autumn.BatchClient("127.0.0.1:9001", 1, 16, scope="kvc")
+keys = [f"m/kv/p{i}".encode() for i in range(128)]
+bc.put_from(keys, [np.zeros(4096, np.uint8)] * 128, 600)
+page = np.zeros(16 << 20, np.uint8); stop = threading.Event()
+def writer(r=0):
+    while not stop.is_set():
+        bc.put_from([f"m/kv/w{r}/{i}".encode() for i in range(64)], [page] * 64, 600); r += 1
+t = threading.Thread(target=writer); t.start(); time.sleep(0.5)
+lat = []
+for _ in range(100):
+    t0 = time.perf_counter(); assert all(bc.exists(keys)); lat.append((time.perf_counter() - t0) * 1e3)
+stop.set(); t.join(); lat.sort(); print(f"exists p50 {lat[50]:.1f} ms  p99 {lat[98]:.1f} ms")  # p99 tens of ms, not hundreds
+PY
+```
+
 ## Put-if-absent for large values (wire 74)
 
 `ClusterClient::compare_put_bulk(key, expected, value, expires_at)` is

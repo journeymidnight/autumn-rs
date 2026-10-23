@@ -122,6 +122,64 @@ type ReadHalf = autumn_transport::ReadHalf;
 /// parking hides. See `submit` for what parking cost on the live cluster.
 const SUBMIT_CHANNEL_CAP: usize = 1024;
 
+/// Which of the writer's two queues a message joins. The writer takes the next
+/// URGENT message before any NORMAL one; a frame already being written is never
+/// interrupted, so an urgent request waits at most for that one frame instead of
+/// for every bulk write queued ahead of it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Lane {
+    Normal,
+    Urgent,
+}
+
+/// Frames at least this large count against the send window.
+const WINDOWED_FRAME_MIN_BYTES: usize = 64 * 1024;
+
+/// How many LARGE normal-lane requests a connection may have written and not
+/// yet seen answered (`RpcClient::set_send_window`; 0 = no limit). A server
+/// that admits a few requests per connection and reads the rest in order (the
+/// PS: `--conn-inflight-cap`) otherwise holds the surplus in its transport,
+/// where nothing can overtake it — UCX accepts a stream send whether or not the
+/// peer reads. Held here instead, they wait in the client's queue and an urgent
+/// request goes first. Small frames are never held.
+#[derive(Default)]
+struct SendWindow {
+    limit: Cell<usize>,
+    unanswered: RefCell<std::collections::HashSet<u32>>,
+    writer: RefCell<Option<std::task::Waker>>,
+}
+
+impl SendWindow {
+    fn is_open(&self) -> bool {
+        let limit = self.limit.get();
+        limit == 0 || self.unanswered.borrow().len() < limit
+    }
+
+    fn written(&self, req_id: u32) {
+        if self.limit.get() != 0 && req_id != 0 {
+            self.unanswered.borrow_mut().insert(req_id);
+        }
+    }
+
+    fn answered(&self, req_id: u32) {
+        if self.unanswered.borrow_mut().remove(&req_id) {
+            self.wake_writer();
+        }
+    }
+
+    /// The reader is gone: nothing will be answered, so stop holding frames.
+    fn close(&self) {
+        self.limit.set(0);
+        self.wake_writer();
+    }
+
+    fn wake_writer(&self) {
+        if let Some(w) = self.writer.borrow_mut().take() {
+            w.wake();
+        }
+    }
+}
+
 /// Submission message pushed onto the writer_task's queue.
 ///
 /// The caller has already (a) assigned `req_id`, (b) inserted its oneshot
@@ -152,6 +210,15 @@ enum SubmitMsg {
 }
 
 impl SubmitMsg {
+    fn is_large(&self) -> bool {
+        match self {
+            SubmitMsg::Single { bytes, .. } | SubmitMsg::Ping { bytes, .. } => bytes.len() >= WINDOWED_FRAME_MIN_BYTES,
+            SubmitMsg::Vectored { bufs, .. } | SubmitMsg::Prepared { bufs, .. } => {
+                bufs.iter().map(Bytes::len).sum::<usize>() >= WINDOWED_FRAME_MIN_BYTES
+            }
+        }
+    }
+
     fn req_id(&self) -> u32 {
         match self {
             SubmitMsg::Single { req_id, .. } => *req_id,
@@ -224,8 +291,9 @@ impl Keepalive {
 
 /// A multiplexed RPC client over a single TCP connection.
 ///
-/// Write path: callers push `SubmitMsg` into `submit_tx`; the `writer_task`
-/// drains and writes sequentially — no cross-caller mutex contention.
+/// Write path: callers push `SubmitMsg` into `submit_tx` (or `urgent_tx`, see
+/// `Lane`); the `writer_task` drains and writes sequentially — no cross-caller
+/// mutex contention.
 /// Read path: the `read_loop` task decodes response frames and dispatches
 /// them via `pending`.
 ///
@@ -238,6 +306,9 @@ pub struct RpcClient {
     /// buffer, so a clone per call hands every caller its own slot and the
     /// capacity stops applying at all (see `submit`).
     submit_tx: RefCell<mpsc::Sender<SubmitMsg>>,
+    /// The urgent lane's queue (`Lane::Urgent`), same bound and refusal.
+    urgent_tx: RefCell<mpsc::Sender<SubmitMsg>>,
+    window: Rc<SendWindow>,
     /// CQ-side inflight map: `req_id -> oneshot::Sender<Frame>`.
     /// Borrowed only briefly (insert/remove/get), never across await.
     pending: Rc<RefCell<HashMap<u32, Pending>>>,
@@ -412,6 +483,7 @@ impl RpcClient {
         let pending: Rc<RefCell<HashMap<u32, Pending>>> = Rc::new(RefCell::new(HashMap::new()));
 
         let (submit_tx, submit_rx) = mpsc::channel::<SubmitMsg>(SUBMIT_CHANNEL_CAP);
+        let (urgent_tx, urgent_rx) = mpsc::channel::<SubmitMsg>(SUBMIT_CHANNEL_CAP);
         let closed: Rc<Cell<bool>> = Rc::new(Cell::new(false));
 
         // SQ: writer_task drains submit_rx and writes to the socket.
@@ -426,10 +498,15 @@ impl RpcClient {
         // Bumped by `writer_task` each time a keepalive ping reaches the socket.
         let pings_on_wire: Rc<Cell<u64>> = Rc::new(Cell::new(0));
         let pings_for_writer = pings_on_wire.clone();
+        let window = Rc::new(SendWindow::default());
+        let window_for_writer = window.clone();
+        let window_for_reader = window.clone();
         let writer_handle = spawn(async move {
             writer_task(
                 writer,
+                urgent_rx,
                 submit_rx,
+                window_for_writer,
                 pending_for_writer.clone(),
                 pings_for_writer,
                 peer_addr,
@@ -454,12 +531,14 @@ impl RpcClient {
                 pending_for_reader.clone(),
                 progress_for_reader,
                 receiving_for_reader,
+                window_for_reader.clone(),
                 peer_addr,
             )
             .await
             {
                 tracing::warn!(addr = %peer_addr, error = %e, "rpc client reader exited");
             }
+            window_for_reader.close();
             // set closed BEFORE clearing pending so subsequent
             // `send_*` short-circuits and never inserts a fresh pending
             // entry that has no read_loop alive to dispatch it.
@@ -472,6 +551,8 @@ impl RpcClient {
         Ok(Rc::new_cyclic(|weak| Self {
             protocol,
             submit_tx: RefCell::new(submit_tx),
+            urgent_tx: RefCell::new(urgent_tx),
+            window,
             pending,
             next_id: Cell::new(1),
             peer_addr,
@@ -500,11 +581,25 @@ impl RpcClient {
         self.closed.get()
     }
 
+    /// Hold large normal-lane requests once `frames` of them are unanswered
+    /// (see `SendWindow`); 0 = no limit, the default.
+    pub fn set_send_window(&self, frames: usize) {
+        self.window.limit.set(frames);
+        self.window.wake_writer();
+    }
+
     /// Send a request and wait for the response.
     pub async fn call(&self, msg_type: u8, payload: Bytes) -> Result<Bytes, RpcError> {
+        self.call_on(Lane::Normal, msg_type, payload).await
+    }
+
+    /// `call` on the given lane. `Lane::Urgent` is for small requests whose
+    /// wait matters (existence probes, read redirects) on a connection that
+    /// also carries large writes.
+    pub async fn call_on(&self, lane: Lane, msg_type: u8, payload: Bytes) -> Result<Bytes, RpcError> {
         let req_id = self.next_req_id();
         let frame = Frame::request(req_id, msg_type, payload);
-        let rx = self.send_frame(frame).await?;
+        let rx = self.send_frame_on(lane, frame).await?;
         Self::await_response(rx).await
     }
 
@@ -549,6 +644,10 @@ impl RpcClient {
     /// with `Unavailable` because the queue is full (see `submit`).
     /// The caller awaits the receiver to get the response frame.
     pub async fn send_frame(&self, frame: Frame) -> Result<oneshot::Receiver<Frame>, RpcError> {
+        self.send_frame_on(Lane::Normal, frame).await
+    }
+
+    async fn send_frame_on(&self, lane: Lane, frame: Frame) -> Result<oneshot::Receiver<Frame>, RpcError> {
         // short-circuit if the reader/writer task has already
         // exited. The check + pending.insert below run in one sync block
         // (single-threaded compio, no awaits), so a concurrent close that
@@ -560,7 +659,7 @@ impl RpcClient {
         let req_id = frame.req_id;
         let (tx, rx) = oneshot::channel();
         let bytes = frame.encode();
-        self.register_and_submit(req_id, Pending::Frame(tx), bytes)
+        self.register_and_submit_on(lane, req_id, Pending::Frame(tx), bytes)
             .await?;
         Ok(rx)
     }
@@ -597,6 +696,17 @@ impl RpcClient {
         timeout: Duration,
     ) -> Result<Bytes, RpcError> {
         Self::with_timeout(self.call(msg_type, payload), timeout).await
+    }
+
+    /// `call_on` with a timeout.
+    pub async fn call_on_timeout(
+        &self,
+        lane: Lane,
+        msg_type: u8,
+        payload: Bytes,
+        timeout: Duration,
+    ) -> Result<Bytes, RpcError> {
+        Self::with_timeout(self.call_on(lane, msg_type, payload), timeout).await
     }
 
     /// Send a vectored request and return the receiver for the response,
@@ -787,7 +897,9 @@ impl RpcClient {
         let (tx, _rx) = oneshot::channel();
         let bytes = Frame::request(req_id, crate::MSG_TYPE_PING, Bytes::new()).encode();
         self.pending.borrow_mut().insert(req_id, Pending::Frame(tx));
-        if self.submit(SubmitMsg::Ping { bytes, req_id }).is_err() {
+        // Urgent: a full send window must not hold the ping, which on UCX is
+        // what starts the dead-peer clock.
+        if self.submit_on(Lane::Urgent, SubmitMsg::Ping { bytes, req_id }).is_err() {
             self.pending.borrow_mut().remove(&req_id);
             return false;
         }
@@ -836,8 +948,18 @@ impl RpcClient {
         entry: Pending,
         bytes: Bytes,
     ) -> Result<(), RpcError> {
+        self.register_and_submit_on(Lane::Normal, req_id, entry, bytes).await
+    }
+
+    async fn register_and_submit_on(
+        &self,
+        lane: Lane,
+        req_id: u32,
+        entry: Pending,
+        bytes: Bytes,
+    ) -> Result<(), RpcError> {
         self.pending.borrow_mut().insert(req_id, entry);
-        if let Err(e) = self.submit(SubmitMsg::Single { bytes, req_id }) {
+        if let Err(e) = self.submit_on(lane, SubmitMsg::Single { bytes, req_id }) {
             // submit failed (queue full, or writer_task exited / channel
             // closed) — remove the pending entry so we don't leak it.
             self.pending.borrow_mut().remove(&req_id);
@@ -879,12 +1001,20 @@ impl RpcClient {
     /// `Unavailable` here as retryable, which is what they already did with the
     /// transport errors this replaces.
     fn submit(&self, msg: SubmitMsg) -> Result<(), RpcError> {
+        self.submit_on(Lane::Normal, msg)
+    }
+
+    fn submit_on(&self, lane: Lane, msg: SubmitMsg) -> Result<(), RpcError> {
+        let tx = match lane {
+            Lane::Normal => &self.submit_tx,
+            Lane::Urgent => &self.urgent_tx,
+        };
         // NO clone: `futures::mpsc` grants each SENDER a guaranteed slot
         // beyond the buffer, so a fresh clone per call handed every caller its
         // own slot — the queue then grew without limit in COUNT, and the caller
         // parked on the flush that followed. Borrowing makes the capacity
         // exactly `buffer + 1` and makes it refusable.
-        self.submit_tx.borrow_mut().try_send(msg).map_err(|e| {
+        tx.borrow_mut().try_send(msg).map_err(|e| {
             if e.is_disconnected() {
                 RpcError::ConnectionClosed
             } else {
@@ -1122,12 +1252,51 @@ async fn keepalive_task(
 /// rest of `pending`.
 async fn writer_task(
     mut writer: WriteHalf,
+    mut urgent_rx: mpsc::Receiver<SubmitMsg>,
     mut submit_rx: mpsc::Receiver<SubmitMsg>,
+    window: Rc<SendWindow>,
     pending: Rc<RefCell<HashMap<u32, Pending>>>,
     pings_on_wire: Rc<Cell<u64>>,
     peer_addr: SocketAddr,
 ) {
-    while let Some(msg) = submit_rx.next().await {
+    use std::task::Poll;
+    let (mut urgent_done, mut normal_done) = (false, false);
+    // A large normal message taken while the window was shut.
+    let mut held: Option<SubmitMsg> = None;
+    loop {
+        // Urgent first, every time; a large normal message waits for the
+        // window. Ends once both queues are closed and nothing is held.
+        let next = futures::future::poll_fn(|cx| {
+            if !urgent_done {
+                match urgent_rx.poll_next_unpin(cx) {
+                    Poll::Ready(Some(msg)) => return Poll::Ready(Some(msg)),
+                    Poll::Ready(None) => urgent_done = true,
+                    Poll::Pending => {}
+                }
+            }
+            if held.is_none() && !normal_done {
+                match submit_rx.poll_next_unpin(cx) {
+                    Poll::Ready(Some(msg)) => held = Some(msg),
+                    Poll::Ready(None) => normal_done = true,
+                    Poll::Pending => {}
+                }
+            }
+            if let Some(msg) = held.take() {
+                let large = msg.is_large();
+                if !large || window.is_open() {
+                    if large {
+                        window.written(msg.req_id());
+                    }
+                    return Poll::Ready(Some(msg));
+                }
+                held = Some(msg);
+                *window.writer.borrow_mut() = Some(cx.waker().clone());
+                return Poll::Pending;
+            }
+            if urgent_done && normal_done { Poll::Ready(None) } else { Poll::Pending }
+        })
+        .await;
+        let Some(msg) = next else { break };
         let req_id = msg.req_id();
         // fix instrumentation: capture iov count + total bytes
         // before the syscall so the EINVAL path can attribute the error
@@ -1187,7 +1356,7 @@ async fn writer_task(
         }
     }
 
-    // submit_rx closed (all Senders dropped / RpcClient dropped). Exit cleanly.
+    // Both queues closed (all Senders dropped / RpcClient dropped). Exit cleanly.
     tracing::debug!(addr = %peer_addr, "rpc client writer_task exiting (channel closed)");
 }
 
@@ -1197,6 +1366,7 @@ async fn read_loop(
     pending: Rc<RefCell<HashMap<u32, Pending>>>,
     rx_progress: Rc<Cell<u64>>,
     receiving: Rc<RefCell<Option<BulkWaiter>>>,
+    send_window: Rc<SendWindow>,
     addr: SocketAddr,
 ) -> Result<(), RpcError> {
     const READ_WINDOW: usize = 64 * 1024;
@@ -1289,6 +1459,7 @@ async fn read_loop(
                 // awaits in the arms below and panic any concurrent `send_*`
                 // on this thread (the same borrow-across-await class).
                 let entry = pending.borrow_mut().remove(&req_id);
+                send_window.answered(req_id);
                 match entry {
                     Some(Pending::IntoPooled(tx)) => {
                         // READ_LOOP acquires + owns the buffer: on caller-cancel
@@ -1351,7 +1522,10 @@ async fn read_loop(
 
             // ── normal path: full frame decode ──
             match decoder.try_decode()? {
-                Some(frame) => match pending.borrow_mut().remove(&frame.req_id) {
+                Some(frame) => match {
+                    send_window.answered(frame.req_id);
+                    pending.borrow_mut().remove(&frame.req_id)
+                } {
                     Some(Pending::Frame(tx)) => {
                         let _ = tx.send(frame);
                     }
@@ -1928,5 +2102,105 @@ mod tests {
         assert_eq!(z.message, "eversion mismatch: have 3 want 5");
         assert!(z.buf.filled().is_empty());
         srv.join().expect("server thread");
+    }
+
+    /// An urgent request queued behind normal ones reaches the peer first.
+    /// Everything is queued before this task yields (the sends only
+    /// `try_send`), so the writer task finds all of it at once and the arrival
+    /// order is its choice alone.
+    /// Ablation: submitting `Lane::Urgent` to the normal queue puts it last.
+    #[compio::test]
+    async fn an_urgent_request_overtakes_queued_ones() {
+        let _ = autumn_transport::current_or_init();
+        const NORMAL: usize = 8;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let server_addr = listener.local_addr().expect("local_addr");
+        let peer = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().expect("accept");
+            test_protocol::accept_std(&mut sock, crate::WIRE_VERSION, 1);
+            let mut decoder = FrameDecoder::new();
+            let mut order = Vec::new();
+            let mut buf = vec![0u8; 1 << 20];
+            while order.len() < NORMAL + 1 {
+                let n = std::io::Read::read(&mut sock, &mut buf).expect("read");
+                assert!(n > 0, "client closed early");
+                decoder.feed(&buf[..n]);
+                while let Some(frame) = decoder.try_decode().expect("decode") {
+                    order.push(frame.msg_type);
+                }
+            }
+            order
+        });
+
+        let client = RpcClient::connect(server_addr).await.expect("connect");
+        let big = Bytes::from(vec![7u8; 256 << 10]);
+        let mut replies = Vec::new();
+        for _ in 0..NORMAL {
+            replies.push(client.send_vectored(1, vec![big.clone()]).await.expect("queue"));
+        }
+        let urgent = Frame::request(client.next_req_id(), 2, Bytes::new());
+        replies.push(client.send_frame_on(Lane::Urgent, urgent).await.expect("queue urgent"));
+
+        // Joining blocks this thread; the writer task needs it first.
+        while !peer.is_finished() {
+            compio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let order = peer.join().expect("peer");
+        assert_eq!(order[0], 2, "the urgent request must go out first: {order:?}");
+        assert_eq!(order.iter().filter(|&&m| m == 1).count(), NORMAL);
+        drop(replies);
+    }
+
+    /// With a send window, large requests past it wait in the client while an
+    /// urgent one and the keepalive ping go out. The normal lane stays FIFO: a
+    /// small request queued behind a held large one waits with it.
+    /// Ablation: the ping on the normal lane is held and never written.
+    #[compio::test]
+    async fn the_send_window_holds_large_requests_but_not_urgent_ones() {
+        let _ = autumn_transport::current_or_init();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let server_addr = listener.local_addr().expect("local_addr");
+        // Reads every frame it gets for a while, answers none.
+        let peer = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().expect("accept");
+            test_protocol::accept_std(&mut sock, crate::WIRE_VERSION, 1);
+            sock.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
+            let mut decoder = FrameDecoder::new();
+            let mut order = Vec::new();
+            let mut buf = vec![0u8; 1 << 20];
+            while let Ok(n) = std::io::Read::read(&mut sock, &mut buf) {
+                if n == 0 {
+                    break;
+                }
+                decoder.feed(&buf[..n]);
+                while let Some(frame) = decoder.try_decode().expect("decode") {
+                    order.push(frame.msg_type);
+                }
+            }
+            order
+        });
+
+        let client = RpcClient::connect(server_addr).await.expect("connect");
+        client.set_send_window(2);
+        let big = Bytes::from(vec![7u8; 256 << 10]);
+        let mut replies = Vec::new();
+        for _ in 0..5 {
+            replies.push(client.send_vectored(1, vec![big.clone()]).await.expect("queue"));
+        }
+        replies.push(client.send_vectored(3, vec![Bytes::from_static(b"small")]).await.expect("small"));
+        let urgent = Frame::request(client.next_req_id(), 2, Bytes::new());
+        replies.push(client.send_frame_on(Lane::Urgent, urgent).await.expect("urgent"));
+        assert!(client.send_ping(), "ping queued");
+        while !peer.is_finished() {
+            compio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let order = peer.join().expect("peer");
+        assert_eq!(order.iter().filter(|&&m| m == 1).count(), 2, "only the window's worth of large frames: {order:?}");
+        assert_eq!(
+            order,
+            vec![2, crate::MSG_TYPE_PING, 1, 1],
+            "urgent and the keepalive ping first, then the window's worth; the small one waits its turn"
+        );
+        drop(replies);
     }
 }

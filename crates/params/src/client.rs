@@ -16,6 +16,11 @@ crate::params! {
         batch_get_concurrency: usize = 32, [1, 4096];
         /// Partition requests a batch put keeps in flight.
         batch_put_concurrency: usize = 32, [1, 4096];
+        /// Large requests (64 KiB and up) a PS connection holds unanswered;
+        /// the rest wait in the client, where reads go ahead of them. One
+        /// under the PS's `--conn-inflight-cap` (4), so a read finds a free
+        /// admission slot; 0 = no limit.
+        ps_send_window: usize = 3, [0, 4096];
         /// A minted token is renewed when less than this much of its life is
         /// left.
         token_renew_margin_secs: u64 = 300, [10, 86_400];

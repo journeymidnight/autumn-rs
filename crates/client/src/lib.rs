@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use autumn_params::client::ClientParams;
-use autumn_rpc::client::RpcClient;
+use autumn_rpc::client::{Lane, RpcClient};
 use autumn_rpc::manager_rpc::*;
 use autumn_rpc::partition_rpc::{self, *};
 use autumn_rpc::{RpcError, StatusCode};
@@ -925,6 +925,18 @@ pub(crate) enum CallKind {
     /// A conditional write: stop at the first attempt that may have been
     /// applied and report `OutcomeUnknown`.
     Conditional,
+}
+
+impl CallKind {
+    /// Reads and admin calls are small requests whose wait is the caller's
+    /// whole latency, so they go ahead of queued writes on the connection
+    /// (an `exists` probe used to wait behind every 16 MiB put queued before it).
+    fn lane(self) -> Lane {
+        match self {
+            CallKind::Read => Lane::Urgent,
+            CallKind::Idempotent | CallKind::Conditional => Lane::Normal,
+        }
+    }
 }
 
 /// Context on a transport failure after the request was handed to the
@@ -2443,6 +2455,7 @@ impl ClusterClient {
             .open_rpc(addr, autumn_rpc::version_hello::Service::PartitionServer)
             .await
             .with_context(|| format!("connect PS {ps_addr}"))?;
+        client.set_send_window(params().ps_send_window.get());
         // BEFORE the CLIENT_AUTH: the PS gates CLIENT_AUTH itself on the client
         // window, so a refused client that sent its credential first would be
         // told "wire version" about a frame it thought was about identity.
@@ -2546,12 +2559,24 @@ impl ClusterClient {
         payload: Bytes,
         timeout: Option<Duration>,
     ) -> Result<Bytes> {
+        self.ps_call_on(Lane::Normal, ps_addr, msg_type, payload, timeout).await
+    }
+
+    /// `ps_call_with_timeout` on the given lane of the PS connection.
+    async fn ps_call_on(
+        &self,
+        lane: Lane,
+        ps_addr: &str,
+        msg_type: u8,
+        payload: Bytes,
+        timeout: Option<Duration>,
+    ) -> Result<Bytes> {
         let client = self
             .get_ps_client_with_timeout(ps_addr, timeout)
             .await?;
         let outcome = match timeout {
-            None => client.call(msg_type, payload).await,
-            Some(t) => client.call_timeout(msg_type, payload, t).await,
+            None => client.call_on(lane, msg_type, payload).await,
+            Some(t) => client.call_on_timeout(lane, msg_type, payload, t).await,
         };
         match outcome {
             Ok(resp) => Ok(resp),
@@ -2831,7 +2856,7 @@ impl ClusterClient {
             let t = self.first_attempt_effective_timeout(attempt);
             let payload = build_payload(part_id, region_epoch);
             let outcome = match tail {
-                None => self.ps_call_with_timeout(&ps_addr, msg_type, payload, t).await,
+                None => self.ps_call_on(kind.lane(), &ps_addr, msg_type, payload, t).await,
                 Some(value) => self.ps_call_bulk_multi(&ps_addr, msg_type, payload, vec![value.clone()], t).await,
             };
             match outcome {
@@ -3089,7 +3114,7 @@ impl ClusterClient {
             // Bug #2 fix: same fast-fail-on-attempt-0 as call_ps_for_key.
             let t = self.first_attempt_effective_timeout(attempt);
             match self
-                .ps_call_with_timeout(&ps_addr, msg_type, payload.clone(), t)
+                .ps_call_on(kind.lane(), &ps_addr, msg_type, payload.clone(), t)
                 .await
             {
                 Ok(b) => return (Ok(b), any_applied),

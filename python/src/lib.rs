@@ -916,10 +916,6 @@ struct BatchWorker {
 #[pyclass]
 struct BatchClient {
     workers: Vec<BatchWorker>,
-    /// Runs `exists` on a thread of its own. On a data worker's thread a
-    /// probe waits while io_uring sends a put's pages inline in the submit
-    /// syscall (128 x 16 MiB: up to 0.8 s).
-    probe: BatchWorker,
     per_worker_cap: usize,
     /// captured from the process transport at construction. True ⟹
     /// zero-copy data path (writes always; reads above BULK_MIN_BYTES).
@@ -1044,11 +1040,10 @@ async fn run_job(client: &ClusterClient, op: BatchOp, items: Vec<WorkItem>, ttl_
 
 #[pymethods]
 impl BatchClient {
-    /// Blocking constructor: spawn `n_workers` data threads and one probe
-    /// thread (for `exists`), each connecting its own ClusterClient, and wait
-    /// until all are ready. `per_worker_cap` is accepted but not enforced: the
-    /// SDK's `batch_get_concurrency` / `batch_put_concurrency` bound each
-    /// worker's requests in flight.
+    /// Blocking constructor: spawn `n_workers` threads, each connecting its own
+    /// ClusterClient, and wait until all are ready. `per_worker_cap` is accepted
+    /// but not enforced: the SDK's `batch_get_concurrency` /
+    /// `batch_put_concurrency` bound each worker's requests in flight.
     /// `scope` (keyword-only) is the REQUIRED key scope. `principal=` +
     /// `credential=` (bytes) bind EVERY worker's ClusterClient to that
     /// credential — required once `kvc/` is enforcement-enabled (the kvcache
@@ -1081,16 +1076,15 @@ impl BatchClient {
         // bulk flag. UCX → zero-copy (writes always; reads size-guarded).
         let is_ucx = IS_UCX.load(std::sync::atomic::Ordering::SeqCst);
         let result: Result<Vec<BatchWorker>, String> = py.allow_threads(|| {
-            let mut workers = Vec::with_capacity(n_workers + 1);
-            for i in 0..=n_workers {
+            let mut workers = Vec::with_capacity(n_workers);
+            for i in 0..n_workers {
                 let (job_tx, mut job_rx) = unbounded::<BatchJob>();
                 let (ready_tx, ready_rx) = smpsc::channel::<Result<(), String>>();
                 let endpoint = manager.clone();
                 let worker_cred = cred_pair.clone();
                 let worker_scope = scope.clone();
-                let name = if i == n_workers { "autumn-probe".to_string() } else { format!("autumn-batch-{i}") };
                 std::thread::Builder::new()
-                    .name(name)
+                    .name(format!("autumn-batch-{i}"))
                     .spawn(move || {
                         let rt = match compio::runtime::Runtime::new() {
                             Ok(rt) => rt,
@@ -1108,9 +1102,34 @@ impl BatchClient {
                                 }
                             };
                             let _ = ready_tx.send(Ok(()));
+                            // Gets and puts run one job at a time; a probe starts at
+                            // once beside them on the same connections, where its
+                            // requests take the urgent lane past queued puts.
+                            let client = std::rc::Rc::new(client);
+                            let (data_tx, mut data_rx) = unbounded::<BatchJob>();
+                            let data_client = client.clone();
+                            compio::runtime::spawn(async move {
+                                while let Some(job) = data_rx.next().await {
+                                    let res = run_job(&data_client, job.op, job.items, job.ttl_secs, per_worker_cap, direct).await;
+                                    let _ = job.done.send(res);
+                                }
+                            })
+                            .detach();
                             while let Some(job) = job_rx.next().await {
-                                let res = run_job(&client, job.op, job.items, job.ttl_secs, per_worker_cap, direct).await;
-                                let _ = job.done.send(res);
+                                if let BatchOp::Head = job.op {
+                                    let probe_client = client.clone();
+                                    compio::runtime::spawn(async move {
+                                        let res = run_job(&probe_client, job.op, job.items, 0, per_worker_cap, direct).await;
+                                        let _ = job.done.send(res);
+                                    })
+                                    .detach();
+                                } else if let Err(e) = data_tx.unbounded_send(job) {
+                                    // The data task panicked: fail the job, and say so —
+                                    // every later get / put on this worker fails too.
+                                    eprintln!("autumn BatchClient: worker data task gone; get/put on this worker fail");
+                                    let job = e.into_inner();
+                                    let _ = job.done.send(vec![false; job.items.len()]);
+                                }
                             }
                         });
                     })
@@ -1122,9 +1141,8 @@ impl BatchClient {
             }
             Ok(workers)
         });
-        let mut workers = result.map_err(PyRuntimeError::new_err)?;
-        let probe = workers.pop().expect("the probe worker is the last one spawned");
-        Ok(BatchClient { workers, probe, per_worker_cap, is_ucx, direct })
+        let workers = result.map_err(PyRuntimeError::new_err)?;
+        Ok(BatchClient { workers, per_worker_cap, is_ucx, direct })
     }
 
     /// Whether this client uses the zero-copy data path. This is now
@@ -1165,11 +1183,11 @@ impl BatchClient {
     /// Batched existence probe: list[bool] aligned to `keys` (an RPC error
     /// reads as absent). Blocks with the GIL released, like `get_into`, so the
     /// result crosses threads once — `Client.batch_head` crosses several, each
-    /// waiting for the GIL. Runs on the client's probe thread, beside its gets
-    /// and puts.
+    /// waiting for the GIL. Does not wait for a get / put job in flight on the
+    /// same client; its requests go ahead of queued writes on the connection.
     fn exists(&self, py: Python<'_>, keys: Vec<Vec<u8>>) -> PyResult<Vec<bool>> {
         let items = keys.into_iter().map(|key| WorkItem { key, ptr: 0, len: 0 }).collect();
-        Ok(self.run_items(py, std::slice::from_ref(&self.probe), BatchOp::Head, items, 0))
+        Ok(self.run_items(py, &self.workers, BatchOp::Head, items, 0))
     }
 
     fn n_workers(&self) -> usize {
