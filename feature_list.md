@@ -33,6 +33,7 @@
 - **Acceptance**: 已存在的 key 不写、不追加日志，返回"已存在"；不存在的写入且带 TTL；大 value 不经 rkyv 拷贝；去掉存在性判定或 TTL 传递任一项测试变红；普通写性能不降；adapter 去重仍然生效。
 - `passes: false`
 - **notes** (2026-10-24): 已实现 `MSG_COMPARE_PUT_BULK`（wire 74，0x60）、`compare_put_bulk` / `put_many_if_absent`、`BatchClient.put_from(..., if_absent=True)`；`expected=None` 只查存在（`lookup_live`，与 HEAD 共用），已存在的 key 在排队前就被拒。消融：去掉存在性判定、去掉 TTL、去掉池化接收识别，各自对应测试变红。实测（UCX，8 rank × 64 × 16 MiB）：全新 key if-absent 3.00 GB/s vs 普通 put 3.07 GB/s（ABAB 中位，噪声内）；**全部已存在时 if-absent 350 ms vs 探测 1 ms**——value 照样整条传过去再被拒。所以 adapter 去重不换成它（读实例重写的页几乎都已存在），仍用 exists 探测；探测的长尾由快速通道解决。Scope 里"adapter 用它代替写前探测"因此不做，待用户确认。Fable 评审无 high；M1（超 64 MiB inline 上限时 PS 回帧级错误，客户端当路由错误整条重发 10 次）已改为回复体 `CODE_VALUE_TOO_LARGE`，消融红；条件写计入 req_count。未覆盖：已存在 key 不追加日志只由代码结构保证（测试只验值不变）。
+- **notes** (2026-10-24 用户): `BatchClient.put_from(if_absent)` 没有调用方，用户要求删掉（API 保持简洁）；已删，连同只为它服务的 `put_many_if_absent`。`compare_put_bulk` 保留，用户如要也删再说。
 
 ### BUG-COMPARE-SEES-EARLIER-PUT-FLAKY — 同连接上紧跟在 put 后的 compare_put 有时看不到它（未定位）
 - **Trigger** (2026-10-24): `compare_write_concurrency::a_comparison_sees_a_put_admitted_before_it` 在 HEAD 3d14236e 上 8 次红 6 次（独立 worktree、独立 target），每次漏 1–8 个，常是连续编号（如 37–44）；本机当时负载 10–14。测试自 a22c83a1 引入，之后数据路径源码没变过，推断是时序相关、一直存在。

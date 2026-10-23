@@ -3300,31 +3300,21 @@ stop.set(); t.join(); lat.sort(); print(f"exists p50 {lat[50]:.1f} ms  p99 {lat[
 PY
 ```
 
-## Put-if-absent for large values (wire 74)
+## Conditional put for large values (wire 74)
 
 `ClusterClient::compare_put_bulk(key, expected, value, expires_at)` is
 `compare_put` with a TTL and the value sent as a bulk tail (`MSG_COMPARE_PUT_BULK`):
 no 64 KiB cap on the value, no copy through rkyv. `expected = None` is
 put-if-absent; the PS checks only that the key is there (it does not read the
-value) and leaves a present key untouched. `put_many_if_absent` runs a batch of
-them; Python: `BatchClient.put_from(keys, bufs, ttl_secs, if_absent=True)`
-(True = written or already present). The value is shipped even when the key is
-present, so for pages that are mostly already stored a cheap `exists` probe
-first is far cheaper (8 ranks x 64 x 16 MiB over UCX, all present: 350 ms
-if-absent vs 1 ms probe; all absent: 3.00 vs 3.07 GB/s plain put). Needs a
-cluster at wire 74; an older cluster gets `Unsupported` from the SDK.
+value) and leaves a present key untouched. The value is shipped even when the
+key is present, so it is no substitute for an `exists` probe when most keys are
+already stored (8 ranks x 64 x 16 MiB over UCX, all present: 350 ms vs 1 ms
+probe; all absent: 3.00 vs 3.07 GB/s plain put). Needs a cluster at wire 74; an
+older cluster gets `Unsupported` from the SDK.
 
 ```bash
 cargo test -p autumn-manager --test compare_put_bulk
 cargo test -p autumn-partition-server --lib compare_put_bulk_tail_is_recvd_into_a_pooled_buffer
-python3 - <<'PY'
-import numpy as np, autumn
-bc = autumn.BatchClient("127.0.0.1:9001", 1, 16, scope="kvc")
-a, b = np.full(1 << 20, 1, np.uint8), np.full(1 << 20, 2, np.uint8)
-print(bc.put_from([b"m/kv/x"], [a], 600, if_absent=True))   # [True]  written
-print(bc.put_from([b"m/kv/x"], [b], 600, if_absent=True))   # [True]  already there
-out = np.zeros(1 << 20, np.uint8); bc.get_into([b"m/kv/x"], [out]); print(out[0])  # 1
-PY
 ```
 
 ## autumn-kvcache model identity

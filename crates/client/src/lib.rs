@@ -3222,22 +3222,16 @@ impl ClusterClient {
             return Err(AutumnError::ValueTooLarge { size: value.len() as u64, cap: CLIENT_PUT_HARD_CAP });
         }
         let key = self.binding.bind_key(key)?;
-        self.compare_put_bulk_bound(&key, expected, value, expires_at).await
-    }
-
-    async fn compare_put_bulk_bound(
-        &self, key: &[u8], expected: Option<&[u8]>, value: Bytes, expires_at: u64,
-    ) -> std::result::Result<bool, AutumnError> {
         let response = self
             .call_ps_for_key_bulk(
                 CallKind::Conditional,
-                key,
+                &key,
                 partition_rpc::MSG_COMPARE_PUT_BULK,
                 |part_id, region_epoch| {
                     rkyv_encode(&partition_rpc::ComparePutBulkReq {
                         part_id,
                         region_epoch,
-                        key: key.to_vec(),
+                        key: key.clone(),
                         expected: expected.map(<[u8]>::to_vec),
                         expires_at,
                     })
@@ -3251,33 +3245,6 @@ impl ClusterClient {
             partition_rpc::CODE_VALUE_TOO_LARGE => Err(AutumnError::ValueTooLarge { size: value.len() as u64, cap: 0 }),
             code => check_ps_code(code, &response.message).map(|()| true),
         }
-    }
-
-    /// Put-if-absent for a batch, each item `(key, value, expires_at)` sent as
-    /// `compare_put_bulk(key, None, ..)`, up to `batch_put_concurrency` in
-    /// flight. Result `i`: `Ok(true)` = written, `Ok(false)` = the key was
-    /// already there and nothing was written, `Err` = that item failed (an
-    /// RPC error may leave it unknown whether the write landed).
-    pub async fn put_many_if_absent(
-        &self,
-        items: &[(&[u8], Bytes, u64)],
-    ) -> Vec<std::result::Result<bool, AutumnError>> {
-        let negotiated = self.negotiated_cluster_wire.get();
-        if negotiated < autumn_rpc::WIRE_VERSION_WITH_COMPARE_PUT_BULK {
-            let why = format!(
-                "put_many_if_absent needs cluster wire >= {}, negotiated {negotiated}",
-                autumn_rpc::WIRE_VERSION_WITH_COMPARE_PUT_BULK
-            );
-            return items.iter().map(|_| Err(AutumnError::Unsupported(why.clone()))).collect();
-        }
-        let futs = items.iter().map(|(key, value, expires_at)| async move {
-            if value.len() as u64 > CLIENT_PUT_HARD_CAP {
-                return Err(AutumnError::ValueTooLarge { size: value.len() as u64, cap: CLIENT_PUT_HARD_CAP });
-            }
-            let key = self.binding.bind_key(key)?;
-            self.compare_put_bulk_bound(&key, None, value.clone(), *expires_at).await
-        });
-        fan_out_collect(futs, batch_put_concurrency()).await
     }
 
     /// Fenced conditional write: when the key's visible value equals

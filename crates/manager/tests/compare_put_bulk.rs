@@ -1,4 +1,4 @@
-//! `compare_put_bulk` / `put_many_if_absent` against a live in-process
+//! `compare_put_bulk` against a live in-process
 //! cluster: a present key is left untouched, an absent one is written with its
 //! TTL, `expected` still compares, deleted and expired keys count as absent,
 //! the presence check works from the memtable and from an SST, both tail paths
@@ -100,15 +100,16 @@ fn put_if_absent_and_compare_with_bulk_values() {
         assert_eq!(c.get(b"ttl").await.unwrap(), None, "the write carried its TTL");
         assert!(c.compare_put_bulk(b"ttl", None, pattern(1 << 20, 9), far).await.unwrap(), "expired → written");
 
-        // Batched: present keys are reported, absent ones written.
+        // Present keys are reported, absent ones written.
         let vals: Vec<Bytes> = (0..6).map(|i| pattern(1 << 20, 100 + i)).collect();
         let keys: Vec<Vec<u8>> = (0..6).map(|i| format!("batch/{i}").into_bytes()).collect();
         for i in [1usize, 4] {
             c.put(&keys[i], b"already").await.unwrap();
         }
-        let items: Vec<(&[u8], Bytes, u64)> =
-            keys.iter().zip(&vals).map(|(k, v)| (k.as_slice(), v.clone(), far)).collect();
-        let results: Vec<bool> = c.put_many_if_absent(&items).await.into_iter().map(|r| r.unwrap()).collect();
+        let mut results = Vec::new();
+        for (k, v) in keys.iter().zip(&vals) {
+            results.push(c.compare_put_bulk(k, None, v.clone(), far).await.unwrap());
+        }
         assert_eq!(results, vec![true, false, true, true, false, true]);
         for (i, k) in keys.iter().enumerate() {
             let want: &[u8] = if results[i] { &vals[i] } else { b"already" };
