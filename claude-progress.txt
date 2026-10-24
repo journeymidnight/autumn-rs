@@ -1,3 +1,10 @@
+Date: 2026-10-24 (9)
+TaskStatus: completed
+Task scope: user — why UCX 8M reads barely scale from 1 to 8 partitions; then "item 2": find and fix the page faults on the hot extent-node thread (item 1, memh on AM sends, dropped by the user: 0.3% left after item 2).
+Current summary: investigation (scratchpad scale.sh / prof.sh: iostat + per-thread CPU + bpftrace profile:hz on the hottest thread): one partition is CPU-bound on one thread per replica — the extent-owner EN shard (UCX) or the PS P-log thread (TCP) — with the data in page cache; eight partitions are disk-bound (3 NVMe at 70-90%). Hot EN thread: page faults 22%, UCX reg/dereg 12%: frame-value appends left idle 256 MiB slabs registered, filling the 512 MiB per-thread budget, so 8 MiB read buffers fell back to fresh unregistered memory (a 4 GiB cap: 7489 MB/s). Fix: regpool `acquire` frees idle slabs to make room (only if that can work; smallest idle class covering the shortfall first; `evicted_total/bytes` counters, printed by perf-check). Tests: transport ucx_regpool_cap (red without eviction, without the feasibility check, and with largest-first). Two opus reviews: no high/medium left. perf-check vs 1a1c9f68: one partition 8M read 3123/3160 -> 5164/5988/6275 MB/s, writes unchanged; eight partitions 3 interleaved pairs: write and read unchanged, no EN eviction (~33 per one-partition run, no visible cost).
+Main gaps: F-UCX-AM-RNDV-INTERNAL acceptance still lacks per-hop A/B and a receiver-CPU measurement. Environment noise: UCX multi-thread connects to the manager fail intermittently on this host (both builds), several perf-check legs lost to it. BUG-PY-PUT-BORROWED-MEMORY open.
+Next steps: user decides — per-hop A/B for the ledger, the structural single-extent read limit (reads of one extent spread over shard threads), or other work.
+
 Date: 2026-10-24 (8)
 TaskStatus: not_completed
 Task scope: user — F-UCX-AM-RNDV-INTERNAL (PS<->EN and client->PS large values over AM rendezvous; slab-side CRC on appends), plus client<->EN direct-read replies; then perf-check.

@@ -27,8 +27,9 @@
 //! ## memlock
 //! Registration pins pages (counts against `RLIMIT_MEMLOCK`). The per-thread
 //! pool is capped (`--ucx-regpool-cap-bytes`); an `acquire` that would exceed the cap
-//! returns an UNREGISTERED buffer (correctness preserved — recv falls back to
-//! copy-out — just not zero-copy), logged once.
+//! first frees idle slabs to make room, and only if the slabs in use fill the
+//! cap returns an UNREGISTERED buffer (correctness preserved — recv falls back
+//! to copy-out — just not zero-copy), logged once.
 
 // Transport-agnostic pool (declared as a top-level `mod regpool` in lib.rs, so
 // it compiles with AND without `ucx`). On `ucx` a fresh slab is registered with
@@ -54,6 +55,12 @@ static HIT_TOTAL: AtomicU64 = AtomicU64::new(0);
 static REGISTER_FAILED_TOTAL: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "ucx")]
 static OVER_CAP_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Idle slabs unregistered and freed to make room for another size (count,
+/// bytes): a steady climb means the working set does not fit the cap.
+#[cfg(feature = "ucx")]
+static EVICTED_TOTAL: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "ucx")]
+static EVICTED_BYTES: AtomicU64 = AtomicU64::new(0);
 static OUT_OF_POOL_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// Sum (over all threads' TLS pools) of `registered_bytes`. Approximate:
 /// updated only at acquire-success and at eviction-decrement; a snapshot
@@ -74,6 +81,9 @@ pub struct RegpoolStats {
     pub over_cap_total: u64,
     pub out_of_pool_total: u64,
     pub registered_bytes: u64,
+    /// Idle slabs freed to make room for another size: (count, bytes).
+    pub evicted_total: u64,
+    pub evicted_bytes: u64,
 }
 
 impl RegpoolStats {
@@ -106,6 +116,14 @@ pub fn snapshot() -> RegpoolStats {
         registered_bytes: REGISTERED_BYTES_GAUGE.load(Ordering::Relaxed),
         #[cfg(not(feature = "ucx"))]
         registered_bytes: 0,
+        #[cfg(feature = "ucx")]
+        evicted_total: EVICTED_TOTAL.load(Ordering::Relaxed),
+        #[cfg(not(feature = "ucx"))]
+        evicted_total: 0,
+        #[cfg(feature = "ucx")]
+        evicted_bytes: EVICTED_BYTES.load(Ordering::Relaxed),
+        #[cfg(not(feature = "ucx"))]
+        evicted_bytes: 0,
     }
 }
 
@@ -192,8 +210,8 @@ struct PoolState {
     /// summed free-list, so a pipelined worker holding N `PooledBuf`s of
     /// 8 MiB in-flight could pin far more than cap before any pressure was
     /// observed. Now `acquire` of a fresh slab checks this counter BEFORE
-    /// `register_memory`; eviction (`PooledBuf::Drop` over-cap branch)
-    /// decrements it after `RegisteredMem` is released. Always 0 on the
+    /// `register_memory`; eviction (in `acquire`, to make room) decrements it
+    /// as it takes a slab off the free-list, which then drops (unregisters). Always 0 on the
     /// non-ucx build (the type-erased `RegisteredMem` is uninhabited there),
     /// so flagged `dead_code` for that build only.
     #[allow(dead_code)]
@@ -454,8 +472,9 @@ impl Drop for PooledBuf {
 
 /// Acquire a registered buffer with usable length `need` from the thread-local
 /// pool. Reuses a pooled slab of the right size class, or allocates+registers a
-/// fresh one. If registering would exceed the per-thread memlock cap, returns
-/// an unregistered buffer (recv falls back to copy-out — still correct).
+/// fresh one. If registering would exceed the per-thread memlock cap, idle
+/// slabs are freed to make room first; if the slabs in use fill the cap, it
+/// returns an unregistered buffer (recv falls back to copy-out — still correct).
 ///
 /// Registration is RUNTIME-transport gated, not just compile-feature gated: a
 /// ucx-feature binary whose process transport is TCP gets plain buffers (memh
@@ -523,6 +542,40 @@ pub fn acquire(need: usize) -> PooledBuf {
         // an over-budget `ucp_mem_map` would either fail (memlock) or succeed
         // and silently push the process past its memlock allowance. Either
         // way the right answer is "fall back to unregistered + copy-out".
+        // Idle slabs give their registration back first: otherwise a burst
+        // of large values (a 256 MiB append) leaves its slabs pinning the
+        // budget, and every later buffer of another size is a fresh,
+        // faulted-in, unregistered allocation. Only when that makes room
+        // (slabs in use do not fill the cap alone), and the smallest idle
+        // class that covers the shortfall goes first.
+        let evicted = POOL.with(|p| {
+            let mut p = p.borrow_mut();
+            let mut evicted = Vec::new();
+            let cap = cap_bytes();
+            if p.registered_bytes.saturating_sub(p.pooled_bytes).saturating_add(class) > cap {
+                return evicted;
+            }
+            while p.registered_bytes.saturating_add(class) > cap {
+                let short = p.registered_bytes + class - cap;
+                let fits = (0..NUM_CLASSES).find(|&i| MIN_CLASS << i >= short && !p.buckets[i].is_empty());
+                let Some(idx) = fits.or_else(|| (0..NUM_CLASSES).rev().find(|&i| !p.buckets[i].is_empty())) else {
+                    break;
+                };
+                let slab = p.buckets[idx].pop().expect("non-empty bucket");
+                let size = MIN_CLASS << idx;
+                p.pooled_bytes -= size;
+                if slab.reg.is_some() {
+                    p.registered_bytes = p.registered_bytes.saturating_sub(size);
+                    REGISTERED_BYTES_GAUGE.fetch_sub(size as u64, Ordering::Relaxed);
+                }
+                EVICTED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                EVICTED_BYTES.fetch_add(size as u64, Ordering::Relaxed);
+                evicted.push(slab);
+            }
+            evicted
+        });
+        // Unregistered and freed outside the borrow (`Slab::drop`).
+        drop(evicted);
         let cap_ok = POOL.with(|p| {
             let p = p.borrow();
             p.registered_bytes.saturating_add(class) <= cap_bytes()

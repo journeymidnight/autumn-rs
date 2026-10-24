@@ -33,6 +33,32 @@ receive/scheduler benchmark; it does not set production runtime defaults.
 The registered-pool UCX tests explicitly call init_with(Ucx); merely
 constructing UcxTransport does not enable regpool registration.
 
+A fresh slab that would push the thread's registered bytes over the cap first
+unregisters and frees idle pooled slabs — the smallest idle class that covers
+the shortfall, else the largest — and only when the slabs in use fill the cap
+on their own (so freeing idle ones could not make room, and nothing is freed)
+does it fall back to an unregistered buffer. `RegpoolStats::evicted_total` /
+`evicted_bytes` count the frees (the perf-check client prints them).
+Without it the budget was held by whatever size came last in bulk: an extent
+node that received 256 MiB appends as frame values kept those slabs idle and
+registered, and every 8 MiB read reply after them was a fresh allocation —
+faulted in, zeroed, registered by UCX's cache for the send, deregistered when
+freed. Profile of the extent-owner shard thread on one partition's 8 MiB reads
+(UCX, 16 threads x depth 8): page faults 22%, registration 12%, read 3386 MB/s;
+with the eviction neither shows and the read is 5963 MB/s. perf-check against
+the build before (3 disks, interleaved): one partition 8M read 3123/3160 ->
+5164/5988/6275 MB/s (p50 270–283 -> 115–125 ms), writes unchanged (906–944 vs
+923–945); eight partitions, three pairs: write 2336–2425 vs 2361–2457, read
+8134–9133 vs 8462–8787, and no eviction at all on the extent nodes. One
+partition's run evicts ~33 slabs over three nodes, mostly 128/256 MiB append
+buffers trading places, with no visible cost. Test:
+`tests/ucx_regpool_cap.rs` (two idle 32 MiB slabs fill a 64 MiB cap; an 8 MiB
+buffer is still registered — red without the eviction; with every slab in use,
+a request that cannot fit frees nothing — red without that check). Not
+measured: a working set larger than the cap with sizes interleaved (big
+appends and 8 MiB reads at once on one thread) would cycle a large slab
+through unregister and register; the eviction counters show it.
+
 ## UCX library version and two worked-around defects
 
 `init_with(Ucx)` exits 2 on UCX < 1.17 (`check_library`, `ucp_get_version`); the

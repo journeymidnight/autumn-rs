@@ -3356,6 +3356,21 @@ print(all(ok), (dst == src).all(), f"{n*page/(time.time()-t)/1e9:.1f} GB/s")
 EOF
 ```
 
+## Registered buffer pool budget (`--ucx-regpool-cap-bytes`)
+
+Each thread registers at most this many bytes of pooled receive/send buffers
+(default 512 MiB). When a buffer of a new size would exceed it, idle buffers are
+unregistered and freed first; only buffers in use filling the budget make the
+pool hand out unregistered memory (still correct, slower: faulted in, and UCX
+registers it per send). The perf-check client prints `regpool: ... over_cap=N
+... evicted=N (B)` for its own process; a steadily climbing `evicted` means the
+working set does not fit the budget.
+
+```bash
+UCX_TLS=rc_mlx5,ud_mlx5,tcp,self UCX_NET_DEVICES=<dev>:1 \
+  cargo test -p autumn-transport --features ucx --test ucx_regpool_cap
+```
+
 ## Large values over UCX as frame values (wire 77)
 
 On UCX, every value part of 64 KiB and up that crosses a hop as part of a frame
