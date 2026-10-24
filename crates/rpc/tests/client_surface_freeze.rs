@@ -111,6 +111,7 @@ use autumn_rpc::partition_rpc::{
     self as ps, encode_put_bulk_meta, parse_put_bulk_meta, BatchDeleteOp, BatchDeleteReq,
     BatchDeleteResp, BatchGetBulkCtrl, BatchGetReq, BatchPutBulkOp, BatchPutBulkReq, BatchPutOp,
     BatchPutReq, BatchPutResp, ClientAuthReq, ClientAuthResp, ComparePutBulkReq, ComparePutReq, CompareWriteBulkReq, CompareWriteReq,
+    GetAmReq, GetAmResp,
     DeleteReq, DeleteResp, GetRedirectItem,
     GetRedirectManyReq, GetRedirectManyResp, GetRedirectResp, GetReq, HeadReq, HeadResp, PutReq,
     PutResp, RangeEntry, RangeReq, RangeResp,
@@ -125,6 +126,8 @@ const GOLDEN: &[(&str, &str)] = &[
     ("PutResp", "7075742d6d6573736167657468652d6b65790000070000008b000000e8ffffffebffffff07000000"),
     ("ComparePutBulkReq", "7468652d6b65796f6c642d76616c756518171615141312112827262524232221e0ffffff0700000001000000dbffffff09000000000000003837363534333231"),
     ("CompareWriteBulkReq", "7468652d6b65796f6c642d76616c756518171615141312112827262524232221e0ffffff0700000001000000dbffffff0900000001000000383736353433323148474645444342415857565554535251"),
+    ("GetAmReq", "7468652d6b6579001817161514131211f0ffffff070000002423222134333231484746454443424158575655545352516867666564636261"),
+    ("GetAmResp", "6765742d616d2d6d6573736167650000070000008e000000ecffffff000000007877767574737271"),
     ("ComparePutReq", "7468652d6b65796f6c642d76616c75657468652d76616c75650000000000000018171615141312112827262524232221d0ffffff0700000001000000cbffffff09000000ccffffff0900000000000000"),
     ("CompareWriteReq", "7468652d6b65796f6c642d76616c756518171615141312112827262524232221e0ffffff0700000001000000dbffffff0900000000000000000000000000000038373635343332314847464544434241"),
     ("GetReq", "7468652d6b6579001817161514131211f0ffffff0700000024232221343332314847464544434241"),
@@ -391,6 +394,30 @@ fn forms() -> Vec<Frozen> {
                 offset: 0x21222324,
                 length: 0x31323334,
                 region_epoch: 0x4142434445464748,
+            }
+        ),
+        frozen!(
+            &[(Ps, ps::MSG_GET_AM)],
+            Req,
+            GetAmReq,
+            GetAmReq {
+                part_id: 0x1112131415161718,
+                key: b"the-key".to_vec(),
+                offset: 0x21222324,
+                length: 0x31323334,
+                region_epoch: 0x4142434445464748,
+                tag: 0x5152535455565758,
+                max_len: 0x6162636465666768,
+            }
+        ),
+        frozen!(
+            &[(Ps, ps::MSG_GET_AM)],
+            Resp,
+            GetAmResp,
+            GetAmResp {
+                code: 7,
+                message: "get-am-message".to_string(),
+                value_len: 0x7172737475767778,
             }
         ),
         frozen!(

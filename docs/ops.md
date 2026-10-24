@@ -3330,9 +3330,11 @@ curl -s http://127.0.0.1:9801/metrics | grep autumn_ps_mem_tier   # bytes / hits
 `BatchClient.get_into` (the kvcache adapter's read) receives each value of
 64 KiB and up directly into the destination page: no copy out of a pool
 buffer. From PS memory, one worker thread reads about 5.4 GB/s on loopback TCP
-(3.0 before) and 6.4–6.7 GB/s on UCX (3.0); eight about 27–30 (18) and 20–21
-(14–15). One worker on UCX is at what one core can write into memory not in
-cache (`ucx_perftest -t stream_bw -s 1073741824`: 7.5 GB/s). A read that times
+(3.0 before); eight about 27–30 (18). Over UCX against a wire-76 cluster the
+value comes as an active message that UCX moves by rendezvous into the page
+with no receive copy: one worker ~42 GB/s at ~4% CPU (6.4–6.9 with the stream
+receive, which costs a core one copy into memory not in cache — `ucx_perftest
+-t stream_bw -s 1073741824`: 7.5 GB/s); more workers add nothing there. A read that times
 out in the middle of a value closes that PS connection; the other reads on it
 retry. To check: the tests below, then a live read compared byte for byte.
 
@@ -3340,7 +3342,7 @@ retry. To check: the tests below, then a live read compared byte for byte.
 cargo test -p autumn-rpc --lib -- call_into_dest in_place after_a_timeout a_pooled_receive
 cargo test -p autumn-manager --test get_into_raw
 AUTUMN_UCX_TEST_BIND='[<roce-ip>]:0' UCX_TLS=rc_mlx5,ud_mlx5,tcp,self UCX_NET_DEVICES=<dev>:1 \
-  cargo test -p autumn-transport --features ucx --test ucx_recv_data -- --test-threads=1
+  cargo test -p autumn-transport --features ucx --test ucx_recv_data --test ucx_am -- --test-threads=1
 # live (TCP cluster up, kvc namespace): put 128 x 16 MiB pages, get_into, compare
 python3 - <<'EOF'
 import numpy as np, autumn, time

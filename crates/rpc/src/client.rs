@@ -69,7 +69,7 @@ use crate::frame::{Frame, FrameDecoder};
 /// syscall). Mirrors the UCX read threshold (`BULK_MIN_BYTES`); TCP
 /// can't be true zero-copy (the kernel copy is unavoidable) but this removes the
 /// extra app-level copy for large values.
-pub const TCP_RECV_INTO_POOLED_MIN_BYTES: usize = 64 * 1024;
+pub const TCP_RECV_INTO_POOLED_MIN_BYTES: usize = autumn_transport::BULK_MIN_BYTES;
 
 /// Outcome of a `call_into_pooled`: the raw value (possibly empty) in a
 /// read_loop-owned pool buffer, plus the bulk status ctrl — application `code`

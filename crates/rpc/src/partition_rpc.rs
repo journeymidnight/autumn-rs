@@ -249,6 +249,14 @@ pub const MSG_COMPARE_PUT_BULK: u8 = 0x60;
 /// negotiated at `WIRE_VERSION_WITH_COMPARE_WRITE_BULK` or later.
 pub const MSG_COMPARE_WRITE_BULK: u8 = 0x61;
 
+/// `MSG_GET_BULK` whose value travels as a UCX active message, which UCX moves
+/// by rendezvous straight into the client's memory: `GetAmReq` names the tag
+/// the client registered and the most it can take. Replied with `GetAmResp`
+/// (code and value length) on the connection; the value, when the reply is
+/// `CODE_OK` and it fits `max_len`, as the AM tagged `tag`. Sent only on a UCX
+/// connection to a cluster negotiated at `WIRE_VERSION_WITH_GET_AM` or later.
+pub const MSG_GET_AM: u8 = 0x62;
+
 /// One op inside a `BatchDeleteReq`. Carries its own fence identity because a
 /// batch may span inodes (a directory unlink walks many), exactly as
 /// `BatchPutOp` does.
@@ -766,6 +774,29 @@ pub struct ComparePutBulkReq {
     pub expires_at: u64,
 }
 
+/// `MSG_GET_AM` request: `GetReq` plus where the value goes.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct GetAmReq {
+    pub part_id: u64,
+    pub key: Vec<u8>,
+    pub offset: u32,
+    pub length: u32,
+    pub region_epoch: u64,
+    /// The AM tag the client expects the value under.
+    pub tag: u64,
+    /// A longer value is not sent (`CODE_VALUE_TOO_LARGE`, with its length).
+    pub max_len: u64,
+}
+
+/// `MSG_GET_AM` reply. `value_len` is the value's length for `CODE_OK` (sent
+/// as the AM) and `CODE_VALUE_TOO_LARGE` (not sent); 0 otherwise.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct GetAmResp {
+    pub code: u8,
+    pub message: String,
+    pub value_len: u64,
+}
+
 /// `MSG_COMPARE_WRITE_BULK` ctrl; the value (empty for a delete) is the
 /// frame's tail. `expected` is capped at `MAX_COMPARE_PUT_BYTES`.
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
@@ -1157,6 +1188,9 @@ pub fn extract_part_id(msg_type: u8, payload: &[u8]) -> u64 {
         MSG_GET_BULK | MSG_GET_REDIRECT => rkyv_decode::<GetReq>(payload)
             .map(|r| r.part_id)
             .unwrap_or(0),
+        MSG_GET_AM => rkyv_decode::<GetAmReq>(payload)
+            .map(|r| r.part_id)
+            .unwrap_or(0),
         MSG_GET_REDIRECT_MANY => rkyv_decode::<GetRedirectManyReq>(payload)
             .map(|r| r.part_id)
             .unwrap_or(0),
@@ -1222,6 +1256,7 @@ mod msg_type_tests {
             MSG_COMPARE_WRITE,
             MSG_COMPARE_PUT_BULK,
             MSG_COMPARE_WRITE_BULK,
+            MSG_GET_AM,
             MSG_DELETE,
             MSG_HEAD,
             MSG_RANGE,

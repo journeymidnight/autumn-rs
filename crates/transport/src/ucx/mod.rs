@@ -7,6 +7,7 @@
 //! `memh` on the receive does not avoid that copy; only posting the FINAL
 //! destination avoids a second, application-level one.
 
+pub(crate) mod am;
 pub(crate) mod endpoint;
 pub(crate) mod ffi;
 pub(crate) mod listener;
@@ -21,6 +22,11 @@ pub use worker::{check_library, register_memory, RegisteredMem};
 /// This thread's (recvs completed in place, recvs completed through UCX's
 /// request callback) for stream recvs that found their data already queued;
 /// see `endpoint.rs`.
+/// This thread's tagged AM values received: (eager, rendezvous).
+pub fn am_received_counts() -> (u64, u64) {
+    am::received_counts()
+}
+
 pub fn recv_counts() -> (u64, u64) {
     (endpoint::RECV_IN_PLACE.get(), endpoint::RECV_VIA_CALLBACK.get())
 }

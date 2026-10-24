@@ -5291,6 +5291,8 @@ pub(crate) struct ConnGateState {
     /// every keyed op while authz is on).
     pub principal: Option<crate::authz::BoundPrincipal>,
     pub protocol: Option<autumn_rpc::version_hello::Negotiated>,
+    /// How `MSG_GET_AM` values leave on this connection; `None` on TCP.
+    pub am: Option<autumn_transport::am::Sender>,
 }
 
 #[cfg(test)]
@@ -5310,6 +5312,7 @@ mod frame_limit_tests {
                 max_client: autumn_rpc::WIRE_VERSION,
                 declared_version: autumn_rpc::WIRE_VERSION,
             }),
+            am: None,
         }
     }
 
@@ -5571,6 +5574,23 @@ fn push_one_frame_to_inflight(
         }
     }
 
+    if msg_type == partition_rpc::MSG_GET_AM {
+        if let Some(part) = part {
+            let part_c = part.clone();
+            let am = conn.am.clone();
+            inflight.push(
+                async move {
+                    let t0 = Instant::now();
+                    let reply = crate::rpc_handlers::handle_get_am(req_id, payload, &part_c, am).await;
+                    part_c.borrow().metrics.get_lat.observe_n(t0.elapsed().as_nanos() as u64, 1);
+                    (reply, Vec::new())
+                }
+                .boxed_local(),
+            );
+            return;
+        }
+    }
+
     // Mode B fix: RANGE / HEAD are reads — serve them locally too so a flush-
     // wedged partition_loop (imm-full back-pressure) can't take reads down.
     if msg_type == MSG_RANGE || msg_type == MSG_HEAD {
@@ -5719,6 +5739,7 @@ async fn handle_ps_connection(
     // The negotiated protocol precedes the principal bound by CLIENT_AUTH.
     let mut conn_state = ConnGateState {
         protocol: Some(protocol),
+        am: writer.am_sender(),
         ..Default::default()
     };
 

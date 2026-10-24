@@ -1,10 +1,18 @@
+Date: 2026-10-24 (6)
+TaskStatus: completed
+Task scope: user — F-UCX-TAG-RNDV: over UCX the kvcache read's value comes as an active message that UCX moves by rendezvous into the page (implemented with AM, not tag: a late value nobody waits for is dropped and its send completes). User: the eager/rendezvous cut equals the 64 KiB bulk cut, not UCX's own threshold.
+Current summary: transport `am` (per-worker handler, tag registry, `expect`/`arrived`/`finish`, `Sender::send` with RNDV at/above `BULK_MIN_BYTES`, EAGER below; `autumn_transport::BULK_MIN_BYTES` now backs the SDK's bulk cut and the TCP pooled receive); wire 76 `MSG_GET_AM` (GetAmReq/GetAmResp, extract_part_id, authz arm + test, client surface, freeze rows); PS `handle_get_am` replies after the send; client `get_am_attempt` (fallback to MSG_GET_BULK for a too-long value). Interleaved A/B (UCX, PS memory tier): 16 MiB W=1 6.9/5.5/6.1 → 42.7/43.0/42.0 GB/s at ~4% client CPU, W=8 ~20 → ~41.5; 256 KiB 5.2 → 35.4; 64 KiB 4.0 → 12.0; every byte verified with two alternating key sets. Tests: ucx_am (UCX threshold 1m) + ucx_am_eager (4k) — each flag's ablation red only in its own file; no-unregister-on-drop ablation red; authz arm ablation red. Fable review: no high; M2 (mid-size double copy) handled by the user's one-cut rule; opus review of the delta: no high, test determinism fixed.
+Main gaps: inferred, untested — a PS dying mid-rendezvous may leave `finish` waiting (MODE_NONE); a wire-75 PS behind a wire-76 manager refuses MSG_GET_AM (stop-world upgrades). UCX perf-check A/B for 23361b24..this not run.
+Next steps (user): BatchClient without W (one worker, one ClusterClient), adapter without client_workers; drop F-CLIENT-IO-THREADS. Then F-UCX-AM-RNDV-INTERNAL (PS<->EN, client->PS; slab-side CRC on appends).
+
 Date: 2026-10-24 (5)
-TaskStatus: not_completed
+TaskStatus: completed
 Task scope: user — remove the second copy on the kvcache read path (pool buffer → caller page); TCP first, both transports benefit in the end.
 Current summary: `RecvDest` (transport) lends caller memory to one receive; `RpcClient::call_into_dest` receives a bulk value straight into it, and only returns once the memory is released (unstarted → taken back; mid-value → receive aborted, connection closed). SDK `unsafe get_range_into_raw` / `get_many_into_raw` (shared retry core `get_bulk_bound`); `BatchClient.get_into` uses it and aborts the process if a job panics. Interleaved A/B (TCP loopback, 16 MiB pages from PS memory): W=1 3.0 → 5.4 GB/s (user CPU 44% → 1%), W=8 18 → 27–30 GB/s. UCX unchanged (2.7–3.0 both; still pooled + copy). Fable review: no high; M1 (mid-value timeout closes the shared connection) documented, M2 (tests did not prove the direct path) fixed with `the_value_is_received_in_place` (red with the path off), L2/L3/L4 fixed.
 UCX direct receive done too: `recv_data_with` copies each queued chunk (ucp_stream_recv_data_nb + release) into the page inside one poll, nothing posted. UCX A/B: W=1 3.0 → 6.4–6.7 GB/s, W=8 14–15 → 20–21. The 11.8 GB/s perftest figure was a cached 16 MiB buffer; at 1 GiB messages stream_bw is 7.5 GB/s (cold destination), and single-core memory bandwidth is the limit (1 core: read 11, fill 7, big memcpy 10.7 GB/s; 16 cores: read 152, copy 106). Fable review of the UCX step: no high; M1 (wake invariant) documented, M2 (duplicate decoder method) fixed.
-Main gaps: F-CLIENT-IO-THREADS (user design: one ClusterClient, W IO threads, connection % W). Non-temporal stores for the UCX copy: microbench 8 KiB chunks 8.4 → 19.7 GB/s, not tried in the client yet. perf-check A/B not run yet.
-Next steps: NT copy on UCX; perf-check A/B; then F-CLIENT-IO-THREADS.
+Non-temporal stores for the UCX copy tried and NOT kept: microbench 8 KiB chunks 8.8 → 19.6 GB/s, but in the client W=1 6.96/6.08/5.84 → 7.01/7.05/7.04 GB/s, W=8 unchanged (~20) — another ceiling at ~7.1 GB/s; patch kept in the session scratchpad only.
+Main gaps: perf-check A/B for 23361b24 + d59f8a0c not run yet. UCX receive still costs one CPU copy (Stream has no rendezvous).
+Next steps (user 2026-10-24): F-UCX-TAG-RNDV first (large values as tag messages, UCX rendezvous straight into the page), then F-CLIENT-IO-THREADS.
 
 Date: 2026-10-24 (4)
 TaskStatus: completed

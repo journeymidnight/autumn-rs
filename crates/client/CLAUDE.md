@@ -155,7 +155,15 @@ through each method, small and large values; ablating any one hand-off is red).
   value's size and own the memory for the call — the python `BatchClient.get_into`
   (kvcache pages); everything else uses the pooled reads. Shares routing, retries and
   refusal classification with `get_range_pooled` (`get_bulk_bound`); each retry lends
-  the memory again only after the previous attempt returned it. Small batches go
+  the memory again only after the previous attempt returned it. Over UCX, against a
+  cluster at `WIRE_VERSION_WITH_GET_AM` or later, an attempt is `get_am_attempt`:
+  register the memory under a fresh AM tag, send `MSG_GET_AM`, and for an OK reply
+  wait (bounded) for the value's arrival; UCX moves it by rendezvous with no receive
+  copy. A value too long for the memory falls back to `MSG_GET_BULK` in the same
+  attempt. Not handled: a PS still at wire 75 in a cluster whose manager is at 76
+  refuses `MSG_GET_AM` (PermissionDenied, terminal) — upgrades stop the whole
+  cluster; and a PS dying in the middle of the value's rendezvous may leave the
+  attempt waiting for UCX (transport CLAUDE.md, "Large values as active messages"). Small batches go
   through `get_many` + copy as in `get_many_into`.
 - The large-value `put` is the **zero-copy write**: NO client-side copy AND no value
   crc scan via `MSG_PUT_BULK` + `RpcClient::call_vectored_bulk` (v28: `[meta][key]` is

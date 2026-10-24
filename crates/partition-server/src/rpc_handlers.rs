@@ -868,6 +868,50 @@ pub(crate) async fn handle_get_bulk(
     (ps_bulk_head(req_id, code, &msg, value.len()), value)
 }
 
+/// `MSG_GET_AM`: the read of `handle_get_bulk`, whose value leaves as the AM
+/// the client registered (`req.tag`), moved by UCX rendezvous into its memory.
+/// The reply goes after the value: once it is sent the client's memory holds
+/// it. A value longer than `req.max_len` is not sent. `am` is `None` on a TCP
+/// connection, which a client never asks this on.
+pub(crate) async fn handle_get_am(
+    req_id: u32,
+    payload: Bytes,
+    part: &Rc<RefCell<PartitionData>>,
+    am: Option<autumn_transport::am::Sender>,
+) -> Bytes {
+    let reply = |code, message: String, value_len: usize| {
+        let resp = GetAmResp { code, message, value_len: value_len as u64 };
+        autumn_rpc::Frame::response(req_id, MSG_GET_AM, partition_rpc::rkyv_encode(&resp)).encode()
+    };
+    let req: GetAmReq = match partition_rpc::rkyv_decode(&payload) {
+        Ok(r) => r,
+        Err(e) => return reply(CODE_INVALID_ARGUMENT, e, 0),
+    };
+    let Some(am) = am else {
+        return reply(CODE_INVALID_ARGUMENT, "MSG_GET_AM needs a UCX connection".to_string(), 0);
+    };
+    let get = partition_rpc::rkyv_encode(&GetReq {
+        part_id: req.part_id,
+        key: req.key,
+        offset: req.offset,
+        length: req.length,
+        region_epoch: req.region_epoch,
+    });
+    match get_value(get, part).await {
+        Ok(GetOutcome::Value(v)) if v.len() as u64 > req.max_len => reply(CODE_VALUE_TOO_LARGE, String::new(), v.len()),
+        Ok(GetOutcome::Value(v)) => {
+            let n = v.len();
+            match am.send(req.tag, v).await {
+                Ok(()) => reply(CODE_OK, String::new(), n),
+                Err(e) => reply(CODE_UNAVAILABLE, format!("sending the value: {e}"), 0),
+            }
+        }
+        Ok(GetOutcome::NotFound) => reply(CODE_NOT_FOUND, String::new(), 0),
+        Ok(GetOutcome::Redirect { .. }) => unreachable!("get_value never redirects"),
+        Err((status, msg)) => reply(partition_rpc::code_for_status(status), msg, 0),
+    }
+}
+
 /// Build the MSG_GET_BULK response head — v28 value-separable frame head
 /// `[header][ctrl_len][code+message][crc]` (crc covers header+ctrl; see
 /// autumn-rpc frame.rs). The value is sent as a SEPARATE `Bytes` right after

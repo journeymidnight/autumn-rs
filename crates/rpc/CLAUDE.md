@@ -482,6 +482,10 @@ value (see autumn-client CLAUDE.md "Zero-copy selection rule"):
 | `TCP_RECV_INTO_POOLED_MIN_BYTES` (client.rs) | client recv | actual value_len | GET-bulk response recv strategy (this table) |
 | `--bulk-recv-min-bytes` (partition-server) | PS recv | actual tail len | bulk-write request recv strategy — `MSG_PUT_BULK` and `MSG_BATCH_PUT_BULK` alike (`drain_bulk_writes`) |
 | `handle_get_redirect` 64 KiB (partition-server) | PS route | actual clamped read len | EN-direct descriptor vs proxy read |
+| `BULK_MIN_BYTES` (autumn-transport `am::send`) | UCX AM send | actual value len | rendezvous (at/above) vs eager — not UCX's own `UCX_RNDV_THRESH` |
+
+`autumn_transport::BULK_MIN_BYTES` is the one constant behind the client's
+`BULK_MIN_BYTES`, `TCP_RECV_INTO_POOLED_MIN_BYTES` and the AM protocol choice.
 
 **Pooled by default (cancel-safety):** the recv runs in the long-lived
 `read_loop`, NOT the caller future, and the read_loop OWNS the `PooledBuf` — a
@@ -518,6 +522,11 @@ read stays posted until bytes or a close arrive. The caller's future must run
 to completion (the SDK API over it is `unsafe`, `get_many_into_raw`, used by
 `BatchClient`, which aborts the process if a job panics: an abandoned receive
 could otherwise write a page after Python has it back).
+
+On UCX against a wire-76 cluster the SDK sends `MSG_GET_AM` instead and the
+value comes as an active message that UCX moves by rendezvous into the memory
+with no receive copy (below, and autumn-client `get_am_attempt`); this call
+remains the path for older clusters and for a value longer than the memory.
 
 On UCX the direct path does not post a receive into the memory: a posted
 stream recv cannot be cancelled, so a peer stalled mid-value would hold it with
@@ -656,7 +665,7 @@ overflows the frame.
 
 ## Wire version, and the two checks over it
 
-`WIRE_VERSION` (currently **75**) is the schema this binary speaks.
+`WIRE_VERSION` (currently **76**) is the schema this binary speaks.
 `MIN_CLIENT_WIRE_VERSION` (**43**) is the oldest CLIENT it serves. Both are maintained
 **BY HAND**. There is no schema fingerprint — hashing the sources byte for byte cost
 more than it caught (a translated comment once split a rolling cluster, and each false
@@ -1001,6 +1010,16 @@ and new bytes. PutResp CODE_PRECONDITION means comparison failed; region/ownersh
 errors retain frame-level status for routing refresh. Both values are capped at
 64 KiB; extract_part_id and both PS namespace/authz gates decode the new request.
 Every service and embedded client must be rebuilt together for wire 44.
+
+## A read whose value comes as a UCX active message (wire 76)
+
+`MSG_GET_AM` (0x62): `GetAmReq` = `GetReq` + `tag` (the AM tag the client
+registered for the value) + `max_len` (its memory). Reply `GetAmResp { code,
+message, value_len }` as an ordinary frame; for `CODE_OK` the value has been
+sent as the AM tagged `tag` (autumn-transport `am`) before the reply, and for
+`CODE_VALUE_TOO_LARGE` it was not sent (`value_len` says how long it is). New
+client-surface form: ceiling [43, 76], floor unchanged; the SDK sends it only
+over UCX to a cluster negotiated at `WIRE_VERSION_WITH_GET_AM` or later.
 
 ## One conditional write for the SDK (wire 75)
 

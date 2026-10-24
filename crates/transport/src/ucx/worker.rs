@@ -95,8 +95,11 @@ pub(crate) fn process_context() -> *mut ucp_context {
         // WAKEUP = enables ucp_worker_get_efd + ucp_worker_arm so the
         // progress task can wait on the eventfd via io_uring POLL_ADD
         // instead of polling.
-        params.features =
-            (ucp_feature::UCP_FEATURE_STREAM | ucp_feature::UCP_FEATURE_WAKEUP) as u64;
+        // AM = large values sent as active messages, which UCX moves by
+        // rendezvous straight into the receiver's buffer (`am.rs`).
+        params.features = (ucp_feature::UCP_FEATURE_STREAM
+            | ucp_feature::UCP_FEATURE_WAKEUP
+            | ucp_feature::UCP_FEATURE_AM) as u64;
         // ROOT-CAUSE FIX (multi-worker collapse): this ONE process-global
         // ucp_context is shared by MANY worker threads — PS has 2 per partition
         // (P-log + P-sst), the perf-check/BatchClient clients have one per
@@ -292,6 +295,7 @@ unsafe fn create_worker(ctx: *mut ucp_context) -> (*mut ucp_worker, std::os::fd:
     let mut w: *mut ucp_worker = ptr::null_mut();
     let st = ucp_worker_create(ctx, &wp, &mut w);
     assert_eq!(st, ucs_status_t::UCS_OK, "ucp_worker_create");
+    crate::ucx::am::register_handler(w);
     let mut efd: i32 = -1;
     let st = ucp_worker_get_efd(w, &mut efd);
     assert_eq!(st, ucs_status_t::UCS_OK, "ucp_worker_get_efd");

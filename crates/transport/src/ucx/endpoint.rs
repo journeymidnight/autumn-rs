@@ -82,14 +82,14 @@ use std::rc::Rc;
 /// eventfd-driven progress wake-up — no amount of local spin shortens
 /// that. Send-completion (local NIC ACK) lands within ~10–20 iters; the
 /// spin should be just long enough to catch that and no longer.
-const SPIN_ITERS: usize = 32;
+pub(crate) const SPIN_ITERS: usize = 32;
 
 // ---- Pointer-status decoder ----
 
 /// UCS uses a fat-pointer convention: NULL = immediate OK, a real heap
 /// pointer = request in progress, or a `(void*)(intptr_t)UCS_ERR_*` =
 /// immediate error (mirrors `UCS_PTR_IS_ERR` from `ucs/type/status.h`).
-fn classify_ptr(ptr: *mut c_void) -> PtrStatus {
+pub(crate) fn classify_ptr(ptr: *mut c_void) -> PtrStatus {
     if ptr.is_null() {
         PtrStatus::Done
     } else {
@@ -102,7 +102,7 @@ fn classify_ptr(ptr: *mut c_void) -> PtrStatus {
     }
 }
 
-enum PtrStatus {
+pub(crate) enum PtrStatus {
     Done,
     Err(ucs_status_t::Type),
     Pending(*mut c_void),
@@ -127,7 +127,7 @@ impl UcxEp {
             recv_abandoned: Cell::new(false),
         })
     }
-    fn ptr(&self) -> *mut ucp_ep {
+    pub(crate) fn ptr(&self) -> *mut ucp_ep {
         self.raw
     }
     #[inline]
@@ -158,7 +158,7 @@ impl UcxEp {
 //
 // Slots live in a thread-local freelist (capped to bound memory). Acquire
 // pops or allocates; release resets and pushes (or drops if pool full).
-struct Slot {
+pub(crate) struct Slot {
     /// 0 = pending, 1 = completed.
     state: Cell<u8>,
     /// `ucs_status_t::Type` written by the cb.
@@ -234,7 +234,7 @@ thread_local! {
 /// 256 covers per-thread peak in-flight (autumn-rpc pool + stream_worker).
 const SLOT_POOL_CAP: usize = 256;
 
-fn slot_acquire() -> *mut Slot {
+pub(crate) fn slot_acquire() -> *mut Slot {
     SLOT_POOL.with(|p| {
         if let Some(slot) = p.borrow_mut().pop() {
             Box::into_raw(slot)
@@ -247,7 +247,7 @@ fn slot_acquire() -> *mut Slot {
 /// SAFETY: caller must own the slot (it must have been returned by a prior
 /// `slot_acquire` and not already released, and UCX must no longer hold the
 /// pointer — i.e. the cb has fired).
-unsafe fn slot_release(slot: *mut Slot) {
+pub(crate) unsafe fn slot_release(slot: *mut Slot) {
     SLOT_POOL.with(|p| {
         let mut p = p.borrow_mut();
         let b = Box::from_raw(slot);
@@ -425,12 +425,12 @@ pub(crate) fn reap_orphans() {
 /// `SmallVec` inline) cannot be guarded: `Inflight::drop` moves the value out
 /// of the dying frame while UCX keeps the pointer. Refused before posting.
 #[inline]
-fn inline_storage<P>(payload: &ManuallyDrop<P>, ptr: *const c_void) -> bool {
+pub(crate) fn inline_storage<P>(payload: &ManuallyDrop<P>, ptr: *const c_void) -> bool {
     let start = payload as *const _ as usize;
     (start..start + std::mem::size_of::<P>()).contains(&(ptr as usize))
 }
 
-fn inline_storage_err() -> io::Error {
+pub(crate) fn inline_storage_err() -> io::Error {
     io::Error::new(
         io::ErrorKind::Unsupported,
         "buffer with inline storage cannot be handed to UCX (a dropped operation could not keep it alive)",
@@ -439,7 +439,7 @@ fn inline_storage_err() -> io::Error {
 
 // ---- Send / recv callbacks ----
 
-unsafe extern "C" fn cb_send(_request: *mut c_void, status: ucs_status_t::Type, user: *mut c_void) {
+pub(crate) unsafe extern "C" fn cb_send(_request: *mut c_void, status: ucs_status_t::Type, user: *mut c_void) {
     let slot = &*(user as *const Slot);
     slot.complete_send(status);
 }
@@ -617,6 +617,17 @@ impl UcxReadHalf {
     }
 }
 
+impl UcxWriteHalf {
+    pub(crate) fn ep(&self) -> &Rc<UcxEp> {
+        &self.ep
+    }
+
+    /// A sender of tagged AM values on this connection (`crate::am`).
+    pub fn am_sender(&self) -> crate::am::Sender {
+        crate::am::Sender { ep: self.ep.clone() }
+    }
+}
+
 impl compio::io::AsyncWrite for UcxWriteHalf {
     async fn write<B: IoBuf>(&mut self, buf: B) -> BufResult<usize, B> {
         ucx_send(self.ep.ptr(), buf).await
@@ -640,7 +651,7 @@ impl compio::io::AsyncWrite for UcxWriteHalf {
 /// slot. Returns the callback's `(status, length)`; request and slot are freed
 /// before returning so the slot is back in the pool when the caller chains
 /// ops, and the caller may then take its payload back.
-async fn await_pending<'a, P: 'static>(
+pub(crate) async fn await_pending<'a, P: 'static>(
     req: *mut c_void,
     slot: *mut Slot,
     spin_iters: usize,

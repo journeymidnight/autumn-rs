@@ -31,7 +31,7 @@ pub use autumn_transport::RegisteredMem;
 /// Re-exported so `call_into_pooled` consumers (autumn-stream's StreamClient)
 /// reference `autumn_rpc::PooledBuf` without a direct autumn-transport dep.
 /// Transport-agnostic: registered on `ucx`, plain (copy-out) on TCP/no-ucx.
-pub use autumn_transport::{regpool_acquire, PooledBuf, RecvDest, Released};
+pub use autumn_transport::{am, regpool_acquire, PooledBuf, RecvDest, Released, BULK_MIN_BYTES};
 pub use error::{Result, RpcError, StatusCode};
 pub use frame::{Frame, FrameDecoder, ReadWindow, HEADER_LEN};
 
@@ -109,7 +109,7 @@ pub fn shard_for_extent(extent_id: u64, shard_count: u32) -> u32 {
 /// Bump it on every wire change. There is no separate "oldest cluster peer"
 /// constant: peers compare for EQUALITY, so a floor pinned to this value would
 /// say nothing.
-pub const WIRE_VERSION: u32 = 75;
+pub const WIRE_VERSION: u32 = 76;
 
 /// The oldest CLIENT this binary serves — the floor of the client window
 /// `[MIN_CLIENT_WIRE_VERSION, WIRE_VERSION]`.
@@ -201,6 +201,12 @@ const _: () = assert!(WIRE_VERSION_WITH_COMPARE_PUT_BULK <= WIRE_VERSION);
 pub const WIRE_VERSION_WITH_COMPARE_WRITE_BULK: u32 = 75;
 
 const _: () = assert!(WIRE_VERSION_WITH_COMPARE_WRITE_BULK <= WIRE_VERSION);
+
+/// The version that introduced `MSG_GET_AM`, gated like
+/// `WIRE_VERSION_WITH_COMPARE_WRITE`.
+pub const WIRE_VERSION_WITH_GET_AM: u32 = 76;
+
+const _: () = assert!(WIRE_VERSION_WITH_GET_AM <= WIRE_VERSION);
 
 /// The version whose manager serves the STABLE, REPLACE and EXCLUSIVE inode
 /// lease modes. An older manager answers them with a generic invalid-argument
@@ -444,9 +450,9 @@ mod wire_version_tests {
         assert!(client_compat_check(3, 2).is_err());
     }
 
-    /// The window is OPEN: `[43, 75]`, opened by raising the CEILING and
+    /// The window is OPEN: `[43, 76]`, opened by raising the CEILING and
     /// widened by `MSG_GET_CLIENT_REGIONS`, `MSG_COMPARE_WRITE`, the new lease
-    /// modes, `MSG_COMPARE_PUT_BULK` and `MSG_COMPARE_WRITE_BULK` (other bumps
+    /// modes, `MSG_COMPARE_PUT_BULK`, `MSG_COMPARE_WRITE_BULK` and `MSG_GET_AM` (other bumps
     /// changed only cluster-internal forms).
     ///
     /// Pinned to literals so that the two silently becoming equal again — which
@@ -458,7 +464,7 @@ mod wire_version_tests {
     #[test]
     fn the_client_window_is_open_and_the_floor_is_where_it_belongs() {
         assert_eq!(MIN_CLIENT_WIRE_VERSION, 43, "read this test's comment");
-        assert_eq!(WIRE_VERSION, 75, "read this test's comment");
+        assert_eq!(WIRE_VERSION, 76, "read this test's comment");
     }
 
     /// The check that actually decides whether a stale SERVER joins is the one

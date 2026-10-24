@@ -141,3 +141,38 @@ woken after each progress pass (the progress loop and the inline spin in
 `wake_stream_waiters` (a posted recv is woken by its own callback, a waiter here
 only by those calls); the `self` transport, which delivers inside a send, is not
 selected for these connections today. Tests: `tests/ucx_recv_data.rs`.
+
+## Large values as active messages (`am`)
+
+UCP Stream has no rendezvous, so a stream receive always costs the receiving
+CPU one copy (one core into memory not in cache: ~7 GB/s). An active message
+does not: `am::Sender::send(tag, value)` is `ucp_am_send_nbx` with the tag as
+an 8-byte header; from `BULK_MIN_BYTES` (64 KiB) on it asks for rendezvous,
+and the receiver's handler gets a descriptor and fetches the value straight into its memory
+(`ucp_am_recv_data_nbx`). One handler per worker (`register_handler`, AM id 1,
+`WHOLE_MSG`) looks the tag up in the thread's registry (`am::expect(tag,
+dest)`): a registered buffer receives the value (rendezvous, or a copy for an
+eager value); an unregistered tag is dropped by returning `UCS_OK`, which also
+completes a rendezvous sender (`ucx_am.rs` checks that). This is why it is
+AM and not the tag API: a tagged rendezvous nobody receives never completes,
+and a caller that gave up leaves exactly that. `Expected` unregisters on drop
+while the value has not arrived; `finish` waits out a rendezvous receive
+already under way (it cannot be stopped), so the memory is released when it
+returns. That wait is bounded by the peer, not by us: with
+`UCP_ERR_HANDLING_MODE_NONE` a sender that dies between the rendezvous request
+and the end of the RDMA read may never complete it (inferred, not tested), the
+same window the stream path avoids by never posting into caller memory. Eager
+or rendezvous is ours, not UCX's: rendezvous from `BULK_MIN_BYTES` (64 KiB,
+the same constant as the SDK's bulk cut and the TCP pooled receive) on, eager
+below, whatever `UCX_RNDV_THRESH` says (`ucx_am.rs` runs with it at 1 MiB and
+`ucx_am_eager.rs` at 4 KiB, so each flag is checked). Below the cut the PS's
+reply can overtake the value (an eager send completes locally), which is why
+the client waits for the arrival after the OK.
+Tags come from a per-thread counter (`next_tag`): the registry is
+per receiving worker. Measured (kvcache read, 16 MiB pages from PS memory,
+rc_mlx5 HCA loopback): one client worker 6.9 → 42 GB/s at ~4% CPU, eight
+workers no faster (41). Tests: `tests/ucx_am.rs` (eager and rendezvous land,
+counted with `ucx_am_received_counts`; a stranger is dropped and its send
+completes; a given-up value writes nothing — red with no unregister on drop;
+a too-long value is reported, not received), `tests/ucx_am_eager.rs` (a value
+under the cut goes eager under a 4 KiB UCX threshold).

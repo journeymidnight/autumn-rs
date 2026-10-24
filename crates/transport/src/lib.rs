@@ -40,12 +40,95 @@ pub use regpool::{
     snapshot as regpool_snapshot, PooledBuf, RegpoolStats,
 };
 pub use recv_dest::{RecvDest, Released};
+
+/// Values at least this long take the bulk paths: the SDK's bulk reads and
+/// writes (`bulk_worthwhile`), the TCP receive into a pool buffer, and over UCX
+/// an active message by rendezvous (below it, eager). One value, measured on
+/// the bulk read/write paths (autumn-client `BULK_MIN_BYTES`).
+pub const BULK_MIN_BYTES: usize = 64 * 1024;
+
+/// Large values as UCX active messages, received by rendezvous straight into
+/// the receiver's memory (`ucx/am.rs`). UCX only: elsewhere `expect` fails and
+/// `WriteHalf::am_sender` is `None`.
+pub mod am {
+    use std::io;
+
+    pub enum Arrival {
+        /// The value (this many bytes) is in the memory.
+        Received(usize),
+        /// The value (this many bytes) is longer than the memory: not received.
+        TooLong(usize),
+    }
+
+    /// Where the value with one tag goes; see `ucx::am::Expected`.
+    pub struct Expected {
+        #[cfg(feature = "ucx")]
+        inner: crate::ucx::am::Expected,
+    }
+
+    /// A tag no other value expected on this thread carries.
+    pub fn next_tag() -> u64 {
+        #[cfg(feature = "ucx")]
+        return crate::ucx::am::next_tag();
+        #[cfg(not(feature = "ucx"))]
+        0
+    }
+
+    /// Register `dest` for the value tagged `tag`, before it can be sent.
+    pub fn expect(tag: u64, dest: crate::RecvDest) -> io::Result<Expected> {
+        #[cfg(feature = "ucx")]
+        if crate::runtime_transport_is_ucx() {
+            return Ok(Expected { inner: crate::ucx::am::expect(tag, dest) });
+        }
+        let _ = (tag, dest);
+        Err(io::Error::new(io::ErrorKind::Unsupported, "AM values need the UCX transport"))
+    }
+
+    impl Expected {
+        pub async fn arrived(&self) -> io::Result<Arrival> {
+            #[cfg(feature = "ucx")]
+            return self.inner.arrived().await.map(|a| match a {
+                crate::ucx::am::Arrival::Received(n) => Arrival::Received(n),
+                crate::ucx::am::Arrival::TooLong(n) => Arrival::TooLong(n),
+            });
+            #[cfg(not(feature = "ucx"))]
+            unreachable!("no Expected without UCX")
+        }
+
+        /// Stop waiting; returns once nothing writes the memory any more.
+        pub async fn finish(self) {
+            #[cfg(feature = "ucx")]
+            self.inner.finish().await;
+        }
+    }
+
+    /// Sends tagged values on one UCX connection.
+    #[derive(Clone)]
+    pub struct Sender {
+        #[cfg(feature = "ucx")]
+        pub(crate) ep: std::rc::Rc<crate::ucx::endpoint::UcxEp>,
+    }
+
+    impl Sender {
+        /// Completes once the receiver fetched or dropped `value`.
+        pub async fn send(&self, tag: u64, value: bytes::Bytes) -> io::Result<()> {
+            #[cfg(feature = "ucx")]
+            return crate::ucx::am::send(&self.ep, tag, value).await;
+            #[cfg(not(feature = "ucx"))]
+            {
+                let _ = (tag, value);
+                unreachable!("no Sender without UCX")
+            }
+        }
+    }
+}
 pub use tcp::TcpTransport;
 #[cfg(feature = "ucx")]
 pub use ucx::UcxTransport;
 #[cfg(feature = "ucx")]
 pub use ucx::{
-    check_library as check_ucx_library, orphan_counts as ucx_orphan_counts, recv_counts as ucx_recv_counts,
+    am_received_counts as ucx_am_received_counts, check_library as check_ucx_library, orphan_counts as ucx_orphan_counts,
+    recv_counts as ucx_recv_counts,
     register_memory, RegisteredMem,
 };
 
@@ -580,6 +663,15 @@ impl ReadHalf {
 }
 
 impl WriteHalf {
+    /// A sender of tagged AM values on this connection; `None` on TCP.
+    pub fn am_sender(&self) -> Option<am::Sender> {
+        match self {
+            #[cfg(feature = "ucx")]
+            Self::Ucx(w) => Some(am::Sender { ep: w.ep().clone() }),
+            Self::Tcp(_) => None,
+        }
+    }
+
     /// Send owned iovecs and await the kernel's buffer-release notification.
     /// The caller must limit the iovec count and serialize complete frames.
     /// UCX retains its ordinary registered-memory send path.

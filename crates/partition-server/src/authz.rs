@@ -21,7 +21,7 @@ use autumn_rpc::partition_rpc::{
     self, parse_put_bulk_meta, BatchGetReq, BatchPutReq, DeleteReq, GetRedirectManyReq, GetReq,
     BatchPutBulkReq, HeadReq, PutReq, RangeReq, MSG_BATCH_GET_BULK, MSG_BATCH_PUT,
     MSG_BATCH_PUT_BULK, MSG_CLIENT_AUTH, MSG_DELETE,
-    MSG_GET_REDIRECT, MSG_GET_REDIRECT_MANY, MSG_GET_BULK, MSG_HEAD, MSG_PUT, MSG_PUT_BULK, MSG_RANGE,
+    MSG_GET_AM, MSG_GET_REDIRECT, MSG_GET_REDIRECT_MANY, MSG_GET_BULK, MSG_HEAD, MSG_PUT, MSG_PUT_BULK, MSG_RANGE,
     PUT_BULK_HEADER_LEN,
 };
 use autumn_rpc::StatusCode;
@@ -295,6 +295,10 @@ pub fn authz_check(
     match msg_type {
         MSG_GET_BULK | MSG_GET_REDIRECT => {
             let r = partition_rpc::rkyv_decode::<GetReq>(payload).ok()?;
+            check_key(&r.key, principal, inner, now)
+        }
+        MSG_GET_AM => {
+            let r = partition_rpc::rkyv_decode::<partition_rpc::GetAmReq>(payload).ok()?;
             check_key(&r.key, principal, inner, now)
         }
         // carries a USER KEY per item — gate each like MSG_BATCH_GET_BULK.
@@ -701,6 +705,21 @@ mod tests {
             lease_epoch: 0,
         });
         assert!(authz_check(MSG_PUT, &put, Some(&p), &inner, now).is_some());
+        // MSG_GET_AM is gated on its key like MSG_GET_BULK.
+        let am = |key: &[u8]| {
+            rkyv_encode(&partition_rpc::GetAmReq {
+                part_id: 1,
+                key: key.to_vec(),
+                offset: 0,
+                length: 0,
+                region_epoch: 0,
+                tag: 1,
+                max_len: 1 << 20,
+            })
+        };
+        assert!(authz_check(MSG_GET_AM, &am(b"mem/acme/doc/1"), Some(&p), &inner, now).is_none());
+        assert!(authz_check(MSG_GET_AM, &am(b"mem/other/doc/1"), Some(&p), &inner, now).is_some());
+        assert!(authz_check(MSG_GET_AM, &am(b"mem/acme/doc/1"), None, &inner, now).is_some());
         // non-data-plane msg_type → not gated
         assert!(authz_check(0x47 /* MSG_MAINTENANCE */, &[], Some(&p), &inner, now).is_none());
         // PROTECT-EVERYTHING: authz_check assumes enabled (the caller gates on

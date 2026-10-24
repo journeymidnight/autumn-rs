@@ -508,7 +508,7 @@ pub const CLIENT_PUT_HARD_CAP: u64 = 256 * 1024 * 1024;
 /// (cheaper at every size — they drop the rkyv encode + value copies).
 /// The inline/VP boundary is `VALUE_THROTTLE` (4 KiB); 64 KiB is the
 /// conservative crossover (the mid-range is parity, large is a clear win).
-pub const BULK_MIN_BYTES: usize = 64 * 1024;
+pub const BULK_MIN_BYTES: usize = autumn_rpc::BULK_MIN_BYTES;
 
 /// the single zero-copy selection rule. Engage bulk (`get_into`/`MSG_GET_BULK`,
 /// `put_bulk`/`MSG_PUT_BULK`) iff the value is at least `BULK_MIN_BYTES`
@@ -1214,6 +1214,63 @@ pub struct RawGetItem<'a> {
     pub key: &'a [u8],
     pub ptr: *mut u8,
     pub len: usize,
+}
+
+/// One `MSG_GET_AM` attempt: register `[ptr, ptr + len)` for the value's AM,
+/// ask, and wait for the value when the reply says it was sent. `None` when
+/// the value is longer than the memory (not sent): the caller reads it the
+/// other way. Returns only once nothing writes the memory any more.
+///
+/// # Safety
+/// As `ClusterClient::get_range_into_raw`.
+async unsafe fn get_am_attempt(
+    client: &RpcClient,
+    req: &GetReq,
+    ptr: *mut u8,
+    len: usize,
+    timeout: Option<Duration>,
+) -> std::result::Result<Option<(u8, String, (usize, Option<autumn_rpc::PooledBuf>))>, RpcError> {
+    use autumn_rpc::am::{self, Arrival};
+    let tag = am::next_tag();
+    let (dest, released) = autumn_rpc::RecvDest::new(ptr, len);
+    let expected = am::expect(tag, dest)?;
+    let ask = rkyv_encode(&GetAmReq {
+        part_id: req.part_id,
+        key: req.key.clone(),
+        offset: req.offset,
+        length: req.length,
+        region_epoch: req.region_epoch,
+        tag,
+        max_len: len as u64,
+    });
+    let reply = match timeout {
+        None => client.call(MSG_GET_AM, ask).await,
+        Some(t) => client.call_timeout(MSG_GET_AM, ask, t).await,
+    };
+    let out = match reply.and_then(|b| rkyv_decode::<GetAmResp>(&b).map_err(|e| RpcError::Io(std::io::Error::other(e)))) {
+        // The PS replies once its send completed: a rendezvous value is in the
+        // memory by then, an eager one at least on its way.
+        Ok(r) if r.code == partition_rpc::CODE_OK => {
+            let arrived = match timeout {
+                None => expected.arrived().await,
+                Some(t) => compio::time::timeout(t, expected.arrived()).await.unwrap_or(Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "the value's AM did not arrive",
+                ))),
+            };
+            match arrived {
+                Ok(Arrival::Received(n)) => Ok(Some((partition_rpc::CODE_OK, r.message, (n, None)))),
+                Ok(Arrival::TooLong(_)) => Ok(None),
+                Err(e) => Err(RpcError::Io(e)),
+            }
+        }
+        Ok(r) if r.code == partition_rpc::CODE_VALUE_TOO_LARGE => Ok(None),
+        Ok(r) => Ok(Some((r.code, r.message, (0, None)))),
+        Err(e) => Err(e),
+    };
+    expected.finish().await;
+    released.await;
+    out
 }
 
 // ── ClusterClient ───────────────────────────────────────────────────────────
@@ -4415,8 +4472,8 @@ impl ClusterClient {
         length: u32,
     ) -> std::result::Result<Option<ValueBuf>, AutumnError> {
         // A timed-out call's pool buffer returns to the pool via the read_loop.
-        self.get_bulk_bound(key, offset, length, "get_range_pooled", |client, payload, timeout| async move {
-            let call = client.call_into_pooled(partition_rpc::MSG_GET_BULK, payload);
+        self.get_bulk_bound(key, offset, length, "get_range_pooled", |client, req, timeout| async move {
+            let call = client.call_into_pooled(partition_rpc::MSG_GET_BULK, rkyv_encode(&req));
             let z = match timeout {
                 None => call.await,
                 Some(t) => compio::time::timeout(t, call).await.unwrap_or(Err(RpcError::Timeout(t))),
@@ -4426,8 +4483,8 @@ impl ClusterClient {
         .await
     }
 
-    /// `MSG_GET_BULK` with routing, epoch-stale refresh and retries; `call`
-    /// makes one attempt on a connection and returns `(code, message, value)`.
+    /// A bulk read with routing, epoch-stale refresh and retries; `call` makes
+    /// one attempt of `req` on a connection and returns `(code, message, value)`.
     async fn get_bulk_bound<T, F, Fut>(
         &self,
         key: &[u8],
@@ -4437,7 +4494,7 @@ impl ClusterClient {
         mut call: F,
     ) -> std::result::Result<Option<T>, AutumnError>
     where
-        F: FnMut(Rc<RpcClient>, Bytes, Option<Duration>) -> Fut,
+        F: FnMut(Rc<RpcClient>, GetReq, Option<Duration>) -> Fut,
         Fut: std::future::Future<Output = std::result::Result<(u8, String, T), RpcError>>,
     {
         let mut attempt: u32 = 0;
@@ -4448,20 +4505,20 @@ impl ClusterClient {
                 .await
                 .map_err(|e| AutumnError::RoutingError(e.to_string()))?;
             let region_epoch = self.lookup_epoch_for_part(part_id);
-            let payload = rkyv_encode(&GetReq {
+            let req = GetReq {
                 part_id,
                 key: key.to_vec(),
                 offset,
                 length,
                 region_epoch,
-            });
+            };
             let timeout = self.first_attempt_effective_timeout(attempt);
             match self
                 .get_ps_client_with_timeout(&ps_addr, timeout)
                 .await
             {
                 Ok(client) => {
-                    match call(client, payload, timeout).await {
+                    match call(client, req, timeout).await {
                         Ok((code, message, value)) => match code {
                             partition_rpc::CODE_OK => return Ok(Some(value)),
                             partition_rpc::CODE_NOT_FOUND => return Ok(None),
@@ -4520,13 +4577,23 @@ impl ClusterClient {
         len: usize,
     ) -> std::result::Result<Option<usize>, AutumnError> {
         let key = self.binding.bind_key(key)?;
+        // Over UCX the value can come as an active message, moved by
+        // rendezvous into the memory with no receive copy (`MSG_GET_AM`).
+        let am = autumn_rpc::runtime_transport_is_ucx()
+            && self.negotiated_cluster_wire.get() >= autumn_rpc::WIRE_VERSION_WITH_GET_AM;
         let got = self
-            .get_bulk_bound(&key, 0, 0, "get_range_into_raw", |client, payload, timeout| async move {
+            .get_bulk_bound(&key, 0, 0, "get_range_into_raw", |client, req, timeout| async move {
+                if am {
+                    // SAFETY: as below.
+                    if let Some(r) = unsafe { get_am_attempt(&client, &req, ptr, len, timeout) }.await? {
+                        return Ok(r);
+                    }
+                }
                 // SAFETY: the caller's contract; the previous attempt's
                 // `call_into_dest` returned, so nothing else holds the memory.
                 let (dest, released) = unsafe { autumn_rpc::RecvDest::new(ptr, len) };
                 let r = client
-                    .call_into_dest(partition_rpc::MSG_GET_BULK, payload, dest, released, timeout)
+                    .call_into_dest(partition_rpc::MSG_GET_BULK, rkyv_encode(&req), dest, released, timeout)
                     .await?;
                 Ok((r.code, r.message, (r.value_len, r.spill)))
             })

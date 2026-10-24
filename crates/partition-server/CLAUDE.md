@@ -533,6 +533,17 @@ per partition. Server side (`enqueue_batch_put`):
 Frozen-for-merge rejection returns `CODE_UNAVAILABLE` per-op via the same
 accumulator.
 
+### `MSG_GET_AM` (0x62) — the value as a UCX active message
+
+`handle_get_am`: the read of `handle_get_bulk`, but the value leaves through
+the connection's `am::Sender` (`ConnGateState::am`, `None` on TCP) under the
+client's tag, and the `GetAmResp` reply follows once that send completed (for
+a rendezvous: once the client fetched it into its memory). A value longer
+than `max_len` is not sent (`CODE_VALUE_TOO_LARGE`). Served on the ps-conn
+task like `MSG_GET_BULK`; the in-flight slot is held until the send ends.
+Gated by `authz_check` on its key (`authz_check_dispatch_get_and_put`, red
+without the arm).
+
 ### `MSG_BATCH_GET_BULK` (0x5B) — server-batched Get, values out of the payload
 
 Request is `BatchGetReq { part_id, region_epoch, keys }`; what distinguishes this
