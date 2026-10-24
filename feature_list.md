@@ -51,6 +51,7 @@
 - **Scope**: 等 F-KVC-ADAPTER-WRITE-READ 读写跑满之后再定要不要做、怎么做（对标 Mooncake：内存先确认、eager 或淘汰时落盘）。
 - **Acceptance**: 先给设计，用户定了再立实现条目。
 - `passes: false`
+- **notes** (2026-10-24 设计定稿，用户选): 研究结论——sglang 每页进 L2 后都写 L3，`write_through_selective` 只是 L2 两次命中门槛；`batch_exists` 按连续前缀计；exists 后 get 失败会截断重算、不重试写 → L3 丢数据只损命中率。Mooncake：DRAM 即确认、默认 1 副本、近似 LRU、exists 后租约防淘汰、SSD 落盘可选（默认 eager，另有 offload_on_evict + 有界队列）。用户定：① 淘汰时只把被读过的条目落盘（队列满就丢）；② 按一次写批成组淘汰，exists 置引用位；③ 预算整个 PS 共享（按分区分片）；④ 直读命中内存先在重定向里回值，量过再定。先做不落盘的最小版量收益。
 
 ### BUG-FS-DIR-NLINK-LOST-UNDER-CONTENTION — 同目录高并发 mkdir 父目录 nlink 少记（已复现，未修）
 - **Trigger** (2026-10-23 父目录类型检查的基准): 4 会话 × 300 次 mkdir 进同一目录，结束后父目录 nlink 比 2+1200 少 0–18（改前改后都有）。`update_dir` 对父 inode 的 CAS 连续冲突 16 次就放弃、只记 WARN（名字已发布，不报错）。

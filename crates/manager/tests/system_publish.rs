@@ -482,7 +482,7 @@ fn a_retire_is_recovered_once_from_every_crash_point() {
         dead.kv_put_fenced(&key::pending_key(s, solo), &op, lease).await.unwrap();
         let named = dead.kv_get_opt(&key::dirent_key(1, b"solo")).await.unwrap().unwrap();
         let swapped = schema::encode_dirent(&schema::DirentValue { child_inode: succ, file_type: schema::DT_REG });
-        assert!(dead.client.compare_put(&key::dirent_key(1, b"solo"), Some(&named), &swapped).await.unwrap());
+        assert!(dead.client.compare_put(&key::dirent_key(1, b"solo"), Some(&named), Some(bytes::Bytes::copy_from_slice(&swapped)), autumn_client::WriteOptions::default()).await.unwrap());
         lease::release(&dead.client, &dead.client_id, s).await.unwrap();
         publish::recover_dead_sessions(&mut rescuer).await.unwrap();
         assert!(rescuer.kv_get_opt(&key::inode_key(solo)).await.unwrap().is_none(), "the single-name inode was not reclaimed");

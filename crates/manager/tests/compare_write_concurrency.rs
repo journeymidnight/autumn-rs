@@ -39,7 +39,7 @@ fn one_of_many_creates_wins() {
         let (clients, _dirs) = boot(241, 24101).await;
         let attempts = (0..32u8).map(|i| {
             let c = &clients[i as usize % clients.len()];
-            async move { (i, c.compare_put(b"winner", None, &[i]).await.unwrap()) }
+            async move { (i, c.compare_put(b"winner", None, Some(bytes::Bytes::copy_from_slice(&[i])), autumn_client::WriteOptions::default()).await.unwrap()) }
         });
         let won: Vec<u8> = futures::future::join_all(attempts)
             .await
@@ -57,7 +57,7 @@ fn one_of_many_creates_wins() {
 fn concurrent_increments_lose_nothing() {
     compio::runtime::Runtime::new().unwrap().block_on(async {
         let (clients, _dirs) = boot(242, 24201).await;
-        clients[0].put(b"counter", &0u64.to_le_bytes()).await.unwrap();
+        clients[0].put(b"counter", &0u64.to_le_bytes(), autumn_client::WriteOptions::default()).await.unwrap();
         const TASKS: usize = 8;
         const EACH: u64 = 25;
         let tasks = (0..TASKS).map(|t| {
@@ -67,12 +67,12 @@ fn concurrent_increments_lose_nothing() {
                     loop {
                         let cur = c.get(b"counter").await.unwrap().unwrap();
                         let next = (u64::from_le_bytes(cur[..8].try_into().unwrap()) + 1).to_le_bytes();
-                        if c.compare_put(b"counter", Some(&cur), &next).await.unwrap() {
+                        if c.compare_put(b"counter", Some(&cur), Some(bytes::Bytes::copy_from_slice(&next)), autumn_client::WriteOptions::default()).await.unwrap() {
                             break;
                         }
                     }
                     // Unrelated writes keep the group commit busy around them.
-                    c.put(format!("noise/{t}/{i}").as_bytes(), b"x").await.unwrap();
+                    c.put(format!("noise/{t}/{i}").as_bytes(), b"x", autumn_client::WriteOptions::default()).await.unwrap();
                 }
             }
         });
@@ -93,7 +93,7 @@ fn a_comparison_sees_a_put_admitted_before_it() {
         let c = &clients[0];
         let pairs = (0..50u8).map(|i| async move {
             let key = format!("k{i}");
-            let (put, swapped) = futures::join!(c.put(key.as_bytes(), b"a"), c.compare_put(key.as_bytes(), Some(b"a"), b"b"));
+            let (put, swapped) = futures::join!(c.put(key.as_bytes(), b"a", autumn_client::WriteOptions::default()), c.compare_put(key.as_bytes(), Some(b"a"), Some(bytes::Bytes::copy_from_slice(b"b")), autumn_client::WriteOptions::default()));
             put.unwrap();
             (i, swapped.unwrap())
         });

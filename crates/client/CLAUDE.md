@@ -65,7 +65,7 @@ Constructors:
 
 Semantics / invariants:
 - **Bind a key exactly once per wire request.** Binding happens at each op's ENTRY
-  (`put`/`get`/`delete`/`head`/`put_bulk`/`get_range`/`get_range_into`/`get_direct`; batch
+  (`put`/`get`/`delete`/`head`/`compare_put`/`get_range`/`get_range_into`/`get_direct`; batch
   ops bind each key; `range` binds+clamps+strips). The bound key flows to both routing
   AND the payload closure. `*_bound`/`*_core`/`*_opts` are UNBOUND cores (they receive
   already-bound keys) so a scoped op never double-prefixes.
@@ -87,7 +87,7 @@ Semantics / invariants:
 with a STABLE, recycled address (UCX runtime: `ucp_mem_map`-registered at slab creation
 → rcache/memh zero-copy; TCP runtime: plain recycler, no per-op alloc/zero). Write side:
 `alloc_value_buf(len)` → fill `as_mut_slice()` → `truncate(n)` → `freeze() → Bytes` →
-`put_bulk`. Read side: `get_pooled` hands the recv'd pool buffer back as a `ValueBuf`
+`put`. Read side: `get_pooled` hands the recv'd pool buffer back as a `ValueBuf`
 (zero SDK-side copies); read in place or `freeze()` for a framework sink. Dropping
 either returns the slab to the pool. Cross-thread drop of a frozen `Bytes` is legal but
 frees the slab instead of re-pooling (regpool home-thread guard — foreign-TLS re-pooling
@@ -111,9 +111,24 @@ one staging memcpy into a `ValueBuf` for a stable address (UCX-optimal — the g
 demo's choice). The copy count is decided by who allocates the source buffer, not by
 the API suffix.
 
-- `put(key, value)` — write a key-value pair. Always durable: there is no
-  sync flag to pass (the extent-node fsync coalescer makes every write durable
-  before it ACKs).
+**Writes take `WriteOptions { ttl: Option<Duration>, lease: WriteLease }`** (by value;
+`Copy`; default = no TTL, unfenced; `WriteOptions::fenced(lease)`, `.with_ttl(d)`,
+`.with_lease(l)`). Five write methods, each taking every option that means something
+for it: `put`, `put_many`, `compare_put` (TTL + lease), `delete`, `delete_many` (lease
+only; a TTL is ignored). The TTL is rounded up to whole seconds and sent as the wire's
+absolute `expires_at`. A lease stamps `(inode_hint, lease_epoch)`; the PS refuses a
+write below the inode's floor with `AutumnError::Fenced` and raises the floor on a
+higher one — the write-lease holders (fuse, the fs core, the S3 gateway through it)
+pass theirs, plain KV callers the default. Tests:
+`crates/manager/tests/write_options.rs::ttl_and_lease_reach_every_write` (each option
+through each method, small and large values; ablating any one hand-off is red).
+
+- `put(key, value: impl IntoValue, opts)` — write a key-value pair. Always durable:
+  there is no sync flag (the extent-node fsync coalescer makes every write durable
+  before it ACKs). `IntoValue`: `Bytes` / `Vec<u8>` / `&Bytes` move in without a
+  copy, `&[u8]` / `&[u8; N]` / `&Vec<u8>` are copied. A value ≥ 64 KiB
+  (`bulk_worthwhile`) goes zero-copy as `MSG_PUT_BULK` (below); a smaller one inline
+  as `MSG_PUT`.
 - `get(key) → Option<Vec<u8>>` / `get_range(key, offset, length)` — read, `None` if not
   found. Served by the same pooled `MSG_GET_BULK` core as `get_pooled`; the returned `Vec`
   is the one application copy. Retry classification is `call_ps_for_key`'s: NotFound is a miss,
@@ -132,13 +147,12 @@ the API suffix.
   cancel-safety). Returns `Some(value_len)` (`dest[..value_len.min(dest.len())]` filled;
   longer values TRUNCATED to fit — same contract as `get_many_into`/`get_many_direct`)
   or `None`.
-- `put_bulk(key, value: Bytes)` — **zero-copy write.** Writes with NO client-side copy AND
-  no value crc scan via `MSG_PUT_BULK` + `RpcClient::call_vectored_bulk` (v28: `[meta][key]`
-  is the CRC'd ctrl, the value rides after the crc as its own iovec from `value`'s backing
-  memory; UCX zero-copy via rcache when that memory is `ucp_mem_map`-registered). Same
-  routing + refresh + retry + inline-cap rules as `put`. The frame decoder hands the PS
-  ctrl and value pre-split (zero-copy).
-- `delete(key)` — delete a key.
+- The large-value `put` is the **zero-copy write**: NO client-side copy AND no value
+  crc scan via `MSG_PUT_BULK` + `RpcClient::call_vectored_bulk` (v28: `[meta][key]` is
+  the CRC'd ctrl, the value rides after the crc as its own iovec from `value`'s backing
+  memory; UCX zero-copy via rcache when that memory is `ucp_mem_map`-registered). The
+  frame decoder hands the PS ctrl and value pre-split (zero-copy).
+- `delete(key, opts)` — delete a key (`Ok` even if it did not exist).
 - `head(key) → KeyMeta` — metadata (`found`, `value_length`).
 - `range(prefix, start, limit) → RangeResult` — prefix scan (resume cursor below).
 - `range_until(prefix, start, end, limit) → RangeResult` — the same scan stopping
@@ -176,9 +190,8 @@ chunks are left behind. Test: `system_putstream::a_stream_overwrite_is_invisible
 All batch APIs are thin wrappers over the `fan_out` / `fan_out_collect` primitive; per-op
 bulk decisions go through `bulk_worthwhile`. No `concurrency` arg — internal defaults apply.
 
-- `put_many(items: &[(key, Bytes, expires_at)]) → Vec<Result<()>>` — **public batched
-  write.** Third tuple field is `expires_at` (Unix-epoch seconds; `0` = no TTL); convert
-  a relative TTL with `ClusterClient::ttl_to_expires_at(ttl_secs)`. SDK groups by owning
+- `put_many(items: &[(key, Bytes)], opts) → Vec<Result<()>>` — **public batched
+  write.** `opts` (TTL, lease) applies to every item. SDK groups by owning
   partition. An item ≥ 64 KiB leaves the batch entirely and goes per-op
   `MSG_PUT_BULK`, fanned out CONCURRENTLY via
   `fan_out_collect(batch_put_concurrency())`, one serial chain per key; a key
@@ -191,9 +204,6 @@ bulk decisions go through `bulk_worthwhile`. No `concurrency` arg — internal d
   values inline in the rkyv payload, which keeps them under the frame CRC. The
   threshold is on the sum because what earns a transfer its own iovec is how much the
   FRAME carries, and batching is what makes a frame big. Result `i` matches `items[i]`.
-- `put_many_fenced(items, lease: WriteLease) → Vec<Result<()>>` — lease-fenced
-  `put_many`: every item stamped with the SAME `(inode_hint, lease_epoch)` (one inode's
-  flush). A fenced item returns `AutumnError::Fenced` in its result slot.
 - `get_many(keys: &[&[u8]]) → Vec<Result<Option<Vec<u8>>>>` — **simpler batched read.**
   SDK allocates a `Vec<u8>` per value; one `MSG_BATCH_GET_BULK` per partition, whose
   reply carries every value in the frame's raw tail with only per-key status and length
@@ -236,7 +246,7 @@ bulk decisions go through `bulk_worthwhile`. No `concurrency` arg — internal d
   recv + one memcpy into `dest`; cancel-safe → the size-scaled timeout + replica
   failover are safe); the win over `get_many_into` is ROUTING (PS NIC egress leaves the
   large-value data path), not copy count.
-- `delete_many(keys) → Vec<Result<()>>` — one `MSG_BATCH_DELETE` (0x5C) per owning
+- `delete_many(keys, opts) → Vec<Result<()>>` — one `MSG_BATCH_DELETE` (0x5C) per owning
   partition, same grouping as `put_many`. No bulk variant: a delete carries no value,
   so there is no tail to keep out of the rkyv payload. It was a client-side fan-out of
   single-key deletes until v36; that looked like N concurrent requests and was not,
@@ -244,8 +254,7 @@ bulk decisions go through `bulk_worthwhile`. No `concurrency` arg — internal d
   together land in the same partition. The gain is EXTENT-NODE load, not latency — an
   append is a replicated write, so fewer appends for the same keys is less work asked
   of the extent nodes.
-- `delete_many_fenced(keys, lease)` — the lease-stamped form, mirroring
-  `put_many_fenced`. A fenced key returns `AutumnError::Fenced` in its own slot.
+  A fenced key (`opts.lease`) returns `AutumnError::Fenced` in its own slot.
   ⚠️ Its stale-routing fallback must use `delete_opts` on the ALREADY-BOUND key, never
   the public `delete`: `delete` binds again, a scoped binding then targets
   `{prefix}{prefix}{key}`, and deleting a key that does not exist reports `Ok` — the
@@ -274,8 +283,8 @@ Module-level, `pub`. All batch APIs are thin wrappers over ONE streaming primiti
 
 ## Bulk-value selection rule — `bulk_worthwhile`
 
-The SDK exposes both regular (`get`/`put`) and zero-copy (`get_into`/`put_bulk`) ops; the
-SELECTION is encapsulated in `autumn_client::bulk_worthwhile(value_size) -> bool` — **the
+The SDK picks inline or zero-copy itself on writes (`put`, `put_many`) and offers both
+on reads (`get` / `get_into`); the SELECTION is encapsulated in `autumn_client::bulk_worthwhile(value_size) -> bool` — **the
 ONE source of truth** that perf-check, the python `BatchClient`, and `get_many_into` all
 call.
 
@@ -285,7 +294,7 @@ to use, from the size the sender knows/expects); the two RECEIVERS re-decide the
 strategy on the ACTUAL size with the same 64 KiB — the client read_loop for GET-bulk
 responses (`TCP_RECV_INTO_POOLED_MIN_BYTES`), the PS ps-conn loop for PUT_BULK requests
 (`--bulk-recv-min-bytes`) — because a reply/request can legitimately be smaller
-than the intent predicted (error/NotFound = 0-length value; bare `put_bulk` doesn't gate).
+than the intent predicted (error/NotFound = 0-length value).
 All four gates (this one + the two recv gates + the PS `handle_get_redirect` 64 KiB) are
 deliberately one value; the dispatch table lives in autumn-rpc CLAUDE.md "read_loop
 dispatch (4-way)". Below 64 KiB the per-op registered/pooled-recv machinery costs more
@@ -434,12 +443,12 @@ request was handed to the connection and no answer came back (`SentNoReply`, set
 `ps_call_with_timeout` / `ps_call_bulk_multi` on a transport failure after the
 connect; a failed connect sent nothing). `Unavailable` / `CODE_UNAVAILABLE` means
 not applied. The retry loops take a `CallKind`:
-- `Idempotent` (put, put_bulk, delete, batch put/delete): retry as before. The
+- `Idempotent` (put, delete, batch put/delete): retry as before. The
   write's error is settled at its single exit (`settle_write_error`): after any
   attempt that may have applied, every error — retries run out, a routing miss on
   a later attempt, a token that expired meanwhile — becomes `OutcomeUnknown`, so
   "not applied" holds only when no attempt may have applied.
-- `Conditional` (`compare_put`, `compare_write`): stop at the first attempt that may
+- `Conditional` (`compare_put`): stop at the first attempt that may
   have applied and return `OutcomeUnknown`. A retry would compare against the first
   attempt's own write and report a conflict (`Ok(false)`) — what
   `write_outcome_settled::the_sdk_stops_a_conditional_write_at_its_first_unknown_outcome`
@@ -610,25 +619,24 @@ substitute for this authentication lifecycle.
 Tests in src/connection_tests.rs count TCP accepts and verify retry epochs;
 manager's system_status_connection_reuse exercises actual split and merge.
 
-## Atomic small-value publication
+## Conditional writes
 
-compare_put(key, expected, value) binds the namespace once, then sends the new
-ComparePutReq (wire 44). None requires absence; Some requires exact current-value
-equality. Both expected and new values are limited to 64 KiB. False is a body-level
-conflict and is not retried as stale routing. Transport outcomes can be ambiguous:
-callers publishing UUID generations may read back their UUID to resolve a lost ACK.
-FUSE uses this for create-only directory-entry publication, never bulk payloads.
-
-compare_put_bulk(key, expected, value: Bytes, expires_at) (wire 74,
-`MSG_COMPARE_PUT_BULK`) sends the value as a bulk tail through
-`call_ps_for_key_bulk` (the key-routed retry loop with a tail), so it has no
-64 KiB cap and no copy, and carries a TTL; `expected` keeps the 64 KiB cap.
-Refused with `Unsupported` below `WIRE_VERSION_WITH_COMPARE_PUT_BULK`. A present key still costs the value's
-transfer, so it does not replace an `exists` probe for dedup of mostly-present
-pages (350 ms vs 1 ms for 8 x 64 x 16 MiB over UCX).
-
-compare_write(key, expected, value, lease) is the fenced form (wire 47): `value`
-None deletes, a non-anonymous lease is fence-checked before the comparison, and
-a raised floor persists even when the comparison fails. Refused client-side with
-`AutumnError::Unsupported` when the negotiated cluster wire is below
-`WIRE_VERSION_WITH_COMPARE_WRITE`; the S3 gateway's publication path needs it.
+`compare_put(key, expected, value: Option<Bytes>, opts) → bool` is the one conditional
+write (wire 75, `MSG_COMPARE_WRITE_BULK`): when the key's visible value equals
+`expected` (`None` = absent) it writes `value` (`None` = deletes the key) and returns
+`true`; otherwise nothing is written and it returns `false` (a body-level conflict,
+not retried as stale routing). Decided by the partition's write actor in arrival
+order, so concurrent callers from any clients get one winner. The value travels as
+a bulk tail through `call_ps_for_key_bulk` (no 64 KiB cap, no copy); `expected` is
+capped at 64 KiB. With `expected = None` the PS only checks the key is present.
+`opts.ttl` reaches the stored entry; a non-anonymous `opts.lease` is fence-checked
+before the comparison and a raised floor persists even when the comparison fails
+(a pure floor bump for a recovering owner). Transport outcomes can be ambiguous
+(`OutcomeUnknown`): callers publishing UUID generations read back their UUID to
+resolve a lost ACK. Refused with `Unsupported` below
+`WIRE_VERSION_WITH_COMPARE_WRITE_BULK`. Callers: the fs core (directory entries,
+inode CAS, link counts, S3 publication, multipart state). A present key still costs
+the value's transfer, so it does not replace an `exists` probe for dedup of
+mostly-present pages (350 ms vs 1 ms for 8 x 64 x 16 MiB over UCX). The PS still
+serves the older `MSG_COMPARE_PUT` / `MSG_COMPARE_WRITE` / `MSG_COMPARE_PUT_BULK`
+for older clients; the SDK no longer sends them.

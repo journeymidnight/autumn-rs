@@ -2679,7 +2679,7 @@ async fn cmd_presplit(
             }
         }
         client
-            .put(&k, &autumn_fs::schema::encode_stripe_geom(&layout))
+            .put(&k, &autumn_fs::schema::encode_stripe_geom(&layout), autumn_client::WriteOptions::default())
             .await
             .map_err(|e| anyhow!("presplit: declare fs stripe geometry: {e}"))?;
         if !json {

@@ -31,7 +31,7 @@ pub(crate) enum Command {
         chunk_size: u32,
         out: Option<String>,
     },
-    /// verification: zero-copy PUT via ClusterClient::put_bulk. Reads
+    /// verification: zero-copy PUT via ClusterClient::put. Reads
     /// `file` into a Bytes, registers it for UCX zero-copy send (ucx build),
     /// writes via MSG_PUT_BULK (value sent as its own iovec, no client-side copy).
     PutBulk {

@@ -14,6 +14,7 @@
 //! and takes a `ClusterClient`, so front-ends without an `FsState` (the
 //! `autumnfs` CLI) read and write the same layout.
 
+use autumn_client::WriteOptions;
 use std::rc::Rc;
 
 use anyhow::{anyhow, Result};
@@ -159,15 +160,15 @@ pub async fn write_object(
     lease: WriteLease,
 ) -> Result<()> {
     let extents = object_extents(data_ino, data.len() as u64, lanes, unit);
-    let items: Vec<(&[u8], Bytes, u64)> = extents
+    let items: Vec<(&[u8], Bytes)> = extents
         .iter()
         .map(|(off, k)| {
             let start = *off as usize;
             let end = (start + unit as usize).min(data.len());
-            (k.as_slice(), data.slice(start..end), 0u64)
+            (k.as_slice(), data.slice(start..end))
         })
         .collect();
-    for r in client.put_many_fenced(&items, lease).await {
+    for r in client.put_many(&items, WriteOptions::fenced(lease)).await {
         r.map_err(|e| anyhow!("data object {data_ino}: {e}"))?;
     }
     Ok(())
@@ -184,7 +185,7 @@ pub async fn delete_object(
 ) -> Result<()> {
     let extents = object_extents(data_ino, len, lanes, unit);
     let keys: Vec<&[u8]> = extents.iter().map(|(_, k)| k.as_slice()).collect();
-    for r in client.delete_many_fenced(&keys, lease).await {
+    for r in client.delete_many(&keys, WriteOptions::fenced(lease)).await {
         r.map_err(|e| anyhow!("delete data object {data_ino}: {e}"))?;
     }
     Ok(())
@@ -218,12 +219,12 @@ pub async fn store_map(
     let keys: Vec<Vec<u8>> = (0..pages.len())
         .map(|i| key::segment_page_key(map_id, i as u32))
         .collect();
-    let items: Vec<(&[u8], Bytes, u64)> = keys
+    let items: Vec<(&[u8], Bytes)> = keys
         .iter()
         .zip(&pages)
-        .map(|(k, p)| (k.as_slice(), Bytes::from(schema::encode_segment_page(p)), 0u64))
+        .map(|(k, p)| (k.as_slice(), Bytes::from(schema::encode_segment_page(p))))
         .collect();
-    for r in client.put_many_fenced(&items, lease).await {
+    for r in client.put_many(&items, WriteOptions::fenced(lease)).await {
         r.map_err(|e| anyhow!("segment map {map_id}: {e}"))?;
     }
     Ok(SegmentMap {
@@ -238,7 +239,7 @@ pub async fn store_map(
 pub async fn delete_pages(client: &ClusterClient, map_id: u64, count: u32, lease: WriteLease) -> Result<()> {
     let keys: Vec<Vec<u8>> = (0..count).map(|i| key::segment_page_key(map_id, i)).collect();
     let refs: Vec<&[u8]> = keys.iter().map(Vec::as_slice).collect();
-    for r in client.delete_many_fenced(&refs, lease).await {
+    for r in client.delete_many(&refs, WriteOptions::fenced(lease)).await {
         r.map_err(|e| anyhow!("delete segment map {map_id}: {e}"))?;
     }
     Ok(())
@@ -429,7 +430,7 @@ impl ObjectStream {
         let (client, key, lease) = (self.client.clone(), self.record_key.clone(), self.lease);
         compio::runtime::spawn(async move {
             client
-                .put_fenced(&key, &schema::encode_segc(&rec), lease)
+                .put(&key, &schema::encode_segc(&rec), WriteOptions::fenced(lease))
                 .await
                 .map_err(|e| anyhow!("KV put: {e}"))
         })
@@ -524,7 +525,7 @@ impl ObjectStream {
         let k = key::data_extent_key(self.data_ino, self.written, self.lanes, self.unit);
         let (client, lease, data_ino) = (self.client.clone(), self.lease, self.data_ino);
         self.inflight.push_back(compio::runtime::spawn(async move {
-            let r = client.put_many_fenced(&[(k.as_slice(), chunk, 0u64)], lease).await;
+            let r = client.put_many(&[(k.as_slice(), chunk)], WriteOptions::fenced(lease)).await;
             match r.into_iter().next() {
                 Some(Ok(())) => Ok(()),
                 Some(Err(e)) => Err(anyhow!("data object {data_ino}: {e}")),
@@ -571,7 +572,7 @@ impl ObjectStream {
         if self.recorded > self.written {
             let rec = SegcRecord::Object { len: self.written, lanes: self.lanes, unit: self.unit };
             self.client
-                .put_fenced(&self.record_key, &schema::encode_segc(&rec), self.lease)
+                .put(&self.record_key, &schema::encode_segc(&rec), WriteOptions::fenced(self.lease))
                 .await
                 .map_err(|e| anyhow!("KV put: {e}"))?;
             self.recorded = self.written;
@@ -878,7 +879,7 @@ pub async fn reclaim_except(
         }
         // A record goes only after what it names, so a crash in between
         // leaves the record to retry.
-        for r in client.delete_many_fenced(&done, lease).await {
+        for r in client.delete_many(&done, WriteOptions::fenced(lease)).await {
             r.map_err(|e| anyhow!("reclaim records of {file_ino}: {e}"))?;
         }
         reclaimed += done.len();

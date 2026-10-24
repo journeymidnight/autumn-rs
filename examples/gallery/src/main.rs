@@ -172,7 +172,7 @@ async fn clear_cache_state(client: &Client, name: &str) -> Result<()> {
         thumb_key(name),
     ];
     for key in keys {
-        match client.delete(key.as_bytes()).await {
+        match client.delete(key.as_bytes(), autumn_client::WriteOptions::default()).await {
             Ok(()) | Err(AutumnError::NotFound) => {}
             Err(error) => return Err(anyhow!("clear stale cache state {key}: {error}")),
         }
@@ -223,14 +223,14 @@ async fn write_meta_fields(client: &Client, name: &str, fields: &[(&'static str,
     }
     let prefix = meta_prefix(name);
     let keys: Vec<String> = fields.iter().map(|(k, _)| format!("{prefix}{k}")).collect();
-    let items: Vec<(&[u8], bytes::Bytes, u64)> = keys
+    let items: Vec<(&[u8], bytes::Bytes)> = keys
         .iter()
         .zip(fields)
-        .map(|(key, (_, val))| (key.as_bytes(), bytes::Bytes::from(val.clone()), 0))
+        .map(|(key, (_, val))| (key.as_bytes(), bytes::Bytes::from(val.clone())))
         .collect();
 
     let t0 = Instant::now();
-    let results = client.put_many(&items).await;
+    let results = client.put_many(&items, autumn_client::WriteOptions::default()).await;
     let dt = elapsed_ms(t0);
     let failed = results.iter().filter(|r| r.is_err()).count();
     if failed > 0 {
@@ -868,7 +868,7 @@ async fn transcode_video_task(name: String, client: Client, map: TranscodeMap) {
             hls_key(&name, &fname)
         };
         kv_bytes += bytes.len() as u64;
-        let put_res = client.put(key.as_bytes(), &bytes).await;
+        let put_res = client.put(key.as_bytes(), &bytes, autumn_client::WriteOptions::default()).await;
         if let Err(e) = put_res {
             tracing::warn!("write {key} failed: {e}");
             map.borrow_mut()
@@ -1238,15 +1238,15 @@ async fn put_handler_inner(
                 let mut vb = autumn_client::alloc_value_buf(data.len());
                 vb.as_mut_slice().copy_from_slice(&data);
                 client
-                    .put_bulk(file_key(&filename).as_bytes(), vb.freeze())
+                    .put(file_key(&filename).as_bytes(), vb.freeze(), autumn_client::WriteOptions::default())
                     .await
             } else {
                 client
-                    .put_bulk(file_key(&filename).as_bytes(), data.clone())
+                    .put(file_key(&filename).as_bytes(), data.clone(), autumn_client::WriteOptions::default())
                     .await
             }
         } else {
-            client.put(file_key(&filename).as_bytes(), &data).await
+            client.put(file_key(&filename).as_bytes(), &data, autumn_client::WriteOptions::default()).await
         };
         let dt = elapsed_ms(t0);
         if let Err(e) = put_res {
@@ -1413,7 +1413,7 @@ async fn get_handler_inner(
 
 async fn cleanup_derived(client: &Client, name: &str) {
     // Best-effort; NotFound is fine.
-    let _ = client.delete(thumb_key(name).as_bytes()).await;
+    let _ = client.delete(thumb_key(name).as_bytes(), autumn_client::WriteOptions::default()).await;
     // Sweep every prefix-scoped artifact for this file: HLS segments and the
     // per-file metadata KV written at upload time.
     for prefix in [hls_dir_prefix(name), meta_prefix(name)] {
@@ -1422,7 +1422,7 @@ async fn cleanup_derived(client: &Client, name: &str) {
             Err(_) => continue,
         };
         for entry in scan.entries {
-            let _ = client.delete(&entry.key).await;
+            let _ = client.delete(&entry.key, autumn_client::WriteOptions::default()).await;
         }
     }
 }
@@ -1850,7 +1850,7 @@ async fn thumb_handler_inner(
         let client = client.clone();
         let thumb = thumb.clone();
         compio::runtime::spawn(async move {
-            if let Err(e) = client.put(key.as_bytes(), &thumb).await {
+            if let Err(e) = client.put(key.as_bytes(), &thumb, autumn_client::WriteOptions::default()).await {
                 tracing::warn!("cache thumbnail put failed for {name}: {e}");
             }
         })

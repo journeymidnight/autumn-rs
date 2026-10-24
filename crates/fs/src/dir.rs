@@ -1,5 +1,6 @@
 //! Directory operations: lookup, readdir, mkdir, rmdir, rename.
 
+use autumn_client::WriteOptions;
 use std::ffi::OsStr;
 
 use anyhow::{anyhow, Result};
@@ -289,7 +290,7 @@ async fn cas_dir(state: &mut FsState, dir: u64, read: Option<Vec<u8>>, change: &
     }
     let swapped = state
         .client
-        .compare_put(&k, Some(&old), &new)
+        .compare_put(&k, Some(&old), Some(bytes::Bytes::copy_from_slice(&new)), WriteOptions::default())
         .await
         .map_err(|e| anyhow!("KV compare_put: {e}"))?;
     if swapped {
@@ -374,7 +375,7 @@ async fn create_child(
     let dv = schema::encode_dirent(&DirentValue { child_inode: ino, file_type });
     let created = state
         .client
-        .compare_put(&dk, None, &dv)
+        .compare_put(&dk, None, Some(bytes::Bytes::copy_from_slice(&dv)), WriteOptions::default())
         .await
         .map_err(|e| anyhow!("KV compare_put: {e}"))?;
     if !created {
@@ -503,9 +504,9 @@ pub async fn unlink(state: &mut FsState, parent: u64, name: &OsStr) -> Result<()
 async fn remove_name(state: &mut FsState, dk: &[u8], v: &[u8]) -> Result<bool> {
     state
         .client
-        .compare_write(dk, Some(v), None, autumn_client::WriteLease::ANON)
+        .compare_put(dk, Some(v), None, WriteOptions::default())
         .await
-        .map_err(|e| anyhow!("KV compare_write: {e}"))
+        .map_err(|e| anyhow!("KV compare_put: {e}"))
 }
 
 /// Add a name to a regular file. The directory entry is create-only so two
@@ -531,7 +532,7 @@ pub async fn link(state: &mut FsState, ino: u64, parent: u64, name: &OsStr) -> R
         child_inode: ino,
         file_type: DT_REG,
     });
-    let created = state.client.compare_put(&key, None, &value).await?;
+    let created = state.client.compare_put(&key, None, Some(bytes::Bytes::copy_from_slice(&value)), WriteOptions::default()).await?;
     if !created {
         // A retry after a lost ACK can see our own inode. Never decrement a
         // reference whose publication might already have succeeded.
@@ -675,7 +676,7 @@ pub async fn compare_put_settled(
     let (mut unsure, mut held) = (false, false);
     for _ in 0..8 {
         if std::mem::take(&mut held) {
-            let landed = client.compare_put(dk, expected, value).await.map_err(|e| anyhow!("KV compare_put: {e}"))?;
+            let landed = client.compare_put(dk, expected, Some(bytes::Bytes::copy_from_slice(value)), WriteOptions::default()).await.map_err(|e| anyhow!("KV compare_put: {e}"))?;
             SETTLE_TEST_LATE_LANDED.store(landed, Relaxed);
         }
         let fault = match SETTLE_TEST_FAULT.load(Relaxed) {
@@ -686,7 +687,7 @@ pub async fn compare_put_settled(
             held = fault == SETTLE_TEST_LANDS_LATE;
             Err(autumn_client::AutumnError::OutcomeUnknown("not sent (test)".into()))
         } else {
-            client.compare_put(dk, expected, value).await
+            client.compare_put(dk, expected, Some(bytes::Bytes::copy_from_slice(value)), WriteOptions::default()).await
         };
         match sent {
             Ok(true) => return Ok(true),

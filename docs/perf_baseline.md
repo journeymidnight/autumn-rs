@@ -88,7 +88,7 @@ write phase left behind. Shape: RF=3 on `/data03`,`/data05`,`/data08`, one
 partition, client depth 8, TCP loopback or same-host RoCE (`mlx5_1:1`),
 compio 0.19. Median of the interleaved runs, MiB/s:
 
-| Transport | Size | Write (`put_bulk`) | PS-proxied read (`get_pooled`) | Direct read (`get_direct`) |
+| Transport | Size | Write (`put`, zero-copy) | PS-proxied read (`get_pooled`) | Direct read (`get_direct`) |
 |---|---|---:|---:|---:|
 | TCP | 64 KiB | 141 | 1,850 | 2,546 |
 | TCP | 1 MiB | 657 | 3,125 | 3,759 |

@@ -283,9 +283,9 @@ async fn routing_retries_keep_the_connection_for_plain_bulk_and_pooled_calls() {
             client.regions.borrow_mut().push((1, region(1)));
             client.part_addrs.borrow_mut().insert(1, peer.addr.clone());
             match shape {
-                0 => client.put(b"key", b"value").await.unwrap(),
+                0 => client.put(b"key", b"value", WriteOptions::default()).await.unwrap(),
                 1 => client
-                    .put_bulk(b"key", Bytes::from(vec![7; 65536]))
+                    .put(b"key", Bytes::from(vec![7; 65536]), WriteOptions::default())
                     .await
                     .unwrap(),
                 _ => assert_eq!(client.get(b"key").await.unwrap().unwrap(), b"value"),
@@ -455,7 +455,7 @@ async fn a_partition_refusal_is_checked_independently_of_the_manager() {
     })
     .await;
     let client = ClusterClient::connect_raw(&mgr.addr).await.unwrap();
-    let err = client.put(b"key", b"value").await.unwrap_err();
+    let err = client.put(b"key", b"value", WriteOptions::default()).await.unwrap_err();
     assert!(matches!(err, AutumnError::WireVersionRefused(_)), "{err}");
     assert!(err.to_string().contains(HELLO_REFUSAL));
     assert_eq!(ps.accepts.get(), 1);

@@ -38,7 +38,7 @@ seconds for throughput/CPU. A trial loads 64 keys of each size, then runs fixed-
 twice: untraced (MiB/s, p99, process CPU through host perf) and traced with
 `copies.bt`. The traced pass exists for byte accounting only: a uprobe fires on
 every memcpy call, so its throughput is not a performance result. Modes are
-`write` (`put_bulk`), `read` (`get_pooled`, PS proxy), `direct` (`get_direct`,
+`write` (`put`, zero-copy above 64 KiB), `read` (`get_pooled`, PS proxy), `direct` (`get_direct`,
 EN descriptor read) and `get` (`ClusterClient::get` at every size).
 
 The driver disables ASLR for itself and every process it starts (the flag is

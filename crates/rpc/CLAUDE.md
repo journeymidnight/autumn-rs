@@ -601,7 +601,7 @@ overflows the frame.
 
 ## Wire version, and the two checks over it
 
-`WIRE_VERSION` (currently **74**) is the schema this binary speaks.
+`WIRE_VERSION` (currently **75**) is the schema this binary speaks.
 `MIN_CLIENT_WIRE_VERSION` (**43**) is the oldest CLIENT it serves. Both are maintained
 **BY HAND**. There is no schema fingerprint — hashing the sources byte for byte cost
 more than it caught (a translated comment once split a rolling cluster, and each false
@@ -946,6 +946,17 @@ and new bytes. PutResp CODE_PRECONDITION means comparison failed; region/ownersh
 errors retain frame-level status for routing refresh. Both values are capped at
 64 KiB; extract_part_id and both PS namespace/authz gates decode the new request.
 Every service and embedded client must be rebuilt together for wire 44.
+
+## One conditional write for the SDK (wire 75)
+
+`MSG_COMPARE_WRITE_BULK` (0x61): ctrl `CompareWriteBulkReq` (part_id,
+region_epoch, key, optional expected, `delete`, expires_at, inode_hint,
+lease_epoch), the value as the frame's tail (empty for a delete). It is what
+`ClusterClient::compare_put` sends for every conditional write, with any mix of
+TTL, lease fence and value size. `MSG_COMPARE_PUT`, `MSG_COMPARE_WRITE` and
+`MSG_COMPARE_PUT_BULK` stay served for older clients (two-form rule) and can go
+when `MIN_CLIENT_WIRE_VERSION` rises past 75. New client-surface form: ceiling
+[43, 75], floor unchanged.
 
 ## Conditional put with a bulk value (wire 74)
 

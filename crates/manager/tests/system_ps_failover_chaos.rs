@@ -227,7 +227,7 @@ fn ps_kill_migrates_partitions() {
                 } else {
                     format!("v{part_idx}-{i}").into_bytes()
                 };
-                cluster.put(&k, &v).await.expect("seed put");
+                cluster.put(&k, &v, autumn_client::WriteOptions::default()).await.expect("seed put");
                 expected.push((k, v));
             }
         }
@@ -272,7 +272,7 @@ fn ps_kill_migrates_partitions() {
             let k = key_for(part_idx, 90_000 + part_idx as u32);
             let t1 = Instant::now();
             loop {
-                match cluster.put(&k, b"post-failover").await {
+                match cluster.put(&k, b"post-failover", autumn_client::WriteOptions::default()).await {
                     Ok(()) => break,
                     Err(e) => {
                         assert!(
@@ -294,7 +294,7 @@ fn ps_kill_migrates_partitions() {
             assert_eq!(got.as_deref(), Some(v.as_slice()), "post-respawn mismatch");
         }
         let k = key_for(0, 95_000);
-        cluster.put(&k, b"post-respawn").await.expect("post-respawn write");
+        cluster.put(&k, b"post-respawn", autumn_client::WriteOptions::default()).await.expect("post-respawn write");
     });
 }
 
@@ -327,7 +327,7 @@ fn ps_kill_during_write_storm() {
             let part_idx = (i % 2) as usize;
             let k = key_for(part_idx, 10_000 + i);
             let v = format!("storm-{i}").into_bytes();
-            match cluster.put(&k, &v).await {
+            match cluster.put(&k, &v, autumn_client::WriteOptions::default()).await {
                 Ok(()) => acked.push((k, v)),
                 Err(_) => { /* uncertain — drop from expectations */ }
             }

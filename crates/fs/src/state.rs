@@ -2,6 +2,7 @@
 //!
 //! Contains ClusterClient, inode cache, dirty tracking, and KV helper methods.
 
+use autumn_client::WriteOptions;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -385,7 +386,7 @@ impl FsState {
     /// `kv_put_sync` is an alias with the same durability guarantee.
     pub async fn kv_put(&mut self, k: &[u8], v: &[u8]) -> Result<()> {
         self.client
-            .put(k, v)
+            .put(k, v, WriteOptions::default())
             .await
             .map_err(|e| anyhow!("KV put: {e}"))
     }
@@ -402,7 +403,7 @@ impl FsState {
         // The chain is kept: `write::flush_inode` asks whether the refusal
         // was the fence.
         self.client
-            .put_fenced(k, v, lease)
+            .put(k, v, WriteOptions::fenced(lease))
             .await
             .map_err(|e| anyhow::Error::new(e).context("KV put"))
     }
@@ -449,7 +450,7 @@ impl FsState {
     /// Delete a key from the KV store.
     pub async fn kv_delete(&mut self, k: &[u8]) -> Result<()> {
         self.client
-            .delete(k)
+            .delete(k, WriteOptions::default())
             .await
             .map_err(|e| anyhow!("KV delete: {e}"))
     }
@@ -463,7 +464,7 @@ impl FsState {
         lease: autumn_client::WriteLease,
     ) -> Result<()> {
         self.client
-            .delete_fenced(k, lease)
+            .delete(k, WriteOptions::fenced(lease))
             .await
             .map_err(|e| anyhow::Error::new(e).context("KV delete"))
     }

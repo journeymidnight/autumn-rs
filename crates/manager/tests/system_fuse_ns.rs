@@ -1,7 +1,7 @@
 //! fuse batch-data-path key-consistency regression test.
 //!
 //! The extent DATA path bypasses `FsState`'s `kv_*` helpers for performance
-//! (read → `get_many_into`, write append → `put_many_fenced`), calling the
+//! (read → `get_many_into`, write append → fenced `put_many`), calling the
 //! scoped client directly. Both paths and the `kv_*` metadata paths must land
 //! at the SAME `fs/[type]…` keys, or a cold remount's range-scan/read
 //! wouldn't find the extents the append path wrote. Every OTHER fuse test
@@ -83,7 +83,7 @@ fn cold_remount_reads_back_written_extents() {
         let mgr = mgr_addr.to_string();
 
         // 10 MiB → 2 extents, written through the buffered append path
-        // (flush_appends → put_many_fenced — the batch write that bypassed the
+        // (flush_appends → fenced put_many — the batch write that bypassed the
         // kv_* choke point pre-fix).
         let total = 10 * 1024 * 1024usize;
         let data = pattern(total, 0xA5);
@@ -162,11 +162,11 @@ fn readdir_pages_past_one_range_page() {
             .iter()
             .map(|n| autumn_fs::key::dirent_key(dir, n.as_bytes()))
             .collect();
-        let items: Vec<(&[u8], bytes::Bytes, u64)> = keys
+        let items: Vec<(&[u8], bytes::Bytes)> = keys
             .iter()
-            .map(|k| (k.as_slice(), bytes::Bytes::from(dv.clone()), 0u64))
+            .map(|k| (k.as_slice(), bytes::Bytes::from(dv.clone())))
             .collect();
-        for r in state.client.put_many(&items).await {
+        for r in state.client.put_many(&items, autumn_client::WriteOptions::default()).await {
             r.expect("put dirent");
         }
 

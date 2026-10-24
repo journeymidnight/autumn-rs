@@ -471,8 +471,8 @@ Persistence — floors survive restart / reschedule:
   max-merges every OP_FENCE_BUMP (idempotent — deliberately bypasses ts-dedup;
   re-applying a checkpoint-covered bump is a no-op).
 
-Client surface: `WriteLease` + `put_fenced`/`put_bulk_fenced`/`put_many_fenced`
-(`AutumnError::Fenced`); fuse stamps from `held_leases[ino].version`, the ioring
+Client surface: `WriteOptions { lease }` on `put` / `put_many` / `delete` /
+`delete_many` / `compare_put` (`AutumnError::Fenced`); fuse stamps from `held_leases[ino].version`, the ioring
 daemon from `OpenedExtents.lease_version`. `MSG_STREAM_PUT` is REMOVED (0x46
 reserved).
 
@@ -3229,11 +3229,13 @@ Tests: `crates/manager/tests/compare_write_concurrency.rs` (one winner of 32
 creates, no increment lost by 8 read-CAS loops, a comparison sees a put sent just
 before it; without the uncommitted-key drain all three are red).
 
-MSG_COMPARE_WRITE shares that handler (`compare_write_admit`; MSG_COMPARE_PUT is
-the unfenced, value-only case of it). So does MSG_COMPARE_PUT_BULK (wire 74): an
-unfenced compare-put whose value is the frame's tail and which carries a TTL;
-`drain_bulk_writes` receives a large tail into a pooled buffer as for
-MSG_PUT_BULK, and `decode_conditional` turns all three into one `Conditional`
+MSG_COMPARE_WRITE_BULK (wire 75) is the form the SDK sends: a value from the
+frame's tail or a delete, a TTL, and a fence, all optional. The older forms share
+the handler (`compare_write_admit`) for older clients: MSG_COMPARE_WRITE (fenced,
+inline value or delete), MSG_COMPARE_PUT (its unfenced, value-only case) and
+MSG_COMPARE_PUT_BULK (wire 74: unfenced, tail value, TTL). `drain_bulk_writes`
+receives a large tail into a pooled buffer as for MSG_PUT_BULK, and
+`decode_conditional` turns all four into one `Conditional`
 (value as `Bytes`, so the tail is never copied; the 64 KiB cap stays on the inline
 forms and on `expected`). With `expected = None` the comparison is presence only
 (`lookup_live`, shared with HEAD): it resolves no value pointer, so a present
@@ -3243,9 +3245,10 @@ inline cap is refused in the reply body (`CODE_VALUE_TOO_LARGE`, as
 `enqueue_put_bulk` does): as a frame error the client read it as a routing miss
 and re-sent the whole value ten times. Conditional writes count in `req_count`
 like every other request; the presence lookup records no read metrics. Tests:
-`crates/manager/tests/compare_put_bulk.rs` (red without the presence check,
-without the TTL, or with the oversized value refused as a frame error), `compare_put_bulk_tail_is_recvd_into_a_pooled_buffer` (red
-without the pooled-receive recognition). Order: epoch/range/freeze, then the fence
+`crates/manager/tests/write_options.rs` (red without the presence check, without
+the TTL or the lease on any write, or with the oversized value refused as a frame
+error), `compare_write_bulk_tail_is_recvd_into_a_pooled_buffer` and its
+`compare_put_bulk_` sibling (red without the pooled-receive recognition). Order: epoch/range/freeze, then the fence
 check-and-bump, then the comparison, then the write — a misrouted request never
 raises a floor. A floor the request raised is persisted as an OP_FENCE_BUMP
 record whether or not the comparison holds, and a failed comparison is reported

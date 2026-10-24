@@ -82,7 +82,7 @@ namespace（`fsA`/`fsB`）。上表是 RELATIVE key —— **client 负责整个
 （prepend + 把返回 range key 剥回、按 namespace 边界 clamp）。`state.rs` 的 8 个
 `kv_*` choke point、`key::*` builder、全部 `parse_*` 都交裸 RELATIVE key 给 client，
 零 wire 拼接。两处 batch 数据路径（`read::prepare` 的 `ChunkSpec.key`、
-`extent::flush_appends` 的 append keys，为性能直调 `get_many_*`/`put_many_fenced`
+`extent::flush_appends` 的 append keys，为性能直调 `get_many_*`/`put_many`
 绕过 `kv_*`）同样交裸 `key::*`——client 一处 prepend，与元数据路径一致。授权 =
 `principal-create --grant fs/` + `--credential-file`（principal 名在文件里，authz
 开了就整个 `fs/` 受保护）。详见 docs/key_namespace_split_design.md。
@@ -582,7 +582,7 @@ S3 multipart 的 Complete 必须**不读、不拷、不重写任何分片正文*
 
 ### 整文件发布（`publish.rs`，S3 PUT / Copy / Complete / Delete 的核心）
 
-新文件写进**新 inode**（`NewFile`），对谁都不可见，然后一次带围栏的 `compare_write` 把
+新文件写进**新 inode**（`NewFile`），对谁都不可见，然后一次带围栏的 `compare_put` 把
 dirent 换过去——`If-None-Match: *`（期望不存在）和 `If-Match`（期望指向那个 inode）由 PS
 判定，不是先读后写。读者只会看到旧文件或新文件的全部。ETag = hex(ino) ++ hex(generation)。
 
@@ -619,7 +619,7 @@ dirent 换过去——`If-None-Match: *`（期望不存在）和 `If-Match`（�
 - **恢复只在 dirent 恰好是 `successor` 时退旧 inode**：别的会话把名字换走时已经自己退过
   一次，再退一次对 nlink=2 的 inode（Lance manifest 经 FUSE 硬链接）就是删掉另一个名字还指着
   的文件（`a_retire_whose_swap_lost_leaves_a_linked_inode_alone`，消融：按"dirent 不再指向
-  它"判定即红）。记录用 `compare_write(None)` 只建不覆盖：结果未知的上一次交换留下的记录
+  它"判定即红）。记录用 `compare_put`（expected = None）只建不覆盖：结果未知的上一次交换留下的记录
   原样保留，`end_swap` 只删本次建的——否则后一次失败的重试会删掉前一次仍可能落地的记录。
 - **结果未知 ≠ 没落地**：CAS 的 RPC 出错时回读 dirent，是新值就算成功；否则返回
   `PublishError::Other`，调用方**不撤销**（在途请求之后仍可能落地），记录留给恢复。只有
@@ -703,7 +703,7 @@ dirent 换过去——`If-None-Match: *`（期望不存在）和 `If-Match`（�
 
 - **状态机只经 CAS 迁移**：`[0x04]mpu/[id]` → `UploadRecord{parent,name,key,state}`，
   `Open → Completing{new_ino,session,frozen} → Completed{new_ino,frozen}`，或
-  `Open → Aborted`，每一步都是对该记录的 `compare_write`，所以 Complete 与 Abort 只有一个
+  `Open → Aborted`，每一步都是对该记录的 `compare_put`，所以 Complete 与 Abort 只有一个
   赢家。`frozen` 是 Complete 冻结的数据对象列表：之后迟到或失败的 UploadPart 写出的对象
   不在其中，既混不进文件，也不会被当成文件的一部分删掉。
 - **数据对象的归属**：分片记录 `[0x04]mpp/[id][part]` 指向该分片**当前**的对象；上传创建

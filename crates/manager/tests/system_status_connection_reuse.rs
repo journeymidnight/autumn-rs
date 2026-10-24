@@ -120,8 +120,8 @@ fn split_merge_status_refusals_reuse_healthy_connections() {
             let admin = ClusterClient::connect_admin(&mgr_addr.to_string())
                 .await
                 .unwrap();
-            admin.put(b"c-key", b"left").await.unwrap();
-            admin.put(b"r-key", b"right").await.unwrap();
+            admin.put(b"c-key", b"left", autumn_client::WriteOptions::default()).await.unwrap();
+            admin.put(b"r-key", b"right", autumn_client::WriteOptions::default()).await.unwrap();
             admin.flush(1801).await.unwrap();
             let observer = ClusterClient::connect_raw(&mgr_addr.to_string())
                 .await
@@ -141,7 +141,7 @@ fn split_merge_status_refusals_reuse_healthy_connections() {
                 .await
             );
             // Cached pre-split epoch must refresh and retry transparently.
-            observer.put(b"c-key", b"left-after-split").await.unwrap();
+            observer.put(b"c-key", b"left-after-split", autumn_client::WriteOptions::default()).await.unwrap();
             assert_ne!(observer.lookup_epoch_for_part(1801), old_epoch);
             let split_accepts = probe_stale_epoch(&observer, 1801, old_epoch, "after split").await;
             admin.refresh_regions().await.unwrap();
@@ -178,7 +178,7 @@ fn split_merge_status_refusals_reuse_healthy_connections() {
                     Duration::from_secs(15),
                     Duration::from_millis(100),
                     || async {
-                        match observer.put(b"c-key", b"left-after-merge").await {
+                        match observer.put(b"c-key", b"left-after-merge", autumn_client::WriteOptions::default()).await {
                             Ok(()) => true,
                             Err(AutumnError::ServerError(m))
                                 if m.contains("partition frozen for merge") =>

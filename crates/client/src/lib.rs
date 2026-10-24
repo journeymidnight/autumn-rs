@@ -242,9 +242,14 @@ impl NamespaceScope<'_> {
         &self.binding
     }
 
-    pub async fn put(&self, key: &[u8], value: &[u8]) -> std::result::Result<(), AutumnError> {
+    pub async fn put(
+        &self,
+        key: &[u8],
+        value: impl IntoValue,
+        opts: WriteOptions,
+    ) -> std::result::Result<(), AutumnError> {
         let bound = self.binding.bind_key(key)?;
-        self.client.put_bound(&bound, value).await
+        self.client.put_bound(&bound, value.into_value(), opts.expires_at(), opts.lease).await
     }
 
     pub async fn get(&self, key: &[u8]) -> std::result::Result<Option<Vec<u8>>, AutumnError> {
@@ -252,9 +257,9 @@ impl NamespaceScope<'_> {
         self.client.get_bound(&bound).await
     }
 
-    pub async fn delete(&self, key: &[u8]) -> std::result::Result<(), AutumnError> {
+    pub async fn delete(&self, key: &[u8], opts: WriteOptions) -> std::result::Result<(), AutumnError> {
         let bound = self.binding.bind_key(key)?;
-        self.client.delete_bound(&bound).await
+        self.client.delete_opts(&bound, opts.lease).await
     }
 
     pub async fn head(&self, key: &[u8]) -> std::result::Result<KeyMeta, AutumnError> {
@@ -304,6 +309,83 @@ impl WriteLease {
         inode_hint: 0,
         lease_epoch: 0,
     };
+}
+
+/// A value `put` takes: `Bytes` and `Vec<u8>` move in without a copy (a large
+/// `Bytes` is then sent straight from its memory); a borrowed slice is copied.
+pub trait IntoValue {
+    fn into_value(self) -> Bytes;
+}
+
+impl IntoValue for Bytes {
+    fn into_value(self) -> Bytes {
+        self
+    }
+}
+
+impl IntoValue for Vec<u8> {
+    fn into_value(self) -> Bytes {
+        Bytes::from(self)
+    }
+}
+
+impl IntoValue for &[u8] {
+    fn into_value(self) -> Bytes {
+        Bytes::copy_from_slice(self)
+    }
+}
+
+impl<const N: usize> IntoValue for &[u8; N] {
+    fn into_value(self) -> Bytes {
+        Bytes::copy_from_slice(self)
+    }
+}
+
+impl IntoValue for &Bytes {
+    fn into_value(self) -> Bytes {
+        self.clone()
+    }
+}
+
+impl IntoValue for &Vec<u8> {
+    fn into_value(self) -> Bytes {
+        Bytes::copy_from_slice(self)
+    }
+}
+
+/// Options of every write: `put`, `put_many`, `delete`, `delete_many`,
+/// `compare_put`. The default is no TTL and no lease fence.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WriteOptions {
+    /// Time to live, rounded up to whole seconds (a zero one is one second);
+    /// `None` = never expires. Deletes ignore it.
+    pub ttl: Option<Duration>,
+    /// Lease the PS fences the write on (`AutumnError::Fenced` once a newer
+    /// writer of the inode has been seen); `WriteLease::ANON` = unfenced.
+    pub lease: WriteLease,
+}
+
+impl WriteOptions {
+    /// No TTL, fenced on `lease`.
+    pub fn fenced(lease: WriteLease) -> Self {
+        WriteOptions { ttl: None, lease }
+    }
+
+    pub fn with_ttl(self, ttl: Duration) -> Self {
+        WriteOptions { ttl: Some(ttl), ..self }
+    }
+
+    pub fn with_lease(self, lease: WriteLease) -> Self {
+        WriteOptions { lease, ..self }
+    }
+
+    /// Absolute unix seconds the wire carries; 0 = no expiry.
+    fn expires_at(&self) -> u64 {
+        self.ttl.map_or(0, |t| {
+            let secs = t.as_secs().saturating_add(u64::from(t.subsec_nanos() > 0));
+            ClusterClient::ttl_to_expires_at(secs.max(1))
+        })
+    }
 }
 
 fn code_to_error(code: u8, message: String) -> AutumnError {
@@ -3199,175 +3281,103 @@ impl ClusterClient {
 
     // ── High-level SDK API ──────────────────────────────────────────────────
 
-    /// Put a key-value pair. Retries once on routing miss.
-    ///
-    /// Every Put is durable through the extent-node fsync coalescer
-    /// (group commit).
-    pub async fn put(&self, key: &[u8], value: &[u8]) -> std::result::Result<(), AutumnError> {
+    /// Put a key-value pair, durable through the extent-node group commit when
+    /// it returns. A value of 64 KiB or more travels as its own iovec straight
+    /// from `value`'s memory (`MSG_PUT_BULK`; RDMA on UCX when that memory is
+    /// registered — see `alloc_value_buf` for which buffers are), a smaller
+    /// one inline (`MSG_PUT`).
+    pub async fn put(
+        &self,
+        key: &[u8],
+        value: impl IntoValue,
+        opts: WriteOptions,
+    ) -> std::result::Result<(), AutumnError> {
         let bound = self.binding.bind_key(key)?;
-        self.put_bound(&bound, value).await
+        self.put_bound(&bound, value.into_value(), opts.expires_at(), opts.lease).await
     }
 
-    /// Atomically replace a small value if it equals `expected`; None requires
-    /// absence. False means conflict. On an RPC error the outcome may be
-    /// ambiguous: a unique generation in the value lets callers resolve it.
-    pub async fn compare_put(
-        &self, key: &[u8], expected: Option<&[u8]>, value: &[u8],
-    ) -> std::result::Result<bool, AutumnError> {
-        let cap = partition_rpc::MAX_COMPARE_PUT_BYTES;
-        if value.len() > cap || expected.is_some_and(|v| v.len() > cap) {
-            return Err(AutumnError::InvalidArgument(format!(
-                "compare_put values exceed {cap} bytes"
-            )));
+    /// `put` over an ALREADY-bound wire key; `raw()` / `rescope` views call
+    /// it with their own key transform. D7.
+    async fn put_bound(
+        &self,
+        key: &[u8],
+        value: Bytes,
+        expires_at: u64,
+        lease: WriteLease,
+    ) -> std::result::Result<(), AutumnError> {
+        if bulk_worthwhile(value.len()) {
+            self.put_bulk_opts(key, value, expires_at, lease).await
+        } else {
+            self.put_opts(key, &value, expires_at, lease).await
         }
-        let key = self.binding.bind_key(key)?;
-        let response = self
-            .call_ps_for_key(
-                CallKind::Conditional,
-                &key,
-                partition_rpc::MSG_COMPARE_PUT,
-                |part_id, region_epoch| {
-                    rkyv_encode(&partition_rpc::ComparePutReq {
-                        part_id,
-                        region_epoch,
-                        key: key.clone(),
-                        expected: expected.map(<[u8]>::to_vec),
-                        value: value.to_vec(),
-                    })
-                },
-            )
-            .await?;
-        let response: PutResp = rkyv_decode(&response).map_err(AutumnError::ServerError)?;
-        if response.code == partition_rpc::CODE_PRECONDITION { return Ok(false); }
-        check_ps_code(response.code, &response.message)?;
-        Ok(true)
     }
 
-    /// `compare_put` for a value of any size up to the put cap, with an
-    /// absolute TTL (`expires_at`, 0 = none). The value is sent as a bulk tail,
-    /// so it is not copied; `expected` is still capped at 64 KiB. With
-    /// `expected = None` this is put-if-absent: the server checks only that
-    /// the key is there, and a present key is not written at all.
-    pub async fn compare_put_bulk(
-        &self, key: &[u8], expected: Option<&[u8]>, value: Bytes, expires_at: u64,
+    /// Conditional write, decided on the PS in arrival order: when the key's
+    /// visible value equals `expected` (`None` = absent), write `value`
+    /// (`None` = delete the key) and return `true`; otherwise write nothing
+    /// and return `false`. `expected` is capped at 64 KiB; `value` has the
+    /// put cap and travels like a large put's. With `expected = None` the PS
+    /// only checks the key is there, without reading its value.
+    ///
+    /// A non-anonymous `opts.lease` is fence-checked BEFORE the comparison and
+    /// a raised floor is made durable even when the comparison fails, so a
+    /// call whose expectation cannot hold is a pure floor bump for the key's
+    /// partition; a stale epoch returns `AutumnError::Fenced`.
+    ///
+    /// An RPC error can leave the outcome unknown (`OutcomeUnknown`, never
+    /// retried here): a retry would compare against its own first attempt.
+    /// Callers that retry need a value unique to their attempt to tell their
+    /// own success from someone else's.
+    pub async fn compare_put(
+        &self,
+        key: &[u8],
+        expected: Option<&[u8]>,
+        value: Option<Bytes>,
+        opts: WriteOptions,
     ) -> std::result::Result<bool, AutumnError> {
         let negotiated = self.negotiated_cluster_wire.get();
-        if negotiated < autumn_rpc::WIRE_VERSION_WITH_COMPARE_PUT_BULK {
+        if negotiated < autumn_rpc::WIRE_VERSION_WITH_COMPARE_WRITE_BULK {
             return Err(AutumnError::Unsupported(format!(
-                "compare_put_bulk needs cluster wire >= {}, negotiated {negotiated}",
-                autumn_rpc::WIRE_VERSION_WITH_COMPARE_PUT_BULK
+                "compare_put needs cluster wire >= {}, negotiated {negotiated}",
+                autumn_rpc::WIRE_VERSION_WITH_COMPARE_WRITE_BULK
             )));
         }
         let cap = partition_rpc::MAX_COMPARE_PUT_BYTES;
         if expected.is_some_and(|v| v.len() > cap) {
-            return Err(AutumnError::InvalidArgument(format!("compare_put_bulk expected exceeds {cap} bytes")));
+            return Err(AutumnError::InvalidArgument(format!("compare_put expected exceeds {cap} bytes")));
         }
-        if value.len() as u64 > CLIENT_PUT_HARD_CAP {
-            return Err(AutumnError::ValueTooLarge { size: value.len() as u64, cap: CLIENT_PUT_HARD_CAP });
+        let size = value.as_ref().map_or(0, Bytes::len) as u64;
+        if size > CLIENT_PUT_HARD_CAP {
+            return Err(AutumnError::ValueTooLarge { size, cap: CLIENT_PUT_HARD_CAP });
         }
         let key = self.binding.bind_key(key)?;
+        let (expires_at, lease) = (opts.expires_at(), opts.lease);
         let response = self
             .call_ps_for_key_bulk(
                 CallKind::Conditional,
                 &key,
-                partition_rpc::MSG_COMPARE_PUT_BULK,
+                partition_rpc::MSG_COMPARE_WRITE_BULK,
                 |part_id, region_epoch| {
-                    rkyv_encode(&partition_rpc::ComparePutBulkReq {
+                    rkyv_encode(&partition_rpc::CompareWriteBulkReq {
                         part_id,
                         region_epoch,
                         key: key.clone(),
                         expected: expected.map(<[u8]>::to_vec),
+                        delete: value.is_none(),
                         expires_at,
+                        inode_hint: lease.inode_hint,
+                        lease_epoch: lease.lease_epoch,
                     })
                 },
-                &value,
+                &value.clone().unwrap_or_default(),
             )
             .await?;
         let response: PutResp = rkyv_decode(&response).map_err(AutumnError::ServerError)?;
         match response.code {
             partition_rpc::CODE_PRECONDITION => Ok(false),
-            partition_rpc::CODE_VALUE_TOO_LARGE => Err(AutumnError::ValueTooLarge { size: value.len() as u64, cap: 0 }),
+            partition_rpc::CODE_VALUE_TOO_LARGE => Err(AutumnError::ValueTooLarge { size, cap: 0 }),
             code => check_ps_code(code, &response.message).map(|()| true),
         }
-    }
-
-    /// Fenced conditional write: when the key's visible value equals
-    /// `expected` (`None` = absent), write `value` (`None` = delete it).
-    /// `Ok(false)` = the expectation did not hold and nothing was written.
-    ///
-    /// A non-anonymous `lease` is fence-checked BEFORE the comparison and a
-    /// raised floor is made durable even when the comparison fails, so a call
-    /// whose expectation cannot hold is a pure floor bump for the key's
-    /// partition. A stale epoch returns `AutumnError::Fenced`.
-    ///
-    /// As with `compare_put`, an RPC error can leave the outcome ambiguous;
-    /// callers that retry need a value unique to their attempt to tell their
-    /// own success from someone else's.
-    pub async fn compare_write(
-        &self,
-        key: &[u8],
-        expected: Option<&[u8]>,
-        value: Option<&[u8]>,
-        lease: WriteLease,
-    ) -> std::result::Result<bool, AutumnError> {
-        let negotiated = self.negotiated_cluster_wire.get();
-        if negotiated < autumn_rpc::WIRE_VERSION_WITH_COMPARE_WRITE {
-            return Err(AutumnError::Unsupported(format!(
-                "compare_write needs cluster wire >= {}, negotiated {negotiated}",
-                autumn_rpc::WIRE_VERSION_WITH_COMPARE_WRITE
-            )));
-        }
-        let cap = partition_rpc::MAX_COMPARE_PUT_BYTES;
-        if value.is_some_and(|v| v.len() > cap) || expected.is_some_and(|v| v.len() > cap) {
-            return Err(AutumnError::InvalidArgument(format!(
-                "compare_write values exceed {cap} bytes"
-            )));
-        }
-        let key = self.binding.bind_key(key)?;
-        let response = self
-            .call_ps_for_key(
-                CallKind::Conditional,
-                &key,
-                partition_rpc::MSG_COMPARE_WRITE,
-                |part_id, region_epoch| {
-                    rkyv_encode(&partition_rpc::CompareWriteReq {
-                        part_id,
-                        region_epoch,
-                        key: key.clone(),
-                        expected: expected.map(<[u8]>::to_vec),
-                        value: value.map(<[u8]>::to_vec),
-                        inode_hint: lease.inode_hint,
-                        lease_epoch: lease.lease_epoch,
-                    })
-                },
-            )
-            .await?;
-        let response: PutResp = rkyv_decode(&response).map_err(AutumnError::ServerError)?;
-        if response.code == partition_rpc::CODE_PRECONDITION { return Ok(false); }
-        check_ps_code(response.code, &response.message)?;
-        Ok(true)
-    }
-
-    /// Internal: `put` over an ALREADY-bound wire key (no namespace binding).
-    /// The public `put` binds then calls this; `raw()`/`rescope` views call it
-    /// with their own key transform. D7.
-    async fn put_bound(&self, key: &[u8], value: &[u8]) -> std::result::Result<(), AutumnError> {
-        self.put_opts(key, value, 0, WriteLease::ANON).await
-    }
-
-    /// BUG-LEASE-2 Phase 2: lease-fenced put. Stamps `(inode_hint,
-    /// lease_epoch)` so the PS fence floor rejects this write with
-    /// `AutumnError::Fenced` once a newer writer's epoch has been seen
-    /// for the inode. Lease-holding writers (autumn-fuse, the ioring
-    /// daemon) MUST use this; anonymous KV callers keep plain `put`.
-    pub async fn put_fenced(
-        &self,
-        key: &[u8],
-        value: &[u8],
-        lease: WriteLease,
-    ) -> std::result::Result<(), AutumnError> {
-        let bound = self.binding.bind_key(key)?;
-        self.put_opts(&bound, value, 0, lease).await
     }
 
     /// Helper: convert a relative TTL (seconds from now) to an
@@ -3381,7 +3391,7 @@ impl ClusterClient {
     /// of "expire impossibly far in the future". (Without it, release-mode
     /// wraparound could flip a huge TTL into instant-expiry or `0`/never; the
     /// PyO3 `ttl_secs` arg is an unchecked `u64` from Python.)
-    pub fn ttl_to_expires_at(ttl_secs: u64) -> u64 {
+    pub(crate) fn ttl_to_expires_at(ttl_secs: u64) -> u64 {
         if ttl_secs == 0 {
             return 0;
         }
@@ -3411,13 +3421,12 @@ impl ClusterClient {
             });
         }
         let key = key.to_vec();
-        let value = value.to_vec();
         let (call, applied) = self
             .call_ps_for_key_tracked(CallKind::Idempotent, &key, MSG_PUT, |part_id, region_epoch| {
                 rkyv_encode(&PutReq {
                     part_id,
                     key: key.clone(),
-                    value: value.clone(),
+                    value: value.to_vec(),
                     expires_at,
                     region_epoch,
                     inode_hint: lease.inode_hint,
@@ -3441,44 +3450,6 @@ impl ClusterClient {
             check_ps_code(resp.code, &resp.message)
         })();
         outcome.map_err(|e| settle_write_error(CallKind::Idempotent, applied, e))
-    }
-
-    /// zero-copy PUT: write a value with NO intermediate value copy and
-    /// NO value crc scan on the client (`MSG_PUT_BULK` +
-    /// `RpcClient::call_vectored_bulk` — v28: the value rides after the ctrl crc
-    /// as its own iovec, straight from `value`'s backing memory). The regular
-    /// `put` path copies the value 3× (to_vec → clone → rkyv_encode); this
-    /// copies 0.
-    ///
-    /// UCX send-side zero-copy is decided by the VALUE'S MEMORY PROVENANCE,
-    /// via UCX's implicit registration cache — there is no explicit
-    /// registration anywhere: the first send from an address region pays a
-    /// lazy `ibv_reg_mr` (~100 µs × rails) and populates the rcache; later
-    /// sends from the SAME region hit for free. So:
-    /// - STABLE addresses (an [`alloc_value_buf`] slab, a pinned KV-pool page
-    ///   aliased via `Bytes::from_static`, a reused template `Bytes`) are
-    ///   effectively registered from the second touch on;
-    /// - FRESH per-op allocations re-register on EVERY send and the cache
-    ///   entry dies with the free — the anti-pattern. Produce values into
-    ///   [`alloc_value_buf`] instead.
-    ///
-    /// Same routing + epoch-stale refresh + RPC-retry shape as
-    /// `call_ps_for_key`. Inline-cap rules are identical to `put` (PS rejects
-    /// over the inline cap with `CODE_VALUE_TOO_LARGE`).
-    pub async fn put_bulk(&self, key: &[u8], value: Bytes) -> std::result::Result<(), AutumnError> {
-        let bound = self.binding.bind_key(key)?;
-        self.put_bulk_opts(&bound, value, 0, WriteLease::ANON).await
-    }
-
-    /// BUG-LEASE-2 Phase 2: lease-fenced zero-copy put (see `put_fenced`).
-    pub async fn put_bulk_fenced(
-        &self,
-        key: &[u8],
-        value: Bytes,
-        lease: WriteLease,
-    ) -> std::result::Result<(), AutumnError> {
-        let bound = self.binding.bind_key(key)?;
-        self.put_bulk_opts(&bound, value, 0, lease).await
     }
 
     pub(crate) async fn put_bulk_opts(
@@ -4577,52 +4548,18 @@ impl ClusterClient {
         fan_out_collect(futs, concurrency).await
     }
 
-    /// batched writes — the write mirror of `get_many`. Each item is routed by
-    /// `bulk_worthwhile(value.len())`: >= 64 KiB → its own `MSG_PUT_BULK` (the
-    /// value travels as its own iovec straight from the `Bytes` backing memory,
-    /// RDMA on UCX when that memory is registered, so `clone` = Arc bump and
-    /// nothing is copied); everything smaller is grouped by owning partition and
-    /// packed into ONE `MSG_BATCH_PUT` frame per partition. A key with a value
-    /// in each class has all its values written one by one in input order, so
-    /// the last input wins. Result `i` matches
-    /// `items[i]`: `Ok(())` = stored, `Err` = that item's RPC failed (others
-    /// still ran).
-    #[allow(clippy::type_complexity)]
+    /// Batched put, result `i` for `items[i]` (`Err` = that item failed;
+    /// the others still ran). Values of 64 KiB or more each go as their own
+    /// zero-copy `MSG_PUT_BULK`; smaller ones are packed into one
+    /// `MSG_BATCH_PUT` (or `MSG_BATCH_PUT_BULK`) per owning partition. A key
+    /// written twice keeps the later value. `opts` (TTL, lease) applies to
+    /// every item.
     pub async fn put_many(
         &self,
-        items: &[(&[u8], bytes::Bytes, u64)],
+        items: &[(&[u8], Bytes)],
+        opts: WriteOptions,
     ) -> Vec<std::result::Result<(), AutumnError>> {
-        // The ONE public batched-write API. Each tuple is
-        // `(key, value, expires_at)`; `expires_at = 0` means no TTL.
-        // Use `ClusterClient::ttl_to_expires_at(ttl_secs)` when you
-        // have a relative TTL.
-        //
-        // Internal routing (encapsulated in `batch_put`):
-        //   * value < 64 KiB → packed into MSG_BATCH_PUT (one frame per
-        //     owning partition, server decodes once and injects all ops
-        //     into partition_loop.pending atomically). Measured 6.9×
-        //     over the pre-merge client-side fan-out on cross-host TCP.
-        //   * value >= 64 KiB → per-op MSG_PUT_BULK (zero-copy value
-        //     transfer; on UCX with registered Bytes → RDMA from caller
-        //     memory). Batching bulk values would bloat the frame.
-        //
-        // No `concurrency` parameter: batch_put issues one RPC per
-        // owning partition and the underlying multiplexed PS connection
-        // does the rest. Callers needing finer pacing should call
-        // `batch_put` directly (pub(crate)).
-        self.batch_put(items, WriteLease::ANON).await
-    }
-
-    /// BUG-LEASE-2 Phase 2: lease-fenced `put_many` — every item is
-    /// stamped with the SAME `(inode_hint, lease_epoch)` (the batch
-    /// belongs to one inode's flush, e.g. autumn-fuse `flush_inode`).
-    /// A fenced item returns `AutumnError::Fenced` in its result slot.
-    pub async fn put_many_fenced(
-        &self,
-        items: &[(&[u8], bytes::Bytes, u64)],
-        lease: WriteLease,
-    ) -> Vec<std::result::Result<(), AutumnError>> {
-        self.batch_put(items, lease).await
+        self.batch_put(items, opts.expires_at(), opts.lease).await
     }
 
     /// **The batched-read API that does not require caller-owned
@@ -4805,24 +4742,25 @@ impl ClusterClient {
     ///   one entry per input item in input order.
     pub(crate) async fn batch_put(
         &self,
-        items: &[(&[u8], bytes::Bytes, u64)],
+        items: &[(&[u8], bytes::Bytes)],
+        expires_at: u64,
         lease: WriteLease,
     ) -> Vec<std::result::Result<(), AutumnError>> {
         let mut results: Vec<std::result::Result<(), AutumnError>> =
             (0..items.len()).map(|_| Ok(())).collect();
-        // (idx, key, value, expires_at) — keep all four pieces threaded so the
-        // bulk fallback and per-partition packing can read them without
-        // re-indexing into `items` (which is borrowed immutably).
+        // (idx, key, value) — threaded so the bulk fallback and per-partition
+        // packing can read them without re-indexing into `items` (which is
+        // borrowed immutably).
         // D7: each tuple's 2nd element is the BOUND wire key (owned) —
         // routing + the batch payload + the bulk/put fallbacks all use it, so a key
         // is bound exactly ONCE. Bind is infallible under Prepend-only.
-        let mut groups: std::collections::HashMap<u64, Vec<(usize, Vec<u8>, bytes::Bytes, u64)>> =
+        let mut groups: std::collections::HashMap<u64, Vec<(usize, Vec<u8>, bytes::Bytes)>> =
             std::collections::HashMap::new();
-        let mut bulk_only: Vec<(usize, Vec<u8>, bytes::Bytes, u64)> = Vec::new();
+        let mut bulk_only: Vec<(usize, Vec<u8>, bytes::Bytes)> = Vec::new();
         let bound: Vec<Option<Vec<u8>>> = items
             .iter()
             .enumerate()
-            .map(|(i, (k, _, _))| match self.binding.bind_key(k) {
+            .map(|(i, (k, _))| match self.binding.bind_key(k) {
                 Ok(b) => Some(b),
                 Err(e) => {
                     results[i] = Err(e);
@@ -4836,16 +4774,16 @@ impl ClusterClient {
         const SMALL: u8 = 1;
         const BULK: u8 = 2;
         let mut classes: std::collections::HashMap<&[u8], u8> = std::collections::HashMap::new();
-        for (bk, (_, v, _)) in bound.iter().zip(items) {
+        for (bk, (_, v)) in bound.iter().zip(items) {
             if let Some(bk) = bk {
                 *classes.entry(bk.as_slice()).or_default() |=
                     if bulk_worthwhile(v.len()) { BULK } else { SMALL };
             }
         }
-        for (i, ((_, v, ttl), bk)) in items.iter().zip(bound.iter()).enumerate() {
+        for (i, ((_, v), bk)) in items.iter().zip(bound.iter()).enumerate() {
             let Some(bk) = bk else { continue };
             if classes[bk.as_slice()] != SMALL {
-                bulk_only.push((i, bk.clone(), v.clone(), *ttl));
+                bulk_only.push((i, bk.clone(), v.clone()));
                 continue;
             }
             let bk = bk.clone();
@@ -4859,7 +4797,7 @@ impl ClusterClient {
             groups
                 .entry(part_id)
                 .or_default()
-                .push((i, bk, v.clone(), *ttl));
+                .push((i, bk, v.clone()));
         }
         // Ops of a frame an earlier attempt of which may have been applied.
         let mut maybe_applied: Vec<usize> = Vec::new();
@@ -4872,16 +4810,16 @@ impl ClusterClient {
             // megabyte on the wire however small each item looks. Deciding per
             // item sent every batch of small values down the copying path no
             // matter how much it added up to.
-            let group_bytes: usize = group.iter().map(|(_, _, v, _)| v.len()).sum();
+            let group_bytes: usize = group.iter().map(|(_, _, v)| v.len()).sum();
             let call = if bulk_worthwhile(group_bytes) {
                 let ops: Vec<partition_rpc::BatchPutBulkOp> = group
                     .iter()
-                    .map(|(_, k, v, ttl)| partition_rpc::BatchPutBulkOp {
+                    .map(|(_, k, v)| partition_rpc::BatchPutBulkOp {
                         inode_hint: lease.inode_hint,
                         lease_epoch: lease.lease_epoch,
                         key: k.clone(),
                         value_len: v.len() as u32,
-                        expires_at: *ttl,
+                        expires_at,
                     })
                     .collect();
                 let ctrl = rkyv_encode(&partition_rpc::BatchPutBulkReq {
@@ -4892,18 +4830,18 @@ impl ClusterClient {
                 // `clone` on a `Bytes` is a refcount bump: the values reach
                 // `writev` as the caller's own buffers, never copied.
                 let values: Vec<bytes::Bytes> =
-                    group.iter().map(|(_, _, v, _)| v.clone()).collect();
+                    group.iter().map(|(_, _, v)| v.clone()).collect();
                 self.call_ps_for_part_bulk(CallKind::Idempotent, part_id, partition_rpc::MSG_BATCH_PUT_BULK, ctrl, values)
                     .await
             } else {
                 let ops: Vec<partition_rpc::BatchPutOp> = group
                     .iter()
-                    .map(|(_, k, v, ttl)| partition_rpc::BatchPutOp {
+                    .map(|(_, k, v)| partition_rpc::BatchPutOp {
                         inode_hint: lease.inode_hint,
                         lease_epoch: lease.lease_epoch,
                         key: k.clone(),
                         value: v.to_vec(),
-                        expires_at: *ttl,
+                        expires_at,
                     })
                     .collect();
                 let payload = rkyv_encode(&partition_rpc::BatchPutReq {
@@ -4933,8 +4871,8 @@ impl ClusterClient {
                     // post-split re-routing (keys may no longer all belong to
                     // `part_id` after the topology change).
                     let _ = self.refresh_regions().await;
-                    for (idx, k, v, ttl) in group.iter() {
-                        results[*idx] = self.put_opts(k, v.as_ref(), *ttl, lease).await;
+                    for (idx, k, v) in group.iter() {
+                        results[*idx] = self.put_opts(k, v.as_ref(), expires_at, lease).await;
                     }
                     continue;
                 }
@@ -4970,11 +4908,11 @@ impl ClusterClient {
                 continue;
             }
             let plan = batch_resend_plan(group.iter().map(|g| g.1.as_slice()), &resp.statuses);
-            for (((idx, k, v, ttl), status), resend) in
+            for (((idx, k, v), status), resend) in
                 group.iter().zip(resp.statuses.iter()).zip(plan)
             {
                 if resend {
-                    let resend = self.put_opts(k, v.as_ref(), *ttl, lease).await;
+                    let resend = self.put_opts(k, v.as_ref(), expires_at, lease).await;
                     results[*idx] = resent_batch_op(*status, resend);
                 } else if *status == partition_rpc::CODE_FENCED {
                     results[*idx] = Err(AutumnError::Fenced(format!(
@@ -5020,7 +4958,7 @@ impl ClusterClient {
         // wait for it (`get_ps_client_inner`).
         let mut key_groups: std::collections::HashMap<&[u8], Vec<usize>> =
             std::collections::HashMap::new();
-        for (pos, (_, k, _, _)) in bulk_only.iter().enumerate() {
+        for (pos, (_, k, _)) in bulk_only.iter().enumerate() {
             key_groups.entry(k.as_slice()).or_default().push(pos);
         }
         let bulk = &bulk_only;
@@ -5028,13 +4966,13 @@ impl ClusterClient {
         let group_futs = key_groups.into_values().map(move |positions| async move {
             let mut out = Vec::with_capacity(positions.len());
             for pos in positions {
-                let (idx, k, v, ttl) = &bulk[pos];
+                let (idx, k, v) = &bulk[pos];
                 // A small value is here only because its key also has a bulk
                 // value in this batch (see `classes`).
                 let r = if bulk_worthwhile(v.len()) {
-                    this.put_bulk_opts(k, v.clone(), *ttl, lease).await
+                    this.put_bulk_opts(k, v.clone(), expires_at, lease).await
                 } else {
-                    this.put_opts(k, v.as_ref(), *ttl, lease).await
+                    this.put_opts(k, v.as_ref(), expires_at, lease).await
                 };
                 out.push((*idx, r));
             }
@@ -5053,19 +4991,14 @@ impl ClusterClient {
     /// no tail to keep out of the rkyv payload. Result `i` matches `keys[i]`
     /// (`Ok(())` even if the key didn't exist, same as `delete`; `Err` = that
     /// item failed, others still ran).
-    pub async fn delete_many(&self, keys: &[&[u8]]) -> Vec<std::result::Result<(), AutumnError>> {
-        self.batch_delete(keys, WriteLease::ANON).await
-    }
-
-    /// Lease-fenced `delete_many` — every key is stamped with the SAME
-    /// `(inode_hint, lease_epoch)`. A fenced key returns `AutumnError::Fenced`
-    /// in its own slot; the rest of the batch still runs.
-    pub async fn delete_many_fenced(
+    /// `opts.lease` stamps every key; a fenced key returns
+    /// `AutumnError::Fenced` in its own slot.
+    pub async fn delete_many(
         &self,
         keys: &[&[u8]],
-        lease: WriteLease,
+        opts: WriteOptions,
     ) -> Vec<std::result::Result<(), AutumnError>> {
-        self.batch_delete(keys, lease).await
+        self.batch_delete(keys, opts.lease).await
     }
 
     /// One `MSG_BATCH_DELETE` per owning partition.
@@ -5220,31 +5153,17 @@ impl ClusterClient {
         fan_out_collect(futs, batch_get_concurrency()).await
     }
 
-    /// Delete a key. Returns Ok(()) even if key didn't exist.
-    pub async fn delete(&self, key: &[u8]) -> std::result::Result<(), AutumnError> {
+    /// Delete a key; Ok(()) even if it didn't exist. A non-anonymous
+    /// `opts.lease` is fenced like a put's (a revoked writer's late unlink
+    /// must not remove the new writer's data).
+    pub async fn delete(&self, key: &[u8], opts: WriteOptions) -> std::result::Result<(), AutumnError> {
         let bound = self.binding.bind_key(key)?;
-        self.delete_bound(&bound).await
+        self.delete_opts(&bound, opts.lease).await
     }
 
-    /// Internal: `delete` over an ALREADY-bound wire key (no namespace binding).
-    /// D7. NOTE: Layer-A does NOT gate deletes at the PS, but the CLIENT
-    /// still prepends so a scoped delete targets THIS scope's key, not a raw one.
-    async fn delete_bound(&self, key: &[u8]) -> std::result::Result<(), AutumnError> {
-        self.delete_opts(key, WriteLease::ANON).await
-    }
-
-    /// BUG-LEASE-2 Phase 2: lease-fenced delete — a revoked writer's late
-    /// truncate/unlink must not remove the new writer's data (same fence
-    /// floor as puts; `AutumnError::Fenced` on rejection).
-    pub async fn delete_fenced(
-        &self,
-        key: &[u8],
-        lease: WriteLease,
-    ) -> std::result::Result<(), AutumnError> {
-        let bound = self.binding.bind_key(key)?;
-        self.delete_opts(&bound, lease).await
-    }
-
+    /// `delete` over an ALREADY-bound wire key. D7: Layer-A does NOT gate
+    /// deletes at the PS, but the CLIENT still prepends so a scoped delete
+    /// targets THIS scope's key, not a raw one.
     async fn delete_opts(
         &self,
         key: &[u8],
@@ -5722,7 +5641,7 @@ impl ClusterClient {
     /// using `put_stream_begin` for the key.
     pub async fn delete_stream(&self, key: &[u8]) -> std::result::Result<(), AutumnError> {
         let meta = self.stripe_meta(key).await?;
-        self.delete(key).await?;
+        self.delete(key, WriteOptions::default()).await?;
         if let Some(meta) = meta {
             delete_upload_chunks(self, key, &meta.upload_id, meta.chunk_count as u64).await;
         }
@@ -6137,7 +6056,7 @@ async fn delete_upload_chunks(
 ) {
     let keys: Vec<Vec<u8>> = (0..count).map(|i| make_chunk_key(user_key, upload_id, i)).collect();
     let refs: Vec<&[u8]> = keys.iter().map(Vec::as_slice).collect();
-    for (i, r) in cluster.delete_many(&refs).await.into_iter().enumerate() {
+    for (i, r) in cluster.delete_many(&refs, WriteOptions::default()).await.into_iter().enumerate() {
         if let Err(e) = r {
             tracing::warn!(chunk = i, error = %e, "stripe chunk delete failed; chunk is orphaned");
         }
@@ -6784,7 +6703,7 @@ impl<'a> PutStreamHandle<'a> {
         // a scoped (Prepend) client prepends the scope prefix so chunks land in
         // the scope range; Raw writes the legacy global chunk space.
         let chunk_key = make_chunk_key(&self.user_key, &self.upload_id, self.next_chunk_index);
-        self.cluster.put(&chunk_key, chunk).await?;
+        self.cluster.put(&chunk_key, chunk, WriteOptions::default()).await?;
         self.next_chunk_index = self.next_chunk_index.saturating_add(1);
         self.bytes_sent = self.bytes_sent.saturating_add(chunk.len() as u64);
         Ok(self.bytes_sent)
@@ -6826,7 +6745,7 @@ impl<'a> PutStreamHandle<'a> {
                 return Err(e);
             }
         };
-        match self.cluster.put(&self.user_key, &blob).await {
+        match self.cluster.put(&self.user_key, &blob, WriteOptions::default()).await {
             Ok(()) => {
                 self.state = PutStreamState::Committed;
                 if let Some(old) = replaced {
@@ -7208,3 +7127,19 @@ mod connection_tests;
 #[cfg(test)]
 #[path = "../../rpc/tests/support/protocol.rs"]
 mod test_protocol;
+
+#[cfg(test)]
+mod write_options_tests {
+    use super::*;
+
+    /// A TTL too long to add to now saturates, as `ttl_to_expires_at` does,
+    /// instead of wrapping into a one-second TTL. Ablation: a plain `+`.
+    #[test]
+    fn a_huge_ttl_saturates() {
+        let opts = WriteOptions::default().with_ttl(Duration::MAX);
+        assert_eq!(opts.expires_at(), ClusterClient::ttl_to_expires_at(u64::MAX));
+        assert_eq!(WriteOptions::default().expires_at(), 0, "no TTL, no expiry");
+        let half = WriteOptions::default().with_ttl(Duration::from_millis(500)).expires_at();
+        assert!(half >= ClusterClient::ttl_to_expires_at(1), "a sub-second TTL rounds up");
+    }
+}

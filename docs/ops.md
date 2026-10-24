@@ -3300,21 +3300,23 @@ stop.set(); t.join(); lat.sort(); print(f"exists p50 {lat[50]:.1f} ms  p99 {lat[
 PY
 ```
 
-## Conditional put for large values (wire 74)
+## Write options and conditional writes (wire 75)
 
-`ClusterClient::compare_put_bulk(key, expected, value, expires_at)` is
-`compare_put` with a TTL and the value sent as a bulk tail (`MSG_COMPARE_PUT_BULK`):
-no 64 KiB cap on the value, no copy through rkyv. `expected = None` is
-put-if-absent; the PS checks only that the key is there (it does not read the
-value) and leaves a present key untouched. The value is shipped even when the
-key is present, so it is no substitute for an `exists` probe when most keys are
-already stored (8 ranks x 64 x 16 MiB over UCX, all present: 350 ms vs 1 ms
-probe; all absent: 3.00 vs 3.07 GB/s plain put). Needs a cluster at wire 74; an
-older cluster gets `Unsupported` from the SDK.
+Every SDK write takes `WriteOptions { ttl, lease }`: `put`, `put_many` and
+`compare_put` honour both, `delete` / `delete_many` the lease. `put` picks the
+transport by size (inline below 64 KiB, zero-copy `MSG_PUT_BULK` above);
+`put_many` applies one TTL to the batch. `compare_put(key, expected, value, opts)`
+is the one conditional write (`MSG_COMPARE_WRITE_BULK`): `expected = None` means
+"only if absent", `value = None` deletes, the value has no 64 KiB cap. With
+`expected = None` the PS checks only that the key is there (no value read). The
+value is shipped even when the key is present, so it is no substitute for an
+`exists` probe when most keys are already stored (8 ranks x 64 x 16 MiB over UCX,
+all present: 350 ms vs 1 ms probe). A wire-75 client needs a wire-75 cluster; the
+PS still serves the older conditional opcodes for older clients.
 
 ```bash
-cargo test -p autumn-manager --test compare_put_bulk
-cargo test -p autumn-partition-server --lib compare_put_bulk_tail_is_recvd_into_a_pooled_buffer
+cargo test -p autumn-manager --test write_options   # TTL and lease through every write; conditional cases
+cargo test -p autumn-partition-server --lib compare_write_bulk_tail_is_recvd_into_a_pooled_buffer
 ```
 
 ## autumn-kvcache model identity

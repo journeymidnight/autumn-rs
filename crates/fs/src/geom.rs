@@ -67,7 +67,7 @@ pub async fn write_stripe_geom(
 ) -> Result<()> {
     layout.checked().map_err(|e| anyhow!(e))?;
     client
-        .put(&key::stripe_geom_key(), &schema::encode_stripe_geom(layout))
+        .put(&key::stripe_geom_key(), schema::encode_stripe_geom(layout), autumn_client::WriteOptions::default())
         .await
         .map_err(|e| anyhow!("declare stripe geometry: {e}"))
 }

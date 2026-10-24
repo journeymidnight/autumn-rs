@@ -86,7 +86,7 @@ fn layer_a_rejects_unregistered_namespace_put() {
             .await
             .expect("scoped connect");
         scoped.set_rpc_timeout(Duration::from_secs(15));
-        scoped.put(b"k1", b"v1").await.expect("put in registered ns");
+        scoped.put(b"k1", b"v1", autumn_client::WriteOptions::default()).await.expect("put in registered ns");
         assert_eq!(scoped.get(b"k1").await.unwrap().as_deref(), Some(&b"v1"[..]));
 
         // RAW (anonymous, no client clamp) put of an ABSOLUTE key whose 1st
@@ -96,7 +96,7 @@ fn layer_a_rejects_unregistered_namespace_put() {
             .await
             .expect("raw connect");
         raw.set_rpc_timeout(Duration::from_secs(15));
-        let err = raw.put(b"unreg/x", b"nope").await.unwrap_err();
+        let err = raw.put(b"unreg/x", b"nope", autumn_client::WriteOptions::default()).await.unwrap_err();
         assert!(
             matches!(err, AutumnError::NamespaceUnknown(_)),
             "put to unregistered namespace must be NamespaceUnknown, got {err:?}"
@@ -104,13 +104,13 @@ fn layer_a_rejects_unregistered_namespace_put() {
 
         // A put whose 1st segment IS registered (`bench/…`) via the raw
         // client is admitted.
-        raw.put(b"bench/raw-ok", b"ok")
+        raw.put(b"bench/raw-ok", b"ok", autumn_client::WriteOptions::default())
             .await
             .expect("raw put under registered ns");
 
         // DELETE is NOT Layer-A gated (Layer-A is put-class only) → succeeds
         // (delete of an absent key is OK).
-        raw.delete(b"unreg/x")
+        raw.delete(b"unreg/x", autumn_client::WriteOptions::default())
             .await
             .expect("delete under unregistered ns is not Layer-A gated");
     });
@@ -152,7 +152,7 @@ fn a_namespace_created_after_the_ps_started_is_writable_at_once() {
             .expect("scoped connect");
         scoped.set_rpc_timeout(Duration::from_secs(15));
         let t0 = std::time::Instant::now();
-        scoped.put(b"k", b"v").await.expect("put in a just-created namespace");
+        scoped.put(b"k", b"v", autumn_client::WriteOptions::default()).await.expect("put in a just-created namespace");
         assert!(t0.elapsed() < Duration::from_secs(10), "took {:?}", t0.elapsed());
         assert_eq!(scoped.get(b"k").await.unwrap().as_deref(), Some(&b"v"[..]));
 
@@ -160,7 +160,7 @@ fn a_namespace_created_after_the_ps_started_is_writable_at_once() {
             .await
             .expect("raw connect");
         raw.set_rpc_timeout(Duration::from_secs(15));
-        let err = raw.put(b"nosuch/x", b"nope").await.unwrap_err();
+        let err = raw.put(b"nosuch/x", b"nope", autumn_client::WriteOptions::default()).await.unwrap_err();
         assert!(
             matches!(err, AutumnError::NamespaceUnknown(_)),
             "put to an unregistered namespace must still be NamespaceUnknown, got {err:?}"

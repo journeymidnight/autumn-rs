@@ -1,3 +1,10 @@
+Date: 2026-10-24 (2)
+TaskStatus: completed
+Task scope: user — collapse the write API into WriteOptions { ttl, lease }: put (folds put_bulk, transport by size), put_many (TTL per batch), delete / delete_many, compare_put (folds compare_put_bulk and compare_write; new MSG_COMPARE_WRITE_BULK, wire 75).
+Current summary: 13 write methods → 5; IntoValue (Bytes/Vec move, slices copy); every caller migrated (fs, bins, benches, gallery, python, tests). Unit + affected integration suites green (incl. fuse-tests fs/lease/FUSE set); write_options::ttl_and_lease_reach_every_write with nine ablations red; Fable review no high, medium (Duration::MAX TTL wrapped to 1 s) fixed with an ablated unit test. perf-check A/B vs b714035b: every cell within noise; fs create/mkdir bench 18 rounds alternating: within 1-1.5% (inside the ±3% round spread).
+Main gaps: none for this task. F-KVC-CACHE-TIER design decided (see feature_list notes).
+Next steps: memory tier minimal version (no persistence), measure.
+
 Date: 2026-10-24
 TaskStatus: completed
 Task scope: user — (1) bulk compare-put, (2) a fast lane for small reads on the shared PS connection without losing performance; then the compare-put ordering bug. (3) the kvc memory tier: user said not yet.

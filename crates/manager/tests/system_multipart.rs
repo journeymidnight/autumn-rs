@@ -300,7 +300,7 @@ fn multipart_complete_is_metadata_only_and_races_resolve() {
         let cur = st.kv_get_opt(&key::upload_key(up_h)).await.unwrap().unwrap();
         let mut rec = schema::decode_upload(&cur).unwrap();
         rec.state = UploadState::Completing { new_ino: h_ino, session: lease.inode_hint, frozen: vec![data_ino_of(&he)] };
-        assert!(st.client.compare_write(&key::upload_key(up_h), Some(&cur), Some(&schema::encode_upload(&rec)), lease).await.unwrap());
+        assert!(st.client.compare_put(&key::upload_key(up_h), Some(&cur), Some(bytes::Bytes::copy_from_slice(&schema::encode_upload(&rec))), autumn_client::WriteOptions::fenced(lease)).await.unwrap());
         let got = multipart::complete(&mut st, up_h, b"bkt/data/h.lance", &[(1, he.clone())], Condition::None)
             .await
             .expect("the retry finishes a landed Complete");
@@ -364,7 +364,7 @@ fn multipart_complete_is_metadata_only_and_races_resolve() {
         let cur = dead.kv_get_opt(&key::upload_key(up)).await.unwrap().unwrap();
         let mut rec = schema::decode_upload(&cur).unwrap();
         rec.state = UploadState::Completing { new_ino: fake_ino, session: dead_session, frozen: vec![data_ino_of(&fe1)] };
-        assert!(dead.client.compare_write(&key::upload_key(up), Some(&cur), Some(&schema::encode_upload(&rec)), lease).await.unwrap());
+        assert!(dead.client.compare_put(&key::upload_key(up), Some(&cur), Some(bytes::Bytes::copy_from_slice(&schema::encode_upload(&rec))), autumn_client::WriteOptions::fenced(lease)).await.unwrap());
         // While it lives, an Abort is refused.
         assert!(matches!(multipart::abort(&mut st, up).await, Err(MultipartError::Busy(_))));
         compio::time::sleep(Duration::from_secs(33)).await;

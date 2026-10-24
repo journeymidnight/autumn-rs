@@ -234,14 +234,14 @@ fn the_sdk_reports_an_unknown_outcome_only_for_a_write_that_may_have_applied() {
         let ps_addr = pick_addr();
         let _ps = ChildPs::spawn(PS_ID, c.mgr, ps_addr, ChildFailpoints::default());
         let sdk = ClusterClient::connect_raw(&c.mgr.to_string()).await.expect("sdk");
-        sdk.put(b"k0", b"v0").await.expect("k0 with every node up");
+        sdk.put(b"k0", b"v0", autumn_client::WriteOptions::default()).await.expect("k0 with every node up");
 
         c.stop(2);
-        match sdk.put(b"k1", b"v1").await {
+        match sdk.put(b"k1", b"v1", autumn_client::WriteOptions::default()).await {
             Err(AutumnError::OutcomeUnknown(_)) => {}
             other => panic!("k1: want OutcomeUnknown, got {other:?}"),
         }
-        match sdk.put(b"k2", b"v2").await {
+        match sdk.put(b"k2", b"v2", autumn_client::WriteOptions::default()).await {
             Err(AutumnError::ConnectionError(m)) if m.contains("not applied") => {}
             other => panic!("k2 (never sent): want a not-applied ConnectionError, got {other:?}"),
         }
@@ -260,11 +260,11 @@ fn the_sdk_stops_a_conditional_write_at_its_first_unknown_outcome() {
         let ps_addr = pick_addr();
         let _ps = ChildPs::spawn(PS_ID, c.mgr, ps_addr, ChildFailpoints::default());
         let sdk = ClusterClient::connect_raw(&c.mgr.to_string()).await.expect("sdk");
-        sdk.put(b"k0", b"v0").await.expect("k0 with every node up");
+        sdk.put(b"k0", b"v0", autumn_client::WriteOptions::default()).await.expect("k0 with every node up");
 
         c.stop(2);
         let started = std::time::Instant::now();
-        match sdk.compare_put(b"k1", None, b"v1").await {
+        match sdk.compare_put(b"k1", None, Some(bytes::Bytes::copy_from_slice(b"v1")), autumn_client::WriteOptions::default()).await {
             Err(AutumnError::OutcomeUnknown(_)) => {}
             other => panic!("k1: want OutcomeUnknown, got {other:?}"),
         }
@@ -283,14 +283,14 @@ fn the_sdk_reports_an_unknown_outcome_for_a_batch_that_may_have_applied() {
         let ps_addr = pick_addr();
         let _ps = ChildPs::spawn(PS_ID, c.mgr, ps_addr, ChildFailpoints::default());
         let sdk = ClusterClient::connect_raw(&c.mgr.to_string()).await.expect("sdk");
-        sdk.put(b"k0", b"v0").await.expect("k0 with every node up");
+        sdk.put(b"k0", b"v0", autumn_client::WriteOptions::default()).await.expect("k0 with every node up");
 
         c.stop(2);
         let results = sdk
             .put_many(&[
-                (&b"k1"[..], bytes::Bytes::from_static(b"v1"), 0),
-                (&b"k2"[..], bytes::Bytes::from_static(b"v2"), 0),
-            ])
+                (&b"k1"[..], bytes::Bytes::from_static(b"v1")),
+                (&b"k2"[..], bytes::Bytes::from_static(b"v2")),
+            ], autumn_client::WriteOptions::default())
             .await;
         for (i, r) in results.iter().enumerate() {
             assert!(matches!(r, Err(AutumnError::OutcomeUnknown(_))), "op {i}: {r:?}");

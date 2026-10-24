@@ -4842,7 +4842,15 @@ fn spawn_ps_read(
 /// other incomplete frame receives the rest of itself in place.
 fn ps_read_window(decoder: &mut FrameDecoder, fixed: usize) -> autumn_rpc::ReadWindow {
     let len = match decoder.peek_header() {
-        Some((_, MSG_PUT_BULK | partition_rpc::MSG_BATCH_PUT_BULK | partition_rpc::MSG_COMPARE_PUT_BULK, _, _))
+        Some((
+            _,
+            MSG_PUT_BULK
+            | partition_rpc::MSG_BATCH_PUT_BULK
+            | partition_rpc::MSG_COMPARE_PUT_BULK
+            | partition_rpc::MSG_COMPARE_WRITE_BULK,
+            _,
+            _,
+        ))
         | None => fixed,
         Some(_) => decoder
             .front_frame_remaining()
@@ -4878,9 +4886,9 @@ fn push_resp(tx_bufs: &mut Vec<Bytes>, done: (Bytes, Vec<Bytes>)) {
 /// is NOT an eligible large bulk write (the caller then runs the normal decode
 /// path on the remainder).
 ///
-/// Three bulk write shapes qualify: `MSG_PUT_BULK` (one value, fixed 44-byte
-/// binary meta then the key), `MSG_COMPARE_PUT_BULK` (rkyv ctrl, one value)
-/// and `MSG_BATCH_PUT_BULK` (rkyv ctrl, tail = every op's value back to back,
+/// Four bulk write shapes qualify: `MSG_PUT_BULK` (one value, fixed 44-byte
+/// binary meta then the key), `MSG_COMPARE_WRITE_BULK` and
+/// `MSG_COMPARE_PUT_BULK` (rkyv ctrl, one value) and `MSG_BATCH_PUT_BULK` (rkyv ctrl, tail = every op's value back to back,
 /// sliced per op downstream). Recognising only the
 /// single-value form left the batch path structurally slower than the per-item
 /// one it exists to beat: its tail is by definition the batch's whole value
@@ -4916,7 +4924,9 @@ async fn drain_bulk_writes(
             return Ok(());
         };
         let is_batch = msg_type == partition_rpc::MSG_BATCH_PUT_BULK;
-        let rkyv_ctrl = is_batch || msg_type == partition_rpc::MSG_COMPARE_PUT_BULK;
+        let rkyv_ctrl = is_batch
+            || msg_type == partition_rpc::MSG_COMPARE_PUT_BULK
+            || msg_type == partition_rpc::MSG_COMPARE_WRITE_BULK;
         if (msg_type != MSG_PUT_BULK && !rkyv_ctrl) || req_id == 0 {
             return Ok(()); // not a bulk write at the front → normal path
         }
@@ -4947,7 +4957,7 @@ async fn drain_bulk_writes(
             return Ok(());
         }
         // Parse enough of the ctrl to route. `MSG_PUT_BULK` is a fixed 44-byte
-        // binary meta then the key; the other two are variable-length rkyv
+        // binary meta then the key; the others are variable-length rkyv
         // structs, so only they pay a decode — the same one `push_one_frame_to_inflight`
         // would have paid had this frame gone down the normal path.
         let part_id = if rkyv_ctrl {
@@ -7752,7 +7762,10 @@ async fn handle_incoming_req(
 
     if matches!(
         req.msg_type,
-        partition_rpc::MSG_COMPARE_PUT | partition_rpc::MSG_COMPARE_WRITE | partition_rpc::MSG_COMPARE_PUT_BULK
+        partition_rpc::MSG_COMPARE_PUT
+            | partition_rpc::MSG_COMPARE_WRITE
+            | partition_rpc::MSG_COMPARE_PUT_BULK
+            | partition_rpc::MSG_COMPARE_WRITE_BULK
     ) {
         let cond = match rpc_handlers::decode_conditional(req.msg_type, &req.payload, req.bulk_value) {
             Ok(c) => c,
@@ -13412,6 +13425,22 @@ fn memtable_snapshot_cost_scales_with_memtable_not_page_size() {
         });
         let tail: Vec<u8> = (0..1u32 << 20).map(|i| (i % 253) as u8).collect();
         assert_tail_takes_pooled_recv(partition_rpc::MSG_COMPARE_PUT_BULK, ctrl, tail);
+    }
+
+    #[test]
+    fn compare_write_bulk_tail_is_recvd_into_a_pooled_buffer() {
+        let ctrl = partition_rpc::rkyv_encode(&partition_rpc::CompareWriteBulkReq {
+            part_id: 11,
+            region_epoch: 0,
+            key: b"fs/cwb".to_vec(),
+            expected: None,
+            delete: false,
+            expires_at: 0,
+            inode_hint: 0,
+            lease_epoch: 0,
+        });
+        let tail: Vec<u8> = (0..1u32 << 20).map(|i| (i % 251) as u8).collect();
+        assert_tail_takes_pooled_recv(partition_rpc::MSG_COMPARE_WRITE_BULK, ctrl, tail);
     }
 
     fn assert_tail_takes_pooled_recv(msg_type: u8, ctrl: Bytes, tail: Vec<u8>) {

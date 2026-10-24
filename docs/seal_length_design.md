@@ -144,8 +144,8 @@ both answers — sending one again leaves the same key in the same state, whethe
 or not the first attempt survived — and returns `AutumnError::OutcomeUnknown`
 when the write fails in the end after an attempt that may have been applied
 (the server said so, or the request was sent and no answer came back); every
-other write error means not applied. A conditional write (`compare_put`,
-`compare_write`) is not idempotent — a retry can report a conflict caused by its
+other write error means not applied. A conditional write (`compare_put`) is not
+idempotent — a retry can report a conflict caused by its
 own first attempt — so it returns `OutcomeUnknown` at its first such attempt.
 
 HDFS block recovery and HBase behave the same way: block recovery syncs a

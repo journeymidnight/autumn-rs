@@ -110,7 +110,7 @@ use autumn_rpc::manager_rpc::{
 use autumn_rpc::partition_rpc::{
     self as ps, encode_put_bulk_meta, parse_put_bulk_meta, BatchDeleteOp, BatchDeleteReq,
     BatchDeleteResp, BatchGetBulkCtrl, BatchGetReq, BatchPutBulkOp, BatchPutBulkReq, BatchPutOp,
-    BatchPutReq, BatchPutResp, ClientAuthReq, ClientAuthResp, ComparePutBulkReq, ComparePutReq, CompareWriteReq,
+    BatchPutReq, BatchPutResp, ClientAuthReq, ClientAuthResp, ComparePutBulkReq, ComparePutReq, CompareWriteBulkReq, CompareWriteReq,
     DeleteReq, DeleteResp, GetRedirectItem,
     GetRedirectManyReq, GetRedirectManyResp, GetRedirectResp, GetReq, HeadReq, HeadResp, PutReq,
     PutResp, RangeEntry, RangeReq, RangeResp,
@@ -124,6 +124,7 @@ const GOLDEN: &[(&str, &str)] = &[
     ("PutReq", "7468652d6b65797468652d76616c75651817161514131211e8ffffff07000000e7ffffff090000002827262524232221383736353433323148474645444342415857565554535251"),
     ("PutResp", "7075742d6d6573736167657468652d6b65790000070000008b000000e8ffffffebffffff07000000"),
     ("ComparePutBulkReq", "7468652d6b65796f6c642d76616c756518171615141312112827262524232221e0ffffff0700000001000000dbffffff09000000000000003837363534333231"),
+    ("CompareWriteBulkReq", "7468652d6b65796f6c642d76616c756518171615141312112827262524232221e0ffffff0700000001000000dbffffff0900000001000000383736353433323148474645444342415857565554535251"),
     ("ComparePutReq", "7468652d6b65796f6c642d76616c75657468652d76616c75650000000000000018171615141312112827262524232221d0ffffff0700000001000000cbffffff09000000ccffffff0900000000000000"),
     ("CompareWriteReq", "7468652d6b65796f6c642d76616c756518171615141312112827262524232221e0ffffff0700000001000000dbffffff0900000000000000000000000000000038373635343332314847464544434241"),
     ("GetReq", "7468652d6b6579001817161514131211f0ffffff0700000024232221343332314847464544434241"),
@@ -335,6 +336,21 @@ fn forms() -> Vec<Frozen> {
             }
         ),
         frozen!(
+            &[(Ps, ps::MSG_COMPARE_WRITE_BULK)],
+            Req,
+            CompareWriteBulkReq,
+            CompareWriteBulkReq {
+                part_id: 0x1112131415161718,
+                region_epoch: 0x2122232425262728,
+                key: b"the-key".to_vec(),
+                expected: Some(b"old-value".to_vec()),
+                delete: true,
+                expires_at: 0x3132333435363738,
+                inode_hint: 0x4142434445464748,
+                lease_epoch: 0x5152535455565758,
+            }
+        ),
+        frozen!(
             &[(Ps, ps::MSG_COMPARE_WRITE)],
             Req,
             CompareWriteReq,
@@ -355,6 +371,7 @@ fn forms() -> Vec<Frozen> {
                 (Ps, ps::MSG_COMPARE_PUT),
                 (Ps, ps::MSG_COMPARE_WRITE),
                 (Ps, ps::MSG_COMPARE_PUT_BULK),
+                (Ps, ps::MSG_COMPARE_WRITE_BULK),
             ],
             Resp,
             PutResp,

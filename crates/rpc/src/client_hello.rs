@@ -278,6 +278,7 @@ pub fn is_client_surface_ps_msg(msg_type: u8) -> bool {
             | MSG_COMPARE_PUT
             | MSG_COMPARE_WRITE
             | MSG_COMPARE_PUT_BULK
+            | MSG_COMPARE_WRITE_BULK
     )
 }
 
@@ -526,6 +527,7 @@ mod tests {
             partition_rpc::MSG_COMPARE_PUT,
             partition_rpc::MSG_COMPARE_WRITE,
             partition_rpc::MSG_COMPARE_PUT_BULK,
+            partition_rpc::MSG_COMPARE_WRITE_BULK,
         ] {
             assert!(is_client_surface_ps_msg(m), "ps msg {m:#x}");
         }

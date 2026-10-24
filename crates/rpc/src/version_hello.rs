@@ -517,6 +517,7 @@ fn known_ps_opcode(opcode: u8) -> bool {
             | MSG_COMPARE_PUT
             | MSG_COMPARE_WRITE
             | MSG_COMPARE_PUT_BULK
+            | MSG_COMPARE_WRITE_BULK
             | MSG_GET_REDIRECT
             | MSG_CLIENT_AUTH
             | MSG_ROLL_TAILS

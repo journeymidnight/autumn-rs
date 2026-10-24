@@ -61,9 +61,9 @@ async fn run(
             let start = Instant::now();
             match mode {
                 "write" if bulk_worthwhile(value.len()) => {
-                    client.put_bulk(key, value.clone()).await.unwrap()
+                    client.put(key, value.clone(), autumn_client::WriteOptions::default()).await.unwrap()
                 }
-                "write" => client.put(key, value).await.unwrap(),
+                "write" => client.put(key, value, autumn_client::WriteOptions::default()).await.unwrap(),
                 "direct" => {
                     assert_eq!(
                         client.get_direct(key).await.unwrap().unwrap().len(),
@@ -135,7 +135,7 @@ fn main() {
         }
         let value = buf.freeze();
         if mode == "load" {
-            let puts = keys.iter().map(|key| client.put_bulk(key, value.clone()));
+            let puts = keys.iter().map(|key| client.put(key, value.clone(), autumn_client::WriteOptions::default()));
             let results = fan_out(puts, depth);
             futures::pin_mut!(results);
             while let Some((_, r)) = results.next().await {

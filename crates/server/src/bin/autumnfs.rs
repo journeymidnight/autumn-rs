@@ -805,7 +805,7 @@ async fn write_file_from_reader(
         }
     };
     for k in written.iter().chain([&key::inode_key(new_ino)]) {
-        if let Err(e) = cluster.delete(k).await {
+        if let Err(e) = cluster.delete(k, autumn_client::WriteOptions::default()).await {
             eprintln!("ino {new_ino}: a key of the abandoned file not deleted (leaked): {e}");
         }
     }
@@ -905,7 +905,7 @@ async fn write_file_data(
                     // so orphan cleanup must cover the partial success (coco P2).
                     written.push(ek.clone());
                     let value = chunk.freeze(); // aliases the pool slab, 0-copy
-                    inflight.push(async move { cluster.put_bulk(&ek, value).await });
+                    inflight.push(async move { cluster.put(&ek, value, autumn_client::WriteOptions::default()).await });
                     off += n as u64;
                     if n < MAX_EXTENT {
                         eof = true;
@@ -934,7 +934,7 @@ async fn write_file_data(
     meta.stripe = if meta.inline_data.is_some() { None } else { stripe };
 
     cluster
-        .put(&key::inode_key(new_ino), &schema::encode_inode_meta(&meta))
+        .put(&key::inode_key(new_ino), &schema::encode_inode_meta(&meta), autumn_client::WriteOptions::default())
         .await
         .map_err(|e| anyhow!("put inode: {e}"))?;
     Ok(())

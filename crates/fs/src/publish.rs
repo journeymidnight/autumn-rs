@@ -2,7 +2,7 @@
 //!
 //! The S3 gateway's PUT, Copy and multipart Complete all end the same way: a
 //! fully written file in a FRESH inode becomes visible under a name in one
-//! step, or not at all. The step is one fenced `compare_write` on the dirent,
+//! step, or not at all. The step is one fenced `compare_put` on the dirent,
 //! so `If-None-Match: *` (expected absent) and `If-Match` (expected the dirent
 //! naming the matched inode) are decided by the partition server, never by a
 //! read followed by a write. A reader of the name sees the old file or the
@@ -20,6 +20,7 @@
 //! sweeper had judged it dead and deleted the inode's data.
 
 
+use autumn_client::WriteOptions;
 use anyhow::{anyhow, Result};
 use bytes::BytesMut;
 
@@ -274,9 +275,9 @@ impl NewFile {
 /// Delete an unpublished inode, its data and its pending record.
 async fn undo_new_file(client: &ClusterClient, ino: u64, lease: WriteLease) -> Result<()> {
     segment::reclaim_except(client, ino, &Default::default(), 0, lease).await?;
-    client.delete_fenced(&key::inode_key(ino), lease).await.map_err(|e| anyhow!("KV delete: {e}"))?;
+    client.delete(&key::inode_key(ino), WriteOptions::fenced(lease)).await.map_err(|e| anyhow!("KV delete: {e}"))?;
     client
-        .delete_fenced(&key::pending_key(lease.inode_hint, ino), lease)
+        .delete(&key::pending_key(lease.inode_hint, ino), WriteOptions::fenced(lease))
         .await
         .map_err(|e| anyhow!("KV delete: {e}"))?;
     Ok(())
@@ -327,7 +328,7 @@ pub(crate) async fn publish_inode(
         if let Some(o) = replacing {
             recorded = hold_for_swap(state, parent, name, o, Some(ino), cond, lease).await?;
         }
-        let swapped = state.client.compare_write(&dk, current.as_deref(), Some(&new), lease).await;
+        let swapped = state.client.compare_put(&dk, current.as_deref(), Some(bytes::Bytes::copy_from_slice(&new)), WriteOptions::fenced(lease)).await;
         let swapped = match swapped {
             Ok(s) => s,
             // The reply was lost, not necessarily the write: look.
@@ -402,7 +403,7 @@ async fn hold_for_swap(
         let op = PendingOp::Retire { parent, name: name.to_vec(), ino: o, successor };
         let created = state
             .client
-            .compare_write(&key::pending_key(lease.inode_hint, o), None, Some(&schema::encode_pending(&op)), lease)
+            .compare_put(&key::pending_key(lease.inode_hint, o), None, Some(schema::encode_pending(&op).into()), WriteOptions::fenced(lease))
             .await
             .map_err(|e| anyhow!("retire record of {o}: {e}"))?;
         Ok(created)
@@ -499,7 +500,7 @@ pub async fn delete_name(
             return Ok(false);
         }
         let recorded = hold_for_swap(state, parent, name, d.child_inode, None, cond, lease).await?;
-        let removed = match state.client.compare_write(&dk, Some(&current), None, lease).await {
+        let removed = match state.client.compare_put(&dk, Some(&current), None, WriteOptions::fenced(lease)).await {
             Ok(r) => r,
             Err(e) => match state.kv_get_opt(&dk).await {
                 Ok(None) => true,
@@ -564,7 +565,7 @@ async fn drop_name_of(state: &mut FsState, ino: u64, lease: WriteLease) -> Resul
             if after != before
                 && !state
                     .client
-                    .compare_write(&k, Some(&before), Some(&after), lease)
+                    .compare_put(&k, Some(&before), Some(bytes::Bytes::copy_from_slice(&after)), WriteOptions::fenced(lease))
                     .await
                     .map_err(|e| anyhow!("count down inode {ino}: {e}"))?
             {
@@ -579,7 +580,7 @@ async fn drop_name_of(state: &mut FsState, ino: u64, lease: WriteLease) -> Resul
         m.nlink -= 1;
         let counted = state
             .client
-            .compare_write(&k, Some(&before), Some(&schema::encode_inode_meta(&m)), lease)
+            .compare_put(&k, Some(&before), Some(schema::encode_inode_meta(&m).into()), WriteOptions::fenced(lease))
             .await
             .map_err(|e| anyhow!("count down inode {ino}: {e}"))?;
         if counted {
@@ -617,7 +618,7 @@ async fn finish_drop(state: &mut FsState, ino: u64, before: &[u8], lease: WriteL
             tracing::warn!(ino, "inode changed since its retire was recorded; its link count is left as it is");
             return Ok(false);
         }
-        if state.client.compare_write(&k, Some(before), Some(&after), lease).await.map_err(|e| anyhow!("count down inode {ino}: {e}"))? {
+        if state.client.compare_put(&k, Some(before), Some(bytes::Bytes::copy_from_slice(&after)), WriteOptions::fenced(lease)).await.map_err(|e| anyhow!("count down inode {ino}: {e}"))? {
             return Ok(false);
         }
     }
@@ -673,7 +674,7 @@ pub async fn ensure_dirs(
             state.kv_put_fenced(&key::inode_key(ino), &schema::encode_inode_meta(&m), lease).await?;
             let created = state
                 .client
-                .compare_write(&key::dirent_key(dir, comp), None, Some(&dirent_bytes(ino, DT_DIR)), lease)
+                .compare_put(&key::dirent_key(dir, comp), None, Some(bytes::Bytes::copy_from_slice(&dirent_bytes(ino, DT_DIR))), WriteOptions::fenced(lease))
                 .await
                 .map_err(|e| anyhow!("mkdir {}: {e}", String::from_utf8_lossy(comp)))?;
             if created {
@@ -696,7 +697,7 @@ pub fn is_file(m: &InodeMeta) -> bool {
 
 // ── recovery ─────────────────────────────────────────────────────────────────
 
-/// Probe value no stored value equals: a `compare_write` expecting it never
+/// Probe value no stored value equals: a `compare_put` expecting it never
 /// writes, and so is a pure fence-floor raise.
 const FENCE_PROBE: &[u8] = b"\x00autumn-fence-probe\x00never-a-stored-value\x00";
 
@@ -721,7 +722,7 @@ pub async fn fence_all(state: &mut FsState, lease: WriteLease) -> Result<()> {
             let probe = if start.as_slice() > NS { &start[NS.len()..] } else { &[][..] };
             state
                 .client
-                .compare_write(probe, Some(FENCE_PROBE), None, lease)
+                .compare_put(probe, Some(FENCE_PROBE), None, WriteOptions::fenced(lease))
                 .await
                 .map_err(|e| anyhow!("fence partition at {:?}: {e}", String::from_utf8_lossy(&start)))?;
             fenced.insert(part);

@@ -350,7 +350,7 @@ async fn cmd_ycsb(
                     }
                     let key = key_for_partition(skref, "ycsb", tid, id);
                     id += 1;
-                    Some(async move { cref.put(key.as_bytes(), vref).await.is_ok() })
+                    Some(async move { cref.put(key.as_bytes(), vref, autumn_client::WriteOptions::default()).await.is_ok() })
                 });
                 let mut s = autumn_client::fan_out(futs, depth);
                 let mut n = 0u64;
@@ -414,13 +414,13 @@ async fn cmd_ycsb(
                         // kind: 0=read (read latency), 1=write/rmw (write latency)
                         if rmw {
                             let _ = cref.get(key.as_bytes()).await;
-                            let ok = cref.put(key.as_bytes(), vref).await.is_ok();
+                            let ok = cref.put(key.as_bytes(), vref, autumn_client::WriteOptions::default()).await.is_ok();
                             (1u8, ok, t0.elapsed())
                         } else if is_read {
                             let ok = cref.get(key.as_bytes()).await.is_ok();
                             (0u8, ok, t0.elapsed())
                         } else {
-                            let ok = cref.put(key.as_bytes(), vref).await.is_ok();
+                            let ok = cref.put(key.as_bytes(), vref, autumn_client::WriteOptions::default()).await.is_ok();
                             (1u8, ok, t0.elapsed())
                         }
                     })
@@ -521,7 +521,7 @@ async fn cmd_perf_clean(
                 .map_err(|e| anyhow!("range from {:?}: {e}", String::from_utf8_lossy(&cursor)))?;
                 let keys: Vec<&[u8]> = page.entries.iter().map(|e| e.key.as_slice()).collect();
                 if !keys.is_empty() && !dry_run {
-                    for (key, r) in keys.iter().zip(bench.delete_many(&keys).await) {
+                    for (key, r) in keys.iter().zip(bench.delete_many(&keys, autumn_client::WriteOptions::default()).await) {
                         r.map_err(|e| anyhow!("delete {:?}: {e}", String::from_utf8_lossy(key)))?;
                     }
                 }
@@ -611,7 +611,7 @@ async fn cmd_perf_check(client: &ClusterClient, threads: usize, duration_secs: u
     // shared `fan_out` streaming primitive. A lazy, deadline-bounded
     // iterator yields ONE single-op future per key; `fan_out(.., depth)`
     // keeps `depth` in-flight (sliding window) until the deadline. Each
-    // future is one `kv_put` (put_bulk for bulk, else put) — kv_put is the unit
+    // future is one `kv_put` (a `put`) — kv_put is the unit
     // the fan-out composes. The SDK routes per key; no per-partition striping.
     // D7: user-space starts within the bench namespace (see
     // `bench_user_starts`); the client re-prepends `bench/perf/`.
@@ -693,12 +693,12 @@ async fn cmd_perf_check(client: &ClusterClient, threads: usize, duration_secs: u
                                     k
                                 })
                                 .collect();
-                            let items: Vec<(&[u8], bytes::Bytes, u64)> = keys
+                            let items: Vec<(&[u8], bytes::Bytes)> = keys
                                 .iter()
-                                .map(|k| (k.as_bytes(), vz.clone(), 0u64))
+                                .map(|k| (k.as_bytes(), vz.clone()))
                                 .collect();
                             let t0 = Instant::now();
-                            let res = cref.put_many(&items).await;
+                            let res = cref.put_many(&items, autumn_client::WriteOptions::default()).await;
                             let el = t0.elapsed();
                             let n_ok = res.iter().filter(|r| r.is_ok()).count();
                             if n_ok > 0 {
@@ -724,9 +724,9 @@ async fn cmd_perf_check(client: &ClusterClient, threads: usize, duration_secs: u
                         Some(async move {
                             let t0 = Instant::now();
                             let ok = if bulk_write {
-                                cref.put_bulk(key.as_bytes(), val).await.is_ok()
+                                cref.put(key.as_bytes(), val, autumn_client::WriteOptions::default()).await.is_ok()
                             } else {
-                                cref.put(key.as_bytes(), val.as_ref()).await.is_ok()
+                                cref.put(key.as_bytes(), val.as_ref(), autumn_client::WriteOptions::default()).await.is_ok()
                             };
                             (ok, t0.elapsed())
                         })
@@ -1190,7 +1190,7 @@ async fn main() -> Result<()> {
         Command::Put { key, file } => {
             let value = std::fs::read(&file).with_context(|| format!("read file {file}"))?;
             client
-                .put(key.as_bytes(), &value)
+                .put(key.as_bytes(), &value, autumn_client::WriteOptions::default())
                 .await
                 .map_err(|e| anyhow!("put: {e}"))?;
             println!("ok");
@@ -1202,7 +1202,7 @@ async fn main() -> Result<()> {
             // UCX rcache auto-registers the value's backing memory on first
             // send (one-time ~100 µs ibv_reg_mr); no SDK-level reg hook needed.
             client
-                .put_bulk(key.as_bytes(), value)
+                .put(key.as_bytes(), value, autumn_client::WriteOptions::default())
                 .await
                 .map_err(|e| anyhow!("put-bulk: {e}"))?;
             println!("ok");
@@ -1340,7 +1340,7 @@ async fn main() -> Result<()> {
 
         Command::Del { key } => {
             client
-                .delete(key.as_bytes())
+                .delete(key.as_bytes(), autumn_client::WriteOptions::default())
                 .await
                 .map_err(|e| anyhow!("delete: {e}"))?;
             println!("ok");

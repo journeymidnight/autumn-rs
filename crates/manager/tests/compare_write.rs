@@ -84,27 +84,27 @@ fn compare_write_conditions_fences_and_persists_a_bump_from_a_failed_compare() {
         let anon = WriteLease::ANON;
 
         // Create-if-absent, and only once.
-        assert!(c.compare_write(b"cw/a", None, Some(b"v1"), anon).await.unwrap());
-        assert!(!c.compare_write(b"cw/a", None, Some(b"v2"), anon).await.unwrap());
+        assert!(c.compare_put(b"cw/a", None, Some(bytes::Bytes::copy_from_slice(b"v1")), autumn_client::WriteOptions::fenced(anon)).await.unwrap());
+        assert!(!c.compare_put(b"cw/a", None, Some(bytes::Bytes::copy_from_slice(b"v2")), autumn_client::WriteOptions::fenced(anon)).await.unwrap());
         assert_eq!(get(&c, b"cw/a").await.as_deref(), Some(&b"v1"[..]));
 
         // Replace only on an exact match.
-        assert!(!c.compare_write(b"cw/a", Some(b"zz"), Some(b"v3"), anon).await.unwrap());
-        assert!(c.compare_write(b"cw/a", Some(b"v1"), Some(b"v3"), anon).await.unwrap());
+        assert!(!c.compare_put(b"cw/a", Some(b"zz"), Some(bytes::Bytes::copy_from_slice(b"v3")), autumn_client::WriteOptions::fenced(anon)).await.unwrap());
+        assert!(c.compare_put(b"cw/a", Some(b"v1"), Some(bytes::Bytes::copy_from_slice(b"v3")), autumn_client::WriteOptions::fenced(anon)).await.unwrap());
         assert_eq!(get(&c, b"cw/a").await.as_deref(), Some(&b"v3"[..]));
 
         // Conditional delete.
-        assert!(!c.compare_write(b"cw/a", Some(b"v1"), None, anon).await.unwrap());
+        assert!(!c.compare_put(b"cw/a", Some(b"v1"), None, autumn_client::WriteOptions::fenced(anon)).await.unwrap());
         assert_eq!(get(&c, b"cw/a").await.as_deref(), Some(&b"v3"[..]));
-        assert!(c.compare_write(b"cw/a", Some(b"v3"), None, anon).await.unwrap());
+        assert!(c.compare_put(b"cw/a", Some(b"v3"), None, autumn_client::WriteOptions::fenced(anon)).await.unwrap());
         assert_eq!(get(&c, b"cw/a").await, None);
         // A tombstone reads as absent, so create-if-absent succeeds over it.
-        assert!(c.compare_write(b"cw/a", None, Some(b"v4"), anon).await.unwrap());
+        assert!(c.compare_put(b"cw/a", None, Some(bytes::Bytes::copy_from_slice(b"v4")), autumn_client::WriteOptions::fenced(anon)).await.unwrap());
         assert_eq!(get(&c, b"cw/a").await.as_deref(), Some(&b"v4"[..]));
 
         // A stale epoch is refused before the comparison is even looked at.
-        assert!(c.compare_write(b"cw/f", None, Some(b"x"), lease(77, 5)).await.unwrap());
-        match c.compare_write(b"cw/g", None, Some(b"y"), lease(77, 4)).await {
+        assert!(c.compare_put(b"cw/f", None, Some(bytes::Bytes::copy_from_slice(b"x")), autumn_client::WriteOptions::fenced(lease(77, 5))).await.unwrap());
+        match c.compare_put(b"cw/g", None, Some(bytes::Bytes::copy_from_slice(b"y")), autumn_client::WriteOptions::fenced(lease(77, 4))).await {
             Err(AutumnError::Fenced(_)) => {}
             other => panic!("stale epoch must be fenced, got {other:?}"),
         }
@@ -113,7 +113,7 @@ fn compare_write_conditions_fences_and_persists_a_bump_from_a_failed_compare() {
         // A comparison that cannot hold is a pure floor bump: nothing is
         // written, and the raised floor is durable. No other write for ino 88
         // precedes the crash, so only the fence-only record can carry it.
-        assert!(!c.compare_write(b"cw/h", Some(b"never"), None, lease(88, 10)).await.unwrap());
+        assert!(!c.compare_put(b"cw/h", Some(b"never"), None, autumn_client::WriteOptions::fenced(lease(88, 10))).await.unwrap());
         assert_eq!(get(&c, b"cw/h").await, None);
 
         child.kill().expect("kill -9 PS");
@@ -121,12 +121,12 @@ fn compare_write_conditions_fences_and_persists_a_bump_from_a_failed_compare() {
         let mut child = spawn_ps(171, mgr_addr, ps_addr);
         compio::time::sleep(Duration::from_millis(3000)).await;
 
-        match c.put_fenced(b"cw/i", b"late", lease(88, 9)).await {
+        match c.put(b"cw/i", b"late", autumn_client::WriteOptions::fenced(lease(88, 9))).await {
             Err(AutumnError::Fenced(_)) => {}
             other => panic!("the bump from a failed compare must survive a PS crash, got {other:?}"),
         }
         assert_eq!(get(&c, b"cw/i").await, None);
-        c.put_fenced(b"cw/i", b"current", lease(88, 10)).await.expect("current epoch writes");
+        c.put(b"cw/i", b"current", autumn_client::WriteOptions::fenced(lease(88, 10))).await.expect("current epoch writes");
 
         child.kill().ok();
         let _ = child.wait();

@@ -19,7 +19,7 @@
 
 use std::sync::Mutex;
 
-use autumn_client::{AutumnError, ClusterClient};
+use autumn_client::{AutumnError, ClusterClient, WriteOptions};
 use futures::channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
 use futures::StreamExt;
 use pyo3::buffer::PyBuffer;
@@ -93,8 +93,7 @@ enum Op {
     Put {
         key: Vec<u8>,
         value: Vec<u8>,
-        /// Relative TTL in seconds; `0` = no expiry. Converted to an absolute
-        /// `expires_at` at write time via `ClusterClient::ttl_to_expires_at`.
+        /// Relative TTL in seconds; `0` = no expiry (`write_opts`).
         ttl_secs: u64,
         handle: PyHandle,
     },
@@ -185,22 +184,19 @@ async fn event_loop(client: ClusterClient, mut rx: UnboundedReceiver<Op>) {
     }
 }
 
+/// A relative TTL from Python (`0` = none) as write options.
+fn write_opts(ttl_secs: u64) -> WriteOptions {
+    match ttl_secs {
+        0 => WriteOptions::default(),
+        s => WriteOptions::default().with_ttl(std::time::Duration::from_secs(s)),
+    }
+}
+
 async fn handle_op(client: &ClusterClient, op: Op) {
     match op {
         Op::Put { key, value, ttl_secs, handle } => {
-            // TTL path routes through `put_many` of 1: the single-`put` wire
-            // (`PutReq`) carries `expires_at`, but the SDK's ergonomic `put`
-            // does not expose it (it was folded into `put_many` on 2026-06-08),
-            // so a TTL'd single put is a batch of one. `Bytes::from(value)`
-            // moves the owned Vec in — no copy. `ttl_secs == 0` keeps the
-            // untouched no-TTL fast path.
-            let res = if ttl_secs == 0 {
-                client.put(&key, &value).await
-            } else {
-                let expires_at = ClusterClient::ttl_to_expires_at(ttl_secs);
-                let items = [(key.as_slice(), bytes::Bytes::from(value), expires_at)];
-                client.put_many(&items).await.into_iter().next().unwrap_or(Ok(()))
-            };
+            // The owned Vec moves in, no copy.
+            let res = client.put(&key, value, write_opts(ttl_secs)).await;
             match res {
                 Ok(()) => handle.resolve(|py| Ok(py.None())),
                 Err(e) => handle.reject(e.to_string()),
@@ -217,7 +213,7 @@ async fn handle_op(client: &ClusterClient, op: Op) {
             }
         }
         Op::Delete { key, handle } => {
-            match client.delete(&key).await {
+            match client.delete(&key, WriteOptions::default()).await {
                 Ok(()) => handle.resolve(|py| Ok(py.None())),
                 Err(e) => handle.reject(e.to_string()),
             }
@@ -273,18 +269,10 @@ async fn handle_op(client: &ClusterClient, op: Op) {
             let value = unsafe {
                 std::slice::from_raw_parts(buf.buf_ptr() as *const u8, buf.item_count())
             };
-            // No-TTL fast path unchanged. TTL path routes through `put_many` of 1
-            // (the wire form carrying `expires_at`); it copies the pinned bytes
-            // into `Bytes` — the single `put_from` TTL path is low-frequency. The
-            // kvcache bulk write path is `BatchClient.put_from` (run_job
-            // `BatchOp::Put`), which stays zero-copy via `Bytes::from_static`.
-            let res = if ttl_secs == 0 {
-                client.put(&key, value).await
-            } else {
-                let expires_at = ClusterClient::ttl_to_expires_at(ttl_secs);
-                let items = [(key.as_slice(), bytes::Bytes::copy_from_slice(value), expires_at)];
-                client.put_many(&items).await.into_iter().next().unwrap_or(Ok(()))
-            };
+            // Copies the pinned bytes. The kvcache bulk write path is
+            // `BatchClient.put_from` (run_job `BatchOp::Put`), which stays
+            // zero-copy via `Bytes::from_static`.
+            let res = client.put(&key, value, write_opts(ttl_secs)).await;
             match res {
                 Ok(()) => handle.resolve(|py| Ok(py.None())),
                 Err(e) => handle.reject(e.to_string()),
@@ -346,25 +334,24 @@ async fn handle_op(client: &ClusterClient, op: Op) {
                     let value = unsafe {
                         std::slice::from_raw_parts(buf.buf_ptr() as *const u8, buf.item_count())
                     };
-                    client.put(k, value)
+                    client.put(k, value, WriteOptions::default())
                 });
                 futures::future::join_all(futs).await.iter().map(|r| r.is_ok()).collect()
             } else {
-                // TTL path: one `put_many` carrying `expires_at` per item. The
-                // pinned pages stay zero-copy via `Bytes::from_static` (bufs
-                // outlive the await; freed at `drop(bufs)` below).
-                let expires_at = ClusterClient::ttl_to_expires_at(ttl_secs);
-                let pitems: Vec<(&[u8], bytes::Bytes, u64)> = keys
+                // TTL path: one `put_many`. The pinned pages stay zero-copy via
+                // `Bytes::from_static` (bufs outlive the await; freed at
+                // `drop(bufs)` below).
+                let pitems: Vec<(&[u8], bytes::Bytes)> = keys
                     .iter()
                     .zip(bufs.iter())
                     .map(|(k, buf)| {
                         let page: &'static [u8] = unsafe {
                             std::slice::from_raw_parts(buf.buf_ptr() as *const u8, buf.item_count())
                         };
-                        (k.as_slice(), bytes::Bytes::from_static(page), expires_at)
+                        (k.as_slice(), bytes::Bytes::from_static(page))
                     })
                     .collect();
-                client.put_many(&pitems).await.iter().map(|r| r.is_ok()).collect()
+                client.put_many(&pitems, write_opts(ttl_secs)).await.iter().map(|r| r.is_ok()).collect()
             };
             handle.resolve(move |py| {
                 Ok(pyo3::types::PyList::new(py, oks)?.into_any().unbind())
@@ -418,7 +405,7 @@ async fn do_batch_delete(client: &ClusterClient, prefix: &[u8]) -> Result<u64, S
         .map_err(|e| e.to_string())?;
     let mut count = 0u64;
     for entry in &res.entries {
-        match client.delete(&entry.key).await {
+        match client.delete(&entry.key, WriteOptions::default()).await {
             Ok(()) => count += 1,
             Err(AutumnError::NotFound) => {}
             Err(e) => return Err(e.to_string()),
@@ -984,31 +971,23 @@ async fn run_job(client: &ClusterClient, op: BatchOp, items: Vec<WorkItem>, ttl_
                 .collect()
         }
         BatchOp::Put => {
-            // consolidate onto `ClusterClient::put_many` (fan_out) — the write
-            // mirror of the Get arm. The bulk decision (`bulk_worthwhile`) + per-item
-            // put_bulk/put dispatch now live once inside `put_many`. The value is a
+            // `ClusterClient::put_many` — the write mirror of the Get arm; it
+            // picks inline or bulk per value. The value is a
             // `Bytes::from_static` view aliasing the pinned source page.
             // SAFETY: each `it.ptr/len` addresses a pinned source page the caller
             // keeps alive for the whole batch (until `allow_threads` returns); the
             // `Bytes::from_static` view is consumed within the call and its Drop is a
             // no-op (never frees the page).
-            // `ttl_secs == 0` ⇒ `expires_at = 0` (no expiry), preserving the
-            // prior behaviour. Compute the absolute deadline once for the batch.
-            let expires_at = if ttl_secs == 0 {
-                0
-            } else {
-                ClusterClient::ttl_to_expires_at(ttl_secs)
-            };
-            let pitems: Vec<(&[u8], bytes::Bytes, u64)> = items
+            let pitems: Vec<(&[u8], bytes::Bytes)> = items
                 .iter()
                 .map(|it| {
                     let page: &'static [u8] =
                         unsafe { std::slice::from_raw_parts(it.ptr as *const u8, it.len) };
-                    (it.key.as_slice(), bytes::Bytes::from_static(page), expires_at)
+                    (it.key.as_slice(), bytes::Bytes::from_static(page))
                 })
                 .collect();
             let _ = cap; // unused — put_many no longer takes a concurrency arg
-            let results = client.put_many(&pitems).await;
+            let results = client.put_many(&pitems, write_opts(ttl_secs)).await;
             drop(pitems);
             results.iter().map(|r| r.is_ok()).collect()
         }

@@ -35,9 +35,9 @@ async fn batch(
         let start = Instant::now();
         if write {
             if bulk_worthwhile(value.len()) {
-                client.put_bulk(key, value.clone()).await.unwrap();
+                client.put(key, value.clone(), autumn_client::WriteOptions::default()).await.unwrap();
             } else {
-                client.put(key, value).await.unwrap();
+                client.put(key, value, autumn_client::WriteOptions::default()).await.unwrap();
             }
         } else if read_mode == "get" {
             let got = client.get(key).await.unwrap().expect("missing key");

@@ -241,6 +241,14 @@ pub const MSG_COMPARE_WRITE: u8 = 0x5E;
 /// `WIRE_VERSION_WITH_COMPARE_PUT_BULK` or later.
 pub const MSG_COMPARE_PUT_BULK: u8 = 0x60;
 
+/// The SDK's one conditional write (`ClusterClient::compare_put`):
+/// `CompareWriteBulkReq` ctrl, the value as the frame's tail, with a TTL and a
+/// lease fence, or a conditional delete. Supersedes `MSG_COMPARE_PUT`,
+/// `MSG_COMPARE_WRITE` and `MSG_COMPARE_PUT_BULK`, which the PS still serves
+/// for older clients. Replied with `PutResp`. Sent only to a cluster
+/// negotiated at `WIRE_VERSION_WITH_COMPARE_WRITE_BULK` or later.
+pub const MSG_COMPARE_WRITE_BULK: u8 = 0x61;
+
 /// One op inside a `BatchDeleteReq`. Carries its own fence identity because a
 /// batch may span inodes (a directory unlink walks many), exactly as
 /// `BatchPutOp` does.
@@ -758,6 +766,24 @@ pub struct ComparePutBulkReq {
     pub expires_at: u64,
 }
 
+/// `MSG_COMPARE_WRITE_BULK` ctrl; the value (empty for a delete) is the
+/// frame's tail. `expected` is capped at `MAX_COMPARE_PUT_BYTES`.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct CompareWriteBulkReq {
+    pub part_id: u64,
+    pub region_epoch: u64,
+    pub key: Vec<u8>,
+    /// None requires absence, Some requires exact visible-value equality.
+    pub expected: Option<Vec<u8>>,
+    /// True writes a tombstone instead of the tail.
+    pub delete: bool,
+    /// Absolute unix seconds; 0 = no expiry.
+    pub expires_at: u64,
+    /// Fence identity, as in `PutReq`. 0 = anonymous (no fence check).
+    pub inode_hint: u64,
+    pub lease_epoch: u64,
+}
+
 /// `MSG_COMPARE_WRITE` request. Replied with `PutResp`: `CODE_OK` when the
 /// write was applied, `CODE_PRECONDITION` when `expected` did not hold,
 /// `CODE_FENCED` when the stamped epoch is below the partition's floor.
@@ -1116,6 +1142,9 @@ pub fn extract_part_id(msg_type: u8, payload: &[u8]) -> u64 {
         MSG_COMPARE_PUT_BULK => rkyv_decode::<ComparePutBulkReq>(payload)
             .map(|r| r.part_id)
             .unwrap_or(0),
+        MSG_COMPARE_WRITE_BULK => rkyv_decode::<CompareWriteBulkReq>(payload)
+            .map(|r| r.part_id)
+            .unwrap_or(0),
         MSG_PUT => rkyv_decode::<PutReq>(payload)
             .map(|r| r.part_id)
             .unwrap_or(0),
@@ -1192,6 +1221,7 @@ mod msg_type_tests {
             MSG_COMPARE_PUT,
             MSG_COMPARE_WRITE,
             MSG_COMPARE_PUT_BULK,
+            MSG_COMPARE_WRITE_BULK,
             MSG_DELETE,
             MSG_HEAD,
             MSG_RANGE,

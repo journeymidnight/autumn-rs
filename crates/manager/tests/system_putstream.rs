@@ -216,7 +216,7 @@ fn get_stream_inline_value_passthrough() {
 
         let value = b"hello inline world";
         let key = b"inline";
-        cluster.put(key, value).await.unwrap();
+        cluster.put(key, value, autumn_client::WriteOptions::default()).await.unwrap();
 
         let mut stream = cluster.get_stream(key, 1024).await.unwrap().unwrap();
         assert_eq!(stream.total_bytes(), value.len() as u64);
@@ -246,8 +246,8 @@ fn get_many_into_mixed_sizes() {
 
         let small = pattern(4 * 1024); // < 64 KiB → small reply decoded
         let large = pattern(256 * 1024); // >= 64 KiB → received into the pool
-        cluster.put(b"k-small", &small).await.expect("put small");
-        cluster.put(b"k-large", &large).await.expect("put large");
+        cluster.put(b"k-small", &small, autumn_client::WriteOptions::default()).await.expect("put small");
+        cluster.put(b"k-large", &large, autumn_client::WriteOptions::default()).await.expect("put large");
 
         let mut d_small = vec![0u8; small.len()];
         let mut d_large = vec![0u8; large.len()];
@@ -340,13 +340,13 @@ fn put_many_small_values_take_the_batched_bulk_path() {
                 bytes::Bytes::from(vec![(i % 251) as u8 + 1; len]) // distinct content
             })
             .collect();
-        let items: Vec<(&[u8], bytes::Bytes, u64)> = keys
+        let items: Vec<(&[u8], bytes::Bytes)> = keys
             .iter()
             .zip(&values)
-            .map(|(k, v)| (k.as_slice(), v.clone(), 0u64))
+            .map(|(k, v)| (k.as_slice(), v.clone()))
             .collect();
 
-        for (i, r) in cluster.put_many(&items).await.into_iter().enumerate() {
+        for (i, r) in cluster.put_many(&items, autumn_client::WriteOptions::default()).await.into_iter().enumerate() {
             assert!(r.is_ok(), "put {i}: {r:?}");
         }
         for (i, (k, v)) in keys.iter().zip(&values).enumerate() {
@@ -435,12 +435,12 @@ fn get_many_recovers_from_a_stale_epoch_after_a_split() {
         let values: Vec<bytes::Bytes> = (0..N)
             .map(|i| bytes::Bytes::from(vec![(i % 251) as u8 + 1; 4096 + i * 32]))
             .collect();
-        let items: Vec<(&[u8], bytes::Bytes, u64)> = keys
+        let items: Vec<(&[u8], bytes::Bytes)> = keys
             .iter()
             .zip(&values)
-            .map(|(k, v)| (k.as_slice(), v.clone(), 0u64))
+            .map(|(k, v)| (k.as_slice(), v.clone()))
             .collect();
-        for r in cluster.put_many(&items).await {
+        for r in cluster.put_many(&items, autumn_client::WriteOptions::default()).await {
             r.expect("put");
         }
 
@@ -503,8 +503,8 @@ fn delete_many_and_head_many() {
     compio::runtime::Runtime::new().unwrap().block_on(async {
         let cluster = boot_cluster(mgr_addr, n1_addr, n2_addr, 122, 12201).await;
 
-        cluster.put(b"dm-a", b"aaaa").await.expect("put a");
-        cluster.put(b"dm-b", b"bbbbbb").await.expect("put b");
+        cluster.put(b"dm-a", b"aaaa", autumn_client::WriteOptions::default()).await.expect("put a");
+        cluster.put(b"dm-b", b"bbbbbb", autumn_client::WriteOptions::default()).await.expect("put b");
 
         // head_many: 2 present + 1 absent.
         let keys: [&[u8]; 3] = [b"dm-a", b"dm-b", b"dm-missing"];
@@ -517,7 +517,7 @@ fn delete_many_and_head_many() {
 
         // delete_many the two present keys.
         let del_keys: [&[u8]; 2] = [b"dm-a", b"dm-b"];
-        let dels = cluster.delete_many(&del_keys).await;
+        let dels = cluster.delete_many(&del_keys, autumn_client::WriteOptions::default()).await;
         assert!(dels[0].is_ok() && dels[1].is_ok());
 
         // Confirm gone.
@@ -553,9 +553,9 @@ fn put_many_mixed_size_duplicate_key_keeps_last_input() {
         let large = bytes::Bytes::from(pattern(256 * 1024));
 
         // Bulk first, small last: the small value must win.
-        let items: [(&[u8], bytes::Bytes, u64); 2] =
-            [(b"pm-dup-a", large.clone(), 0), (b"pm-dup-a", small.clone(), 0)];
-        for (i, r) in cluster.put_many(&items).await.iter().enumerate() {
+        let items: [(&[u8], bytes::Bytes); 2] =
+            [(b"pm-dup-a", large.clone()), (b"pm-dup-a", small.clone())];
+        for (i, r) in cluster.put_many(&items, autumn_client::WriteOptions::default()).await.iter().enumerate() {
             assert!(r.is_ok(), "op {i}: {r:?}");
         }
         assert_eq!(
@@ -565,9 +565,9 @@ fn put_many_mixed_size_duplicate_key_keeps_last_input() {
         );
 
         // Small first, bulk last: the bulk value must win.
-        let items: [(&[u8], bytes::Bytes, u64); 2] =
-            [(b"pm-dup-b", small.clone(), 0), (b"pm-dup-b", large.clone(), 0)];
-        for (i, r) in cluster.put_many(&items).await.iter().enumerate() {
+        let items: [(&[u8], bytes::Bytes); 2] =
+            [(b"pm-dup-b", small.clone()), (b"pm-dup-b", large.clone())];
+        for (i, r) in cluster.put_many(&items, autumn_client::WriteOptions::default()).await.iter().enumerate() {
             assert!(r.is_ok(), "op {i}: {r:?}");
         }
         assert_eq!(
@@ -579,14 +579,14 @@ fn put_many_mixed_size_duplicate_key_keeps_last_input() {
         // Three values, alternating classes, other keys interleaved: the last
         // one wins and the other keys keep their own values.
         let mid = bytes::Bytes::from(pattern(128 * 1024));
-        let items: [(&[u8], bytes::Bytes, u64); 5] = [
-            (b"pm-dup-c", small.clone(), 0),
-            (b"pm-dup-other", large.clone(), 0),
-            (b"pm-dup-c", large.clone(), 0),
-            (b"pm-dup-other2", small.clone(), 0),
-            (b"pm-dup-c", mid.clone(), 0),
+        let items: [(&[u8], bytes::Bytes); 5] = [
+            (b"pm-dup-c", small.clone()),
+            (b"pm-dup-other", large.clone()),
+            (b"pm-dup-c", large.clone()),
+            (b"pm-dup-other2", small.clone()),
+            (b"pm-dup-c", mid.clone()),
         ];
-        for (i, r) in cluster.put_many(&items).await.iter().enumerate() {
+        for (i, r) in cluster.put_many(&items, autumn_client::WriteOptions::default()).await.iter().enumerate() {
             assert!(r.is_ok(), "op {i}: {r:?}");
         }
         assert_eq!(cluster.get(b"pm-dup-c").await.unwrap().as_deref(), Some(mid.as_ref()));

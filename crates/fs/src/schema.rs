@@ -230,7 +230,7 @@ pub fn decode_pending(bytes: &[u8]) -> Result<PendingOp, String> {
     autumn_rpc::partition_rpc::rkyv_decode(bytes).map_err(|e| format!("{:?}", e))
 }
 
-/// Where a multipart upload is. Every transition is a `compare_write` on the
+/// Where a multipart upload is. Every transition is a `compare_put` on the
 /// upload record, so a Complete and an Abort race to exactly one winner.
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub enum UploadState {

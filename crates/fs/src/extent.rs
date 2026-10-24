@@ -20,6 +20,7 @@
 //! is zero-filled, so short/last extents AND sparse holes both read correctly
 //! even if a cached `len` over-estimates (cold inference of a sparse file).
 
+use autumn_client::WriteOptions;
 use anyhow::{anyhow, Result};
 use bytes::Bytes;
 
@@ -319,13 +320,13 @@ pub async fn execute_append(
     client: std::rc::Rc<autumn_client::ClusterClient>,
     plan: &AppendPlan,
 ) -> Result<()> {
-    let items: Vec<(&[u8], Bytes, u64)> = plan
+    let items: Vec<(&[u8], Bytes)> = plan
         .keys
         .iter()
         .zip(plan.values.iter())
-        .map(|(k, v)| (k.as_slice(), v.clone(), 0u64))
+        .map(|(k, v)| (k.as_slice(), v.clone()))
         .collect();
-    for r in client.put_many_fenced(&items, plan.lease).await {
+    for r in client.put_many(&items, WriteOptions::fenced(plan.lease)).await {
         r.map_err(|e| anyhow::Error::new(e).context("KV put"))?;
     }
     Ok(())
@@ -484,15 +485,15 @@ async fn flush_appends(
     let drained_keys = std::mem::take(keys);
     let drained_values = std::mem::take(values);
     let drained_upserts = std::mem::take(upserts);
-    // This append path calls `put_many_fenced` directly on the client, which
+    // This append path calls `put_many` directly on the client, which
     // prepends `fs/` — same as the RMW-overwrite branch (kv_put_fenced)
     // and the read path (read::prepare). The bare `key::*` keys are relative.
-    let items: Vec<(&[u8], Bytes, u64)> = drained_keys
+    let items: Vec<(&[u8], Bytes)> = drained_keys
         .iter()
         .zip(drained_values.iter())
-        .map(|(k, v)| (k.as_slice(), v.clone(), 0u64))
+        .map(|(k, v)| (k.as_slice(), v.clone()))
         .collect();
-    let results = state.client.put_many_fenced(&items, lease).await;
+    let results = state.client.put_many(&items, WriteOptions::fenced(lease)).await;
     for (i, r) in results.into_iter().enumerate() {
         r.map_err(|e| anyhow::Error::new(e).context("KV put"))?;
         let (start, len) = drained_upserts[i];

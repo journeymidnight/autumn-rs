@@ -8,7 +8,7 @@
 //! with the bytes.
 //!
 //! **One state machine, CASed.** The upload record (`key::upload_key`) moves
-//! `Open → Completing → Completed` or `Open → Aborted` only by `compare_write`,
+//! `Open → Completing → Completed` or `Open → Aborted` only by `compare_put`,
 //! so a Complete and an Abort have exactly one winner. `Completing` names the
 //! session doing it and freezes the list of data objects it publishes;
 //! whatever a late or failed UploadPart writes afterwards is not in that list
@@ -38,6 +38,7 @@
 //! it once the dirent names the file, and the session's recovery settles it
 //! otherwise.
 
+use autumn_client::WriteOptions;
 use std::collections::HashSet;
 
 use anyhow::{anyhow, Result};
@@ -205,7 +206,7 @@ impl PartWriter {
         // A plain put: a retry of the same part number replaces the record,
         // and the object it named stays recorded for the terminal cleanup.
         client
-            .put_fenced(&key::upload_part_key(self.upload, self.part), &schema::encode_part(&rec), self.lease)
+            .put(&key::upload_part_key(self.upload, self.part), &schema::encode_part(&rec), WriteOptions::fenced(self.lease))
             .await
             .map_err(|e| anyhow!("KV put: {e}"))?;
         // Did the upload stay open until the part landed? A Complete that
@@ -213,7 +214,7 @@ impl PartWriter {
         let now = load(client, self.upload).await?;
         if now.as_ref().is_some_and(|(_, r)| owns(&r.state, d, true)) {
             client
-                .delete_fenced(&key::pending_key(self.lease.inode_hint, d), self.lease)
+                .delete(&key::pending_key(self.lease.inode_hint, d), WriteOptions::fenced(self.lease))
                 .await
                 .map_err(|e| anyhow!("KV delete: {e}"))?;
             return Ok((part_etag(d, crc32c), size));
@@ -250,11 +251,11 @@ async fn drop_part_object(client: &ClusterClient, upload: u64, part: u32, s: u64
     if let Some(cur) = client.get(&pk).await.map_err(|e| anyhow!("KV get: {e}"))? {
         let r = schema::decode_part(&cur).map_err(|e| anyhow!("part {upload}/{part}: {e}"))?;
         if r.data_ino == d {
-            client.compare_write(&pk, Some(&cur), None, lease).await.map_err(|e| anyhow!("{e}"))?;
+            client.compare_put(&pk, Some(&cur), None, WriteOptions::fenced(lease)).await.map_err(|e| anyhow!("{e}"))?;
         }
     }
     delete_allocated(client, upload, s, d, lease).await?;
-    client.delete_fenced(&key::pending_key(s, d), lease).await.map_err(|e| anyhow!("KV delete: {e}"))
+    client.delete(&key::pending_key(s, d), WriteOptions::fenced(lease)).await.map_err(|e| anyhow!("KV delete: {e}"))
 }
 
 /// Delete an upload's data object `d` (written by session `s`) and its
@@ -268,7 +269,7 @@ async fn delete_allocated(client: &ClusterClient, upload: u64, s: u64, d: u64, l
         {
             segment::delete_object(client, d, len, lanes, unit, lease).await?;
         }
-        client.delete_fenced(&ak, lease).await.map_err(|e| anyhow!("KV delete: {e}"))?;
+        client.delete(&ak, WriteOptions::fenced(lease)).await.map_err(|e| anyhow!("KV delete: {e}"))?;
     }
     Ok(())
 }
@@ -344,7 +345,7 @@ pub async fn complete(
     // the record is how recovery finds and reopens the upload if it does.
     let swapped = state
         .client
-        .compare_write(&key::upload_key(upload), Some(&cur), Some(&schema::encode_upload(&completing)), lease)
+        .compare_put(&key::upload_key(upload), Some(&cur), Some(schema::encode_upload(&completing).into()), WriteOptions::fenced(lease))
         .await
         .map_err(|e| anyhow!("complete {upload}: {e}"))?;
     if !swapped {
@@ -434,9 +435,9 @@ async fn write_and_publish(
         }
         off += p.size;
     }
-    let items: Vec<(&[u8], bytes::Bytes, u64)> =
-        rkeys.iter().zip(rvals).map(|(k, v)| (k.as_slice(), v, 0u64)).collect();
-    for r in state.client.put_many_fenced(&items, lease).await {
+    let items: Vec<(&[u8], bytes::Bytes)> =
+        rkeys.iter().zip(rvals).map(|(k, v)| (k.as_slice(), v)).collect();
+    for r in state.client.put_many(&items, WriteOptions::fenced(lease)).await {
         r.map_err(|e| anyhow!("file records of {new_ino}: {e}"))?;
     }
     let map = segment::publish_map(state, new_ino, segs, lease).await?;
@@ -504,11 +505,11 @@ async fn finish_completed(
     let done = UploadRecord { state: UploadState::Completed { new_ino, frozen }, ..completing.clone() };
     let swapped = state
         .client
-        .compare_write(
+        .compare_put(
             &key::upload_key(upload),
             Some(&schema::encode_upload(completing)),
-            Some(&schema::encode_upload(&done)),
-            lease,
+            Some(schema::encode_upload(&done).into()),
+            WriteOptions::fenced(lease),
         )
         .await
         .map_err(|e| anyhow!("complete {upload}: {e}"))?;
@@ -551,7 +552,7 @@ async fn undo_complete(state: &mut FsState, upload: u64, new_ino: u64, lease: Wr
                 }
             }
         }
-        for r in state.client.delete_many_fenced(&refs, lease).await {
+        for r in state.client.delete_many(&refs, WriteOptions::fenced(lease)).await {
             r.map_err(|e| anyhow!("records of {new_ino}: {e}"))?;
         }
         if !has_more {
@@ -564,7 +565,7 @@ async fn undo_complete(state: &mut FsState, upload: u64, new_ino: u64, lease: Wr
             let open = UploadRecord { state: UploadState::Open, ..rec };
             state
                 .client
-                .compare_write(&key::upload_key(upload), Some(&cur), Some(&schema::encode_upload(&open)), lease)
+                .compare_put(&key::upload_key(upload), Some(&cur), Some(schema::encode_upload(&open).into()), WriteOptions::fenced(lease))
                 .await
                 .map_err(|e| anyhow!("reopen {upload}: {e}"))?;
         }
@@ -589,7 +590,7 @@ pub async fn abort(state: &mut FsState, upload: u64) -> std::result::Result<(), 
                 let aborted = UploadRecord { state: UploadState::Aborted, ..rec.clone() };
                 let swapped = state
                     .client
-                    .compare_write(&key::upload_key(upload), Some(&cur), Some(&schema::encode_upload(&aborted)), lease)
+                    .compare_put(&key::upload_key(upload), Some(&cur), Some(schema::encode_upload(&aborted).into()), WriteOptions::fenced(lease))
                     .await
                     .map_err(|e| anyhow!("abort {upload}: {e}"))?;
                 if !swapped {
@@ -673,7 +674,7 @@ pub async fn cleanup(state: &mut FsState, upload: u64, lease: WriteLease) -> Res
     loop {
         let (keys, has_more) = state.kv_range_page(&pprefix, &pprefix, 1024).await?;
         let refs: Vec<&[u8]> = keys.iter().map(Vec::as_slice).collect();
-        for r in state.client.delete_many_fenced(&refs, lease).await {
+        for r in state.client.delete_many(&refs, WriteOptions::fenced(lease)).await {
             r.map_err(|e| anyhow!("part records of {upload}: {e}"))?;
         }
         if !has_more {
@@ -685,7 +686,7 @@ pub async fn cleanup(state: &mut FsState, upload: u64, lease: WriteLease) -> Res
     }
     state
         .client
-        .compare_write(&key::upload_key(upload), Some(&cur), None, lease)
+        .compare_put(&key::upload_key(upload), Some(&cur), None, WriteOptions::fenced(lease))
         .await
         .map_err(|e| anyhow!("upload {upload}: {e}"))
 }
@@ -727,11 +728,11 @@ pub async fn expire_completed(state: &mut FsState, now_secs: u64) -> Result<usiz
         // leaves the entry to retry.
         let answers: Vec<Vec<u8>> = due.iter().map(|(_, id)| key::completed_upload_key(*id)).collect();
         let refs: Vec<&[u8]> = answers.iter().map(Vec::as_slice).collect();
-        for r in state.client.delete_many_fenced(&refs, lease).await {
+        for r in state.client.delete_many(&refs, WriteOptions::fenced(lease)).await {
             r.map_err(|e| anyhow!("completed uploads: {e}"))?;
         }
         let entries: Vec<&[u8]> = due.iter().map(|(k, _)| k.as_slice()).collect();
-        for r in state.client.delete_many_fenced(&entries, lease).await {
+        for r in state.client.delete_many(&entries, WriteOptions::fenced(lease)).await {
             r.map_err(|e| anyhow!("completed upload expiries: {e}"))?;
         }
         n += due.len();

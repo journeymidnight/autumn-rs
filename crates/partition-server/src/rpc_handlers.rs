@@ -891,9 +891,10 @@ async fn get_value(
     get_value_inner(payload, part, false).await
 }
 
-/// A decoded conditional write: `MSG_COMPARE_WRITE`, `MSG_COMPARE_PUT` (a
-/// value, no fence) or `MSG_COMPARE_PUT_BULK` (a value from the frame's tail
-/// and a TTL, no fence).
+/// A decoded conditional write: `MSG_COMPARE_WRITE_BULK` (the SDK's form: a
+/// tail value or a delete, TTL, fence), or one of the older forms it
+/// supersedes — `MSG_COMPARE_WRITE`, `MSG_COMPARE_PUT` (a value, no fence) and
+/// `MSG_COMPARE_PUT_BULK` (a tail value and a TTL, no fence).
 pub(crate) struct Conditional {
     pub(crate) part_id: u64,
     pub(crate) region_epoch: u64,
@@ -914,6 +915,23 @@ pub(crate) fn decode_conditional(
     let invalid = |e| (StatusCode::InvalidArgument, e);
     let too_large = || (StatusCode::InvalidArgument, "compare_put value exceeds 64 KiB".to_string());
     let cond = match msg_type {
+        MSG_COMPARE_WRITE_BULK => {
+            let req: CompareWriteBulkReq = rkyv_decode(payload).map_err(invalid)?;
+            if req.expected.as_ref().is_some_and(|v| v.len() > MAX_COMPARE_PUT_BYTES) {
+                return Err(too_large());
+            }
+            // The value cap is answered in the reply body (`compare_write_admit`).
+            return Ok(Conditional {
+                part_id: req.part_id,
+                region_epoch: req.region_epoch,
+                key: req.key,
+                expected: req.expected,
+                value: (!req.delete).then(|| bulk_value.unwrap_or_default()),
+                expires_at: req.expires_at,
+                inode_hint: req.inode_hint,
+                lease_epoch: req.lease_epoch,
+            });
+        }
         MSG_COMPARE_PUT_BULK => {
             let req: ComparePutBulkReq = rkyv_decode(payload).map_err(invalid)?;
             if req.expected.as_ref().is_some_and(|v| v.len() > MAX_COMPARE_PUT_BYTES) {

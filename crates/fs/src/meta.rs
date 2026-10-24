@@ -2,6 +2,7 @@
 //!
 //! All functions run on the compio thread, accessing ClusterClient directly.
 
+use autumn_client::WriteOptions;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
@@ -304,7 +305,7 @@ pub async fn put_inode(state: &mut FsState, ino: u64, meta: &InodeMeta) -> Resul
         // these bytes read back means it landed, and an attempt still in
         // flight expected bytes that are then gone.
         let written = bytes == stored
-            || match state.client.compare_write(&k, Some(&stored), Some(&bytes), lease).await {
+            || match state.client.compare_put(&k, Some(&stored), Some(bytes::Bytes::copy_from_slice(&bytes)), WriteOptions::fenced(lease)).await {
                 Ok(w) => w,
                 Err(autumn_client::AutumnError::OutcomeUnknown(_)) => false,
                 Err(e) => return Err(anyhow::Error::new(e).context("KV put")),
@@ -376,8 +377,7 @@ pub async fn change_links(state: &mut FsState, ino: u64, delta: i32) -> Result<I
         m.ctime_secs = s;
         m.ctime_nsecs = ns;
         let value = schema::encode_inode_meta(&m);
-        let anon = autumn_client::WriteLease::ANON;
-        let result = state.client.compare_write(&k, Some(&stored), Some(&value), anon).await;
+        let result = state.client.compare_put(&k, Some(&stored), Some(bytes::Bytes::copy_from_slice(&value)), WriteOptions::default()).await;
         match lost_reply_for_test(result).await {
             Ok(true) => {
                 note_links(state, ino, &m);
