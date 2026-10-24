@@ -122,3 +122,14 @@ list scans. Tests (`tests/ucx_dropped_recv.rs`): a dropped registered recv keeps
 its slab out of the pool, the slab is not written after the drop, the slab is
 reused once the bytes landed; a read after a dropped recv fails at once; a
 pending orphan costs 200 later ping-pongs no list scan.
+
+## Receiving into caller memory (`RecvDest`)
+
+`RecvDest::new(ptr, cap)` (unsafe) lends caller memory to one receive as an
+owned `IoBufMut`; its drop resolves the paired `Released`. Ownership is the
+whole safety argument: compio keeps an owned buffer until a dropped read's
+completion lands, so `Released` resolving means nothing writes the memory any
+more. `ReadHalf::read_exact_into_dest` is the TCP read; it marks the first
+`filled` bytes initialized before slicing (compio's `slice` asserts the start
+is within the initialized length). UCX has no such read: a posted stream recv
+cannot be cancelled, so autumn-rpc receives UCX values into a pool buffer.

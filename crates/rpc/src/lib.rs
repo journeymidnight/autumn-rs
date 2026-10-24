@@ -31,7 +31,7 @@ pub use autumn_transport::RegisteredMem;
 /// Re-exported so `call_into_pooled` consumers (autumn-stream's StreamClient)
 /// reference `autumn_rpc::PooledBuf` without a direct autumn-transport dep.
 /// Transport-agnostic: registered on `ucx`, plain (copy-out) on TCP/no-ucx.
-pub use autumn_transport::{regpool_acquire, PooledBuf};
+pub use autumn_transport::{regpool_acquire, PooledBuf, RecvDest, Released};
 pub use error::{Result, RpcError, StatusCode};
 pub use frame::{Frame, FrameDecoder, ReadWindow, HEADER_LEN};
 

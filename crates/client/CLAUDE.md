@@ -142,11 +142,21 @@ through each method, small and large values; ablating any one hand-off is red).
   Honors `rpc_timeout` (pooled recv is cancel-safe).
 - `get_into(key, dest: &mut [u8]) → Option<usize>` — **bulk read, one copy**:
   `get_range_pooled` + ONE memcpy into `dest`. For address-CONSTRAINED consumers only
-  (sglang pages / torch tensors / python buffers / fuse assembly) — the copy is inherent
-  there (bytes must land at THEIR address; recv-into-caller-memory was removed for
-  cancel-safety). Returns `Some(value_len)` (`dest[..value_len.min(dest.len())]` filled;
-  longer values TRUNCATED to fit — same contract as `get_many_into`/`get_many_direct`)
-  or `None`.
+  (sglang pages / torch tensors / python buffers / fuse assembly). Returns
+  `Some(value_len)` (`dest[..value_len.min(dest.len())]` filled; longer values
+  TRUNCATED to fit — same contract as `get_many_into`/`get_many_direct`) or `None`.
+  A borrowed `&mut [u8]` cannot be lent to a receive (dropping the future would end
+  the borrow while the receive writes), hence the copy.
+- `get_range_into_raw(key, ptr, len)` / `get_many_into_raw(items: &[RawGetItem])` —
+  **unsafe**, whole values received straight into caller memory over
+  `RpcClient::call_into_dest` (autumn-rpc CLAUDE.md "Receiving into caller memory"):
+  no copy out of a pool buffer. Contract: the memory stays valid and untouched until
+  the future completes, and the future runs to completion. For callers that know the
+  value's size and own the memory for the call — the python `BatchClient.get_into`
+  (kvcache pages); everything else uses the pooled reads. Shares routing, retries and
+  refusal classification with `get_range_pooled` (`get_bulk_bound`); each retry lends
+  the memory again only after the previous attempt returned it. Small batches go
+  through `get_many` + copy as in `get_many_into`.
 - The large-value `put` is the **zero-copy write**: NO client-side copy AND no value
   crc scan via `MSG_PUT_BULK` + `RpcClient::call_vectored_bulk` (v28: `[meta][key]` is
   the CRC'd ctrl, the value rides after the crc as its own iovec from `value`'s backing

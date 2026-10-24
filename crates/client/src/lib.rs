@@ -1208,6 +1208,14 @@ pub struct GetManyItem<'a> {
     pub dest: &'a mut [u8],
 }
 
+/// One whole-value read of [`ClusterClient::get_many_into_raw`]: the value
+/// lands at `[ptr, ptr + len)`.
+pub struct RawGetItem<'a> {
+    pub key: &'a [u8],
+    pub ptr: *mut u8,
+    pub len: usize,
+}
+
 // ── ClusterClient ───────────────────────────────────────────────────────────
 
 /// Client for interacting with an autumn-rs cluster.
@@ -4406,6 +4414,32 @@ impl ClusterClient {
         offset: u32,
         length: u32,
     ) -> std::result::Result<Option<ValueBuf>, AutumnError> {
+        // A timed-out call's pool buffer returns to the pool via the read_loop.
+        self.get_bulk_bound(key, offset, length, "get_range_pooled", |client, payload, timeout| async move {
+            let call = client.call_into_pooled(partition_rpc::MSG_GET_BULK, payload);
+            let z = match timeout {
+                None => call.await,
+                Some(t) => compio::time::timeout(t, call).await.unwrap_or(Err(RpcError::Timeout(t))),
+            }?;
+            Ok((z.code, z.message, ValueBuf::from_pooled(z.buf)))
+        })
+        .await
+    }
+
+    /// `MSG_GET_BULK` with routing, epoch-stale refresh and retries; `call`
+    /// makes one attempt on a connection and returns `(code, message, value)`.
+    async fn get_bulk_bound<T, F, Fut>(
+        &self,
+        key: &[u8],
+        offset: u32,
+        length: u32,
+        what: &str,
+        mut call: F,
+    ) -> std::result::Result<Option<T>, AutumnError>
+    where
+        F: FnMut(Rc<RpcClient>, Bytes, Option<Duration>) -> Fut,
+        Fut: std::future::Future<Output = std::result::Result<(u8, String, T), RpcError>>,
+    {
         let mut attempt: u32 = 0;
         let mut last_err: Option<String> = None;
         while attempt <= MAX_PS_REFRESHES {
@@ -4427,35 +4461,18 @@ impl ClusterClient {
                 .await
             {
                 Ok(client) => {
-                    // The value lands in a read_loop-owned PooledBuf and is
-                    // handed back as-is (ZERO SDK-side copies). Racing
-                    // rpc_timeout is safe: on expiry the dropped call's buffer
-                    // returns to the pool via the read_loop (cancel-safe,
-                    // unlike the removed call_into_dest).
-                    let call = client.call_into_pooled(partition_rpc::MSG_GET_BULK, payload);
-                    let outcome = match timeout {
-                        None => call.await,
-                        Some(t) => match compio::time::timeout(t, call).await {
-                            Ok(r) => r,
-                            Err(_) => Err(RpcError::Timeout(t)),
-                        },
-                    };
-                    match outcome {
-                        Ok(z) => match z.code {
-                            partition_rpc::CODE_OK => {
-                                return Ok(Some(ValueBuf::from_pooled(z.buf)));
-                            }
+                    match call(client, payload, timeout).await {
+                        Ok((code, message, value)) => match code {
+                            partition_rpc::CODE_OK => return Ok(Some(value)),
                             partition_rpc::CODE_NOT_FOUND => return Ok(None),
                             // Stale epoch, GC-pinned extent, internal error:
                             // refresh + retry, as `call_ps_for_key` does for
                             // the same refusals.
-                            other => last_err = Some(code_to_error(other, z.message).to_string()),
+                            other => last_err = Some(code_to_error(other, message).to_string()),
                         },
                         Err(e) => {
                             self.evict_ps_on_error(&ps_addr, &e);
-                            // Frame-level error or transport failure. (An authz
-                            // denial now decodes properly — it used to be
-                            // misparsed as a bulk meta by the IntoDest path.)
+                            // Frame-level error or transport failure.
                             match rpc_status_to_error(e) {
                                 // TERMINAL — retrying can't grant access /
                                 // create the namespace (same classification as
@@ -4484,7 +4501,44 @@ impl ClusterClient {
                 break;
             }
         }
-        Err(self.routing_exhausted("get_range_pooled", attempt, last_err))
+        Err(self.routing_exhausted(what, attempt, last_err))
+    }
+
+    /// `get_range_into` whose value is received straight into `[ptr, ptr +
+    /// len)`: no copy out of a pool buffer. A value longer than `len` is
+    /// received into a pool buffer and its first `len` bytes copied, as
+    /// `get_range_into` does. Returns the value's length.
+    ///
+    /// # Safety
+    /// `[ptr, ptr + len)` must be valid for writes and touched by nobody else
+    /// until the returned future completes, and the future must be run to
+    /// completion: dropped early, a receive may still write the memory.
+    pub async unsafe fn get_range_into_raw(
+        &self,
+        key: &[u8],
+        ptr: *mut u8,
+        len: usize,
+    ) -> std::result::Result<Option<usize>, AutumnError> {
+        let key = self.binding.bind_key(key)?;
+        let got = self
+            .get_bulk_bound(&key, 0, 0, "get_range_into_raw", |client, payload, timeout| async move {
+                // SAFETY: the caller's contract; the previous attempt's
+                // `call_into_dest` returned, so nothing else holds the memory.
+                let (dest, released) = unsafe { autumn_rpc::RecvDest::new(ptr, len) };
+                let r = client
+                    .call_into_dest(partition_rpc::MSG_GET_BULK, payload, dest, released, timeout)
+                    .await?;
+                Ok((r.code, r.message, (r.value_len, r.spill)))
+            })
+            .await?;
+        Ok(got.map(|(value_len, spill)| {
+            if let Some(pb) = spill {
+                let n = len.min(pb.len());
+                // SAFETY: the caller's contract.
+                unsafe { std::slice::from_raw_parts_mut(ptr, n) }.copy_from_slice(&pb.as_ref()[..n]);
+            }
+            value_len
+        }))
     }
 
     /// batched point reads — the ONE client-side fan-out primitive. (Its first
@@ -4546,6 +4600,38 @@ impl ClusterClient {
             async move { self.get_range_into(key, offset, length, dest).await }
         });
         fan_out_collect(futs, concurrency).await
+    }
+
+    /// `get_many_into` for whole values received straight into each item's
+    /// memory (`get_range_into_raw`). Small values are read in one batched
+    /// request per partition and copied, as `get_many_into` does.
+    ///
+    /// # Safety
+    /// As `get_range_into_raw`, for every item.
+    pub async unsafe fn get_many_into_raw(
+        &self,
+        items: &[RawGetItem<'_>],
+    ) -> Vec<std::result::Result<Option<usize>, AutumnError>> {
+        if !items.is_empty() && items.iter().all(|it| !bulk_worthwhile(it.len)) {
+            let keys: Vec<&[u8]> = items.iter().map(|it| it.key).collect();
+            let resp = self.get_many(&keys).await;
+            return items
+                .iter()
+                .zip(resp)
+                .map(|(it, r)| {
+                    r.map(|v| {
+                        v.map(|v| {
+                            let n = v.len().min(it.len);
+                            // SAFETY: the caller's contract.
+                            unsafe { std::slice::from_raw_parts_mut(it.ptr, n) }.copy_from_slice(&v[..n]);
+                            v.len()
+                        })
+                    })
+                })
+                .collect();
+        }
+        let futs = items.iter().map(|it| unsafe { self.get_range_into_raw(it.key, it.ptr, it.len) });
+        fan_out_collect(futs, batch_get_concurrency()).await
     }
 
     /// Batched put, result `i` for `items[i]` (`Err` = that item failed;

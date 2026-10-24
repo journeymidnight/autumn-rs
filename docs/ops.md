@@ -3325,6 +3325,32 @@ AUTUMN_PS_MEM_TIER_BYTES=$((64<<30)) AUTUMN_PS_MEM_TIER_PREFIX=kvc/ bash cluster
 curl -s http://127.0.0.1:9801/metrics | grep autumn_ps_mem_tier   # bytes / hits / evictions
 ```
 
+## KV-cache reads land straight in the caller's pages
+
+`BatchClient.get_into` (the kvcache adapter's read) receives each value of
+64 KiB and up directly into the destination page over TCP: no copy out of a pool
+buffer. One worker thread reads about 5.4 GB/s from PS memory on loopback (3.0
+before); eight about 27–30 GB/s (18). UCX still receives into a pool buffer and
+copies (a UCX stream receive cannot be cancelled). A read that times out in the
+middle of a value closes that PS connection; the other reads on it retry. To
+check: the rpc tests below, then a live read compared byte for byte.
+
+```bash
+cargo test -p autumn-rpc --lib -- call_into_dest in_place after_a_timeout a_pooled_receive
+cargo test -p autumn-manager --test get_into_raw
+# live (TCP cluster up, kvc namespace): put 128 x 16 MiB pages, get_into, compare
+python3 - <<'EOF'
+import numpy as np, autumn, time
+n, page = 128, 16 << 20
+bc = autumn.BatchClient("127.0.0.1:9001", 1, 64, False, scope="kvc")
+src = np.random.randint(0, 255, n * page, dtype=np.uint8); dst = np.zeros_like(src)
+keys = [f"check/{i}".encode() for i in range(n)]
+assert all(bc.put_from(keys, [src[i*page:(i+1)*page] for i in range(n)], 3600))
+t = time.time(); ok = bc.get_into(keys, [dst[i*page:(i+1)*page] for i in range(n)])
+print(all(ok), (dst == src).all(), f"{n*page/(time.time()-t)/1e9:.1f} GB/s")
+EOF
+```
+
 ## Write options and conditional writes (wire 75)
 
 Every SDK write takes `WriteOptions { ttl, lease }`: `put`, `put_many` and

@@ -930,24 +930,7 @@ async fn run_job(client: &ClusterClient, op: BatchOp, items: Vec<WorkItem>, ttl_
     let cap = cap.max(1);
     match op {
         BatchOp::Get => {
-            // consolidate onto `ClusterClient::get_many_into` — the ONE
-            // batch-read fan-out primitive (also driving the e2e-tested SDK path).
-            // Drops the hand-rolled `buffered` loop + the per-item `bulk_worthwhile`
-            // decision (which used to drift across callers); the bulk rule
-            // now lives once, inside `get_many_into`. `cap` (per_worker_cap) is the
-            // concurrency window.
-            // SAFETY: each `it.ptr/len` addresses a pinned dest page the caller keeps
-            // alive for the whole batch; disjoint pages → disjoint `&mut` slices;
-            // single-threaded compio (no parallel aliasing).
-            let mut gitems: Vec<autumn_client::GetManyItem> = items
-                .iter()
-                .map(|it| autumn_client::GetManyItem {
-                    key: &it.key,
-                    offset: 0,
-                    length: 0,
-                    dest: unsafe { std::slice::from_raw_parts_mut(it.ptr as *mut u8, it.len) },
-                })
-                .collect();
+            // The SDK's batch reads decide bulk vs batched and the concurrency.
             let _ = cap; // unused — SDK manages internal concurrency
             // `direct` (BatchClient(direct=True)) sends the
             // ≥ 64 KiB whole-value gets STRAIGHT to an EN (`get_many_direct`),
@@ -957,11 +940,29 @@ async fn run_job(client: &ClusterClient, op: BatchOp, items: Vec<WorkItem>, ttl_
             // opt-in, default OFF; each item falls back to the PS proxy on any
             // direct-read failure. Small values route through the PS regardless.
             let results = if direct {
+                // SAFETY: each `it.ptr/len` addresses a pinned dest page the caller
+                // keeps alive for the whole batch; disjoint pages → disjoint
+                // `&mut` slices; single-threaded compio (no parallel aliasing).
+                let mut gitems: Vec<autumn_client::GetManyItem> = items
+                    .iter()
+                    .map(|it| autumn_client::GetManyItem {
+                        key: &it.key,
+                        offset: 0,
+                        length: 0,
+                        dest: unsafe { std::slice::from_raw_parts_mut(it.ptr as *mut u8, it.len) },
+                    })
+                    .collect();
                 client.get_many_direct(&mut gitems).await
             } else {
-                client.get_many_into(&mut gitems).await
+                // Values are received straight into the pages. SAFETY: as
+                // above, and this job runs to completion before the batch
+                // returns to Python (`run_items` waits for every worker).
+                let ritems: Vec<autumn_client::RawGetItem> = items
+                    .iter()
+                    .map(|it| autumn_client::RawGetItem { key: &it.key, ptr: it.ptr as *mut u8, len: it.len })
+                    .collect();
+                unsafe { client.get_many_into_raw(&ritems).await }
             };
-            drop(gitems);
             // Success = the value was found AND its length matches the page size
             // the caller reserved (same contract as the former per-item path).
             results
@@ -1071,7 +1072,17 @@ impl BatchClient {
                             let data_client = client.clone();
                             compio::runtime::spawn(async move {
                                 while let Some(job) = data_rx.next().await {
-                                    let res = run_job(&data_client, job.op, job.items, job.ttl_secs, per_worker_cap, direct).await;
+                                    let job_fut = run_job(&data_client, job.op, job.items, job.ttl_secs, per_worker_cap, direct);
+                                    // Gets receive straight into the caller's pages; a job
+                                    // abandoned by a panic may leave a receive writing one
+                                    // after the batch returned to Python. Stop instead.
+                                    let res = match futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(job_fut)).await {
+                                        Ok(res) => res,
+                                        Err(_) => {
+                                            eprintln!("autumn BatchClient: a worker panicked mid-batch; its receives may still write the caller's pages, aborting");
+                                            std::process::abort();
+                                        }
+                                    };
                                     let _ = job.done.send(res);
                                 }
                             })

@@ -21,6 +21,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::sync::OnceLock;
 
+mod recv_dest;
 mod tcp;
 mod zerocopy;
 #[cfg(feature = "ucx")]
@@ -38,6 +39,7 @@ pub use regpool::{
     acquire as regpool_acquire, set_regpool_cap_bytes,
     snapshot as regpool_snapshot, PooledBuf, RegpoolStats,
 };
+pub use recv_dest::{RecvDest, Released};
 pub use tcp::TcpTransport;
 #[cfg(feature = "ucx")]
 pub use ucx::UcxTransport;
@@ -536,6 +538,31 @@ impl ReadHalf {
         Ok(slice.into_inner())
     }
 
+    /// `read_exact_into_pooled` into caller memory. Same cancel rule: `dest`
+    /// travels by value, so a dropped read keeps it until its completion lands.
+    /// TCP only.
+    pub async fn read_exact_into_dest(
+        &mut self,
+        dest: RecvDest,
+        filled: usize,
+        target: usize,
+    ) -> compio::BufResult<(), RecvDest> {
+        debug_assert!(filled <= target && target <= dest.cap());
+        if self.is_ucx() {
+            let e = io::Error::new(io::ErrorKind::Unsupported, "read_exact_into_dest is TCP-only");
+            return compio::BufResult(Err(e), dest);
+        }
+        if filled >= target {
+            return compio::BufResult(Ok(()), dest);
+        }
+        use compio::buf::{IntoInner, IoBuf, SetLen};
+        use compio::io::AsyncReadExt;
+        let mut dest = dest;
+        // `slice` starts within what is initialized: the first `filled` bytes are.
+        unsafe { dest.set_len(filled) };
+        let compio::BufResult(r, slice) = self.read_exact(dest.slice(filled..target)).await;
+        compio::BufResult(r.map(|_| ()), slice.into_inner())
+    }
 }
 
 impl WriteHalf {

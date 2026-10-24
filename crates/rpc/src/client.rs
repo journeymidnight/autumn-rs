@@ -106,10 +106,52 @@ enum Pending {
     /// drops the `PooledBuf` → returns to pool (no leak; cancel-safe, since the
     /// cancellable caller never owns the in-flight buffer).
     IntoPooled(oneshot::Sender<Result<BulkResp, RpcError>>),
+    /// `call_into_dest`: the value is received into the caller's memory,
+    /// lent through the slot (see `DestSlot`).
+    IntoDest(DestWaiter, Rc<DestSlot>),
 }
 
 /// The sender a `call_into_pooled` caller awaits.
 type BulkWaiter = oneshot::Sender<Result<BulkResp, RpcError>>;
+/// The sender a `call_into_dest` caller awaits.
+type DestWaiter = oneshot::Sender<Result<DestResp, RpcError>>;
+
+/// The caller of the bulk value receive `read_loop` is in the middle of.
+enum Receiving {
+    Pooled(BulkWaiter),
+    Dest(DestWaiter),
+}
+
+/// Outcome of a `call_into_dest`: the status ctrl (as in [`BulkResp`]) and the
+/// value's length. The value is in the caller's memory, or in `spill` when it
+/// was longer than that memory.
+pub struct DestResp {
+    pub code: u8,
+    pub message: String,
+    pub ctrl: Bytes,
+    pub value_len: usize,
+    pub spill: Option<autumn_transport::PooledBuf>,
+}
+
+impl std::fmt::Debug for DestResp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DestResp")
+            .field("code", &self.code)
+            .field("message", &self.message)
+            .field("value_len", &self.value_len)
+            .field("spilled", &self.spill.is_some())
+            .finish()
+    }
+}
+
+/// The caller's memory while its request is pending. The caller takes `dest`
+/// back if the read loop has not started on it; once started, `abort` stops
+/// the receive. Either way the caller then waits for the `RecvDest` to drop.
+#[derive(Default)]
+struct DestSlot {
+    dest: RefCell<Option<autumn_transport::RecvDest>>,
+    abort: RefCell<Option<futures::future::AbortHandle>>,
+}
 
 type WriteHalf = autumn_transport::WriteHalf;
 type ReadHalf = autumn_transport::ReadHalf;
@@ -362,7 +404,7 @@ pub struct RpcClient {
     /// `close_silent_peer` releases it from here. Deliberately not by
     /// cancelling the reader: on UCX a dropped receive stays posted and takes
     /// the connection's next bytes, which would be lost to a reader kept alive.
-    receiving: Rc<RefCell<Option<BulkWaiter>>>,
+    receiving: Rc<RefCell<Option<Receiving>>>,
     /// Watches for a silent peer (see `Keepalive`). Holds only a `Weak` to the
     /// client, so it never keeps a connection alive, and ends with it.
     _keepalive_task: JoinHandle<()>,
@@ -520,7 +562,7 @@ impl RpcClient {
         // Bumped by `read_loop` for every read that returns bytes; the
         // keepalive only compares it between ticks.
         let rx_progress: Rc<Cell<u64>> = Rc::new(Cell::new(0));
-        let receiving: Rc<RefCell<Option<BulkWaiter>>> = Rc::new(RefCell::new(None));
+        let receiving: Rc<RefCell<Option<Receiving>>> = Rc::new(RefCell::new(None));
         let pending_for_reader = pending.clone();
         let closed_for_reader = closed.clone();
         let progress_for_reader = rx_progress.clone();
@@ -636,6 +678,56 @@ impl RpcClient {
         self.register_and_submit(req_id, Pending::IntoPooled(meta_tx), bytes)
             .await?;
         meta_rx.await.map_err(|_| RpcError::ConnectionClosed)?
+    }
+
+    /// `call_into_pooled` that receives the value into `dest` — the transport's
+    /// receive copy lands there, with no copy out of a pool buffer. A value
+    /// longer than `dest` comes back in `DestResp::spill` instead.
+    ///
+    /// When this returns, whatever the outcome (`timeout` included), `dest`
+    /// has been dropped and `released` has resolved: nothing writes the memory
+    /// any more. A timeout before the value started arriving takes `dest`
+    /// back at once; one in the middle of it ends the receive, and with it
+    /// the connection, whose stream position is lost.
+    pub async fn call_into_dest(
+        &self,
+        msg_type: u8,
+        payload: Bytes,
+        dest: autumn_transport::RecvDest,
+        released: autumn_transport::Released,
+        timeout: Option<Duration>,
+    ) -> Result<DestResp, RpcError> {
+        let slot = Rc::new(DestSlot::default());
+        *slot.dest.borrow_mut() = Some(dest);
+        let outcome = self.call_into_slot(msg_type, payload, &slot, timeout).await;
+        drop(slot.dest.borrow_mut().take());
+        if let Some(abort) = slot.abort.borrow_mut().take() {
+            abort.abort();
+        }
+        released.await;
+        outcome
+    }
+
+    async fn call_into_slot(
+        &self,
+        msg_type: u8,
+        payload: Bytes,
+        slot: &Rc<DestSlot>,
+        timeout: Option<Duration>,
+    ) -> Result<DestResp, RpcError> {
+        if self.closed.get() {
+            return Err(RpcError::ConnectionClosed);
+        }
+        let req_id = self.next_req_id();
+        let (tx, rx) = oneshot::channel();
+        let bytes = Frame::request(req_id, msg_type, payload).encode();
+        self.register_and_submit(req_id, Pending::IntoDest(tx, slot.clone()), bytes)
+            .await?;
+        let rx = async { rx.await.map_err(|_| RpcError::ConnectionClosed)? };
+        match timeout {
+            None => rx.await,
+            Some(t) => compio::time::timeout(t, rx).await.unwrap_or(Err(RpcError::Timeout(t))),
+        }
     }
 
     /// Send a request frame and return the oneshot receiver for the response.
@@ -1365,7 +1457,7 @@ async fn read_loop(
     mut reader: ReadHalf,
     pending: Rc<RefCell<HashMap<u32, Pending>>>,
     rx_progress: Rc<Cell<u64>>,
-    receiving: Rc<RefCell<Option<BulkWaiter>>>,
+    receiving: Rc<RefCell<Option<Receiving>>>,
     send_window: Rc<SendWindow>,
     addr: SocketAddr,
 ) -> Result<(), RpcError> {
@@ -1389,7 +1481,7 @@ async fn read_loop(
     let bulk_fast_path = |req_id: u32, flags: u8, payload_len: usize| {
         (flags & crate::frame::FLAG_ERROR) == 0
             && (is_ucx || payload_len >= TCP_RECV_INTO_POOLED_MIN_BYTES)
-            && matches!(pending.borrow().get(&req_id), Some(Pending::IntoPooled(_)))
+            && matches!(pending.borrow().get(&req_id), Some(Pending::IntoPooled(_) | Pending::IntoDest(..)))
     };
 
     loop {
@@ -1468,52 +1560,86 @@ async fn read_loop(
                         // The sender waits in `receiving` for the receive, where
                         // a keepalive close can release it; taken back after,
                         // it may already be gone.
-                        *receiving.borrow_mut() = Some(tx);
+                        *receiving.borrow_mut() = Some(Receiving::Pooled(tx));
                         let finish = |outcome: Result<BulkResp, RpcError>| {
                             let waiter = receiving.borrow_mut().take();
-                            if let Some(tx) = waiter {
+                            if let Some(Receiving::Pooled(tx)) = waiter {
                                 let _ = tx.send(outcome);
                             }
                         };
-                        let mut pb = autumn_transport::regpool_acquire(value_len);
-                        if reader.is_ucx() {
-                            let (outcome, p) =
-                                recv_value_ucx(&mut reader, &mut decoder, pb, &rx_progress).await;
-                            pb = p;
-                            match outcome {
-                                ValueRecv::Done => {}
-                                ValueRecv::PeerClosed => {
-                                    finish(Err(RpcError::ConnectionClosed));
-                                    return Ok(());
-                                }
-                                ValueRecv::Failed(e) => {
-                                    finish(Err(e.into()));
-                                    return Err(RpcError::ConnectionClosed);
-                                }
+                        let pb = match recv_value_pooled(&mut reader, &mut decoder, value_len, &rx_progress).await {
+                            Ok(pb) => pb,
+                            Err(RecvFailed::PeerClosed) => {
+                                finish(Err(RpcError::ConnectionClosed));
+                                return Ok(());
                             }
-                        } else {
-                            // TCP: drain the buffered prefix, then one owned
-                            // read into the pool buffer (single copy).
-                            let filled = {
-                                let (dest, _reg) = pb.dest_and_reg();
-                                decoder.drain_into(dest)
-                            };
-                            match read_value_tcp(&mut reader, pb, filled, value_len, &rx_progress)
-                                .await
-                            {
-                                Ok(p) => pb = p,
-                                Err(e) => {
-                                    finish(Err(e.into()));
-                                    return Err(RpcError::ConnectionClosed);
-                                }
+                            Err(RecvFailed::Io(e)) => {
+                                finish(Err(e.into()));
+                                return Err(RpcError::ConnectionClosed);
                             }
-                        }
+                        };
                         finish(Ok(BulkResp {
                             buf: pb,
                             code,
                             message,
                             ctrl: ctrl_tail,
                         }));
+                    }
+                    Some(Pending::IntoDest(tx, slot)) => {
+                        *receiving.borrow_mut() = Some(Receiving::Dest(tx));
+                        let finish = |outcome: Result<DestResp, RpcError>| {
+                            let waiter = receiving.borrow_mut().take();
+                            if let Some(Receiving::Dest(tx)) = waiter {
+                                let _ = tx.send(outcome);
+                            }
+                        };
+                        let resp = |spill| DestResp { code, message, ctrl: ctrl_tail, value_len, spill };
+                        let direct = !reader.is_ucx()
+                            && slot.dest.borrow().as_ref().is_some_and(|d| value_len <= d.cap());
+                        if direct {
+                            let mut dest = slot.dest.borrow_mut().take().expect("checked above");
+                            let filled = decoder.drain_into(&mut dest.region_mut()[..value_len]);
+                            let (abort, reg) = futures::future::AbortHandle::new_pair();
+                            *slot.abort.borrow_mut() = Some(abort);
+                            let recv = read_value_tcp_into_dest(&mut reader, dest, filled, value_len, &rx_progress);
+                            let r = futures::future::Abortable::new(recv, reg).await;
+                            slot.abort.borrow_mut().take();
+                            match r {
+                                Ok(Ok(dest)) => {
+                                    drop(dest);
+                                    finish(Ok(resp(None)));
+                                }
+                                Ok(Err(e)) => {
+                                    finish(Err(e.into()));
+                                    return Err(RpcError::ConnectionClosed);
+                                }
+                                // The caller gave up mid-value; the stream
+                                // position is lost with the receive.
+                                Err(futures::future::Aborted) => {
+                                    finish(Err(RpcError::ConnectionClosed));
+                                    return Err(RpcError::ConnectionClosed);
+                                }
+                            }
+                        } else {
+                            // UCX, a value longer than the lent memory, or a
+                            // caller that already took it back: receive into a
+                            // pool buffer, then copy what fits. The memory stays
+                            // in the slot meanwhile, so a caller giving up takes
+                            // it back at once (a UCX recv cannot be aborted).
+                            let pb = match recv_value_pooled(&mut reader, &mut decoder, value_len, &rx_progress).await {
+                                Ok(pb) => pb,
+                                Err(RecvFailed::PeerClosed) => {
+                                    finish(Err(RpcError::ConnectionClosed));
+                                    return Ok(());
+                                }
+                                Err(RecvFailed::Io(e)) => {
+                                    finish(Err(e.into()));
+                                    return Err(RpcError::ConnectionClosed);
+                                }
+                            };
+                            let dest = slot.dest.borrow_mut().take();
+                            finish(Ok(resp(copy_into_dest(dest, pb))));
+                        }
                     }
                     _ => unreachable!("bulk_pending checked above"),
                 }
@@ -1548,6 +1674,14 @@ async fn read_loop(
                             finish_into_pooled_from_frame(tx, &frame.payload, &frame.value);
                         }
                     }
+                    Some(Pending::IntoDest(tx, slot)) => {
+                        if frame.is_error() {
+                            let (code, message) = RpcError::decode_status(&frame.payload);
+                            let _ = tx.send(Err(RpcError::status(code, message)));
+                        } else {
+                            finish_into_dest_from_frame(tx, &slot, &frame.payload, &frame.value);
+                        }
+                    }
                     None => {
                         tracing::trace!(
                             req_id = frame.req_id,
@@ -1562,13 +1696,65 @@ async fn read_loop(
     }
 }
 
-/// How a bulk value recv ended.
-enum ValueRecv {
-    Done,
+/// Why a bulk value receive stopped short.
+enum RecvFailed {
     /// Peer closed the connection mid-value.
     PeerClosed,
     /// Transport error mid-value.
-    Failed(std::io::Error),
+    Io(std::io::Error),
+}
+
+/// Receive a bulk value of `value_len` bytes into a fresh pool buffer, starting
+/// with what `decoder` already holds.
+async fn recv_value_pooled(
+    reader: &mut ReadHalf,
+    decoder: &mut FrameDecoder,
+    value_len: usize,
+    rx_progress: &Cell<u64>,
+) -> Result<autumn_transport::PooledBuf, RecvFailed> {
+    let mut pb = autumn_transport::regpool_acquire(value_len);
+    if reader.is_ucx() {
+        return recv_value_ucx(reader, decoder, pb, rx_progress).await;
+    }
+    let filled = {
+        let (dest, _reg) = pb.dest_and_reg();
+        decoder.drain_into(dest)
+    };
+    read_value_tcp(reader, pb, filled, value_len, rx_progress).await.map_err(RecvFailed::Io)
+}
+
+/// TCP: the rest of a bulk value, `[filled, value_len)`, into lent memory.
+async fn read_value_tcp_into_dest(
+    reader: &mut ReadHalf,
+    mut dest: autumn_transport::RecvDest,
+    mut filled: usize,
+    value_len: usize,
+    rx_progress: &Cell<u64>,
+) -> std::io::Result<autumn_transport::RecvDest> {
+    while filled < value_len {
+        let upto = value_len.min(filled + TCP_VALUE_PROGRESS_STEP);
+        let BufResult(r, d) = reader.read_exact_into_dest(dest, filled, upto).await;
+        dest = d;
+        r?;
+        rx_progress.set(rx_progress.get().wrapping_add(1));
+        filled = upto;
+    }
+    Ok(dest)
+}
+
+/// Put a value received into a pool buffer where the caller lent memory for
+/// it: copied when it fits (`None`), else handed back as the spill.
+fn copy_into_dest(
+    dest: Option<autumn_transport::RecvDest>,
+    pb: autumn_transport::PooledBuf,
+) -> Option<autumn_transport::PooledBuf> {
+    match dest {
+        Some(mut d) if pb.len() <= d.cap() => {
+            d.region_mut()[..pb.len()].copy_from_slice(pb.as_ref());
+            None
+        }
+        _ => Some(pb),
+    }
 }
 
 /// Largest step of a TCP bulk value receive between two keepalive progress
@@ -1606,22 +1792,22 @@ async fn recv_value_ucx(
     decoder: &mut FrameDecoder,
     mut pb: autumn_transport::PooledBuf,
     rx_progress: &Cell<u64>,
-) -> (ValueRecv, autumn_transport::PooledBuf) {
+) -> Result<autumn_transport::PooledBuf, RecvFailed> {
     let value_len = pb.cap();
     let mut filled = decoder.drain_into(pb.dest_mut());
     while filled < value_len {
         let BufResult(r, p) = reader.recv_pooled(pb, filled).await;
         pb = p;
         match r {
-            Ok(0) => return (ValueRecv::PeerClosed, pb),
+            Ok(0) => return Err(RecvFailed::PeerClosed),
             Ok(k) => {
                 rx_progress.set(rx_progress.get().wrapping_add(1));
                 filled += k
             }
-            Err(e) => return (ValueRecv::Failed(e), pb),
+            Err(e) => return Err(RecvFailed::Io(e)),
         }
     }
-    (ValueRecv::Done, pb)
+    Ok(pb)
 }
 
 /// Complete a `call_into_pooled` from a fully-decoded value frame (TCP /
@@ -1653,6 +1839,28 @@ fn finish_into_pooled_from_frame(
         message,
         ctrl: ctrl_tail,
     }));
+}
+
+/// `finish_into_pooled_from_frame` for a `call_into_dest`: the value is copied
+/// into the lent memory if it fits.
+fn finish_into_dest_from_frame(tx: DestWaiter, slot: &DestSlot, ctrl: &[u8], value: &[u8]) {
+    let (code, message, ctrl_tail) = match crate::frame::parse_bulk_ctrl(ctrl) {
+        Some((c, m)) => (c, String::from_utf8_lossy(m).into_owned(), Bytes::copy_from_slice(m)),
+        None => (0, String::new(), Bytes::new()),
+    };
+    let dest = slot.dest.borrow_mut().take();
+    let spill = match dest {
+        Some(mut d) if value.len() <= d.cap() => {
+            d.region_mut()[..value.len()].copy_from_slice(value);
+            None
+        }
+        _ => {
+            let mut pb = autumn_transport::regpool_acquire(value.len());
+            pb.dest_mut().copy_from_slice(value);
+            Some(pb)
+        }
+    };
+    let _ = tx.send(Ok(DestResp { code, message, ctrl: ctrl_tail, value_len: value.len(), spill }));
 }
 
 // ── connection-close tests ─────────────────────────────────────────────
@@ -2060,6 +2268,147 @@ mod tests {
             &value[..],
             "large value bytes landed in the pool buffer"
         );
+        srv.join().expect("server thread");
+    }
+
+    /// A test server for `call_into_dest`: answers its first request with
+    /// `value`, sending the first `split` value bytes, then the rest after
+    /// `pause`; it starts answering after `delay`.
+    fn dest_server(
+        value: Vec<u8>,
+        delay: Duration,
+        split: usize,
+        pause: Duration,
+    ) -> (std::net::SocketAddr, std::thread::JoinHandle<()>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let srv = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().expect("accept");
+            test_protocol::accept_std(&mut sock, crate::WIRE_VERSION, 1);
+            let mut hdr = [0u8; 10];
+            sock.read_exact(&mut hdr).expect("read req hdr");
+            let req_id = u32::from_le_bytes(hdr[0..4].try_into().unwrap());
+            let plen = u32::from_le_bytes(hdr[6..10].try_into().unwrap()) as usize;
+            let mut req_payload = vec![0u8; plen];
+            sock.read_exact(&mut req_payload).expect("read req payload");
+            std::thread::sleep(delay);
+            let head = crate::frame::encode_bulk_response_head(req_id, 15, 0, "", value.len());
+            // One write, so the client's first read holds the prologue and a
+            // value prefix. The client may have closed the connection by now.
+            let _ = sock.write_all(&[&head[..], &value[..split]].concat());
+            std::thread::sleep(pause);
+            let _ = sock.write_all(&value[split..]);
+            std::thread::sleep(Duration::from_millis(200));
+        });
+        (addr, srv)
+    }
+
+    fn pattern(n: usize) -> Vec<u8> {
+        (0..n).map(|i| ((i * 31 + 7) & 0xff) as u8).collect()
+    }
+
+    /// A large value lands in the lent memory, a value that does not fit comes
+    /// back as the spill, and a small one (decoded with its frame) is copied in.
+    #[compio::test]
+    async fn call_into_dest_receives_into_the_lent_memory() {
+        let _ = autumn_transport::current_or_init(); // TCP
+        for (n, cap) in [(256 * 1024usize, 256 * 1024usize), (300 * 1024, 256 * 1024), (1000, 4096)] {
+            let value = pattern(n);
+            let (addr, srv) = dest_server(value.clone(), Duration::ZERO, n, Duration::ZERO);
+            let client = RpcClient::connect(addr).await.expect("connect");
+            let mut mem = vec![0u8; cap];
+            let (dest, released) = unsafe { autumn_transport::RecvDest::new(mem.as_mut_ptr(), cap) };
+            let r = client
+                .call_into_dest(15, Bytes::from_static(b"req"), dest, released, None)
+                .await
+                .expect("call_into_dest");
+            assert_eq!((r.code, r.value_len), (0, n));
+            match r.spill {
+                None => assert_eq!(&mem[..n], &value[..], "value {n} in the lent memory"),
+                Some(pb) => {
+                    assert!(n > cap, "only a value longer than the memory spills");
+                    assert_eq!(pb.filled(), &value[..]);
+                    assert!(mem.iter().all(|&b| b == 0), "a spilled value leaves the memory alone");
+                }
+            }
+            srv.join().expect("server thread");
+        }
+    }
+
+    /// Once `call_into_dest` returns from a timeout, nothing writes the lent
+    /// memory: not a reply that arrives later, and not the rest of a value
+    /// that was half received. Ablation: return without waiting for the
+    /// `RecvDest` to drop and the late bytes land after the return.
+    #[compio::test]
+    async fn after_a_timeout_nothing_writes_the_lent_memory() {
+        let _ = autumn_transport::current_or_init(); // TCP
+        let n = 1 << 20;
+        // (reply delay, value bytes before the stall): before the value, mid-value.
+        for (delay, split) in [(Duration::from_millis(300), n), (Duration::ZERO, n / 2)] {
+            let (addr, srv) = dest_server(pattern(n), delay, split, Duration::from_millis(300));
+            let client = RpcClient::connect(addr).await.expect("connect");
+            let mut mem = vec![0u8; n];
+            let (dest, released) = unsafe { autumn_transport::RecvDest::new(mem.as_mut_ptr(), n) };
+            let t = Duration::from_millis(100);
+            let call = client.call_into_dest(15, Bytes::from_static(b"req"), dest, released, Some(t));
+            let r = compio::time::timeout(Duration::from_secs(5), call).await.expect("returns promptly");
+            assert!(matches!(r, Err(RpcError::Timeout(_)) | Err(RpcError::ConnectionClosed)), "{r:?}");
+            mem.fill(0xEE);
+            // Block the thread: a receive left running cannot be aborted
+            // meanwhile, and the rest of the value arrives in this window.
+            std::thread::sleep(Duration::from_millis(600));
+            compio::time::sleep(Duration::from_millis(100)).await;
+            assert!(mem.iter().all(|&b| b == 0xEE), "written after the return (split {split})");
+            srv.join().expect("server thread");
+        }
+    }
+
+    /// The value is received in place: while the server stalls halfway, the
+    /// first half is already in the lent memory. A value received into a pool
+    /// buffer and copied would show nothing until it was all in.
+    #[compio::test]
+    async fn the_value_is_received_in_place() {
+        let _ = autumn_transport::current_or_init(); // TCP
+        let n = 1 << 20;
+        let value = pattern(n);
+        let (addr, srv) = dest_server(value.clone(), Duration::ZERO, n / 2, Duration::from_millis(400));
+        let client = RpcClient::connect(addr).await.expect("connect");
+        let mut mem = vec![0u8; n];
+        let ptr = mem.as_ptr() as usize;
+        let (dest, released) = unsafe { autumn_transport::RecvDest::new(mem.as_mut_ptr(), n) };
+        let call = client.call_into_dest(15, Bytes::from_static(b"req"), dest, released, None);
+        let peek = async {
+            compio::time::sleep(Duration::from_millis(200)).await;
+            // The receive owns the memory; read it the way the NIC would see it.
+            (n / 4..n / 2).all(|i| unsafe { std::ptr::read_volatile((ptr + i) as *const u8) } == value[i])
+        };
+        let (r, first_half_in) = futures::join!(call, peek);
+        r.expect("call_into_dest");
+        assert!(first_half_in, "the first half was not in the lent memory during the stall");
+        assert_eq!(mem, value);
+        srv.join().expect("server thread");
+    }
+
+    /// A value received into a pool buffer (longer than the lent memory here;
+    /// every value on UCX) leaves the memory in the slot until it is in, so a
+    /// caller giving up mid-value gets it back at once instead of waiting for
+    /// the rest. Ablation: take the memory out before the receive and the
+    /// call waits for the stalled value.
+    #[compio::test]
+    async fn a_pooled_receive_does_not_hold_the_lent_memory() {
+        let _ = autumn_transport::current_or_init(); // TCP
+        let n = 1 << 20;
+        let (addr, srv) = dest_server(pattern(n), Duration::ZERO, n / 2, Duration::from_secs(2));
+        let client = RpcClient::connect(addr).await.expect("connect");
+        let mut mem = vec![0u8; n / 4];
+        let (dest, released) = unsafe { autumn_transport::RecvDest::new(mem.as_mut_ptr(), mem.len()) };
+        let start = std::time::Instant::now();
+        let r = client
+            .call_into_dest(15, Bytes::from_static(b"req"), dest, released, Some(Duration::from_millis(100)))
+            .await;
+        assert!(matches!(r, Err(RpcError::Timeout(_))), "{r:?}");
+        assert!(start.elapsed() < Duration::from_secs(1), "waited {:?} for the value", start.elapsed());
         srv.join().expect("server thread");
     }
 

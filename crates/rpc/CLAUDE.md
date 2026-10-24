@@ -434,8 +434,8 @@ response = the v28 value-separable frame: ctrl = `[code:1][message…]` (both
 CRC-protected together with the header; bulk errors carry a readable message),
 value = raw tail (`value_len` derived from `payload_len`).
 `RegisteredMem`/`PooledBuf` re-export from autumn-transport (uninhabited/plain
-stubs on non-ucx). A recv-into-CALLER-dest sibling (`call_into_dest`) no longer
-exists — see "Why pooled-only" below.
+stubs on non-ucx). A caller that already owns memory of the value's size
+receives into it instead with `call_into_dest` (below).
 
 **read_loop dispatch (4-way)** — keyed on the req_id's `Pending` variant (which
 API the caller used), NEVER on msg_type (the rpc layer stays business-agnostic;
@@ -464,6 +464,8 @@ Pending::IntoPooled, response frame IS FLAG_ERROR
     IntoPooled arm decodes the `[status_code][message]` envelope into
     `RpcError::Status` (an authz PermissionDenied / mis-route NotFound reaches
     the bulk caller typed, never parsed as a bulk ctrl).
+Pending::IntoDest (call_into_dest) → the same gates; the arms are in
+  "Receiving into caller memory" below.
 ```
 
 The TCP size gate lives at the RECEIVER, not the caller, because its input — the
@@ -481,18 +483,59 @@ value (see autumn-client CLAUDE.md "Zero-copy selection rule"):
 | `--bulk-recv-min-bytes` (partition-server) | PS recv | actual tail len | bulk-write request recv strategy — `MSG_PUT_BULK` and `MSG_BATCH_PUT_BULK` alike (`drain_bulk_writes`) |
 | `handle_get_redirect` 64 KiB (partition-server) | PS route | actual clamped read len | EN-direct descriptor vs proxy read |
 
-**Why pooled-only (cancel-safety):** the recv runs in the long-lived
+**Pooled by default (cancel-safety):** the recv runs in the long-lived
 `read_loop`, NOT the caller future, and the read_loop OWNS the `PooledBuf` — a
 caller-cancel/timeout just drops the buffer back to the pool, never a leak,
-never a NIC writing freed memory. The removed `call_into_dest` variant recv'd
-into a caller-owned `*mut u8`, which forced the inverse contract (dest outlives
-the call, NO per-call timeout ever) — making it the one SDK RPC that could hang
-unboundedly; its explicit `reg` was `None` at every production call site
-(implicit rcache registration), and the default-on EN-direct read path had
-already chosen pooled-recv + one memcpy deliberately. Callers needing the value
-at a specific address copy out of the returned `PooledBuf`
-(`ClusterClient::get_range_into` does exactly this, and now honors
-`rpc_timeout`).
+never a NIC writing freed memory. Callers needing the value at a specific
+address copy out of the returned `PooledBuf` (`ClusterClient::get_range_into`).
+
+### Receiving into caller memory (`call_into_dest`)
+
+For a caller that knows the value's size and already owns the memory (the
+kvcache's pages in SGLang's L2 host pool), the copy out of the pool buffer was
+the second of the two copies on the read path: on loopback TCP one 16 MiB page
+read cost a core 56% in the kernel receive copy and 43% in that memcpy
+(bpftrace, W=1 `BatchClient.get_into`, 3.0 GB/s). `call_into_dest(msg, payload,
+dest, released, timeout)` lends the memory as a `RecvDest`
+(autumn-transport): an owned `IoBufMut` over the caller's pointer whose drop
+resolves its `Released`.
+
+The earlier `call_into_dest` was removed because a caller that gave up could
+get its memory back while a receive still wrote it, so it had no timeout and
+could hang. Ownership fixes that: the `RecvDest` sits in a `DestSlot` in the
+pending entry; the read loop takes it when the value starts and drops it when
+the value is in; a dropped TCP read keeps it until its completion lands. When
+the call ends for any reason it takes the memory back if the receive has not
+started, aborts the receive (`AbortHandle`) if it has — the connection goes
+with it, its stream position lost — and returns only after `released`. That
+abort fails every other request in flight on the connection
+(`ConnectionClosed`; the SDK re-routes and retries them), where a pooled
+receive kept the connection; it takes a timeout in the middle of a value
+(first attempt 5 s, later ones `rpc_timeout`), and the clock includes waiting
+behind the other values on the connection. One corner is bounded by the peer,
+not by us: if io_uring has no room for the cancel, compio only warns and the
+read stays posted until bytes or a close arrive. The caller's future must run
+to completion (the SDK API over it is `unsafe`, `get_many_into_raw`, used by
+`BatchClient`, which aborts the process if a job panics: an abandoned receive
+could otherwise write a page after Python has it back).
+
+What does not take the direct path, and gets the pooled one: a value longer
+than the memory (returned in `DestResp::spill`), a reply arriving after the
+caller took the memory back, a small TCP reply decoded with its frame (copied
+in), and UCX: a posted stream recv cannot be cancelled, so a peer stalled
+mid-value would hold the memory with no bound, so the memory stays in the slot
+until the pooled receive is done. Measured (loopback TCP, 16 MiB pages from the
+PS memory tier, interleaved with the pooled build): one worker 3.0 → 5.4 GB/s
+with user CPU 44% → 1%; eight workers 18 → 27–30 GB/s. UCX unchanged (2.7–3.0
+both). Tests: `call_into_dest_receives_into_the_lent_memory` (exact fit, spill,
+small frame; the server writes the prologue and a value prefix in one write —
+the first version panicked on a non-zero prefix and the earlier test never sent
+one), `the_value_is_received_in_place` (the first half is in the memory while
+the server stalls; red with the direct path off),
+`after_a_timeout_nothing_writes_the_lent_memory` (before the value and
+mid-value; red when the call returns without waiting for `released`),
+`a_pooled_receive_does_not_hold_the_lent_memory` (red when the memory leaves
+the slot before a pooled receive).
 
 **Write counterpart (`MSG_PUT_BULK = 0x51`)** uses `call_vectored_bulk`: ctrl =
 `[meta][key]` (CRC'd with the header), the value rides after the crc as its own
