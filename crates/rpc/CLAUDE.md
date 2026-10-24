@@ -519,15 +519,25 @@ to completion (the SDK API over it is `unsafe`, `get_many_into_raw`, used by
 `BatchClient`, which aborts the process if a job panics: an abandoned receive
 could otherwise write a page after Python has it back).
 
+On UCX the direct path does not post a receive into the memory: a posted
+stream recv cannot be cancelled, so a peer stalled mid-value would hold it with
+no bound. It copies each chunk UCX has queued into the memory instead
+(`ReadHalf::recv_data_with`, `ucp_stream_recv_data_nb` + release): one copy, the
+same one a stream recv's unpack makes, and nothing is left posted when the
+receive is aborted. Bytes of a chunk past the value go back to the decoder
+(`FrameDecoder::feed`).
+
 What does not take the direct path, and gets the pooled one: a value longer
 than the memory (returned in `DestResp::spill`), a reply arriving after the
 caller took the memory back, a small TCP reply decoded with its frame (copied
-in), and UCX: a posted stream recv cannot be cancelled, so a peer stalled
-mid-value would hold the memory with no bound, so the memory stays in the slot
-until the pooled receive is done. Measured (loopback TCP, 16 MiB pages from the
-PS memory tier, interleaved with the pooled build): one worker 3.0 → 5.4 GB/s
-with user CPU 44% → 1%; eight workers 18 → 27–30 GB/s. UCX unchanged (2.7–3.0
-both). Tests: `call_into_dest_receives_into_the_lent_memory` (exact fit, spill,
+in). The memory stays in the slot until the pooled receive is done. Measured
+(16 MiB pages from the PS memory tier, interleaved with the pooled build): TCP
+loopback, one worker 3.0 → 5.4 GB/s with user CPU 44% → 1%, eight 18 → 27–30;
+UCX (rc_mlx5, HCA loopback), one worker 3.0 → 6.4–6.7 GB/s, eight 14–15 →
+20–21. One worker on UCX is at the single-core limit for receiving into memory
+that is not in cache: `ucx_perftest -t stream_bw` falls from 13.7 GB/s at
+16 MiB messages (its buffer stays cached) to 7.5 GB/s at 1 GiB, and a KV page
+batch (128 x 16 MiB) is never in cache. Tests: `call_into_dest_receives_into_the_lent_memory` (exact fit, spill,
 small frame; the server writes the prologue and a value prefix in one write —
 the first version panicked on a non-zero prefix and the earlier test never sent
 one), `the_value_is_received_in_place` (the first half is in the memory while
@@ -535,7 +545,9 @@ the server stalls; red with the direct path off),
 `after_a_timeout_nothing_writes_the_lent_memory` (before the value and
 mid-value; red when the call returns without waiting for `released`),
 `a_pooled_receive_does_not_hold_the_lent_memory` (red when the memory leaves
-the slot before a pooled receive).
+the slot before a pooled receive). The UCX chunk read: transport
+`tests/ucx_recv_data.rs` (in order; a dropped call leaves the connection
+readable, red with a posted read in its place).
 
 **Write counterpart (`MSG_PUT_BULK = 0x51`)** uses `call_vectored_bulk`: ctrl =
 `[meta][key]` (CRC'd with the header), the value rides after the crc as its own

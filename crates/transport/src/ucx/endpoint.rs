@@ -559,7 +559,53 @@ impl compio::io::AsyncRead for UcxReadHalf {
     }
 }
 
+thread_local! {
+    /// Tasks in `recv_data_with` waiting for stream data on this thread's worker.
+    static STREAM_WAITERS: std::cell::RefCell<Vec<std::task::Waker>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Wake every `recv_data_with` waiter; called after each progress pass.
+pub(crate) fn wake_stream_waiters() {
+    let waiters = STREAM_WAITERS.with(|w| std::mem::take(&mut *w.borrow_mut()));
+    for w in waiters {
+        w.wake();
+    }
+}
+
 impl UcxReadHalf {
+    /// Wait until stream data is queued on this connection, then hand each
+    /// queued chunk to `f`, in order, and release it. Returns the bytes
+    /// handed over. Nothing is posted to UCX, so a dropped call leaves no
+    /// operation behind: the data `f` copies goes where `f` puts it, and only
+    /// while `f` runs.
+    pub async fn recv_data_with(&mut self, mut f: impl FnMut(&[u8])) -> io::Result<usize> {
+        self.ep.check_readable()?;
+        let ep = self.ep.ptr();
+        std::future::poll_fn(|cx| {
+            let mut total = 0;
+            loop {
+                let mut len = 0usize;
+                let p = unsafe { ucp_stream_recv_data_nb(ep, &mut len) } as *mut c_void;
+                match classify_ptr(p) {
+                    PtrStatus::Done => break,
+                    PtrStatus::Err(st) => return std::task::Poll::Ready(Err(ucs_err(st, "ucp_stream_recv_data_nb"))),
+                    PtrStatus::Pending(data) => {
+                        // SAFETY: UCX owns `len` bytes at `data` until the release.
+                        f(unsafe { std::slice::from_raw_parts(data as *const u8, len) });
+                        unsafe { ucp_stream_data_release(ep, data) };
+                        total += len;
+                    }
+                }
+            }
+            if total > 0 {
+                return std::task::Poll::Ready(Ok(total));
+            }
+            STREAM_WAITERS.with(|w| w.borrow_mut().push(cx.waker().clone()));
+            std::task::Poll::Pending
+        })
+        .await
+    }
+
     /// `ucp_stream_recv_nbx` into `pb`'s writable region from `filled` on. A
     /// registered slab passes its `memh` via `UCP_OP_ATTR_FIELD_MEMH`; Stream
     /// receive still unpacks the arrived AM data into the slab (see
@@ -616,6 +662,8 @@ async fn await_pending<'a, P: 'static>(
             ucp_worker_progress(worker);
         }
     }
+    // The spin may have queued stream data that a `recv_data_with` waits for.
+    wake_stream_waiters();
     // Wait for completion (resolves immediately if the spin caught it).
     WaitSlot {
         slot: slot as *const Slot,

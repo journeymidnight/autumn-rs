@@ -132,4 +132,12 @@ completion lands, so `Released` resolving means nothing writes the memory any
 more. `ReadHalf::read_exact_into_dest` is the TCP read; it marks the first
 `filled` bytes initialized before slicing (compio's `slice` asserts the start
 is within the initialized length). UCX has no such read: a posted stream recv
-cannot be cancelled, so autumn-rpc receives UCX values into a pool buffer.
+cannot be cancelled. `UcxReadHalf::recv_data_with(f)` instead takes what UCX
+has queued (`ucp_stream_recv_data_nb`), hands each chunk to `f` and releases
+it, all inside one poll, so nothing is ever posted and a dropped call leaves
+the connection readable. With nothing queued it parks on `STREAM_WAITERS`,
+woken after each progress pass (the progress loop and the inline spin in
+`await_pending`). Invariant: every path that can queue stream data must end in
+`wake_stream_waiters` (a posted recv is woken by its own callback, a waiter here
+only by those calls); the `self` transport, which delivers inside a send, is not
+selected for these connections today. Tests: `tests/ucx_recv_data.rs`.

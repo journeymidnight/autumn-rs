@@ -378,6 +378,7 @@ async fn progress_loop(w: WorkerPtr, efd: std::os::fd::RawFd) {
         // Phase 1: drain everything currently ready.
         unsafe { while ucp_worker_progress(w.0) > 0 {} }
         crate::ucx::endpoint::reap_orphans();
+        crate::ucx::endpoint::wake_stream_waiters();
 
         // Phase 2: arm. UCX promises to write the efd if a NEW event
         // arrives after this point.

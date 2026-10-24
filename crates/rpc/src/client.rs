@@ -1594,14 +1594,13 @@ async fn read_loop(
                             }
                         };
                         let resp = |spill| DestResp { code, message, ctrl: ctrl_tail, value_len, spill };
-                        let direct = !reader.is_ucx()
-                            && slot.dest.borrow().as_ref().is_some_and(|d| value_len <= d.cap());
+                        let direct = slot.dest.borrow().as_ref().is_some_and(|d| value_len <= d.cap());
                         if direct {
                             let mut dest = slot.dest.borrow_mut().take().expect("checked above");
                             let filled = decoder.drain_into(&mut dest.region_mut()[..value_len]);
                             let (abort, reg) = futures::future::AbortHandle::new_pair();
                             *slot.abort.borrow_mut() = Some(abort);
-                            let recv = read_value_tcp_into_dest(&mut reader, dest, filled, value_len, &rx_progress);
+                            let recv = recv_value_into_dest(&mut reader, &mut decoder, dest, filled, value_len, &rx_progress);
                             let r = futures::future::Abortable::new(recv, reg).await;
                             slot.abort.borrow_mut().take();
                             match r {
@@ -1621,11 +1620,10 @@ async fn read_loop(
                                 }
                             }
                         } else {
-                            // UCX, a value longer than the lent memory, or a
-                            // caller that already took it back: receive into a
-                            // pool buffer, then copy what fits. The memory stays
-                            // in the slot meanwhile, so a caller giving up takes
-                            // it back at once (a UCX recv cannot be aborted).
+                            // A value longer than the lent memory, or a caller
+                            // that already took it back: receive into a pool
+                            // buffer, then copy what fits. The memory stays in
+                            // the slot meanwhile (a UCX recv cannot be aborted).
                             let pb = match recv_value_pooled(&mut reader, &mut decoder, value_len, &rx_progress).await {
                                 Ok(pb) => pb,
                                 Err(RecvFailed::PeerClosed) => {
@@ -1721,6 +1719,36 @@ async fn recv_value_pooled(
         decoder.drain_into(dest)
     };
     read_value_tcp(reader, pb, filled, value_len, rx_progress).await.map_err(RecvFailed::Io)
+}
+
+/// The rest of a bulk value, `[filled, value_len)`, into lent memory. TCP
+/// reads into it; UCX copies each queued chunk in (`recv_data_with`), since a
+/// posted UCX receive could not be taken back, and returns what follows the
+/// value to `decoder`.
+async fn recv_value_into_dest(
+    reader: &mut ReadHalf,
+    decoder: &mut FrameDecoder,
+    mut dest: autumn_transport::RecvDest,
+    mut filled: usize,
+    value_len: usize,
+    rx_progress: &Cell<u64>,
+) -> std::io::Result<autumn_transport::RecvDest> {
+    if !reader.is_ucx() {
+        return read_value_tcp_into_dest(reader, dest, filled, value_len, rx_progress).await;
+    }
+    let mem = &mut dest.region_mut()[..value_len];
+    while filled < value_len {
+        reader
+            .recv_data_with(|chunk| {
+                let take = chunk.len().min(value_len - filled);
+                mem[filled..filled + take].copy_from_slice(&chunk[..take]);
+                filled += take;
+                decoder.feed(&chunk[take..]); // not while a read window is lent: none is
+            })
+            .await?;
+        rx_progress.set(rx_progress.get().wrapping_add(1));
+    }
+    Ok(dest)
 }
 
 /// TCP: the rest of a bulk value, `[filled, value_len)`, into lent memory.

@@ -1,9 +1,10 @@
 Date: 2026-10-24 (5)
-TaskStatus: completed
+TaskStatus: not_completed
 Task scope: user — remove the second copy on the kvcache read path (pool buffer → caller page); TCP first, both transports benefit in the end.
 Current summary: `RecvDest` (transport) lends caller memory to one receive; `RpcClient::call_into_dest` receives a bulk value straight into it, and only returns once the memory is released (unstarted → taken back; mid-value → receive aborted, connection closed). SDK `unsafe get_range_into_raw` / `get_many_into_raw` (shared retry core `get_bulk_bound`); `BatchClient.get_into` uses it and aborts the process if a job panics. Interleaved A/B (TCP loopback, 16 MiB pages from PS memory): W=1 3.0 → 5.4 GB/s (user CPU 44% → 1%), W=8 18 → 27–30 GB/s. UCX unchanged (2.7–3.0 both; still pooled + copy). Fable review: no high; M1 (mid-value timeout closes the shared connection) documented, M2 (tests did not prove the direct path) fixed with `the_value_is_received_in_place` (red with the path off), L2/L3/L4 fixed.
-Main gaps: UCX W=1 ~3 GB/s vs ucx_perftest stream_bw 11.8 GB/s on the same HCA loopback — the client worker is 100% user CPU; being profiled. UCX direct receive (ucp_stream_recv_data_nb, synchronous copy) not done.
-Next steps: find where UCX is mis-used on the client read path; then UCX direct receive.
+UCX direct receive done too: `recv_data_with` copies each queued chunk (ucp_stream_recv_data_nb + release) into the page inside one poll, nothing posted. UCX A/B: W=1 3.0 → 6.4–6.7 GB/s, W=8 14–15 → 20–21. The 11.8 GB/s perftest figure was a cached 16 MiB buffer; at 1 GiB messages stream_bw is 7.5 GB/s (cold destination), and single-core memory bandwidth is the limit (1 core: read 11, fill 7, big memcpy 10.7 GB/s; 16 cores: read 152, copy 106). Fable review of the UCX step: no high; M1 (wake invariant) documented, M2 (duplicate decoder method) fixed.
+Main gaps: F-CLIENT-IO-THREADS (user design: one ClusterClient, W IO threads, connection % W). Non-temporal stores for the UCX copy: microbench 8 KiB chunks 8.4 → 19.7 GB/s, not tried in the client yet. perf-check A/B not run yet.
+Next steps: NT copy on UCX; perf-check A/B; then F-CLIENT-IO-THREADS.
 
 Date: 2026-10-24 (4)
 TaskStatus: completed

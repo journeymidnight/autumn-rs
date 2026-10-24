@@ -538,6 +538,20 @@ impl ReadHalf {
         Ok(slice.into_inner())
     }
 
+    /// UCX: wait for queued stream data and hand each chunk to `f` (see
+    /// `UcxReadHalf::recv_data_with`); nothing stays posted if the call is
+    /// dropped. TCP errors.
+    pub async fn recv_data_with(&mut self, f: impl FnMut(&[u8])) -> io::Result<usize> {
+        match self {
+            #[cfg(feature = "ucx")]
+            ReadHalf::Ucx(r) => r.recv_data_with(f).await,
+            ReadHalf::Tcp(_) => {
+                let _ = f;
+                Err(io::Error::new(io::ErrorKind::Unsupported, "recv_data_with is UCX-only"))
+            }
+        }
+    }
+
     /// `read_exact_into_pooled` into caller memory. Same cancel rule: `dest`
     /// travels by value, so a dropped read keeps it until its completion lands.
     /// TCP only.

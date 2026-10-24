@@ -14,6 +14,12 @@
 
 ## Active
 
+### F-CLIENT-IO-THREADS — 一个 ClusterClient 带 W 个 IO 线程（替代 BatchClient 的 W 个 ClusterClient）
+- **Trigger** (2026-10-24 用户): `BatchClient(W=8)` 现在是 8 个独立 `ClusterClient`（8 份路由缓存、8 条 manager 连接、每个分区 8 条连接，同一 key 的写和后续 compare_put/读可能落在不同连接上，PS 不保证跨连接顺序）。用户："我可以接受 ClusterClient 有多个 io 线程，比如 W=8，然后多个 connection % W 分配到 IO thread 上面，绝对不是一个分区一个线程"。实测单 worker 已是单核冷拷贝上限（TCP 5.4、UCX 6.5 GB/s；`ucx_perftest stream_bw` 1 GiB 7.5 GB/s），再快只能多核并行收包。
+- **Scope**: 一个 `ClusterClient`（一份路由/鉴权/manager 连接，每个 PS 地址一条连接）内部开 W 个 IO 线程；连接按编号 % W 固定在一个 IO 线程上（收发都在那个线程）；不是一个分区一个线程。`BatchClient` 改用它，W 的含义变成 IO 线程数。
+- **Acceptance**: 同一 PS 地址只有一条连接（连接计数测试）；同 key 的 put 后 compare_put/读顺序成立；单 rank 读吞吐不低于现在 W=8 的 8 个 ClusterClient（TCP 27–30、UCX 20–21 GB/s，同测法交替对照）；单 rank 写吞吐也不低于现在 W=8（每分区连接从 8 条变 1 条，客户端发送窗口 3 与 PS `--conn-inflight-cap` 4 都按连接计，可能要随之调整）；W=1 不比现在慢。
+- `passes: false`
+
 ### F-KVC-ADAPTER-WRITE-READ — KV-cache adapter 读写跑满（autumn_kvcache 仓库）
 - **Trigger** (2026-10-23 实测): autumn 单 rank 写 2.39 GB/s、读 1.79 GB/s（微基准），但 SGLang 里取 128 页（2 GiB）要 2–6 s，超过 timeout 预算，跨实例命中 0%；读实例预取失败后重算、把已在 L3 的页又写一遍（adapter 写前不查 exists），和读抢带宽。
 - **Scope**: (1) 写前去重（批量 exists，只写不存在的页）；(2) 查清引擎内取数比微基准慢 2–5 倍的原因（拷贝？GIL？和写争用？）并修。
