@@ -3285,7 +3285,7 @@ cargo test -p autumn-rpc --lib an_urgent_request_overtakes_queued_ones
 cargo test -p autumn-rpc --lib the_send_window_holds_large_requests_but_not_urgent_ones
 python3 - <<'PY'
 import threading, time, numpy as np, autumn
-bc = autumn.BatchClient("127.0.0.1:9001", 1, 16, scope="kvc")
+bc = autumn.BatchClient("127.0.0.1:9001", 16, scope="kvc")
 keys = [f"m/kv/p{i}".encode() for i in range(128)]
 bc.put_from(keys, [np.zeros(4096, np.uint8)] * 128, 600)
 page = np.zeros(16 << 20, np.uint8); stop = threading.Event()
@@ -3347,7 +3347,7 @@ AUTUMN_UCX_TEST_BIND='[<roce-ip>]:0' UCX_TLS=rc_mlx5,ud_mlx5,tcp,self UCX_NET_DE
 python3 - <<'EOF'
 import numpy as np, autumn, time
 n, page = 128, 16 << 20
-bc = autumn.BatchClient("127.0.0.1:9001", 1, 64, False, scope="kvc")
+bc = autumn.BatchClient("127.0.0.1:9001", 64, False, scope="kvc")
 src = np.random.randint(0, 255, n * page, dtype=np.uint8); dst = np.zeros_like(src)
 keys = [f"check/{i}".encode() for i in range(n)]
 assert all(bc.put_from(keys, [src[i*page:(i+1)*page] for i in range(n)], 3600))

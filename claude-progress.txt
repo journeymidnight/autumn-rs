@@ -1,3 +1,10 @@
+Date: 2026-10-24 (7)
+TaskStatus: completed
+Task scope: user — BatchClient without W (one worker, one ClusterClient), adapter without client_workers; drop F-CLIENT-IO-THREADS. User picked this ("A") after the TCP numbers below.
+Current summary: `BatchClient(manager, per_worker_cap=16, direct=False, *, scope, ...)`, one worker thread; autumn_kvcache passes it by keyword and warns on a leftover `client_workers`. UCX: 40.85 GB/s, every byte verified. TCP loopback, pre-touched destinations: P=1 get 5.5 GB/s (W=8 was 20-25), put 4.5 (9); P=8 put ~12 either way, get batch p50 0.56-0.61 s (0.26-0.47 s with W=8) — all faster than recompute (~1 s). Opus review: no high; version skew handled by keyword args + AUTUMN_REV bump.
+Main gaps: with fresh (np.zeros) destinations W=8 x P=8 stalled 3-6 s per batch — inferred concurrent page faults on the mm lock, the likely source of the old unreproduced read stall (not verified). UCX perf-check A/B for 23361b24..now not run. Cross-host TCP per-worker rate unmeasured.
+Next steps: F-UCX-AM-RNDV-INTERNAL (PS<->EN and client->PS over AM; slab-side CRC on appends); perf-check A/B.
+
 Date: 2026-10-24 (6)
 TaskStatus: completed
 Task scope: user — F-UCX-TAG-RNDV: over UCX the kvcache read's value comes as an active message that UCX moves by rendezvous into the page (implemented with AM, not tag: a late value nobody waits for is dropped and its send completes). User: the eager/rendezvous cut equals the 64 KiB bulk cut, not UCX's own threshold.

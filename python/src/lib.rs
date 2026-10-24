@@ -848,19 +848,17 @@ fn set_transport(kind: &str) -> PyResult<()> {
     }
 }
 
-// ── BatchClient: GIL-releasing multi-worker batch engine ─────────────────────
+// ── BatchClient: GIL-releasing batch engine ─────────────────────────────────
 //
 // The async `Client` above pays per-op asyncio + GIL overhead: each get/put is
 // a Python future resolved via `call_soon_threadsafe`. For a 128-page batch
-// that's 128 GIL-serialized round-trips → ~480 MB/s ceiling regardless of how
-// many client workers you stack (the GIL serializes the marshaling).
+// that's 128 GIL-serialized round-trips → ~480 MB/s ceiling.
 //
 // `BatchClient` removes that: ONE PyO3 call extracts all N (key, dest-ptr,
-// len) under the GIL, then `py.allow_threads` releases it while K dedicated
-// worker threads — each with its own compio runtime + ClusterClient + UCX
-// worker — pipeline the transfers and memcpy directly into the pinned dest
-// pages in Rust. No per-op Python, no asyncio. Concurrency per worker is
-// capped (`buffered`) to stay under the UCX single-worker rendezvous cliff.
+// len) under the GIL, then `py.allow_threads` releases it while one worker
+// thread — its own compio runtime, ClusterClient and UCX worker — runs the
+// batch, receiving values straight into the pinned pages. No per-op Python,
+// no asyncio.
 
 use std::sync::mpsc as smpsc;
 
@@ -900,7 +898,7 @@ struct BatchWorker {
 
 #[pyclass]
 struct BatchClient {
-    workers: Vec<BatchWorker>,
+    worker: BatchWorker,
     per_worker_cap: usize,
     /// captured from the process transport at construction. True ⟹
     /// zero-copy data path (writes always; reads above BULK_MIN_BYTES).
@@ -956,7 +954,7 @@ async fn run_job(client: &ClusterClient, op: BatchOp, items: Vec<WorkItem>, ttl_
             } else {
                 // Values are received straight into the pages. SAFETY: as
                 // above, and this job runs to completion before the batch
-                // returns to Python (`run_items` waits for every worker).
+                // returns to Python (`run_items` waits for the worker).
                 let ritems: Vec<autumn_client::RawGetItem> = items
                     .iter()
                     .map(|it| autumn_client::RawGetItem { key: &it.key, ptr: it.ptr as *mut u8, len: it.len })
@@ -1002,21 +1000,23 @@ async fn run_job(client: &ClusterClient, op: BatchOp, items: Vec<WorkItem>, ttl_
 
 #[pymethods]
 impl BatchClient {
-    /// Blocking constructor: spawn `n_workers` threads, each connecting its own
-    /// ClusterClient, and wait until all are ready. `per_worker_cap` is accepted
-    /// but not enforced: the SDK's `batch_get_concurrency` /
-    /// `batch_put_concurrency` bound each worker's requests in flight.
+    /// Blocking constructor: spawn the worker thread, which connects one
+    /// ClusterClient, and wait until it is ready. One worker reads at the
+    /// single-core limit on TCP (~5 GB/s, faster than recompute) and at the
+    /// NIC on UCX (rendezvous); more workers only bought TCP latency for whole
+    /// cores, and each had its own routing and connections. `per_worker_cap` is
+    /// accepted but not enforced: the SDK's `batch_get_concurrency` /
+    /// `batch_put_concurrency` bound the requests in flight.
     /// `scope` (keyword-only) is the REQUIRED key scope. `principal=` +
-    /// `credential=` (bytes) bind EVERY worker's ClusterClient to that
-    /// credential — required once `kvc/` is enforcement-enabled (the kvcache
-    /// connector threads these from `kv_connector_extra_config`); harmless with
-    /// authz off. Both or neither, validated up front.
+    /// `credential=` (bytes) bind the ClusterClient to that credential —
+    /// required once `kvc/` is enforcement-enabled (the kvcache connector
+    /// threads these from `kv_connector_extra_config`); harmless with authz
+    /// off. Both or neither, validated up front.
     #[new]
-    #[pyo3(signature = (manager, n_workers=4, per_worker_cap=16, direct=false, *, scope, principal=None, credential=None))]
+    #[pyo3(signature = (manager, per_worker_cap=16, direct=false, *, scope, principal=None, credential=None))]
     fn new(
         py: Python<'_>,
         manager: String,
-        n_workers: usize,
         per_worker_cap: usize,
         direct: bool,
         scope: String,
@@ -1032,89 +1032,84 @@ impl BatchClient {
                 ))
             }
         };
-        let n_workers = n_workers.max(1);
         // "ucx ⟹ zerocopy": derive the data path from the process
         // transport (set via set_transport BEFORE construction) — no explicit
         // bulk flag. UCX → zero-copy (writes always; reads size-guarded).
         let is_ucx = IS_UCX.load(std::sync::atomic::Ordering::SeqCst);
-        let result: Result<Vec<BatchWorker>, String> = py.allow_threads(|| {
-            let mut workers = Vec::with_capacity(n_workers);
-            for i in 0..n_workers {
-                let (job_tx, mut job_rx) = unbounded::<BatchJob>();
-                let (ready_tx, ready_rx) = smpsc::channel::<Result<(), String>>();
-                let endpoint = manager.clone();
-                let worker_cred = cred_pair.clone();
-                let worker_scope = scope.clone();
-                std::thread::Builder::new()
-                    .name(format!("autumn-batch-{i}"))
-                    .spawn(move || {
-                        let rt = match compio::runtime::Runtime::new() {
-                            Ok(rt) => rt,
+        let result: Result<BatchWorker, String> = py.allow_threads(|| {
+            let (job_tx, mut job_rx) = unbounded::<BatchJob>();
+            let (ready_tx, ready_rx) = smpsc::channel::<Result<(), String>>();
+            let endpoint = manager.clone();
+            let worker_cred = cred_pair.clone();
+            let worker_scope = scope.clone();
+            std::thread::Builder::new()
+                .name("autumn-batch".to_string())
+                .spawn(move || {
+                    let rt = match compio::runtime::Runtime::new() {
+                        Ok(rt) => rt,
+                        Err(e) => {
+                            let _ = ready_tx.send(Err(format!("compio runtime: {e}")));
+                            return;
+                        }
+                    };
+                    rt.block_on(async move {
+                        let client = match connect_worker_client(&endpoint, &worker_scope, worker_cred).await {
+                            Ok(c) => c,
                             Err(e) => {
-                                let _ = ready_tx.send(Err(format!("compio runtime: {e}")));
+                                let _ = ready_tx.send(Err(e));
                                 return;
                             }
                         };
-                        rt.block_on(async move {
-                            let client = match connect_worker_client(&endpoint, &worker_scope, worker_cred).await {
-                                Ok(c) => c,
-                                Err(e) => {
-                                    let _ = ready_tx.send(Err(e));
-                                    return;
-                                }
-                            };
-                            let _ = ready_tx.send(Ok(()));
-                            // Gets and puts run one job at a time; a probe starts at
-                            // once beside them on the same connections, where its
-                            // requests take the urgent lane past queued puts.
-                            let client = std::rc::Rc::new(client);
-                            let (data_tx, mut data_rx) = unbounded::<BatchJob>();
-                            let data_client = client.clone();
-                            compio::runtime::spawn(async move {
-                                while let Some(job) = data_rx.next().await {
-                                    let job_fut = run_job(&data_client, job.op, job.items, job.ttl_secs, per_worker_cap, direct);
-                                    // Gets receive straight into the caller's pages; a job
-                                    // abandoned by a panic may leave a receive writing one
-                                    // after the batch returned to Python. Stop instead.
-                                    let res = match futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(job_fut)).await {
-                                        Ok(res) => res,
-                                        Err(_) => {
-                                            eprintln!("autumn BatchClient: a worker panicked mid-batch; its receives may still write the caller's pages, aborting");
-                                            std::process::abort();
-                                        }
-                                    };
-                                    let _ = job.done.send(res);
-                                }
-                            })
-                            .detach();
-                            while let Some(job) = job_rx.next().await {
-                                if let BatchOp::Head = job.op {
-                                    let probe_client = client.clone();
-                                    compio::runtime::spawn(async move {
-                                        let res = run_job(&probe_client, job.op, job.items, 0, per_worker_cap, direct).await;
-                                        let _ = job.done.send(res);
-                                    })
-                                    .detach();
-                                } else if let Err(e) = data_tx.unbounded_send(job) {
-                                    // The data task panicked: fail the job, and say so —
-                                    // every later get / put on this worker fails too.
-                                    eprintln!("autumn BatchClient: worker data task gone; get/put on this worker fail");
-                                    let job = e.into_inner();
-                                    let _ = job.done.send(vec![false; job.items.len()]);
-                                }
+                        let _ = ready_tx.send(Ok(()));
+                        // Gets and puts run one job at a time; a probe starts at
+                        // once beside them on the same connections, where its
+                        // requests take the urgent lane past queued puts.
+                        let client = std::rc::Rc::new(client);
+                        let (data_tx, mut data_rx) = unbounded::<BatchJob>();
+                        let data_client = client.clone();
+                        compio::runtime::spawn(async move {
+                            while let Some(job) = data_rx.next().await {
+                                let job_fut = run_job(&data_client, job.op, job.items, job.ttl_secs, per_worker_cap, direct);
+                                // Gets receive straight into the caller's pages; a job
+                                // abandoned by a panic may leave a receive writing one
+                                // after the batch returned to Python. Stop instead.
+                                let res = match futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(job_fut)).await {
+                                    Ok(res) => res,
+                                    Err(_) => {
+                                        eprintln!("autumn BatchClient: a worker panicked mid-batch; its receives may still write the caller's pages, aborting");
+                                        std::process::abort();
+                                    }
+                                };
+                                let _ = job.done.send(res);
                             }
-                        });
-                    })
-                    .map_err(|e| format!("spawn batch worker: {e}"))?;
-                ready_rx
-                    .recv()
-                    .map_err(|_| "batch worker died during connect".to_string())??;
-                workers.push(BatchWorker { job_tx });
-            }
-            Ok(workers)
+                        })
+                        .detach();
+                        while let Some(job) = job_rx.next().await {
+                            if let BatchOp::Head = job.op {
+                                let probe_client = client.clone();
+                                compio::runtime::spawn(async move {
+                                    let res = run_job(&probe_client, job.op, job.items, 0, per_worker_cap, direct).await;
+                                    let _ = job.done.send(res);
+                                })
+                                .detach();
+                            } else if let Err(e) = data_tx.unbounded_send(job) {
+                                // The data task panicked: fail the job, and say so —
+                                // every later get / put on this worker fails too.
+                                eprintln!("autumn BatchClient: worker data task gone; get/put on this worker fail");
+                                let job = e.into_inner();
+                                let _ = job.done.send(vec![false; job.items.len()]);
+                            }
+                        }
+                    });
+                })
+                .map_err(|e| format!("spawn batch worker: {e}"))?;
+            ready_rx
+                .recv()
+                .map_err(|_| "batch worker died during connect".to_string())??;
+            Ok(BatchWorker { job_tx })
         });
-        let workers = result.map_err(PyRuntimeError::new_err)?;
-        Ok(BatchClient { workers, per_worker_cap, is_ucx, direct })
+        let worker = result.map_err(PyRuntimeError::new_err)?;
+        Ok(BatchClient { worker, per_worker_cap, is_ucx, direct })
     }
 
     /// Whether this client uses the zero-copy data path. This is now
@@ -1134,7 +1129,7 @@ impl BatchClient {
 
     /// Batched zero-copy get. Returns list[bool] aligned to `keys`: True iff the
     /// key was found AND its stored size == the buffer length (value copied into
-    /// the buffer). Fans across worker threads with the GIL released.
+    /// the buffer). Runs on the worker thread with the GIL released.
     fn get_into(&self, py: Python<'_>, keys: Vec<Vec<u8>>, bufs: Vec<PyBuffer<u8>>) -> PyResult<Vec<bool>> {
         self.run_batch(py, BatchOp::Get, keys, bufs, true, 0)
     }
@@ -1153,11 +1148,7 @@ impl BatchClient {
     /// same client; its requests go ahead of queued writes on the connection.
     fn exists(&self, py: Python<'_>, keys: Vec<Vec<u8>>) -> PyResult<Vec<bool>> {
         let items = keys.into_iter().map(|key| WorkItem { key, ptr: 0, len: 0 }).collect();
-        Ok(self.run_items(py, &self.workers, BatchOp::Head, items, 0))
-    }
-
-    fn n_workers(&self) -> usize {
-        self.workers.len()
+        Ok(self.run_items(py, BatchOp::Head, items, 0))
     }
 }
 
@@ -1190,51 +1181,21 @@ impl BatchClient {
                 len: buf.item_count(),
             });
         }
-        let results = self.run_items(py, &self.workers, op, items, ttl_secs);
-        drop(bufs); // release pinned buffers only after all workers finished
+        let results = self.run_items(py, op, items, ttl_secs);
+        drop(bufs); // release pinned buffers only after the worker finished
         Ok(results)
     }
 
-    /// Shards `items` across `workers` in order and waits for all of them
-    /// with the GIL released.
-    fn run_items(&self, py: Python<'_>, workers: &[BatchWorker], op: BatchOp, items: Vec<WorkItem>, ttl_secs: u64) -> Vec<bool> {
+    /// Hands `items` to the worker and waits for them with the GIL released.
+    fn run_items(&self, py: Python<'_>, op: BatchOp, items: Vec<WorkItem>, ttl_secs: u64) -> Vec<bool> {
         let n = items.len();
-        let k = workers.len();
-        // Split into k contiguous shards (preserves order on reassembly).
-        let per = n.div_ceil(k).max(1);
-        let mut shards: Vec<Vec<WorkItem>> = Vec::with_capacity(k);
-        let mut it = items.into_iter();
-        for _ in 0..k {
-            let chunk: Vec<WorkItem> = it.by_ref().take(per).collect();
-            if chunk.is_empty() {
-                break;
-            }
-            shards.push(chunk);
-        }
-
         py.allow_threads(|| {
-            let mut dones: Vec<(smpsc::Receiver<Vec<bool>>, usize)> = Vec::with_capacity(shards.len());
-            for (wi, chunk) in shards.into_iter().enumerate() {
-                let chunk_len = chunk.len();
-                let (done_tx, done_rx) = smpsc::channel::<Vec<bool>>();
-                let job = BatchJob { op, items: chunk, ttl_secs, done: done_tx };
-                if workers[wi].job_tx.unbounded_send(job).is_err() {
-                    // Worker dead: synthesize a failed chunk so output stays aligned.
-                    let (tx, rx) = smpsc::channel::<Vec<bool>>();
-                    let _ = tx.send(vec![false; chunk_len]);
-                    dones.push((rx, chunk_len));
-                } else {
-                    dones.push((done_rx, chunk_len));
-                }
+            let (done, result) = smpsc::channel::<Vec<bool>>();
+            let job = BatchJob { op, items, ttl_secs, done };
+            if self.worker.job_tx.unbounded_send(job).is_err() {
+                return vec![false; n];
             }
-            let mut out: Vec<bool> = Vec::with_capacity(n);
-            for (rx, chunk_len) in dones {
-                match rx.recv() {
-                    Ok(part) => out.extend(part),
-                    Err(_) => out.extend(std::iter::repeat(false).take(chunk_len)),
-                }
-            }
-            out
+            result.recv().unwrap_or_else(|_| vec![false; n])
         })
     }
 }
