@@ -16,8 +16,12 @@
 //! no gap above `GROUP_GAP` (one engine batch, in practice), capped at
 //! `GROUP_MAX_ENTRIES`. A KV-cache hit is the run of consecutive pages from the
 //! start of a prefix, so evicting one page in the middle of a run wastes every
-//! page after it; dropping a burst together does not. A read or existence
-//! check of any member gives the whole group a second chance.
+//! page after it; dropping a burst together does not. Writing to a group and
+//! reading or checking any member both set its reference bit, so what goes is
+//! the oldest group nobody has touched since the hand last passed it (an
+//! approximate LRU). A new group starting unreferenced would be evicted before
+//! older groups that were merely read once: the burst just written, the one
+//! most likely to be read next, would go first.
 //!
 //! A durable write of a key held here (a delete, a conditional write, a batch
 //! put, a put that did not fit) marks the entry superseded when it is queued;
@@ -160,11 +164,12 @@ impl MemShard {
         let open = self.last_insert.is_some_and(|t| now.duration_since(t) <= GROUP_GAP)
             && self.groups.back().is_some_and(|g| g.keys.len() < GROUP_MAX_ENTRIES);
         if !open {
-            self.groups.push_back(Group { id: self.next_group, keys: Vec::new(), referenced: Rc::new(Cell::new(false)) });
+            self.groups.push_back(Group { id: self.next_group, keys: Vec::new(), referenced: Rc::default() });
             self.next_group += 1;
         }
         self.last_insert = Some(now);
         let group = self.groups.back_mut().expect("a group was just ensured");
+        group.referenced.set(true);
         group.keys.push(key.to_vec());
         let entry = Entry {
             value,
@@ -215,7 +220,7 @@ impl MemShard {
     /// Drop the first group the hand finds unreferenced, clearing the
     /// reference of each it passes. False when the shard holds nothing.
     fn evict_one_group(&mut self) -> bool {
-        // Two turns at most: the first clears every reference bit.
+        // One turn clears every reference bit; the next pop evicts.
         for _ in 0..2 * self.groups.len() + 1 {
             let Some(g) = self.groups.pop_front() else { return false };
             if g.referenced.replace(false) {
@@ -269,30 +274,65 @@ mod tests {
         assert!(b.covers(b"kvc/a") && b.covers(b"x/b") && !b.covers(b"fs/c"));
     }
 
+    /// Inserts `keys` as one burst at `at`.
+    fn burst(s: &mut MemShard, keys: &[&[u8]], at: Instant) {
+        for (i, k) in keys.iter().enumerate() {
+            assert!(s.insert(k, v(1000), 0, at + Duration::from_millis(i as u64)));
+        }
+    }
+
     #[test]
-    fn a_burst_is_evicted_together_and_a_read_saves_its_group() {
+    fn a_burst_is_evicted_together_oldest_first() {
         let entry = 1000 + 2 * 6 + ENTRY_OVERHEAD;
         let mut s = shard(6 * entry);
         let t0 = Instant::now();
-        // Two bursts of three, far apart: two groups.
-        for (i, k) in [b"kvc/a1", b"kvc/a2", b"kvc/a3"].iter().enumerate() {
-            assert!(s.insert(*k, v(1000), 0, t0 + Duration::from_millis(i as u64)));
+        burst(&mut s, &[b"kvc/a1", b"kvc/a2", b"kvc/a3"], t0);
+        burst(&mut s, &[b"kvc/b1", b"kvc/b2", b"kvc/b3"], t0 + Duration::from_secs(1));
+        burst(&mut s, &[b"kvc/c1"], t0 + Duration::from_secs(2));
+        for k in [b"kvc/a1", b"kvc/a2", b"kvc/a3"] {
+            assert!(s.get(k, 0).is_none(), "the oldest burst went as a whole");
         }
-        let t1 = t0 + Duration::from_secs(1);
-        for (i, k) in [b"kvc/b1", b"kvc/b2", b"kvc/b3"].iter().enumerate() {
-            assert!(s.insert(*k, v(1000), 0, t1 + Duration::from_millis(i as u64)));
-        }
-        // Reading one member of the older group gives it a second chance.
-        assert!(s.get(b"kvc/a2", 0).is_some());
-        let t2 = t1 + Duration::from_secs(1);
-        assert!(s.insert(b"kvc/c1", v(1000), 0, t2));
-        for k in [b"kvc/b1", b"kvc/b2", b"kvc/b3"] {
-            assert!(s.get(k, 0).is_none(), "the unread burst went as a whole");
-        }
-        for k in [b"kvc/a1", b"kvc/a2", b"kvc/a3", b"kvc/c1"] {
+        for k in [b"kvc/b1", b"kvc/b2", b"kvc/b3", b"kvc/c1"] {
             assert!(s.get(k, 0).is_some());
         }
         assert_eq!(s.budget.used(), 4 * entry);
+    }
+
+    /// The burst just written outlives an older one that was read once: every
+    /// insert sets its group's bit. Ablation: inserts leave the bit alone and the
+    /// fresh burst is evicted first.
+    #[test]
+    fn a_fresh_burst_outlives_an_old_one_read_once() {
+        let entry = 1000 + 2 * 6 + ENTRY_OVERHEAD;
+        let mut s = shard(2 * entry);
+        let t0 = Instant::now();
+        burst(&mut s, &[b"kvc/o1"], t0);
+        burst(&mut s, &[b"kvc/o2"], t0 + Duration::from_secs(1));
+        // A sweep clears both, evicting o1; then o2 is read once.
+        burst(&mut s, &[b"kvc/n1"], t0 + Duration::from_secs(2));
+        assert!(s.get(b"kvc/o2", 0).is_some());
+        // The next need for room takes the old, once-read o2, not fresh n1.
+        burst(&mut s, &[b"kvc/n2"], t0 + Duration::from_secs(3));
+        assert!(s.get(b"kvc/n1", 0).is_some(), "the fresh burst stayed");
+        assert!(s.get(b"kvc/o2", 0).is_none(), "the old burst went");
+    }
+
+    /// After the hand has cleared every bit, a burst read since then outlives
+    /// one that was not. Ablation: a GET leaves the bit alone and k2 goes.
+    #[test]
+    fn a_read_since_the_last_sweep_saves_a_burst() {
+        let entry = 1000 + 2 * 6 + ENTRY_OVERHEAD;
+        let mut s = shard(3 * entry);
+        let t0 = Instant::now();
+        for (i, k) in [b"kvc/k1", b"kvc/k2", b"kvc/k3", b"kvc/k4"].iter().enumerate() {
+            burst(&mut s, &[*k], t0 + Duration::from_secs(i as u64));
+        }
+        // k4 needed room: the sweep cleared k1..k3 and evicted k1; k2 is next.
+        assert!(s.get(b"kvc/k1", 0).is_none());
+        assert!(s.get(b"kvc/k2", 0).is_some(), "read k2");
+        burst(&mut s, &[b"kvc/k5"], t0 + Duration::from_secs(5));
+        assert!(s.get(b"kvc/k2", 0).is_some(), "read since the sweep: kept");
+        assert!(s.get(b"kvc/k3", 0).is_none(), "unread since the sweep: evicted");
     }
 
     #[test]

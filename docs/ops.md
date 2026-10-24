@@ -3310,8 +3310,9 @@ DRAM and acknowledges them without writing the log; reads look there first.
 or move loses it, and a key that also had an older durable value reads that
 value afterwards. Use it only for data that can be recomputed (the KV cache);
 everything else should stay outside the prefix. The budget is for the whole PS;
-a partition that needs room evicts its own oldest unread write bursts, and a
-put that still does not fit is written durably as usual (a partition that
+a partition that needs room evicts its own write bursts that nobody has written
+to or read for longest (approximate LRU, a burst at a time), and a put that
+still does not fit is written durably as usual (a partition that
 filled its share and went idle keeps it). Small, fenced, batched and oversized
 puts are always durable. `RANGE` does not list keys held only in memory. Watch
 `autumn_ps_mem_tier_*` on the PS `/metrics`.

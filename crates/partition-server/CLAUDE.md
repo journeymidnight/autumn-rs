@@ -647,9 +647,13 @@ inline memtable hit, so a redirect request gets the value inline.
   partition that filled its share and went idle keeps it; the others write
   durably once the PS budget is full (`refused_total` grows).
 - **Eviction**: CLOCK over groups — inserts closer than 50 ms form one group
-  (≤ 256 entries), dropped together; a GET or HEAD of any member sets the
-  group's reference bit. A KV-cache hit is a run of consecutive pages, so a
-  hole in the middle of a run wastes the rest of it.
+  (≤ 256 entries), dropped together. Writing to a group and a GET or HEAD of
+  any member both set its reference bit, so what goes is the oldest group
+  nobody touched since the hand last passed it (approximate LRU). A KV-cache
+  hit is a run of consecutive pages, so a hole in the middle of a run wastes
+  the rest of it. Every insert sets the bit: a new group left unreferenced
+  went before older groups read once — measured, a bench's just-written batch
+  was evicted before it could be read.
 - **Durable writes of a held key** (delete, conditional write, batch put,
   fenced or oversized put, a put that did not fit) mark the entry superseded
   when queued (marked after dispatch over what the enqueue appended to
@@ -661,13 +665,14 @@ inline memtable hit, so a redirect request gets the value inline.
 - Not covered: RANGE does not list keys held only in memory.
 - Metrics: `autumn_ps_mem_tier_{bytes,capacity_bytes,hits_total,
   inserts_total,refused_total,evicted_entries_total,evicted_bytes_total}`.
-- Tests: `mem_tier::tests` (grouped eviction and its second chance, refusal,
-  expiry, supersede-then-apply, budget returned on drop);
+- Tests: `mem_tier::tests` (grouped eviction, a fresh burst outliving an old
+  one read once, a read saving a burst, refusal, expiry, supersede-then-apply,
+  budget returned on drop; ablations red: no bit on insert, no bit on GET);
   `crates/manager/tests/mem_tier.rs` (held keys gone after a restart, durable
   fallbacks back, a durable write replacing the held value, delete, TTL,
-  conditional write, grouped eviction, a held put behind an older durable write
-  of its key written durably; ablations red: no drop on apply, GET or presence
-  lookup skipping the tier, no older-write check).
+  conditional write, the oldest burst evicted whole, a held put behind an
+  older durable write of its key written durably; ablations red: no drop on
+  apply, GET or presence lookup skipping the tier, no older-write check).
 
 ## Read Path: Get
 

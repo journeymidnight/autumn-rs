@@ -1,3 +1,10 @@
+Date: 2026-10-24 (4)
+TaskStatus: completed
+Task scope: user — more client workers on TCP (not UCX rebuild, not GPU-direct); the memory-tier eviction bug the bench hit.
+Current summary: adapter TCP default client_workers 8 (autumn_kvcache a75857e; UCX stays 1; a TCP fallback after a failed UCX switch gets 8). 8-rank aggregate get W1 12.8 → W8 ~18.3 GB/s; single rank 2 GiB 1.04 s → 0.16 s; engine W4 per-request p50 457 ms (recompute 976). Eviction: a new group started unreferenced and went before older groups read once (the bench's just-written batch was evicted); now every insert and every GET/HEAD sets the bit (approximate LRU). Unit tests for both bits red under ablation; Opus review: fix correct, the read-bit test did not test its name — rewritten, ablation red.
+Main gaps: the multi-second read stall seen earlier (3-10 s, W=2 and W=8, also without the tier) did not reproduce in 6 instrumented W=8 runs on a fresh cluster (no GET attempt over 1.9 s, none failed); not fixed. Engine not re-run at W=8.
+Next steps: persistence step of the tier; cross-partition budget.
+
 Date: 2026-10-24 (3)
 TaskStatus: completed
 Task scope: user — research the write-through KV-cache tier (done; user chose: persist on eviction only entries that were read, evict in groups, one budget per PS, measure the direct-read handling first), then its minimal version without persistence.

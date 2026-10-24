@@ -3,8 +3,8 @@
 //! a PS restart (never logged); uncovered, small, fenced, oversized and batched
 //! writes stay durable; a durable write replaces the held value; a put behind
 //! an older durable write of its key is written durably too; deletes, TTLs and
-//! conditional writes see the held value; an unread burst is evicted as a
-//! whole while a read burst survives.
+//! conditional writes see the held value; the oldest burst is evicted as a
+//! whole.
 
 mod support;
 
@@ -51,23 +51,19 @@ fn memory_tier_holds_covered_puts_until_restart() {
         c.set_rpc_timeout(Duration::from_secs(30));
         let none = WriteOptions::default();
 
-        // Grouped eviction: 13 values of 300 KiB fit. Three bursts of five; a
-        // read of one member of the first saves it, the unread second goes
-        // whole when the third needs room.
+        // Grouped eviction: 13 values of 300 KiB fit. Three bursts of five; when
+        // the third needs room, the oldest goes as a whole.
         let page = 300 << 10;
         for (burst, seed) in [("A", 1u8), ("B", 2), ("C", 3)] {
-            if burst == "C" {
-                assert!(c.head(b"kvc/A2").await.unwrap().found);
-            }
             for i in 0..5 {
                 c.put(format!("kvc/{burst}{i}").as_bytes(), val(page, seed), none).await.unwrap();
             }
             compio::time::sleep(Duration::from_millis(200)).await;
         }
         for i in 0..5 {
-            assert_eq!(get(&c, format!("kvc/B{i}").as_bytes()).await, None, "B{i}: the unread burst went whole");
-            assert_eq!(get(&c, format!("kvc/A{i}").as_bytes()).await, Some(vec![1; page]), "A{i}: the read burst stayed");
-            assert_eq!(get(&c, format!("kvc/C{i}").as_bytes()).await, Some(vec![3; page]), "C{i}");
+            assert_eq!(get(&c, format!("kvc/A{i}").as_bytes()).await, None, "A{i}: the oldest burst went whole");
+            assert_eq!(get(&c, format!("kvc/B{i}").as_bytes()).await, Some(vec![2; page]), "B{i}");
+            assert_eq!(get(&c, format!("kvc/C{i}").as_bytes()).await, Some(vec![3; page]), "C{i}: the newest stayed");
         }
 
         let big = 100 << 10; // a bulk put: what the tier holds
