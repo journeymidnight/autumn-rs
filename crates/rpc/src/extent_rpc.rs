@@ -158,6 +158,22 @@ impl AppendReq {
             payload,
         })
     }
+
+    /// The frame-value form (`am_frame`): `ctrl` is the 32-byte header then
+    /// the payload's crc32c (u32 LE), and the payload came as the frame's
+    /// value, which no frame CRC covers — so it is checked here.
+    pub fn decode_checked(ctrl: Bytes, payload: Bytes) -> Result<Self, &'static str> {
+        if ctrl.len() != APPEND_HEADER_LEN + 4 {
+            return Err("append request: header and payload crc expected");
+        }
+        let crc = u32::from_le_bytes(ctrl[APPEND_HEADER_LEN..].try_into().unwrap());
+        if crc32c::crc32c(&payload) != crc {
+            return Err("append payload crc mismatch");
+        }
+        let mut req = Self::decode(ctrl.slice(..APPEND_HEADER_LEN))?;
+        req.payload = payload;
+        Ok(req)
+    }
 }
 
 /// Fixed binary AppendResponse: 17 bytes.
@@ -1350,6 +1366,27 @@ const _: () = {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The frame-value append carries its payload's crc32c; a payload that
+    /// does not match it is refused, not appended.
+    #[test]
+    fn a_frame_value_append_is_checked_against_its_crc() {
+        let header = AppendReq::encode_header(7, 2, 4096, 9);
+        let payload = Bytes::from(vec![0xabu8; 100_000]);
+        let ctrl = |crc: u32| {
+            let mut c = header.to_vec();
+            c.extend_from_slice(&crc.to_le_bytes());
+            Bytes::from(c)
+        };
+        let good = crc32c::crc32c(&payload);
+        let req = AppendReq::decode_checked(ctrl(good), payload.clone()).expect("decode");
+        assert_eq!((req.extent_id, req.eversion, req.commit, req.owner_epoch), (7, 2, 4096, 9));
+        assert_eq!(req.payload, payload);
+        let mut flipped = payload.to_vec();
+        flipped[50_000] ^= 1;
+        assert_eq!(AppendReq::decode_checked(ctrl(good), Bytes::from(flipped)).err(), Some("append payload crc mismatch"));
+        assert!(AppendReq::decode_checked(header, payload).is_err(), "no crc after the header");
+    }
 
     #[test]
     fn fence_extent_req_round_trip() {

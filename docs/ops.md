@@ -3330,7 +3330,7 @@ curl -s http://127.0.0.1:9801/metrics | grep autumn_ps_mem_tier   # bytes / hits
 `BatchClient.get_into` (the kvcache adapter's read) receives each value of
 64 KiB and up directly into the destination page: no copy out of a pool
 buffer. From PS memory, one worker thread reads about 5.4 GB/s on loopback TCP
-(3.0 before); eight about 27–30 (18). Over UCX against a wire-76 cluster the
+(3.0 before); eight about 27–30 (18). Over UCX against a wire-76 or later cluster the
 value comes as an active message that UCX moves by rendezvous into the page
 with no receive copy: one worker ~42 GB/s at ~4% CPU (6.4–6.9 with the stream
 receive, which costs a core one copy into memory not in cache — `ucx_perftest
@@ -3354,6 +3354,35 @@ assert all(bc.put_from(keys, [src[i*page:(i+1)*page] for i in range(n)], 3600))
 t = time.time(); ok = bc.get_into(keys, [dst[i*page:(i+1)*page] for i in range(n)])
 print(all(ok), (dst == src).all(), f"{n*page/(time.time()-t)/1e9:.1f} GB/s")
 EOF
+```
+
+## Large values over UCX as frame values (wire 77)
+
+On UCX, every value part of 64 KiB and up that crosses a hop as part of a frame
+travels beside it as an active message by rendezvous, so the receiving NIC
+writes it into a pool buffer and no receiving CPU copies it: client → PS bulk
+writes, PS → extent node appends, extent node → PS reads, extent node → client
+direct reads, PS → client bulk reads. Smaller parts, TCP, and any peer below
+wire 77 keep the stream exactly as before. An append sent this way carries its
+payload's crc32c, which the extent node recomputes before writing; a mismatch
+fails that replica's append (the stream client retries on a new extent). Each
+process logs once when it first receives one: `received a frame value by UCX
+rendezvous (first in this process)`.
+
+```bash
+cargo test -p autumn-rpc --lib -- am_frame prepared_payload frame_value
+AUTUMN_UCX_TEST_BIND='[<roce-ip>]:0' UCX_TLS=rc_mlx5,ud_mlx5,tcp,self UCX_NET_DEVICES=<dev>:1 \
+  cargo test -p autumn-transport --features ucx --test ucx_am_frame
+# needs the RoCE bind and this UCX_TLS: the read burst only goes red over a
+# transport that registers memory (rc_mlx5), never over `self` or shared memory
+AUTUMN_TEST_UCX_BIND='[<roce-ip>]:0' UCX_TLS=rc_mlx5,ud_mlx5,tcp,self UCX_NET_DEVICES=<dev>:1 \
+  cargo test -p autumn-stream --features autumn-rpc/ucx --test prepared_append
+# live (UCX cluster up, namespace bench created): sizes around the 64 KiB cut, compared byte for byte
+AC=(target/release/autumn-client --manager "[<roce-ip>]:9001" --transport ucx --namespace bench/perf)
+for n in 1000 65535 65536 100000 1048583 8388608 34603017; do
+  head -c $n /dev/urandom > /tmp/v$n; "${AC[@]}" put fv$n /tmp/v$n >/dev/null
+  "${AC[@]}" get fv$n | cmp - /tmp/v$n && echo "ok $n"; done
+grep -l "frame value by UCX rendezvous" /tmp/autumn-rs-logs/*.log   # ps.log and every node*.log
 ```
 
 ## Write options and conditional writes (wire 75)

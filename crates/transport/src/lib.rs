@@ -66,6 +66,14 @@ pub mod am {
         inner: crate::ucx::am::Expected,
     }
 
+    /// This thread's values received as active messages: (eager, rendezvous).
+    pub fn received_counts() -> (u64, u64) {
+        #[cfg(feature = "ucx")]
+        return crate::ucx::am::received_counts();
+        #[cfg(not(feature = "ucx"))]
+        (0, 0)
+    }
+
     /// A tag no other value expected on this thread carries.
     pub fn next_tag() -> u64 {
         #[cfg(feature = "ucx")]
@@ -120,6 +128,77 @@ pub mod am {
                 unreachable!("no Sender without UCX")
             }
         }
+
+        /// Send `value` as the frame value tagged `tag` (unique on this
+        /// connection) and return at once; the send runs on its own task,
+        /// holding `value` until the receiver fetched it. The frame that names
+        /// the tag may go before or after it.
+        pub fn post_frame_value(&self, tag: u64, value: bytes::Bytes) {
+            #[cfg(feature = "ucx")]
+            {
+                let ep = self.ep.clone();
+                compio::runtime::spawn(async move {
+                    if let Err(e) = crate::ucx::am::send_frame_value(&ep, tag, value).await {
+                        // The receiver waits for this value until the connection goes.
+                        tracing::warn!(tag, error = %e, "frame value send failed");
+                    }
+                })
+                .detach();
+            }
+            #[cfg(not(feature = "ucx"))]
+            {
+                let _ = (tag, value);
+                unreachable!("no Sender without UCX")
+            }
+        }
+    }
+
+    /// A frame's value being received (`start_frame_value`).
+    pub struct FrameValue {
+        #[cfg(feature = "ucx")]
+        inner: crate::ucx::am::FrameValue,
+    }
+
+    /// Start receiving a frame's value into one pool buffer: `segments` are
+    /// its pieces in order, `(len, tag)`, where tag 0 is the next piece of
+    /// `inline` (bytes that came on the stream) and any other tag a frame value
+    /// on this connection. Every piece is registered now, so values started
+    /// before any is waited for are received together. Dropped before `wait`
+    /// ends, a receive under way keeps the buffer until it ends. UCX only.
+    pub fn start_frame_value(
+        reader: &crate::ReadHalf,
+        segments: &[(usize, u64)],
+        inline: &[u8],
+    ) -> io::Result<FrameValue> {
+        match reader {
+            #[cfg(feature = "ucx")]
+            crate::ReadHalf::Ucx(r) => {
+                Ok(FrameValue { inner: crate::ucx::am::start_value(r.ep(), segments, inline)? })
+            }
+            crate::ReadHalf::Tcp(_) => {
+                let _ = (segments, inline);
+                Err(io::Error::new(io::ErrorKind::Unsupported, "frame values need the UCX transport"))
+            }
+        }
+    }
+
+    impl FrameValue {
+        /// The whole value, once every piece is in.
+        pub async fn wait(self) -> io::Result<crate::PooledBuf> {
+            #[cfg(feature = "ucx")]
+            return self.inner.wait().await;
+            #[cfg(not(feature = "ucx"))]
+            unreachable!("no FrameValue without UCX")
+        }
+    }
+
+    /// `start_frame_value`, then `wait`.
+    pub async fn receive_frame_value(
+        reader: &crate::ReadHalf,
+        segments: &[(usize, u64)],
+        inline: &[u8],
+    ) -> io::Result<crate::PooledBuf> {
+        start_frame_value(reader, segments, inline)?.wait().await
     }
 }
 pub use tcp::TcpTransport;

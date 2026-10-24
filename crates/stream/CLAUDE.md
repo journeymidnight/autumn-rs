@@ -352,6 +352,23 @@ each payload a second time (1.0x on every replica, measured with a memcpy uprobe
 plus jemalloc regrowth copies. The buffer of an in-flight append stays pinned
 until its pwritev + fsync complete, exactly as its decoder slice did before.
 
+**Frame values over UCX (wire 77).** From a peer at 77 or later over UCX, an
+append whose payload has a part of at least 64 KiB arrives as a frame value
+(autumn-rpc "Frame values"): the large parts come by rendezvous straight into a
+registered pool buffer (no unpack copy), and the ctrl carries the payload's
+crc32c after the 32-byte header. `process_frames_backpressured` receives the
+values of every frame of a burst together (`am_frame::complete`, `join_all`)
+before it handles any of them, so frames keep their order; `decode_append`
+takes the frame-value form through `AppendReq::decode_checked`, which
+recomputes the crc over the received buffer — a mismatch is an error frame and
+nothing is appended (the stream client treats it as a failed replica). One
+read pass over the payload per replica replaces the unpack copy. A burst whose
+value is still on its way holds the connection loop, as a stream value did.
+`READ_BYTES_BULK` replies of 64 KiB or more go the same way (`AmOut::frame_now`),
+to the PS and to a client reading directly. Test: `tests/prepared_append.rs`
+over UCX (`AUTUMN_TEST_UCX_BIND`): appends and the read reply counted as
+rendezvous receives, a payload that misses its crc refused.
+
 **Extent-len reservation**: `build_append_future` stores `extent.len =
 total_end` BEFORE returning the I/O future into FU, so overlapping same-extent
 submits compute non-overlapping `file_start` values.

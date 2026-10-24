@@ -2370,6 +2370,8 @@ async fn process_frames_backpressured(
     cap: usize,
     protocol: &autumn_rpc::version_hello::Negotiated,
     principal: &mut Option<autumn_rpc::cap_token::BoundPrincipal>,
+    reader: &autumn_transport::ReadHalf,
+    am_out: Option<&std::rc::Rc<autumn_rpc::am_frame::AmOut>>,
 ) -> Result<()> {
     use futures::stream::StreamExt as _;
     let client = protocol.role == autumn_rpc::version_hello::Role::Client;
@@ -2400,6 +2402,28 @@ async fn process_frames_backpressured(
             None => break,
         }
     }
+    // Values that come as active messages, received a run at a time (at most
+    // `cap` frames in flight) before any of these frames is handled, so the
+    // burst's values are all held before back-pressure applies, as a burst's
+    // stream bytes were. Only peers send them: a Client connection's decoder
+    // refuses them.
+    if frames.iter().any(|f| f.am_pieces.is_some()) {
+        let value_budget = decoder.max_payload() as usize;
+        let mut ready = Vec::with_capacity(frames.len());
+        let mut rest = frames.into_iter().peekable();
+        while rest.peek().is_some() {
+            let (mut run, mut value_bytes) = (Vec::new(), 0);
+            while run.len() < cap && value_bytes < value_budget {
+                let Some(f) = rest.next() else { break };
+                value_bytes += autumn_rpc::am_frame::am_value_len(&f);
+                run.push(autumn_rpc::am_frame::start(reader, f)?);
+            }
+            for incoming in run {
+                ready.push(incoming.into_frame().await.map_err(|e| anyhow::anyhow!("frame value: {e}"))?);
+            }
+        }
+        frames = ready;
+    }
 
     // Back-pressure: before each push, if we're at/above cap, await one
     // completion and accumulate its bytes into tx_bufs so the caller's
@@ -2422,7 +2446,7 @@ async fn process_frames_backpressured(
 
         if msg_type == MSG_APPEND {
             // Group consecutive same-extent APPEND frames.
-            let first_req = match AppendReq::decode(frames[i].payload.clone()) {
+            let first_req = match decode_append(&frames[i]) {
                 Ok(r) => r,
                 Err(e) => {
                     let req_id = frames[i].req_id;
@@ -2440,7 +2464,7 @@ async fn process_frames_backpressured(
             });
             i += 1;
             while i < frames.len() && frames[i].msg_type == MSG_APPEND {
-                match AppendReq::decode(frames[i].payload.clone()) {
+                match decode_append(&frames[i]) {
                     Ok(r) if r.extent_id == anchor_extent => {
                         slots.push(AppendSlot {
                             req: r,
@@ -2592,7 +2616,7 @@ async fn process_frames_backpressured(
                     continue;
                 }
             };
-            inflight.push(build_read_future(extent, file_rc, slots, false));
+            inflight.push(build_read_future(extent, file_rc, slots, false, None));
         } else if msg_type == MSG_READ_BYTES_BULK {
             // zero-copy read grouping — mirrors MSG_READ_BYTES but every
             // value response is bulk-shaped (`bulk_read_head` + value Bytes)
@@ -2674,7 +2698,7 @@ async fn process_frames_backpressured(
                     continue;
                 }
             };
-            inflight.push(build_read_future(extent, file_rc, slots, true));
+            inflight.push(build_read_future(extent, file_rc, slots, true, am_out.cloned()));
         } else if msg_type == autumn_rpc::MSG_TYPE_PING {
             // Keepalive: answered here, not through `dispatch`, so a reply
             // never waits behind back-pressure or a slow control RPC — the
@@ -3523,6 +3547,16 @@ fn bulk_read_head(req_id: u32, code: u8, msg: &str, value_len: usize) -> Bytes {
     autumn_rpc::frame::encode_bulk_response_head(req_id, MSG_READ_BYTES_BULK, code, msg, value_len)
 }
 
+/// An append request: the payload inside ctrl, or (frame-value form) in the
+/// frame's value with its crc32c after the header, checked here.
+fn decode_append(frame: &Frame) -> Result<AppendReq, &'static str> {
+    if frame.value.is_empty() {
+        AppendReq::decode(frame.payload.clone())
+    } else {
+        AppendReq::decode_checked(frame.payload.clone(), frame.value.clone())
+    }
+}
+
 fn build_read_future(
     extent: std::rc::Rc<ExtentEntry>,
     // the fd is resolved ONCE at the call site (which has the
@@ -3533,6 +3567,8 @@ fn build_read_future(
     file_rc: std::rc::Rc<CompioFile>,
     slots: Vec<ReadSlot>,
     bulk: bool,
+    // Sends a large value beside its reply frame.
+    am_out: Option<std::rc::Rc<autumn_rpc::am_frame::AmOut>>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<Bytes>>>> {
     Box::pin(async move {
         use compio::io::AsyncReadAtExt;
@@ -3616,8 +3652,21 @@ fn build_read_future(
                 match result {
                     Ok(_) => {
                         let value = Bytes::from_owner(pb);
-                        out.push(bulk_read_head(slot.req_id, CODE_OK, "", value.len()));
-                        out.push(value);
+                        match am_out.as_ref().filter(|_| value.len() >= autumn_rpc::BULK_MIN_BYTES) {
+                            Some(am) => out.extend(am.frame_now(
+                                slot.req_id,
+                                MSG_READ_BYTES_BULK,
+                                autumn_rpc::frame::FLAG_RESPONSE,
+                                // Not `from_static`: a large stream send registers every iovec, and
+                                // read-only memory cannot be registered.
+                                vec![Bytes::copy_from_slice(&[CODE_OK])],
+                                vec![value],
+                            )),
+                            None => {
+                                out.push(bulk_read_head(slot.req_id, CODE_OK, "", value.len()));
+                                out.push(value);
+                            }
+                        }
                     }
                     Err(_e) => {
                         out.push(bulk_read_head(slot.req_id, CODE_ERROR, "pread failed", 0));
@@ -5638,10 +5687,12 @@ impl ExtentNode {
         }
         // Bound by CLIENT_AUTH on a Client connection (see `client_gate`).
         let mut principal: Option<autumn_rpc::cap_token::BoundPrincipal> = None;
+        let am_out = autumn_rpc::am_frame::AmOut::for_connection(&writer, protocol.remote_wire);
         let mut decoder = FrameDecoder::new();
         // A client only reads here: its requests are small control messages.
         if protocol.role == autumn_rpc::version_hello::Role::Client {
             decoder.set_max_payload(autumn_rpc::frame::CLIENT_CONTROL_MAX_PAYLOAD);
+            decoder.set_am_values(false);
         }
 
         let cap = en_params().inflight_cap.get();
@@ -5705,6 +5756,8 @@ impl ExtentNode {
                             cap,
                             &protocol,
                             &mut principal,
+                            &reader,
+                            am_out.as_ref(),
                         )
                         .await?;
                         read_fut = Some(spawn_read(reader, next_window(&mut decoder)));
@@ -5763,6 +5816,8 @@ impl ExtentNode {
                                 cap,
                                 &protocol,
                                 &mut principal,
+                                &reader,
+                                am_out.as_ref(),
                             )
                             .await?;
                             read_fut = Some(spawn_read(reader, next_window(&mut decoder)));

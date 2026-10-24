@@ -1,3 +1,12 @@
+Date: 2026-10-24 (8)
+TaskStatus: not_completed
+Task scope: user — F-UCX-AM-RNDV-INTERNAL (PS<->EN and client->PS large values over AM rendezvous; slab-side CRC on appends), plus client<->EN direct-read replies; then perf-check.
+Current summary: frame values, wire 77 (`FLAG_AM_VALUE`, piece list in the CRC-covered ctrl; transport AM id 2 keyed by (endpoint, tag), early rendezvous requests held; `am_frame::AmOut`; RpcClient bulk writes + `send_prepared`, EN READ_BYTES_BULK replies, PS GET_BULK replies; receive loops start a run's values then take frames in order; append ctrl = header + crc32c(body), checked at the EN). Four review rounds (fable + 3 opus), all findings handled or recorded. Tests green (unit; transport ucx_am_frame; stream prepared_append over UCX with the EN on its own thread — crc refusal and the read-burst regression both red under ablation; manager get_into_raw/write_options/frame_limit_admission/mem_tier). Real UCX cluster: put/get 1000 B..33 MiB and kvcache put/get_into at 16 MiB/256 KiB/64 KiB/60 KiB byte-exact, no UCX ERROR.
+The first perf-check collapsed one partition's UCX 8M read to ~150 MB/s: root cause `Bytes::from_static(&[CODE_OK])` in the EN reply ctrl — UCP Stream >= 478 B goes zero-copy and registers every iovec; `.rodata` fails and the default protocol stack then stops that endpoint's stream silently (found with an assertion+logging UCX build and the failing address mapped to `.rodata`). Fixed (heap copy) + regression test + transport doc rule.
+perf-check ABAB vs c81a22df (after the fix): UCX writes up (p1 8M 556-702 -> 857-915, p8 2234-2237 -> 2473-2553); p1 8M read 3080-3391 -> 2813-2861 (p50 +15%, p99 same; 4x4 2551 -> 6936); p8 reads, 4K, TCP within noise.
+Main gaps: acceptance "UCX 8M read does not drop" not met for one partition at 16x8 (folded into the scaling investigation the user asked for: UCX reads do not scale with partitions and degrade with concurrency, base too). BUG-PY-PUT-BORROWED-MEMORY recorded (pre-existing, widened by frame values). Pre-existing: autumn-client lib connection test flaky/hangs 1 in 5 on base too.
+Next steps: the UCX read scaling investigation (scratchpad scale.sh: transport x partitions x concurrency with iostat and per-thread CPU).
+
 Date: 2026-10-24 (7)
 TaskStatus: completed
 Task scope: user — BatchClient without W (one worker, one ClusterClient), adapter without client_workers; drop F-CLIENT-IO-THREADS. User picked this ("A") after the TCP numbers below.

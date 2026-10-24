@@ -20,6 +20,14 @@
 - **Acceptance**: 每跳单独 perf-check 交替对照（TCP 不变，UCX 8M 读/写不降且接收端 CPU 下降）；持久性语义与 CRC 决策写进文档；旧二进制互通按两种格式并存规则处理。
 - `passes: false`
 - **notes** (2026-10-24 用户定，先说 ICRC 后改定): 追加载荷改走 AM rendezvous 后，PS 照旧对载荷算 crc32c（`PreparedPayload`，3 副本共用一次）放进 AM 头，EN 在 rendezvous 收进 slab 后补算并比对，对上才落盘/确认，不符即拒绝该追加走现有失败重试。不只靠 RC ICRC：ICRC 只护网线一跳，PCIe/DMA、网卡缓冲、发错内存（UCX 1.16 rcache 竞争那类）都只有端到端 CRC 能当场发现；大值读路径不校验、scrub 的 `.ck` 是落盘后才记的，在途损坏只有这一道关。省掉的是解包拷贝，留下一次只读 crc32c。TCP 路径不变。
+- **notes** (2026-10-24 用户追加): client 直读 EN 的 UCX bulk 读回复也走 AM。实现为帧级通用机制（`FLAG_AM_VALUE`，wire 77）：一帧里 ≥64 KiB 的值片段各自走 AM rendezvous，小片段留在流上；覆盖 client→PS 写、PS→EN 追加（带正文 crc32c，EN 补算）、EN→PS 读、EN→client 直读、PS→client 读回复。UCX 集群上各大小逐字节校验通过。
+- **notes** (2026-10-24 perf-check ABAB vs c81a22df，3 盘 16 线程深度 8，各两轮): UCX 写升（单分区 8M 556–702 → 857–915 MB/s，8 分区 2234–2237 → 2473–2553）；单分区 8M 读 3080–3391 → 2813–2861（p50 +15%，p99 不变；同一读在 4×4 并发 2551 → 6936）；8 分区读、4K 与 TCP 各格噪声内。验收"UCX 8M 读不降"单分区这格未达成，归入高并发 UCX 读不随分区扩展的排查。首轮测得单分区读崩到 ~150 MB/s，根因是 EN 回复 ctrl 用了 `.rodata` 的 `Bytes::from_static`（UCX 流 ≥478 B 零拷贝逐段注册，注册失败后默认协议栈下该连接静默停摆），已修并加回归测试。
+
+### BUG-PY-PUT-BORROWED-MEMORY — Python 写路径把调用方内存当 'static 交给传输层
+- **Trigger** (2026-10-24 评审): `python/src/lib.rs` 的 `BatchPutFrom`（带 TTL）与 `BatchClient` 的 Put 把调用方 buffer 包成 `Bytes::from_static` 交给 `put_many`。UCX 上 ≥64 KiB 的值走帧值 rendezvous（PS 取走前一直引用这块内存），小值拼进 ≥478 B 的流发送（零拷贝，逐段注册）。
+- **Scope**: (1) 只读映射（`np.memmap(mode='r')`、只读 mmap）注册失败 → 该连接的流静默停住（同 `.rodata` 那次）；(2) 写超时/重试后 Python 已返回并重用这页，PS 之后取到的是新内容并存在旧 key 下（KV 缓存静默错数据）。两者 AM 之前就存在（流的零拷贝同样注册、同样延后读取），帧值把窗口拉长到 PS 处理到该帧为止。sglang 的 KV 页是可写堆/锁页内存，不触发 (1)。
+- **Acceptance**: 调用返回之后传输层不再引用调用方内存（像 `get_into` 的 `Released` 那样等释放，或在边界拷贝）；只读 buffer 不会让连接停住；各有一个去掉修复就变红的测试。
+- `passes: false`
 
 ### F-KVC-ADAPTER-WRITE-READ — KV-cache adapter 读写跑满（autumn_kvcache 仓库）
 - **Trigger** (2026-10-23 实测): autumn 单 rank 写 2.39 GB/s、读 1.79 GB/s（微基准），但 SGLang 里取 128 页（2 GiB）要 2–6 s，超过 timeout 预算，跨实例命中 0%；读实例预取失败后重算、把已在 L3 的页又写一遍（adapter 写前不查 exists），和读抢带宽。

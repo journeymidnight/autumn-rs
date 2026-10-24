@@ -2127,12 +2127,7 @@ async fn launch_append(
     // the payload size and the replica count, and it lives inside
     // `PreparedPayload` where it can be measured — not here. The payload
     // segments are refcount clones either way, never copied.
-    let prepared = {
-        let mut parts = Vec::with_capacity(1 + payload_parts.len());
-        parts.push(hdr);
-        parts.extend(payload_parts);
-        autumn_rpc::frame::PreparedPayload::new(parts, tail.replica_addrs.len())
-    };
+    let prepared = autumn_rpc::frame::PreparedPayload::new(hdr, payload_parts, tail.replica_addrs.len());
     let send_futs = tail.replica_addrs.iter().map(|addr| {
         let addr = addr.clone();
         let pool = pool.clone();

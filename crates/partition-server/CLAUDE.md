@@ -544,6 +544,28 @@ task like `MSG_GET_BULK`; the in-flight slot is held until the send ends.
 Gated by `authz_check` on its key (`authz_check_dispatch_get_and_put`, red
 without the arm).
 
+### Frame values over UCX (wire 77)
+
+On a UCX connection whose peer is at wire 77 or later (`ConnGateState::am_out`),
+large value parts travel beside their frame as active messages (autumn-rpc
+"Frame values"):
+
+- **Requests** (the SDK's `PUT_BULK` family): `drain_bulk_writes` steps aside
+  for an `FLAG_AM_VALUE` frame; the normal decode receives its value
+  (`am_frame::complete`, in `push_frames_to_inflight` and the first-frame decode)
+  before the frame is queued, so the connection's requests keep their order, and
+  `push_one_frame_to_inflight` routes it with the value as `bulk_value`, like a
+  small value-separable request. The value is fetched before the authz gate runs
+  (as a small stream frame is read whole before it); the decoder's frame limit
+  covers the whole value, so an unauthenticated client of an authz cluster is
+  still held to 1 MiB.
+- **Replies**: `MSG_GET_BULK` / `MSG_BATCH_GET_BULK` from `serve_get_local` are
+  re-encoded by `AmOut::reframe` when a value is 64 KiB or more.
+- **The log stream**: appends to the extent nodes go the same way from the
+  stream client (`send_prepared`), with the payload's crc32c in the ctrl, which
+  the extent node checks; reads of log values from the extent nodes come back
+  as frame values into the read loop's pool buffer.
+
 ### `MSG_BATCH_GET_BULK` (0x5B) — server-batched Get, values out of the payload
 
 Request is `BatchGetReq { part_id, region_epoch, keys }`; what distinguishes this

@@ -4945,9 +4945,13 @@ async fn drain_bulk_writes(
 ) -> Result<()> {
     use futures::FutureExt;
     loop {
-        let Some((req_id, msg_type, _flags, _payload_len)) = decoder.peek_header() else {
+        let Some((req_id, msg_type, flags, _payload_len)) = decoder.peek_header() else {
             return Ok(());
         };
+        if flags & autumn_rpc::frame::FLAG_AM_VALUE != 0 {
+            // Its value comes as active messages: the normal path receives it.
+            return Ok(());
+        }
         let is_batch = msg_type == partition_rpc::MSG_BATCH_PUT_BULK;
         let rkyv_ctrl = is_batch
             || msg_type == partition_rpc::MSG_COMPARE_PUT_BULK
@@ -5293,6 +5297,8 @@ pub(crate) struct ConnGateState {
     pub protocol: Option<autumn_rpc::version_hello::Negotiated>,
     /// How `MSG_GET_AM` values leave on this connection; `None` on TCP.
     pub am: Option<autumn_transport::am::Sender>,
+    /// Sends large reply values beside their frames (UCX, peer reads them).
+    pub am_out: Option<Rc<autumn_rpc::am_frame::AmOut>>,
 }
 
 #[cfg(test)]
@@ -5313,6 +5319,7 @@ mod frame_limit_tests {
                 declared_version: autumn_rpc::WIRE_VERSION,
             }),
             am: None,
+            am_out: None,
         }
     }
 
@@ -5335,6 +5342,35 @@ mod frame_limit_tests {
         assert!(authz.is_enabled());
         assert_eq!(conn(Role::Client).frame_limit(&authz), CLIENT_CONTROL_MAX_PAYLOAD);
         assert_eq!(conn(Role::Peer).frame_limit(&authz), MAX_PAYLOAD_LEN);
+
+        // Held to control messages, it takes no frame values either; once
+        // bound to a principal, or as a peer, it does.
+        let am_frame = || {
+            let (bufs, _) = autumn_rpc::frame::encode_am_frame(
+                1,
+                autumn_rpc::partition_rpc::MSG_PUT_BULK,
+                0,
+                vec![bytes::Bytes::from_static(b"meta")],
+                vec![bytes::Bytes::from(vec![1u8; 64 << 10])],
+                || 9,
+            );
+            bufs.concat()
+        };
+        let decodes = |c: &ConnGateState| {
+            let mut decoder = autumn_rpc::FrameDecoder::new();
+            c.limit_decoder(&mut decoder, &authz);
+            decoder.feed(&am_frame());
+            match decoder.try_decode() {
+                Ok(Some(_)) => true,
+                Err(autumn_rpc::frame::FrameError::Malformed(_)) => false,
+                other => panic!("unexpected decode outcome: {other:?}"),
+            }
+        };
+        assert!(!decodes(&conn(Role::Client)), "an unauthenticated client sent a frame value");
+        assert!(decodes(&conn(Role::Peer)));
+        let mut bound = conn(Role::Client);
+        bound.principal = Some(crate::authz::BoundPrincipal { allowed_prefixes: vec![b"t/".to_vec()], exp: u64::MAX, kid: 1 });
+        assert!(decodes(&bound));
     }
 }
 
@@ -5352,6 +5388,16 @@ impl ConnGateState {
         } else {
             autumn_rpc::frame::MAX_PAYLOAD_LEN
         }
+    }
+
+    /// Set the decoder's limits for the next frame: a connection held to
+    /// control messages takes no frame values either (it has no business
+    /// sending values, and a value it declared and never sent would hold the
+    /// loop and its buffer).
+    fn limit_decoder(&self, decoder: &mut FrameDecoder, authz: &crate::authz::AuthzState) {
+        let limit = self.frame_limit(authz);
+        decoder.set_max_payload(limit);
+        decoder.set_am_values(limit == autumn_rpc::frame::MAX_PAYLOAD_LEN);
     }
 }
 
@@ -5559,9 +5605,19 @@ fn push_one_frame_to_inflight(
     if matches!(msg_type, MSG_GET_BULK | partition_rpc::MSG_BATCH_GET_BULK) {
         if let Some(part) = part {
             let part_c = part.clone();
-            let mut response =
-                async move { serve_get_local(req_id, msg_type, payload, &part_c).await }
-                    .boxed_local();
+            let am_out = conn.am_out.clone();
+            let mut response = async move {
+                let (head, values) = serve_get_local(req_id, msg_type, payload, &part_c).await;
+                match am_out {
+                    // Large values beside the frame, by rendezvous.
+                    Some(out) => {
+                        let mut bufs = out.reframe(head, values).into_iter();
+                        (bufs.next().expect("a frame"), bufs.collect())
+                    }
+                    None => (head, values),
+                }
+            }
+            .boxed_local();
             // Cached reads often finish on the first poll. Collect their
             // response immediately; only suspended reads need the in-flight
             // queue. Never await here: disk/network reads must leave receive
@@ -5643,26 +5699,54 @@ async fn push_frames_to_inflight(
     // threaded into push_one_frame_to_inflight for the per-frame gate.
     authz: &crate::authz::AuthzState,
     conn: &mut ConnGateState,
+    reader: &autumn_transport::ReadHalf,
+    // A frame already decoded whose value comes as active messages.
+    mut first: Option<Frame>,
 ) -> Result<()> {
     loop {
-        // Per frame: a CLIENT_AUTH just pushed lifts the limit for the next.
-        decoder.set_max_payload(conn.frame_limit(authz));
-        match decoder.try_decode().map_err(|e| anyhow!(e))? {
-            Some(frame) if frame.req_id != 0 => {
-                // Back-pressure: drain one completion if we're at cap.
-                while inflight.len() >= cap {
-                    if let Some(done) = inflight.next().await {
-                        push_resp(tx_bufs, done);
-                    } else {
+        // A CLIENT_AUTH lifts the limit for the frames after it, so a run of
+        // frames decoded together ends with one.
+        conn.limit_decoder(decoder, authz);
+        // The run's values are received together, so their buffers are taken
+        // before any of its frames passes the gate: no more frames than may be
+        // in flight, and past the frame limit no further frame (a run may end
+        // up to one frame over it).
+        let value_budget = decoder.max_payload() as usize;
+        let mut value_bytes = 0;
+        let mut run = Vec::new();
+        if let Some(frame) = first.take() {
+            value_bytes += autumn_rpc::am_frame::am_value_len(&frame);
+            run.push(autumn_rpc::am_frame::start(reader, frame)?);
+        }
+        while run.len() < cap && value_bytes < value_budget {
+            match decoder.try_decode().map_err(|e| anyhow!(e))? {
+                Some(frame) if frame.req_id != 0 => {
+                    let auth = frame.msg_type == partition_rpc::MSG_CLIENT_AUTH;
+                    value_bytes += autumn_rpc::am_frame::am_value_len(&frame);
+                    run.push(autumn_rpc::am_frame::start(reader, frame)?);
+                    if auth {
                         break;
                     }
                 }
-                push_one_frame_to_inflight(
-                    frame, req_tx, part, owner_part, inflight, authz, conn, tx_bufs,
-                );
+                Some(_) => continue, // req_id == 0 fire-and-forget
+                None => break,
             }
-            Some(_) => continue, // req_id == 0 fire-and-forget
-            None => break,
+        }
+        if run.is_empty() {
+            break;
+        }
+        // In order, each with its whole value: this connection's requests stay in order.
+        for incoming in run {
+            let frame = incoming.into_frame().await?;
+            // Back-pressure: drain one completion if we're at cap.
+            while inflight.len() >= cap {
+                if let Some(done) = inflight.next().await {
+                    push_resp(tx_bufs, done);
+                } else {
+                    break;
+                }
+            }
+            push_one_frame_to_inflight(frame, req_tx, part, owner_part, inflight, authz, conn, tx_bufs);
         }
     }
     Ok(())
@@ -5738,6 +5822,7 @@ async fn handle_ps_connection(
     let mut decoder = FrameDecoder::new();
     // The negotiated protocol precedes the principal bound by CLIENT_AUTH.
     let mut conn_state = ConnGateState {
+        am_out: autumn_rpc::am_frame::AmOut::for_connection(&writer, protocol.remote_wire),
         protocol: Some(protocol),
         am: writer.am_sender(),
         ..Default::default()
@@ -5792,7 +5877,7 @@ async fn handle_ps_connection(
                 PsReadBurst::Err { e } => return Err(e.into()),
                 PsReadBurst::Data { window, mut reader } => {
                     decoder.finish_read(window);
-                    decoder.set_max_payload(conn_state.frame_limit(&authz));
+                    conn_state.limit_decoder(&mut decoder, &authz);
 
                     // recv any LARGE bulk-write tail(s) at the
                     // front straight into a PooledBuf (UCX Stream unpack / TCP
@@ -5815,7 +5900,10 @@ async fn handle_ps_connection(
                     // A single complete frame says nothing about the peer's
                     // pipeline depth. Queue it so a suspended handler cannot
                     // prevent the next request from entering this connection.
-                    let first = decoder.try_decode().map_err(|e| anyhow!(e))?;
+                    let mut first = decoder.try_decode().map_err(|e| anyhow!(e))?;
+                    // One whose value comes as active messages joins the frames
+                    // after it, so their values are received together.
+                    let with_value = first.take_if(|f| f.am_pieces.is_some());
                     if let Some(frame) = first {
                         #[cfg(test)]
                         if decoder.front_frame_remaining().is_none_or(|rest| rest > 0)
@@ -5851,6 +5939,8 @@ async fn handle_ps_connection(
                         cap,
                         &authz,
                         &mut conn_state,
+                        &reader,
+                        with_value,
                     )
                     .await?;
                     read_fut = Some(spawn_ps_read(
@@ -5925,7 +6015,7 @@ async fn handle_ps_connection(
                     PsReadBurst::Err { e } => return Err(e.into()),
                     PsReadBurst::Data { window, mut reader } => {
                         decoder.finish_read(window);
-                        decoder.set_max_payload(conn_state.frame_limit(&authz));
+                        conn_state.limit_decoder(&mut decoder, &authz);
                         // recv large bulk-write tails into
                         // pooled buffers first (UCX registered / TCP owned read).
                         drain_bulk_writes(
@@ -5950,6 +6040,8 @@ async fn handle_ps_connection(
                             cap,
                             &authz,
                             &mut conn_state,
+                            &reader,
+                            None,
                         )
                         .await?;
                         read_fut = Some(spawn_ps_read(

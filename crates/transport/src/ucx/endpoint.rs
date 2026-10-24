@@ -143,6 +143,14 @@ impl UcxEp {
     }
 }
 
+impl Drop for UcxEp {
+    /// The ep itself stays allocated (see "EP lifetime"); frame values held
+    /// for it are released, so their senders complete.
+    fn drop(&mut self) {
+        crate::ucx::am::forget_ep(self.raw);
+    }
+}
+
 // ---- Pooled completion slot ----
 //
 // Replaces the prior per-op `(oneshot::channel + Rc<Cell<bool>> +
@@ -573,6 +581,10 @@ pub(crate) fn wake_stream_waiters() {
 }
 
 impl UcxReadHalf {
+    pub(crate) fn ep(&self) -> &Rc<UcxEp> {
+        &self.ep
+    }
+
     /// Wait until stream data is queued on this connection, then hand each
     /// queued chunk to `f`, in order, and release it. Returns the bytes
     /// handed over. Nothing is posted to UCX, so a dropped call leaves no

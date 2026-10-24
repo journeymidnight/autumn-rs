@@ -221,6 +221,8 @@ impl AutumnManager {
         )
         .await?;
         let mut decoder = FrameDecoder::new();
+        // Nothing sent to the manager carries a value.
+        decoder.set_am_values(false);
         // A client sends the manager only small control messages.
         if protocol.role == autumn_rpc::version_hello::Role::Client {
             decoder.set_max_payload(autumn_rpc::frame::CLIENT_CONTROL_MAX_PAYLOAD);

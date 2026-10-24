@@ -22,7 +22,7 @@ payload = [ctrl_len: u32 LE][ctrl …][crc32c: u32 LE][value …]
 |-------|------|-------------|
 | req_id | 4B | Multiplexing ID. Client picks, server echoes. 0 = fire-and-forget. |
 | msg_type | 1B | RPC method identifier (0-255 per service) |
-| flags | 1B | bit 0 `FLAG_RESPONSE`, bit 1 `FLAG_ERROR`, bit 2 `FLAG_STREAM_END`. Bit 3 reserved (was `FLAG_CRC` pre-v28 — protection is now structural, no bit to flip off) |
+| flags | 1B | bit 0 `FLAG_RESPONSE`, bit 1 `FLAG_ERROR`, bit 2 `FLAG_STREAM_END`, bit 4 `FLAG_AM_VALUE` (below). Bit 3 reserved (was `FLAG_CRC` pre-v28 — protection is now structural, no bit to flip off) |
 | payload_len | 4B | Everything after the header (`HEADER_LEN=10`) |
 | ctrl_len | 4B | Length of the CRC-protected control bytes |
 | crc32c | 4B | Over `header ++ ctrl_len ++ ctrl` — NEVER over `value` |
@@ -47,7 +47,79 @@ record CRC, SST block CRC); a per-value crc was measured at ~20% of a core
 - `MSG_PUT_BULK` requests: ctrl = `[put_bulk meta 44B][key]`, value = raw value —
   the sender never crc-scans the value (`call_vectored_bulk`).
 - **`MSG_APPEND` is the ONE deliberate exception** (durability path): its bulk
-  payload rides INSIDE ctrl, keeping in-transit CRC on WAL/SST bytes.
+  payload rides INSIDE ctrl, keeping in-transit CRC on WAL/SST bytes. Its
+  frame-value form (below) carries the payload's crc32c in ctrl instead.
+
+### Frame values: large value parts as UCX active messages (wire 77)
+
+UCP Stream has no rendezvous, so every byte a stream receive takes costs the
+receiving CPU one copy. With `FLAG_AM_VALUE` the frame's large value parts go
+beside it as active messages instead (autumn-transport "Frame values"), which
+UCX moves by rendezvous: the receiver's NIC reads them straight into its pool
+buffer. The frame lists the value's pieces at the end of its ctrl region,
+CRC-covered: `[(len: u32 LE, tag: u64 LE) × n][n: u16 LE]`; tag 0 is the next
+piece of the stream tail (the parts under `BULK_MIN_BYTES`, one piece per run),
+every other tag one part of at least `BULK_MIN_BYTES` (rendezvous moves only
+contiguous memory without a copy — UCX 1.20 `rndv/get/zcopy` takes contiguous
+datatypes only — so each large part is its own message). `try_decode` strips the
+list (`Frame::payload` is the ctrl alone), puts the stream pieces in
+`Frame::value` and the list in `Frame::am_pieces`; `peek_bulk_prologue` refuses
+such a frame (its value is not the stream tail), so every bulk fast path steps
+aside and the normal decode takes it. A list with an empty or a repeated
+tagged piece is `Malformed` (its receiver would wait forever). A decoder with
+`set_am_values(false)` refuses such frames outright (`Malformed`, the
+connection drops): every manager connection (its loop never assembles a value),
+an EN Client connection, and a PS client held to control messages (before
+CLIENT_AUTH under authz, `ConnGateState::limit_decoder`). Those connections
+have no business sending values, and a value declared and never sent would hold
+the loop and its buffer with nothing to end the wait — the dead-peer class a
+stream read has under `UCP_ERR_HANDLING_MODE_NONE`, but reachable from an
+unauthenticated client with one tiny frame. The connection's payload limit
+(`set_max_payload`) covers the whole value, so an unauthenticated client
+cannot make a server fetch more than it could have streamed (per frame; runs
+are bounded, below).
+
+`am_frame::AmOut` (one per connection, `for_connection(writer, peer_wire)`:
+UCX and the peer at `WIRE_VERSION_WITH_AM_VALUES`) encodes such frames
+(`encode` / `frame_now` / `reframe` for an already-encoded bulk head) and posts
+the values. Who sends them:
+
+| Sender | Frame | Posted |
+|---|---|---|
+| `RpcClient::call_vectored_bulk(_multi)` (SDK `PUT_BULK` family) | request | by `writer_task`, just before the frame is written (the `SubmitMsg` carries them, and they count toward the send window) |
+| `RpcClient::send_prepared` (PS→EN `MSG_APPEND`) | request | same |
+| EN `READ_BYTES_BULK` reply (PS reads, client direct reads) | reply | when the reply is built (`frame_now`) |
+| PS `GET_BULK` / `BATCH_GET_BULK` reply | reply | same (`reframe`) |
+
+Every receive loop decodes the frames it has buffered, starts all their values
+(`am_frame::start`, which registers every piece) and then takes the frames in
+order, each once its value is in (`Incoming::into_parts` / `into_frame`): the
+values of a burst are fetched together and the connection's frames keep their
+order. `read_loop` decodes a run up to the next bulk fast-path frame (the
+value lands in the pooled buffer a `call_into_pooled` caller gets; a
+`call_into_dest` caller gets a copy); the EN starts every frame of a burst; the
+PS runs end at a `CLIENT_AUTH`, which changes the next frame's limit
+(`push_frames_to_inflight`, then routed like any value-separable request). A
+run's buffers are taken before its frames pass the authz gate and back-pressure,
+so at the PS and the EN a run is at most the in-flight cap of frames and one
+frame limit (`max_payload`) of value bytes: an unauthenticated client of an authz
+cluster gets one 1 MiB frame's worth at a time, as when values came on the
+stream (a review found the unbounded run let ~2,000 tiny frames claim 2 GiB). A
+frame whose value is still arriving blocks its connection's loop, as a stream
+value did. A handler that skips `start` would see only the stream pieces in
+`Frame::value`; every loop that can receive such frames calls it (the manager
+is never sent one).
+
+The frame-value append: ctrl = `[AppendReq header 32 B][crc32c(payload): u32
+LE]`, value = the payload. `PreparedPayload` computes that crc once for all
+replicas (`am_parts`, a `OnceCell`; the shared scan of the stream form is lazy
+too, so a UCX append scans its payload once), and the extent node recomputes it over the
+received buffer before appending (`AppendReq::decode_checked`); a mismatch is an
+error frame, which the stream client treats as a failed replica (retry, new
+extent). That keeps the user's CRC rule for appends — no frame CRC covers a
+frame value, and RC's ICRC covers only the wire hop, not PCIe, NIC buffers or a
+DMA into the wrong memory. Over TCP, and to a peer below 77, every byte is
+unchanged.
 
 Builders: `Frame::encode` / `encode_response_with` (ctrl-only, one buffer),
 `encode_vectored_head` + `compute_ctrl_crc` (vectored sends),
@@ -62,7 +134,8 @@ first frame with CrcMismatch instead of reaching the version handshake).
 
 ### Prepared replica payloads
 
-`PreparedPayload` owns immutable `Bytes` segments and their total length.
+`PreparedPayload` owns the message head (an append's 32-byte header), the body
+segments and their total length.
 `frame_parts` gives each replica connection a frame carrying its own req_id,
 and the checksum cannot be paired with different bytes through the public API.
 The frame's bytes and full header/control coverage are unchanged; no
@@ -483,6 +556,7 @@ value (see autumn-client CLAUDE.md "Zero-copy selection rule"):
 | `--bulk-recv-min-bytes` (partition-server) | PS recv | actual tail len | bulk-write request recv strategy — `MSG_PUT_BULK` and `MSG_BATCH_PUT_BULK` alike (`drain_bulk_writes`) |
 | `handle_get_redirect` 64 KiB (partition-server) | PS route | actual clamped read len | EN-direct descriptor vs proxy read |
 | `BULK_MIN_BYTES` (autumn-transport `am::send`) | UCX AM send | actual value len | rendezvous (at/above) vs eager — not UCX's own `UCX_RNDV_THRESH` |
+| `BULK_MIN_BYTES` (`encode_am_frame`) | UCX frame send | each value part's len | frame value by rendezvous (at/above) vs on the stream |
 
 `autumn_transport::BULK_MIN_BYTES` is the one constant behind the client's
 `BULK_MIN_BYTES`, `TCP_RECV_INTO_POOLED_MIN_BYTES` and the AM protocol choice.
@@ -665,7 +739,7 @@ overflows the frame.
 
 ## Wire version, and the two checks over it
 
-`WIRE_VERSION` (currently **76**) is the schema this binary speaks.
+`WIRE_VERSION` (currently **77**) is the schema this binary speaks.
 `MIN_CLIENT_WIRE_VERSION` (**43**) is the oldest CLIENT it serves. Both are maintained
 **BY HAND**. There is no schema fingerprint — hashing the sources byte for byte cost
 more than it caught (a translated comment once split a rolling cluster, and each false
@@ -1010,6 +1084,28 @@ and new bytes. PutResp CODE_PRECONDITION means comparison failed; region/ownersh
 errors retain frame-level status for routing refresh. Both values are capped at
 64 KiB; extract_part_id and both PS namespace/authz gates decode the new request.
 Every service and embedded client must be rebuilt together for wire 44.
+
+## Frame values (wire 77)
+
+perf-check ABAB against the build before it (3 disks, 16 threads, depth 8,
+two runs each): UCX writes up — one partition 8M 556–702 → 857–915 MB/s, eight
+2234–2237 → 2473–2553; one partition 8M read 3080–3391 → 2813–2861 (p50 253–271
+→ 311 ms, p99 unchanged; at 4 threads x depth 4 the same read is 2551 → 6936);
+eight-partition reads and every 4K and TCP cell within noise. The first
+measurement collapsed that one-partition read to ~150 MB/s: a `.rodata` ctrl
+byte in the extent node's reply (transport CLAUDE.md, "Every buffer of a UCX
+send must be registrable").
+
+`FLAG_AM_VALUE` and its piece list (see "Frame values" above). Sent only to a
+peer negotiated at `WIRE_VERSION_WITH_AM_VALUES` (77) or later over UCX, so a
+client on either side of 77 keeps working: it neither sends nor receives one
+below. Client-facing (the SDK's bulk writes, PS and EN bulk read replies):
+ceiling [43, 77], floor unchanged. Tests: `frame::tests::an_am_frame_*`,
+`a_prepared_payload_s_am_parts_carry_the_body_crc`,
+`extent_rpc::tests::a_frame_value_append_is_checked_against_its_crc`; over UCX,
+stream `tests/prepared_append.rs` (appends and the read reply counted as
+rendezvous receives; a payload that misses its crc refused — red with the check
+off).
 
 ## A read whose value comes as a UCX active message (wire 76)
 

@@ -24,6 +24,14 @@
 //!   the sender never CRC-scans the value.
 //! - `MSG_APPEND` is the ONE deliberate exception (durability path): its bulk
 //!   payload rides INSIDE ctrl, so append bytes keep in-transit CRC protection.
+//!   With its value as active messages (below) the ctrl carries the payload's
+//!   crc32c instead, which the extent node checks.
+//!
+//! `FLAG_AM_VALUE` (UCX, peers at `WIRE_VERSION_WITH_AM_VALUES`): pieces of the
+//! value travel as UCX active messages beside the frame, by rendezvous, so the
+//! receiving CPU does not copy them. The ctrl region then ends with the piece
+//! list — `[(len: u32 LE, tag: u64 LE) × n][n: u16 LE]`, CRC-covered — and only
+//! the tag-0 pieces follow on the stream, in order (`am_frame`).
 //!
 //! Header-inclusive CRC closes two pre-v28 holes: a flipped `req_id` delivering
 //! a valid-CRC response to the wrong caller, and a flipped CRC flag bit
@@ -72,6 +80,17 @@ pub const CLIENT_CONTROL_MAX_PAYLOAD: u32 = 1 << 20;
 pub const FLAG_RESPONSE: u8 = 0x01;
 pub const FLAG_ERROR: u8 = 0x02;
 pub const FLAG_STREAM_END: u8 = 0x04;
+/// The value's pieces are listed at the end of the ctrl region; those with a
+/// tag come as UCX active messages (see the module doc).
+pub const FLAG_AM_VALUE: u8 = 0x10;
+
+/// One piece of the value of a `FLAG_AM_VALUE` frame: `(len, tag)`. Tag 0 is
+/// the next `len` bytes of the stream tail; any other tag is an active message
+/// on the same connection.
+pub type AmPiece = (usize, u64);
+
+const AM_PIECE_LEN: usize = 12;
+const AM_COUNT_LEN: usize = 2;
 
 /// A single RPC frame on the wire.
 #[derive(Debug, Clone)]
@@ -84,8 +103,12 @@ pub struct Frame {
     /// payload, so existing handlers keep reading `frame.payload` unchanged.
     pub payload: Bytes,
     /// Raw value tail — NOT covered by the frame CRC (transport + storage
-    /// integrity). Empty for non-value-separable frames.
+    /// integrity). Empty for non-value-separable frames. For a frame with
+    /// `am_pieces`, only the pieces that came on the stream.
     pub value: Bytes,
+    /// The value's pieces when some come as active messages
+    /// (`FLAG_AM_VALUE`); the receiver assembles it (`am_frame::receive_value`).
+    pub am_pieces: Option<Vec<AmPiece>>,
 }
 
 impl Frame {
@@ -97,6 +120,7 @@ impl Frame {
             flags: 0,
             payload,
             value: Bytes::new(),
+            am_pieces: None,
         }
     }
 
@@ -108,6 +132,7 @@ impl Frame {
             flags: FLAG_RESPONSE,
             payload,
             value: Bytes::new(),
+            am_pieces: None,
         }
     }
 
@@ -120,6 +145,7 @@ impl Frame {
             flags: FLAG_RESPONSE | FLAG_ERROR,
             payload,
             value: Bytes::new(),
+            am_pieces: None,
         }
     }
 
@@ -132,6 +158,7 @@ impl Frame {
             flags: 0,
             payload: ctrl,
             value,
+            am_pieces: None,
         }
     }
 
@@ -144,6 +171,7 @@ impl Frame {
             flags: FLAG_RESPONSE,
             payload: ctrl,
             value,
+            am_pieces: None,
         }
     }
 
@@ -302,6 +330,94 @@ pub fn compute_ctrl_crc(head: &[u8], ctrl_parts: &[Bytes]) -> [u8; 4] {
     crc.to_le_bytes()
 }
 
+/// Split a `FLAG_AM_VALUE` ctrl region into the ctrl length and the piece
+/// list at its end. `stream_len`: value bytes that follow on the stream, which
+/// the tag-0 pieces must add up to.
+fn split_am_pieces(region: &[u8], stream_len: usize) -> Result<(usize, Vec<AmPiece>), FrameError> {
+    let bad = |why| Err(FrameError::Malformed(why));
+    let Some(count_at) = region.len().checked_sub(AM_COUNT_LEN) else {
+        return bad("value piece list missing");
+    };
+    let n = u16::from_le_bytes(region[count_at..].try_into().unwrap()) as usize;
+    let Some(ctrl_len) = count_at.checked_sub(n * AM_PIECE_LEN) else {
+        return bad("value piece list longer than the ctrl");
+    };
+    let mut pieces = Vec::with_capacity(n);
+    let mut inline = 0usize;
+    for p in region[ctrl_len..count_at].chunks_exact(AM_PIECE_LEN) {
+        let len = u32::from_le_bytes(p[..4].try_into().unwrap()) as usize;
+        let tag = u64::from_le_bytes(p[4..].try_into().unwrap());
+        if tag == 0 {
+            inline += len;
+        }
+        pieces.push((len, tag));
+    }
+    if inline != stream_len || !pieces.iter().any(|p| p.1 != 0) {
+        return bad("value pieces disagree with the frame");
+    }
+    let mut tags: Vec<u64> = pieces.iter().filter(|p| p.1 != 0).map(|p| p.1).collect();
+    tags.sort_unstable();
+    if pieces.iter().any(|p| p.0 == 0) || tags.windows(2).any(|w| w[0] == w[1]) {
+        // An empty or repeated tagged piece would wait for a value that never comes.
+        return bad("value pieces: an empty or repeated piece");
+    }
+    Ok((ctrl_len, pieces))
+}
+
+/// A `FLAG_AM_VALUE` frame: the buffers to write on the stream, and the
+/// `(tag, value part)` active messages to send beside them. Each value part of
+/// at least `BULK_MIN_BYTES` becomes its own message (rendezvous moves only
+/// contiguous memory without a copy); smaller parts stay on the stream, one
+/// piece per run of them. `next_tag` gives tags unique on the connection.
+pub fn encode_am_frame(
+    req_id: u32,
+    msg_type: u8,
+    flags: u8,
+    ctrl_parts: Vec<Bytes>,
+    value_parts: Vec<Bytes>,
+    mut next_tag: impl FnMut() -> u64,
+) -> (Vec<Bytes>, Vec<(u64, Bytes)>) {
+    let mut pieces: Vec<AmPiece> = Vec::new();
+    let mut inline = Vec::new();
+    let mut am = Vec::new();
+    for part in value_parts {
+        if part.len() >= autumn_transport::BULK_MIN_BYTES {
+            let tag = next_tag();
+            pieces.push((part.len(), tag));
+            am.push((tag, part));
+        } else if !part.is_empty() {
+            match pieces.last_mut() {
+                Some((len, 0)) => *len += part.len(),
+                _ => pieces.push((part.len(), 0)),
+            }
+            inline.push(part);
+        }
+    }
+    let mut list = BytesMut::with_capacity(pieces.len() * AM_PIECE_LEN + AM_COUNT_LEN);
+    for &(len, tag) in &pieces {
+        debug_assert!(len <= u32::MAX as usize);
+        list.put_u32_le(len as u32);
+        list.put_u64_le(tag);
+    }
+    debug_assert!(pieces.len() <= u16::MAX as usize);
+    list.put_u16_le(pieces.len() as u16);
+    let list = list.freeze();
+    let ctrl_len = ctrl_parts.iter().map(Bytes::len).sum::<usize>() + list.len();
+    let inline_len = inline.iter().map(Bytes::len).sum();
+    let head = encode_vectored_head(req_id, msg_type, flags | FLAG_AM_VALUE, ctrl_len, inline_len);
+    let mut crc = crc32c::crc32c(&head);
+    for p in ctrl_parts.iter().chain(std::iter::once(&list)) {
+        crc = crc32c::crc32c_append(crc, p);
+    }
+    let mut bufs = Vec::with_capacity(3 + ctrl_parts.len() + inline.len());
+    bufs.push(Bytes::copy_from_slice(&head));
+    bufs.extend(ctrl_parts);
+    bufs.push(list);
+    bufs.push(Bytes::copy_from_slice(&crc.to_le_bytes()));
+    bufs.extend(inline);
+    (bufs, am)
+}
+
 /// Payload big enough that sharing one scan across frames beats re-scanning.
 ///
 /// `crc32c_combine` is a GF(2) matrix ladder: its cost grows with log(len) but
@@ -327,13 +443,21 @@ const COMBINE_MIN_BYTES: usize = 1024 * 1024;
 /// pairing a cached CRC with different data. Each frame still protects its own
 /// req_id/header and the complete payload, with identical wire bytes.
 pub struct PreparedPayload {
-    parts: Vec<Bytes>,
+    /// The message header ahead of the body (an append's 32 bytes).
+    head: Bytes,
+    body: Vec<Bytes>,
     len: usize,
-    /// `Some` only when sharing this scan across `frames` beats re-scanning;
-    /// `None` makes every `frame_parts` scan for itself, which is what a
-    /// per-frame vectored send did. Both produce the same bytes — this is
-    /// purely which arithmetic is cheaper.
-    crc: Option<u32>,
+    /// Whether sharing one scan across `frames` beats re-scanning; otherwise
+    /// every `frame_parts` scans for itself, which is what a per-frame vectored
+    /// send did. Both produce the same bytes — this is purely which arithmetic
+    /// is cheaper.
+    shared: bool,
+    /// The shared scan of `head ++ body`, made by the first frame that needs
+    /// it (none does when every replica takes the frame-value form).
+    crc: std::cell::OnceCell<u32>,
+    /// crc32c of `body`, for frames whose body travels as frame values:
+    /// computed once, by the first such frame.
+    body_crc: std::cell::OnceCell<u32>,
 }
 
 impl PreparedPayload {
@@ -341,27 +465,38 @@ impl PreparedPayload {
     /// replica. It is an input because the trade-off depends on it: the shared
     /// scan is only amortised over the frames AFTER the first, so a single
     /// frame can never win it back, however large the payload.
-    pub fn new(parts: Vec<Bytes>, frames: usize) -> Self {
-        let len = parts.iter().map(Bytes::len).sum();
-        let crc = (frames > 1 && len >= COMBINE_MIN_BYTES)
-            .then(|| parts.iter().fold(0, |crc, p| crc32c::crc32c_append(crc, p)));
-        Self { parts, len, crc }
+    pub fn new(head: Bytes, body: Vec<Bytes>, frames: usize) -> Self {
+        let len = head.len() + body.iter().map(Bytes::len).sum::<usize>();
+        let shared = frames > 1 && len >= COMBINE_MIN_BYTES;
+        Self { head, body, len, shared, crc: std::cell::OnceCell::new(), body_crc: std::cell::OnceCell::new() }
+    }
+
+    pub fn body(&self) -> &[Bytes] {
+        &self.body
     }
 
     pub(crate) fn frame_parts(&self, req_id: u32, msg_type: u8) -> Vec<Bytes> {
         let head = encode_vectored_head(req_id, msg_type, 0, self.len, 0);
-        let crc = match self.crc {
-            Some(payload_crc) => {
-                crc32c::crc32c_combine(crc32c::crc32c(&head), payload_crc, self.len)
-                    .to_le_bytes()
-            }
-            None => compute_ctrl_crc(&head, &self.parts),
+        let parts = || std::iter::once(&self.head).chain(&self.body);
+        let crc = if self.shared {
+            let payload_crc = *self.crc.get_or_init(|| parts().fold(0, |crc, p| crc32c::crc32c_append(crc, p)));
+            crc32c::crc32c_combine(crc32c::crc32c(&head), payload_crc, self.len).to_le_bytes()
+        } else {
+            parts().fold(crc32c::crc32c(&head), |crc, p| crc32c::crc32c_append(crc, p)).to_le_bytes()
         };
-        let mut bufs = Vec::with_capacity(self.parts.len() + 2);
+        let mut bufs = Vec::with_capacity(self.body.len() + 3);
         bufs.push(Bytes::copy_from_slice(&head));
-        bufs.extend(self.parts.iter().cloned());
+        bufs.extend(parts().cloned());
         bufs.push(Bytes::copy_from_slice(&crc));
         bufs
+    }
+
+    /// The ctrl and value parts of a frame whose body travels as frame
+    /// values: ctrl = `[head][crc32c(body): u32 LE]`, which keeps the body
+    /// end-to-end checked though no frame CRC covers it.
+    pub(crate) fn am_parts(&self) -> (Vec<Bytes>, Vec<Bytes>) {
+        let crc = *self.body_crc.get_or_init(|| self.body.iter().fold(0, |crc, p| crc32c::crc32c_append(crc, p)));
+        (vec![self.head.clone(), Bytes::copy_from_slice(&crc.to_le_bytes())], self.body.clone())
     }
 }
 
@@ -443,6 +578,10 @@ pub struct FrameDecoder {
     /// header alone (so a large frame is received in place), so an untrusted
     /// connection's limit bounds what one header can make this reserve.
     max_payload: u32,
+    /// Whether `FLAG_AM_VALUE` frames are accepted: not on a connection that
+    /// may only send control messages, nor by a loop that never assembles
+    /// values (its receiver would wait on values nobody bounds).
+    am_values: bool,
 }
 
 impl FrameDecoder {
@@ -450,12 +589,22 @@ impl FrameDecoder {
         Self {
             buf: BytesMut::with_capacity(64 * 1024),
             max_payload: MAX_PAYLOAD_LEN,
+            am_values: true,
         }
     }
 
     /// Refuse frames whose payload exceeds `max` (`FrameError::PayloadTooLarge`).
     pub fn set_max_payload(&mut self, max: u32) {
         self.max_payload = max;
+    }
+
+    pub fn max_payload(&self) -> u32 {
+        self.max_payload
+    }
+
+    /// Refuse (`Malformed`) or accept `FLAG_AM_VALUE` frames.
+    pub fn set_am_values(&mut self, accept: bool) {
+        self.am_values = accept;
     }
 
     /// Feed new data into the decoder buffer. Copies `data`; a receive loop
@@ -560,10 +709,25 @@ impl FrameDecoder {
         let msg_type = self.buf[4];
         let flags = self.buf[5];
         let value_len = payload_len - CTRL_OVERHEAD - ctrl_len;
+        let ctrl_start = HEADER_LEN + CTRL_PREFIX_LEN;
+        let (ctrl_len, am_pieces) = if flags & FLAG_AM_VALUE != 0 {
+            if !self.am_values {
+                return Err(FrameError::Malformed("frame values are not accepted on this connection"));
+            }
+            let (len, pieces) = split_am_pieces(&self.buf[ctrl_start..ctrl_start + ctrl_len], value_len)?;
+            // The connection's limit covers the whole value, not just the stream part.
+            let whole = pieces.iter().map(|p| p.0).sum::<usize>().saturating_add(payload_len - value_len);
+            if whole > self.max_payload as usize {
+                return Err(FrameError::PayloadTooLarge(whole.min(u32::MAX as usize) as u32));
+            }
+            (len, Some(pieces))
+        } else {
+            (ctrl_len, None)
+        };
 
-        self.buf.advance(HEADER_LEN + CTRL_PREFIX_LEN);
+        self.buf.advance(ctrl_start);
         let payload = self.buf.split_to(ctrl_len).freeze();
-        self.buf.advance(CRC_LEN);
+        self.buf.advance(crc_off + CRC_LEN - ctrl_start - ctrl_len);
         let value = self.buf.split_to(value_len).freeze();
 
         Ok(Some(Frame {
@@ -572,6 +736,7 @@ impl FrameDecoder {
             flags,
             payload,
             value,
+            am_pieces,
         }))
     }
 
@@ -627,6 +792,10 @@ impl FrameDecoder {
         let Some((req_id, msg_type, flags, payload_len)) = self.peek_header() else {
             return Ok(None);
         };
+        if flags & FLAG_AM_VALUE != 0 {
+            // Its value is not the stream tail; `try_decode` assembles the pieces.
+            return Err(FrameError::Malformed("bulk prologue of a frame whose value comes as active messages"));
+        }
         if payload_len > self.max_payload {
             return Err(FrameError::PayloadTooLarge(payload_len));
         }
@@ -836,6 +1005,103 @@ mod tests {
         assert!(frames.iter().all(|f| f.payload.as_ref() == &[7; 4096][..]));
     }
 
+    /// A frame value frame: the large parts become active messages, each run
+    /// of small ones one stream piece; the piece list sits at the end of the
+    /// CRC-covered ctrl and the decoder hands back the ctrl alone.
+    #[test]
+    fn an_am_frame_lists_its_pieces_and_carries_only_the_small_ones() {
+        let big = autumn_transport::BULK_MIN_BYTES;
+        let parts: Vec<Bytes> = [100, big, 50, 30, 1 << 20].iter().map(|&n| Bytes::from(vec![n as u8; n])).collect();
+        let mut tags = 41..;
+        let (bufs, am) = encode_am_frame(9, 0x51, 0, vec![Bytes::from_static(b"meta")], parts.clone(), || tags.next().unwrap());
+        assert_eq!(am, vec![(41, parts[1].clone()), (42, parts[4].clone())]);
+        let wire = bufs.concat();
+        let mut list = Vec::new();
+        for (len, tag) in [(100u32, 0u64), (big as u32, 41), (80, 0), (1 << 20, 42)] {
+            list.extend_from_slice(&len.to_le_bytes());
+            list.extend_from_slice(&tag.to_le_bytes());
+        }
+        list.extend_from_slice(&4u16.to_le_bytes());
+        let ctrl_at = HEADER_LEN + CTRL_PREFIX_LEN;
+        assert_eq!(wire[5], FLAG_AM_VALUE);
+        assert_eq!(&wire[ctrl_at..ctrl_at + 4], b"meta");
+        assert_eq!(&wire[ctrl_at + 4..ctrl_at + 4 + list.len()], list.as_slice());
+        let mut decoder = FrameDecoder::new();
+        decoder.feed(&wire);
+        let frame = decoder.try_decode().unwrap().unwrap();
+        assert_eq!(frame.payload.as_ref(), b"meta");
+        assert_eq!(frame.value, [parts[0].clone(), parts[2].clone(), parts[3].clone()].concat());
+        assert_eq!(frame.am_pieces, Some(vec![(100, 0), (big, 41), (80, 0), (1 << 20, 42)]));
+        assert_eq!(decoder.buffered_len(), 0);
+
+        // The piece list is CRC-covered.
+        let mut bad = wire.clone();
+        bad[ctrl_at + 4 + 4] ^= 1;
+        let mut decoder = FrameDecoder::new();
+        decoder.feed(&bad);
+        assert!(matches!(decoder.try_decode(), Err(FrameError::CrcMismatch { .. })));
+
+        // Its value is not the stream tail: no bulk prologue for it.
+        let mut decoder = FrameDecoder::new();
+        decoder.feed(&wire);
+        assert!(matches!(decoder.peek_bulk_prologue(), Err(FrameError::Malformed(_))));
+    }
+
+    /// A piece list naming an empty or a repeated tagged piece is refused: its
+    /// receiver would wait for a value that never comes.
+    #[test]
+    fn an_am_frame_with_an_empty_or_repeated_piece_is_refused() {
+        let frame_with = |pieces: &[(u32, u64)]| {
+            let mut ctrl = b"k".to_vec();
+            for &(len, tag) in pieces {
+                ctrl.extend_from_slice(&len.to_le_bytes());
+                ctrl.extend_from_slice(&tag.to_le_bytes());
+            }
+            ctrl.extend_from_slice(&(pieces.len() as u16).to_le_bytes());
+            let head = encode_vectored_head(1, 0x51, FLAG_AM_VALUE, ctrl.len(), 0);
+            let ctrl = Bytes::from(ctrl);
+            let crc = compute_ctrl_crc(&head, std::slice::from_ref(&ctrl));
+            let mut decoder = FrameDecoder::new();
+            decoder.feed(&[&head[..], &ctrl, &crc].concat());
+            decoder.try_decode()
+        };
+        assert!(frame_with(&[(1 << 20, 5), (1 << 20, 6)]).unwrap().is_some());
+        assert!(matches!(frame_with(&[(1 << 20, 5), (1 << 20, 5)]), Err(FrameError::Malformed(_))));
+        assert!(matches!(frame_with(&[(0, 5), (1 << 20, 6)]), Err(FrameError::Malformed(_))));
+    }
+
+    /// A connection's payload limit covers the whole value, wherever it comes from.
+    #[test]
+    fn an_am_frame_is_held_to_the_connection_s_limit() {
+        let parts = vec![Bytes::from(vec![1u8; 2 << 20])];
+        let (bufs, _) = encode_am_frame(1, 0x51, 0, vec![Bytes::from_static(b"k")], parts, || 7);
+        let mut limited = FrameDecoder::new();
+        limited.set_max_payload(CLIENT_CONTROL_MAX_PAYLOAD);
+        limited.feed(&bufs.concat());
+        assert!(matches!(limited.try_decode(), Err(FrameError::PayloadTooLarge(_))));
+
+        // A connection that takes no frame values refuses even a small one.
+        let (bufs, _) = encode_am_frame(1, 0x51, 0, vec![Bytes::from_static(b"k")], vec![Bytes::from(vec![1u8; 64 << 10])], || 7);
+        let mut control_only = FrameDecoder::new();
+        control_only.set_am_values(false);
+        control_only.feed(&bufs.concat());
+        assert!(matches!(control_only.try_decode(), Err(FrameError::Malformed(_))));
+    }
+
+    /// The frame-value form of a prepared payload: the head, then the body's
+    /// crc32c, computed once whichever replica asks first.
+    #[test]
+    fn a_prepared_payload_s_am_parts_carry_the_body_crc() {
+        let head = Bytes::from_static(&[3; 32]);
+        let body = vec![Bytes::from(vec![5u8; 70_000]), Bytes::from(vec![6u8; 9])];
+        let prepared = PreparedPayload::new(head.clone(), body.clone(), 3);
+        let (ctrl, value) = prepared.am_parts();
+        let crc = crc32c::crc32c(&body.concat());
+        assert_eq!(ctrl, vec![head, Bytes::copy_from_slice(&crc.to_le_bytes())]);
+        assert_eq!(value, body);
+        assert_eq!(prepared.am_parts().0, ctrl);
+    }
+
     /// Both checksum strategies produce the same frame. The sizes straddle
     /// COMBINE_MIN_BYTES and the frame counts straddle 1, so each run covers
     /// the shared-scan arm and the re-scan arm of `frame_parts`; a threshold
@@ -850,9 +1116,9 @@ mod tests {
                 Bytes::copy_from_slice(&payload[..middle]), Bytes::new(),
                 Bytes::copy_from_slice(&payload[middle..]),
             ];
-            let prepared = PreparedPayload::new(parts.clone(), frames);
+            let prepared = PreparedPayload::new(parts[0].clone(), parts[1..].to_vec(), frames);
             assert_eq!(
-                prepared.crc.is_some(),
+                prepared.shared,
                 frames > 1 && len >= COMBINE_MIN_BYTES,
                 "wrong checksum strategy at len={len} frames={frames}",
             );
@@ -945,7 +1211,8 @@ mod tests {
                 // it should track whichever primitive above is cheaper.
                 let start = Instant::now();
                 for _ in 0..runs {
-                    let prepared = PreparedPayload::new(black_box(parts.clone()), rf as usize);
+                    let parts = black_box(parts.clone());
+                    let prepared = PreparedPayload::new(parts[0].clone(), parts[1..].to_vec(), rf as usize);
                     for id in 1..=rf {
                         black_box(prepared.frame_parts(id, 1));
                     }

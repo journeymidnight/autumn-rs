@@ -176,3 +176,78 @@ counted with `ucx_am_received_counts`; a stranger is dropped and its send
 completes; a given-up value writes nothing — red with no unregister on drop;
 a too-long value is reported, not received), `tests/ucx_am_eager.rs` (a value
 under the cut goes eager under a 4 KiB UCX threshold).
+
+### Frame values (AM id 2)
+
+The value of an RPC frame can travel beside it as active messages
+(`am::Sender::post_frame_value`, `am::receive_frame_value`; the frame format is
+autumn-rpc's `FLAG_AM_VALUE`). Unlike `MSG_GET_AM`, nobody asked for the value
+in advance, so the sender picks the tag (unique per connection, from autumn-rpc's
+`AmOut`) and the receiver learns of it from the frame, which may arrive before or
+after the value's rendezvous request. The send sets `UCP_AM_SEND_FLAG_REPLY`, so
+the handler (`on_frame_value`) gets the receiving endpoint and keys the value by
+`(endpoint, tag)`:
+
+- a registered piece is received at once (`ucp_am_recv_data_nbx`);
+- one that arrives first is held: the callback answers `UCS_INPROGRESS` for the
+  rendezvous descriptor (`EARLY`), and `start_frame_value` starts its receive
+  when the frame asks. That receive, started outside a progress pass, then
+  spins `SPIN_ITERS` like every other operation. Between two processes the
+  completion event would wake the progress loop anyway; with both ends on one
+  worker UCX picks the `self` transport, which raises no event, so there the
+  receive does not move without the spin (the tests' "value came first" case
+  hangs without it under `UCX_TLS=...,self` and passes without `self`);
+- only a rendezvous request is held (a descriptor, not the value — the same
+  scale as the unexpected data UCP Stream queues for an unread connection); an
+  eager frame value nobody registered, or a second value under a tag already
+  held, is dropped with a warning: nothing of ours sends either, and copying
+  them would let any connection grow the receiver's memory without sending a
+  single frame;
+- one whose receiver gave up (`Expected` dropped while waiting → `ABANDONED`) is
+  dropped on arrival, which completes its sender;
+- a piece of another length than the frame said is refused (`InvalidData`) and
+  its descriptor released;
+- values held for an endpoint that goes away (`UcxEp` drop → `forget_ep`) are
+  released, so their senders complete; the endpoint is remembered
+  (`FORGOTTEN`) because UCX keeps it and later values still arrive on it — they
+  are dropped on arrival (red without it: such a sender never completes).
+
+`start_frame_value(reader, pieces, inline)` assembles one pool buffer: tag-0
+pieces are copied from the bytes that came on the stream, every other piece is
+registered at once, and `FrameValue::wait` waits for them; a receive loop starts
+the values of every frame it has buffered before waiting for the first, so they
+are received together. The slab's memh is passed to the receive. The buffer is owned by
+an `Rc` each in-flight receive holds, so dropping the call midway cannot free
+memory under a receive. Sends ask for rendezvous (pieces are `BULK_MIN_BYTES`
+or larger), and `post_frame_value` runs each send on its own task: the writer
+must not wait for it, the receiver only fetches once it has read the frame.
+Tests: `tests/ucx_am_frame.rs` (value before / after its frame; stream and AM
+pieces joined in order; wrong length refused and its sender completes; a
+given-up value, a value held for a dropped connection and one sent after it
+let their senders complete; values started together waited in either order).
+
+Not handled (inferred, not tested): a sender whose spawned send fails only logs
+`frame value send failed`, and the receiver's connection loop then waits for
+that value until the connection is replaced (keepalive, at the client); a
+receiver waiting for a value whose sender died cannot be woken by the stream,
+which under `UCP_ERR_HANDLING_MODE_NONE` reports no error either — the same
+dead-peer class as a stream read.
+
+### Every buffer of a UCX send must be registrable: never `Bytes::from_static`
+
+UCP Stream sends 478 bytes and up zero-copy (UCX 1.20 default protocols,
+`UCX_PROTO_INFO=y`: "multi-frag stream zero-copy copy-out"), registering every
+iovec through the registration cache with write access. A literal behind
+`Bytes::from_static` lives in `.rodata`, so its registration fails
+(`ibv_reg_mr(... length=16 ...) failed: Bad address`), and under the default
+protocol stack the connection's stream stops there: later sends report done
+and never arrive, until the peer gives up on the connection. The legacy stack
+(`UCX_PROTO_ENABLE=n`) falls back to a copy, which is why it hid the bug. Found
+when an extent node's frame-value reply put `Bytes::from_static(&[CODE_OK])` in
+its ctrl: a burst of replies flushed together crossed 478 bytes, and one
+partition's 8 MiB reads fell from ~3 GB/s to ~150 MB/s with 5–10 s stalls.
+`inline_storage` refuses stack memory; nothing refuses `.rodata`, so heap-copy
+any constant that can reach a UCX send. Test: stream `tests/prepared_append.rs`
+(64 bulk reads at once, extent node on its own thread so the connection takes
+the NIC rather than the `self` transport, which registers nothing — red with
+the static byte back).

@@ -61,6 +61,7 @@ fn main() {
         .allowlist_function("ucp_worker_set_am_recv_handler")
         .allowlist_function("ucp_am_send_nbx")
         .allowlist_function("ucp_am_recv_data_nbx")
+        .allowlist_function("ucp_am_data_release")
         .allowlist_function("ucp_mem_map")
         .allowlist_function("ucp_mem_unmap")
         .allowlist_function("ucp_request_cancel")

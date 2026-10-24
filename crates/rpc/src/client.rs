@@ -26,6 +26,7 @@ use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use crate::am_frame::AmOut;
 use bytes::Bytes;
 use compio::io::{AsyncRead, AsyncWriteExt};
 use compio::runtime::{spawn, JoinHandle};
@@ -238,10 +239,14 @@ enum SubmitMsg {
     Vectored {
         bufs: Vec<Bytes>,
         req_id: u32,
+        /// Frame values to send beside the frame (`am_frame`), posted when
+        /// the frame is written.
+        am: Vec<(u64, Bytes)>,
     },
     Prepared {
         bufs: Vec<Bytes>,
         req_id: u32,
+        am: Vec<(u64, Bytes)>,
     },
     /// A keepalive ping. Written like `Single`; the writer counts it once it
     /// is on the wire, which is when the keepalive starts timing the reply.
@@ -255,8 +260,9 @@ impl SubmitMsg {
     fn is_large(&self) -> bool {
         match self {
             SubmitMsg::Single { bytes, .. } | SubmitMsg::Ping { bytes, .. } => bytes.len() >= WINDOWED_FRAME_MIN_BYTES,
-            SubmitMsg::Vectored { bufs, .. } | SubmitMsg::Prepared { bufs, .. } => {
-                bufs.iter().map(Bytes::len).sum::<usize>() >= WINDOWED_FRAME_MIN_BYTES
+            SubmitMsg::Vectored { bufs, am, .. } | SubmitMsg::Prepared { bufs, am, .. } => {
+                bufs.iter().chain(am.iter().map(|(_, v)| v)).map(Bytes::len).sum::<usize>()
+                    >= WINDOWED_FRAME_MIN_BYTES
             }
         }
     }
@@ -343,6 +349,8 @@ impl Keepalive {
 /// `pending` uses `RefCell` with scoped borrows — never held across await.
 pub struct RpcClient {
     protocol: crate::version_hello::Negotiated,
+    /// Sends large values beside their frames (UCX, peer reads them).
+    am_out: Option<Rc<AmOut>>,
     /// SQ: submit channel to writer_task. Borrowed mutably, never cloned per
     /// send: `futures::mpsc` grants each SENDER a slot beyond the shared
     /// buffer, so a clone per call hands every caller its own slot and the
@@ -524,6 +532,8 @@ impl RpcClient {
         }
         let pending: Rc<RefCell<HashMap<u32, Pending>>> = Rc::new(RefCell::new(HashMap::new()));
 
+        let am_out = AmOut::for_connection(&writer, protocol.remote_wire);
+        let am_for_writer = am_out.clone();
         let (submit_tx, submit_rx) = mpsc::channel::<SubmitMsg>(SUBMIT_CHANNEL_CAP);
         let (urgent_tx, urgent_rx) = mpsc::channel::<SubmitMsg>(SUBMIT_CHANNEL_CAP);
         let closed: Rc<Cell<bool>> = Rc::new(Cell::new(false));
@@ -546,6 +556,7 @@ impl RpcClient {
         let writer_handle = spawn(async move {
             writer_task(
                 writer,
+                am_for_writer,
                 urgent_rx,
                 submit_rx,
                 window_for_writer,
@@ -592,6 +603,7 @@ impl RpcClient {
         // this connection's only teardown.
         Ok(Rc::new_cyclic(|weak| Self {
             protocol,
+            am_out,
             submit_tx: RefCell::new(submit_tx),
             urgent_tx: RefCell::new(urgent_tx),
             window,
@@ -834,7 +846,7 @@ impl RpcClient {
         bufs.extend(payload_parts);
         bufs.push(Bytes::copy_from_slice(&crc));
 
-        if let Err(e) = self.submit(SubmitMsg::Vectored { bufs, req_id }) {
+        if let Err(e) = self.submit(SubmitMsg::Vectored { bufs, req_id, am: Vec::new() }) {
             self.pending.borrow_mut().remove(&req_id);
             return Err(e);
         }
@@ -852,10 +864,16 @@ impl RpcClient {
             return Err(RpcError::ConnectionClosed);
         }
         let req_id = self.next_req_id();
-        let bufs = payload.frame_parts(req_id, msg_type);
+        let (bufs, am) = match &self.am_out {
+            Some(out) if AmOut::wants(payload.body()) => {
+                let (ctrl, body) = payload.am_parts();
+                out.encode(req_id, msg_type, 0, ctrl, body)
+            }
+            _ => (payload.frame_parts(req_id, msg_type), Vec::new()),
+        };
         let (tx, rx) = oneshot::channel();
         self.pending.borrow_mut().insert(req_id, Pending::Frame(tx));
-        if let Err(e) = self.submit(SubmitMsg::Prepared { bufs, req_id }) {
+        if let Err(e) = self.submit(SubmitMsg::Prepared { bufs, req_id, am }) {
             self.pending.borrow_mut().remove(&req_id);
             return Err(e);
         }
@@ -895,22 +913,12 @@ impl RpcClient {
             return Err(RpcError::ConnectionClosed);
         }
         let req_id = self.next_req_id();
-        let ctrl_len: usize = ctrl_parts.iter().map(|p| p.len()).sum();
-        let value_len: usize = values.iter().map(|v| v.len()).sum();
-        let head =
-            crate::frame::encode_vectored_head(req_id, msg_type, 0, ctrl_len, value_len);
+        let (bufs, am) = self.value_frame(req_id, msg_type, ctrl_parts, values);
 
         let (tx, rx) = oneshot::channel();
         self.pending.borrow_mut().insert(req_id, Pending::Frame(tx));
 
-        let crc = crate::frame::compute_ctrl_crc(&head, &ctrl_parts);
-        let mut bufs: Vec<Bytes> = Vec::with_capacity(3 + ctrl_parts.len() + values.len());
-        bufs.push(Bytes::copy_from_slice(&head));
-        bufs.extend(ctrl_parts);
-        bufs.push(Bytes::copy_from_slice(&crc));
-        bufs.extend(values);
-
-        if let Err(e) = self.submit(SubmitMsg::Vectored { bufs, req_id }) {
+        if let Err(e) = self.submit(SubmitMsg::Vectored { bufs, req_id, am }) {
             self.pending.borrow_mut().remove(&req_id);
             return Err(e);
         }
@@ -928,26 +936,42 @@ impl RpcClient {
             return Err(RpcError::ConnectionClosed);
         }
         let req_id = self.next_req_id();
-        let ctrl_len: usize = ctrl_parts.iter().map(|p| p.len()).sum();
-        let head =
-            crate::frame::encode_vectored_head(req_id, msg_type, 0, ctrl_len, value.len());
+        let (bufs, am) = self.value_frame(req_id, msg_type, ctrl_parts, vec![value]);
 
         let (tx, rx) = oneshot::channel();
         self.pending.borrow_mut().insert(req_id, Pending::Frame(tx));
 
-        let crc = crate::frame::compute_ctrl_crc(&head, &ctrl_parts);
-        let mut bufs: Vec<Bytes> = Vec::with_capacity(3 + ctrl_parts.len());
-        bufs.push(Bytes::copy_from_slice(&head));
-        bufs.extend(ctrl_parts);
-        bufs.push(Bytes::copy_from_slice(&crc));
-        bufs.push(value);
-
-        if let Err(e) = self.submit(SubmitMsg::Vectored { bufs, req_id }) {
+        if let Err(e) = self.submit(SubmitMsg::Vectored { bufs, req_id, am }) {
             self.pending.borrow_mut().remove(&req_id);
             return Err(e);
         }
 
         Self::await_response(rx).await
+    }
+
+    /// A value-separable request's stream buffers
+    /// (`[head][ctrl parts…][crc][values…]`), or on a connection that sends
+    /// frame values, a `FLAG_AM_VALUE` frame and its values.
+    fn value_frame(
+        &self,
+        req_id: u32,
+        msg_type: u8,
+        ctrl_parts: Vec<Bytes>,
+        values: Vec<Bytes>,
+    ) -> (Vec<Bytes>, Vec<(u64, Bytes)>) {
+        if let Some(out) = self.am_out.as_ref().filter(|_| AmOut::wants(&values)) {
+            return out.encode(req_id, msg_type, 0, ctrl_parts, values);
+        }
+        let ctrl_len: usize = ctrl_parts.iter().map(|p| p.len()).sum();
+        let value_len: usize = values.iter().map(|v| v.len()).sum();
+        let head = crate::frame::encode_vectored_head(req_id, msg_type, 0, ctrl_len, value_len);
+        let crc = crate::frame::compute_ctrl_crc(&head, &ctrl_parts);
+        let mut bufs: Vec<Bytes> = Vec::with_capacity(3 + ctrl_parts.len() + values.len());
+        bufs.push(Bytes::copy_from_slice(&head));
+        bufs.extend(ctrl_parts);
+        bufs.push(Bytes::copy_from_slice(&crc));
+        bufs.extend(values);
+        (bufs, Vec::new())
     }
 
     /// Send a fire-and-forget frame (no response expected).
@@ -1344,6 +1368,7 @@ async fn keepalive_task(
 /// rest of `pending`.
 async fn writer_task(
     mut writer: WriteHalf,
+    am_out: Option<Rc<AmOut>>,
     mut urgent_rx: mpsc::Receiver<SubmitMsg>,
     mut submit_rx: mpsc::Receiver<SubmitMsg>,
     window: Rc<SendWindow>,
@@ -1405,13 +1430,22 @@ async fn writer_task(
                 (bufs.len(), total)
             }
         };
+        let post = |am: Vec<(u64, Bytes)>| {
+            if !am.is_empty() {
+                am_out.as_ref().expect("frame values only on a connection that sends them").post(am);
+            }
+        };
         let result = match msg {
             SubmitMsg::Single { bytes, .. } | SubmitMsg::Ping { bytes, .. } => {
                 let BufResult(r, _) = writer.write_all(bytes).await;
                 r
             }
-            SubmitMsg::Vectored { bufs, .. } => write_vectored_chunked(&mut writer, bufs).await,
-            SubmitMsg::Prepared { bufs, .. } => {
+            SubmitMsg::Vectored { bufs, am, .. } => {
+                post(am);
+                write_vectored_chunked(&mut writer, bufs).await
+            }
+            SubmitMsg::Prepared { bufs, am, .. } => {
+                post(am);
                 write_prepared(&mut writer, bufs, total_bytes).await
             }
         };
@@ -1479,7 +1513,7 @@ async fn read_loop(
     // reads ctrl_len from the verified prologue. The pending entry is checked
     // without removing it: it must stay pending if the loop waits for more bytes.
     let bulk_fast_path = |req_id: u32, flags: u8, payload_len: usize| {
-        (flags & crate::frame::FLAG_ERROR) == 0
+        (flags & (crate::frame::FLAG_ERROR | crate::frame::FLAG_AM_VALUE)) == 0
             && (is_ucx || payload_len >= TCP_RECV_INTO_POOLED_MIN_BYTES)
             && matches!(pending.borrow().get(&req_id), Some(Pending::IntoPooled(_) | Pending::IntoDest(..)))
     };
@@ -1645,15 +1679,54 @@ async fn read_loop(
             }
 
             // ── normal path: full frame decode ──
-            match decoder.try_decode()? {
-                Some(frame) => match {
+            // Decode the run of buffered frames that take this path, starting
+            // their values that come as active messages, so those are received
+            // together; then dispatch them in order. A frame's caller stays in
+            // `pending` while its value arrives, where a keepalive close finds it.
+            let mut run = Vec::new();
+            while let Some((req_id, _mt, flags, payload_len)) = decoder.peek_header() {
+                if bulk_fast_path(req_id, flags, payload_len as usize) {
+                    break;
+                }
+                match decoder.try_decode()? {
+                    Some(frame) => run.push(crate::am_frame::start(&reader, frame)?),
+                    None => break,
+                }
+            }
+            if run.is_empty() {
+                break;
+            }
+            for incoming in run {
+                let (mut frame, am_value) = incoming.into_parts().await?;
+                match {
                     send_window.answered(frame.req_id);
-                    pending.borrow_mut().remove(&frame.req_id)
+                    (am_value, pending.borrow_mut().remove(&frame.req_id))
                 } {
-                    Some(Pending::Frame(tx)) => {
+                    (Some(pb), Some(Pending::Frame(tx))) => {
+                        frame.value = Bytes::from_owner(pb);
                         let _ = tx.send(frame);
                     }
-                    Some(Pending::IntoPooled(tx)) => {
+                    (Some(pb), Some(Pending::IntoPooled(tx))) => {
+                        let (code, message, ctrl) = bulk_status(&frame.payload);
+                        let _ = tx.send(Ok(BulkResp { buf: pb, code, message, ctrl }));
+                    }
+                    (Some(pb), Some(Pending::IntoDest(tx, slot))) => {
+                        let (code, message, ctrl) = bulk_status(&frame.payload);
+                        let value_len = pb.len();
+                        let spill = copy_into_dest(slot.dest.borrow_mut().take(), pb);
+                        let _ = tx.send(Ok(DestResp { code, message, ctrl, value_len, spill }));
+                    }
+                    (_, None) => {
+                        tracing::trace!(
+                            req_id = frame.req_id,
+                            msg_type = frame.msg_type,
+                            "response for unknown req_id, dropped"
+                        );
+                    }
+                    (None, Some(Pending::Frame(tx))) => {
+                        let _ = tx.send(frame);
+                    }
+                    (None, Some(Pending::IntoPooled(tx))) => {
                         if frame.is_error() {
                             // Frame-level ERROR (FLAG_ERROR — e.g. an authz
                             // PermissionDenied from the PS authz_gate, or a
@@ -1672,7 +1745,7 @@ async fn read_loop(
                             finish_into_pooled_from_frame(tx, &frame.payload, &frame.value);
                         }
                     }
-                    Some(Pending::IntoDest(tx, slot)) => {
+                    (None, Some(Pending::IntoDest(tx, slot))) => {
                         if frame.is_error() {
                             let (code, message) = RpcError::decode_status(&frame.payload);
                             let _ = tx.send(Err(RpcError::status(code, message)));
@@ -1680,15 +1753,7 @@ async fn read_loop(
                             finish_into_dest_from_frame(tx, &slot, &frame.payload, &frame.value);
                         }
                     }
-                    None => {
-                        tracing::trace!(
-                            req_id = frame.req_id,
-                            msg_type = frame.msg_type,
-                            "response for unknown req_id, dropped"
-                        );
-                    }
-                },
-                None => break,
+                }
             }
         }
     }
@@ -1848,14 +1913,7 @@ fn finish_into_pooled_from_frame(
     ctrl: &[u8],
     value: &[u8],
 ) {
-    let (code, message, ctrl_tail) = match crate::frame::parse_bulk_ctrl(ctrl) {
-        Some((c, m)) => (
-            c,
-            String::from_utf8_lossy(m).into_owned(),
-            Bytes::copy_from_slice(m),
-        ),
-        None => (0, String::new(), Bytes::new()), // empty ctrl = OK, no message
-    };
+    let (code, message, ctrl_tail) = bulk_status(ctrl);
     let mut pb = autumn_transport::regpool_acquire(value.len());
     {
         let (dest, _reg) = pb.dest_and_reg();
@@ -1869,13 +1927,18 @@ fn finish_into_pooled_from_frame(
     }));
 }
 
+/// A bulk reply's ctrl as `(code, message, ctrl tail)`; empty = OK, no message.
+fn bulk_status(ctrl: &[u8]) -> (u8, String, Bytes) {
+    match crate::frame::parse_bulk_ctrl(ctrl) {
+        Some((c, m)) => (c, String::from_utf8_lossy(m).into_owned(), Bytes::copy_from_slice(m)),
+        None => (0, String::new(), Bytes::new()),
+    }
+}
+
 /// `finish_into_pooled_from_frame` for a `call_into_dest`: the value is copied
 /// into the lent memory if it fits.
 fn finish_into_dest_from_frame(tx: DestWaiter, slot: &DestSlot, ctrl: &[u8], value: &[u8]) {
-    let (code, message, ctrl_tail) = match crate::frame::parse_bulk_ctrl(ctrl) {
-        Some((c, m)) => (c, String::from_utf8_lossy(m).into_owned(), Bytes::copy_from_slice(m)),
-        None => (0, String::new(), Bytes::new()),
-    };
+    let (code, message, ctrl_tail) = bulk_status(ctrl);
     let dest = slot.dest.borrow_mut().take();
     let spill = match dest {
         Some(mut d) if value.len() <= d.cap() => {
