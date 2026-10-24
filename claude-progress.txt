@@ -1,3 +1,10 @@
+Date: 2026-10-24 (10)
+TaskStatus: completed
+Task scope: user — the per-hop A/B for F-UCX-AM-RNDV-INTERNAL (spreading one extent's reads over EN threads: user said not to do it).
+Current summary: a measurement build (scratchpad worktree, not committed) switched each hop with AUTUMN_EXP_AM_HOPS; per variant a fresh UCX cluster, perf-check 16x8 8M, whole-process CPU of PS / ENs / client over 6 s per phase, a log check that only the intended receivers got frame values; direct reads via BatchClient(direct=True). Every hop: UCX throughput not lower, receiver CPU s/GB down 18-71% (table in crates/rpc/CLAUDE.md "Frame values (wire 77)" and the ledger notes). Ledger: F-UCX-AM-RNDV-INTERNAL passes.
+Main gaps: one assertion failure in one direct-read run of the all-stream variant (old script: put / read / compare not told apart), not reproduced in 16 later runs (10 all-stream). BUG-PY-PUT-BORROWED-MEMORY open.
+Next steps: user decides.
+
 Date: 2026-10-24 (9)
 TaskStatus: completed
 Task scope: user — why UCX 8M reads barely scale from 1 to 8 partitions; then "item 2": find and fix the page faults on the hot extent-node thread (item 1, memh on AM sends, dropped by the user: 0.3% left after item 2).

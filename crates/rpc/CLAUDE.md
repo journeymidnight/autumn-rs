@@ -1096,6 +1096,23 @@ measurement collapsed that one-partition read to ~150 MB/s: a `.rodata` ctrl
 byte in the extent node's reply (transport CLAUDE.md, "Every buffer of a UCX
 send must be registrable").
 
+Per hop (a measurement build with each hop switchable; UCX, 3 disks, 16
+threads x depth 8, 8 MiB, two interleaved rounds; receiver CPU = whole-process
+CPU seconds per GB moved):
+
+| Hop (receiver) | Throughput, stream -> frame values (MB/s) | Receiver CPU s/GB |
+|---|---|---|
+| client -> PS write (PS) | p1 616/704 -> 708/851, p8 2165/2283 -> 2431/2342 | p1 0.85 -> 0.59, p8 1.28 -> 0.80 |
+| PS -> EN append (EN) | p1 616/704 -> 762/817, p8 2165/2283 -> 2220/2168 | p1 2.32 -> 1.91, p8 3.48 -> 2.29 |
+| EN -> PS read (PS) | p1 3022/3349 -> 5883/4710, p8 5875/5554 -> 7282/7221 | p1 0.35 -> 0.10, p8 0.76 -> 0.23 |
+| PS -> client read (client) | p1 3022/3349 -> 3798/3682, p8 5875/5554 -> 6647/6627 | p1 0.91 -> 0.40, p8 1.38 -> 0.64 |
+| EN -> client direct read (client, `BatchClient(direct=True).get_into`, 64 x 16 MiB, six pairs) | 1.30–1.75 -> 2.04–2.62 GB/s | 0.31–0.35 -> 0.14–0.17 |
+| every hop | write p1 950/951, p8 2435/2467; read p1 7392/5740, p8 8074/8197 | — |
+
+The sender's CPU drops too (the client sends 8 MiB puts at ~0.01 core instead
+of ~0.6). Eight-partition writes gain only on the client hop: they are bound
+by the disks' fsync.
+
 `FLAG_AM_VALUE` and its piece list (see "Frame values" above). Sent only to a
 peer negotiated at `WIRE_VERSION_WITH_AM_VALUES` (77) or later over UCX, so a
 client on either side of 77 keeps working: it neither sends nor receives one
