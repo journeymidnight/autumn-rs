@@ -367,6 +367,7 @@ impl PartitionMetrics {
 /// Gauges sum the partitions still open on this PS.
 pub struct PsMetrics {
     block_cache: Arc<BlockCache>,
+    mem_tier: Option<Arc<crate::mem_tier::MemTierBudget>>,
     plog_load: Arc<PlogLoad>,
     parts: parking_lot::Mutex<Parts>,
 }
@@ -448,9 +449,14 @@ struct Gauges {
 }
 
 impl PsMetrics {
-    pub(crate) fn new(block_cache: Arc<BlockCache>, plog_load: Arc<PlogLoad>) -> Self {
+    pub(crate) fn new(
+        block_cache: Arc<BlockCache>,
+        plog_load: Arc<PlogLoad>,
+        mem_tier: Option<Arc<crate::mem_tier::MemTierBudget>>,
+    ) -> Self {
         Self {
             block_cache,
+            mem_tier,
             plog_load,
             parts: parking_lot::Mutex::new(Parts::default()),
         }
@@ -518,6 +524,22 @@ impl PsMetrics {
             push_type(&mut out, name, kind);
             push_metric(&mut out, name, &[], v);
         }
+        if let Some(t) = &self.mem_tier {
+            use std::sync::atomic::Ordering::Relaxed;
+            let tier: [(&str, &str, f64); 7] = [
+                ("autumn_ps_mem_tier_bytes", "gauge", t.used() as f64),
+                ("autumn_ps_mem_tier_capacity_bytes", "gauge", t.cap() as f64),
+                ("autumn_ps_mem_tier_hits_total", "counter", t.hits.load(Relaxed) as f64),
+                ("autumn_ps_mem_tier_inserts_total", "counter", t.inserts.load(Relaxed) as f64),
+                ("autumn_ps_mem_tier_refused_total", "counter", t.refused.load(Relaxed) as f64),
+                ("autumn_ps_mem_tier_evicted_entries_total", "counter", t.evicted_entries.load(Relaxed) as f64),
+                ("autumn_ps_mem_tier_evicted_bytes_total", "counter", t.evicted_bytes.load(Relaxed) as f64),
+            ];
+            for (name, kind, v) in tier {
+                push_type(&mut out, name, kind);
+                push_metric(&mut out, name, &[], v);
+            }
+        }
 
         let minor: Vec<(&str, u64)> = MinorCause::ALL.iter().map(|c| c.name()).zip(c.minor).collect();
         let labeled: [(&str, &str, Vec<(&str, u64)>); 3] = [
@@ -570,7 +592,7 @@ mod tests {
 
     #[test]
     fn render_sums_partitions_with_no_partition_label() {
-        let ps = PsMetrics::new(Arc::new(BlockCache::new(64 << 20)), Arc::new(PlogLoad::new()));
+        let ps = PsMetrics::new(Arc::new(BlockCache::new(64 << 20)), Arc::new(PlogLoad::new()), None);
         let a = Arc::new(PartitionMetrics::default());
         let b = Arc::new(PartitionMetrics::default());
         ps.register(a.clone());
@@ -614,7 +636,7 @@ mod tests {
 
     #[test]
     fn counters_stay_put_when_a_partition_closes_and_reopens() {
-        let ps = PsMetrics::new(Arc::new(BlockCache::new(1 << 20)), Arc::new(PlogLoad::new()));
+        let ps = PsMetrics::new(Arc::new(BlockCache::new(1 << 20)), Arc::new(PlogLoad::new()), None);
         let old = Arc::new(PartitionMetrics::default());
         ps.register(old.clone());
         old.record_flush(10);

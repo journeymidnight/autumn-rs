@@ -3300,6 +3300,30 @@ stop.set(); t.join(); lat.sort(); print(f"exists p50 {lat[50]:.1f} ms  p99 {lat[
 PY
 ```
 
+## Memory tier for KV cache (`--mem-tier-bytes`, `--mem-tier-prefix`)
+
+Off by default. `autumn-ps --mem-tier-bytes 256G --mem-tier-prefix kvc/` (or
+`AUTUMN_PS_MEM_TIER_BYTES` + `AUTUMN_PS_MEM_TIER_PREFIX` with `cluster.sh`)
+holds bulk puts (values of 64 KiB and up) of keys under the prefix in the PS's
+DRAM and acknowledges them without writing the log; reads look there first.
+**What is held is not durable**: a PS restart, a partition reopen, split, merge
+or move loses it, and a key that also had an older durable value reads that
+value afterwards. Use it only for data that can be recomputed (the KV cache);
+everything else should stay outside the prefix. The budget is for the whole PS;
+a partition that needs room evicts its own oldest unread write bursts, and a
+put that still does not fit is written durably as usual (a partition that
+filled its share and went idle keeps it). Small, fenced, batched and oversized
+puts are always durable. `RANGE` does not list keys held only in memory. Watch
+`autumn_ps_mem_tier_*` on the PS `/metrics`.
+
+```bash
+cargo test -p autumn-partition-server --lib mem_tier
+cargo test -p autumn-manager --test mem_tier
+# live: start with the tier on, put a covered key, read it, restart the PS, read again
+AUTUMN_PS_MEM_TIER_BYTES=$((64<<30)) AUTUMN_PS_MEM_TIER_PREFIX=kvc/ bash cluster.sh start 3
+curl -s http://127.0.0.1:9801/metrics | grep autumn_ps_mem_tier   # bytes / hits / evictions
+```
+
 ## Write options and conditional writes (wire 75)
 
 Every SDK write takes `WriteOptions { ttl, lease }`: `put`, `put_many` and

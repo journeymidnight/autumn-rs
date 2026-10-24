@@ -116,6 +116,14 @@ crate::params! {
         sst_bloom_fp_rate: f64 = 0.01, [0.0001, 0.5];
         /// SST block cache per PS.
         sst_block_cache_bytes: usize = 512 * MIB as usize, [16 * MIB as usize, 256 * GIB as usize];
+        /// Memory tier budget for the whole PS (0 = off): keys under
+        /// `--mem-tier-prefix` are held in DRAM and acknowledged without a log
+        /// append. Not durable — a restart, reopen, split, merge or move loses
+        /// them. For recomputable data (KV cache).
+        mem_tier_bytes: u64 = 0, [0, 4096 * GIB];
+        /// Key prefixes the memory tier holds (comma-separated or repeated),
+        /// e.g. `kvc/`.
+        mem_tier_prefix: Vec<String>;
 
         // ── GC ───────────────────────────────────────────────────────────
         /// Read chunk of a GC relocation scan.

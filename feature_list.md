@@ -52,6 +52,7 @@
 - **Acceptance**: 先给设计，用户定了再立实现条目。
 - `passes: false`
 - **notes** (2026-10-24 设计定稿，用户选): 研究结论——sglang 每页进 L2 后都写 L3，`write_through_selective` 只是 L2 两次命中门槛；`batch_exists` 按连续前缀计；exists 后 get 失败会截断重算、不重试写 → L3 丢数据只损命中率。Mooncake：DRAM 即确认、默认 1 副本、近似 LRU、exists 后租约防淘汰、SSD 落盘可选（默认 eager，另有 offload_on_evict + 有界队列）。用户定：① 淘汰时只把被读过的条目落盘（队列满就丢）；② 按一次写批成组淘汰，exists 置引用位；③ 预算整个 PS 共享（按分区分片）；④ 直读命中内存先在重定向里回值，量过再定。先做不落盘的最小版量收益。
+- **notes** (2026-10-24，最小版已提交，不落盘): `--mem-tier-bytes` / `--mem-tier-prefix`，bulk put 进内存即确认、读先查内存、成组 CLOCK、整个 PS 共享预算。微基准（UCX，8 rank×128×16 MiB）：写 2.76→8.65 GB/s，读 5.34→10.54 GB/s。引擎端到端（Qwen3-VL-32B、逐个请求、timeout、TCP、page_first_direct）：每请求 p50 1344→980 ms（重算 976），取 2 GiB 999→699 ms，命中 99%。还没低于重算：单 rank TCP 读内存约 3 GB/s。下一步候选：落盘（淘汰时落盘被读过的条目）；UCX/零拷贝回包（缓存值放进注册内存）；跨分区让出预算（闲置分区不让）；被改写 key 的旧组副本到组淘汰才释放；千万级条目的 HashMap 扩容卡写 actor；过期条目到组淘汰才释放。
 
 ### BUG-FS-DIR-NLINK-LOST-UNDER-CONTENTION — 同目录高并发 mkdir 父目录 nlink 少记（已复现，未修）
 - **Trigger** (2026-10-23 父目录类型检查的基准): 4 会话 × 300 次 mkdir 进同一目录，结束后父目录 nlink 比 2+1200 少 0–18（改前改后都有）。`update_dir` 对父 inode 的 CAS 连续冲突 16 次就放弃、只记 WARN（名字已发布，不报错）。

@@ -1,3 +1,10 @@
+Date: 2026-10-24 (3)
+TaskStatus: completed
+Task scope: user — research the write-through KV-cache tier (done; user chose: persist on eviction only entries that were read, evict in groups, one budget per PS, measure the direct-read handling first), then its minimal version without persistence.
+Current summary: PS memory tier (`mem_tier.rs`, flags --mem-tier-bytes / --mem-tier-prefix, cluster.sh AUTUMN_PS_MEM_TIER_*): bulk puts of covered keys held in DRAM and acked without a log append, reads/HEAD/compare look there first, group CLOCK eviction, per-PS budget with per-partition shards, durable writes of a held key mark it and drop it when they land, a put behind an older durable write of its key goes durable. Not durable by design. Fable review: H1 (older durable write dropping a newer held value) fixed with an ablated regression test; M1/M3/M4 fixed; M2/M5/M6/L1 recorded. Micro: write 2.76→8.65 GB/s, read 5.34→10.54 GB/s. Engine: per-request p50 1344→980 ms (recompute 976).
+Main gaps: persistence step; per-request still ≈ recompute (single-rank TCP read from PS memory ~3 GB/s).
+Next steps: user picks — persistence, UCX/zero-copy replies, cross-partition budget.
+
 Date: 2026-10-24 (2)
 TaskStatus: completed
 Task scope: user — collapse the write API into WriteOptions { ttl, lease }: put (folds put_bulk, transport by size), put_many (TTL per batch), delete / delete_many, compare_put (folds compare_put_bulk and compare_write; new MSG_COMPARE_WRITE_BULK, wire 75).

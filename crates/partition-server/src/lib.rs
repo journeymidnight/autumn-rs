@@ -9,6 +9,7 @@ pub mod compact_policy;
 mod wal_record;
 pub mod metrics;
 mod plog_load;
+mod mem_tier;
 pub use metrics::{LatHist, PartitionMetrics, LAT_BUCKET_BOUNDS_NS};
 
 use background::*;
@@ -689,6 +690,9 @@ fn record_carries_value_pointer(op: u8, value_len: usize) -> bool {
 /// (`op & OP_VALUE_POINTER == 0`).
 const OP_FENCE_BUMP: u8 = 0x08;
 
+/// Record op of a put (an inline value).
+const OP_PUT: u8 = 1;
+
 /// Record op of a delete (the low bits; `OP_VALUE_POINTER` is a flag above).
 const OP_TOMBSTONE: u8 = 2;
 
@@ -1111,6 +1115,8 @@ pub(crate) struct PartitionData {
     /// This partition's SST block cache, owned by the `PartitionServer` and
     /// shared by all of its partitions (see `PartitionServer::block_cache`).
     block_cache: std::sync::Arc<crate::sstable::BlockCache>,
+    /// This partition's shard of the PS memory tier (`mem_tier.rs`); None = off.
+    pub(crate) mem_tier: Option<mem_tier::MemShard>,
     /// sender to the per-partition bulk thread. Always present —
     /// `open_partition` returns Err if P-sst fails to spawn, so the
     /// partition is never half-opened with no flush channel.
@@ -2053,6 +2059,15 @@ pub(crate) struct WriteRequest {
 
 impl WriteRequest {
     /// Whether this request writes the user key `key`.
+    /// The key this request writes; None for a fence record.
+    fn written_key(&self) -> Option<&[u8]> {
+        match &self.op {
+            WriteOp::Put { user_key, .. } => Some(user_key),
+            WriteOp::Delete { user_key } => Some(user_key),
+            WriteOp::FenceBump { .. } => None,
+        }
+    }
+
     fn writes_key(&self, key: &[u8]) -> bool {
         match &self.op {
             WriteOp::Put { user_key, .. } => user_key[..] == *key,
@@ -2405,6 +2420,8 @@ pub struct PartitionServer {
     /// process-global: its keys `(extent_id, offset)` are unique only within
     /// one cluster, and one PS serves exactly one cluster.
     block_cache: std::sync::Arc<crate::sstable::BlockCache>,
+    /// Memory tier budget shared by every partition this PS opens; None = off.
+    mem_tier: Option<std::sync::Arc<mem_tier::MemTierBudget>>,
     /// What `/metrics` serves; the metrics thread reads it directly.
     metrics: std::sync::Arc<metrics::PsMetrics>,
     /// Set at the top of `shutdown()`; once set, `sync_regions_once` does
@@ -3303,6 +3320,10 @@ impl PartitionServer {
                     if resp.code == manager_rpc::CODE_OK {
                         let connected_idx = idx;
                         let block_cache = new_block_cache();
+                        let mem_tier = mem_tier::MemTierBudget::new(
+                            params().mem_tier_bytes.get(),
+                            &params().mem_tier_prefix.get(),
+                        );
                         let plog_load = std::sync::Arc::new(plog_load::PlogLoad::new());
                         let server = Self {
                             ps_id,
@@ -3328,9 +3349,11 @@ impl PartitionServer {
                             authz: std::sync::Arc::new(crate::authz::AuthzState::new()),
                             open_backoff: Rc::new(RefCell::new(HashMap::new())),
                             block_cache: block_cache.clone(),
+                            mem_tier: mem_tier.clone(),
                             metrics: std::sync::Arc::new(metrics::PsMetrics::new(
                                 block_cache,
                                 plog_load,
+                                mem_tier,
                             )),
                             shutting_down: Rc::new(Cell::new(false)),
                             sync_pass: Rc::new(futures::lock::Mutex::new(())),
@@ -4358,6 +4381,7 @@ impl PartitionServer {
         self.metrics.register(metrics_for_thread.clone());
         // Every partition of this PS shares the PS's one block cache.
         let block_cache_for_thread = self.block_cache.clone();
+        let mem_tier_for_thread = self.mem_tier.clone();
         // build the compact + GC trigger channels on the main thread
         // so `PartitionHandle` can hold a Send `mpsc::Sender` for the
         // maintenance scheduler. The receivers go into `partition_thread_main`
@@ -4397,6 +4421,7 @@ impl PartitionServer {
                         drain_rx,
                         metrics_for_thread,
                         block_cache_for_thread,
+                        mem_tier_for_thread,
                         compact_tx_for_thread,
                         compact_rx_main,
                         gc_tx_for_thread,
@@ -5947,6 +5972,7 @@ async fn partition_thread_main(
     drain_rx: mpsc::UnboundedReceiver<DrainAck>,
     metrics_arc: std::sync::Arc<PartitionMetrics>,
     block_cache: std::sync::Arc<crate::sstable::BlockCache>,
+    mem_tier: Option<std::sync::Arc<mem_tier::MemTierBudget>>,
     // trigger channels created on the main thread; the senders
     // are cloned into `PartitionData` (replacing the old in-thread
     // channel) so loopback rpc handlers + the maintenance scheduler
@@ -6257,6 +6283,7 @@ async fn partition_thread_main(
         durable_ckpt_vp: Cell::new(recovered_ckpt_vp.unwrap_or((0, 0))),
         stream_client: part_sc.clone(),
         block_cache: block_cache.clone(),
+        mem_tier: mem_tier.map(mem_tier::MemShard::new),
         flush_req_tx: flush_req_tx.clone(),
         row_append_tx: row_append_tx.clone(),
         row_invalidate_tx: row_invalidate_tx.clone(),
@@ -7774,6 +7801,9 @@ async fn handle_incoming_req(
                 return;
             }
         };
+        if let Some(mem) = part.borrow_mut().mem_tier.as_mut() {
+            mem.supersede(&cond.key);
+        }
         // This actor owns user-write admission, so requests are compared in
         // arrival order. The comparison reads committed state: a write to the
         // key still queued or in flight is committed first (stopping at a
@@ -7914,10 +7944,30 @@ async fn handle_incoming_req(
     // (bootstrap / tests / legacy callers). Reads already perform this
     // inside their respective handlers (`handle_get_bulk` / `handle_head`
     // / `handle_range` in `rpc_handlers.rs`).
-    let (part_region_epoch, part_id_for_err) = {
+    let (part_region_epoch, part_id_for_err, tiered) = {
         let p = part.borrow();
-        (p.region_epoch, p.part_id)
+        (p.region_epoch, p.part_id, p.mem_tier.is_some())
     };
+    // Memory tier: a covered put is held in DRAM and answered here; the
+    // durable writes below mark the keys they write (`mem_tier.rs`).
+    let req = if tiered {
+        match mem_tier_put(req, part, pending) {
+            Some(req) => req,
+            None => return,
+        }
+    } else {
+        req
+    };
+    let marked_from = pending.len();
+    let writes = matches!(
+        req.msg_type,
+        MSG_PUT
+            | MSG_PUT_BULK
+            | MSG_DELETE
+            | partition_rpc::MSG_BATCH_PUT
+            | partition_rpc::MSG_BATCH_PUT_BULK
+            | partition_rpc::MSG_BATCH_DELETE
+    );
     // BUG-LEASE-2 Phase 1 (coco R2-P1 #4 fix): the part borrow MUST
     // be scoped to the PUT arms only. The legacy code held an outer
     // immutable borrow across the entire `match`; the `_` /
@@ -8165,6 +8215,15 @@ async fn handle_incoming_req(
             let _ = req.resp_tx.send(result);
         }
     }
+    if tiered && writes {
+        let mut p = part.borrow_mut();
+        let mem = p.mem_tier.as_mut().expect("tiered");
+        for w in &pending[marked_from.min(pending.len())..] {
+            if let Some(k) = w.written_key() {
+                mem.supersede(k);
+            }
+        }
+    }
 }
 
 /// BUG-LEASE-2 (coco P0 #2, 2026-06-05) Phase 1 — pure-fn fencing
@@ -8213,6 +8272,61 @@ pub(crate) fn check_and_bump_fence(
 /// a mis-routed key must be refused BEFORE the fence floor is raised/persisted).
 /// `enqueue_batch_put` keeps its own region check + per-op range (it records
 /// accumulator statuses, not a single resp).
+/// The memory tier's put: a bulk put of a covered key, unfenced and within the
+/// value cap, is held in the partition's shard and answered OK without a log
+/// append. Returns the request when it must take the durable path instead (not
+/// covered, fenced, too large, an older durable write of the key not applied
+/// yet, or no room after eviction).
+fn mem_tier_put(
+    req: PartitionRequest,
+    part: &Rc<RefCell<PartitionData>>,
+    pending: &[WriteRequest],
+) -> Option<PartitionRequest> {
+    let (key, value, expires_at, region_epoch) = match req.msg_type {
+        MSG_PUT_BULK => {
+            // Malformed requests take the durable path, which answers them.
+            let Some(meta) = partition_rpc::parse_put_bulk_meta(&req.payload) else { return Some(req) };
+            if meta.inode_hint != 0 {
+                return Some(req);
+            }
+            let key = req.payload.slice(PUT_BULK_HEADER_LEN..meta.value_offset);
+            let value = match &req.bulk_value {
+                Some(v) => v.clone(),
+                None => req.payload.slice(meta.value_offset..),
+            };
+            (key, value, meta.expires_at, meta.region_epoch)
+        }
+        _ => return Some(req),
+    };
+    let mut p = part.borrow_mut();
+    if !p.mem_tier.as_ref().is_some_and(|m| m.covers(&key)) || value.len() > AUTUMN_PS_MAX_INLINE_BYTES_DEFAULT as usize {
+        return Some(req);
+    }
+    // An older durable write of the key, queued or in flight, would land
+    // after the held value and could drop it (`applied`) for its older value:
+    // write this one durably behind it instead.
+    if pending.iter().any(|w| w.writes_key(&key))
+        || p.inflight_write_keys.contains_key(&background::inflight_key_hash(&key))
+    {
+        return Some(req);
+    }
+    if let Some(err) = admit_region_range(region_epoch, &key, p.region_epoch, p.part_id, Some(&p.rg)) {
+        let _ = req.resp_tx.send(Err(err));
+        return None;
+    }
+    // Own the bytes: a received value aliases a pooled receive buffer (or a
+    // batch's whole tail) that must go back to its pool.
+    let owned = if req.bulk_value.is_some() { Bytes::copy_from_slice(&value) } else { value };
+    let mem = p.mem_tier.as_mut().expect("checked above");
+    if !mem.insert(&key, owned, expires_at, Instant::now()) {
+        return Some(req);
+    }
+    drop(p);
+    let resp = PutResp { code: CODE_OK, message: String::new(), key: key.to_vec() };
+    let _ = req.resp_tx.send(Ok(partition_rpc::rkyv_encode(&resp)));
+    None
+}
+
 fn admit_region_range(
     region_epoch: u64,
     key: &[u8],

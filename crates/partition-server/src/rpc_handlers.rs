@@ -1180,7 +1180,9 @@ async fn get_value_inner(
                 "key is out of range".to_string(),
             ));
         }
-        lookup_in_memtable(&p.active, &req.key)
+        // The memory tier holds a newer value than anything in the LSM.
+        mem_tier_get(&p, &req.key)
+            .or_else(|| lookup_in_memtable(&p.active, &req.key))
             .inspect(|_r| {
                 source = 1;
             })
@@ -1389,6 +1391,12 @@ pub(crate) async fn handle_head(
 /// The newest entry for `key` — memtable, immutables, then SSTs — as
 /// `(op, raw value)`, or None when absent, deleted or expired. Resolves no
 /// value pointer. The caller has checked epoch and range.
+/// A value the memory tier holds for `key`, shaped like a memtable hit.
+fn mem_tier_get(p: &PartitionData, key: &[u8]) -> Option<(u8, Bytes, u64)> {
+    let (value, expires_at) = p.mem_tier.as_ref()?.get(key, now_secs())?;
+    Some((crate::OP_PUT, value, expires_at))
+}
+
 async fn lookup_live(
     part: &Rc<RefCell<PartitionData>>,
     key: &[u8],
@@ -1396,7 +1404,7 @@ async fn lookup_live(
     // Borrow released before the SST lookup's awaits (note 15).
     let mut found = {
         let p = part.borrow();
-        lookup_in_memtable(&p.active, key).or_else(|| {
+        mem_tier_get(&p, key).or_else(|| lookup_in_memtable(&p.active, key)).or_else(|| {
             for imm in p.imm.iter().rev() {
                 if let Some(r) = lookup_in_memtable(imm, key) {
                     return Some(r);

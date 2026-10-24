@@ -621,6 +621,54 @@ a compaction moves the cursor past them. Load-bearing:
   extent's garbage reported as `open_tail_dead`, then as debt once the cursor
   moves; red when split at the tail), `background::wal_debt_tests`.
 
+## Memory tier (`mem_tier.rs`) — optional, not durable
+
+`--mem-tier-bytes N --mem-tier-prefix kvc/` (both needed; off by default). A
+bulk put of a covered key (`MSG_PUT_BULK`, i.e. a value ≥ 64 KiB; unfenced,
+within the inline cap) is held in DRAM by the partition's write actor and
+answered OK without a log append (`mem_tier_put`, after the freeze and
+epoch/range checks, so it keeps arrival order with deletes and conditional
+writes of the key). Small puts stay durable: KV pages are bulk, and leaving
+`MSG_PUT` alone keeps every other put from being decoded twice. A put whose key
+has an older durable write queued or in flight (`pending`, `inflight_write_keys`)
+is written durably behind it — held, it would be dropped when the older write
+landed and reads would go back to the older value.
+Reads look in the tier first: `get_value_inner` (GET, batched GET, redirects,
+`compare`) and `lookup_live` (HEAD, presence checks) — a hit is shaped as an
+inline memtable hit, so a redirect request gets the value inline.
+
+- **Not durable**: a restart, reopen, split, merge or move drops the shard
+  with `PartitionData`; a key that also has a durable value reads that older
+  value afterwards. Meant for recomputable data (KV cache).
+- **Budget** is per PS (atomic, shared by its partitions); each partition owns
+  its shard on its own thread (no lock). A shard evicts only its own entries;
+  an insert that cannot fit after that takes the durable path, and the value
+  held for the key (if any) stays served, marked, until that write lands. So a
+  partition that filled its share and went idle keeps it; the others write
+  durably once the PS budget is full (`refused_total` grows).
+- **Eviction**: CLOCK over groups — inserts closer than 50 ms form one group
+  (≤ 256 entries), dropped together; a GET or HEAD of any member sets the
+  group's reference bit. A KV-cache hit is a run of consecutive pages, so a
+  hole in the middle of a run wastes the rest of it.
+- **Durable writes of a held key** (delete, conditional write, batch put,
+  fenced or oversized put, a put that did not fit) mark the entry superseded
+  when queued (marked after dispatch over what the enqueue appended to
+  `pending`; conditional writes by key); `finish_write_batch` drops a marked
+  entry once a write of its key reaches the memtable. A read therefore never
+  falls back to a value older than the held one; a later memory put clears
+  the mark. GC relocation writes the memtable through its own path, so it
+  never drops an entry.
+- Not covered: RANGE does not list keys held only in memory.
+- Metrics: `autumn_ps_mem_tier_{bytes,capacity_bytes,hits_total,
+  inserts_total,refused_total,evicted_entries_total,evicted_bytes_total}`.
+- Tests: `mem_tier::tests` (grouped eviction and its second chance, refusal,
+  expiry, supersede-then-apply, budget returned on drop);
+  `crates/manager/tests/mem_tier.rs` (held keys gone after a restart, durable
+  fallbacks back, a durable write replacing the held value, delete, TTL,
+  conditional write, grouped eviction, a held put behind an older durable write
+  of its key written durably; ablations red: no drop on apply, GET or presence
+  lookup skipping the tier, no older-write check).
+
 ## Read Path: Get
 
 ```

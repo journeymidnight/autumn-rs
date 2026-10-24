@@ -569,6 +569,10 @@ launch_ps() {
     if [[ -n "${AUTUMN_PS_CONN_INFLIGHT_CAP:-}" ]]; then
         tunable_args+=(--conn-inflight-cap "$AUTUMN_PS_CONN_INFLIGHT_CAP")
     fi
+    # Memory tier (crates/partition-server/src/mem_tier.rs): both or neither.
+    if [[ -n "${AUTUMN_PS_MEM_TIER_BYTES:-}" ]]; then
+        tunable_args+=(--mem-tier-bytes "$AUTUMN_PS_MEM_TIER_BYTES" --mem-tier-prefix "${AUTUMN_PS_MEM_TIER_PREFIX:?set AUTUMN_PS_MEM_TIER_PREFIX with AUTUMN_PS_MEM_TIER_BYTES}")
+    fi
     if [[ -n "${AUTUMN_PS_FG_RATE_BYTES_PER_SEC:-}" ]]; then
         tunable_args+=(--fg-rate-bytes-per-sec "$AUTUMN_PS_FG_RATE_BYTES_PER_SEC")
     fi

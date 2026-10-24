@@ -2268,6 +2268,11 @@ pub(crate) async fn finish_write_batch(
         let durable_bumps_ref = &mut durable_bumps;
         let mut deletes: u64 = 0;
         let deletes_ref = &mut deletes;
+        // Keys the memory tier must hear about once applied (`mem_tier.rs`).
+        let mut applied_keys: Option<Vec<Bytes>> = p.mem_tier.as_ref().map(|_| Vec::new());
+        let mem_budget = p.mem_tier.as_ref().map(|m| m.budget());
+        let mem_covers = move |k: &[u8]| mem_budget.as_ref().is_some_and(|b| b.covers(k));
+        let applied_keys_ref = &mut applied_keys;
         // Value bytes this batch left behind ValuePointers: the only part of
         // its log records still live after the flush (`Memtable::wal_dead`).
         let mut vp_value_bytes: u64 = 0;
@@ -2329,6 +2334,11 @@ pub(crate) async fn finish_write_batch(
                 }
             };
 
+            if let Some(keys) = applied_keys_ref.as_mut() {
+                if mem_covers(&entry.user_key) {
+                    keys.push(entry.user_key.clone());
+                }
+            }
             if entry.op == crate::OP_TOMBSTONE {
                 *deletes_ref += 1;
             }
@@ -2338,6 +2348,11 @@ pub(crate) async fn finish_write_batch(
         });
 
         p.active.insert_batch(iter);
+        if let (Some(keys), Some(mem)) = (applied_keys, p.mem_tier.as_mut()) {
+            for k in keys {
+                mem.applied(&k);
+            }
+        }
         p.publish_lsm_gauges();
         if deletes > 0 {
             p.metrics
