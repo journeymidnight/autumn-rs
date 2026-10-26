@@ -694,8 +694,12 @@ inline memtable hit, so a redirect request gets the value inline.
   Accepted cost (standard CLOCK, user's call): when everything in the tier was
   read since the hand's last pass, a burst not yet read is what goes next.
   The clock is `clock.rs` (a slot array, shared with the block cache below);
-  groups are its items. The group a burst writes to is remembered by (slot,
-  id): when it was
+  groups are its items. Making room for a burst never evicts the group it is
+  writing: with every other group read since the hand's last pass, the hand
+  used to come round to it first. Only that one group is kept — a burst
+  longer than one group (256 entries) can still lose its earlier groups, and
+  a burst whose inserts are refused for over 50 ms counts as over. The group a
+  burst writes to is remembered by (slot, id): when it was
   whatever sat last in a rotating queue, the hand moving read groups behind it
   made the rest of a burst join one of them.
 - **Durable writes of a held key** (delete, conditional write, batch put,
@@ -712,7 +716,8 @@ inline memtable hit, so a redirect request gets the value inline.
 - Tests: `mem_tier::tests` (grouped eviction, a read saving a burst, groups
   read before the first eviction surviving it, groups read every round
   surviving steady writes of uneven bursts, a burst that evicts keeping its
-  own group (red on the queue version), refusal, expiry,
+  own group whole (red on the queue version, and when the group is not
+  kept), refusal, expiry,
   supersede-then-apply, budget returned on drop; ablations red: a bit on
   insert, no bit on GET);
   `crates/manager/tests/mem_tier.rs` (held keys gone after a restart, durable

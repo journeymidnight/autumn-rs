@@ -1,3 +1,10 @@
+Date: 2026-10-26 (3)
+TaskStatus: completed
+Task scope: user — "fix: 淘汰时跳过当前正在写的组" (memory tier: making room for a burst must not evict the burst's own group).
+Current summary: MemShard::insert passes the burst's current group (remembered (slot, id), within the 50 ms burst gap) as `keep` to Clock::evict. Test a_burst_that_evicts_keeps_its_own_group now requires all 4 burst keys in one new group (red with keep=None: 3 held). PS lib 252 green; live 8 GiB hot-set 20/20 both variants. Opus review: no correctness issue.
+Main gaps (for the user): only the current group is kept — a burst longer than 256 entries per shard can still lose its head group (reviewer reproduced with 400); refused inserts do not extend the burst, so after 50 ms of refusals the burst's group is unprotected. Docs say so.
+Next steps: user decides on the two gaps. Autumn cluster (8 GiB repro config) up; sglang TP8 test instance stopped; held TP8 server (port 30000) untouched.
+
 Date: 2026-10-26 (2)
 TaskStatus: completed
 Task scope: user — merge the two CLOCK implementations (SST block cache, memory tier) into one file; the user's design: slot array + free list + hand, skip empty slots. Then re-run sglang TP8 + autumn L3.

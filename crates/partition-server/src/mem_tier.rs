@@ -20,7 +20,8 @@
 //! `crate::clock`: a new group starts unreferenced, a read or check of any
 //! member sets its reference bit, and the hand evicts the first group it finds
 //! without one, clearing the bits it passes. The group a burst writes to is
-//! remembered by slot and id, so a burst never spills into an older group.
+//! remembered by slot and id, so a burst never spills into an older group,
+//! and making room for it never evicts that group.
 //!
 //! A write does not set the bit. When it did, every group was born referenced:
 //! under steady writes the hand cleared a whole turn every few batches, and a
@@ -159,12 +160,15 @@ impl MemShard {
     }
 
     /// Hold `value` for `key`. False when it does not fit even after evicting
-    /// this shard's evictable groups; the caller then writes it durably.
+    /// every other group of this shard; the caller then writes it durably.
     pub(crate) fn insert(&mut self, key: &[u8], value: Bytes, expires_at: u64, now: Instant) -> bool {
         // The key is stored twice: in the map and in its group.
         let charge = 2 * key.len() as u64 + value.len() as u64 + ENTRY_OVERHEAD;
+        let in_burst = self.last_insert.is_some_and(|t| now.duration_since(t) <= GROUP_GAP);
+        // Making room never evicts the group this burst is writing.
+        let current = self.open.filter(|&(slot, id)| in_burst && self.groups.get(slot).is_some_and(|g| g.id == id));
         while !self.budget.try_reserve(charge) {
-            if !self.evict_one_group() {
+            if !self.evict_one_group(current.map(|(slot, _)| slot)) {
                 self.budget.refused.fetch_add(1, Relaxed);
                 // The caller writes it durably: keep serving the held value
                 // until that write lands.
@@ -173,10 +177,7 @@ impl MemShard {
             }
         }
         self.remove(key);
-        let in_burst = self.last_insert.is_some_and(|t| now.duration_since(t) <= GROUP_GAP);
-        let open = self.open.filter(|&(slot, id)| {
-            in_burst && self.groups.get(slot).is_some_and(|g| g.id == id && g.keys.len() < GROUP_MAX_ENTRIES)
-        });
+        let open = current.filter(|&(slot, _)| self.groups.get(slot).is_some_and(|g| g.keys.len() < GROUP_MAX_ENTRIES));
         let (slot, id) = open.unwrap_or_else(|| {
             let id = self.next_group;
             self.next_group += 1;
@@ -224,9 +225,10 @@ impl MemShard {
         }
     }
 
-    /// Drop the group the clock picks. False when the shard holds nothing.
-    fn evict_one_group(&mut self) -> bool {
-        let Some((_, g)) = self.groups.evict(None) else { return false };
+    /// Drop the group the clock picks, never `keep`. False when nothing else
+    /// is left.
+    fn evict_one_group(&mut self, keep: Option<usize>) -> bool {
+        let Some((_, g)) = self.groups.evict(keep) else { return false };
         let mut bytes = 0;
         let mut n = 0;
         for k in &g.keys {
@@ -379,9 +381,11 @@ mod tests {
         }
     }
 
-    /// A burst that needs room keeps its own group. When the open group was
-    /// whatever sat last in the ring, the hand moving read groups behind it
-    /// made the rest of the burst join one of them (c2 joined b).
+    /// A burst that needs room keeps its own group, whole. When the open group
+    /// was whatever sat last in a rotating queue, the hand moving read groups
+    /// behind it made the rest of the burst join one of them (c2 joined b);
+    /// with every other group read, the hand evicted the burst's own group
+    /// (c1) unless it is kept.
     #[test]
     fn a_burst_that_evicts_keeps_its_own_group() {
         let entry = 1000 + 2 * 6 + ENTRY_OVERHEAD;
@@ -398,8 +402,8 @@ mod tests {
         let c: &[&[u8]] = &[b"kvc/c1", b"kvc/c2", b"kvc/c3", b"kvc/c4"];
         burst(&mut s, c, t0 + Duration::from_secs(2));
         let held: Vec<u64> = c.iter().filter_map(|k| s.entries.get(*k).map(|e| e.group)).collect();
-        assert!(held.len() >= 3, "burst keys held: {held:?}");
-        assert!(held.iter().all(|g| !old.contains(g)), "burst keys joined an older group: {held:?} vs {old:?}");
+        assert_eq!(held.len(), 4, "burst keys held: {held:?}");
+        assert!(held.iter().all(|g| *g == held[0] && !old.contains(g)), "burst split or joined an older group: {held:?} vs {old:?}");
     }
 
     #[test]
