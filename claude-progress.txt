@@ -1,3 +1,10 @@
+Date: 2026-10-26 (4)
+TaskStatus: completed
+Task scope: user — fix the two gaps of the burst-group keep (a long burst's first group; refusals ending a burst); then, after review, "撤掉这次两处改动".
+Current summary: implemented keep = [burst's first group, current group] + refused inserts extending the burst; both regression tests red-then-green. Opus review found a HIGH: a burst is cut by a 50 ms gap, so under nonstop writes it never ends; a shard left with only those two groups refused every insert and the refusals kept the burst alive (unit test: 0 of the last 1000 inserts accepted; committed code accepts all). User chose to revert both. Kept test nonstop_writes_keep_being_accepted (red on the reverted version; its budget-200 case is red when refusals alone extend the burst). Docs/ledger record the decision (BUG-MEM-TIER-LONG-BURST-LOSES-HEAD, passes false); a later review struck an overclaim ("the first group is lost only when the tier is all hot" — false: a new group appended at the end can sit ahead of the hand). PS lib 253 green.
+Main gaps: pre-existing — a shard with under one group of room refuses part of nonstop writes until 50 ms pass without an accepted insert (reviewer: 650-850 of 1000 accepted at 100-255 entries). A real fix for burst boundaries needs the client to mark them (one put_from = one group), a wire change.
+Next steps: user decides. Test cluster stopped and cleaned; release binaries rebuilt from HEAD code; held TP8 server (port 30000) untouched.
+
 Date: 2026-10-26 (3)
 TaskStatus: completed
 Task scope: user — "fix: 淘汰时跳过当前正在写的组" (memory tier: making room for a burst must not evict the burst's own group).

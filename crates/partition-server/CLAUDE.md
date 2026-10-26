@@ -682,7 +682,7 @@ inline memtable hit, so a redirect request gets the value inline.
 - **Eviction**: CLOCK over groups — inserts closer than 50 ms form one group
   (≤ 256 entries), dropped together. A KV-cache hit is a run of consecutive
   pages, so a hole in the middle of a run wastes the rest of it. A new group
-  goes in behind the hand (a full turn before the hand reaches it); only a GET
+  usually goes in behind the hand (into the slot it just freed); only a GET
   or HEAD of a member sets its reference bit. A write used to set it too, so
   every group was born referenced: under steady writes the hand cleared a
   whole turn every few batches, and a group read once between batches was
@@ -698,10 +698,14 @@ inline memtable hit, so a redirect request gets the value inline.
   writing: with every other group read since the hand's last pass, the hand
   used to come round to it first. Only that one group is kept — a burst
   longer than one group (256 entries) can still lose its earlier groups, and
-  a burst whose inserts are refused for over 50 ms counts as over. The group a
-  burst writes to is remembered by (slot, id): when it was
-  whatever sat last in a rotating queue, the hand moving read groups behind it
-  made the rest of a burst join one of them.
+  a burst whose inserts are refused for over 50 ms counts as over. Keeping
+  the first group too, with refusals extending the burst, was tried and
+  reverted (user, 2026-10-26): a burst is cut by time, so under nonstop writes
+  it never ends and a shard left with only those groups refused every insert
+  (`nonstop_writes_keep_being_accepted`). The group a burst writes to is
+  remembered by (slot, id): when it was whatever sat last in a rotating queue,
+  the hand moving read groups behind it made the rest of a burst join one of
+  them.
 - **Durable writes of a held key** (delete, conditional write, batch put,
   fenced or oversized put, a put that did not fit) mark the entry superseded
   when queued (marked after dispatch over what the enqueue appended to

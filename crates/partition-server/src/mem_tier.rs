@@ -406,6 +406,29 @@ mod tests {
         assert!(held.iter().all(|g| *g == held[0] && !old.contains(g)), "burst split or joined an older group: {held:?} vs {old:?}");
     }
 
+    fn key(prefix: &str, i: usize) -> Vec<u8> {
+        format!("kvc/{prefix}{i:07}").into_bytes()
+    }
+
+    /// Writes that never pause keep being accepted. A burst under nonstop
+    /// writes never ends, so refusals extending it froze a shard: with the
+    /// burst's first group kept too (300 entries), or alone once the current
+    /// group fills the shard (200).
+    #[test]
+    fn nonstop_writes_keep_being_accepted() {
+        let entry = 1000 + 2 * 12 + ENTRY_OVERHEAD;
+        let late_accepted = |cap: u64| {
+            let mut s = shard(cap * entry);
+            let t0 = Instant::now();
+            let accepted: Vec<bool> =
+                (0..3000).map(|i| s.insert(&key("n", i), v(1000), 0, t0 + Duration::from_millis(i as u64))).collect();
+            let newest_held = (2900..3000).filter(|&i| s.entries.contains_key(&key("n", i))).count();
+            (accepted[2000..].iter().filter(|&&a| a).count(), newest_held)
+        };
+        assert_eq!(late_accepted(300), (1000, 100));
+        assert!(late_accepted(200).0 > 0, "a shard under one group of room stopped accepting");
+    }
+
     #[test]
     fn a_value_that_cannot_fit_is_refused() {
         let mut s = shard(500);
