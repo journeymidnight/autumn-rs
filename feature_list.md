@@ -44,13 +44,6 @@
 - **notes** (2026-10-24): exists 长尾（写入进行中 p99 500–800 ms）的根因不是 PS `conn_inflight_cap`（调到 64 不变），也不是 GIL、连接队列：io_uring 在提交系统调用里就地完成 socket 发送，16 MiB 页在回环上是内核里的 CPU 活，worker 线程 93% CPU 卡在 `submit_with_args`（gdb 25/25 采样），同一运行时上的探测只能等。对照：另一线程上的 client p99 12 ms；写 1 MiB 页长尾缩到 35 ms。修：BatchClient 多一个专门跑 exists 的线程（自己的运行时和连接），读写 worker 恢复串行 → 同 client 写入进行中 exists p99 12–13 ms、max 13 ms；消融（探测走读写 worker）p50 927 ms。
 - **notes** (2026-10-24，exists 长尾根因修正): 前面"专门 probe 线程"只对 TCP 的 io_uring 就地发送有效；UCX 上同 client 探测 p99 270 ms 的真因是 PS 每连接 4 个准入槽读写共用，同连接上 2–3 个 16 MiB put 占满后 HEAD 要等一次提交。修：RPC 客户端加 urgent 通道（读类请求先发）+ PS 连接的发送窗口（≥64 KiB 的未应答请求最多 3 个，`--ps-send-window`），probe 线程删掉，exists 回到同一 worker/同一 ClusterClient。同 client 写入进行中 exists p99 270 → 8.6 ms；perf-check 交替对照无一格变慢，UCX 单分区写 +30%。
 
-### F-KVC-LOW-REPLICA — kvc 写 2 副本、封存后转 EC 2+1
-- **Trigger** (2026-10-23 用户): KV-cache 可重算，3 副本写放大不必要。
-- **Scope**: 现在 `bootstrap --replication` 对 log/row/meta 一视同仁、split 子分区继承父流参数，没有按 namespace / 分区设副本数的入口。kvc 范围的分区：日志流 2 副本打开、封存后转 EC 2+1；meta/row 流保持 3 副本。
-- **Acceptance**: kvc 写入落 2 份、封存后为 EC 2+1；其他 namespace 不变；写带宽相对 3 副本提升可测；坏一块盘时的行为写进文档。
-- `passes: false`
-- **notes** (2026-10-23 用户): 按 namespace 设副本数比较难。替代：(1) KV-cache 单独一套集群，bootstrap 即 `--replication 2+0 --log-ec 2+1`，零代码；(2) 只在建 kvc 分区时指定日志流参数，之后 split 照常继承。倾向先 (1)。
-
 ### F-KVC-PARTITION-LAYOUT — PS 规划 8–16 分区，kvc 默认按哈希预切
 - **Trigger** (2026-10-23 用户 + 实测): 默认部署下一个模型的 KV 全在一个分区（实测写 0.36 GB/s）；kvc key 的模型标识带大写，`presplit --namespace` 拒收，只能 `presplit --namespace kvc --hash-prefix <model_scope>/kv/` 且只能切空键空间。
 - **Scope**: PS 分区数按 8–16 规划；kvc 按哈希预切做成部署的默认动作（模型标识事先不知道时怎么切要设计）。
