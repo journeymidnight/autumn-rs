@@ -6,8 +6,8 @@
 //! readers keep their per-reader slot vec (their memory is the resident
 //! bytes themselves, the slot vec just skips re-decode).
 //!
-//! Eviction: CLOCK. Entries sit in a slot array; a hit sets the slot's
-//! reference bit, and on overflow the hand clears set bits and evicts the
+//! Eviction: CLOCK (`crate::clock`). A block starts unreferenced, a hit sets
+//! its reference bit, and on overflow the hand clears set bits and evicts the
 //! first clear one. Every entry is reachable by the hand. The previous
 //! sampled LRU took the first 16 entries of the map's iteration order, which
 //! is fixed for a given table layout: entries outside that window were never
@@ -20,31 +20,33 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 
 use super::format::DecodedBlock;
+use crate::clock::Clock;
 
-struct Slot {
+struct Cached {
     key: (u64, u64),
     block: Arc<DecodedBlock>,
     size: usize,
-    referenced: bool,
 }
 
 struct Inner {
     map: HashMap<(u64, u64), usize>,
-    slots: Vec<Option<Slot>>,
-    free: Vec<usize>,
-    hand: usize,
+    clock: Clock<Cached>,
     bytes: usize,
     hits: u64,
     misses: u64,
 }
 
 impl Inner {
+    #[cfg(test)]
     fn remove_slot(&mut self, idx: usize) {
-        if let Some(s) = self.slots[idx].take() {
-            self.map.remove(&s.key);
-            self.bytes -= s.size;
-            self.free.push(idx);
+        if let Some(c) = self.clock.remove(idx) {
+            self.forget(c);
         }
+    }
+
+    fn forget(&mut self, c: Cached) {
+        self.map.remove(&c.key);
+        self.bytes -= c.size;
     }
 }
 
@@ -58,9 +60,7 @@ impl BlockCache {
         Self {
             inner: Mutex::new(Inner {
                 map: HashMap::new(),
-                slots: Vec::new(),
-                free: Vec::new(),
-                hand: 0,
+                clock: Clock::new(),
                 bytes: 0,
                 hits: 0,
                 misses: 0,
@@ -78,9 +78,8 @@ impl BlockCache {
         match g.map.get(&key).copied() {
             Some(idx) => {
                 g.hits += 1;
-                let slot = g.slots[idx].as_mut().expect("mapped slot is live");
-                slot.referenced = true;
-                Some(slot.block.clone())
+                g.clock.touch(idx);
+                Some(g.clock.get(idx).expect("mapped slot is live").block.clone())
             }
             None => {
                 g.misses += 1;
@@ -94,48 +93,26 @@ impl BlockCache {
         let g = &mut *g;
         let idx = match g.map.get(&key).copied() {
             Some(idx) => {
-                let slot = g.slots[idx].as_mut().expect("mapped slot is live");
-                g.bytes = g.bytes - slot.size + size;
-                slot.block = block;
-                slot.size = size;
-                slot.referenced = true;
+                let c = g.clock.get_mut(idx).expect("mapped slot is live");
+                let old = std::mem::replace(&mut c.size, size);
+                c.block = block;
+                g.bytes = g.bytes - old + size;
+                g.clock.touch(idx);
                 idx
             }
             None => {
                 // Unreferenced until hit: a block read once goes first.
-                let slot = Some(Slot {
-                    key,
-                    block,
-                    size,
-                    referenced: false,
-                });
-                let idx = match g.free.pop() {
-                    Some(i) => {
-                        g.slots[i] = slot;
-                        i
-                    }
-                    None => {
-                        g.slots.push(slot);
-                        g.slots.len() - 1
-                    }
-                };
+                let idx = g.clock.insert(Cached { key, block, size });
                 g.map.insert(key, idx);
                 g.bytes += size;
                 idx
             }
         };
-        // Never evicts the entry just inserted. Each pass clears every bit
-        // it passes, so a victim turns up within two turns of the hand.
-        while g.bytes > self.cap_bytes && g.map.len() > 1 {
-            let h = g.hand;
-            g.hand = (h + 1) % g.slots.len();
-            if h == idx {
-                continue;
-            }
-            match g.slots[h].as_mut() {
-                None => {}
-                Some(s) if s.referenced => s.referenced = false,
-                Some(_) => g.remove_slot(h),
+        // Never evicts the entry just inserted.
+        while g.bytes > self.cap_bytes {
+            match g.clock.evict(Some(idx)) {
+                Some((_, c)) => g.forget(c),
+                None => break,
             }
         }
     }

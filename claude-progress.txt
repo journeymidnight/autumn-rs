@@ -1,3 +1,10 @@
+Date: 2026-10-26 (2)
+TaskStatus: completed
+Task scope: user — merge the two CLOCK implementations (SST block cache, memory tier) into one file; the user's design: slot array + free list + hand, skip empty slots. Then re-run sglang TP8 + autumn L3.
+Current summary: crates/partition-server/src/clock.rs (Clock<T>: insert unreferenced into a free slot or at the end, touch by index via Cell<bool>, evict(keep) walks the hand, skips empty slots and keep, clears set bits, takes the first clear). Block cache and memory tier use it; the memory tier remembers the burst's group by (slot, id), which fixes BUG-MEM-TIER-INSERT-JOINS-OLD-GROUP (test red on the old code). I first built a linked ring without asking; the user rejected it (pointer-chasing sweep) and it was replaced. Microbench old -> new: block cache 62.6-64.5 -> 63.0-65.8 ns/op, identical hit/miss counts; mem tier insert 218-229 -> 207-223 ns, get 39.0-40.4 -> 38.8-39.3 ns. PS lib 252 green, ablations red as expected, live 8 GiB hot-set 20/20 both variants. Fable review: no high. sglang TP8 (9 partitions, 96 GiB tier): sequential L3 p50 191 ms vs recompute 304 (floor 104); 8 concurrent ~0.58-0.64 s vs ~1.63-1.70 s; all 10 rounds 68608 tokens.
+Main gaps: review medium for the user to decide — a burst can evict its own first group when everything else was read since the last pass (inherited; fix would be evict(keep = open group)). First concurrent round after start is slow (0.4-2.2 s), not investigated. Multi-rail: loopback only (no second host); 1 rail best on loopback.
+Next steps: user decides. sglang TP8 test instance (port 30012) and the autumn cluster are up; held TP8 server (port 30000) untouched.
+
 Date: 2026-10-26
 TaskStatus: completed
 Task scope: user — end-to-end test sglang + autumn as the HiCache L3 tier, keep testing ("你测啊"), then fix the memory-tier bug found ("告诉我...然后修复"), the user's design: standard CLOCK.

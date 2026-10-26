@@ -693,6 +693,11 @@ inline memtable hit, so a redirect request gets the value inline.
   every hot entry (36–49 GB evicted) and the sglang rounds stay at 68608.
   Accepted cost (standard CLOCK, user's call): when everything in the tier was
   read since the hand's last pass, a burst not yet read is what goes next.
+  The clock is `clock.rs` (a slot array, shared with the block cache below);
+  groups are its items. The group a burst writes to is remembered by (slot,
+  id): when it was
+  whatever sat last in a rotating queue, the hand moving read groups behind it
+  made the rest of a burst join one of them.
 - **Durable writes of a held key** (delete, conditional write, batch put,
   fenced or oversized put, a put that did not fit) mark the entry superseded
   when queued (marked after dispatch over what the enqueue appended to
@@ -706,7 +711,8 @@ inline memtable hit, so a redirect request gets the value inline.
   inserts_total,refused_total,evicted_entries_total,evicted_bytes_total}`.
 - Tests: `mem_tier::tests` (grouped eviction, a read saving a burst, groups
   read before the first eviction surviving it, groups read every round
-  surviving steady writes of uneven bursts, refusal, expiry,
+  surviving steady writes of uneven bursts, a burst that evicts keeping its
+  own group (red on the queue version), refusal, expiry,
   supersede-then-apply, budget returned on drop; ablations red: a bit on
   insert, no bit on GET);
   `crates/manager/tests/mem_tier.rs` (held keys gone after a restart, durable
@@ -2635,9 +2641,10 @@ what skips a table; with no working filter each probe reads a data block, so the
 block cache's working set is readers x tables.
 
 ### Block cache eviction
-CLOCK over a slot array: a hit sets the slot's reference bit, a new block
-starts unreferenced, and on overflow the hand clears set bits and evicts the
-first clear slot. Every entry is reachable by the hand. The earlier sampled
+CLOCK over a slot array (`clock.rs`, shared with the memory tier): a hit sets
+the slot's reference bit, a new block starts unreferenced, and on overflow the
+hand clears set bits and evicts the first clear slot; it skips empty slots and
+the block just inserted. Every entry is reachable by the hand. The earlier sampled
 LRU took the first 16 entries of `HashMap` iteration order, which is fixed
 for a given table layout (Rust randomises the hash seed, not the iteration
 start), so entries outside that window were never evicted: once full, only

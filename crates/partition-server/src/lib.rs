@@ -9,6 +9,7 @@ pub mod compact_policy;
 mod wal_record;
 pub mod metrics;
 mod plog_load;
+mod clock;
 mod mem_tier;
 pub use metrics::{LatHist, PartitionMetrics, LAT_BUCKET_BOUNDS_NS};
 

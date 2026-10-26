@@ -16,10 +16,11 @@
 //! no gap above `GROUP_GAP` (one engine batch, in practice), capped at
 //! `GROUP_MAX_ENTRIES`. A KV-cache hit is the run of consecutive pages from the
 //! start of a prefix, so evicting one page in the middle of a run wastes every
-//! page after it; dropping a burst together does not. A new group goes in
-//! behind the hand, so the hand reaches it only after a full turn; a read or
-//! check of any member sets its reference bit, and the hand evicts the first
-//! group it finds without one, clearing the bits it passes.
+//! page after it; dropping a burst together does not. Groups sit in a
+//! `crate::clock`: a new group starts unreferenced, a read or check of any
+//! member sets its reference bit, and the hand evicts the first group it finds
+//! without one, clearing the bits it passes. The group a burst writes to is
+//! remembered by slot and id, so a burst never spills into an older group.
 //!
 //! A write does not set the bit. When it did, every group was born referenced:
 //! under steady writes the hand cleared a whole turn every few batches, and a
@@ -32,14 +33,14 @@
 //! to a value older than the one held here. A later memory put of the key
 //! replaces the entry and clears the mark.
 
-use std::cell::Cell;
-use std::collections::{HashMap, VecDeque};
-use std::rc::Rc;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+
+use crate::clock::Clock;
 
 /// Inserts closer together than this belong to one group.
 const GROUP_GAP: Duration = Duration::from_millis(50);
@@ -116,29 +117,37 @@ struct Entry {
     expires_at: u64,
     charge: u64,
     group: u64,
-    referenced: Rc<Cell<bool>>,
+    /// The group's slot in `groups`.
+    slot: usize,
     superseded: bool,
 }
 
 struct Group {
     id: u64,
     keys: Vec<Vec<u8>>,
-    referenced: Rc<Cell<bool>>,
 }
 
 /// One partition's entries, owned by its thread.
 pub(crate) struct MemShard {
     budget: Arc<MemTierBudget>,
     entries: HashMap<Vec<u8>, Entry>,
-    /// CLOCK ring of groups; the front is the hand.
-    groups: VecDeque<Group>,
+    groups: Clock<Group>,
     next_group: u64,
+    /// The group the current burst writes to: (slot, id).
+    open: Option<(usize, u64)>,
     last_insert: Option<Instant>,
 }
 
 impl MemShard {
     pub(crate) fn new(budget: Arc<MemTierBudget>) -> Self {
-        MemShard { budget, entries: HashMap::new(), groups: VecDeque::new(), next_group: 0, last_insert: None }
+        MemShard {
+            budget,
+            entries: HashMap::new(),
+            groups: Clock::new(),
+            next_group: 0,
+            open: None,
+            last_insert: None,
+        }
     }
 
     pub(crate) fn covers(&self, key: &[u8]) -> bool {
@@ -164,23 +173,19 @@ impl MemShard {
             }
         }
         self.remove(key);
-        let open = self.last_insert.is_some_and(|t| now.duration_since(t) <= GROUP_GAP)
-            && self.groups.back().is_some_and(|g| g.keys.len() < GROUP_MAX_ENTRIES);
-        if !open {
-            self.groups.push_back(Group { id: self.next_group, keys: Vec::new(), referenced: Rc::default() });
+        let in_burst = self.last_insert.is_some_and(|t| now.duration_since(t) <= GROUP_GAP);
+        let open = self.open.filter(|&(slot, id)| {
+            in_burst && self.groups.get(slot).is_some_and(|g| g.id == id && g.keys.len() < GROUP_MAX_ENTRIES)
+        });
+        let (slot, id) = open.unwrap_or_else(|| {
+            let id = self.next_group;
             self.next_group += 1;
-        }
+            (self.groups.insert(Group { id, keys: Vec::new() }), id)
+        });
+        self.open = Some((slot, id));
         self.last_insert = Some(now);
-        let group = self.groups.back_mut().expect("a group was just ensured");
-        group.keys.push(key.to_vec());
-        let entry = Entry {
-            value,
-            expires_at,
-            charge,
-            group: group.id,
-            referenced: group.referenced.clone(),
-            superseded: false,
-        };
+        self.groups.get_mut(slot).expect("the open group is live").keys.push(key.to_vec());
+        let entry = Entry { value, expires_at, charge, group: id, slot, superseded: false };
         self.entries.insert(key.to_vec(), entry);
         self.budget.inserts.fetch_add(1, Relaxed);
         true
@@ -193,7 +198,7 @@ impl MemShard {
         if e.expires_at > 0 && e.expires_at <= now_secs {
             return None;
         }
-        e.referenced.set(true);
+        self.groups.touch(e.slot);
         self.budget.hits.fetch_add(1, Relaxed);
         Some((e.value.clone(), e.expires_at))
     }
@@ -219,32 +224,23 @@ impl MemShard {
         }
     }
 
-    /// Drop the first group the hand finds unreferenced, clearing the
-    /// reference of each it passes. False when the shard holds nothing.
+    /// Drop the group the clock picks. False when the shard holds nothing.
     fn evict_one_group(&mut self) -> bool {
-        // One turn clears every reference bit; the next pop evicts.
-        for _ in 0..2 * self.groups.len() + 1 {
-            let Some(g) = self.groups.pop_front() else { return false };
-            if g.referenced.replace(false) {
-                self.groups.push_back(g);
-                continue;
+        let Some((_, g)) = self.groups.evict(None) else { return false };
+        let mut bytes = 0;
+        let mut n = 0;
+        for k in &g.keys {
+            // A key re-inserted later belongs to a newer group.
+            if self.entries.get(k).is_some_and(|e| e.group == g.id) {
+                let e = self.entries.remove(k).expect("checked above");
+                self.budget.release(e.charge);
+                bytes += e.charge;
+                n += 1;
             }
-            let mut bytes = 0;
-            let mut n = 0;
-            for k in &g.keys {
-                // A key re-inserted later belongs to a newer group.
-                if self.entries.get(k).is_some_and(|e| e.group == g.id) {
-                    let e = self.entries.remove(k).expect("checked above");
-                    self.budget.release(e.charge);
-                    bytes += e.charge;
-                    n += 1;
-                }
-            }
-            self.budget.evicted_entries.fetch_add(n, Relaxed);
-            self.budget.evicted_bytes.fetch_add(bytes, Relaxed);
-            return true;
         }
-        false
+        self.budget.evicted_entries.fetch_add(n, Relaxed);
+        self.budget.evicted_bytes.fetch_add(bytes, Relaxed);
+        true
     }
 }
 
@@ -381,6 +377,29 @@ mod tests {
             let left = hot_left_per_round(24, 40, Some(seed));
             assert!(left.iter().all(|&h| h == 2 * GROUP_MAX_ENTRIES), "seed {seed}: hot entries per round {left:?}");
         }
+    }
+
+    /// A burst that needs room keeps its own group. When the open group was
+    /// whatever sat last in the ring, the hand moving read groups behind it
+    /// made the rest of the burst join one of them (c2 joined b).
+    #[test]
+    fn a_burst_that_evicts_keeps_its_own_group() {
+        let entry = 1000 + 2 * 6 + ENTRY_OVERHEAD;
+        let mut s = shard(8 * entry);
+        let t0 = Instant::now();
+        let (a, b): (&[&[u8]], &[&[u8]]) =
+            (&[b"kvc/a1", b"kvc/a2", b"kvc/a3", b"kvc/a4"], &[b"kvc/b1", b"kvc/b2", b"kvc/b3"]);
+        burst(&mut s, a, t0);
+        burst(&mut s, b, t0 + Duration::from_secs(1));
+        for k in a.iter().chain(b) {
+            assert!(s.get(k, 0).is_some());
+        }
+        let old: std::collections::HashSet<u64> = s.entries.values().map(|e| e.group).collect();
+        let c: &[&[u8]] = &[b"kvc/c1", b"kvc/c2", b"kvc/c3", b"kvc/c4"];
+        burst(&mut s, c, t0 + Duration::from_secs(2));
+        let held: Vec<u64> = c.iter().filter_map(|k| s.entries.get(*k).map(|e| e.group)).collect();
+        assert!(held.len() >= 3, "burst keys held: {held:?}");
+        assert!(held.iter().all(|g| !old.contains(g)), "burst keys joined an older group: {held:?} vs {old:?}");
     }
 
     #[test]
