@@ -16,12 +16,15 @@
 //! no gap above `GROUP_GAP` (one engine batch, in practice), capped at
 //! `GROUP_MAX_ENTRIES`. A KV-cache hit is the run of consecutive pages from the
 //! start of a prefix, so evicting one page in the middle of a run wastes every
-//! page after it; dropping a burst together does not. Writing to a group and
-//! reading or checking any member both set its reference bit, so what goes is
-//! the oldest group nobody has touched since the hand last passed it (an
-//! approximate LRU). A new group starting unreferenced would be evicted before
-//! older groups that were merely read once: the burst just written, the one
-//! most likely to be read next, would go first.
+//! page after it; dropping a burst together does not. A new group goes in
+//! behind the hand, so the hand reaches it only after a full turn; a read or
+//! check of any member sets its reference bit, and the hand evicts the first
+//! group it finds without one, clearing the bits it passes.
+//!
+//! A write does not set the bit. When it did, every group was born referenced:
+//! under steady writes the hand cleared a whole turn every few batches, and a
+//! group read once between batches was evicted whenever the hand reached it
+//! twice in that time — the first eviction was such a turn.
 //!
 //! A durable write of a key held here (a delete, a conditional write, a batch
 //! put, a put that did not fit) marks the entry superseded when it is queued;
@@ -169,7 +172,6 @@ impl MemShard {
         }
         self.last_insert = Some(now);
         let group = self.groups.back_mut().expect("a group was just ensured");
-        group.referenced.set(true);
         group.keys.push(key.to_vec());
         let entry = Entry {
             value,
@@ -185,7 +187,7 @@ impl MemShard {
     }
 
     /// The value held for `key` and its `expires_at`, if any and not
-    /// expired. A hit gives the key's group a second chance.
+    /// expired. A hit sets its group's reference bit.
     pub(crate) fn get(&self, key: &[u8], now_secs: u64) -> Option<(Bytes, u64)> {
         let e = self.entries.get(key)?;
         if e.expires_at > 0 && e.expires_at <= now_secs {
@@ -298,27 +300,8 @@ mod tests {
         assert_eq!(s.budget.used(), 4 * entry);
     }
 
-    /// The burst just written outlives an older one that was read once: every
-    /// insert sets its group's bit. Ablation: inserts leave the bit alone and the
-    /// fresh burst is evicted first.
-    #[test]
-    fn a_fresh_burst_outlives_an_old_one_read_once() {
-        let entry = 1000 + 2 * 6 + ENTRY_OVERHEAD;
-        let mut s = shard(2 * entry);
-        let t0 = Instant::now();
-        burst(&mut s, &[b"kvc/o1"], t0);
-        burst(&mut s, &[b"kvc/o2"], t0 + Duration::from_secs(1));
-        // A sweep clears both, evicting o1; then o2 is read once.
-        burst(&mut s, &[b"kvc/n1"], t0 + Duration::from_secs(2));
-        assert!(s.get(b"kvc/o2", 0).is_some());
-        // The next need for room takes the old, once-read o2, not fresh n1.
-        burst(&mut s, &[b"kvc/n2"], t0 + Duration::from_secs(3));
-        assert!(s.get(b"kvc/n1", 0).is_some(), "the fresh burst stayed");
-        assert!(s.get(b"kvc/o2", 0).is_none(), "the old burst went");
-    }
-
-    /// After the hand has cleared every bit, a burst read since then outlives
-    /// one that was not. Ablation: a GET leaves the bit alone and k2 goes.
+    /// A burst read since the hand last passed outlives one that was not.
+    /// Ablation: a GET leaves the bit alone and k2 goes.
     #[test]
     fn a_read_since_the_last_sweep_saves_a_burst() {
         let entry = 1000 + 2 * 6 + ENTRY_OVERHEAD;
@@ -327,12 +310,77 @@ mod tests {
         for (i, k) in [b"kvc/k1", b"kvc/k2", b"kvc/k3", b"kvc/k4"].iter().enumerate() {
             burst(&mut s, &[*k], t0 + Duration::from_secs(i as u64));
         }
-        // k4 needed room: the sweep cleared k1..k3 and evicted k1; k2 is next.
+        // k4 needed room: the hand evicted k1; k2 is next.
         assert!(s.get(b"kvc/k1", 0).is_none());
         assert!(s.get(b"kvc/k2", 0).is_some(), "read k2");
         burst(&mut s, &[b"kvc/k5"], t0 + Duration::from_secs(5));
         assert!(s.get(b"kvc/k2", 0).is_some(), "read since the sweep: kept");
         assert!(s.get(b"kvc/k3", 0).is_none(), "unread since the sweep: evicted");
+    }
+
+    /// Hot entries still held before each round. The budget holds the bytes of
+    /// `groups` full groups;
+    /// `pre` groups are written, then `hot` groups; each round reads every hot
+    /// entry, then writes `churn` entries in bursts of seeded uneven sizes
+    /// (full groups when `seed` is None).
+    fn hot_left_per_round(pre: usize, rounds: usize, seed: Option<u64>) -> Vec<usize> {
+        let (groups, hot, churn) = (16, 2, 4 * GROUP_MAX_ENTRIES);
+        let entry = 100 + 2 * 14 + ENTRY_OVERHEAD;
+        let mut s = shard(groups * GROUP_MAX_ENTRIES as u64 * entry);
+        let mut t = Instant::now();
+        let mut n = 0;
+        let mut burst = |s: &mut MemShard, tag: &str, len: usize| -> Vec<Vec<u8>> {
+            t += Duration::from_secs(1);
+            n += 1;
+            let keys: Vec<Vec<u8>> = (0..len).map(|i| format!("kvc/{tag}{n:05}{i:04}").into_bytes()).collect();
+            for (i, k) in keys.iter().enumerate() {
+                assert!(s.insert(k, v(100), 0, t + Duration::from_micros(i as u64)));
+            }
+            keys
+        };
+        for _ in 0..pre {
+            burst(&mut s, "p", GROUP_MAX_ENTRIES);
+        }
+        let hot_keys: Vec<Vec<u8>> = (0..hot).flat_map(|_| burst(&mut s, "h", GROUP_MAX_ENTRIES)).collect();
+        let mut rng = seed.unwrap_or(0);
+        let mut left_per_round = Vec::new();
+        for _ in 0..rounds {
+            left_per_round.push(hot_keys.iter().filter(|k| s.get(k, 0).is_some()).count());
+            let mut left = churn;
+            while left > 0 {
+                let len = match seed {
+                    None => GROUP_MAX_ENTRIES,
+                    Some(_) => {
+                        rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                        1 + (rng >> 33) as usize % GROUP_MAX_ENTRIES
+                    }
+                };
+                burst(&mut s, "c", len.min(left));
+                left -= len.min(left);
+            }
+        }
+        left_per_round
+    }
+
+    /// Groups read before the first eviction survive it. When a write set the
+    /// bit, the first eviction cleared a whole turn and then evicted in write
+    /// order, the read groups first (round 4).
+    #[test]
+    fn groups_read_before_the_first_eviction_survive_it() {
+        let left = hot_left_per_round(0, 20, None);
+        assert!(left.iter().all(|&h| h == 2 * GROUP_MAX_ENTRIES), "hot entries per round: {left:?}");
+    }
+
+    /// Groups read once per round survive steady writes of uneven bursts. When
+    /// a write set the bit, 16 of these 20 seeds lost them, first at round 15:
+    /// the hand cleared them, then cleared a whole turn of fresh groups and
+    /// reached them again before the next read.
+    #[test]
+    fn groups_read_every_round_survive_steady_writes() {
+        for seed in 0..20 {
+            let left = hot_left_per_round(24, 40, Some(seed));
+            assert!(left.iter().all(|&h| h == 2 * GROUP_MAX_ENTRIES), "seed {seed}: hot entries per round {left:?}");
+        }
     }
 
     #[test]

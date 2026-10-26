@@ -1,3 +1,10 @@
+Date: 2026-10-26
+TaskStatus: completed
+Task scope: user — end-to-end test sglang + autumn as the HiCache L3 tier, keep testing ("你测啊"), then fix the memory-tier bug found ("告诉我...然后修复"), the user's design: standard CLOCK.
+Current summary: e2e (Qwen3-VL-32B TP4 x2 next to the held TP8 server, UCX, page_first_direct): every L3 hit answers correctly (8/8 hidden-password docs, cached_tokens all from storage). Default cluster (1 partition, O_DIRECT on disk): L3 1006 ms > recompute 446. With the PS memory tier (96 GiB) + kvc presplit per rank (13 partitions): sequential L3 p50 ~208 ms vs recompute 450, concurrent 8 requests 0.69 s vs 2.69 s. Found: concurrent rounds lost L3 hits round by round — the memory tier evicted a hot set read every round. Cause: `insert` set the CLOCK reference bit (same bit as reads); under steady writes the hand clears a whole turn every few batches and reaches a once-per-round hot group twice. Fix: a write sets no bit (new group behind the hand), only reads do. Tests: two new mem_tier unit tests, red with the bit on insert; PS lib 246 green; manager mem_tier green; live 8 GiB reproducer 20/20 rounds both from empty and steady; sglang 10 rounds all 68608 tokens with 95 GB evicted. Manual check scripts/mem_tier_hot_set.py (ops.md). Fable review: no high; ledger text fixed, trade-off documented.
+Main gaps: BUG-MEM-TIER-INSERT-JOINS-OLD-GROUP (pre-existing grouping defect, recorded). Contribution of memory tier vs presplit not separated. Perf baselines still not re-recorded (host never idle).
+Next steps: user decides. Test sglang instances A/B (ports 30010/30011) and the autumn cluster are still up; the held TP8 server (port 30000) untouched.
+
 Date: 2026-10-24 (10)
 TaskStatus: completed
 Task scope: user — the per-hop A/B for F-UCX-AM-RNDV-INTERNAL (spreading one extent's reads over EN threads: user said not to do it).

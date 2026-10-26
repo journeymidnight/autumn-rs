@@ -680,13 +680,19 @@ inline memtable hit, so a redirect request gets the value inline.
   partition that filled its share and went idle keeps it; the others write
   durably once the PS budget is full (`refused_total` grows).
 - **Eviction**: CLOCK over groups — inserts closer than 50 ms form one group
-  (≤ 256 entries), dropped together. Writing to a group and a GET or HEAD of
-  any member both set its reference bit, so what goes is the oldest group
-  nobody touched since the hand last passed it (approximate LRU). A KV-cache
-  hit is a run of consecutive pages, so a hole in the middle of a run wastes
-  the rest of it. Every insert sets the bit: a new group left unreferenced
-  went before older groups read once — measured, a bench's just-written batch
-  was evicted before it could be read.
+  (≤ 256 entries), dropped together. A KV-cache hit is a run of consecutive
+  pages, so a hole in the middle of a run wastes the rest of it. A new group
+  goes in behind the hand (a full turn before the hand reaches it); only a GET
+  or HEAD of a member sets its reference bit. A write used to set it too, so
+  every group was born referenced: under steady writes the hand cleared a
+  whole turn every few batches, and a group read once between batches was
+  evicted whenever the hand reached it twice in that time. Measured: a hot set
+  read every round was lost at the first eviction (8 GiB tier) or after 11–18
+  rounds of steady writes; in the sglang L3 e2e, concurrent rounds lost their
+  hits round by round (60032 → 320 of 68608 tokens). Without it, 20 rounds keep
+  every hot entry (36–49 GB evicted) and the sglang rounds stay at 68608.
+  Accepted cost (standard CLOCK, user's call): when everything in the tier was
+  read since the hand's last pass, a burst not yet read is what goes next.
 - **Durable writes of a held key** (delete, conditional write, batch put,
   fenced or oversized put, a put that did not fit) mark the entry superseded
   when queued (marked after dispatch over what the enqueue appended to
@@ -698,9 +704,11 @@ inline memtable hit, so a redirect request gets the value inline.
 - Not covered: RANGE does not list keys held only in memory.
 - Metrics: `autumn_ps_mem_tier_{bytes,capacity_bytes,hits_total,
   inserts_total,refused_total,evicted_entries_total,evicted_bytes_total}`.
-- Tests: `mem_tier::tests` (grouped eviction, a fresh burst outliving an old
-  one read once, a read saving a burst, refusal, expiry, supersede-then-apply,
-  budget returned on drop; ablations red: no bit on insert, no bit on GET);
+- Tests: `mem_tier::tests` (grouped eviction, a read saving a burst, groups
+  read before the first eviction surviving it, groups read every round
+  surviving steady writes of uneven bursts, refusal, expiry,
+  supersede-then-apply, budget returned on drop; ablations red: a bit on
+  insert, no bit on GET);
   `crates/manager/tests/mem_tier.rs` (held keys gone after a restart, durable
   fallbacks back, a durable write replacing the held value, delete, TTL,
   conditional write, the oldest burst evicted whole, a held put behind an
