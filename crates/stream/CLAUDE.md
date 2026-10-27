@@ -1202,6 +1202,16 @@ append*(stream_id, payload):
 └─────────────────────────────────────────────────────────────────┘
 ```
 
+**Where an append's time goes** is logged once a second on both sides. The
+worker's "stream worker summary" gives the appends already in flight on the
+stream when one launched and launch -> first / last replica reply; the extent
+node's "extent append summary" gives bursts (one `pwrite` + `sync_data` each),
+appends per burst, the burst time and how long an append waited in the
+extent owner's mailbox. 4 KiB writes, 8 partitions, 3 NVMe: the first replica
+answers in 0.4–0.6 ms and the last in 3.4–6.6 ms, while a burst takes 0.6–1.3 ms
+and carries 1.0–1.4 appends, after 0.2–1.4 ms in the mailbox — every append
+pays its own fsync, and part of the gap to the last reply is still unplaced.
+
 **No external Mutex**: all state mutations happen inside the worker; the public
 API talks to it via bounded mpsc + per-op oneshot.
 

@@ -830,6 +830,51 @@ struct StreamAppendState {
     /// snapshotted bad-nodes TTL — clone-on-spawn from StreamClientConfig
     /// so the worker doesn't need to re-clone the config Rc per Err.
     bad_nodes_ttl: Duration,
+    timings: WorkerTimings,
+}
+
+/// Where an append's time goes inside the worker, logged once a second as
+/// "stream worker summary": appends already in flight when it launched, and
+/// launch to the first and to the last replica's reply.
+struct WorkerTimings {
+    started_at: Instant,
+    launches: u64,
+    inflight_sum: u64,
+    first_ns: u64,
+    all_ns: u64,
+}
+
+impl WorkerTimings {
+    fn record(&mut self, extent_id: u64, t: &AppendTiming) {
+        self.launches += 1;
+        self.inflight_sum += t.inflight_at_launch as u64;
+        self.first_ns += t.first_ns;
+        self.all_ns += t.all_ns;
+        let elapsed = self.started_at.elapsed();
+        if elapsed >= Duration::from_secs(1) {
+            let n = self.launches;
+            tracing::info!(
+                extent_id,
+                appends = n,
+                avg_inflight_at_launch = self.inflight_sum as f64 / n as f64,
+                avg_first_replica_ms = ns_to_ms(self.first_ns, n),
+                avg_all_replicas_ms = ns_to_ms(self.all_ns, n),
+                "stream worker summary",
+            );
+            *self = WorkerTimings::new();
+        }
+    }
+
+    fn new() -> Self {
+        WorkerTimings { started_at: Instant::now(), launches: 0, inflight_sum: 0, first_ns: 0, all_ns: 0 }
+    }
+}
+
+/// One append's timing, measured from its launch.
+struct AppendTiming {
+    inflight_at_launch: u32,
+    first_ns: u64,
+    all_ns: u64,
 }
 
 // The bad-nodes TTL helper `bad_nodes_ttl()` was removed. Value now lives on
@@ -855,6 +900,7 @@ impl StreamAppendState {
             bad_nodes,
             failure_report_tx,
             bad_nodes_ttl,
+            timings: WorkerTimings::new(),
         }
     }
 
@@ -1539,6 +1585,7 @@ struct InflightResult {
     /// to its `node_id` for the per-stream `bad_nodes` exclusion list.
     replica_node_ids: Vec<u64>,
     ack_tx: oneshot::Sender<Result<AppendResult>>,
+    timing: AppendTiming,
 }
 
 /// Pinned boxed type for the FuturesUnordered payload.
@@ -1855,7 +1902,9 @@ fn apply_completion(state: &mut StreamAppendState, result: InflightResult) {
         frames,
         replica_node_ids,
         ack_tx,
+        timing,
     } = result;
+    state.timings.record(extent_id, &timing);
 
     // Bad-replica attribution below resolves a node by the frame's INDEX, so
     // these two must stay parallel. Star replication makes that structural —
@@ -2096,6 +2145,8 @@ async fn launch_append(
     }
 
     let size: u64 = payload_parts.iter().map(|p| p.len() as u64).sum();
+    let inflight_at_launch = state.in_flight;
+    let launched_at = Instant::now();
     let (offset, end) = state.lease(size);
     let header_commit = offset; // Option A: lease-time cursor.
 
@@ -2167,7 +2218,7 @@ async fn launch_append(
     let timeout = append_deadline.for_len(size);
     let fut = async move {
         let wait_futs = receivers.into_iter().map(|(addr, rx_res)| async move {
-            match rx_res {
+            let r = match rx_res {
                 Err(e) => Err(anyhow!("{} submit error: {}", addr, e)),
                 Ok(rx) => {
                     let recv_fut = rx;
@@ -2183,9 +2234,13 @@ async fn launch_append(
                         }
                     }
                 }
-            }
+            };
+            (r, launched_at.elapsed())
         });
-        let frames = join_all(wait_futs).await;
+        let replies = join_all(wait_futs).await;
+        let first_ns = replies.iter().map(|(_, d)| d.as_nanos() as u64).min().unwrap_or(0);
+        let all_ns = replies.iter().map(|(_, d)| d.as_nanos() as u64).max().unwrap_or(0);
+        let frames = replies.into_iter().map(|(r, _)| r).collect();
         InflightResult {
             offset,
             end,
@@ -2193,6 +2248,7 @@ async fn launch_append(
             frames,
             replica_node_ids,
             ack_tx,
+            timing: AppendTiming { inflight_at_launch, first_ns, all_ns },
         }
     };
     inflight.push(Box::pin(fut));
@@ -6344,6 +6400,7 @@ mod pipeline_tests {
                 frames: vec![Ok(ok_frame(o_b, e_b))],
                 replica_node_ids: vec![1],
                 ack_tx: tx_b,
+                timing: AppendTiming { inflight_at_launch: 0, first_ns: 0, all_ns: 0 },
             },
         );
 

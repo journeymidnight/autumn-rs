@@ -88,6 +88,11 @@ fn en_prealloc_bytes() -> u64 {
 
 pub(crate) struct ExtentAppendMetrics {
     started_at: Instant,
+    /// Bursts written: one `pwrite` + `sync_data` each.
+    bursts: u64,
+    /// Appends taken out of an owner's mailbox, and their summed wait in it.
+    queued: u64,
+    queue_ns: u64,
     req_count: u64,
     bytes: u64,
     total_ns: u64,
@@ -97,12 +102,20 @@ impl ExtentAppendMetrics {
     fn new() -> Self {
         Self {
             started_at: Instant::now(),
+            bursts: 0,
+            queued: 0,
+            queue_ns: 0,
             req_count: 0,
             bytes: 0,
             total_ns: 0,
         }
     }
+    pub(crate) fn record_queue_wait(&mut self, appends: u64, ns: u64) {
+        self.queued += appends;
+        self.queue_ns += ns;
+    }
     pub(crate) fn record(&mut self, reqs: u64, bytes: u64, elapsed_ns: u64) {
+        self.bursts += 1;
         self.req_count += reqs;
         self.bytes += bytes;
         self.total_ns += elapsed_ns;
@@ -117,11 +130,14 @@ impl ExtentAppendMetrics {
     fn maybe_report(&mut self) {
         if self.started_at.elapsed() >= Duration::from_secs(1) && self.req_count > 0 {
             let elapsed = self.started_at.elapsed();
-            let batches = self.req_count.max(1);
+            let bursts = self.bursts.max(1);
             tracing::info!(
                 req_count = self.req_count,
+                bursts = self.bursts,
+                reqs_per_burst = self.req_count as f64 / bursts as f64,
                 mb_per_sec = self.bytes as f64 / elapsed.as_secs_f64() / 1_048_576.0,
-                avg_write_ms = autumn_common::metrics::ns_to_ms(self.total_ns, batches),
+                avg_burst_ms = autumn_common::metrics::ns_to_ms(self.total_ns, bursts),
+                avg_queue_ms = autumn_common::metrics::ns_to_ms(self.queue_ns, self.queued),
                 "extent append summary",
             );
             *self = Self::new();
@@ -2516,6 +2532,7 @@ async fn process_frames_backpressured(
                             req: slot.req,
                             req_id,
                             resp: tx,
+                            queued_at: Instant::now(),
                         },
                     );
                     (req_id, rx)
@@ -2775,6 +2792,8 @@ pub(crate) enum ExtentMsg {
         /// Frame::error), matching the old build_append_future output, so the
         /// ps-conn task batches it into its existing vectored write unchanged.
         resp: futures::channel::oneshot::Sender<Bytes>,
+        /// When it entered the owner's mailbox (append summary: queue wait).
+        queued_at: Instant,
     },
     // Later steps add: Truncate, Seal, FencePersist (the interleaving set that
     // must move together with Append), plus the SHORT commit messages of the
@@ -3173,9 +3192,13 @@ async fn owner_loop(node: ExtentNode, extent: std::rc::Rc<ExtentEntry>) {
             Vec<futures::channel::oneshot::Sender<Bytes>>,
         )> = Vec::new();
         let mut prev_epoch_end: Option<(i64, u64)> = None; // (owner_epoch, commit + payload.len())
+        let mut queue_ns = 0u64;
+        let mut queued = 0u64;
         for msg in burst {
             match msg {
-                ExtentMsg::Append { req, req_id, resp } => {
+                ExtentMsg::Append { req, req_id, resp, queued_at } => {
+                    queue_ns += queued_at.elapsed().as_nanos() as u64;
+                    queued += 1;
                     let contiguous = matches!(
                         prev_epoch_end,
                         Some((pe, pend)) if pe == req.owner_epoch && pend == req.commit
@@ -3190,6 +3213,7 @@ async fn owner_loop(node: ExtentNode, extent: std::rc::Rc<ExtentEntry>) {
                 }
             }
         }
+        EXTENT_APPEND_METRICS.with(|m| m.borrow_mut().record_queue_wait(queued, queue_ns));
         // Each run is ONE group commit (prologue reserves extent.len
         // synchronously, then the returned future does pwrite+fsync). Runs run
         // SEQUENTIALLY so a later run's fence/commit prologue observes the prior
@@ -13272,6 +13296,7 @@ mod owner_burst_splitter_tests {
             },
             req_id,
             resp: tx,
+            queued_at: Instant::now(),
         };
         (msg, rx)
     }
