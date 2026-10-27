@@ -813,7 +813,9 @@ blocks — which silently served one cluster's data to another.) Recovery opens 
 
 **A cache miss is a bulk read** (`read_value_into_pooled`, `MSG_READ_BYTES_BULK`),
 falling back to `read_bytes_from_extent` for whatever the bulk path declines
-(EC, stale layout, failed replicas). The block travels as the frame's value, so
+(an EC block across two shards or on a Suspected shard's node, a stale layout,
+failed replicas); an EC block inside one data shard is a bulk read of that
+shard. The block travels as the frame's value, so
 no frame CRC covers it — the block's own CRC32C, checked on decode with a reread
 from the other copies, is its integrity check (the `autumn-rpc` CRC rule). The
 copy path put the block in ctrl, so the same bytes went through two CRC passes.
@@ -952,7 +954,8 @@ registered buffer does not remove. The seam is
   kernel copy, no FrameDecoder copy. The PS hands the value onward as
   `Bytes::from_owner(pb)` (aliases the pool buffer; returns to the pool when that
   `Bytes` drops after the client write completes). Falls back to the
-  `read_bytes_from_extent` copy path for EC / chunked / stale-eversion / length==0.
+  `read_bytes_from_extent` copy path for an EC value across shards / chunked /
+  stale-eversion / length==0 (an EC value inside one shard is a bulk read of it).
   No value crc is verified (integrity is the transport's job).
 - **inline value**: `resolve_value` returns a zero-copy `raw_value.slice(..)`.
 - **`handle_get_bulk`** returns the response as TWO segments `(head, value)`:

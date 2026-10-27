@@ -4891,13 +4891,94 @@ impl StreamClient {
         r
     }
 
+    /// The EC half of `read_value_into_pooled`: a range inside one data shard,
+    /// whose node is not Suspected, is one bulk read of that shard at the offset
+    /// inside it (the layout `ec_subrange_read` plans with). A range across
+    /// shards, past the data shards, or on a Suspected node, and a read the node
+    /// refused (a non-OK code or an error frame), is `Ok(None)`: the copy path
+    /// splits it, reconstructs it or refreshes the layout. A read that failed in
+    /// transport (connection, timeout) is rebuilt here from the other shards: the
+    /// copy path would read the same node again first and pay its timeout twice.
+    async fn ec_shard_into_pooled(
+        &self,
+        extent_id: u64,
+        offset: u64,
+        length: u64,
+        ex: &ExtentInfo,
+    ) -> Result<Option<(autumn_rpc::PooledBuf, usize)>> {
+        let data_shards = ex.replicates.len();
+        let shard_size = crate::erasure::shard_size(ex.sealed_length as usize, data_shards.max(1)) as u64;
+        if data_shards == 0 || shard_size == 0 {
+            return Ok(None);
+        }
+        let shard = offset / shard_size;
+        if shard != (offset + length - 1) / shard_size || shard as usize >= data_shards {
+            return Ok(None);
+        }
+        let shard = shard as usize;
+        let node_id = ex.replicates[shard];
+        if self.is_node_suspected(node_id) {
+            return Ok(None);
+        }
+        let addrs = self.replica_addrs_for_extent(ex).await?;
+        let req = ReadBytesReq::new(
+            extent_id,
+            ex.eversion,
+            offset % shard_size,
+            length,
+            PayloadRef::for_extent(published_payload(ex)?, shard as u32),
+        )
+        .encode();
+        match self
+            .pool
+            .call_into_pooled(&addrs[shard], MSG_READ_BYTES_BULK, req, self.config.read_deadline().for_len(length))
+            .await
+        {
+            // BULK-EXACT: CODE_OK means the buffer holds exactly `length` bytes.
+            Ok(z) if z.code == CODE_OK => Ok(Some((z.buf, length as usize))),
+            Ok(z) => {
+                tracing::debug!(extent_id, shard, code = z.code, message = %z.message, "EC bulk read non-OK; using the copy path");
+                self.extent_info_cache.remove(&extent_id);
+                Ok(None)
+            }
+            // An error frame from the node is a refusal: the copy path refreshes
+            // the layout or reconstructs, as for a non-OK code.
+            Err(e)
+                if e.chain()
+                    .any(|c| matches!(c.downcast_ref::<autumn_rpc::RpcError>(), Some(autumn_rpc::RpcError::Status { .. }))) =>
+            {
+                tracing::debug!(extent_id, shard, error = %format_args!("{e:#}"), "EC bulk read refused; using the copy path");
+                self.extent_info_cache.remove(&extent_id);
+                Ok(None)
+            }
+            Err(e) => {
+                tracing::warn!(extent_id, shard, error = %format_args!("{e:#}"), "EC bulk read failed; reconstructing without that shard");
+                self.extent_info_cache.remove(&extent_id);
+                // After the rebuild: forgetting the address first would send it
+                // to the manager for a node map it does not need.
+                let rebuilt = self.ec_subrange_read(extent_id, offset, length, ex, Some(shard)).await;
+                if is_connect_failure(&e) {
+                    self.note_unreachable(node_id, extent_id);
+                }
+                let (data, _) = rebuilt?;
+                if data.len() as u64 != length {
+                    return Ok(None);
+                }
+                let mut pb = autumn_rpc::regpool_acquire(data.len());
+                pb.dest_and_reg().0.copy_from_slice(&data);
+                Ok(Some((pb, data.len())))
+            }
+        }
+    }
+
     /// UCX / TCP recv-side copy-elimination fast path: recv the
     /// value straight into a read_loop-owned `PooledBuf` (MSG_READ_BYTES_BULK +
     /// call_into_pooled). UCX → one Stream unpack into the pooled slab; TCP →
     /// compio owned read (one kernel copy). No app-level copy of the value. Returns `Some((pb, len))`
-    /// on a clean OK; returns `Ok(None)` for ANYTHING the simple replicated path
-    /// can't handle (EC extent, length==0/unknown, multi-chunk, eversion-stale,
-    /// non-OK code, all replicas failed) so the caller falls back to the copy path
+    /// on a clean OK; returns `Ok(None)` for ANYTHING it can't handle (an EC range
+    /// that is not inside one healthy data shard, length==0/unknown,
+    /// multi-chunk, eversion-stale, non-OK code, all replicas failed) so the
+    /// caller falls back to the copy path
     /// (`read_bytes_from_extent`, which owns eversion-retry / EC / chunking /
     /// failover). Cancel-safe: call_into_pooled keeps the buffer with the
     /// read_loop, so a timeout reclaims it (no leak).
@@ -4924,12 +5005,12 @@ impl StreamClient {
         // the 3 s timeout on a Suspected EN — the VP-read-paths-fragmented trap).
         self.maybe_refresh_suspected();
         let ex = self.fetch_extent_info(extent_id).await?;
-        // EC / chunked / stale-VP-offset → let the copy path handle it.
-        if ex.ec_converted
-            || length > self.config.read_chunk_bytes
-            || (ex.sealed && offset > ex.sealed_length)
-        {
+        // Chunked / stale-VP-offset → let the copy path handle it.
+        if length > self.config.read_chunk_bytes || (ex.sealed && offset > ex.sealed_length) {
             return Ok(None);
+        }
+        if ex.ec_converted {
+            return self.ec_shard_into_pooled(extent_id, offset, length, &ex).await;
         }
         let addrs = self.replica_addrs_for_extent(&ex).await?;
         // WAL self-heal A1: serve only avali-eligible slots, healthy

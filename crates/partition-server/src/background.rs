@@ -4817,8 +4817,9 @@ pub(crate) async fn read_value_from_log(
     // R3/R4: zero-copy fast path — recv the value straight into a
     // registered RegPool buffer over UCX (MSG_READ_BYTES_BULK) and hand it onward
     // as a Bytes ALIASING that buffer (from_owner; pb returns to the pool when
-    // the Bytes drops). No off-wire copy, no pb->Vec. Any non-OK / EC / chunked
-    // / non-UCX case returns None -> the proven read_bytes_from_extent copy path.
+    // the Bytes drops). No off-wire copy, no pb->Vec. A case the bulk read does
+    // not take (EC across shards, chunked, non-OK) returns None -> the
+    // read_bytes_from_extent copy path.
     if let Ok(Some((pb, _n))) = stream_client
         .read_value_into_pooled(vp.extent_id, read_off, read_len)
         .await

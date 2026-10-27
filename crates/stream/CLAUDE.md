@@ -1364,6 +1364,24 @@ says nothing about the others — and the fallback is unchanged. Neither
 `is_connect_failure` nor `is_liveness_timeout` matches this text, so the
 note-29 damping and the note-34 address-forgetting are untouched.
 
+**Bulk read of an EC extent** (`read_value_into_pooled` → `ec_shard_into_pooled`):
+a range inside one data shard whose node is not Suspected is one
+`MSG_READ_BYTES_BULK` to that shard's node, at the offset inside the shard (the
+layout `ec_subrange_read` plans with). A range across shards, past the data
+shards or on a Suspected node, and a refused read, return `Ok(None)` and the copy
+path splits it, reconstructs it or refreshes the layout, as it did for every EC
+read before. A read that failed (connection, timeout) is rebuilt right there
+from the other shards (`ec_subrange_read` with that shard distrusted) and copied
+into a pool buffer: handed to the copy path, it would read the same node again
+first and pay its timeout twice. SST
+blocks (<= ~64 KiB) cross a shard boundary about once per shard. In-process
+cluster over TCP, 60 KiB blocks of one 2+1 extent, sequential: 52–55 us per bulk
+read vs 81–83 us on the copy path. Test: `crates/manager/tests/ec_bulk_read.rs`
+(a range in shard 0 and one in shard 1 come back from the bulk read, one across
+them is `None` and the copy path reads it — red with EC sent to the copy path;
+shard 0's node moved to a dead address comes back rebuilt — red when a failed
+read returns `None`).
+
 **Read path** (`read_bytes_from_extent`): the start replica rotates by
 `(extent_id, offset)` hash so read IO spreads across all replicas; failover
 walks the rest in rotated order. **OPEN-tail extents rotate too** (an open
