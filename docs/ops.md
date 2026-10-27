@@ -5227,13 +5227,18 @@ AUTUMN_BIND_HOST='[fdbd:dc62:3:300::14]' UCX_NET_DEVICES=mlx5_2:1 \
   ./perf/perf_check.sh --3disk --partitions 8 --ucx      # eth1 = mlx5_2, the storage NIC
 ```
 
-The committed baselines (2026-09-28) were taken this way with direct I/O on (the EN
-default) and the io_uring workers confined: TCP with the cluster on node-1 cores
-(EN 48-55/56-63/64-71, PS 72-87), UCX on the NIC's node 0 (EN 8-15/16-23/24-31,
-PS 32-47); each file is the median-write run of three. TCP 4K 54.9K write / 583K
-read ops/s, 8M 2.4 GB/s write / 7.5 GB/s read; UCX 4K 18.3K / 964K, 8M 2.2 / 5.0
-GB/s — UCX 4K writes are slow because every small append pays an rc round trip,
-which the old posix-shm baselines hid. Batch sizing is adaptive and needs no tuning
+The committed baselines (2026-10-27, `--conn-inflight-cap` 16, 2 GiB registered
+pools, reads after the compaction) were taken this way with direct I/O on (the
+EN default): TCP with the cluster on node-1 cores (EN 52-59 / 60-64,66,69,71 /
+72-78,80, PS 81,84,86-89,91-95), UCX on the NIC's node 0 (EN 8-15 / 16-20,22-24 /
+25-29,31-33, PS 3,4,6,34,36,38-44); each file is the median-write run of three.
+TCP 4K 33.2K write / 254K read ops/s, 8M 2.51 GB/s write / 7.4 GB/s read; UCX
+4K 36.2K / 239K, 8M 2.61 / 13.7 GB/s. sglang schedulers, unpinned, drifted onto
+some of those cores during the runs (core 18 and the siblings of 2-3 during UCX),
+and the same binaries unpinned on a quieter hour wrote 4K at 44-48K on TCP — the
+4K write baseline is on the low side of this host. The 4K reads are SST reads
+since the compaction step; the earlier baselines (583K TCP, 964K UCX) read
+mostly from the memtable and are not comparable. Batch sizing is adaptive and needs no tuning
 knob (the old `--min-pipeline-batch` PS flag is refused).
 
 **Pin the cluster away from the tenants first.** This box is shared with

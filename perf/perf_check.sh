@@ -19,9 +19,8 @@
 # side AND keeps each partition's single-threaded UCX worker on the PS
 # in its supported region (see "UCX cliff" note below).
 # At 16t × d=8 = 128 in-flight, 3 disks, 8 partitions (baselines of
-# 2026-09-28): TCP 4 KB 55 k write / 583 k read ops/s, 8 MB 2.4 / 7.5 GB/s;
-# UCX over RoCE 4 KB 18 k / 964 k, 8 MB 2.2 / 5.0 GB/s. UCX 4 KB writes pay
-# an rc round trip per small append.
+# 2026-10-27, reads after compaction): TCP 4 KB 33 k write / 254 k read ops/s,
+# 8 MB 2.5 / 7.4 GB/s; UCX over RoCE 4 KB 36 k / 239 k, 8 MB 2.6 / 13.7 GB/s.
 #
 # UCX cliff (post fix(ucx): drop UcxEp close-on-Drop, 2026-04-29). Each
 # PS partition runs a single-threaded UCX worker. The cliff is set by

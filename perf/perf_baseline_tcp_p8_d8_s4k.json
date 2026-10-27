@@ -1,22 +1,22 @@
 {
   "version": 1,
   "write": {
-    "total_ops": 603971,
-    "total_bytes": 2473865216,
-    "ops_per_sec": 54882.96347456647,
-    "throughput_mb_per_sec": 214.3865760725253,
-    "p50_ms": 0.852094,
-    "p95_ms": 8.572379999999999,
-    "p99_ms": 24.83735
+    "total_ops": 365168,
+    "total_bytes": 1495728128,
+    "ops_per_sec": 33188.190108043666,
+    "throughput_mb_per_sec": 129.64136760954557,
+    "p50_ms": 0.705233,
+    "p95_ms": 21.843205,
+    "p99_ms": 34.901248
   },
   "read": {
-    "total_ops": 6416561,
-    "total_bytes": 26282233856,
-    "ops_per_sec": 583139.2169882698,
-    "throughput_mb_per_sec": 2277.887566360429,
-    "p50_ms": 0.09618600000000001,
-    "p95_ms": 0.620916,
-    "p99_ms": 0.9865480000000001
+    "total_ops": 2799286,
+    "total_bytes": 11465875456,
+    "ops_per_sec": 254441.51849737586,
+    "throughput_mb_per_sec": 993.9121816303744,
+    "p50_ms": 0.394648,
+    "p95_ms": 0.901867,
+    "p99_ms": 1.3041509999999998
   },
   "config": {
     "threads": 16,
@@ -28,5 +28,5 @@
     "partition_count": 8,
     "group_commit_cap": null
   },
-  "recorded_at": 1790574486
+  "recorded_at": 1793138012
 }
