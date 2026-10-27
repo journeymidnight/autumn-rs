@@ -7,7 +7,9 @@
 //! fragment unboundedly). Recv-into-`PooledBuf` avoids the application's frame
 //! accumulation buffer. UCX Stream still unpacks incoming AM data into the
 //! destination; registration benefits stable-address sends and PS forwarding,
-//! and does not itself make Stream receive end-to-end zero-copy.
+//! and does not itself make Stream receive end-to-end zero-copy. Every UCX
+//! stream send is staged through a slab from here and sent with its memh
+//! (`endpoint.rs`, `ucx_send_staged`).
 //!
 //! ## Why thread-local
 //! The PS runs one partition per OS thread and the EN one shard per OS thread
@@ -29,7 +31,8 @@
 //! pool is capped (`--ucx-regpool-cap-bytes`); an `acquire` that would exceed the cap
 //! first frees idle slabs to make room, and only if the slabs in use fill the
 //! cap returns an UNREGISTERED buffer (correctness preserved — recv falls back
-//! to copy-out — just not zero-copy), logged once.
+//! to copy-out — just not zero-copy), logged once. For a staged send it means
+//! UCX registers that fresh buffer itself, and the buffer is freed on drop.
 
 // Transport-agnostic pool (declared as a top-level `mod regpool` in lib.rs, so
 // it compiles with AND without `ucx`). On `ucx` a fresh slab is registered with

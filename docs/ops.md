@@ -172,8 +172,9 @@ The regression tests need a RoCE host (`AUTUMN_UCX_TEST_BIND='[<roce-ip>]:0'`,
 `UCX_TLS=rc_mlx5,ud_mlx5,tcp,self`, `UCX_NET_DEVICES=<dev>:1`):
 
 ```bash
-# 1: 60 s of zero-copy sends while other threads release pages. Against a 1.16
-#    library (e.g. via LD_LIBRARY_PATH) it dies within the minute.
+# 1: 60 s of 64 KiB rendezvous sends while other threads release pages.
+#    Against a 1.16 library (e.g. via LD_LIBRARY_PATH) it segfaults in about
+#    half the runs (2 of 4); run it a few times.
 cargo test --release -p autumn-transport --features ucx --test ucx_rcache_race -- --nocapture
 # 2: 200 messages queued before the receiver posts a recv; fails if any recv
 #    completed through UCX's request callback (it does with NO_IMM_CMPL).
@@ -182,6 +183,9 @@ cargo test --release -p autumn-transport --features ucx --test ucx_immediate_rec
 #    pool slab stays out of the pool until the bytes land, then is reused, and a
 #    later read on that connection fails instead of losing bytes.
 cargo test --release -p autumn-transport --features ucx --test ucx_dropped_recv
+# 4: a stream send out of .rodata (unregistrable) arrives: stream sends go out
+#    of the registered pool, never the caller's memory.
+cargo test --release -p autumn-transport --features ucx --test ucx_send_staged
 ```
 
 Perf-check on UCX 1.20.1 vs the 2026-09-28 baselines (system 1.16), over a

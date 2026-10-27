@@ -45,13 +45,14 @@
 - **Acceptance**: 根因写明；刷盘后 4K 读回到 memtable 读的合理比例（目标与证据一起给出）；perf-check 4K 读基线不再取决于写阶段写了多少。
 - `passes: false`
 - **notes** (2026-10-27 根因): 不是 SST 点查本身慢，是块缓存未命中的成本。固定 key 集（TCP，8 分区，16×深度 8，均匀）：放得进 512 MB 块缓存的 8 万 key，memtable 1.44M → 刷盘后 1.16–1.23M ops/s（约 83%）；1.6 GB 的 40 万 key（命中 33%）1.39M → 0.17M（12%），8 个分区线程全满，每次未命中约耗 65 µs：为一个 4 KiB 值取回整块约 64 KiB，CPU 43% 是 CRC32C——块走 `MSG_READ_BYTES`，放在 ctrl 里被帧 CRC 算一遍、块解码再算一遍（违反 rpc 的 CRC 规则），27% 是收数据的系统调用。perf-check 写超过 memtable 切换点，数据就超出块缓存。
-- **notes** (2026-10-27 用户选 A：块读改走 bulk 读): `read_block_via` 未命中改走 `read_value_into_pooled`（`MSG_READ_BYTES_BULK`，块作帧值，不算帧 CRC，块 CRC 照旧），declined 时退回拷贝路径；块拷出池 buffer（直接收进缓存自有内存会让 UCX 每次未命中都注册新内存）。块切在 64 KiB 以下，TCP 走帧内解码再拷进池 buffer，比原拷贝路径多一次拷贝，收益全来自少算一遍 CRC。交替对照（TCP）：缓存放不下的集合 169–171K → 225–226K ops/s（+33%），p99 2.0 → 1.13 ms；放得下的集合不变（噪声内）。剖析：帧解码从 22% 降到 0.5%，CRC 只剩块解码的一遍。UCX 交替对照新旧都约 5K（见 BUG-UCX-ZC-SEND-REGISTERS-FRESH-MEMORY），放得下的集合噪声内。验收未全部达成：缓存放不下时仍是 memtable 的 16%；剩下的是收数据与块 CRC，随块大小变（方案 B：块切小，未做）；perf-check 4K 读仍取决于写入量。
+- **notes** (2026-10-27 用户选 A：块读改走 bulk 读): `read_block_via` 未命中改走 `read_value_into_pooled`（`MSG_READ_BYTES_BULK`，块作帧值，不算帧 CRC，块 CRC 照旧），declined 时退回拷贝路径；块拷出池 buffer（直接收进缓存自有内存会让 UCX 每次未命中都注册新内存）。4 KiB 值的块约 62 KiB（块内条目最多 64 KiB，另加尾部），TCP 走帧内解码再拷进池 buffer，比原拷贝路径多一次拷贝，收益全来自少算一遍 CRC。交替对照（TCP）：缓存放不下的集合 169–171K → 225–226K ops/s（+33%），p99 2.0 → 1.13 ms；放得下的集合不变（噪声内）。剖析：帧解码从 22% 降到 0.5%，CRC 只剩块解码的一遍。UCX 交替对照新旧都约 5K（见 BUG-UCX-ZC-SEND-REGISTERS-FRESH-MEMORY），放得下的集合噪声内。验收未全部达成：缓存放不下时仍是 memtable 的 16%；剩下的是收数据与块 CRC，随块大小变（方案 B：块切小，未做）；perf-check 4K 读仍取决于写入量。
 
 ### BUG-UCX-ZC-SEND-REGISTERS-FRESH-MEMORY — UCX 下 SST 块缓存未命中的 4K 读塌到约 5K ops/s（未修）
 - **Trigger** (2026-10-27 BUG-READ-SLOWER-AFTER-FLUSH 的 UCX 对照): 同一 1.6 GB 固定 key 集刷盘后读（块缓存命中 33%），TCP 0.17–0.23M ops/s，UCX 只有 4–6K、p99 100+ ms；放得进块缓存的集合 UCX 0.68–0.79M 正常。分区线程采样 88–91% 在 `pthread_spin_lock`，可见 `ibv_reg_mr`/`ibv_dereg_mr`。PS 加 `UCX_ZCOPY_THRESH=inf` 后同一读 247K ops/s（约 50 倍）。新旧二进制（块读改 bulk 前后）一样。
 - **Scope**: 推断（未证实）：PS 的零拷贝流发送（≥478 B 逐段注册）注册的是新分配的内存（未命中时新读的块，GET 回复的值切片），注册缓存每次都不命中，注册/注销在 UCX context 级的锁下串行，8 个分区线程互相等。先坐实是哪一段发送在注册，再定修法（发送前拷进注册池、或对新内存不走零拷贝），性能不能降。
 - **Acceptance**: 同一负载 UCX 缓存放不下时的读不低于 TCP；放得下的集合与写不降；去掉修复变差。
-- `passes: false`
+- `passes: true`
+- **notes** (2026-10-27 修复): 坐实在 PS 的发送：只换 PS（客户端、EN 不变）即恢复。4K GET 回复是刚读进缓存的块的切片，UCX 流 ≥478 B 零拷贝，经注册缓存逐段注册，新内存每次未命中，`ibv_reg_mr`/`ibv_dereg_mr` 在注册锁上排队。修法（transport）：`ucx_send`/`ucx_send_vectored` 把各段拷进一个 regpool slab，带 memh 发（`ucx_send_staged`），调用方内存不再交给 UCX 注册；≥64 KiB 的值本来就走 AM，流上只剩小段，拷贝相当于 eager bcopy。交替对照（UCX）：缓存放不下 4.5–4.9K → 242–247K ops/s（TCP 225K），p99 95–109 ms → 0.9 ms；放得下 0.73–0.79M → 1.28–1.29M；memtable 读 0.96–1.09M → 1.22–1.26M；装 4K 10.6–15.5K → 36K。perf-check UCX：4K 写 13.2–14.0K → 31.3–46.1K，8M 写 2442–2449 → 2656–2742 MB/s，8M 读 7088–7537 → 9566–9989；4K 读 942–966K → 419–433K 是写得多越过 memtable 切换点所致（固定数据上全部更快）。fable 评审后补测 32 KiB（流上内联，批量回复整段拷贝）：单个写/读四轮交替互在波动内，`--bulk 64` 写 47–50K → 54–57K、读持平。测试：`ucx_send_staged.rs`（从 `.rodata` 发出能到，去掉修复红：Bad address）；`ucx_rcache_race.rs` 改用 64 KiB rendezvous AM 发送（流发送不再碰注册缓存），原版 1.16 上 4 次里 2 次段错误，1.20.1 通过。
 
 ### F-KVC-CACHE-TIER — PS 之上的 kvc 专用薄缓存层（记录，暂缓）
 - **Trigger** (2026-10-23 用户): 从性能看需要给 kvc 一层很薄的缓存：write-through、超大 CLOCK、选择性落盘，把所有节点的内存池化；放在 PS 层之上，PS 层以下保持原样（不在 PS 里加读缓存——存储不该带重读缓存，3FS/HDFS 都不做）。

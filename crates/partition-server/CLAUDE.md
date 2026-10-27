@@ -782,10 +782,12 @@ from the other copies, is its integrity check (the `autumn-rpc` CRC rule). The
 copy path put the block in ctrl, so the same bytes went through two CRC passes.
 The block is copied out of the pool buffer, since the cache keeps it past the
 request; receiving straight into memory the cache owns would save that copy on
-TCP but make UCX register fresh memory on every miss. A block is cut below
-64 KiB, under TCP's receive-into-pool threshold, so on TCP the reply is decoded
-in place and copied into the pool buffer first: one more copy than the copy
-path made. The gain below is the CRC pass. The bulk path never hedges
+TCP but make UCX register fresh memory on every miss. A block holds at most
+64 KiB of entries plus its footer (entry offsets, count, CRC); a block of 4 KiB
+values is ~62 KiB, under TCP's receive-into-pool threshold, so on TCP its reply
+is decoded in place and copied into the pool buffer first: one more copy than
+the copy path made. A block of small entries can run a little past 64 KiB and
+is received straight into the pool buffer. The gain below is the CRC pass. The bulk path never hedges
 (`autumn-ps --read-hedge-ms`, off by default); the copy path does.
 
 What a miss costs is what separates a flushed 4 KiB read from a memtable one.

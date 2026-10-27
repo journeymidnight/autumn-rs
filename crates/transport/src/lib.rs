@@ -753,7 +753,7 @@ impl WriteHalf {
 
     /// Send owned iovecs and await the kernel's buffer-release notification.
     /// The caller must limit the iovec count and serialize complete frames.
-    /// UCX retains its ordinary registered-memory send path.
+    /// UCX sends as `write_vectored_all` does: staged through the pool.
     pub async fn write_vectored_all_zerocopy(&mut self, bufs: Vec<bytes::Bytes>) -> io::Result<()> {
         match self {
             Self::Tcp(writer) => zerocopy::write_all(writer, bufs).await,

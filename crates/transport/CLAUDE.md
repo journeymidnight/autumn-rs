@@ -23,7 +23,8 @@ is unchanged. write_vectored_all_zerocopy is explicit: it waits for the buffer
 release future even on send failure, advances only the acknowledged suffix on
 partial sends, and falls back for unsupported operations or zerocopy resource
 exhaustion. Cancellation leaves ownership with compio through the final CQE.
-UCX uses its existing ordinary send. Callers must cap iovec counts.
+UCX stages the bytes through the pool like every stream send. Callers must cap
+iovec counts.
 
 zerocopy_tcp covers actual owned-buffer cancellation/close and segmented sends.
 zerocopy module tests hold the completion notification pending and exercise
@@ -62,8 +63,9 @@ through unregister and register; the eviction counters show it.
 ## UCX library version and two worked-around defects
 
 `init_with(Ucx)` exits 2 on UCX < 1.17 (`check_library`, `ucp_get_version`); the
-Python binding checks first and raises. Sends pass no memh, so every zcopy iov
-entry (heap `Bytes`, regpool slabs alike) goes through UCX's registration cache.
+Python binding checks first and raises. An active-message value is sent with no
+memh, so its memory goes through UCX's registration cache (stream sends leave
+from the registered pool, below).
 In 1.16 the cache's worker fast path (`ucs_rcache_lookup_unsafe`, non-atomic
 refcount under the context mt_lock only) raced the memory-event callback, which
 invalidated regions on whatever thread called `munmap`/`madvise` (jemalloc purges);
@@ -71,9 +73,10 @@ a referenced region reached the GC list and was deregistered under the send →
 `Local protection error`, segfault or the `refcount == 0` assertion. 1.17 added
 `UCS_RCACHE_FLAG_SYNC_EVENTS` to the ucp cache, so events only queue. A 1.16 build
 patched with just that flag passed the repro; vanilla 1.16 failed it.
-`tests/ucx_rcache_race.rs` is the regression test: 8 sender threads with 32
-head+value iov pairs from 256 single-page regions, 2 threads `madvise`ing those
-pages every 2 ms, 60 s. It bypasses `init_with`, so it tests the library itself.
+`tests/ucx_rcache_race.rs` is the regression test: 8 sender threads sending
+64 KiB rendezvous values from 64 regions, 2 threads `madvise`ing a page of one
+every 2 ms, 60 s. It bypasses `init_with`, so it tests the library itself.
+Against a vanilla 1.16 build it segfaulted in 2 of 4 runs; 1.20.1 passes.
 Fewer invalidations miss the window; more push every lookup onto the locked slow
 path, where the callback queues and the race cannot happen (4 releasers: 0/4).
 
@@ -259,21 +262,51 @@ receiver waiting for a value whose sender died cannot be woken by the stream,
 which under `UCP_ERR_HANDLING_MODE_NONE` reports no error either — the same
 dead-peer class as a stream read.
 
-### Every buffer of a UCX send must be registrable: never `Bytes::from_static`
+### Stream sends leave from the registered pool
 
-UCP Stream sends 478 bytes and up zero-copy (UCX 1.20 default protocols,
-`UCX_PROTO_INFO=y`: "multi-frag stream zero-copy copy-out"), registering every
-iovec through the registration cache with write access. A literal behind
-`Bytes::from_static` lives in `.rodata`, so its registration fails
-(`ibv_reg_mr(... length=16 ...) failed: Bad address`), and under the default
-protocol stack the connection's stream stops there: later sends report done
-and never arrive, until the peer gives up on the connection. The legacy stack
-(`UCX_PROTO_ENABLE=n`) falls back to a copy, which is why it hid the bug. Found
-when an extent node's frame-value reply put `Bytes::from_static(&[CODE_OK])` in
-its ctrl: a burst of replies flushed together crossed 478 bytes, and one
-partition's 8 MiB reads fell from ~3 GB/s to ~150 MB/s with 5–10 s stalls.
-`inline_storage` refuses stack memory; nothing refuses `.rodata`, so heap-copy
-any constant that can reach a UCX send. Test: stream `tests/prepared_append.rs`
-(64 bulk reads at once, extent node on its own thread so the connection takes
-the NIC rather than the `self` transport, which registers nothing — red with
-the static byte back).
+`ucx_send` / `ucx_send_vectored` copy the parts into one regpool slab and send it
+with the slab's memh (`ucx_send_staged`). Handed the caller's memory, UCP Stream
+sends 478 bytes and up zero-copy and registers every iovec through the
+registration cache; memory that turns over misses that cache on every send. The
+PS's reply to a 4 KiB GET is a slice of the SST block it read, and on a block
+cache miss that block was just allocated: every reply paid `ibv_reg_mr` and,
+once jemalloc purged the pages, `ibv_dereg_mr`, and the eight partition threads
+queued on the registration lock (88–91% of a partition thread's samples in
+`pthread_spin_lock`). The copy is what eager bcopy would cost, and values of
+`BULK_MIN_BYTES` and up go beside the stream as active messages, so the stream
+carries small parts. Measured on one host (RoCE loopback, 3 EN, 8 partitions,
+16 clients x depth 8, alternating builds of the PS, and of the client too for
+the memtable and load cases): flushed 4 KiB reads of a set larger
+than the PS's 512 MB block cache 4.5–4.9K -> 242–247K ops/s (p99 95–109 ms ->
+0.9 ms); a set in the cache 0.73–0.79M -> 1.28–1.29M; fresh keys read from the
+memtable 0.96–1.09M -> 1.22–1.26M; loading 80K 4 KiB keys 10.6–15.5K -> 36K
+ops/s. perf-check (`--ucx --3disk`, 20 s phases): 4 KiB write 13.2–14.0K ->
+31.3–46.1K, 8 MiB write 2442–2449 -> 2656–2742 MB/s, 8 MiB read 7088–7537 ->
+9566–9989 MB/s. Its 4 KiB read fell (942–966K -> 419–433K) because it reads
+what its write phase wrote, and the faster writes pushed each partition past
+the memtable switch into SST reads; on fixed data every 4 KiB read case above is
+faster. 32 KiB values (inline on the stream, so a batched reply copies every
+part): single writes 9.7–12.1K vs 11.1–12.0K ops/s and single reads 237–270K
+vs 243–284K over four alternating rounds each, within each other's spread;
+`--bulk 64` writes 47–50K -> 54–57K, `--bulk 64` reads 16.1–16.5K vs
+15.7–18.4K.
+Not measured: a thread whose slabs in use fill the regpool cap gets an
+unregistered staging buffer for each send, which UCX registers itself and which
+is freed afterwards, so such a thread's sends pay registration again
+(`RegpoolStats::over_cap_total` counts it; the PS and EN do not export it).
+Test: `tests/ucx_send_staged.rs` (a send and a vectored send out of `.rodata`,
+which cannot be registered, arrive; red without the staging: `ibv_reg_mr`
+fails with Bad address).
+
+### An active-message value must be registrable: never `Bytes::from_static`
+
+An AM value goes to UCX as the caller's memory and is registered through the
+cache with write access. A literal behind `Bytes::from_static` lives in
+`.rodata`, so its registration fails (`ibv_reg_mr(...) failed: Bad address`),
+and under the default protocol stack the connection then stops: later sends
+report done and never arrive, until the peer gives up on the connection. The
+legacy stack (`UCX_PROTO_ENABLE=n`) falls back to a copy and hides it. Found
+when an extent node's reply carried a static byte (one partition's 8 MiB reads
+fell from ~3 GB/s to ~150 MB/s with 5–10 s stalls). `inline_storage` refuses
+stack memory; nothing refuses `.rodata`, so heap-copy any constant that can
+become a frame value. Stream sends copy into the pool and take anything.

@@ -699,15 +699,46 @@ pub(crate) async fn await_pending<'a, P: 'static>(
 }
 
 async fn ucx_send<B: IoBuf>(ep: *mut ucp_ep, buf: B) -> BufResult<usize, B> {
-    let mut buf = ManuallyDrop::new(buf);
-    let len = buf.buf_len();
-    if len == 0 {
-        return BufResult(Ok(0), ManuallyDrop::into_inner(buf));
+    let r = ucx_send_staged(ep, || std::iter::once(buf.as_init())).await;
+    BufResult(r, buf)
+}
+
+/// Vectored send — the whole buffer list goes out in ONE stream send.
+///
+/// Without this the trait default applies, and it sends only the FIRST
+/// non-empty buffer, so `write_vectored_all` walks the list one send at a
+/// time: a 256-op batched write left here as 259 separate sends. TCP has had
+/// the sendmsg-with-N-iovecs path all along; this is the UCX counterpart.
+async fn ucx_send_vectored<T: IoVectoredBuf>(ep: *mut ucp_ep, buf: T) -> BufResult<usize, T> {
+    let r = ucx_send_staged(ep, || buf.iter_slice()).await;
+    BufResult(r, buf)
+}
+
+/// A stream send leaves from a registered pool slab, the parts copied in,
+/// with the slab's `memh`. Handed the caller's memory, UCX sends 478 bytes and
+/// up zero-copy and registers every buffer through its cache, which misses on
+/// memory that turns over (SST blocks read on a cache miss, heap pages
+/// jemalloc purged): each such send paid `ibv_reg_mr` and later
+/// `ibv_dereg_mr`, and the partition threads queued on the registration lock.
+/// The copy is what eager bcopy would cost; values of `BULK_MIN_BYTES` and up
+/// go beside the stream as active messages, so the stream carries small parts.
+async fn ucx_send_staged<'a, I: Iterator<Item = &'a [u8]>>(ep: *mut ucp_ep, parts: impl Fn() -> I) -> io::Result<usize> {
+    let total: usize = parts().map(<[u8]>::len).sum();
+    if total == 0 {
+        return Ok(0);
     }
-    let ptr = buf.buf_ptr();
-    if inline_storage(&buf, ptr as *const c_void) {
-        return BufResult(Err(inline_storage_err()), ManuallyDrop::into_inner(buf));
+    let mut slab = crate::regpool_acquire(total);
+    {
+        let (dest, _) = slab.dest_and_reg();
+        let mut at = 0;
+        for p in parts() {
+            dest[at..at + p.len()].copy_from_slice(p);
+            at += p.len();
+        }
     }
+    let ptr = slab.filled().as_ptr();
+    let memh = slab.reg().map_or(ptr::null_mut(), |r| r.memh());
+    let mut payload = ManuallyDrop::new(slab);
 
     let slot = slot_acquire();
 
@@ -716,76 +747,12 @@ async fn ucx_send<B: IoBuf>(ep: *mut ucp_ep, buf: B) -> BufResult<usize, B> {
         | ucp_op_attr_t::UCP_OP_ATTR_FIELD_USER_DATA) as u32;
     params.cb.send = Some(cb_send);
     params.user_data = slot as *mut c_void;
-
-    let r = unsafe { ucp_stream_send_nbx(ep, ptr as *const c_void, len, &params) };
-    let outcome = match classify_ptr(r) {
-        PtrStatus::Done => {
-            unsafe { slot_release(slot) };
-            Ok(len)
-        }
-        PtrStatus::Err(st) => {
-            unsafe { slot_release(slot) };
-            Err(ucs_err(st, "ucp_stream_send_nbx"))
-        }
-        PtrStatus::Pending(req) => {
-            let (status, _) = await_pending(req, slot, SPIN_ITERS, &mut buf, None).await;
-            if status == ucs_status_t::UCS_OK {
-                Ok(len)
-            } else {
-                Err(ucs_err(status, "ucp_stream_send cb"))
-            }
-        }
-    };
-    BufResult(outcome, ManuallyDrop::into_inner(buf))
-}
-
-/// Vectored send — ONE `ucp_stream_send_nbx` for the whole buffer list, via
-/// `UCP_DATATYPE_IOV`.
-///
-/// Without this the trait default applies, and it sends only the FIRST
-/// non-empty buffer, so `write_vectored_all` walks the list one send at a
-/// time: a 256-op batched write left here as 259 separate sends. TCP has had
-/// the sendmsg-with-N-iovecs path all along; this is the UCX counterpart.
-///
-/// UCX reads the iov ARRAY itself — not just the payloads it points at — for
-/// the duration of the operation, so the array is part of the payload
-/// `Inflight` guards and is freed only once the operation completed.
-async fn ucx_send_vectored<T: IoVectoredBuf>(ep: *mut ucp_ep, buf: T) -> BufResult<usize, T> {
-    let mut iov: Vec<ucp_dt_iov_t> = Vec::new();
-    let mut total = 0usize;
-    for s in buf.iter_slice() {
-        if s.is_empty() {
-            continue;
-        }
-        total += s.len();
-        iov.push(ucp_dt_iov_t {
-            buffer: s.as_ptr() as *mut c_void,
-            length: s.len(),
-        });
-    }
-    if total == 0 {
-        return BufResult(Ok(0), buf);
-    }
-    let mut payload = ManuallyDrop::new((buf, iov));
-    let iov = &payload.1;
-    if iov.iter().any(|e| inline_storage(&payload, e.buffer)) {
-        let (buf, _iov) = ManuallyDrop::into_inner(payload);
-        return BufResult(Err(inline_storage_err()), buf);
+    if !memh.is_null() {
+        params.op_attr_mask |= ucp_op_attr_t::UCP_OP_ATTR_FIELD_MEMH as u32;
+        params.memh = memh;
     }
 
-    let slot = slot_acquire();
-
-    let mut params: ucp_request_param_t = unsafe { std::mem::zeroed() };
-    params.op_attr_mask = (ucp_op_attr_t::UCP_OP_ATTR_FIELD_CALLBACK
-        | ucp_op_attr_t::UCP_OP_ATTR_FIELD_USER_DATA
-        | ucp_op_attr_t::UCP_OP_ATTR_FIELD_DATATYPE) as u32;
-    params.cb.send = Some(cb_send);
-    params.user_data = slot as *mut c_void;
-    params.datatype = ucp_dt_type::UCP_DATATYPE_IOV as ucp_datatype_t;
-
-    // With UCP_DATATYPE_IOV the "buffer" is the iov array and the "count" is
-    // the number of entries, not a byte length.
-    let r = unsafe { ucp_stream_send_nbx(ep, iov.as_ptr() as *const c_void, iov.len(), &params) };
+    let r = unsafe { ucp_stream_send_nbx(ep, ptr as *const c_void, total, &params) };
     let outcome = match classify_ptr(r) {
         PtrStatus::Done => {
             unsafe { slot_release(slot) };
@@ -793,19 +760,19 @@ async fn ucx_send_vectored<T: IoVectoredBuf>(ep: *mut ucp_ep, buf: T) -> BufResu
         }
         PtrStatus::Err(st) => {
             unsafe { slot_release(slot) };
-            Err(ucs_err(st, "ucp_stream_send_nbx(iov)"))
+            Err(ucs_err(st, "ucp_stream_send_nbx"))
         }
         PtrStatus::Pending(req) => {
             let (status, _) = await_pending(req, slot, SPIN_ITERS, &mut payload, None).await;
             if status == ucs_status_t::UCS_OK {
                 Ok(total)
             } else {
-                Err(ucs_err(status, "ucp_stream_send(iov) cb"))
+                Err(ucs_err(status, "ucp_stream_send cb"))
             }
         }
     };
-    let (buf, _iov) = ManuallyDrop::into_inner(payload);
-    BufResult(outcome, buf)
+    drop(ManuallyDrop::into_inner(payload));
+    outcome
 }
 
 pub(crate) async fn ucx_flush(ep: *mut ucp_ep) -> io::Result<()> {

@@ -1,3 +1,10 @@
+Date: 2026-10-27 (2)
+TaskStatus: completed
+Task scope: user — "修复BUG-UCX-ZC-SEND-REGISTERS-FRESH-MEMORY" (UCX flushed 4 KiB reads past the block cache collapsed to ~5K ops/s).
+Current summary: cause confirmed on the PS's sends (swapping only the PS restores it): a 4 KiB GET reply is a slice of a just-read SST block; UCP Stream sends >= 478 B zero-copy and registers every iovec through the registration cache, which misses on fresh memory, so every reply paid ibv_reg_mr/ibv_dereg_mr and the partition threads queued on the registration lock (88-91% pthread_spin_lock). Fix in autumn-transport: ucx_send / ucx_send_vectored copy the parts into one regpool slab and send it with its memh (ucx_send_staged); >= 64 KiB values already travel as AM. A/B UCX: miss-heavy 4.5-4.9K -> 242-247K (TCP 225K), in-cache 0.73-0.79M -> 1.28-1.29M, memtable 0.96-1.09M -> 1.22-1.26M; perf-check UCX 4K write 13-14K -> 31-46K, 8M write +9-12%, 8M read +30%; perf-check 4K read lower only because more was written (past the memtable switch). Tests: new ucx_send_staged (ablation red: Bad address); ucx_rcache_race rewritten to 64 KiB rendezvous AM sends (stream no longer reaches the cache), vanilla 1.16 segfaults 2/4 runs, 1.20.1 green; all UCX transport tests, prepared_append over UCX, transport/PS/client/rpc lib green.
+Main gaps: open question to the user — remove the copy-path fallback in read_block_via (it is what serves EC row extents today); EC blocks could take the bulk path for single-shard reads (not done).
+Next steps: user decides.
+
 Date: 2026-10-27
 TaskStatus: completed
 Task scope: user — BUG-READ-SLOWER-AFTER-FLUSH: find the root cause; then option A (user's choice): SST block-cache misses read through the bulk path.

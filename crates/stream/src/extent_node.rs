@@ -3657,8 +3657,6 @@ fn build_read_future(
                                 slot.req_id,
                                 MSG_READ_BYTES_BULK,
                                 autumn_rpc::frame::FLAG_RESPONSE,
-                                // Not `from_static`: a large stream send registers every iovec, and
-                                // read-only memory cannot be registered.
                                 vec![Bytes::copy_from_slice(&[CODE_OK])],
                                 vec![value],
                             )),
