@@ -2059,7 +2059,6 @@ pub(crate) struct WriteRequest {
 }
 
 impl WriteRequest {
-    /// Whether this request writes the user key `key`.
     /// The key this request writes; None for a fence record.
     fn written_key(&self) -> Option<&[u8]> {
         match &self.op {
@@ -2069,6 +2068,7 @@ impl WriteRequest {
         }
     }
 
+    /// Whether this request writes the user key `key`.
     fn writes_key(&self, key: &[u8]) -> bool {
         match &self.op {
             WriteOp::Put { user_key, .. } => user_key[..] == *key,
@@ -8409,25 +8409,27 @@ pub(crate) fn check_and_bump_fence(
     Ok(stamped_epoch > durable.get(&inode_hint).copied().unwrap_or(0))
 }
 
-/// region-epoch + in_range admission shared by `enqueue_put` /
-/// `enqueue_put_bulk` / `enqueue_delete`. Returns `Some(rejection)` for the FIRST
-/// failing check — stale region epoch → `FailedPrecondition`, out-of-range key
-/// → `InvalidArgument` — or `None` if admitted. The caller sends the rejection
-/// on its own single `resp_tx` and returns, which keeps the exact
-/// region → range → value-too-large → fence admission order (BUG-LEASE-2 P1 #1:
-/// a mis-routed key must be refused BEFORE the fence floor is raised/persisted).
-/// `enqueue_batch_put` keeps its own region check + per-op range (it records
-/// accumulator statuses, not a single resp).
-/// The memory tier's put: a bulk put of a covered key, unfenced and within the
-/// value cap, is held in the partition's shard and answered OK without a log
-/// append. Returns the request when it must take the durable path instead (not
+/// The memory tier's put: a put (`MSG_PUT` or `MSG_PUT_BULK`) of a covered key,
+/// unfenced and within the value cap, is held in the partition's shard and
+/// answered OK without a log append; batches go to `mem_tier_batch_put`.
+/// Returns the request when it must take the durable path instead (not
 /// covered, fenced, too large, an older durable write of the key not applied
-/// yet, or no room after eviction).
+/// yet, or no room).
 fn mem_tier_put(
     req: PartitionRequest,
     part: &Rc<RefCell<PartitionData>>,
     pending: &[WriteRequest],
 ) -> Option<PartitionRequest> {
+    if !matches!(req.msg_type, MSG_PUT | MSG_PUT_BULK | partition_rpc::MSG_BATCH_PUT | partition_rpc::MSG_BATCH_PUT_BULK) {
+        return Some(req);
+    }
+    // A partition that holds no covered key is never decoded here.
+    {
+        let p = part.borrow();
+        if !p.mem_tier.as_ref().is_some_and(|m| m.overlaps(&p.rg.start_key, &p.rg.end_key)) {
+            return Some(req);
+        }
+    }
     let (key, value, expires_at, region_epoch) = match req.msg_type {
         MSG_PUT_BULK => {
             // Malformed requests take the durable path, which answers them.
@@ -8442,6 +8444,14 @@ fn mem_tier_put(
             };
             (key, value, meta.expires_at, meta.region_epoch)
         }
+        MSG_PUT => {
+            let Ok(put) = partition_rpc::rkyv_decode::<partition_rpc::PutReq>(&req.payload) else { return Some(req) };
+            if put.inode_hint != 0 {
+                return Some(req);
+            }
+            (Bytes::from(put.key), Bytes::from(put.value), put.expires_at, put.region_epoch)
+        }
+        partition_rpc::MSG_BATCH_PUT | partition_rpc::MSG_BATCH_PUT_BULK => return mem_tier_batch_put(req, part, pending),
         _ => return Some(req),
     };
     let mut p = part.borrow_mut();
@@ -8473,6 +8483,93 @@ fn mem_tier_put(
     None
 }
 
+/// The memory tier's batched put: a `MSG_BATCH_PUT` / `MSG_BATCH_PUT_BULK` is
+/// held in the shard only as a whole — every op covered, unfenced, within the
+/// value cap and the partition's range, with no older durable write of its key
+/// queued or in flight — and answered with every op OK. Otherwise the whole
+/// batch takes the durable path, which also overrides any op this one already
+/// put in the shard (the durable writes mark their keys).
+fn mem_tier_batch_put(
+    req: PartitionRequest,
+    part: &Rc<RefCell<PartitionData>>,
+    pending: &[WriteRequest],
+) -> Option<PartitionRequest> {
+    // (key, value, expires_at, inode_hint); malformed requests take the
+    // durable path, which answers them.
+    let (region_epoch, ops): (u64, Vec<(Bytes, Bytes, u64, u64)>) = if req.msg_type == partition_rpc::MSG_BATCH_PUT {
+        let Ok(b) = partition_rpc::rkyv_decode::<partition_rpc::BatchPutReq>(&req.payload) else { return Some(req) };
+        let ops = b.ops.into_iter().map(|o| (Bytes::from(o.key), Bytes::from(o.value), o.expires_at, o.inode_hint)).collect();
+        (b.region_epoch, ops)
+    } else {
+        let Ok(b) = partition_rpc::rkyv_decode::<partition_rpc::BatchPutBulkReq>(&req.payload) else { return Some(req) };
+        let values = req.bulk_value.clone().unwrap_or_default();
+        if b.ops.iter().map(|o| o.value_len as u64).sum::<u64>() != values.len() as u64 {
+            return Some(req);
+        }
+        let mut off = 0usize;
+        let ops = b
+            .ops
+            .into_iter()
+            .map(|o| {
+                let v = values.slice(off..off + o.value_len as usize);
+                off += o.value_len as usize;
+                (Bytes::from(o.key), v, o.expires_at, o.inode_hint)
+            })
+            .collect();
+        (b.region_epoch, ops)
+    };
+    let queued: std::collections::HashSet<&[u8]> = pending.iter().filter_map(|w| w.written_key()).collect();
+    let mut p = part.borrow_mut();
+    let Some(mem) = p.mem_tier.as_ref() else { return Some(req) };
+    let eligible = !ops.is_empty()
+        && (region_epoch == 0 || region_epoch == p.region_epoch)
+        && ops.iter().all(|(key, value, _, inode_hint)| {
+            *inode_hint == 0
+                && mem.covers(key)
+                && value.len() <= AUTUMN_PS_MAX_INLINE_BYTES_DEFAULT as usize
+                && in_range(&p.rg, key)
+                && !p.inflight_write_keys.contains_key(&background::inflight_key_hash(key))
+                && !queued.contains(&key[..])
+        });
+    if !eligible {
+        return Some(req);
+    }
+    // A batch that could not fit with this shard emptied goes durable before
+    // evicting anything.
+    let total: u64 = ops.iter().map(|(k, v, ..)| mem_tier::charge(k.len(), v.len())).sum();
+    if !mem.could_fit(total) {
+        return Some(req);
+    }
+    let n = ops.len();
+    let now = Instant::now();
+    let mem = p.mem_tier.as_mut().expect("checked above");
+    for (i, (key, value, expires_at, _)) in ops.iter().enumerate() {
+        // Own the bytes: a bulk tail aliases a pooled receive buffer.
+        let owned = if req.msg_type == partition_rpc::MSG_BATCH_PUT_BULK { Bytes::copy_from_slice(value) } else { value.clone() };
+        if !mem.insert(key, owned, *expires_at, now) {
+            // Take back what this batch put in: until its durable write lands
+            // they would be read, and that write may still fail.
+            for (k, ..) in &ops[..i] {
+                mem.discard(k);
+            }
+            return Some(req);
+        }
+    }
+    drop(p);
+    let resp = partition_rpc::BatchPutResp { code: CODE_OK, message: String::new(), statuses: vec![0; n] };
+    let _ = req.resp_tx.send(Ok(partition_rpc::rkyv_encode(&resp)));
+    None
+}
+
+/// region-epoch + in_range admission shared by `enqueue_put` /
+/// `enqueue_put_bulk` / `enqueue_delete`. Returns `Some(rejection)` for the FIRST
+/// failing check — stale region epoch → `FailedPrecondition`, out-of-range key
+/// → `InvalidArgument` — or `None` if admitted. The caller sends the rejection
+/// on its own single `resp_tx` and returns, which keeps the exact
+/// region → range → value-too-large → fence admission order (BUG-LEASE-2 P1 #1:
+/// a mis-routed key must be refused BEFORE the fence floor is raised/persisted).
+/// `enqueue_batch_put` keeps its own region check + per-op range (it records
+/// accumulator statuses, not a single resp).
 fn admit_region_range(
     region_epoch: u64,
     key: &[u8],

@@ -1,3 +1,10 @@
+Date: 2026-10-27 (5)
+TaskStatus: not_completed
+Task scope: user — the memory tier must take autumn_kvcache's batched page writes (BatchClient.put_from -> MSG_BATCH_PUT_BULK / MSG_BATCH_PUT), then "开了 tier 就所有匹配的都进 mem-tier": every covered write, single MSG_PUT included; build and deploy (target not given yet).
+Current summary: `mem_tier_put` holds MSG_PUT (new), MSG_PUT_BULK, and batches via `mem_tier_batch_put` (held only as a whole: every op covered, unfenced, in range, current epoch, no older durable write of its key queued/in flight; else the whole batch is durable). Fenced writes stay durable (the fence floor is the durable path's). Partitions whose range holds no covered key skip the tier before decoding (`MemShard::overlaps`). `MemShard::could_fit` refuses an insert or batch that could not fit with the shard emptied before evicting anything; a batch refused partway discards what it put in, then goes durable. Tests: mem_tier system test (single small put, small batch, bulk batch held and gone after restart; batch with an fs/ key, fenced small put, batch behind an older durable write, 80x60 KiB batch over budget durable; duplicate key keeps later value) and unit tests (overlaps, discard, pre-check); ablations red: batch branch, MSG_PUT branch, queued/in-flight check, insert pre-check. PS lib 258 green. Three opus reviews; fixes applied (double decode on uncovered partitions, O(ops x pending) scan, partial-insert rollback, shard wiped by an impossible batch, misplaced doc comments).
+Main gaps: live-cluster acceptance (tier usage up, no log bytes for kvc page writes) waits for an idle host; deploy target unknown. Adapter note for the user: vLLM `__present__` marker now held too and can outlive its layers (adapter-side fix).
+Next steps: user gives the deploy target; live-cluster acceptance on an idle host. Recorded BUG-MEM-TIER-EMPTY-GROUPS-LINGER (inferred by review: emptied groups are not reclaimed until a budget-full eviction).
+
 Date: 2026-10-27 (4)
 TaskStatus: completed
 Task scope: user — "同意做ec的bulk读": an SST block (or VP value) of an EC extent inside one data shard takes the bulk read instead of the copy path.

@@ -28,11 +28,14 @@
 //! group read once between batches was evicted whenever the hand reached it
 //! twice in that time — the first eviction was such a turn.
 //!
-//! A durable write of a key held here (a delete, a conditional write, a batch
-//! put, a put that did not fit) marks the entry superseded when it is queued;
-//! the entry is dropped when that write is applied, so a read never falls back
-//! to a value older than the one held here. A later memory put of the key
-//! replaces the entry and clears the mark.
+//! A durable write of a key held here (a delete, a conditional write, a fenced
+//! put, a put or batch that did not fit) marks the entry superseded when it is
+//! queued; the entry is dropped when that write is applied, so a read does not
+//! fall back to a value older than the one held here. The exceptions drop the
+//! entry outright: eviction, and a batch taking back the ops it had put in
+//! before going durable (`discard`) — reads then see the LSM's value until the
+//! durable write lands. A later memory put of the key replaces the entry and
+//! clears the mark.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
@@ -54,12 +57,27 @@ const ENTRY_OVERHEAD: u64 = 96;
 pub(crate) struct MemTierBudget {
     cap: u64,
     prefixes: Vec<Vec<u8>>,
+    /// Each prefix's `prefix_successor`.
+    successors: Vec<Option<Vec<u8>>>,
     used: AtomicU64,
     pub(crate) hits: AtomicU64,
     pub(crate) inserts: AtomicU64,
     pub(crate) refused: AtomicU64,
     pub(crate) evicted_entries: AtomicU64,
     pub(crate) evicted_bytes: AtomicU64,
+}
+
+/// The first key past every key starting with `p`; None when there is none
+/// (`p` is all 0xff).
+fn prefix_successor(p: &[u8]) -> Option<Vec<u8>> {
+    let mut s = p.to_vec();
+    while let Some(last) = s.pop() {
+        if last < 0xff {
+            s.push(last + 1);
+            return Some(s);
+        }
+    }
+    None
 }
 
 impl MemTierBudget {
@@ -70,9 +88,11 @@ impl MemTierBudget {
         if cap == 0 || prefixes.is_empty() {
             return None;
         }
+        let successors = prefixes.iter().map(|p| prefix_successor(p)).collect();
         Some(Arc::new(MemTierBudget {
             cap,
             prefixes,
+            successors,
             used: AtomicU64::new(0),
             hits: AtomicU64::new(0),
             inserts: AtomicU64::new(0),
@@ -84,6 +104,16 @@ impl MemTierBudget {
 
     pub(crate) fn covers(&self, key: &[u8]) -> bool {
         self.prefixes.iter().any(|p| key.starts_with(p))
+    }
+
+    /// Whether a partition `[start, end)` (empty end = unbounded) can hold a
+    /// covered key: the keys under a prefix are `[prefix, prefix's successor)`.
+    pub(crate) fn overlaps(&self, start: &[u8], end: &[u8]) -> bool {
+        self.prefixes.iter().zip(&self.successors).any(|(p, succ)| {
+            let below_end = end.is_empty() || p.as_slice() < end;
+            let above_start = succ.as_ref().is_none_or(|s| start < s.as_slice());
+            below_end && above_start
+        })
     }
 
     pub(crate) fn cap(&self) -> u64 {
@@ -137,6 +167,14 @@ pub(crate) struct MemShard {
     /// The group the current burst writes to: (slot, id).
     open: Option<(usize, u64)>,
     last_insert: Option<Instant>,
+    /// Bytes this shard's entries are charged.
+    held: u64,
+}
+
+/// What an entry is charged against the budget. The key is stored twice: in
+/// the map and in its group.
+pub(crate) fn charge(key_len: usize, value_len: usize) -> u64 {
+    2 * key_len as u64 + value_len as u64 + ENTRY_OVERHEAD
 }
 
 impl MemShard {
@@ -148,7 +186,15 @@ impl MemShard {
             next_group: 0,
             open: None,
             last_insert: None,
+            held: 0,
         }
+    }
+
+    /// Whether `charge` bytes could fit with every evictable entry of this
+    /// shard gone: the budget minus what the other partitions hold. Past that,
+    /// evicting would empty the shard and still not make room.
+    pub(crate) fn could_fit(&self, charge: u64) -> bool {
+        charge <= self.budget.cap.saturating_sub(self.budget.used().saturating_sub(self.held))
     }
 
     pub(crate) fn covers(&self, key: &[u8]) -> bool {
@@ -162,8 +208,12 @@ impl MemShard {
     /// Hold `value` for `key`. False when it does not fit even after evicting
     /// every other group of this shard; the caller then writes it durably.
     pub(crate) fn insert(&mut self, key: &[u8], value: Bytes, expires_at: u64, now: Instant) -> bool {
-        // The key is stored twice: in the map and in its group.
-        let charge = 2 * key.len() as u64 + value.len() as u64 + ENTRY_OVERHEAD;
+        let charge = charge(key.len(), value.len());
+        if !self.could_fit(charge) {
+            self.budget.refused.fetch_add(1, Relaxed);
+            self.supersede(key);
+            return false;
+        }
         let in_burst = self.last_insert.is_some_and(|t| now.duration_since(t) <= GROUP_GAP);
         // Making room never evicts the group this burst is writing.
         let current = self.open.filter(|&(slot, id)| in_burst && self.groups.get(slot).is_some_and(|g| g.id == id));
@@ -188,6 +238,7 @@ impl MemShard {
         self.groups.get_mut(slot).expect("the open group is live").keys.push(key.to_vec());
         let entry = Entry { value, expires_at, charge, group: id, slot, superseded: false };
         self.entries.insert(key.to_vec(), entry);
+        self.held += charge;
         self.budget.inserts.fetch_add(1, Relaxed);
         true
     }
@@ -202,6 +253,16 @@ impl MemShard {
         self.groups.touch(e.slot);
         self.budget.hits.fetch_add(1, Relaxed);
         Some((e.value.clone(), e.expires_at))
+    }
+
+    pub(crate) fn overlaps(&self, start: &[u8], end: &[u8]) -> bool {
+        self.budget.overlaps(start, end)
+    }
+
+    /// Drop `key`'s entry: a batch that could not be held takes back what it
+    /// had put in before going durable.
+    pub(crate) fn discard(&mut self, key: &[u8]) {
+        self.remove(key);
     }
 
     /// A durable write of `key` was queued: keep serving the held value until
@@ -222,6 +283,7 @@ impl MemShard {
     fn remove(&mut self, key: &[u8]) {
         if let Some(e) = self.entries.remove(key) {
             self.budget.release(e.charge);
+            self.held -= e.charge;
         }
     }
 
@@ -236,6 +298,7 @@ impl MemShard {
             if self.entries.get(k).is_some_and(|e| e.group == g.id) {
                 let e = self.entries.remove(k).expect("checked above");
                 self.budget.release(e.charge);
+                self.held -= e.charge;
                 bytes += e.charge;
                 n += 1;
             }
@@ -249,14 +312,60 @@ impl MemShard {
 impl Drop for MemShard {
     /// A closed partition gives its bytes back to the PS budget.
     fn drop(&mut self) {
-        let held: u64 = self.entries.values().map(|e| e.charge).sum();
-        self.budget.release(held);
+        self.budget.release(self.held);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_partition_overlaps_the_prefix_only_where_covered_keys_can_fall() {
+        let b = MemTierBudget::new(1 << 20, &["kvc/".to_string()]).unwrap();
+        assert!(b.overlaps(b"", b""), "the whole key space");
+        assert!(b.overlaps(b"kvc/m", b"kvc/n"));
+        assert!(b.overlaps(b"a", b"kvc/0"), "end past the prefix start");
+        assert!(!b.overlaps(b"a", b"kvc/"), "ends where covered keys begin");
+        assert!(!b.overlaps(b"kvc0", b""), "starts past every covered key");
+        assert!(b.overlaps(b"kvc/\xff", b""));
+        assert!(!b.overlaps(b"fs/", b"fs0"));
+    }
+
+    /// A discarded entry is gone and its bytes are back; evicting its group
+    /// later releases nothing twice.
+    #[test]
+    fn a_discarded_entry_releases_its_bytes_once() {
+        let mut s = shard(1 << 20);
+        let now = Instant::now();
+        assert!(s.insert(b"kvc/a", Bytes::from(vec![1; 1000]), 0, now));
+        assert!(s.insert(b"kvc/b", Bytes::from(vec![2; 1000]), 0, now));
+        let before = s.budget.used();
+        s.discard(b"kvc/a");
+        assert_eq!(s.get(b"kvc/a", 0), None);
+        assert_eq!(s.budget.used(), before - charge(5, 1000));
+        assert!(s.evict_one_group(None));
+        assert_eq!(s.budget.used(), 0, "the group's other entry only");
+        assert_eq!(s.held, 0);
+    }
+
+    /// An insert that could not fit with its own shard emptied — the other
+    /// partitions hold the rest of the budget — is refused before evicting
+    /// anything.
+    #[test]
+    fn an_insert_past_what_the_shard_could_free_evicts_nothing() {
+        let budget = MemTierBudget::new(10_000, &["kvc/".to_string()]).unwrap();
+        let mut other = MemShard::new(budget.clone());
+        let mut s = MemShard::new(budget);
+        let now = Instant::now();
+        assert!(other.insert(b"kvc/o", Bytes::from(vec![0; 6000]), 0, now));
+        assert!(s.insert(b"kvc/a", Bytes::from(vec![1; 2000]), 0, now));
+        let later = now + 2 * GROUP_GAP;
+        assert!(!s.insert(b"kvc/big", Bytes::from(vec![2; 4000]), 0, later), "4000 + the key does not fit in 10000 - 6000");
+        assert!(s.get(b"kvc/a", 0).is_some(), "nothing was evicted for it");
+        assert!(s.could_fit(charge(5, 1000)));
+        assert!(!s.could_fit(charge(7, 4000)));
+    }
 
     fn shard(cap: u64) -> MemShard {
         MemShard::new(MemTierBudget::new(cap, &["kvc/".to_string()]).unwrap())

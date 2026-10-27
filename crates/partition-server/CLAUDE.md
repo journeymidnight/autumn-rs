@@ -694,12 +694,31 @@ a compaction moves the cursor past them. Load-bearing:
 ## Memory tier (`mem_tier.rs`) — optional, not durable
 
 `--mem-tier-bytes N --mem-tier-prefix kvc/` (both needed; off by default). A
-bulk put of a covered key (`MSG_PUT_BULK`, i.e. a value ≥ 64 KiB; unfenced,
-within the inline cap) is held in DRAM by the partition's write actor and
+put of a covered key (`MSG_PUT` or `MSG_PUT_BULK`, any size up to the 64 MiB
+value cap; unfenced) is held in DRAM by the partition's write actor and
 answered OK without a log append (`mem_tier_put`, after the freeze and
 epoch/range checks, so it keeps arrival order with deletes and conditional
-writes of the key). Small puts stay durable: KV pages are bulk, and leaving
-`MSG_PUT` alone keeps every other put from being decoded twice. A put whose key
+writes of the key). A batched put (`MSG_BATCH_PUT`, `MSG_BATCH_PUT_BULK` — what
+`put_many` / `BatchClient.put_from` send for values under 64 KiB) is held
+as a whole (`mem_tier_batch_put`): only when every op passes the same checks,
+answered with every op OK; any op that does not sends the whole batch down the
+durable path. A batch whose total charge could not fit even with this shard
+emptied (`MemShard::could_fit`: the budget minus what the other partitions
+hold) goes durable before evicting anything, as a single insert does; one
+refused partway anyway first takes back the ops this batch already put in —
+until the durable write landed they would be read, and that write can still
+fail — then goes durable. A batch over 256 ops spans two groups, and making
+room for the second can evict its own first (only the group a burst is
+writing is kept); batches make such long bursts common.
+
+Size is left to the budget: every covered write is held, and CLOCK evicts by
+bytes. A partition whose range holds no covered key (`MemShard::overlaps`)
+skips the tier before decoding anything; in one that does, a put or batch that
+is not held is decoded twice (the SDK sends a `MSG_PUT` or an inline batch only
+under 64 KiB, though the PS accepts either up to the value cap; a bulk form's
+values stay in the tail, only its ctrl is decoded). A fenced write
+(`inode_hint != 0`, a file-system lease) is never held: its floor bump is the
+durable path's. A put or batch whose key
 has an older durable write queued or in flight (`pending`, `inflight_write_keys`)
 is written durably behind it — held, it would be dropped when the older write
 landed and reads would go back to the older value.
@@ -715,7 +734,8 @@ inline memtable hit, so a redirect request gets the value inline.
   an insert that cannot fit after that takes the durable path, and the value
   held for the key (if any) stays served, marked, until that write lands. So a
   partition that filled its share and went idle keeps it; the others write
-  durably once the PS budget is full (`refused_total` grows).
+  durably once the PS budget is full (`refused_total` grows; a batch sent
+  durable whole because it could not fit is not counted there).
 - **Eviction**: CLOCK over groups — inserts closer than 50 ms form one group
   (≤ 256 entries), dropped together. A KV-cache hit is a run of consecutive
   pages, so a hole in the middle of a run wastes the rest of it. A new group
@@ -743,8 +763,8 @@ inline memtable hit, so a redirect request gets the value inline.
   remembered by (slot, id): when it was whatever sat last in a rotating queue,
   the hand moving read groups behind it made the rest of a burst join one of
   them.
-- **Durable writes of a held key** (delete, conditional write, batch put,
-  fenced or oversized put, a put that did not fit) mark the entry superseded
+- **Durable writes of a held key** (delete, conditional write, fenced put, a
+  put or batch that was not held) mark the entry superseded
   when queued (marked after dispatch over what the enqueue appended to
   `pending`; conditional writes by key); `finish_write_batch` drops a marked
   entry once a write of its key reaches the memtable. A read therefore never

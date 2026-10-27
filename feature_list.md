@@ -56,6 +56,19 @@
 - `passes: true`
 - **notes** (2026-10-27 修复): 坐实在 PS 的发送：只换 PS（客户端、EN 不变）即恢复。4K GET 回复是刚读进缓存的块的切片，UCX 流 ≥478 B 零拷贝，经注册缓存逐段注册，新内存每次未命中，`ibv_reg_mr`/`ibv_dereg_mr` 在注册锁上排队。修法（transport）：`ucx_send`/`ucx_send_vectored` 把各段拷进一个 regpool slab，带 memh 发（`ucx_send_staged`），调用方内存不再交给 UCX 注册；≥64 KiB 的值本来就走 AM，流上只剩小段，拷贝相当于 eager bcopy。交替对照（UCX）：缓存放不下 4.5–4.9K → 242–247K ops/s（TCP 225K），p99 95–109 ms → 0.9 ms；放得下 0.73–0.79M → 1.28–1.29M；memtable 读 0.96–1.09M → 1.22–1.26M；装 4K 10.6–15.5K → 36K。perf-check UCX：4K 写 13.2–14.0K → 31.3–46.1K，8M 写 2442–2449 → 2656–2742 MB/s，8M 读 7088–7537 → 9566–9989；4K 读 942–966K → 419–433K 是写得多越过 memtable 切换点所致（固定数据上全部更快）。fable 评审后补测 32 KiB（流上内联，批量回复整段拷贝）：单个写/读四轮交替互在波动内，`--bulk 64` 写 47–50K → 54–57K、读持平。测试：`ucx_send_staged.rs`（从 `.rodata` 发出能到，去掉修复红：Bad address）；`ucx_rcache_race.rs` 改用 64 KiB rendezvous AM 发送（流发送不再碰注册缓存），原版 1.16 上 4 次里 2 次段错误，1.20.1 通过。
 
+### F-MEM-TIER-BATCH-PUT — 批量写也进 PS 内存层
+- **Trigger** (2026-10-27 用户): autumn_kvcache 用 `BatchClient.put_from` 写页，小于 64 KiB 的页按分区打包成 `MSG_BATCH_PUT_BULK`（合计不到 64 KiB 时 `MSG_BATCH_PUT`）；内存层只拦截单条 `MSG_PUT_BULK`，批量写仍全部落盘，Freetoken 主写路径用不上刚配的 16 GiB tier。
+- **Scope**: `mem_tier_put` 处理 `MSG_BATCH_PUT` 与 `MSG_BATCH_PUT_BULK`：一批里每条都在内存层前缀下、值不超过内联上限、不带 lease（inode_hint 0）、在分区范围内、region epoch 对、没有同 key 更早的落盘写在排队或在途，才整批放进内存层并按批量写的回复格式逐条回 OK；任何一条不符合或内存层腾不出地方，整批走原落盘路径（已放进内存层的同 key 条目由落盘写标记失效）。
+- **Acceptance**: 单元测试：符合条件的两种批量写进内存层（不进 pending、不写日志、能读回、回复逐条 OK）；混一条非前缀 key 的批整批落盘；有同 key 落盘写排队时整批落盘；去掉批量分支变红。真实集群：`put_many` 小页写入后内存层用量上升、落盘字节不增加。
+- `passes: false`
+- **notes** (2026-10-27): `mem_tier_batch_put`。系统测试 `crates/manager/tests/mem_tier.rs`：小值批（`MSG_BATCH_PUT`）与合计过 64 KiB 的批（`MSG_BATCH_PUT_BULK`）读得回、PS 重启后没有（未写日志）；混一个 `fs/` key 的批两个 key 重启后都在；排在同 key 更早落盘写后的批落盘且为较新值；去掉批量分支变红（"a covered batch: held in memory only"），连跑 3 次绿。用户随后定"开了 tier 就所有匹配的都进，CLOCK 按容量算"：单条 `MSG_PUT` 也进内存层（测试 `kvc/small` 重启后没有，去掉分支变红）；带 lease 的写仍落盘（围栏水位只在落盘路径）；值大小只受 64 MiB 协议上限与总预算约束。真实集群验收（内存层用量上升、落盘字节不增）待空闲时与性能一起做。
+
+### BUG-MEM-TIER-EMPTY-GROUPS-LINGER — 条目被删后其组不回收（评审推断，未复现）
+- **Trigger** (2026-10-27 内存层批量写的第三轮评审): `MemShard::remove`（删除、批量写撤回、落盘覆盖后的 `applied`）只删条目，组里的 key 副本和 CLOCK 槽位留着；同一批 key 跨批次反复重写或删除时，空组只在预算满触发淘汰时才被清掉，这部分内存不计入预算、槽位数组持续增长。
+- **Scope**: 先复现（反复重写/删除同一批 key，看 groups 槽位数与 RSS），坐实后让空组随最后一个条目离开而释放。
+- **Acceptance**: 复现用例修复前槽位数随轮次增长、修复后有界；消融变红；内存层其余测试全过。
+- `passes: false`
+
 ### F-KVC-CACHE-TIER — PS 之上的 kvc 专用薄缓存层（记录，暂缓）
 - **Trigger** (2026-10-23 用户): 从性能看需要给 kvc 一层很薄的缓存：write-through、超大 CLOCK、选择性落盘，把所有节点的内存池化；放在 PS 层之上，PS 层以下保持原样（不在 PS 里加读缓存——存储不该带重读缓存，3FS/HDFS 都不做）。
 - **Scope**: 等 F-KVC-ADAPTER-WRITE-READ 读写跑满之后再定要不要做、怎么做（对标 Mooncake：内存先确认、eager 或淘汰时落盘）。

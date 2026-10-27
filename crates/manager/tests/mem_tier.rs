@@ -1,10 +1,10 @@
 //! The PS memory tier (`--mem-tier-bytes`, `--mem-tier-prefix`) against a live
-//! in-process cluster: covered bulk puts are served from memory and gone after
-//! a PS restart (never logged); uncovered, small, fenced, oversized and batched
-//! writes stay durable; a durable write replaces the held value; a put behind
-//! an older durable write of its key is written durably too; deletes, TTLs and
-//! conditional writes see the held value; the oldest burst is evicted as a
-//! whole.
+//! in-process cluster: covered puts, small or bulk, and covered batches are
+//! served from memory and gone after a PS restart (never logged); uncovered,
+//! fenced and oversized writes, and a batch with any such op, stay durable; a
+//! durable write replaces the held value; a put or batch behind an older durable
+//! write of its key is written durably too; deletes, TTLs and conditional writes
+//! see the held value; the oldest burst is evicted as a whole.
 
 mod support;
 
@@ -101,11 +101,54 @@ fn memory_tier_holds_covered_puts_until_restart() {
         compio::time::sleep(Duration::from_secs(4)).await;
         assert_eq!(get(&c, b"kvc/t").await, None, "expired in memory");
 
-        // Durable: a value larger than the whole budget, a small value, a
-        // batch, an uncovered key.
-        c.put(b"kvc/huge", val(5 << 20, 9), none).await.unwrap();
-        c.put(b"kvc/small", b"inline", none).await.unwrap();
+        // Held: a batch of covered keys, small (MSG_BATCH_PUT) or adding up
+        // past the bulk cut (MSG_BATCH_PUT_BULK).
         for r in c.put_many(&[(&b"kvc/b1"[..], val(100, 4)), (&b"kvc/b2"[..], val(100, 5))], none).await {
+            r.unwrap();
+        }
+        let part = 30 << 10;
+        for r in c
+            .put_many(&[(&b"kvc/bb1"[..], val(part, 6)), (&b"kvc/bb2"[..], val(part, 7)), (&b"kvc/bb3"[..], val(part, 8))], none)
+            .await
+        {
+            r.unwrap();
+        }
+        assert_eq!(get(&c, b"kvc/b2").await, Some(vec![5; 100]));
+        assert_eq!(get(&c, b"kvc/bb3").await, Some(vec![8; part]));
+        // A batch behind an older durable write of one of its keys, not yet
+        // applied, is written durably as a whole.
+        let rb = [(&b"kvc/rb"[..], val(100, 24))];
+        let (older, newer) = futures::join!(c.put(b"kvc/rb", val(8 << 20, 23), fenced), c.put_many(&rb, none));
+        older.unwrap();
+        for r in newer {
+            r.unwrap();
+        }
+
+        // A key twice in one held batch keeps the later value.
+        let dup = [(&b"kvc/dup"[..], val(100, 27)), (&b"kvc/dup"[..], val(100, 28))];
+        for r in c.put_many(&dup, none).await {
+            r.unwrap();
+        }
+        assert_eq!(get(&c, b"kvc/dup").await, Some(vec![28; 100]));
+
+        // A batch larger than the whole budget is refused partway: it takes
+        // back what it had put in and is written durably.
+        let over_keys: Vec<Vec<u8>> = (0..80).map(|i| format!("kvc/over{i:02}").into_bytes()).collect();
+        let over: Vec<(&[u8], Bytes)> = over_keys.iter().map(|k| (&k[..], val(60 << 10, 30))).collect();
+        for r in c.put_many(&over, none).await {
+            r.unwrap();
+        }
+        assert_eq!(get(&c, b"kvc/over79").await, Some(vec![30; 60 << 10]));
+
+        // Held: a small single put (MSG_PUT); a fenced one stays durable.
+        c.put(b"kvc/small", b"inline", none).await.unwrap();
+        c.put(b"kvc/sfenced", b"fenced", fenced).await.unwrap();
+        assert_eq!(get(&c, b"kvc/small").await.as_deref(), Some(&b"inline"[..]));
+
+        // Durable: a value larger than the whole budget, a batch with an
+        // uncovered key, an uncovered key.
+        c.put(b"kvc/huge", val(5 << 20, 9), none).await.unwrap();
+        for r in c.put_many(&[(&b"kvc/mix"[..], val(100, 25)), (&b"fs/mix"[..], val(100, 26))], none).await {
             r.unwrap();
         }
         c.put(b"fs/x", b"durable", none).await.unwrap();
@@ -127,8 +170,17 @@ fn memory_tier_holds_covered_puts_until_restart() {
         assert!(back, "the PS came back");
         assert_eq!(get(&c, b"fs/x").await.as_deref(), Some(&b"durable"[..]));
         assert_eq!(get(&c, b"kvc/huge").await.map(|v| v.len()), Some(5 << 20), "too large for memory: durable");
-        assert_eq!(get(&c, b"kvc/b1").await, Some(vec![4; 100]), "batched: durable");
-        assert_eq!(get(&c, b"kvc/small").await.as_deref(), Some(&b"inline"[..]), "small: durable");
+        assert_eq!(get(&c, b"kvc/b1").await, None, "a covered batch: held in memory only");
+        assert_eq!(get(&c, b"kvc/dup").await, None, "held in memory only");
+        for k in [&b"kvc/over00"[..], b"kvc/over40", b"kvc/over79"] {
+            assert_eq!(get(&c, k).await, Some(vec![30; 60 << 10]), "a batch that did not fit: durable");
+        }
+        assert_eq!(get(&c, b"kvc/bb2").await, None, "a covered bulk batch: held in memory only");
+        assert_eq!(get(&c, b"kvc/mix").await, Some(vec![25; 100]), "a batch with an uncovered key: durable");
+        assert_eq!(get(&c, b"fs/mix").await, Some(vec![26; 100]));
+        assert_eq!(get(&c, b"kvc/rb").await, Some(vec![24; 100]), "a batch behind an older durable write: durable, and newer");
+        assert_eq!(get(&c, b"kvc/small").await, None, "a small single put: held in memory only");
+        assert_eq!(get(&c, b"kvc/sfenced").await.as_deref(), Some(&b"fenced"[..]), "a small fenced put: durable");
         assert_eq!(get(&c, b"kvc/m").await, Some(vec![12; big]), "fenced: durable");
         assert_eq!(get(&c, b"kvc/r").await, Some(vec![22; 1 << 20]), "behind an older durable write: durable, and newer");
         assert_eq!(get(&c, b"kvc/held").await, None, "held in memory only");

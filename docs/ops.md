@@ -3360,7 +3360,9 @@ grep 'is below --conn-inflight-cap' /tmp/autumn-rs-logs/ps.log   # one WARN
 
 Off by default. `autumn-ps --mem-tier-bytes 256G --mem-tier-prefix kvc/` (or
 `AUTUMN_PS_MEM_TIER_BYTES` + `AUTUMN_PS_MEM_TIER_PREFIX` with `cluster.sh`)
-holds bulk puts (values of 64 KiB and up) of keys under the prefix in the PS's
+holds every put of a key under the prefix — single puts of any size, and batched
+puts (`put_many`, `BatchClient.put_from`: values under 64 KiB packed per
+partition) — in the PS's
 DRAM and acknowledges them without writing the log; reads look there first.
 **What is held is not durable**: a PS restart, a partition reopen, split, merge
 or move loses it, and a key that also had an older durable value reads that
@@ -3369,8 +3371,13 @@ everything else should stay outside the prefix. The budget is for the whole PS;
 a partition that needs room evicts its own write bursts, a burst at a time
 (CLOCK: a new burst gets a full turn of the hand; only a read saves one after
 that), and a put that still does not fit is written durably as usual (a
-partition that filled its share and went idle keeps it). Small, fenced, batched and oversized
-puts are always durable. `RANGE` does not list keys held only in memory. Watch
+partition that filled its share and went idle keeps it). A batch is held only as a
+whole: one fenced or uncovered op, or a batch the budget cannot take, makes the
+whole batch durable (an op over the 64 MiB value cap gets the batch refused, as
+without the tier).
+Fenced puts (file-system leases) are always durable, and a value over the 64 MiB
+value cap is refused as without the tier. A write that could not fit even with
+its partition's held entries all evicted goes durable without evicting them. `RANGE` does not list keys held only in memory. Watch
 `autumn_ps_mem_tier_*` on the PS `/metrics`.
 
 ```bash
