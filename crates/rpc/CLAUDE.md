@@ -424,8 +424,8 @@ partitions on both transports), and UCX one-partition writes up (8M 502/471 →
 exit opens the window. Keepalive pings take the urgent lane, so a full
 window cannot keep the UCX dead-peer clock (timed from the ping's write) from
 starting. Limits: only large frames are windowed, so a stream of small writes
-can still take the PS's spare slot; the SDK's window (3) is tied by hand to
-the PS's `--conn-inflight-cap` (4) — a cap at or under the window brings the
+can still take the PS's spare slot; the SDK's window (3) must stay under
+the PS's `--conn-inflight-cap` (16) — a cap at or under the window brings the
 wait back; a request the server never answers keeps its slot until the
 connection is replaced. Tests: `an_urgent_request_overtakes_queued_ones`
 (ablation red: urgent sent to the normal queue),

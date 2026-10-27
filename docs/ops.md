@@ -3275,8 +3275,8 @@ A client's reads to a partition (HEAD, which `BatchClient.exists` uses, and the
 redirect and range lookups) take the RPC client's urgent lane, and each PS
 connection holds at most `--ps-send-window` (client parameter, default 3, 0 =
 off) large requests (64 KiB and up) unanswered; further large ones wait in the
-client. Without the window a client putting large values filled the PS's 4
-admission slots per connection, and a probe from the same client waited for a
+client. Without the window a client putting large values filled the PS's
+admission slots on the connection (4 of them then), and a probe from the same client waited for a
 put to commit. kvcache load, UCX, one BatchClient putting 128 x 16 MiB pages
 while it probes: `exists` p99 270 ms → 8.6 ms; 8 ranks of 16 MiB puts: one
 partition 0.44–0.57 → 0.82 GB/s, 16 partitions 2.32–2.63 → 2.54–2.74 GB/s.
@@ -3302,6 +3302,58 @@ for _ in range(100):
     t0 = time.perf_counter(); assert all(bc.exists(keys)); lat.append((time.perf_counter() - t0) * 1e3)
 stop.set(); t.join(); lat.sort(); print(f"exists p50 {lat[50]:.1f} ms  p99 {lat[98]:.1f} ms")  # p99 tens of ms, not hundreds
 PY
+```
+
+## Per-connection admission and the registered pool
+
+A PS admits `--conn-inflight-cap` requests per client connection (default 16);
+with the slots full it stops reading the connection. The admitted requests of
+all of a partition's connections are what one group-commit batch can hold, so
+the cap bounds small-write batching: at 4, with the perf bench's two writing
+connections per partition, every batch was 8 ops and 4 KiB writes stopped near
+8K ops/s per partition whatever the client's depth.
+
+Under UCX every large value in flight (a GET answered from the log, a bulk PUT,
+64 KiB and up) sits in a buffer from the thread's registered pool,
+`--ucx-regpool-cap-bytes` per thread (default 2 GiB; one PS partition thread,
+one EN shard thread, one client worker thread each have their own). Past the
+pool the buffer is fresh, unregistered memory: zeroed, faulted in, registered
+with the NIC on every send and dropped afterwards, and the throughput falls
+with it. Size the pool on every side for the largest values in flight at once:
+
+    pool per thread >= connections per partition x --conn-inflight-cap x largest value
+
+kvcache under a TP8 engine: 8 connections x 16 x 16 MiB pages = 2 GiB, the
+default. The PS checks one side of this at start under UCX and logs a WARN when
+`--ucx-regpool-cap-bytes` < `--conn-inflight-cap` x 128 MiB (8 connections x
+16 MiB); it cannot see connection counts or value sizes, so a larger deployment
+must still be sized by hand. The extent node holding a partition's log extent
+needs the same headroom for the PS's concurrent reads, and the client for its
+own concurrency (`batch_get_concurrency` x value size per worker thread). The
+pool only grows with use, but idle slabs stay registered until pressure from a
+new size evicts them, so a thread can keep up to its cap pinned after a burst (on
+TCP the same cap bounds the idle heap a thread keeps pooled).
+
+Measured (one host, UCX, one partition, 16 MiB values, 4 threads x
+`--bulk 32`, so the PS holds 4 connections x the cap of reads):
+
+| `--conn-inflight-cap` | pool (PS / EN / client) | 16 MiB reads |
+|---|---|---|
+| 4 | 512 MiB | 8.5–9.2 GB/s |
+| 16 | 512 MiB | 6.0–6.3 GB/s |
+| 32 | 512 MiB | 3.0–3.7 GB/s (PS partition thread 0.54 cores registering) |
+| 32 | 4 GiB on the PS only | 5.6 GB/s |
+| 32 | 4 GiB everywhere | 8.5 GB/s |
+| 16 | 2 GiB (defaults) | 8.8 GB/s |
+
+TCP registers nothing: the same reads went 1.37 → 1.88 GB/s from cap 4 to 32.
+`cluster.sh` passes `AUTUMN_UCX_REGPOOL_CAP_BYTES` to the PS and the extent
+nodes; the client takes `--ucx-regpool-cap-bytes`. Check the warning:
+
+```bash
+AUTUMN_TRANSPORT=ucx AUTUMN_BIND_HOST='[<roce-ip>]' UCX_TLS=rc_mlx5,ud_mlx5,tcp,self \
+  UCX_NET_DEVICES=<dev>:1 AUTUMN_PS_CONN_INFLIGHT_CAP=32 bash cluster.sh start 3
+grep 'is below --conn-inflight-cap' /tmp/autumn-rs-logs/ps.log   # one WARN
 ```
 
 ## Memory tier for KV cache (`--mem-tier-bytes`, `--mem-tier-prefix`)
@@ -3369,7 +3421,10 @@ EOF
 ## Registered buffer pool budget (`--ucx-regpool-cap-bytes`)
 
 Each thread registers at most this many bytes of pooled receive/send buffers
-(default 512 MiB). When a buffer of a new size would exceed it, idle buffers are
+(default 2 GiB; sizing against the PS's admission: "Per-connection admission and
+the registered pool"). On TCP nothing is registered, but the same cap bounds the
+idle buffers a thread keeps pooled after a burst, so a thread can hold up to 2 GiB
+of heap that way. When a buffer of a new size would exceed it, idle buffers are
 unregistered and freed first; only buffers in use filling the budget make the
 pool hand out unregistered memory (still correct, slower: faulted in, and UCX
 registers it per send). The perf-check client prints `regpool: ... over_cap=N
@@ -5155,7 +5210,12 @@ cargo test -p autumn-manager --test system_gc_multiversion_same_extent
 **Write-pipeline changes (e.g. natural batching) are verified with the perf matrix**
 (`perf/perf_check.sh` builds release, starts a fresh 3-replica cluster, runs 4K and 8M
 and compares each leg against `perf/perf_baseline_<transport>_p8_d8_s<size>.json`; a leg
-passes when ops/s ≥ 80% of baseline and p99 ≤ 2×). TCP and UCX run as two invocations,
+passes when ops/s ≥ 80% of baseline and p99 ≤ 2×). Between a leg's write and read
+phases the script compacts every partition (perf-check `--before-read`, which runs
+`autumn-op compact <part> --wait`), so the reads come from SSTs. Before that, a read
+leg read whatever the write phase had left in the memtable, which moved with the
+write throughput: at one `--conn-inflight-cap` the 4K read was 562–568K, at another
+412–423K, while reads of the same fixed data were equal. TCP and UCX run as two invocations,
 because UCX — on one host as on many — binds a RoCE NIC IP with
 `UCX_TLS=rc_mlx5,ud_mlx5,tcp,self` and a pinned `UCX_NET_DEVICES` (the script refuses
 UCX on 127.0.0.1; there is no loopback UCX configuration):
@@ -5273,9 +5333,10 @@ sed 's/\x1b\[[0-9;]*m//g' /tmp/autumn-rs-logs/ps.log | grep 'partition write sum
 ```
 
 With the default bench (16 threads × depth 8 over 8 partitions, 2 connections per
-partition, `--conn-inflight-cap` 4) expect **≈8**: both connections' admitted
-ops ride one append (8.00 on every isolated run). **≈4** means the loop is
-launching on one connection's worth — the fragmentation that
+partition, `--conn-inflight-cap` 16) expect **≈13.3 on TCP and ≈10.2–10.6 on UCX**
+over two runs each, out of 16 in flight (each connection holds its whole depth
+of 8). At a cap of 4 it was 8.00 (both connections' admitted ops in one append),
+and 4 meant the loop launched on one connection's worth — the fragmentation that
 `MIN_PIPELINED_BATCH` + `CoalesceWindow` in `partition_loop` exist to prevent
 (with the tenants pinned away: 4.4 → 8.00, 56K → 74K 4K-write ops/s; see the
 partition-server guide, "Natural batching").

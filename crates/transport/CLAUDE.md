@@ -290,10 +290,14 @@ part): single writes 9.7–12.1K vs 11.1–12.0K ops/s and single reads 237–27
 vs 243–284K over four alternating rounds each, within each other's spread;
 `--bulk 64` writes 47–50K -> 54–57K, `--bulk 64` reads 16.1–16.5K vs
 15.7–18.4K.
-Not measured: a thread whose slabs in use fill the regpool cap gets an
-unregistered staging buffer for each send, which UCX registers itself and which
-is freed afterwards, so such a thread's sends pay registration again
-(`RegpoolStats::over_cap_total` counts it; the PS and EN do not export it).
+A thread whose slabs in use fill the regpool cap gets unregistered buffers —
+for its receives and for this staging alike — which UCX registers on every
+send and which are freed afterwards. That is the cost the cap's default (2 GiB
+per thread, `--ucx-regpool-cap-bytes` on every binary and the transport's own
+default for the Python binding) is sized against: 16 MiB bulk reads with the
+PS, the EN and the client over a 512 MiB cap fell from 8.5 to 3.0–3.7 GB/s
+(docs/ops.md, "Per-connection admission and the registered pool").
+`RegpoolStats::over_cap_total` counts it; the PS and EN do not export it.
 Test: `tests/ucx_send_staged.rs` (a send and a vectored send out of `.rodata`,
 which cannot be registered, arrive; red without the staging: `ibv_reg_mr`
 fails with Bad address).

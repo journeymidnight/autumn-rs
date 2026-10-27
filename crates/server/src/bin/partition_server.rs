@@ -74,6 +74,14 @@ async fn main() -> Result<()> {
         std::process::exit(2);
     }
     let _ = autumn_transport::init_with(params.transport.get().into());
+    if autumn_transport::current().kind() == autumn_transport::TransportKind::Ucx {
+        if let Some(w) = autumn_partition_server::regpool_admission_mismatch(
+            params.ucx_regpool_cap_bytes.get(),
+            params.conn_inflight_cap.get(),
+        ) {
+            tracing::warn!("{w}");
+        }
+    }
     autumn_rpc::client::set_prepared_zerocopy_min_bytes(params.tcp_zerocopy_min_bytes.get());
     // --cpuset (if given) is installed BEFORE any cpu_pin reader
     // fires, so the cached core list reflects the override.

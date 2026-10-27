@@ -110,7 +110,7 @@ conn):
 │    NEVER dropped mid-flight (io_uring SQE stability)            │
 │                                                                 │
 │  CQ side — FuturesUnordered<LocalBoxFuture<'static, ...>>       │
-│    cap = --conn-inflight-cap (default 4)                        │
+│    cap = --conn-inflight-cap (default 16)                       │
 │    each future: clone req_tx → send PartitionRequest →          │
 │                 await oneshot resp → encode Frame::response     │
 │                                                                 │
@@ -371,6 +371,43 @@ fixed target.
 
 The threshold and the window are constants, not knobs (`--min-pipeline-batch`
 is refused).
+
+### Per-connection admission (`--conn-inflight-cap`, default 16)
+
+`handle_ps_connection` holds at most this many requests of one connection;
+once it is full it stops reading the connection. The cap also bounds the
+group-commit batch: what all of a partition's connections have admitted is
+all a batch can hold, and while one batch's append is in flight the next one
+can only take what the slots freed. At 4, with the perf bench's two writing
+connections per partition, every batch was 8 ops and the partition waited for
+that append (1.6–2 ms) before the next: 4 KiB writes stopped near 8K ops/s per
+partition whatever the client's depth (UCX, 16 threads, depth 32: 28–33K
+ops/s for 8 partitions, batch 8.0).
+
+The cap is bounded from above by the UCX registered pool: every admitted large
+value holds a pooled buffer on the partition thread, and past
+`--ucx-regpool-cap-bytes` the buffers are fresh memory that every send
+registers again (docs/ops.md, "Per-connection admission and the registered
+pool"). 16 with a 2 GiB pool fits kvcache under a TP8 engine (8 connections x
+16 x 16 MiB pages); at startup under UCX the PS warns when the pool is under
+`--conn-inflight-cap` x 128 MiB (`regpool_admission_mismatch`). 32 with the old
+512 MiB pool cut 16 MiB bulk reads from 8.5–9.2 to 3.0–3.7 GB/s.
+
+From 4 to 16 (perf bench, 16 threads x depth 8, alternating, 2 runs): TCP 4 KiB
+writes 38.8–42.3K -> 44.8–48.1K (batch 8.0 -> 13.3), 8 MiB reads 5.0–5.9 ->
+6.3–7.4 GB/s; UCX within noise. With deep clients 32 went further (TCP 256 x 8
+writes 79K -> 127K; UCX 16 x 32 28–33K -> 59K; 16: 47K). Reads of fixed data
+past the block cache: 16 x 8 equal; 256 x 8 at 32: in-cache +5–26%, past-cache
+-7–15%.
+
+The 256-client run that once failed with EINVAL at 8 and up ran clean at 4, 32
+and 64: the EINVAL was a `writev` past `IOV_MAX` (bigger batches, more iovecs
+per append; the writer logged a 1075-iovec write failing with errno 40), and
+`write_vectored_chunked` now caps the iovec count (`crates/rpc/src/client.rs`).
+The SDK's large-request window (`ps_send_window`, 3) stays under the cap, so a
+read still finds a free slot behind a client's large puts. `MIN_PIPELINED_BATCH`
+stays 8: at 16 it made batches bigger (10.5 -> 13.5) and UCX 4 KiB writes
+slower (33.1–34.4K -> 31.3–31.8K).
 
 ### In-order Phase 3 commit
 

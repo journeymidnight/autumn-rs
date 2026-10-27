@@ -316,8 +316,19 @@ run_perf() {
     echo "[perf-check] mode=$mode partitions=$parts pipeline-depth=$depth size=$size_label ($size B) storage=$STORAGE_LABEL"
     echo "[perf-check] baseline=$(basename "$baseline")"
     echo "============================================================"
+    # Reads come from SSTs: compact every partition between the phases, so the
+    # read result does not move with how much the write phase left in the
+    # memtable (docs/ops.md, "Core-path performance validation").
+    # A listing that fails or names nothing fails the leg, rather than reading
+    # an uncompacted set.
+    local ao
+    ao="$(printf '%q ' "$ROOT_DIR/target/release/autumn-op" --cluster-secret-file \
+        "${AUTUMN_CLUSTER_SECRET_FILE:-$AUTUMN_DATA_ROOT/cluster.secret}" \
+        --manager "${AUTUMN_BIND_HOST:-127.0.0.1}:9001" --transport "$mode")"
+    local before_read="parts=\$($ao info | awk '/^  part/{print \$2}') && [ -n \"\$parts\" ] || exit 1; for p in \$parts; do $ao compact \$p --wait >/dev/null || exit 1; done"
     ${AC_PREFIX:-} "$AC" --manager "${AUTUMN_BIND_HOST:-127.0.0.1}:9001" --transport "$mode" \
         perf-check \
+        --before-read "$before_read" \
         --threads "$THREADS" \
         --duration "$DURATION" \
         --size "$size" \

@@ -562,7 +562,7 @@ async fn cmd_perf_clean(
 // ---------------------------------------------------------------------------
 
 #[allow(clippy::too_many_arguments)]
-async fn cmd_perf_check(client: &ClusterClient, threads: usize, duration_secs: u64, value_size: usize, baseline_file: String, threshold: f64, update_baseline: bool, partitions_meta_from_flag: usize, pipeline_depth: usize, group_commit_cap: Option<usize>, bulk: usize, ramp_ms: u64, direct_read: bool, manager: &str, cred: Option<(String, Vec<u8>)>) -> Result<()> {
+async fn cmd_perf_check(client: &ClusterClient, threads: usize, duration_secs: u64, value_size: usize, baseline_file: String, threshold: f64, update_baseline: bool, partitions_meta_from_flag: usize, pipeline_depth: usize, group_commit_cap: Option<usize>, bulk: usize, ramp_ms: u64, direct_read: bool, before_read: Option<String>, manager: &str, cred: Option<(String, Vec<u8>)>) -> Result<()> {
     let cred = Arc::new(cred);
     let pipeline_depth = pipeline_depth.max(1);
     // bulk ("ucx ⟹ zerocopy") selection — ONE symmetric rule, shared
@@ -789,6 +789,22 @@ async fn cmd_perf_check(client: &ClusterClient, threads: usize, duration_secs: u
 
     if written_per_thread.iter().all(|&w| w == 0) {
         bail!("write phase produced no keys — is the cluster running?");
+    }
+
+    // What the write phase left in the memtable depends on how much it wrote
+    // and when a rotation fell, and reads of it were several times faster, so
+    // the read result moved with the write throughput; perf_check.sh compacts
+    // the bench partitions here so every read comes from an SST. Not timed as
+    // part of the read phase. A shell command: compaction is an admin
+    // operation (autumn-op), which this data-plane client does not issue.
+    if let Some(cmd) = before_read {
+        let started = Instant::now();
+        let status = std::process::Command::new("sh").arg("-c").arg(&cmd).status()
+            .with_context(|| format!("running --before-read {cmd:?}"))?;
+        if !status.success() {
+            bail!("--before-read {cmd:?} failed: {status}");
+        }
+        println!("==> perf-check: before-read command done in {:.1}s", started.elapsed().as_secs_f64());
     }
 
     // ---- Read phase ----
@@ -1390,8 +1406,9 @@ async fn main() -> Result<()> {
             bulk,
             ramp_ms,
             direct_read,
+            before_read,
         } => cmd_perf_check(
-            &client, threads, duration_secs, value_size, baseline_file, threshold, update_baseline, partitions_meta_from_flag, pipeline_depth, group_commit_cap, bulk, ramp_ms, direct_read, &args.manager, cred,
+            &client, threads, duration_secs, value_size, baseline_file, threshold, update_baseline, partitions_meta_from_flag, pipeline_depth, group_commit_cap, bulk, ramp_ms, direct_read, before_read, &args.manager, cred,
         )
         .await?,
 

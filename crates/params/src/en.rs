@@ -85,7 +85,7 @@ crate::params! {
         /// Per-connection read window.
         conn_read_buf_bytes: usize = 512 * KIB as usize, [4 * KIB as usize, 64 * MIB as usize];
         /// UCX registered buffer pool cap per thread.
-        ucx_regpool_cap_bytes: usize = 512 * MIB as usize, [16 * MIB as usize, 64 * GIB as usize];
+        ucx_regpool_cap_bytes: usize = 2 * GIB as usize, [16 * MIB as usize, 64 * GIB as usize];
     }
 
     removed {

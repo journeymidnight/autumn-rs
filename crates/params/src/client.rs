@@ -17,8 +17,8 @@ crate::params! {
         /// Partition requests a batch put keeps in flight.
         batch_put_concurrency: usize = 32, [1, 4096];
         /// Large requests (64 KiB and up) a PS connection holds unanswered;
-        /// the rest wait in the client, where reads go ahead of them. One
-        /// under the PS's `--conn-inflight-cap` (4), so a read finds a free
+        /// the rest wait in the client, where reads go ahead of them. Under
+        /// the PS's `--conn-inflight-cap` (16), so a read finds a free
         /// admission slot; 0 = no limit.
         ps_send_window: usize = 3, [0, 4096];
         /// A minted token is renewed when less than this much of its life is
@@ -27,7 +27,7 @@ crate::params! {
         /// Chunk size of a striped put when the caller names none.
         stripe_chunk_bytes: u32 = 4 * MIB as u32, [64 * 1024, 64 * MIB as u32];
         /// UCX registered buffer pool cap per thread.
-        ucx_regpool_cap_bytes: usize = 512 * MIB as usize, [16 * MIB as usize, 64 * crate::GIB as usize];
+        ucx_regpool_cap_bytes: usize = 2 * crate::GIB as usize, [16 * MIB as usize, 64 * crate::GIB as usize];
     }
 }
 

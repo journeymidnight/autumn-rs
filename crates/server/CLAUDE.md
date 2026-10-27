@@ -6,8 +6,9 @@
 <tcp|ucx> <bytes> <seconds> <depth> <load|write|read|direct>` uses 256 fixed keys
 under `bench/core-path`, warms each measured operation for two seconds, and fails
 on RPC errors or missing/short values. Load once before a comparison. Run both
-versions against the same data and layout: `perf-check` derives its read set from
-the preceding write phase, so its read results can change with write throughput.
+versions against the same data and layout: `perf-check` reads what its write phase
+wrote; `perf_check.sh` compacts every partition between the phases (`--before-read`)
+so those reads come from SSTs whatever the write phase left in the memtable.
 The benchmark is single-threaded and reports sampled operation latency (1/16).
 
 ## Purpose
@@ -96,7 +97,7 @@ autumn-client --manager 127.0.0.1:9001 <COMMAND>
 | `del <KEY>` | Delete key |
 | `head <KEY>` | Show key metadata (length) |
 | `ls [--prefix P] [--start S] [--limit N]` | List/scan keys |
-| `perf-check [--threads N] [--size B] [--bulk N] [--baseline FILE] [--threshold T] [--update-baseline] [--partitions N] [--pipeline-depth K] [--group-commit-cap N]` | Regression-gated bench: pure write phase then pure read phase vs a JSON baseline; fails if throughput < threshold. `--size` accepts a byte suffix (`4k`/`8m`, same grammar as `gc --max-size`). `--bulk N` (>0) drives each round through one `put_many`/`get_many_into(N items)` — a live batch-size knob (replaces the removed `--batch-put`/`--batch-get`/`--put-many`). |
+| `perf-check [--threads N] [--size B] [--bulk N] [--baseline FILE] [--threshold T] [--update-baseline] [--partitions N] [--pipeline-depth K] [--group-commit-cap N] [--before-read CMD]` | Regression-gated bench: pure write phase then pure read phase vs a JSON baseline; fails if throughput < threshold. `--before-read CMD` runs `sh -c CMD` between the phases and fails the run unless it succeeds (`perf_check.sh` compacts the partitions with it; the client issues no admin RPC itself). `--size` accepts a byte suffix (`4k`/`8m`, same grammar as `gc --max-size`). `--bulk N` (>0) drives each round through one `put_many`/`get_many_into(N items)` — a live batch-size knob (replaces the removed `--batch-put`/`--batch-get`/`--put-many`). |
 | `perf-clean [--dry-run] [--parallel N]` | Delete everything the benchmarks wrote (the `bench/perf` scope: perf-check and ycsb keys). Each bench partition's user range is paged with `range_until` (4096 keys; it never walks into the next partition, so a short page does not read another range's tombstones) and deleted with one `delete_many` per page, N ranges at a time (default 8); the next page starts after the last key. Data-plane only (no admin RPC). The space comes back when the partition's major compaction drops the tombstones: automatically once they are in SSTs (the PS's deletion rule counts SSTs, not the memtable), at once with `autumn-op compact`. `--dry-run` only counts |
 | `ycsb [--threads 32] [--duration 30] [--size 1024] [--partitions N] [--pipeline-depth 16] [--read-ratio 0.5] [--key-dist zipfian\|uniform] [--records 100000] [--rmw]` | YCSB-equivalent MIXED workload: LOAD then one mixed R/W run; keys partition-local per thread; our driver, not reference Java YCSB |
 

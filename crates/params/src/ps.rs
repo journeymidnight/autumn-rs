@@ -82,7 +82,7 @@ crate::params! {
         /// Memtable rotation size = the size of a flushed SST.
         flush_mem_bytes: u64 = 256 * MIB, [4 * KIB, GIB];
         /// Requests admitted per client connection.
-        conn_inflight_cap: usize = 4, [1, 4096];
+        conn_inflight_cap: usize = 16, [1, 4096];
         /// Per-connection read window.
         conn_read_buf_bytes: usize = 64 * KIB as usize, [4 * KIB as usize, 64 * MIB as usize];
         /// Values at least this large are received straight into a pooled
@@ -189,7 +189,7 @@ crate::params! {
         /// (0 = off).
         tcp_zerocopy_min_bytes: usize = 0, [0, usize::MAX];
         /// UCX registered buffer pool cap per thread.
-        ucx_regpool_cap_bytes: usize = 512 * MIB as usize, [16 * MIB as usize, 64 * GIB as usize];
+        ucx_regpool_cap_bytes: usize = 2 * GIB as usize, [16 * MIB as usize, 64 * GIB as usize];
         /// Log the UCX pool every this many seconds (0 = off).
         regpool_log_interval_secs: u64 = 0, [0, 86_400];
     }

@@ -88,6 +88,10 @@ pub(crate) enum Command {
         /// read phase uses get_direct (MSG_GET_REDIRECT + EN direct
         /// read) instead of get/get_into.
         direct_read: bool,
+        /// Shell command run (`sh -c`) between the write and the read phase,
+        /// which waits for it to succeed; perf_check.sh compacts the bench
+        /// partitions with it.
+        before_read: Option<String>,
     },
     /// Delete every key the benchmarks wrote (everything under the
     /// `bench/perf` scope: perf-check and ycsb data). `dry_run` only counts.
@@ -152,7 +156,7 @@ Data-plane commands (KV + bench):
   del <KEY>                         Delete key
   head <KEY>                        Get key metadata (size)
   ls [--prefix P] [--start S] [--limit N]  List keys
-  perf-check [--threads 256] [--duration 10] [--size 4096] [--baseline perf_baseline.json] [--threshold 0.8] [--update-baseline] [--partitions N] [--pipeline-depth K]   (zero-copy auto on --transport ucx)
+  perf-check [--threads 256] [--duration 10] [--size 4096] [--baseline perf_baseline.json] [--threshold 0.8] [--update-baseline] [--partitions N] [--pipeline-depth K] [--before-read CMD]   (zero-copy auto on --transport ucx)
                                     Quick write+read bench; warns if >threshold regression vs baseline
   perf-clean [--dry-run] [--parallel 8]
                                     Delete everything perf-check / ycsb wrote (the bench/perf scope)
@@ -420,6 +424,7 @@ pub(crate) fn parse_args() -> Args {
             // batch_size. 0 = legacy per-op fan_out.
             let mut ramp_ms: u64 = 0;
             let mut direct_read = false;
+            let mut before_read: Option<String> = None;
             let mut bulk: usize = 0;
             // was `AUTUMN_GROUP_COMMIT_CAP` env read at baseline-
             // write time. Now an explicit CLI flag — operators pass the
@@ -484,6 +489,10 @@ pub(crate) fn parse_args() -> Args {
                     "--direct-read" => {
                         direct_read = true;
                     }
+                    "--before-read" => {
+                        i += 1;
+                        before_read = Some(val(&raw, i).to_owned());
+                    }
                     "--ramp-ms" => {
                         // bench: stagger thread start by tid*ramp_ms so
                         // UCX worker creation doesn't storm (host-level devx
@@ -526,6 +535,7 @@ pub(crate) fn parse_args() -> Args {
                 bulk,
                 ramp_ms,
                 direct_read,
+                before_read,
             }
         }
         "perf-clean" => {

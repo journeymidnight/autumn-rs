@@ -453,12 +453,15 @@ launch_extent_node() {
         0) dio_args=(--no-direct-io) ;;
         *) die "AUTUMN_EXTENT_DIRECT_IO must be 0 or 1, got '$AUTUMN_EXTENT_DIRECT_IO'" ;;
     esac
+    local -a regpool_args=()
+    [[ -n "${AUTUMN_UCX_REGPOOL_CAP_BYTES:-}" ]] && regpool_args=(--ucx-regpool-cap-bytes "$AUTUMN_UCX_REGPOOL_CAP_BYTES")
     start_proc "node$i" \
         "$NODE" --port "$port" --data "$disk_arg" --manager "$MANAGER_ADDR" \
         --listen "$BIND_HOST" --transport "$TRANSPORT" \
         --advertise "${BIND_HOST}:$port" \
         ${stride_args[@]:+"${stride_args[@]}"} \
         ${dio_args[@]:+"${dio_args[@]}"} \
+        ${regpool_args[@]:+"${regpool_args[@]}"} \
         ${cpu_args[@]:+"${cpu_args[@]}"} \
         --cluster-secret-file "$CLUSTER_SECRET_FILE"
     # "ready" comes after every shard scanned its extents and bound; a UCX bind

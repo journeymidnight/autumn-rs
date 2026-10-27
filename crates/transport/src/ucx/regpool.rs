@@ -164,8 +164,8 @@ fn class_index(class: usize) -> usize {
 
 /// Per-thread cap on total registered (pinned) bytes held by the pool's
 /// free-list. Operators must keep `cap × threads < RLIMIT_MEMLOCK`. Default
-/// 512 MiB; overridable once via [`set_regpool_cap_bytes`] from a CLI flag
-/// (no env reads in production code).
+/// 2 GiB, the same as every binary's `--ucx-regpool-cap-bytes` (the Python
+/// binding sets none); overridable once via [`set_regpool_cap_bytes`].
 static REGPOOL_CAP_CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 
 /// Set the per-thread registered-buffer-pool cap (first-call-wins). Clamp
@@ -177,7 +177,7 @@ pub fn set_regpool_cap_bytes(n: usize) -> bool {
 }
 
 fn cap_bytes() -> usize {
-    *REGPOOL_CAP_CELL.get_or_init(|| 512 * 1024 * 1024)
+    *REGPOOL_CAP_CELL.get_or_init(|| 2 << 30)
 }
 
 struct Slab {

@@ -476,7 +476,7 @@ not applied. The retry loops take a `CallKind`:
 Lanes: `CallKind::lane` sends `Read` (reads and admin calls through
 `call_ps_for_key` / `call_ps_for_part`: HEAD, GET_REDIRECT(_MANY), RANGE, maintenance) on
 the RPC client's urgent lane, and every PS connection gets
-`set_send_window(ps_send_window)` (3: one under the PS's 4 admission slots),
+`set_send_window(ps_send_window)` (3, under the PS's 16 admission slots),
 so an `exists` probe overtakes queued large puts and finds a slot at the PS
 (rpc CLAUDE.md, "Two lanes and a send window"). The bulk GET requests
 (`call_into_pooled`) stay on the normal lane.

@@ -4781,21 +4781,53 @@ impl PartitionServer {
 /// once. Once at cap, transport reads stop (back-pressure) until one completion
 /// drains into `tx_bufs`.
 ///
-/// **Default is 4.** Originally chosen for the single-listener topology (256 client
-/// conns to ONE PS listener → keep `N_conns × CAP` under
-/// `WRITE_CHANNEL_CAP = 1024`; caps of 8+ then caused EINVAL under that load).
-/// With per-partition listeners each partition has its own listener (1 conn each)
-/// and GET reads are served FU-locally (no `req_tx` hop, no shared-channel
-/// pressure), so that constraint is gone — but a 4→16 bump was TRIED (commit
-/// d6aa298) and REVERTED after measurement showed NO read benefit at any size:
-/// cross-host 8 MiB read is NIC-bound (cap4 ≈ cap16 ≈ ~12 GB/s; even cap4 =
-/// 4×8 MiB ≫ the RoCE bandwidth-delay product, so the pipe is already full),
-/// and intra-host reads are per-op-CPU-bound and saturate by depth ~4. The
-/// deeper cap only added a tiny intra-host regression. Keep 4; raise per-deploy
-/// via `--conn-inflight-cap` if a future
-/// workload ever shows a need.
+/// It also bounds a partition's group-commit batch: the ops admitted on all of
+/// its connections are all a batch can hold, and the next batch waits for this
+/// one's append. See `crates/partition-server/CLAUDE.md` ("Per-connection
+/// admission") for why the default is 16.
 fn ps_conn_inflight_cap() -> usize {
     params().conn_inflight_cap.get()
+}
+
+/// Registered-pool bytes one admission slot stands for on a partition thread:
+/// eight connections (a TP8 engine's ranks) each holding one 16 MiB kvcache
+/// page in a pooled buffer while it is read and sent.
+pub const REGPOOL_BYTES_PER_ADMITTED_REQUEST: usize = 8 * (16 << 20);
+
+/// Under UCX, a partition thread holds a pooled buffer for every large value it
+/// has admitted, and the buffers past `--ucx-regpool-cap-bytes` are fresh,
+/// unregistered memory that every send registers again. `Some(warning)` when
+/// `--conn-inflight-cap` slots of `REGPOOL_BYTES_PER_ADMITTED_REQUEST` do not
+/// fit the pool.
+pub fn regpool_admission_mismatch(regpool_cap_bytes: usize, conn_inflight_cap: usize) -> Option<String> {
+    let need = conn_inflight_cap.saturating_mul(REGPOOL_BYTES_PER_ADMITTED_REQUEST);
+    (regpool_cap_bytes < need).then(|| {
+        format!(
+            "--ucx-regpool-cap-bytes {regpool_cap_bytes} is below --conn-inflight-cap {conn_inflight_cap} x {} MiB = {need}: \
+             large values past the pool are sent from unregistered memory, re-registered on every send (docs/ops.md, \
+             \"Per-connection admission and the registered pool\")",
+            REGPOOL_BYTES_PER_ADMITTED_REQUEST >> 20
+        )
+    })
+}
+
+#[cfg(test)]
+mod regpool_admission_tests {
+    use super::*;
+
+    /// The shipped defaults fit each other: changing one without the other
+    /// turns this red.
+    #[test]
+    fn the_default_admission_fits_the_default_pool() {
+        let p = PsParams::default();
+        assert_eq!(regpool_admission_mismatch(p.ucx_regpool_cap_bytes.get(), p.conn_inflight_cap.get()), None);
+    }
+
+    #[test]
+    fn a_cap_past_the_pool_warns() {
+        assert!(regpool_admission_mismatch(2 << 30, 32).is_some());
+        assert_eq!(regpool_admission_mismatch(4 << 30, 32), None);
+    }
 }
 
 /// Test-only count of receive iterations carrying one complete frame.
@@ -13119,13 +13151,12 @@ fn memtable_snapshot_cost_scales_with_memtable_not_page_size() {
         });
     }
 
-    /// test 3 — Back-pressure at cap. The default `--conn-inflight-cap` is
-    /// 4; fire 100 frames in one write and verify: (a) every frame completes
-    /// correctly, (b) the merged_loop never observes more than `cap` reqs
-    /// simultaneously in-flight.
+    /// test 3 — Back-pressure at cap: fire more frames than
+    /// `--conn-inflight-cap` admits in one write and verify: (a) every frame
+    /// completes correctly, (b) the merged_loop never observes more than the
+    /// cap simultaneously in-flight.
     #[test]
     fn backpressure_at_cap() {
-        const CAP: usize = 4;
         const N_FRAMES: u32 = 100;
 
         // Hold the workspace ps-conn lock across the spawned thread so
@@ -13142,6 +13173,7 @@ fn memtable_snapshot_cost_scales_with_memtable_not_page_size() {
                     // The peak-concurrency assertion below holds at whatever
                     // cap is in force.
                     let effective_cap = ps_conn_inflight_cap();
+                    assert!(effective_cap < N_FRAMES as usize, "the cap must leave frames waiting");
 
                     let listener = compio::net::TcpListener::bind("127.0.0.1:0")
                         .await
@@ -13175,7 +13207,7 @@ fn memtable_snapshot_cost_scales_with_memtable_not_page_size() {
                         // Hold each request on a small timer so concurrency
                         // actually builds up. This is the mechanism that
                         // exercises back-pressure: if ps-conn didn't cap
-                        // inflight at CAP, cur would rise above CAP.
+                        // inflight, cur would rise above the cap.
                         let mut handlers = FuturesUnordered::new();
                         let mut drained: u32 = 0;
                         loop {
@@ -13280,23 +13312,10 @@ fn memtable_snapshot_cost_scales_with_memtable_not_page_size() {
                     let drained = loop_handle.await.unwrap_or(0);
                     assert_eq!(drained, N_FRAMES);
 
-                    // Peak concurrency assertion — gated on the override
-                    // actually having been picked up (see the comment
-                    // above ps_conn_inflight_cap()).
+                    // Every frame arrives in one write, so the connection
+                    // fills to the cap and no further.
                     let p = peak.get();
-                    if effective_cap == CAP {
-                        assert!(
-                            p <= CAP,
-                            "peak in-flight {p} exceeded cap {CAP} — back-pressure failed"
-                        );
-                    } else {
-                        // Env override didn't win the OnceLock race; still
-                        // assert peak never exceeded the effective cap.
-                        assert!(
-                            p <= effective_cap,
-                            "peak in-flight {p} exceeded effective cap {effective_cap}"
-                        );
-                    }
+                    assert_eq!(p, effective_cap, "peak in-flight {p} vs cap {effective_cap}");
                 });
             })
             .expect("spawn bp test thread");
