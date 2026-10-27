@@ -348,9 +348,30 @@ impl SstReader {
         if let Some(b) = cache.get(key) {
             return Ok(b);
         }
-        let (raw, _end) = sc
-            .read_bytes_from_extent(extent_id, abs, bo.block_len as u64)
-            .await?;
+        // The bulk read leaves the block out of the frame CRC: its own CRC is
+        // checked on decode. Copied out of the pool buffer because the cache
+        // keeps the block past this request; receiving into fresh memory
+        // instead would make UCX register it on every miss.
+        let raw = match sc
+            .read_value_into_pooled(extent_id, abs, bo.block_len as u64)
+            .await
+        {
+            Ok(Some((pb, _))) => Bytes::copy_from_slice(pb.filled()),
+            declined => {
+                if let Err(e) = declined {
+                    tracing::debug!(
+                        extent_id,
+                        off = abs,
+                        error = %format_args!("{e:#}"),
+                        "bulk block read failed; using the copy path"
+                    );
+                }
+                let (raw, _end) = sc
+                    .read_bytes_from_extent(extent_id, abs, bo.block_len as u64)
+                    .await?;
+                Bytes::from(raw)
+            }
+        };
         if raw.len() < bo.block_len as usize {
             return Err(anyhow!(
                 "paged block short read: extent={extent_id} off={abs} need={} got={}",
@@ -358,7 +379,7 @@ impl SstReader {
                 raw.len()
             ));
         }
-        let block = match DecodedBlock::decode(Bytes::from(raw), &bo.key) {
+        let block = match DecodedBlock::decode(raw, &bo.key) {
             Ok(b) => Arc::new(b),
             Err(why) => self.reread_block(idx, sc, why).await?,
         };

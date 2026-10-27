@@ -774,6 +774,30 @@ blocks — which silently served one cluster's data to another.) Recovery opens 
 (last-4-bytes → meta region) and the WAL replay streams in 64 MB chunked-carry
 (`decode_records_chunk`), so restart RSS = replay-window bound, dataset-independent.
 
+**A cache miss is a bulk read** (`read_value_into_pooled`, `MSG_READ_BYTES_BULK`),
+falling back to `read_bytes_from_extent` for whatever the bulk path declines
+(EC, stale layout, failed replicas). The block travels as the frame's value, so
+no frame CRC covers it — the block's own CRC32C, checked on decode with a reread
+from the other copies, is its integrity check (the `autumn-rpc` CRC rule). The
+copy path put the block in ctrl, so the same bytes went through two CRC passes.
+The block is copied out of the pool buffer, since the cache keeps it past the
+request; receiving straight into memory the cache owns would save that copy on
+TCP but make UCX register fresh memory on every miss. A block is cut below
+64 KiB, under TCP's receive-into-pool threshold, so on TCP the reply is decoded
+in place and copied into the pool buffer first: one more copy than the copy
+path made. The gain below is the CRC pass. The bulk path never hedges
+(`autumn-ps --read-hedge-ms`, off by default); the copy path does.
+
+What a miss costs is what separates a flushed 4 KiB read from a memtable one.
+Same 4 KiB keys, TCP, 8 partitions, 16 x depth 8, uniform: a set that fits the
+512 MB cache reads at ~83% of its memtable rate (1.44M → 1.16-1.23M ops/s);
+a 1.6 GB set (33% hits) at 12% (1.39M → 0.17M), every partition thread
+saturated: a miss fetches the whole ~64 KiB block for one value, ~65 us of
+partition-thread CPU, 43% of it CRC. Dropping the frame CRC lifted that set to
+0.225M (p99 2.0 → 1.13 ms, alternating builds) and left the in-cache set
+unchanged; the remaining cost is the receive (~31%) and the block's CRC
+(~26%), which scale with the block size.
+
 INVARIANT: the replay chunks MUST use
 `StreamClient::read_committed_bytes_from_extent` (committed-clamped), never the
 plain explicit-length read — a replica's file legitimately holds speculative bytes

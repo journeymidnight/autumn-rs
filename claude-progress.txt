@@ -1,3 +1,10 @@
+Date: 2026-10-27
+TaskStatus: completed
+Task scope: user — BUG-READ-SLOWER-AFTER-FLUSH: find the root cause; then option A (user's choice): SST block-cache misses read through the bulk path.
+Current summary: root cause = cost of a block-cache miss, not the SST lookup. Fixed-key probe (TCP, 8 partitions, 16 x depth 8, 4 KiB): set fitting the 512 MB cache 1.44M memtable -> 1.16-1.23M flushed (~83%); 1.6 GB set (33% hits) 1.39M -> 0.17M (12%), partition threads saturated, ~65 us per miss: whole ~64 KiB block for one value, 43% CRC (frame CRC over ctrl + block CRC on the same bytes), 27% receive. Change: read_block_via misses use read_value_into_pooled (MSG_READ_BYTES_BULK, no frame CRC; block CRC + reread unchanged), copy path on decline, block copied out of the pool buffer. Alternating A/B TCP: miss-heavy 169-171K -> 225-226K ops/s, p99 2.0 -> 1.13 ms; in-cache unchanged; frame decode 22% -> 0.5% of the partition thread. PS lib 253, system_sst_block_rot 6 green. Opus review: no correctness issue; medium = on TCP a sub-64 KiB block gets one more copy (decoded frame -> pool buffer -> Bytes), so the gain is the CRC pass alone — docs corrected; receiving into cache-owned memory was rejected because UCX would register fresh memory per miss.
+Main gaps: ledger acceptance not met (passes false): a miss-heavy flushed read is still 16% of memtable; remaining cost scales with block size (option B, 16 KiB blocks, not done); perf-check 4K read still depends on write volume. New BUG-UCX-ZC-SEND-REGISTERS-FRESH-MEMORY: UCX miss-heavy reads ~5K ops/s on old and new (88-91% pthread_spin_lock, ibv_reg_mr); PS with UCX_ZCOPY_THRESH=inf -> 247K. Nothing proves by test that the bulk path is taken (profile only).
+Next steps: user decides — option B experiment, the UCX registration bug, the window read (compaction) still double-CRCs its windows.
+
 Date: 2026-10-26 (4)
 TaskStatus: completed
 Task scope: user — fix the two gaps of the burst-group keep (a long burst's first group; refusals ending a burst); then, after review, "撤掉这次两处改动".
