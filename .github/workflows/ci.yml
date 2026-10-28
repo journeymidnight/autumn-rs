@@ -69,3 +69,13 @@ jobs:
           # diagnostic — confirm the new limits actually took
           cat /proc/$$/limits | grep -E 'locked|files'
           cargo test --workspace --tests --exclude ucx-sys-mini --features autumn-manager/fuse-tests --no-fail-fast -- --test-threads=1
+      - name: Chaos (one round, every nemesis)
+        # The full harness: every nemesis must run OK at least once, and every
+        # acknowledged write (puts, deletes, TTL puts, two writers on one key
+        # space) must read back as the history allows. Seeded per run; the
+        # seed is in the log to replay a failure.
+        run: |
+          sudo prlimit --pid $$ --memlock=unlimited:unlimited || true
+          sudo prlimit --pid $$ --nofile=65536:65536 || true
+          AUTUMN_CHAOS_SEED=${{ github.run_id }} cargo test -p autumn-manager --test system_chaos \
+            chaos_real_kill_split_merge_ec_fence_no_data_loss -- --ignored --nocapture --exact

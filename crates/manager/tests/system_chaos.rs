@@ -127,8 +127,7 @@ struct ChaosConfig {
     /// Disks per extent node. More than one so the nemesis loop reaches the
     /// code that treats disks separately — `choose_disk`'s placement and
     /// tie-breaking, and reloading extents from several disks after a restart.
-    /// With one disk per node none of that is reachable. Disk HEALTH still is
-    /// not: nothing here faults a disk (see `data_dirs`).
+    /// With one disk per node none of that is reachable, nor `diskfault`.
     disks_per_en: u32,
     seed: u64,
     /// `AUTUMN_CHAOS_PS_FLUSH_BYTES` (default 256 KiB, 0 = the PS default):
@@ -201,6 +200,7 @@ impl ChaosConfig {
                     "pskill" => Action::PsKill,
                     "rollrow" => Action::RollRow,
                     "flushburst" => Action::FlushBurst,
+                    "diskfault" => Action::DiskFault,
                     other => panic!("unknown action name: {other}"),
                 })
                 .collect(),
@@ -209,13 +209,25 @@ impl ChaosConfig {
             !actions.is_empty(),
             "AUTUMN_CHAOS_ACTIONS must have at least one action"
         );
+        // With one disk per node `diskfault` can only decline.
+        let actions = if std::env::var("AUTUMN_CHAOS_ACTIONS").is_err()
+            && env_u32("AUTUMN_CHAOS_DISKS_PER_EN", 2) < 2
+        {
+            actions.into_iter().filter(|a| *a != Action::DiskFault).collect()
+        } else {
+            actions
+        };
         let decommission = std::env::var("AUTUMN_CHAOS_DECOMMISSION")
             .ok()
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
+        let nemesis_interval_ms = env_u64("AUTUMN_CHAOS_NEMESIS_INTERVAL_MS", 3000);
+        // Every enabled action must run (see the coverage gate): by default
+        // leave room for two passes over the shuffled set.
+        let two_passes = 2 * actions.len() as u64 * nemesis_interval_ms / 1000 + 10;
         Self {
-            duration_secs: env_u64("AUTUMN_CHAOS_DURATION_SECS", 30),
-            nemesis_interval_ms: env_u64("AUTUMN_CHAOS_NEMESIS_INTERVAL_MS", 3000),
+            duration_secs: env_u64("AUTUMN_CHAOS_DURATION_SECS", two_passes.max(30)),
+            nemesis_interval_ms,
             ec_k,
             ec_m,
             num_ens,
@@ -327,11 +339,10 @@ struct EnProcess {
     /// separately at all: which disk a new extent lands on, and reloading
     /// extents from several disks on restart.
     ///
-    /// It does NOT make disk HEALTH reachable. These are subdirectories of one
-    /// tempdir on one filesystem, so every disk reports the same free space and
-    /// stays Online; nothing here faults one. `Full` / `Faulted` and the
-    /// rebuild of a single disk's replicas need a fault injector this harness
-    /// does not have yet.
+    /// These are subdirectories of one tempdir on one filesystem, so every
+    /// disk reports the same free space: `Full` is not reached here (see
+    /// enospc_chaos.sh). `Faulted` and the rebuild of one disk's copies are,
+    /// through `diskfault`.
     data_dirs: Vec<PathBuf>,
     /// Node-id assigned by the manager after `autumn-op format`'s
     /// `register_node` call. Stable across kill/restart (sentinel files
@@ -870,7 +881,7 @@ async fn bulk_load(
     sc: &StreamClient,
     router: &PsRouter,
     topo: &Topology,
-    expected: &RefCell<HashMap<Vec<u8>, Vec<u8>>>,
+    expected: &RefCell<History>,
 ) {
     let per_burst = COLD_KEY_COUNT / BULK_BURSTS;
     for burst in 0..BULK_BURSTS {
@@ -896,7 +907,8 @@ async fn bulk_load(
                 .unwrap_or_else(|e| panic!("bulk put {kid}: {e}"));
             let r: partition_rpc::PutResp = partition_rpc::rkyv_decode(&resp).expect("decode PutResp");
             assert_eq!(r.code, partition_rpc::CODE_OK, "bulk put {kid} refused: {}", r.message);
-            expected.borrow_mut().insert(key, value);
+            let invoked = begin_write(expected);
+            record_ack(expected, key, Val::Present { v: value, expires_at: 0 }, 0, invoked);
         }
         for (_, _, part_id) in topo.snapshot() {
             let client = router.client_for(part_id).await;
@@ -1285,13 +1297,246 @@ fn make_value(key: &[u8], seq: u64) -> Vec<u8> {
     out
 }
 
+// ── Write history ──────────────────────────────────────────────────────
+
+/// What a write left in a key.
+#[derive(Clone, Debug, PartialEq)]
+enum Val {
+    Absent,
+    /// `expires_at` in unix seconds, 0 = never.
+    Present { v: Vec<u8>, expires_at: u64 },
+}
+
+/// Seconds either side of an expiry when a read may still see the value or
+/// already miss it (clocks and the PS's lazy expiry).
+const TTL_SLACK_SECS: u64 = 2;
+
+impl Val {
+    fn reads_as(&self, got: Option<&[u8]>, now: u64) -> bool {
+        match self {
+            Val::Absent => got.is_none(),
+            Val::Present { v, expires_at } => {
+                let gone = *expires_at > 0 && expires_at + TTL_SLACK_SECS <= now;
+                let alive = *expires_at == 0 || *expires_at > now + TTL_SLACK_SECS;
+                match got {
+                    None => !alive,
+                    Some(g) => !gone && g == v.as_slice(),
+                }
+            }
+        }
+    }
+
+    fn may_be_present(&self, now: u64) -> bool {
+        self.reads_as(match self {
+            Val::Present { v, .. } => Some(v),
+            Val::Absent => return false,
+        }, now)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct Write {
+    val: Val,
+    writer: u8,
+    invoked: u64,
+    /// When the ack arrived; `None` = outcome unknown (timeout, lost
+    /// connection), which may land at any time after `invoked`.
+    acked_at: Option<u64>,
+}
+
+/// The writes that may still be one key's value. An acked write is
+/// superseded by an acked write invoked after it was acked; an unknown one
+/// only by a later acked write of the same writer: the key's partition
+/// applies writes in arrival order and serves only after replaying its log,
+/// so a write the writer sent earlier cannot land after one it sent later and
+/// saw acknowledged. Nothing else forgets a write, so an unknown outcome
+/// never erases an acknowledged one.
+#[derive(Clone, Debug, Default)]
+struct KeyHistory {
+    writes: Vec<Write>,
+}
+
+impl KeyHistory {
+    fn add(&mut self, w: Write) {
+        if w.acked_at.is_some() {
+            self.writes.retain(|o| match o.acked_at {
+                Some(done) => done >= w.invoked,
+                None => !(o.writer == w.writer && o.invoked < w.invoked),
+            });
+        }
+        self.writes.push(w);
+    }
+
+    /// `got` is the value read at unix time `now`, `None` for NOT_FOUND.
+    fn allows(&self, got: Option<&[u8]>, now: u64) -> bool {
+        let never_acked = self.writes.iter().all(|w| w.acked_at.is_none());
+        (got.is_none() && never_acked) || self.writes.iter().any(|w| w.val.reads_as(got, now))
+    }
+
+    fn must_exist(&self, now: u64) -> bool {
+        !self.allows(None, now)
+    }
+
+    fn must_be_absent(&self, now: u64) -> bool {
+        !self.writes.iter().any(|w| w.val.may_be_present(now))
+    }
+
+    fn describe(&self) -> String {
+        let d: Vec<String> = self
+            .writes
+            .iter()
+            .map(|w| {
+                let v = match &w.val {
+                    Val::Absent => "deleted".to_string(),
+                    Val::Present { v, expires_at } => format!(
+                        "seq={}{}",
+                        extract_seq(v).unwrap_or(0),
+                        if *expires_at > 0 { format!(" ttl@{expires_at}") } else { String::new() }
+                    ),
+                };
+                format!("w{}:{v}:{}", w.writer, if w.acked_at.is_some() { "acked" } else { "unknown" })
+            })
+            .collect();
+        d.join(", ")
+    }
+}
+
+/// Every key's history, on one logical clock of invocations and acks.
+#[derive(Clone, Debug, Default)]
+struct History {
+    keys: HashMap<Vec<u8>, KeyHistory>,
+    clock: u64,
+}
+
+impl History {
+    fn tick(&mut self) -> u64 {
+        self.clock += 1;
+        self.clock
+    }
+
+    fn len(&self) -> usize {
+        self.keys.len()
+    }
+}
+
+/// Stamp a write's invocation; pass the result to `record_ack` /
+/// `record_uncertain` once its outcome is known.
+fn begin_write(h: &RefCell<History>) -> u64 {
+    h.borrow_mut().tick()
+}
+
+fn record_ack(h: &RefCell<History>, key: Vec<u8>, val: Val, writer: u8, invoked: u64) {
+    let mut h = h.borrow_mut();
+    let acked_at = Some(h.tick());
+    h.keys.entry(key).or_default().add(Write { val, writer, invoked, acked_at });
+}
+
+fn record_uncertain(h: &RefCell<History>, key: Vec<u8>, val: Val, writer: u8, invoked: u64) {
+    h.borrow_mut()
+        .keys
+        .entry(key)
+        .or_default()
+        .add(Write { val, writer, invoked, acked_at: None });
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+#[cfg(test)]
+mod history_tests {
+    use super::*;
+
+    fn put(v: &[u8]) -> Val {
+        Val::Present { v: v.to_vec(), expires_at: 0 }
+    }
+
+    fn key(h: &RefCell<History>) -> KeyHistory {
+        h.borrow().keys[b"k".as_slice()].clone()
+    }
+
+    #[test]
+    fn an_unknown_outcome_keeps_the_acked_value_checked() {
+        let h = RefCell::new(History::default());
+        let t = begin_write(&h);
+        record_ack(&h, b"k".to_vec(), put(b"v1"), 1, t);
+        let t = begin_write(&h);
+        record_uncertain(&h, b"k".to_vec(), put(b"v2"), 1, t);
+        let k = key(&h);
+        assert!(k.allows(Some(b"v1"), 0) && k.allows(Some(b"v2"), 0));
+        assert!(!k.allows(None, 0), "the acked v1 cannot vanish");
+        assert!(!k.allows(Some(b"v0"), 0));
+    }
+
+    #[test]
+    fn a_key_never_acked_may_be_absent_or_hold_an_uncertain_write() {
+        let h = RefCell::new(History::default());
+        let t = begin_write(&h);
+        record_uncertain(&h, b"k".to_vec(), put(b"v1"), 1, t);
+        let k = key(&h);
+        assert!(k.allows(None, 0) && k.allows(Some(b"v1"), 0));
+    }
+
+    #[test]
+    fn a_later_ack_of_the_same_writer_supersedes_its_unknown_writes() {
+        let h = RefCell::new(History::default());
+        let t = begin_write(&h);
+        record_uncertain(&h, b"k".to_vec(), put(b"v1"), 1, t);
+        let t = begin_write(&h);
+        record_ack(&h, b"k".to_vec(), put(b"v2"), 1, t);
+        let k = key(&h);
+        assert!(k.allows(Some(b"v2"), 0) && !k.allows(Some(b"v1"), 0) && !k.allows(None, 0));
+    }
+
+    #[test]
+    fn another_writers_unknown_write_may_still_land() {
+        let h = RefCell::new(History::default());
+        let t = begin_write(&h);
+        record_uncertain(&h, b"k".to_vec(), put(b"v1"), 1, t);
+        let t = begin_write(&h);
+        record_ack(&h, b"k".to_vec(), put(b"v2"), 2, t);
+        assert!(key(&h).allows(Some(b"v1"), 0));
+    }
+
+    #[test]
+    fn overlapping_acked_writes_may_both_be_last() {
+        let h = RefCell::new(History::default());
+        let (t1, t2) = (begin_write(&h), begin_write(&h));
+        record_ack(&h, b"k".to_vec(), put(b"v1"), 1, t1);
+        record_ack(&h, b"k".to_vec(), put(b"v2"), 2, t2);
+        let k = key(&h);
+        assert!(k.allows(Some(b"v1"), 0) && k.allows(Some(b"v2"), 0));
+        // A write invoked after both acks settles it.
+        let t3 = begin_write(&h);
+        record_ack(&h, b"k".to_vec(), Val::Absent, 1, t3);
+        let k = key(&h);
+        assert!(k.allows(None, 0) && !k.allows(Some(b"v1"), 0) && !k.allows(Some(b"v2"), 0));
+        assert!(k.must_be_absent(0));
+    }
+
+    #[test]
+    fn an_expired_value_reads_absent_and_one_near_its_expiry_either_way() {
+        let h = RefCell::new(History::default());
+        let t = begin_write(&h);
+        record_ack(&h, b"k".to_vec(), Val::Present { v: b"v".to_vec(), expires_at: 100 }, 1, t);
+        let k = key(&h);
+        assert!(k.allows(Some(b"v"), 90) && !k.allows(None, 90));
+        assert!(k.allows(Some(b"v"), 100) && k.allows(None, 100));
+        assert!(k.allows(None, 110) && !k.allows(Some(b"v"), 110));
+    }
+}
+
 // ── Writer / Reader tasks ──────────────────────────────────────────────
 
 async fn writer_loop(
     name: &'static str,
+    writer: u8,
     router: Rc<PsRouter>,
     topo: Rc<Topology>,
-    expected: Rc<RefCell<HashMap<Vec<u8>, Vec<u8>>>>,
+    expected: Rc<RefCell<History>>,
     key_prefix: u8,
     key_count: u32,
     stop: Arc<AtomicBool>,
@@ -1315,21 +1560,47 @@ async fn writer_loop(
         seq += 1;
         let kid = lcg.range(0, key_count as u64) as u32;
         let key = chaos_key(key_prefix, kid);
-        let value = make_value(&key, seq);
         let part_id = topo.route(&key);
-
-        let payload = partition_rpc::rkyv_encode(&partition_rpc::PutReq {
-            part_id,
-            key: key.clone(),
-            value: value.clone(),
-            expires_at: 0,
-            region_epoch: 0,
-        inode_hint: 0,
-        lease_epoch: 0,
-        });
+        // 1 in 8 a delete, 1 in 8 a put that expires in a few seconds, 1 in
+        // 16 one that outlives the round; the rest plain puts.
+        let op = lcg.range(0, 16);
+        let val = if op < 2 {
+            Val::Absent
+        } else {
+            let expires_at = match op {
+                2 | 3 => unix_now() + lcg.range(2, 6),
+                4 => unix_now() + 3600,
+                _ => 0,
+            };
+            Val::Present { v: make_value(&key, seq), expires_at }
+        };
+        let (msg, payload) = match &val {
+            Val::Absent => (
+                partition_rpc::MSG_DELETE,
+                partition_rpc::rkyv_encode(&partition_rpc::DeleteReq {
+                    part_id,
+                    key: key.clone(),
+                    region_epoch: 0,
+                    inode_hint: 0,
+                    lease_epoch: 0,
+                }),
+            ),
+            Val::Present { v, expires_at } => (
+                partition_rpc::MSG_PUT,
+                partition_rpc::rkyv_encode(&partition_rpc::PutReq {
+                    part_id,
+                    key: key.clone(),
+                    value: v.clone(),
+                    expires_at: *expires_at,
+                    region_epoch: 0,
+                    inode_hint: 0,
+                    lease_epoch: 0,
+                }),
+            ),
+        };
 
         // try_client_for: if partition is transiently unreachable
-        // (mid-split, mid-merge, region_sync lag), skip this put
+        // (mid-split, mid-merge, region_sync lag), skip this write
         // rather than panic the writer task.
         let client = match router.try_client_for(part_id).await {
             Ok(c) => c,
@@ -1340,56 +1611,49 @@ async fn writer_loop(
                 continue;
             }
         };
+        let invoked = begin_write(&expected);
         // Bounded: a wedged PS that accepts the connection but never
         // replies would otherwise hang this writer forever (it only checks
         // `stop` between calls), so shutdown-join would hang the whole test.
-        // Treat a timeout as a failed write and loop (re-checks `stop`).
-        let put_call = match compio::time::timeout(
-            Duration::from_secs(5),
-            client.call(partition_rpc::MSG_PUT, payload),
-        )
-        .await
-        {
+        let call = match compio::time::timeout(Duration::from_secs(5), client.call(msg, payload)).await {
             Ok(r) => r,
             Err(_) => {
                 // A client-side timeout is an UNKNOWN outcome: the append may
                 // still land server-side after a transient stall (e.g. the
                 // all-replica commit blocks while a replica is network-partitioned,
-                // then completes once it heals). So we must NOT treat the key
-                // as "old value" — that produced false "got seq > expected"
-                // mismatches. Forget the key entirely; its state is uncertain
-                // until a later write to it succeeds and re-records it.
-                eprintln!("writer[{name}]: PUT TIMED OUT (5s) part_id={part_id} — uncertain, dropping key from expected");
-                expected.borrow_mut().remove(&key);
+                // then completes once it heals).
+                eprintln!("writer[{name}]: WRITE TIMED OUT (5s) part_id={part_id} — outcome uncertain");
+                record_uncertain(&expected, key, val, writer, invoked);
                 writes_failed.fetch_add(1, Ordering::Relaxed);
-                note("put timed out (5s, outcome uncertain)");
+                note("write timed out (5s, outcome uncertain)");
                 continue;
             }
         };
-        match put_call {
-            Ok(resp) => match partition_rpc::rkyv_decode::<partition_rpc::PutResp>(&resp) {
-                // Only record `expected[]` when the PS actually accepted
-                // the put — `CODE_OK`. A successful wire decode with
-                // (e.g.) `CODE_INVALID_ARGUMENT` ("key out of range"
-                // when topo is stale post-split, or
-                // `CODE_FAILED_PRECONDITION` region_epoch mismatch) is
-                // a REJECTED write, not an acked one. Pre-fix this was
-                // unconditional and produced false "data loss"
-                // mismatches at verify time on b*/q* boundary keys.
-                Ok(r) if r.code == partition_rpc::CODE_OK => {
-                    expected.borrow_mut().insert(key, value);
-                    writes_acked.fetch_add(1, Ordering::Relaxed);
+        match call {
+            Ok(resp) => {
+                // Only an OK is an acked write. A decoded refusal (e.g.
+                // "key out of range" when topo is stale post-split, or a
+                // region_epoch mismatch) was not applied.
+                let code = match &val {
+                    Val::Absent => partition_rpc::rkyv_decode::<partition_rpc::DeleteResp>(&resp).map(|r| r.code),
+                    Val::Present { .. } => partition_rpc::rkyv_decode::<partition_rpc::PutResp>(&resp).map(|r| r.code),
+                };
+                match code {
+                    Ok(partition_rpc::CODE_OK) => {
+                        record_ack(&expected, key, val, writer, invoked);
+                        writes_acked.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Ok(c) => {
+                        writes_failed.fetch_add(1, Ordering::Relaxed);
+                        note(&format!("PS rejected: code={c}"));
+                    }
+                    Err(e) => {
+                        writes_failed.fetch_add(1, Ordering::Relaxed);
+                        note(&format!("response decode failed: {e}"));
+                    }
                 }
-                Ok(r) => {
-                    writes_failed.fetch_add(1, Ordering::Relaxed);
-                    note(&format!("PS rejected: code={}", r.code));
-                }
-                Err(e) => {
-                    writes_failed.fetch_add(1, Ordering::Relaxed);
-                    note(&format!("PutResp decode failed: {e}"));
-                }
-            },
-            // A status is the server's answer that the put was refused —
+            }
+            // A status is the server's answer that the write was refused —
             // except `Internal`, which is what a failed WAL append reports:
             // one replica can time out after its write landed, and the record
             // is then replayed on reopen. That case falls through as uncertain.
@@ -1403,17 +1667,17 @@ async fn writer_loop(
                 ) =>
             {
                 writes_failed.fetch_add(1, Ordering::Relaxed);
-                note(&format!("put RPC failed: {e}"));
+                note(&format!("write RPC failed: {e}"));
                 compio::time::sleep(Duration::from_millis(50)).await;
             }
             Err(e) => {
-                // No answer: the connection broke after the put was sent — a
-                // PS killed between its append and its reply, typically. The
-                // value may be durable, so the key's state is uncertain, as on
-                // a timeout.
-                expected.borrow_mut().remove(&key);
+                // No answer: the connection broke after the write was sent —
+                // a PS killed between its append and its reply, typically. The
+                // write may be durable, so its outcome is unknown, as on a
+                // timeout.
+                record_uncertain(&expected, key, val, writer, invoked);
                 writes_failed.fetch_add(1, Ordering::Relaxed);
-                note(&format!("put RPC failed (outcome uncertain): {e}"));
+                note(&format!("write RPC failed (outcome uncertain): {e}"));
                 compio::time::sleep(Duration::from_millis(50)).await;
             }
         }
@@ -1429,24 +1693,24 @@ async fn reader_loop(
     name: &'static str,
     router: Rc<PsRouter>,
     topo: Rc<Topology>,
-    expected: Rc<RefCell<HashMap<Vec<u8>, Vec<u8>>>>,
+    expected: Rc<RefCell<History>>,
     stop: Arc<AtomicBool>,
     reads_ok: Arc<AtomicU64>,
     reads_miss: Arc<AtomicU64>,
     mut lcg: Lcg,
 ) {
     while !stop.load(Ordering::Relaxed) {
-        let sample: Option<(Vec<u8>, Vec<u8>)> = {
+        let sample: Option<Vec<u8>> = {
             let exp = expected.borrow();
-            if exp.is_empty() {
+            if exp.keys.is_empty() {
                 None
             } else {
-                let n = exp.len();
+                let n = exp.keys.len();
                 let idx = (lcg.next() as usize) % n;
-                exp.iter().nth(idx).map(|(k, v)| (k.clone(), v.clone()))
+                exp.keys.keys().nth(idx).cloned()
             }
         };
-        let Some((key, want)) = sample else {
+        let Some(key) = sample else {
             compio::time::sleep(Duration::from_millis(50)).await;
             continue;
         };
@@ -1489,11 +1753,9 @@ async fn reader_loop(
                     // Sanity-only live check: the value must be a
                     // `make_value(key, _)` shape — starts with "chaos-"
                     // (6) + 8B seq + ":" (1) + key + padding. We do NOT
-                    // assert `value == want` here because between
-                    // sampling `want` and the GET response landing, the
-                    // writer can run *two* updates, leaving `expected[key]`
-                    // at a third value — comparing the live response to
-                    // either snapshot is racy. The authoritative
+                    // compare with the history here: between sampling the
+                    // key and the GET response landing, the writer can run
+                    // more updates, so a live comparison is racy. The authoritative
                     // correctness contract is the post-workload final
                     // verify, which runs AFTER writes stop + settle.
                     let prefix_ok = value.len() >= 6 + 8 + 1 + key.len()
@@ -1507,10 +1769,6 @@ async fn reader_loop(
                             value.len()
                         );
                     }
-                    // Drop the `want` shadow so it's clear we don't use
-                    // it for the live check; keep it bound to make
-                    // intent legible.
-                    let _ = want;
                     reads_ok.fetch_add(1, Ordering::Relaxed);
                 }
                 _ => {
@@ -1558,6 +1816,10 @@ enum Action {
     /// table order and row-stream order part ways. A round's single flushes
     /// between compactions never get there.
     FlushBurst,
+    /// Break one disk of one live node for the rest of the round (one-shot):
+    /// its sealed copies must be rebuilt elsewhere, the node's other disks
+    /// left alone.
+    DiskFault,
 }
 
 /// The healthy-node count the STRICTEST nemesis insists on before it will act.
@@ -1595,6 +1857,7 @@ const ALL_ACTIONS: &[Action] = &[
     Action::PsKill,
     Action::RollRow,
     Action::FlushBurst,
+    Action::DiskFault,
 ];
 
 struct NemesisCtx {
@@ -1645,6 +1908,10 @@ struct NemesisCtx {
     /// holder was down when it looked), non-zero with nothing injected means a
     /// usable target existed and no node ever described it.
     rot_shape_seen: Cell<usize>,
+    /// The disk the disk-fault nemesis broke, once it has.
+    disk_fault: RefCell<Option<DiskFault>>,
+    /// `write_witness_extents`' stream.
+    witness_stream: u64,
     nemesis_events: Arc<AtomicU64>,
     nemesis_errors: Arc<AtomicU64>,
     /// Per action: how many times it was chosen, and how many times it acted.
@@ -1687,6 +1954,13 @@ struct NemesisCtx {
 }
 
 impl NemesisCtx {
+    /// The node whose disk the disk-fault nemesis broke. No other nemesis
+    /// touches it: a restart would clear the fault before recovery acted on
+    /// it, and a fence or a rot rebuild would move its other disks' copies.
+    fn spared(&self, node_id: u64) -> bool {
+        self.disk_fault.borrow().as_ref().is_some_and(|d| d.node_id == node_id)
+    }
+
     /// Count nodes that are currently reachable from manager + PS:
     /// alive process AND not fenced AND not SIGKILL'd AND not toxiproxy-
     /// partitioned. Pre-fix this didn't subtract `partitioned`, so two
@@ -1910,7 +2184,12 @@ async fn do_fence_unfence(ctx: &NemesisCtx) -> Result<String, String> {
         let fenced = ctx.fenced.borrow();
         let dead = ctx.dead.borrow();
         ens.iter()
-            .find(|e| e.is_alive() && !fenced.contains(&e.node_id) && !dead.contains(&e.node_id))
+            .find(|e| {
+                e.is_alive()
+                    && !fenced.contains(&e.node_id)
+                    && !dead.contains(&e.node_id)
+                    && !ctx.spared(e.node_id)
+            })
             .map(|e| e.node_id)
     };
     let victim = candidate.ok_or("no candidate")?;
@@ -1973,7 +2252,10 @@ async fn do_kill_en(ctx: &NemesisCtx) -> Result<String, String> {
         let fenced = ctx.fenced.borrow();
         let dead = ctx.dead.borrow();
         ens.iter().position(|e| {
-            e.is_alive() && !fenced.contains(&e.node_id) && !dead.contains(&e.node_id)
+            e.is_alive()
+                && !fenced.contains(&e.node_id)
+                && !dead.contains(&e.node_id)
+                && !ctx.spared(e.node_id)
         })
     };
     let Some(idx) = victim_idx else {
@@ -2023,7 +2305,10 @@ async fn do_kill_then_fence(ctx: &NemesisCtx) -> Result<String, String> {
         let fenced = ctx.fenced.borrow();
         let dead = ctx.dead.borrow();
         ens.iter().position(|e| {
-            e.is_alive() && !fenced.contains(&e.node_id) && !dead.contains(&e.node_id)
+            e.is_alive()
+                && !fenced.contains(&e.node_id)
+                && !dead.contains(&e.node_id)
+                && !ctx.spared(e.node_id)
         })
     };
     let Some(idx) = victim_idx else {
@@ -2149,6 +2434,7 @@ async fn do_network_partition(ctx: &NemesisCtx) -> Result<String, String> {
                     && !fenced.contains(&e.node_id)
                     && !dead.contains(&e.node_id)
                     && !partitioned.contains(&e.proxy_name)
+                    && !ctx.spared(e.node_id)
             })
             .map(|e| (e.proxy_name.clone(), e.node_id));
         match pick {
@@ -2466,6 +2752,7 @@ async fn rottable_replicas(ctx: &NemesisCtx) -> RotTargets {
                 || fenced.contains(nid)
                 || dead.contains(nid)
                 || partitioned.contains(&en.proxy_name)
+                || ctx.spared(*nid)
             {
                 continue;
             }
@@ -2520,6 +2807,398 @@ fn find_extent_dat(data_dirs: &[PathBuf], extent_id: u64) -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// Sealed extents of a stream no partition owns, so no GC or compaction ever
+/// deletes them: copies the disk-fault check can count on finding again.
+/// Partition extents can all be truncated or reclaimed during a round.
+async fn write_witness_extents(mgr: &RpcClient, mgr_addr: SocketAddr) -> u64 {
+    const WITNESS_EXTENTS: usize = 16;
+    let stream_id = create_stream(mgr, 3).await;
+    let sc = StreamClient::connect(
+        &mgr_addr.to_string(),
+        "chaos-witness".to_string(),
+        128 * 1024 * 1024,
+        Rc::new(ConnPool::new()),
+    )
+    .await
+    .expect("witness stream client");
+    for i in 0..WITNESS_EXTENTS {
+        sc.append(stream_id, &[i as u8; 4096]).await.expect("witness append");
+        sc.seal_and_roll_tail(stream_id).await.expect("witness roll");
+    }
+    stream_id
+}
+
+/// How long the disk-fault nemesis waits for the broken disk to be reported.
+const DISK_FAULT_REPORT_LIMIT: Duration = Duration::from_secs(60);
+
+/// One broken disk: what the disk-fault nemesis did and what it saw first.
+struct DiskFault {
+    node_id: u64,
+    disk_id: u64,
+    dir: PathBuf,
+    /// Sealed extents with a copy on the disk when it broke: each must be
+    /// rebuilt elsewhere.
+    on_disk: Vec<u64>,
+    /// (extent, disk) copies on the node's other disks: none may move.
+    on_others: Vec<(u64, u64)>,
+}
+
+/// (node, disk) of every slot of `ex`.
+fn extent_slots(ex: &MgrExtentInfo) -> Vec<(u64, u64)> {
+    assert!(
+        ex.replicate_disks.len() == ex.replicates.len() && ex.parity_disks.len() == ex.parity.len(),
+        "extent {}: disk lists do not match its slots",
+        ex.extent_id
+    );
+    ex.replicates
+        .iter()
+        .copied()
+        .zip(ex.replicate_disks.iter().copied())
+        .chain(ex.parity.iter().copied().zip(ex.parity_disks.iter().copied()))
+        .collect()
+}
+
+async fn etcd_extents(endpoint: &str) -> Result<Vec<MgrExtentInfo>, String> {
+    let client = autumn_etcd::EtcdClient::connect(endpoint)
+        .await
+        .map_err(|e| format!("etcd connect: {e}"))?;
+    let resp = client
+        .get_prefix("extents/")
+        .await
+        .map_err(|e| format!("etcd extents/: {e}"))?;
+    Ok(resp
+        .kvs
+        .iter()
+        .map(|kv| support::decode_persisted_extent(&String::from_utf8_lossy(&kv.key), &kv.value))
+        .collect())
+}
+
+/// Replace each hash directory of `disk` with a regular file. Root ignores
+/// permission bits, so this is how a disk stops taking new files here: files
+/// already open keep working, and every create, rename or open under a hash
+/// directory fails with ENOTDIR — what a dead disk looks like to the EN.
+fn break_disk(disk: &Path) -> Result<usize, String> {
+    let mut n = 0;
+    for entry in std::fs::read_dir(disk).map_err(|e| format!("{}: {e}", disk.display()))? {
+        let path = entry.map_err(|e| e.to_string())?.path();
+        let hash_dir = path.is_dir()
+            && path.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+                n.len() == 2 && n.bytes().all(|b| b.is_ascii_hexdigit())
+            });
+        if hash_dir {
+            std::fs::rename(&path, path.with_extension("offline")).map_err(|e| e.to_string())?;
+            std::fs::write(&path, b"broken disk").map_err(|e| e.to_string())?;
+            n += 1;
+        }
+    }
+    Ok(n)
+}
+
+fn restore_disk(disk: &Path) {
+    let Ok(entries) = std::fs::read_dir(disk) else { return };
+    for path in entries.flatten().map(|e| e.path()) {
+        if path.extension().is_some_and(|x| x == "offline") {
+            let orig = path.with_extension("");
+            if let Err(e) = std::fs::remove_file(&orig).and_then(|_| std::fs::rename(&path, &orig)) {
+                eprintln!("chaos: WARNING could not restore {}: {e}", orig.display());
+            }
+        }
+    }
+}
+
+/// Whether the manager has `node_id`'s own report that `disk_id` is faulted.
+async fn disk_reported_faulted(mgr: &RpcClient, node_id: u64, disk_id: u64) -> bool {
+    let Ok(resp) = mgr.call(MSG_CLUSTER_DF, rkyv_encode(&ClusterDfReq {})).await else {
+        return false;
+    };
+    let Ok(df) = rkyv_decode::<ClusterDfResp>(&resp) else {
+        return false;
+    };
+    df.per_node
+        .iter()
+        .filter(|n| n.node_id == node_id)
+        .flat_map(|n| n.disks.iter())
+        .any(|d| d.disk_id == disk_id && d.faulted)
+}
+
+async fn do_disk_fault(ctx: &NemesisCtx) -> Result<String, String> {
+    if ctx.disk_fault.borrow().is_some() {
+        return Err("one-shot: a disk is already broken this round".into());
+    }
+    // Eligible nodes, last first: the other nemeses take the first.
+    let candidates: Vec<(u64, Vec<PathBuf>, u16)> = {
+        let ens = ctx.ens.borrow();
+        let fenced = ctx.fenced.borrow();
+        let dead = ctx.dead.borrow();
+        let partitioned = ctx.partitioned.borrow();
+        ens.iter()
+            .rev()
+            .filter(|e| {
+                e.is_alive()
+                    && e.data_dirs.len() >= 2
+                    && !fenced.contains(&e.node_id)
+                    && !dead.contains(&e.node_id)
+                    && !partitioned.contains(&e.proxy_name)
+            })
+            .map(|e| (e.node_id, e.data_dirs.clone(), e.port))
+            .collect()
+    };
+    if candidates.is_empty() {
+        return Err("no live node with two disks".into());
+    }
+    let extents: Vec<MgrExtentInfo> = etcd_extents(&ctx.etcd_endpoint)
+        .await?
+        .into_iter()
+        .filter(|ex| ex.sealed && ex.sealed_length > 0)
+        .collect();
+    let witness: std::collections::HashSet<u64> = ctx
+        .sc
+        .get_stream_info(ctx.witness_stream)
+        .await
+        .map_err(|e| format!("witness stream: {e}"))?
+        .extent_ids
+        .into_iter()
+        .collect();
+    // On the first candidate holding a witness copy, the disk holding most:
+    // a witness extent is what the fault is triggered through, and what
+    // cannot be deleted before the check.
+    let mut pick = None;
+    for (node_id, dirs, port) in &candidates {
+        let mut best: Option<(usize, u64, PathBuf)> = None;
+        for dir in dirs {
+            let disk_id: u64 = std::fs::read_to_string(dir.join("disk_id"))
+                .map_err(|e| format!("disk_id of {}: {e}", dir.display()))?
+                .trim()
+                .parse()
+                .map_err(|e| format!("disk_id of {}: {e}", dir.display()))?;
+            let n = extents
+                .iter()
+                .filter(|ex| witness.contains(&ex.extent_id))
+                .filter(|ex| extent_slots(ex).contains(&(*node_id, disk_id)))
+                .count();
+            if n > 0 && best.as_ref().is_none_or(|b| n > b.0) {
+                best = Some((n, disk_id, dir.clone()));
+            }
+        }
+        if let Some((_, disk_id, dir)) = best {
+            pick = Some((*node_id, disk_id, dir, *port));
+            break;
+        }
+    }
+    let Some((node_id, disk_id, dir, port)) = pick else {
+        return Err("no disk of an eligible node holds a witness extent".into());
+    };
+    let mut on_disk = Vec::new();
+    let mut on_others = Vec::new();
+    for ex in &extents {
+        for (n, d) in extent_slots(ex) {
+            if n != node_id {
+                continue;
+            }
+            if d == disk_id {
+                on_disk.push(ex.extent_id);
+            } else {
+                on_others.push((ex.extent_id, d));
+            }
+        }
+    }
+    // Booked before the break: from here on no other nemesis touches the node.
+    *ctx.disk_fault.borrow_mut() = Some(DiskFault {
+        node_id,
+        disk_id,
+        dir: dir.clone(),
+        on_disk: on_disk.clone(),
+        on_others,
+    });
+    let dirs = break_disk(&dir)?;
+    // The EN judges a disk on a failed write. A fence persists the extent's
+    // `.meta` in its hash directory: fence a witness extent on the disk (no
+    // writer to lock out) and wait for the node's report.
+    let probe = on_disk
+        .iter()
+        .copied()
+        .find(|id| witness.contains(id))
+        .expect("the disk was chosen for a witness copy");
+    let reported = compio::time::timeout(DISK_FAULT_REPORT_LIMIT, async {
+        let fence = autumn_rpc::extent_rpc::FenceExtentReq { extent_id: probe, owner_epoch: 1 << 40 }.encode();
+        let en = format!("127.0.0.1:{port}");
+        let pool = ConnPool::new();
+        loop {
+            // The expected answer is PRECONDITION: the `.meta` persist failed.
+            match pool.call(&en, autumn_rpc::extent_rpc::MSG_FENCE_EXTENT, fence.clone()).await {
+                Ok(b) => match autumn_rpc::extent_rpc::FenceExtentResp::decode(b) {
+                    Ok(r) if r.code == autumn_rpc::extent_rpc::CODE_PRECONDITION => {}
+                    Ok(r) => eprintln!(
+                        "nemesis: disk fault: fence of witness extent {probe} on node {node_id}: \
+                         code {} {}",
+                        r.code, r.message
+                    ),
+                    Err(e) => eprintln!("nemesis: disk fault: fence reply: {e}"),
+                },
+                Err(e) => eprintln!("nemesis: disk fault: fence of witness extent {probe} on node {node_id}: {e}"),
+            }
+            if disk_reported_faulted(&ctx.mgr, node_id, disk_id).await {
+                break;
+            }
+            compio::time::sleep(Duration::from_secs(1)).await;
+        }
+    })
+    .await;
+    if reported.is_err() {
+        return Err(format!(
+            "disk {disk_id} of node {node_id} ({dirs} hash dirs broken) was never reported faulted"
+        ));
+    }
+    Ok(format!(
+        "disk {disk_id} of node {node_id} faulted; {} sealed extent(s) to rebuild elsewhere",
+        on_disk.len()
+    ))
+}
+
+/// (extents still holding a copy on the faulted disk, copies on the node's
+/// other disks that moved). Extents gone from `slots` count as neither. A
+/// copy the rot nemesis damaged on this node (`rotted`: extent, node) is
+/// rebuilt elsewhere on purpose, so it may move.
+fn disk_fault_verdict(
+    f: &DiskFault,
+    slots: &HashMap<u64, Vec<(u64, u64)>>,
+    rotted: &std::collections::HashSet<(u64, u64)>,
+) -> (Vec<u64>, Vec<(u64, u64)>) {
+    let stuck = f
+        .on_disk
+        .iter()
+        .copied()
+        .filter(|id| slots.get(id).is_some_and(|s| s.contains(&(f.node_id, f.disk_id))))
+        .collect();
+    let moved = f
+        .on_others
+        .iter()
+        .copied()
+        .filter(|(id, _)| !rotted.contains(&(*id, f.node_id)))
+        .filter(|(id, d)| slots.get(id).is_some_and(|s| !s.contains(&(f.node_id, *d))))
+        .collect();
+    (stuck, moved)
+}
+
+#[cfg(test)]
+mod disk_fault_tests {
+    use super::*;
+
+    #[test]
+    fn a_rotted_copy_on_the_other_disk_may_move() {
+        let f = DiskFault {
+            node_id: 5,
+            disk_id: 1,
+            dir: PathBuf::new(),
+            on_disk: vec![10, 11],
+            on_others: vec![(20, 2), (21, 2), (22, 2)],
+        };
+        // 10 rebuilt elsewhere, 11 still on the faulted disk; 20 rotted on
+        // this node and rebuilt elsewhere; 21 moved for no reason; 22 moved
+        // although its rot was on another node.
+        let slots: HashMap<u64, Vec<(u64, u64)>> = [
+            (10, vec![(6, 3)]),
+            (11, vec![(5, 1)]),
+            (20, vec![(7, 4)]),
+            (21, vec![(8, 4)]),
+            (22, vec![(9, 4)]),
+        ]
+        .into_iter()
+        .collect();
+        let rotted = [(20, 5), (22, 6)].into_iter().collect();
+        let (stuck, moved) = disk_fault_verdict(&f, &slots, &rotted);
+        assert_eq!(stuck, vec![11]);
+        assert_eq!(moved, vec![(21, 2), (22, 2)]);
+    }
+}
+
+/// After the round: the node with the broken disk is still a member and not
+/// fenced, every sealed extent that had a copy on the disk has it rebuilt
+/// elsewhere (within the recovery budget), and no copy on its other disks
+/// moved. Extents deleted meanwhile (GC, a compaction's truncate) prove
+/// nothing either way; a round in which every one of them was deleted did
+/// not check the rebuild and fails.
+async fn verify_disk_fault(ctx: &NemesisCtx) -> Vec<String> {
+    let Some(f) = ctx.disk_fault.borrow_mut().take() else {
+        return Vec::new();
+    };
+    let mut errors = Vec::new();
+    if !disk_reported_faulted(&ctx.mgr, f.node_id, f.disk_id).await {
+        errors.push(format!(
+            "disk fault: disk {} of node {} was broken but never reported faulted, so nothing \
+             was asked to rebuild it",
+            f.disk_id, f.node_id
+        ));
+        return errors;
+    }
+    match autumn_etcd::EtcdClient::connect(&ctx.etcd_endpoint).await {
+        Ok(c) => {
+            let fenced = c.get_prefix(&format!("node_override/{}", f.node_id)).await;
+            if fenced.map_or(true, |r| !r.kvs.is_empty()) {
+                errors.push(format!("disk fault: node {} carries an override (fenced?)", f.node_id));
+            }
+            let member = c.get_prefix(&format!("nodes/{}", f.node_id)).await;
+            if member.map_or(true, |r| r.kvs.is_empty()) {
+                errors.push(format!("disk fault: node {} is no longer registered", f.node_id));
+            }
+        }
+        Err(e) => errors.push(format!("disk fault: etcd connect: {e}")),
+    }
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        let extents = match etcd_extents(&ctx.etcd_endpoint).await {
+            Ok(x) => x,
+            Err(e) => {
+                errors.push(format!("disk fault: {e}"));
+                return errors;
+            }
+        };
+        let slots: HashMap<u64, Vec<(u64, u64)>> =
+            extents.iter().map(|ex| (ex.extent_id, extent_slots(ex))).collect();
+        let rotted: std::collections::HashSet<(u64, u64)> =
+            ctx.corrupted.borrow().iter().map(|r| (r.extent_id, r.node_id)).collect();
+        let (stuck, moved) = disk_fault_verdict(&f, &slots, &rotted);
+        if !moved.is_empty() {
+            errors.push(format!(
+                "disk fault: copies on node {}'s OTHER disks moved: {moved:?}",
+                f.node_id
+            ));
+            return errors;
+        }
+        if stuck.is_empty() {
+            let rebuilt = f.on_disk.iter().filter(|id| slots.contains_key(*id)).count();
+            eprintln!(
+                "chaos: disk fault: of {} sealed extent(s) on disk {} of node {}, {rebuilt} rebuilt elsewhere \
+                 and {} deleted meanwhile; {} copies on its other disks stayed",
+                f.on_disk.len(),
+                f.disk_id,
+                f.node_id,
+                f.on_disk.len() - rebuilt,
+                f.on_others.len()
+            );
+            if rebuilt == 0 {
+                errors.push(format!(
+                    "disk fault: all {} sealed extent(s) on the faulted disk were deleted before \
+                     the check, so no rebuild was checked",
+                    f.on_disk.len()
+                ));
+            }
+            return errors;
+        }
+        if Instant::now() > deadline {
+            errors.push(format!(
+                "disk fault: {} of {} sealed extent(s) still hold a copy on faulted disk {} of node {} after 120 s: {stuck:?}",
+                stuck.len(),
+                f.on_disk.len(),
+                f.disk_id,
+                f.node_id
+            ));
+            return errors;
+        }
+        compio::time::sleep(Duration::from_secs(2)).await;
+    }
 }
 
 async fn do_latency_spike(ctx: &NemesisCtx) -> Result<String, String> {
@@ -2686,6 +3365,15 @@ async fn do_force_gc(ctx: &NemesisCtx) -> Result<String, String> {
     ))
 }
 
+/// The enabled actions that have not run OK yet.
+fn never_ran(actions: &[Action], tally: &std::collections::BTreeMap<String, (u64, u64)>) -> Vec<String> {
+    actions
+        .iter()
+        .map(|a| format!("{a:?}"))
+        .filter(|k| tally.get(k).is_none_or(|(_, ok)| *ok == 0))
+        .collect()
+}
+
 async fn nemesis_loop(
     ctx: Rc<NemesisCtx>,
     stop: Arc<AtomicBool>,
@@ -2746,6 +3434,7 @@ async fn nemesis_loop(
                 Action::PsTerm => do_ps_restart(&ctx, true).await,
                 Action::PsKill => do_ps_restart(&ctx, false).await,
                 Action::RollRow => do_roll_row(&ctx).await,
+                Action::DiskFault => do_disk_fault(&ctx).await,
                 Action::FlushBurst => {
                     let mut done = Vec::new();
                     let mut last = Ok(String::new());
@@ -2767,6 +3456,9 @@ async fn nemesis_loop(
         // A PS restart bounds its own drain and reopen; give it room for both.
         let limit = match action {
             Action::PsTerm | Action::PsKill => PS_DRAIN_LIMIT + PS_READY_LIMIT + Duration::from_secs(30),
+            // Past its own 60 s wait for the fault to be reported: cut short,
+            // it would leave a broken disk booked and never run OK.
+            Action::DiskFault => DISK_FAULT_REPORT_LIMIT + Duration::from_secs(30),
             _ => Duration::from_secs(30),
         };
         let result = match compio::time::timeout(limit, dispatch).await {
@@ -3584,7 +4276,7 @@ fn extract_seq(v: &[u8]) -> Option<u64> {
 async fn verify_per_key(
     router: &PsRouter,
     topo: &Topology,
-    expected: &HashMap<Vec<u8>, Vec<u8>>,
+    expected: &History,
 ) -> (usize, Vec<String>, Vec<String>) {
     let mut mismatches: Vec<String> = Vec::new();
     let mut not_found: Vec<String> = Vec::new();
@@ -3594,7 +4286,7 @@ async fn verify_per_key(
     // grinding every key just delays the FAILED report by minutes.
     let mut wedged_parts: std::collections::HashSet<u64> = std::collections::HashSet::new();
     let total = expected.len();
-    for (key, want) in expected {
+    for (key, want) in &expected.keys {
         let part_id = topo.route(key);
         if wedged_parts.contains(&part_id) {
             not_found.push(format!(
@@ -3688,18 +4380,24 @@ async fn verify_per_key(
             }
             compio::time::sleep(Duration::from_millis(300)).await;
         }
+        let found = last_status.as_ref().is_some_and(|(c, _)| *c == partition_rpc::CODE_NOT_FOUND);
+        let now = unix_now();
         match got {
-            Some(v) if v == *want => {}
+            Some(v) if want.allows(Some(&v), now) => {}
+            None if found && want.allows(None, now) => {}
             Some(v) => {
-                let exp_seq = extract_seq(want).unwrap_or(0);
-                let got_seq = extract_seq(&v).unwrap_or(0);
                 mismatches.push(format!(
-                    "{} (expected seq={} got seq={})",
+                    "{} (may hold: {}; got seq={})",
                     String::from_utf8_lossy(key),
-                    exp_seq,
-                    got_seq
+                    want.describe(),
+                    extract_seq(&v).unwrap_or(0)
                 ));
             }
+            None if found => not_found.push(format!(
+                "{} (may hold: {})",
+                String::from_utf8_lossy(key),
+                want.describe()
+            )),
             None => not_found.push(match &last_status {
                 // A real miss: the PS answered NOT_FOUND, the key is absent.
                 Some((c, _)) if *c == partition_rpc::CODE_NOT_FOUND => {
@@ -3931,14 +4629,29 @@ async fn liveness_rejects_readable_partition_when_every_put_fails() {
 async fn verify_per_partition_range(
     router: &PsRouter,
     topo: &Topology,
-    expected: &HashMap<Vec<u8>, Vec<u8>>,
+    expected: &History,
 ) -> Vec<String> {
     let mut errors = Vec::new();
     let parts = topo.snapshot();
     for (start, end, pid) in &parts {
-        // Collect expected keys in [start, end).
+        // Keys in [start, end) that must exist, and those that must not.
+        let now = unix_now();
+        let in_part = |k: &&Vec<u8>| {
+            k.as_slice() >= start.as_slice() && (end.is_empty() || k.as_slice() < end.as_slice())
+        };
+        let gone_in_part: std::collections::HashSet<Vec<u8>> = expected
+            .keys
+            .iter()
+            .filter(|(_, h)| h.must_be_absent(now))
+            .map(|(k, _)| k)
+            .filter(in_part)
+            .cloned()
+            .collect();
         let mut want_in_part: Vec<Vec<u8>> = expected
-            .keys()
+            .keys
+            .iter()
+            .filter(|(_, h)| h.must_exist(now))
+            .map(|(k, _)| k)
             .filter(|k| {
                 let after_start = k.as_slice() >= start.as_slice();
                 let before_end = end.is_empty() || k.as_slice() < end.as_slice();
@@ -4038,6 +4751,13 @@ async fn verify_per_partition_range(
                         String::from_utf8_lossy(&k),
                         String::from_utf8_lossy(start),
                         String::from_utf8_lossy(end)
+                    ));
+                }
+                if gone_in_part.contains(&k) {
+                    errors.push(format!(
+                        "part {pid}: range returned DELETED/EXPIRED key {:?} ({})",
+                        String::from_utf8_lossy(&k),
+                        expected.keys[&k].describe()
                     ));
                 }
                 prev_key = Some(k.clone());
@@ -5263,12 +5983,12 @@ fn chaos_real_kill_split_merge_ec_fence_no_data_loss() {
         )
         .await
         .expect("stream client for the checkpoint check");
+        let witness_stream = write_witness_extents(&mgr, mgr_addr).await;
 
         // -------- Workload state --------
         let topo = Rc::new(Topology::new());
         refresh_topology(&mgr, &topo).await;
-        let expected: Rc<RefCell<HashMap<Vec<u8>, Vec<u8>>>> =
-            Rc::new(RefCell::new(HashMap::new()));
+        let expected: Rc<RefCell<History>> = Rc::new(RefCell::new(History::default()));
         if cfg.bulk {
             let t0 = Instant::now();
             bulk_load(&mgr, &sc, &router, &topo, &expected).await;
@@ -5302,7 +6022,7 @@ fn chaos_real_kill_split_merge_ec_fence_no_data_loss() {
             let lcg = Lcg::new(cfg.seed.wrapping_add(101));
             async move {
                 writer_loop(
-                    "w1", router, topo, expected, b'b', CHAOS_KEY_COUNT, stop, writes_acked, writes_failed, write_failures, lcg,
+                    "w1", 1, router, topo, expected, b'b', CHAOS_KEY_COUNT, stop, writes_acked, writes_failed, write_failures, lcg,
                 )
                 .await;
             }
@@ -5318,7 +6038,24 @@ fn chaos_real_kill_split_merge_ec_fence_no_data_loss() {
             let lcg = Lcg::new(cfg.seed.wrapping_add(202));
             async move {
                 writer_loop(
-                    "w2", router, topo, expected, b'q', CHAOS_KEY_COUNT, stop, writes_acked, writes_failed, write_failures, lcg,
+                    "w2", 2, router, topo, expected, b'q', CHAOS_KEY_COUNT, stop, writes_acked, writes_failed, write_failures, lcg,
+                )
+                .await;
+            }
+        });
+        // A second writer on w1's keys: writes to one key overlap.
+        let w3 = compio::runtime::spawn({
+            let router = router.clone();
+            let topo = topo.clone();
+            let expected = expected.clone();
+            let stop = stop.clone();
+            let writes_acked = writes_acked.clone();
+            let writes_failed = writes_failed.clone();
+            let write_failures = write_failures.clone();
+            let lcg = Lcg::new(cfg.seed.wrapping_add(505));
+            async move {
+                writer_loop(
+                    "w3", 3, router, topo, expected, b'b', CHAOS_KEY_COUNT, stop, writes_acked, writes_failed, write_failures, lcg,
                 )
                 .await;
             }
@@ -5369,6 +6106,8 @@ fn chaos_real_kill_split_merge_ec_fence_no_data_loss() {
             action_tally: RefCell::new(Default::default()),
             corrupted: RefCell::new(Vec::new()),
             rot_shape_seen: Cell::new(0),
+            disk_fault: RefCell::new(None),
+            witness_stream,
             etcd_endpoint: etcd_endpoint.clone(),
             fence_stranded_sealed: Cell::new(0),
             ec_k: cfg.ec_k,
@@ -5393,18 +6132,48 @@ fn chaos_real_kill_split_merge_ec_fence_no_data_loss() {
         });
 
         // -------- Run --------
+        // Past the configured duration, run on until every enabled action has
+        // run OK once (an action can decline on the cluster's state, a merge
+        // before any split) or been tried four more times without, up to six
+        // times the duration.
         let t0 = Instant::now();
         compio::time::sleep(Duration::from_secs(cfg.duration_secs)).await;
+        let cap = Duration::from_secs(cfg.duration_secs * 6);
+        let tried_before = nemesis_ctx.action_tally.borrow().clone();
+        while t0.elapsed() < cap && {
+            let tally = nemesis_ctx.action_tally.borrow();
+            never_ran(&cfg.actions, &tally).iter().any(|k| {
+                let tried = |t: &std::collections::BTreeMap<String, (u64, u64)>| t.get(k).map_or(0, |e| e.0);
+                tried(&tally) - tried(&tried_before) < 4
+            })
+        } {
+            compio::time::sleep(Duration::from_millis(cfg.nemesis_interval_ms)).await;
+        }
         eprintln!("chaos: stopping workload after {:?}", t0.elapsed());
         stop.store(true, Ordering::Relaxed);
 
-        let _ = w1.await;
-        let _ = w2.await;
-        let _ = r1.await;
-        let _ = r2.await;
-        let _ = n.await;
+        // A task that panicked stopped writing, reading or injecting faults
+        // for the rest of the round.
+        let mut task_panics = Vec::new();
+        for (name, r) in [
+            ("w1", w1.await),
+            ("w2", w2.await),
+            ("w3", w3.await),
+            ("r1", r1.await),
+            ("r2", r2.await),
+            ("nemesis", n.await),
+        ] {
+            if let Err(e) = r {
+                task_panics.push(format!("{name}: {e:?}"));
+            }
+        }
 
         let mut cleanup_faults: Vec<String> = Vec::new();
+        // The broken disk's files are walked by the checks below; its EN
+        // keeps the disk Faulted until it restarts.
+        if let Some(f) = nemesis_ctx.disk_fault.borrow().as_ref() {
+            restore_disk(&f.dir);
+        }
         // Cleanup: unfence everyone and ensure ENs are alive for verify. A fence
         // that will not clear leaves that node excluded from placement for the
         // whole verify phase — the same untracked-fault shape as an unhealed
@@ -5545,6 +6314,7 @@ fn chaos_real_kill_split_merge_ec_fence_no_data_loss() {
             nemesis_events.load(Ordering::Relaxed),
             nemesis_errors.load(Ordering::Relaxed),
         );
+        let mut coverage_errors: Vec<String> = Vec::new();
         // WHAT ACTUALLY RAN. `skipped` in the lines above cannot distinguish an
         // action that declined once from one the cluster can never satisfy, so
         // name the never-ran ones here rather than leaving them to be inferred
@@ -5563,20 +6333,18 @@ fn chaos_real_kill_split_merge_ec_fence_no_data_loss() {
                 })
                 .collect();
             eprintln!("chaos: nemesis actions (ran/chosen): {}", rendered.join(" | "));
-            let never: Vec<String> = cfg
-                .actions
-                .iter()
-                .map(|a| format!("{a:?}"))
-                .filter(|k| tally.get(k).is_none_or(|(_, ok)| *ok == 0))
-                .collect();
+            let never = never_ran(&cfg.actions, &tally);
             if !never.is_empty() {
-                eprintln!(
-                    "chaos: NOTE these enabled actions never ran this round: {}. \
-One round proves nothing (a decline is per-tick), but an action that never \
-runs ACROSS rounds is uncovered, not unlucky.",
+                coverage_errors.push(format!(
+                    "COVERAGE: these enabled actions never ran OK this round: {} \
+                     (ran/chosen above; the round ran on, up to six times its duration, \
+                     until each was tried four more times)",
                     never.join(", ")
-                );
+                ));
             }
+        }
+        if !task_panics.is_empty() {
+            coverage_errors.push(format!("workload tasks panicked: {}", task_panics.join("; ")));
         }
 
         let expected_snapshot = expected.borrow().clone();
@@ -5669,7 +6437,10 @@ runs ACROSS rounds is uncovered, not unlucky.",
         // Nothing should still be in flight now that the nemesis has stopped
         // and the cluster has settled.
         eprintln!("chaos: verifying nothing is left in flight (op ledger + EC markers)");
-        let mut inflight_errors = verify_no_ops_left_in_flight(&mgr).await;
+        // The disk-fault check first: it waits for the rebuild, which the
+        // in-flight check would otherwise catch still running.
+        let mut inflight_errors = verify_disk_fault(&nemesis_ctx).await;
+        inflight_errors.extend(verify_no_ops_left_in_flight(&mgr).await);
         inflight_errors.extend(verify_no_ec_markers_pinned(&mgr).await);
         // Only demand a rebuild when a fence actually stranded something. A
         // round where the victim held no sealed extent has nothing to recover,
@@ -5783,7 +6554,7 @@ runs ACROSS rounds is uncovered, not unlucky.",
                 eprintln!("  {count:6}  {why}{}", expected_rejection_note(why));
             }
         }
-        let mut workload_errors: Vec<String> = Vec::new();
+        let mut workload_errors: Vec<String> = coverage_errors;
         // PS restarts and the checkpoint check. A drain that overran, a
         // partition that never reopened, or a checkpoint naming an extent the
         // row stream no longer has.

@@ -104,6 +104,7 @@
   （否则 freeze 直接拒、manager kill 落空），**这一步未实跑**。另：该脚本开机时 `kill -9` 本机
   所有 `autumn-*`/`etcd` 进程，多租户机器上会杀掉别的工作树的进程。
 - **notes** (2026-10-20): review.md 4.2 仍列为待补：全动作长时 chaos、硬盘故障、断电、跨机 UCX、真实 FUSE mount 都未在 CI 运行；动作要有非零成功/完成计数，历史 checker 要保留已 ACK 写入。CI 现已跑全部非 opt-in 测试并装 toxiproxy、fuse3。
+- **notes** (2026-10-28): system_chaos 已改：(1) 历史改成线性一致寄存器检查——每次写记录发起/确认的逻辑时钟与写者，未知结果不再抹掉已确认值；三个写者（两个共享 key 空间）发 put / delete / 2–5 s 过期的 TTL put / 长 TTL put；逐键与 range 校验按"可能的最终值"判定，range 另拒已删除/已过期 key（history_tests 6 条）。(2) 门槛：每个启用的动作至少 OK 一次，否则整轮失败；超过时长后继续跑到每个都 OK 或再试 4 次（上限 6 倍时长）；写者/读者/nemesis 任务 panic 也让整轮失败。(3) 新 nemesis `diskfault`（见已删除的 F-CHAOS-DISK-FAULT）。(4) CI 增加一轮完整 chaos（种子 = run id）。PS 故障在 chaos 内（psterm/pskill）；manager 换主与在线 Remove 由已在 CI 的定向测试覆盖（system_manager_failover、system_review_remove_retry、node_lifecycle），未进 chaos（chaos 的 manager 在进程内）。异步动作（EC 转换、compaction）的"OK"仍是提交成功，不是完成。实跑：全动作三轮绿（6251/6254 key 零错零丢）；关闭门槛前一轮因 Merge 未跑成正确变红。待 CI 实跑通过再改 passes。
 
 ### F-COMPIO-UPGRADE — 升级运行时并分阶段验证 TCP 内核 CPU 降耗
 - **Trigger** (2026-09-14，用户要求记录升级计划): 当前 compio 0.18.0 /
@@ -200,34 +201,6 @@
   修后在 py≥3.11 上 v1/v2 的 KV key 逐字节相同。
 - **Status**: `passes: false` (2026-09-04) — 既有缺陷，非本轮引入。已知调用方传字符串
   而非 enum 成员，所以现在不触发；严重度取决于上面 sglang 那半的查证结果。
-
-### F-CHAOS-DISK-FAULT — 多盘形态有了，但"一块盘坏了"本身还没有 nemesis
-- **Trigger** (2026-09-10，fable 评审确认): chaos 的 EN 现在是多盘的
-  (`AUTUMN_CHAOS_DISKS_PER_EN`,默认 2),既有 nemesis 因此第一次跑在多盘形态上。
-  但**没有任何 nemesis 会弄坏一块盘**,而且两块"盘"是同一个 tempdir 下的子目录、
-  同一个文件系统 ⇒ `disk_stats()` 返回相同数字、全程都是 Online。
-  所以多盘真正覆盖到的只有:多目录 format/注册、重启时跨盘 `load_extents`、
-  以及 `choose_disk` 的挑选与打平(open/held/last_picked)。
-  `Full` / `Faulted` 和"只重建那块盘上的 sealed slot"**依然零 chaos 覆盖**。
-  (我第一版把这三样都写进了 docs/ops.md 和结构体注释的"已覆盖"里,是**夸大**,
-  评审指出后已改成如实描述 —— 记在这里因为这正是账本存在的意义。)
-- **两条已核过的约束,写下来免得下一轮重新踩**:
-  1. **不能用"杀掉 EN → chmod 000 该盘 → 重启"**。`read_and_verify_cluster_id`
-     (crates/server/src/bin/extent_node.rs)在启动时读每个盘的 `cluster_id`,读不到就
-     `bail!` —— 整个进程起不来。那是杀节点,不是坏一块盘。
-  2. **Faulted 粘到进程重启为止**(docs/ops.md 的失败盘 runbook)。所以这个 nemesis
-     **不可逆**,不能当成每 tick 都能挑中的普通动作 —— 要么做成一轮一次的 one-shot
-     (像 decommission),要么给它自己的预算门,保证任何时刻活着的盘数仍能满足 RF。
-- **Scope**: 对一个活着的 EN,把它**某一块**盘的 hash 子目录改成不可写(`chmod 0500`),
-  让下一次在该盘上建 extent 得到 EACCES —— 走 `classify_disk_error` 的 Media 臂
-  (EACCES 既不在 Capacity 也不在 Process 名单里),EN 把该盘置 Faulted 并在 df 里
-  上报 `online:false`。注入前先快照该盘上的 extent id(每个 disk 目录下的 `extent-*.dat`)。
-- **Acceptance**: 注入后 (a) 该节点**仍是集群成员**、没有被 fence;(b) 快照里那些
-  extent 的该 slot 在限流预算内被重建到别处(manager 的 extent 布局不再指向这台的这块盘);
-  (c) 该节点**另一块**盘上的 extent 一个都没被搬;(d) 轮末的逐键校验零丢失。
-  没有 `apply_df_disk_health` + 恢复门那条 per-disk 臂时,(b) 必须是红的。
-- **Status**: `passes: false` (2026-09-10) — 本轮只交付了多盘形态本身;盘级故障注入
-  是独立的一件事,且因为不可逆需要自己的预算设计,不适合顺手塞进同一个改动。
 
 ### F-EXTENT-PLACEMENT — extent 分片放到哪台，两条路径两套策略，且都不看均衡
 - **Trigger** (2026-09-05，AZ 迁移实测暴露): 迁移中发现"逐台下线"会让数据**回流到还没下线的

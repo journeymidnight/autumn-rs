@@ -2807,6 +2807,12 @@ partition writes, and are rebuilt once sealed.
 Watch for `df: node reports this disk FAULTED` in the manager log, then the
 usual recovery ops in `autumn-op ops list --active`.
 
+A disk is judged on a failed write, including an extent file it could not
+create: allocation picks a disk by load alone, so a disk that takes no new
+files would otherwise be picked again and again while every allocation on the
+node failed over elsewhere and nothing reported it. The chaos harness drives
+this end to end (`diskfault`, below).
+
 `Faulted` is sticky until the EN process restarts. A **replaced** disk is a new
 device: re-run `autumn-op format` on it (new `disk_uuid` → new `disk_id`) and
 restart the EN. Note the EN refuses to start if a configured `--data` dir
@@ -4270,20 +4276,39 @@ AUTUMN_DATA_ROOT=/data05/autumn-rs ./scripts/manager_ha_chaos.sh ucx
 AUTUMN_CHAOS_SEED=583 AUTUMN_CHAOS_DURATION_SECS=45 AUTUMN_CHAOS_NEMESIS_INTERVAL_MS=1500 \
   cargo test -p autumn-manager --test system_chaos \
   chaos_real_kill_split_merge_ec_fence_no_data_loss -- --nocapture --ignored
-#   knobs: AUTUMN_CHAOS_SEED, _DURATION_SECS (30), _NEMESIS_INTERVAL_MS (3000),
-#          _NUM_ENS, _DISKS_PER_EN (2), _EC_K/_EC_M, _ACTIONS (split,merge,ec,
-#          fence,flush,compact,gc,kill,killfence,partition,latency,corrupt).
+#   knobs: AUTUMN_CHAOS_SEED, _DURATION_SECS (default: two passes over the
+#          actions, at least 30), _NEMESIS_INTERVAL_MS (3000), _NUM_ENS,
+#          _DISKS_PER_EN (2), _EC_K/_EC_M, _ACTIONS (split,merge,ec,fence,flush,
+#          compact,gc,forcegc,kill,killfence,partition,latency,corrupt,psterm,
+#          pskill,rollrow,flushburst,diskfault).
+#   COVERAGE GATE: every enabled action must run OK at least once. Past the
+#   duration the round runs on, up to six times it, until each has run OK or
+#   been tried four more times; one that never ran OK fails the round ("COVERAGE:
+#   ..."), and so does a writer, reader or nemesis task that panicked. CI runs one full round per push.
+#   HISTORY: three writers (two of them on the same keys) issue puts, deletes,
+#   puts that expire in 2-5 s and puts that outlive the round; every write is
+#   recorded with when it was invoked and acknowledged. A read must return a
+#   value some write may have left: the newest acknowledged one, one acked
+#   concurrently with it, or one whose outcome the client never learned
+#   (timeout, lost connection). An unknown outcome never erases an acknowledged
+#   write. The range check also refuses a key that must be deleted or expired.
 #   MULTI-DISK: every EN is formatted with _DISKS_PER_EN directories (one
 #   tempdir per node, one subdir per disk) and started with a comma-separated
-#   --data list. What that actually covers: multi-dir format + register, extent
-#   reload across several disks on restart, and `choose_disk`'s tie-breaking
-#   (open/held extents, last-picked). What it does NOT cover: per-disk HEALTH.
-#   Both "disks" are subdirectories of one tempdir on one filesystem, so they
-#   report identical free space and both stay Online for the whole run — no
-#   nemesis faults a disk, so `Full`, `Faulted`, and the rebuild of one disk's
-#   replicas while its node stays a member are still reached only by unit tests
-#   (tracked as F-CHAOS-DISK-FAULT). Set _DISKS_PER_EN=1 to A/B a failure
-#   against the single-disk shape.
+#   --data list. `diskfault` (one-shot) breaks the disk holding most witness
+#   copies (below) on the last eligible two-disk node: each of its hash
+#   directories is replaced by a regular file (root ignores chmod), then one
+#   witness extent there is fenced on that EN directly — the fence persists its
+#   `.meta`, the write fails, and the node reports the disk faulted (waiting for
+#   an allocation to land there is luck: the EN steers new extents to its other
+#   disk). At the end the node must still be a
+#   member and unfenced, every sealed extent that had a copy there must have
+#   been rebuilt elsewhere (within 120 s), and no copy on its other disks may
+#   have moved. 16 sealed extents of a stream no partition owns (the witness
+#   stream) are written at the start, so the check always has extents GC and
+#   compaction cannot delete, and fencing one locks out no writer;
+#   a round in which every one was deleted fails rather than passing unchecked.
+#   No other nemesis touches that node afterwards. `Full` is still reached only
+#   by enospc_chaos.sh. Set _DISKS_PER_EN=1 to A/B against one disk.
 #   verdict-gate: a real bug = `mismatches>0` OR a not_found that REPRODUCES on
 #   DRAINED ports. A burst of not_found with `mismatches=0` after back-to-back
 #   runs is almost always loopback PORT EXHAUSTION (cumulative TIME-WAIT) — a

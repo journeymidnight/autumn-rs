@@ -4877,64 +4877,90 @@ impl ExtentNode {
     pub(crate) async fn mark_disk_error_for_extent(&self, extent_id: u64, err_msg: &str) {
         // Release the DashMap guard before any probe awaits.
         let disk_id = self.extents.get(&extent_id).map(|entry| entry.disk_id);
-        if let Some(disk_id) = disk_id {
-            if let Some(disk) = self.disks.get(&disk_id) {
-                if !disk.online() {
+        if let Some(disk) = disk_id.and_then(|id| self.disks.get(&id)) {
+            self.mark_disk_error(disk, extent_id, err_msg).await;
+        }
+    }
+
+    /// `mark_disk_error_for_extent` for an extent not registered yet: its
+    /// file could not be created on `disk`.
+    async fn mark_disk_error(&self, disk: &DiskFS, extent_id: u64, err_msg: &str) {
+        let disk_id = disk.disk_id;
+        if !disk.online() {
+            return;
+        }
+        let class = match Self::classify_disk_error(err_msg) {
+            DiskErrorClass::Media => match disk.probe_write(extent_id).await {
+                Ok(()) => {
+                    tracing::warn!(extent_id, disk_id, err_msg,
+                        "write failed but disk write/fsync self-check passed; retaining disk health");
                     return;
                 }
-                let class = match Self::classify_disk_error(err_msg) {
-                    DiskErrorClass::Media => match disk.probe_write(extent_id).await {
-                        Ok(()) => {
-                            tracing::warn!(extent_id, disk_id, err_msg,
-                                "write failed but disk write/fsync self-check passed; retaining disk health");
-                            return;
-                        }
-                        Err(probe_error) => {
-                            tracing::warn!(extent_id, disk_id, err_msg, error = %probe_error,
-                                "disk write/fsync self-check failed");
-                            probe_error.class()
-                        }
-                    },
-                    class => class,
-                };
-                match class {
-                    DiskErrorClass::Capacity => {
-                        if disk.health() == DiskHealth::Online {
-                            tracing::warn!(
-                                extent_id,
-                                disk_id,
-                                "disk FULL (capacity) — new-extent allocation suspended; \
-                                 self-heals when free space returns"
-                            );
-                            disk.set_full();
-                        }
-                    }
-                    DiskErrorClass::Process => {
-                        // The write failed and the caller already rejected the
-                        // operation; the disk is not the thing that broke.
-                        // Condemning it here would suspend allocation on it and
-                        // — since the manager rebuilds a faulted disk's
-                        // replicas — migrate everything off it, permanently,
-                        // because this process momentarily ran out of a handle.
-                        tracing::warn!(
-                            extent_id,
-                            disk_id,
-                            err_msg,
-                            "write failed on process-level exhaustion, not disk failure; \
-                             leaving disk health alone"
-                        );
-                    }
-                    DiskErrorClass::Media if disk.online() => {
-                        tracing::error!(
-                            extent_id,
-                            disk_id,
-                            err_msg,
-                            "disk fault confirmed by write/fsync self-check"
-                        );
-                        disk.set_faulted();
-                    }
-                    DiskErrorClass::Media => {}
+                Err(probe_error) => {
+                    tracing::warn!(extent_id, disk_id, err_msg, error = %probe_error,
+                        "disk write/fsync self-check failed");
+                    probe_error.class()
                 }
+            },
+            class => class,
+        };
+        match class {
+            DiskErrorClass::Capacity => {
+                if disk.health() == DiskHealth::Online {
+                    tracing::warn!(
+                        extent_id,
+                        disk_id,
+                        "disk FULL (capacity) — new-extent allocation suspended; \
+                         self-heals when free space returns"
+                    );
+                    disk.set_full();
+                }
+            }
+            DiskErrorClass::Process => {
+                // The write failed and the caller already rejected the
+                // operation; the disk is not the thing that broke.
+                // Condemning it here would suspend allocation on it and
+                // — since the manager rebuilds a faulted disk's
+                // replicas — migrate everything off it, permanently,
+                // because this process momentarily ran out of a handle.
+                tracing::warn!(
+                    extent_id,
+                    disk_id,
+                    err_msg,
+                    "write failed on process-level exhaustion, not disk failure; \
+                     leaving disk health alone"
+                );
+            }
+            DiskErrorClass::Media if disk.online() => {
+                tracing::error!(
+                    extent_id,
+                    disk_id,
+                    err_msg,
+                    "disk fault confirmed by write/fsync self-check"
+                );
+                disk.set_faulted();
+            }
+            DiskErrorClass::Media => {}
+        }
+    }
+
+    /// Create (or open) `extent_id`'s `.dat` on `disk`. A failure is
+    /// reported against the disk like any failed write.
+    async fn create_extent_file(&self, disk: &DiskFS, extent_id: u64) -> Result<CompioFile, String> {
+        let path = disk.extent_path(extent_id);
+        let created = async {
+            if let Some(parent) = path.parent() {
+                compio::fs::create_dir_all(parent).await?;
+            }
+            OpenOptions::new().create(true).read(true).write(true).open(&path).await
+        }
+        .await;
+        match created {
+            Ok(f) => Ok(f),
+            Err(e) => {
+                let msg = e.to_string();
+                self.mark_disk_error(disk, extent_id, &msg).await;
+                Err(msg)
             }
         }
     }
@@ -5933,19 +5959,7 @@ impl ExtentNode {
         let disk = self
             .choose_disk()
             .ok_or_else(|| "no online disk available".to_string())?;
-        let path = disk.extent_path(extent_id);
-        if let Some(parent) = path.parent() {
-            compio::fs::create_dir_all(parent)
-                .await
-                .map_err(|e| e.to_string())?;
-        }
-        let file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .open(&path)
-            .await
-            .map_err(|e| e.to_string())?;
+        let file = self.create_extent_file(&disk, extent_id).await?;
 
         // Optional ext4 block preallocation via `fallocate(FALLOC_FL_KEEP_SIZE)`.
         // Triggered ONLY when `--prealloc-bytes` is set to a positive
@@ -8757,19 +8771,10 @@ impl ExtentNode {
         })?;
         let disk_id = disk.disk_id;
 
-        let path = disk.extent_path(req.extent_id);
-        if let Some(parent) = path.parent() {
-            compio::fs::create_dir_all(parent)
-                .await
-                .map_err(|e| (StatusCode::Internal, e.to_string()))?;
-        }
-        let file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .open(&path)
-            .await
-            .map_err(|e| (StatusCode::Internal, e.to_string()))?;
+        let file = match self.create_extent_file(&disk, req.extent_id).await {
+            Ok(f) => f,
+            Err(e) => return Err((StatusCode::Internal, e)),
+        };
         let len = file
             .metadata()
             .await
@@ -11317,6 +11322,27 @@ mod enospc_disk_health_tests {
             DiskHealth::Faulted,
             "later success must not clear a confirmed fault"
         );
+    }
+
+    /// An allocation that cannot create its file is evidence about the disk
+    /// too: without it a disk that takes no new files stays Online, keeps
+    /// being chosen, and nothing tells the manager.
+    #[compio::test]
+    async fn a_failed_allocation_faults_its_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = ExtentNode::new(ExtentNodeConfig::new(dir.path().to_path_buf(), 1))
+            .await
+            .unwrap();
+        let disk = node.disk_for(1).unwrap();
+        let path = disk.extent_path(6200).parent().unwrap().to_path_buf();
+        std::fs::create_dir_all(&path).unwrap();
+        std::fs::rename(&path, path.with_extension("offline")).unwrap();
+        std::fs::write(&path, b"broken directory").unwrap();
+        assert!(node
+            .handle_alloc_extent(rkyv_encode(&AllocExtentReq { extent_id: 6200 }))
+            .await
+            .is_err());
+        assert_eq!(disk.health(), DiskHealth::Faulted);
     }
 
     /// Full is recoverable and gates allocation; Faulted is terminal.
