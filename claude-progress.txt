@@ -1,3 +1,10 @@
+Date: 2026-10-28
+TaskStatus: completed
+Task scope: user — close the memory-tier "hold every covered write" task (5de91bdd) and drop the finished BUG-UCX-ZC-SEND-REGISTERS-FRESH-MEMORY entry from the backlog.
+Current summary: F-MEM-TIER-BATCH-PUT closed by the user and removed from feature_list.md; its live-cluster acceptance (tier usage up, no log bytes for kvc page writes) was not run — waived by the user. BUG-UCX-ZC-SEND-REGISTERS-FRESH-MEMORY (passes: true, fde544a4) removed. No code change.
+Main gaps: BUG-MEM-TIER-EMPTY-GROUPS-LINGER stays open (inferred, not reproduced). Adapter-side: the vLLM `__present__` marker is held in the tier and can outlive its layers.
+Next steps: user decides.
+
 Date: 2026-10-27 (5)
 TaskStatus: not_completed
 Task scope: user — the memory tier must take autumn_kvcache's batched page writes (BatchClient.put_from -> MSG_BATCH_PUT_BULK / MSG_BATCH_PUT), then "开了 tier 就所有匹配的都进 mem-tier": every covered write, single MSG_PUT included; build and deploy (target not given yet).
