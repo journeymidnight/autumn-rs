@@ -39,16 +39,11 @@
 - **Acceptance**: 新部署的 kvc 写入无需人工就分散到 8–16 个分区；ops.md 写明。
 - `passes: false`
 
-### BUG-READ-SLOWER-AFTER-FLUSH — 小 value 读在 memtable 刷进 SST 后掉到约 40%（未定位）
-- **Trigger** (2026-09-28 实测 + 2026-10-23 用户): perf-check 4K 读随写入量双峰——写阶段没越过 256 MiB memtable 切换时读 1.2–1.4M ops/s、p99 0.13 ms，越过后 0.41–0.65M、p99 ~1 ms；表现为"写得越慢读越快"。用户怀疑 SST 读路径。
-- **Scope**: 先用固定 key 集、同一数据分别在 memtable / 刷盘后各读一遍（`compact` 会先刷），确认差距；再剖析 SST 点查（bloom、索引、block cache 命中、row stream 读）找根因。大 value 不受影响（2026-10-23 核实：16 MiB 页在 memtable 与 SST 读速相同，SST 命中计数确认）。
-- **Acceptance**: 根因写明；刷盘后 4K 读回到 memtable 读的合理比例（目标与证据一起给出）；perf-check 4K 读基线不再取决于写阶段写了多少。
+### F-SST-SMALLER-BLOCKS — 块缓存未命中时 4K 读只有 memtable 的 15–20%（方案 B，未做）
+- **Trigger** (2026-10-28，BUG-READ-SLOWER-AFTER-FLUSH 验收拆出): 读集合超出 512 MiB 块缓存时，每次未命中为一个 4 KiB 值从 EN 取回约 62 KiB 的块并校验整块 CRC；固定 key 集刷盘后读 TCP 0.21M / UCX 0.24M ops/s，memtable 1.33M / 1.23M（ycsb `--before-run`，docs/ops.md "Core-path performance validation"）。
+- **Scope**: 量块大小（如 16 KiB）对未命中读、命中读、写放大、SST 索引大小与 compaction 吞吐的影响，再定是否改默认块大小。
+- **Acceptance**: 同一测法下未命中读提升且命中读、写、compaction 不降（交替对照）；结论与数字写进 ops.md。
 - `passes: false`
-- **notes** (2026-10-27 `--conn-inflight-cap` 4→32 时又踩到): perf-check 4K 读在上限 32 时 562–568K → 412–423K，固定数据上却完全持平（16×8：184.5–187.6K vs 185.6–185.9K，未命中/读同为 0.909）。差别在读集合：读开始时 memtable 里还剩多少随写阶段节奏变（1.5–1.8 GiB vs 0.3–1.3 GiB，未命中/读 0.20–0.21 vs 0.36–0.51）。perf-check 的 4K 读门槛因此会误判，需要固定读集合（例如读前先刷盘、或读固定 key 集）。
-- **notes** (2026-10-27 perf-check 读集合): perf-check 加 `--before-read CMD`，perf_check.sh 在写、读之间对每个分区 `autumn-op compact --wait`，读全部来自 SST（数据量超过块缓存时每块未命中一次，不再随 memtable 剩余量变）。TCP 4K 读从 ~0.5M（memtable 为主）变为 ~0.25M（SST），旧基线须按新口径重录。
-- **notes** (2026-10-27 根因): 不是 SST 点查本身慢，是块缓存未命中的成本。固定 key 集（TCP，8 分区，16×深度 8，均匀）：放得进 512 MB 块缓存的 8 万 key，memtable 1.44M → 刷盘后 1.16–1.23M ops/s（约 83%）；1.6 GB 的 40 万 key（命中 33%）1.39M → 0.17M（12%），8 个分区线程全满，每次未命中约耗 65 µs：为一个 4 KiB 值取回整块约 64 KiB，CPU 43% 是 CRC32C——块走 `MSG_READ_BYTES`，放在 ctrl 里被帧 CRC 算一遍、块解码再算一遍（违反 rpc 的 CRC 规则），27% 是收数据的系统调用。perf-check 写超过 memtable 切换点，数据就超出块缓存。
-- **notes** (2026-10-27 用户选 A：块读改走 bulk 读): `read_block_via` 未命中改走 `read_value_into_pooled`（`MSG_READ_BYTES_BULK`，块作帧值，不算帧 CRC，块 CRC 照旧），declined 时退回拷贝路径；块拷出池 buffer（直接收进缓存自有内存会让 UCX 每次未命中都注册新内存）。4 KiB 值的块约 62 KiB（块内条目最多 64 KiB，另加尾部），TCP 走帧内解码再拷进池 buffer，比原拷贝路径多一次拷贝，收益全来自少算一遍 CRC。交替对照（TCP）：缓存放不下的集合 169–171K → 225–226K ops/s（+33%），p99 2.0 → 1.13 ms；放得下的集合不变（噪声内）。剖析：帧解码从 22% 降到 0.5%，CRC 只剩块解码的一遍。UCX 交替对照新旧都约 5K（见 BUG-UCX-ZC-SEND-REGISTERS-FRESH-MEMORY），放得下的集合噪声内。验收未全部达成：缓存放不下时仍是 memtable 的 16%；剩下的是收数据与块 CRC，随块大小变（方案 B：块切小，未做）；perf-check 4K 读仍取决于写入量。
-
 ### BUG-MEM-TIER-EMPTY-GROUPS-LINGER — 条目被删后其组不回收（评审推断，未复现）
 - **Trigger** (2026-10-27 内存层批量写的第三轮评审): `MemShard::remove`（删除、批量写撤回、落盘覆盖后的 `applied`）只删条目，组里的 key 副本和 CLOCK 槽位留着；同一批 key 跨批次反复重写或删除时，空组只在预算满触发淘汰时才被清掉，这部分内存不计入预算、槽位数组持续增长。
 - **Scope**: 先复现（反复重写/删除同一批 key，看 groups 槽位数与 RSS），坐实后让空组随最后一个条目离开而释放。

@@ -5222,7 +5222,10 @@ phases the script compacts every partition (perf-check `--before-read`, which ru
 `autumn-op compact <part> --wait`), so the reads come from SSTs. Before that, a read
 leg read whatever the write phase had left in the memtable, which moved with the
 write throughput: at one `--conn-inflight-cap` the 4K read was 562–568K, at another
-412–423K, while reads of the same fixed data were equal. TCP and UCX run as two invocations,
+412–423K, while reads of the same fixed data were equal. With the compaction the 4K
+read no longer moves with the write volume (TCP, 2026-10-28: 10 s of writes 247K/232K,
+20 s 268K/249K): the read set is always far past the 512 MiB block cache, so the leg
+measures SST reads that mostly miss the cache. TCP and UCX run as two invocations,
 because UCX — on one host as on many — binds a RoCE NIC IP with
 `UCX_TLS=rc_mlx5,ud_mlx5,tcp,self` and a pinned `UCX_NET_DEVICES` (the script refuses
 UCX on 127.0.0.1; there is no loopback UCX configuration):
@@ -5233,6 +5236,28 @@ export AUTUMN_DATA_ROOT=/data05/autumn-rs AUTUMN_EXTENT_SHARDS=8   # plus the cp
 AUTUMN_BIND_HOST='[fdbd:dc62:3:300::14]' UCX_NET_DEVICES=mlx5_2:1 \
   ./perf/perf_check.sh --3disk --partitions 8 --ucx      # eth1 = mlx5_2, the storage NIC
 ```
+
+To compare one fixed key set read from the memtable and from SSTs, start a cluster the
+way the script does (it tears its own down) and run `ycsb` twice, the second time with
+`--before-run` compacting every partition (the memtable holds 256 MiB per partition, so
+keep the set under that):
+
+```bash
+bash cluster.sh start 3
+ao="target/release/autumn-op --cluster-secret-file $AUTUMN_DATA_ROOT/cluster.secret --manager 127.0.0.1:9001"
+$ao namespace-create --name bench && $ao presplit --namespace bench/perf --count 8
+compact="for p in \$($ao info | awk '/^  part/{print \$2}'); do $ao compact \$p --wait || exit 1; done"
+for hook in "" "$compact"; do
+  target/release/autumn-client --manager 127.0.0.1:9001 ycsb --threads 16 --duration 15 \
+    --size 4096 --partitions 8 --pipeline-depth 8 --read-ratio 1.0 --key-dist uniform \
+    --records 5000 ${hook:+--before-run "$hook"}
+done
+```
+
+`--records` is per thread: 5000 × 16 × 4 KiB fits the 512 MiB block cache, 25000 does
+not. Measured 2026-10-28 (8 partitions, cluster cpuset-isolated): a set that fits reads
+from SSTs at 85% (TCP) / 98% (UCX) of the memtable rate; a set four times the cache at
+15% / 20%, the cost of fetching a ~62 KiB block from an extent node for each 4 KiB value.
 
 The committed baselines (2026-09-28) were taken this way with direct I/O on (the EN
 default) and the io_uring workers confined: TCP with the cluster on node-1 cores
