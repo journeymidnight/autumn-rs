@@ -58,6 +58,12 @@ spec:
           envFrom:
             - configMapRef: { name: autumn-config }
           env:
+            # Recomputable KV-cache writes may live in PS DRAM instead of the
+            # durable log. The 16 GiB budget is per PS; a restart drops it.
+            - name: AUTUMN_PS_MEM_TIER_BYTES
+              value: "17179869184"
+            - name: AUTUMN_PS_MEM_TIER_PREFIX
+              value: "kvc/"
             - name: POD_IP
               valueFrom:
                 fieldRef:

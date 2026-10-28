@@ -299,6 +299,8 @@ PS_TUNABLES=(
     "AUTUMN_PS_MAJOR_COMPACT_PARALLELISM:--major-compact-parallelism"
     "AUTUMN_PS_GC_PARALLELISM:--gc-parallelism"
     "AUTUMN_PS_CONN_INFLIGHT_CAP:--conn-inflight-cap"
+    "AUTUMN_PS_MEM_TIER_BYTES:--mem-tier-bytes"
+    "AUTUMN_PS_MEM_TIER_PREFIX:--mem-tier-prefix"
     "AUTUMN_PS_FG_RATE_BYTES_PER_SEC:--fg-rate-bytes-per-sec"
     "AUTUMN_PS_FG_IOPS_PER_SEC:--fg-iops-per-sec"
     "AUTUMN_PS_ADMISSION_COMPACT_RATE_BYTES_PER_SEC:--admission-compact-rate-bytes-per-sec"
