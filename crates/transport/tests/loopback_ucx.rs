@@ -80,7 +80,7 @@ async fn many_iter_pingpong() {
     }
     drop(w);
     drop(r);
-    let _ = server.await;
+    server.await.expect("server task");
 }
 
 /// Cancel-safety: drop a `read` future mid-await. The recv stays posted (UCX
@@ -118,7 +118,7 @@ async fn drop_read_mid_await_is_safe() {
     let _ = compio::time::timeout(Duration::from_millis(1), race).await;
 
     // Wait for the server to finish so we don't tear it down early.
-    let _ = server.await;
+    server.await.expect("server task");
 }
 
 /// A registered pool recv that completes normally hands its slab back, and the
@@ -172,7 +172,7 @@ async fn registered_pool_recv_reuses_the_slab() {
     let pb = recv_whole(&mut r, pb).await;
     assert!(pb.filled().iter().all(|&b| b == 0x5a));
 
-    let _ = server.await;
+    server.await.expect("server task");
 }
 
 #[compio::test]

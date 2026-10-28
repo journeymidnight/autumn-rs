@@ -1488,7 +1488,11 @@ below the old tombstone, and a whole-log replay (no checkpoint cursor or SST
 stamp resolves) let the tombstone through the lowered threshold to shadow the
 acknowledged put. `crates/manager/tests/system_compact_seq_below_dropped.rs`
 (both compaction cases red without `cover_seq`; the no-compaction control
-green either way).
+green either way). The same threshold keeps a split child's whole-log replay
+from taking its sibling's half of the parent's records back in (the child's
+compaction drops them, they held the parent's highest seqs, and replay does not
+filter by range): `system_split_replay_out_of_range.rs` (red without
+`cover_seq`: the sibling's deleted key reads its pre-split value after a merge).
 
 Only the final chunk is raised; raising it moves nothing, because outputs take
 their window's place in the list rather than a place by seq (see "Table list

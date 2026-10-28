@@ -601,6 +601,69 @@ mod tests {
         );
     }
 
+    // ── AsyncMergeIterator tests ─────────────────────────────────────────────
+
+    /// Resident readers never touch the stream client, so it points nowhere.
+    async fn async_iter(reader: Arc<SstReader>) -> AsyncTableIterator {
+        let sc = StreamClient::new_with_owner_epoch(
+            "127.0.0.1:1",
+            "merge-test".into(),
+            1,
+            1024 * 1024,
+            Rc::new(autumn_stream::ConnPool::new()),
+        )
+        .await
+        .unwrap();
+        AsyncTableIterator::new(reader, sc, Arc::new(BlockCache::new(1 << 20)), FetchMode::Cached)
+    }
+
+    async fn drain(m: &mut AsyncMergeIterator) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let mut out = Vec::new();
+        while m.valid() {
+            let it = m.item().unwrap();
+            out.push((it.key.clone(), it.value.clone()));
+            m.next().await.unwrap();
+        }
+        out
+    }
+
+    #[test]
+    fn merge_orders_by_internal_key_and_the_first_table_wins_a_tie() {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let t0 = build_sst(&[(b"a", 5, b"t0a5"), (b"c", 3, b"t0c3"), (b"d", 9, b"t0d9")]);
+            let t1 = build_sst(&[(b"a", 7, b"t1a7"), (b"b", 2, b"t1b2"), (b"d", 9, b"t1d9")]);
+            let mut m = AsyncMergeIterator::new(vec![async_iter(t0).await, async_iter(t1).await]);
+            m.rewind().await.unwrap();
+            let want: Vec<(Vec<u8>, Vec<u8>)> = [
+                (&b"a"[..], 7, &b"t1a7"[..]),
+                (b"a", 5, b"t0a5"),
+                (b"b", 2, b"t1b2"),
+                (b"c", 3, b"t0c3"),
+                // One entry for an identical internal key: the earlier table's.
+                (b"d", 9, b"t0d9"),
+            ]
+            .iter()
+            .map(|(k, ts, v)| (ikey(k, *ts), v.to_vec()))
+            .collect();
+            assert_eq!(drain(&mut m).await, want);
+
+            m.rewind().await.unwrap();
+            assert_eq!(drain(&mut m).await, want, "rewind starts the merge over");
+        });
+    }
+
+    #[test]
+    fn merge_of_no_tables_or_empty_tables_is_empty() {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let mut m = AsyncMergeIterator::new(vec![]);
+            m.rewind().await.unwrap();
+            assert!(!m.valid());
+            let mut m = AsyncMergeIterator::new(vec![async_iter(build_sst(&[])).await]);
+            m.rewind().await.unwrap();
+            assert!(!m.valid() && m.item().is_none());
+        });
+    }
+
     // ── MemtableIterator tests ───────────────────────────────────────────────
 
     #[test]

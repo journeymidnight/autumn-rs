@@ -50,7 +50,7 @@ async fn recv_data_with_hands_over_the_stream_in_order() {
         r.recv_data_with(|chunk| got.extend_from_slice(chunk)).await.unwrap();
     }
     assert_eq!(got, data);
-    let _ = server.await;
+    server.await.expect("server task");
 }
 
 #[compio::test]
@@ -73,5 +73,5 @@ async fn a_dropped_recv_data_with_leaves_the_connection_readable() {
     let compio::BufResult(res, buf) = r.read_exact(vec![0u8; 64]).await;
     res.expect("read after the dropped call");
     assert_eq!(buf, pattern(64));
-    let _ = server.await;
+    server.await.expect("server task");
 }

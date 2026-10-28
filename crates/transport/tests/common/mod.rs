@@ -26,7 +26,7 @@ async fn round_trip_at<T: AutumnTransport + Clone>(t: T, addr: SocketAddr, n: us
     });
     let c = t.connect(bound).await.unwrap();
     write_then_read(c, n).await;
-    let _ = server.await;
+    server.await.expect("server task");
 }
 
 pub async fn many_concurrent_at<T: AutumnTransport + Clone>(t: T, addr: SocketAddr, n: usize) {
@@ -50,9 +50,9 @@ pub async fn many_concurrent_at<T: AutumnTransport + Clone>(t: T, addr: SocketAd
         }));
     }
     for h in handles {
-        let _ = h.await;
+        h.await.expect("client task");
     }
-    let _ = server.await;
+    server.await.expect("server task");
 }
 
 #[allow(dead_code)] // loopback_ucx has no half-close test
@@ -79,7 +79,7 @@ pub async fn half_close_at<T: AutumnTransport + Clone>(t: T, addr: SocketAddr) {
     let buf = vec![0u8; 5];
     let BufResult(n, _) = r.read(buf).await;
     assert_eq!(n.unwrap(), 5);
-    let _ = server.await;
+    server.await.expect("server task");
 }
 
 /// One `write_vectored` must ship EVERY buffer, not just the first.

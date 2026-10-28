@@ -121,6 +121,9 @@ pub(crate) enum Command {
         records: u64,
         /// Workload F: each op is a read-modify-write (get then put).
         rmw: bool,
+        /// Shell command run (`sh -c`) between the load and the run phase,
+        /// like perf-check's `before_read`.
+        before_run: Option<String>,
     },
 }
 
@@ -160,7 +163,7 @@ Data-plane commands (KV + bench):
                                     Quick write+read bench; warns if >threshold regression vs baseline
   perf-clean [--dry-run] [--parallel 8]
                                     Delete everything perf-check / ycsb wrote (the bench/perf scope)
-  ycsb [--threads 32] [--duration 30] [--size 1024] [--partitions N] [--pipeline-depth 16] [--read-ratio 0.5] [--key-dist zipfian|uniform] [--records 100000] [--rmw]
+  ycsb [--threads 32] [--duration 30] [--size 1024] [--partitions N] [--pipeline-depth 16] [--read-ratio 0.5] [--key-dist zipfian|uniform] [--records 100000] [--rmw] [--before-run CMD]
                                     YCSB-equivalent mixed workload (A=0.5 B=0.95 C=1.0 D=0.95 F=--rmw); LOAD then mixed RUN
 
 Operator / admin commands moved to `autumn-op`:
@@ -570,6 +573,7 @@ pub(crate) fn parse_args() -> Args {
             let mut zipfian = true; // YCSB default distribution
             let mut records: u64 = 100_000; // per-thread keyspace
             let mut rmw = false;
+            let mut before_run: Option<String> = None;
             while i < raw.len() {
                 match raw[i].as_str() {
                     "--threads" | "-t" => {
@@ -618,6 +622,10 @@ pub(crate) fn parse_args() -> Args {
                     "--rmw" => {
                         rmw = true;
                     }
+                    "--before-run" => {
+                        i += 1;
+                        before_run = Some(val(&raw, i).to_owned());
+                    }
                     other => {
                         eprintln!("unknown ycsb flag: {other}");
                         usage();
@@ -635,6 +643,7 @@ pub(crate) fn parse_args() -> Args {
                 zipfian,
                 records,
                 rmw,
+                before_run,
             }
         }
         other => {

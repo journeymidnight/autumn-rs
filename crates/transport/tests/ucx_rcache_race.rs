@@ -104,7 +104,7 @@ fn rendezvous_sends_survive_concurrent_page_release() {
                     }));
                 }
                 for d in drains {
-                    let _ = d.await;
+                    d.await.expect("drain task");
                 }
             })
     });

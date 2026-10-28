@@ -12481,6 +12481,79 @@ mod merged_loop_tests {
         assert_eq!(decoded.key.as_slice(), b"big-key");
     }
 
+    /// A refused oversized Put must not raise its inode's fence floor: the
+    /// same writer's next, smaller write at an older epoch is still admitted.
+    #[test]
+    fn oversized_put_does_not_raise_the_fence_floor() {
+        let put = |value: Vec<u8>, lease_epoch: u64| {
+            let req = PutReq {
+                part_id: 0,
+                key: b"f/7".to_vec(),
+                value,
+                expires_at: 0,
+                region_epoch: 0,
+                inode_hint: 7,
+                lease_epoch,
+            };
+            let (resp_tx, resp_rx) = oneshot::channel();
+            let req = PartitionRequest {
+                msg_type: MSG_PUT,
+                payload: partition_rpc::rkyv_encode(&req),
+                resp_tx,
+                bulk_value: None,
+            };
+            (req, resp_rx)
+        };
+        let floors = FenceFloors::recovered(HashMap::new());
+        let mut pending: Vec<WriteRequest> = Vec::new();
+
+        let (big, big_rx) = put(vec![0u8; AUTUMN_PS_MAX_INLINE_BYTES_DEFAULT as usize + 1], 5);
+        enqueue_put(big, &mut pending, 0, 0, Some(&floors), None);
+        let frame = compio::runtime::Runtime::new().unwrap().block_on(big_rx);
+        let resp: PutResp = partition_rpc::rkyv_decode(&frame.unwrap().unwrap()).unwrap();
+        assert_eq!(resp.code, CODE_VALUE_TOO_LARGE);
+        assert!(pending.is_empty());
+
+        let (small, _small_rx) = put(b"v".to_vec(), 3);
+        enqueue_put(small, &mut pending, 0, 0, Some(&floors), None);
+        assert!(
+            pending.iter().any(|w| matches!(w.op, WriteOp::Put { .. })),
+            "epoch 3 must not be fenced by the refused epoch-5 write"
+        );
+    }
+
+    /// The same for `MSG_PUT_BULK`, whose large value arrives beside the
+    /// payload (`bulk_value`).
+    #[test]
+    fn oversized_bulk_put_does_not_raise_the_fence_floor() {
+        let put = |value: Vec<u8>, lease_epoch: u64| {
+            let (resp_tx, resp_rx) = oneshot::channel();
+            let req = PartitionRequest {
+                msg_type: MSG_PUT_BULK,
+                payload: partition_rpc::encode_put_bulk_meta(0, 0, 0, b"f/7", 7, lease_epoch),
+                resp_tx,
+                bulk_value: Some(Bytes::from(value)),
+            };
+            (req, resp_rx)
+        };
+        let floors = FenceFloors::recovered(HashMap::new());
+        let mut pending: Vec<WriteRequest> = Vec::new();
+
+        let (big, big_rx) = put(vec![0u8; AUTUMN_PS_MAX_INLINE_BYTES_DEFAULT as usize + 1], 5);
+        enqueue_put_bulk(big, &mut pending, 0, 0, Some(&floors), None);
+        let frame = compio::runtime::Runtime::new().unwrap().block_on(big_rx);
+        let resp: PutResp = partition_rpc::rkyv_decode(&frame.unwrap().unwrap()).unwrap();
+        assert_eq!(resp.code, CODE_VALUE_TOO_LARGE);
+        assert!(pending.is_empty());
+
+        let (small, _small_rx) = put(b"v".to_vec(), 3);
+        enqueue_put_bulk(small, &mut pending, 0, 0, Some(&floors), None);
+        assert!(
+            pending.iter().any(|w| matches!(w.op, WriteOp::Put { .. })),
+            "epoch 3 must not be fenced by the refused epoch-5 write"
+        );
+    }
+
     /// regular Put at exactly the inline cap goes through normally.
     /// Cap is `> AUTUMN_PS_MAX_INLINE_BYTES`, so equality is allowed.
     #[test]

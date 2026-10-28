@@ -76,27 +76,19 @@
 - **Acceptance**: 同一基准多轮 nlink 一个不少；去掉修复变红；mkdir 吞吐不降。
 - `passes: false`
 
-### F-TEST-FOLLOWUPS — 测试集体检留下的缺口与疑点（未处理）
-- **Trigger** (2026-10-19，测试集体检的审查与删除过程中发现，均未在那次改动里处理):
-  - `system_gc_chunked_read` 从不 roll 日志，GC 实际没跑（应加 roll_tails，而不是删）。
-  - `AsyncMergeIterator` 没有自己的单测（同步 `MergeIterator` 只在测试里存在，已随其测试删除）；合并顺序只由上层 range/compaction 测试间接覆盖。
-  - 没有测试覆盖"超大 Put 不推高 inode fence floor"（`enqueue_put_rejects_oversized_value` 传的 floor 是 None）。
-  - `etcd_replay_owner_lock_allows_check_commit_length_without_reacquire` 用 `drop(mgr1)`，mgr1 仍是 leader，failover 重放没被走到。
-  - 行流前缀裁剪遇到在途 Recovery 时按设计推迟到"下一次 compaction"；分区若此后空闲，没有任何东西再触发 compaction，被替换下来的 row extent 就一直留在流里（占空间，不影响正确性）。由 `system_sst_block_rot::a_compaction_reads_around_a_rotted_replica` 的偶发失败暴露（2026-10-20）。
-  - 推断：`handle_check_commit_length` 没有 leader 检查，standby 会用冻结的 store 回答（与"standby 拒绝元数据查询"相悖），未核实。
-  - 推断：transport `many_concurrent_at` 用 `let _ = h.await` 丢弃任务结果，任务 panic 可能不会让测试失败，未核实。
-- **Scope**: 逐项核实；真缺口补测试（消融能红），真 bug 另立条目按根因修，偶发失败先复现再定位。
-- **Acceptance**: 每项写明结论（已补/已修/证伪）；补的测试消融变红。
+### BUG-ROW-PREFIX-CUT-DEFERRED-ON-IDLE — 行流前缀裁剪被推迟后，空闲分区再也不裁（推断，未复现）
+- **Trigger** (2026-10-28，测试集体检遗留项拆出): `truncate_unreferenced_row_prefix` 遇到在途 op（Recovery/EC）时推迟到"下一次 compaction"；分区此后空闲就没有任何东西再裁，被替换下来的 row extent 一直留在流里（占空间，不影响正确性）。tick 上的 reclaim 探针只在有活表引用头 extent 时才动，不管无表引用的前缀。
+- **Scope**: 先复现（compaction 替换掉的 row extent 上有在途 op，使裁剪被推迟，然后分区空闲），坐实后让推迟的裁剪在 op 结束后由已有的周期机制补做（在维护闸门下，与 compaction 串行）。
+- **Acceptance**: 复现用例修复前 extent 留在流里、修复后被裁；消融变红。
 - `passes: false`
-- **notes** (2026-10-20): review.md N6 已坐实 `handle_check_commit_length` 缺 leader gate，另立 BUG-CHECK-COMMIT-LENGTH-NO-LEADER-GATE（含修正 `etcd_replay_owner_lock_...` 测试）；review.md 4.2 也确认 `system_gc_chunked_read` 不建立可 GC 的 sealed log 前置条件。
-- **notes** (2026-10-20): 已修：`handle_check_commit_length` 加严格 leader gate；`etcd_replay_owner_lock_allows_check_commit_length_without_reacquire` 改为真正停掉 mgr1 并等 mgr2 接任（两项结论：已修）。
-
+- **notes** (2026-10-28): 用 `system_sst_block_rot::a_compaction_reads_around_a_rotted_replica` 去掉重复 compact、只 compact 一次后空闲 40 s，6/6 次都在 200 ms 内裁掉，未出现推迟；未修。
 ### BUG-LEASE-HEARTBEAT-STALE-NOTHELD — 心跳快照期间重新 acquire 的 lease 会被迟到的 NotHeld 删掉（推断，未复现）
 - **Trigger** (2026-10-17 fuse_lease_loss 修复的 opus 评审): `lease_tasks.rs` 心跳循环先快照 `held_leases` 的 ino 再逐个 await 心跳 RPC；期间最后一次 release + 新 Open 可以重新 acquire 同一 ino，迟到的 `NotHeld` 把新条目删掉（现在还会多做一次失效）：后续写 EIO "no lease"，manager 那份新 lease 漏到 TTL 过期。
 - **Scope**: 先复现（心跳 RPC 前挂暂停点，期间 release+acquire）。坐实后：删条目前比较快照时的 `lease_epoch`，不同则不删。
 - **Acceptance**: 复现用例修复前新 lease 被删、修复后保留；消融变红。
 - `passes: false`
 - **notes** (2026-10-17): 分析后未复现、未修。挂载对 manager 只有一条 FIFO 连接：心跳的回复总在之后发出的 release/acquire 的回复之前到达，新条目只可能在迟到的 NotHeld 落地之后插入——单连接上不可达。可达的前提是心跳与重新 acquire 走不同连接（心跳期间 manager 换主、`mgr_call_retry` 轮换到新 leader）。若要修，删/置 revoked 前比较快照时的 `lease_epoch` 即可；等有换主中的复现再做。
+- **notes** (2026-10-28 证伪): 不可达。manager 回 NotHeld 的分支在回包前没有 await（`handle_heartbeat_lease`，rpc_handlers.rs:7744），同一连接上它的回包排在之后任何请求的回包前面；换主时 release/acquire 要先在旧连接上拿到 NOT_LEADER 才会转到新 leader，那个回包同样排在心跳之后，所以迟到的 NotHeld 总在新 lease 插入前落地。建议关闭本条（验收的"复现用例"无法构造）。
 
 ### F-ETCD-AUTH — manager 连接带认证/TLS 的 etcd
 - **Trigger** (2026-10-07 用户): 生产 etcd 要开 auth。现 manager 只有 `--etcd <endpoints>`，`crates/etcd` 是 h2c 明文 gRPC，无 `Auth/Authenticate`、无 token 头、无 TLS；开 auth 的 etcd 连不上。
@@ -104,13 +96,6 @@
 - **Acceptance**: 对开了 auth+TLS 的真实 etcd，manager 选主、replay、写入、token 过期后自动重认证均正常；错误口令/证书启动即响亮失败；不带新 flag 时对明文 etcd 行为不变。
 - `passes: false`
 - **notes** (2026-10-07): 用户定：后做，排在 F-CLUSTER-STATUS-SUMMARY 之后。
-
-### F-REVIEW-T3-REAL-CRASH — P2 crash 测试真正停止旧 runtime
-- **Trigger**: review.md T3；drop RpcClient 不等于杀 PS/EN。
-- **Scope**: 改用可终止 runtime 或 SIGKILL 子进程并等待退出；compact/flush 用 durable/checkpoint barrier。
-- **Acceptance**: 证明旧服务退出、故障发生于指定窗口；重启验证 ACK 数据和 tombstone。
-- `passes: false`
-- **notes** (2026-10-20): review.md（新版全仓审查）4.2 仍列为待补：crash/restart 测试应记录旧进程/线程退出、checkpoint 位点、重启后的 pid/runtime 身份；已核实的反例是 `etcd_replay_owner_lock_allows_check_commit_length_without_reacquire`（`drop(RpcClient)` 当 kill）。注意：同 psid 接管类测试（旧 PS 因 owner epoch 被围栏、LockedByOther 自退且不 flush）是真实的非优雅崩溃，不在此列。
 
 ### F-REVIEW-T4-CHAOS-GATES — P2 chaos 覆盖与历史验收
 - **Trigger**: review.md T4；动作零成功、ignored 未运行、未知结果抹掉已 ACK 历史。
@@ -331,29 +316,6 @@
 - **Acceptance**: 在一个持续写入的分区上跑一次 16 GiB EC 转换，
   append fanout 的 p99 不超过 size-scaled deadline 的一半；转换本身允许变慢。
 - **Status**: `passes: false` (2026-09-11) — 仅立账。
-
-### F-MERGE-REPLAY-OUT-OF-RANGE — 重放不按 range 过滤，可能让已分离的孩子重新带上兄弟的 key（未复现）
-- **Trigger** (2026-09-27，merge 分离闸门的独立评审提出，推断): merge 现在要求两侧
-  `has_overlap == 0`（`MSG_MERGE_FREEZE` 拒绝），这个标志只从 SST 算（split 时与 open 时）。
-  但 reopen 的 WAL 重放**不做 `in_range` 过滤**，唯一的跳过是 `ts <= extent_dedup`
-  （`partition-server/src/lib.rs` `recover_partition` 重放段）；而每个来源的 dedup 取该
-  checkpoint 记录里**仍能解析**的 SST 的 `last_seq` 最大值，解析不到时为 0，major compaction
-  丢掉最新条目又会压低输出表的 `last_seq`。推断链：祖先有 ≥2 个非空 meta extent（或 meta
-  尾被 roll 过）⇒ 最早的 checkpoint vp 在后来的父记录之前 ⇒ 孩子 major compaction 之后那些
-  区间按 0 或偏低的值去重 ⇒ 任何一次 reopen 都把兄弟那半的父记录重新插进孩子的 memtable
-  ⇒ `has_overlap` 仍是 0，下一次 flush（包括 merge freeze 自己的 drain flush）写出带越界 key
-  的 SST ⇒ merge 放行后与本次修掉的现象相同。
-- **已做的复现尝试（阴性）**: split → 两侧写/删 → 两侧 major compact → PS 优雅重启 / SIGKILL
-  重启 → merge → 读，D/K/J/R 全部正确（一次父 flush、一个 meta extent 的形状，最早 vp 在所有
-  父记录之后，构造不出推断链的前提）。另观察到：一侧的删除若是它 checkpoint 前的最后一条
-  记录，未设闸门的 merge 之后该 key 读 NOT_FOUND——与"被 compaction 丢掉的 tombstone 在
-  reopen 时被重放"一致，是同一机制的无害一面。
-- **Scope（复现之后才谈）**: 造出 ≥2 个 meta extent 的祖先（强制 meta roll，或多级 split），
-  走完上面的链；若坐实，根因修法是重放时对每条记录做一次 `in_range(rg)` 过滤（同时去掉被
-  重放的 tombstone），不是再加一个标志。
-- **Acceptance**: 一个确定性复现（或一份说明为什么前提不可达的分析），据此决定修不修；修则
-  消融能变红。
-- `passes: false`
 
 ### F-SPLIT-CARRIED-BYTES-UNBOUNDED — 大 value 分区可以无限长大，而现在没有任何判据会说话
 - **Trigger** (2026-09-11，本次 split 判据重设计的直接后果): 硬 size 触发器改读

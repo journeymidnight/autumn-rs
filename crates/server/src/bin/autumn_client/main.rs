@@ -270,6 +270,19 @@ fn pcts(v: &mut [f64]) -> (f64, f64, f64) {
     (v[idx(0.50)], v[idx(0.95)], v[idx(0.99)])
 }
 
+/// Run a bench's between-phases shell command (`sh -c`), untimed; its
+/// failure fails the bench.
+fn run_hook(bench: &str, flag: &str, cmd: &str) -> Result<()> {
+    let started = Instant::now();
+    let status = std::process::Command::new("sh").arg("-c").arg(cmd).status()
+        .with_context(|| format!("running {flag} {cmd:?}"))?;
+    if !status.success() {
+        bail!("{flag} {cmd:?} failed: {status}");
+    }
+    println!("==> {bench}: {flag} command done in {:.1}s", started.elapsed().as_secs_f64());
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn cmd_ycsb(
     client: &ClusterClient,
@@ -282,6 +295,7 @@ async fn cmd_ycsb(
     zipfian: bool,
     records: u64,
     rmw: bool,
+    before_run: Option<String>,
     manager: &str,
     cred: Option<(String, Vec<u8>)>,
 ) -> Result<()> {
@@ -372,6 +386,10 @@ async fn cmd_ycsb(
         "LOAD: {loaded} keys in {load_el:.1}s = {:.0} ops/s",
         loaded as f64 / load_el
     );
+
+    if let Some(cmd) = before_run {
+        run_hook("ycsb", "--before-run", &cmd)?;
+    }
 
     // ---- RUN phase: one mixed loop, read_ratio reads / rest updates ----
     let run_ops = Arc::new(AtomicU64::new(0));
@@ -798,13 +816,7 @@ async fn cmd_perf_check(client: &ClusterClient, threads: usize, duration_secs: u
     // part of the read phase. A shell command: compaction is an admin
     // operation (autumn-op), which this data-plane client does not issue.
     if let Some(cmd) = before_read {
-        let started = Instant::now();
-        let status = std::process::Command::new("sh").arg("-c").arg(&cmd).status()
-            .with_context(|| format!("running --before-read {cmd:?}"))?;
-        if !status.success() {
-            bail!("--before-read {cmd:?} failed: {status}");
-        }
-        println!("==> perf-check: before-read command done in {:.1}s", started.elapsed().as_secs_f64());
+        run_hook("perf-check", "--before-read", &cmd)?;
     }
 
     // ---- Read phase ----
@@ -1426,8 +1438,9 @@ async fn main() -> Result<()> {
             zipfian,
             records,
             rmw,
+            before_run,
         } => cmd_ycsb(
-            &client, threads, duration_secs, value_size, partitions, pipeline_depth, read_ratio, zipfian, records, rmw, &args.manager, cred,
+            &client, threads, duration_secs, value_size, partitions, pipeline_depth, read_ratio, zipfian, records, rmw, before_run, &args.manager, cred,
         )
         .await?,
     }

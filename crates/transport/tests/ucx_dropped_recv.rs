@@ -96,7 +96,7 @@ async fn a_dropped_recv_keeps_its_pool_slab_until_the_bytes_land() {
         again.filled().as_ptr() == first_slab || again2.filled().as_ptr() == first_slab,
         "the orphan's slab did not return to the pool"
     );
-    let _ = server.await;
+    server.await.expect("server task");
 }
 
 /// After a recv future was dropped, a later read on the same connection must
@@ -123,7 +123,7 @@ async fn a_read_after_a_dropped_recv_fails_instead_of_losing_bytes() {
         Ok(BufResult(Ok(n), _)) => panic!("the read after a dropped recv returned {n} bytes"),
         Ok(BufResult(Err(e), _)) => assert_eq!(e.kind(), std::io::ErrorKind::ConnectionAborted, "{e}"),
     }
-    let _ = server.await;
+    server.await.expect("server task");
 }
 
 /// An orphan whose peer never sends again never completes. Later operations on
@@ -171,7 +171,7 @@ async fn a_pending_orphan_costs_later_operations_no_scan() {
         res.unwrap();
         assert!(b.iter().all(|&v| v == (i & 0xff) as u8));
     }
-    let _ = server.await;
+    server.await.expect("server task");
     let (orphaned, reaped, scans) = ucx_orphan_counts();
     assert_eq!(orphaned, orphaned0, "no further orphan");
     assert_eq!(reaped, reaped0, "the silent orphan cannot complete");
