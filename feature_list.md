@@ -92,20 +92,6 @@
 - `passes: false`
 - **notes** (2026-10-07): 用户定：后做，排在 F-CLUSTER-STATUS-SUMMARY 之后。
 
-### F-REVIEW-T4-CHAOS-GATES — P2 chaos 覆盖与历史验收
-- **Trigger**: review.md T4；动作零成功、ignored 未运行、未知结果抹掉已 ACK 历史。
-- **Scope**: 区分 smoke/定向/长跑；必需动作非零门槛；修正 full-action 脚本；专用 CI；保留 invocation/response 历史及并发允许结果。
-- **Acceptance**: 必需动作未进入/完成则失败；包含 manager/PS 故障与在线 Remove、DELETE/TTL/多 writer 的定向覆盖，CI 实际执行。
-- `passes: false`
-- **notes** (2026-09-20): 普通 manager 测试已解除对系统 FUSE 的无条件依赖；8 个 FUSE 专属目标通过 fuse-tests feature 显式启用，CI 的 clippy/integration 命令保持启用。完整 ignored chaos、动作覆盖门槛和历史 checker 尚未完成。本轮定向验证入口见 scripts/README.md。
-- **notes** (2026-09-27): `scripts/transport_chaos.sh` 在 HEAD 上整体跑不起来——自 `67728e4`
-  起 `autumn-client` 的 KV 命令必须带 `--namespace`，脚本没带，seed 全部失败，后续 E1–E7 的
-  断言因此没有意义。同日 merge 加了分离闸门，E7b 前补了"两侧 compact + 等 `has_overlap=0`"
-  （否则 freeze 直接拒、manager kill 落空），**这一步未实跑**。另：该脚本开机时 `kill -9` 本机
-  所有 `autumn-*`/`etcd` 进程，多租户机器上会杀掉别的工作树的进程。
-- **notes** (2026-10-20): review.md 4.2 仍列为待补：全动作长时 chaos、硬盘故障、断电、跨机 UCX、真实 FUSE mount 都未在 CI 运行；动作要有非零成功/完成计数，历史 checker 要保留已 ACK 写入。CI 现已跑全部非 opt-in 测试并装 toxiproxy、fuse3。
-- **notes** (2026-10-28): system_chaos 已改：(1) 历史改成线性一致寄存器检查——每次写记录发起/确认的逻辑时钟与写者，未知结果不再抹掉已确认值；三个写者（两个共享 key 空间）发 put / delete / 2–5 s 过期的 TTL put / 长 TTL put；逐键与 range 校验按"可能的最终值"判定，range 另拒已删除/已过期 key（history_tests 6 条）。(2) 门槛：每个启用的动作至少 OK 一次，否则整轮失败；超过时长后继续跑到每个都 OK 或再试 4 次（上限 6 倍时长）；写者/读者/nemesis 任务 panic 也让整轮失败。(3) 新 nemesis `diskfault`（见已删除的 F-CHAOS-DISK-FAULT）。(4) CI 增加一轮完整 chaos（种子 = run id）。PS 故障在 chaos 内（psterm/pskill）；manager 换主与在线 Remove 由已在 CI 的定向测试覆盖（system_manager_failover、system_review_remove_retry、node_lifecycle），未进 chaos（chaos 的 manager 在进程内）。异步动作（EC 转换、compaction）的"OK"仍是提交成功，不是完成。实跑：全动作多轮绿（6251–6254 key 零错零丢）；门槛曾因 Merge / DiskFault 未跑成正确变红。CI 首跑（6a344312）：https://github.com/journeymidnight/autumn-rs/actions/runs/40635951837 ，结果由用户查看；chaos 步骤通过即可改 passes。
-
 ### F-COMPIO-UPGRADE — 升级运行时并分阶段验证 TCP 内核 CPU 降耗
 - **Trigger** (2026-09-14，用户要求记录升级计划): 当前 compio 0.18.0 /
   compio-driver 0.11.4 / compio-runtime 0.11.0；H200-1 单 partition 写入采样的
