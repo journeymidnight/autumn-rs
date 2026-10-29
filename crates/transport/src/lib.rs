@@ -37,7 +37,8 @@ mod regpool;
 
 pub use regpool::{
     acquire as regpool_acquire, set_regpool_cap_bytes,
-    snapshot as regpool_snapshot, PooledBuf, RegBytes, RegpoolStats,
+    acquire_for as regpool_acquire_for, snapshot as regpool_snapshot, try_acquire_for as regpool_try_acquire_for,
+    PoolError, PooledBuf, RegBytes, RegpoolStats, Use as PoolUse, UseStats as PoolUseStats,
 };
 pub use recv_dest::{RecvDest, Released};
 

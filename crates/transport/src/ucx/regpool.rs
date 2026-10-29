@@ -66,6 +66,20 @@ pub struct RegpoolStats {
     pub registered_bytes: u64,
     /// Bytes handed out and not yet returned (4 KiB granular).
     pub in_use_bytes: u64,
+    /// Per `Use`, in its order.
+    pub uses: [UseStats; USES],
+}
+
+/// One use's budget (`acquire_for`).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct UseStats {
+    pub quota_bytes: u64,
+    pub in_use_bytes: u64,
+    pub high_water_bytes: u64,
+    /// Acquires that had to wait.
+    pub waits: u64,
+    /// Waits that ended without a buffer.
+    pub timeouts: u64,
 }
 
 impl RegpoolStats {
@@ -88,6 +102,15 @@ pub fn snapshot() -> RegpoolStats {
         out_of_pool_total: OUT_OF_POOL_TOTAL.load(Ordering::Relaxed),
         ..Default::default()
     };
+    for (i, b) in BUDGETS.iter().enumerate() {
+        s.uses[i] = UseStats {
+            quota_bytes: use_quota(i) as u64,
+            in_use_bytes: b.in_use.load(Ordering::Relaxed) as u64,
+            high_water_bytes: b.high_water.load(Ordering::Relaxed) as u64,
+            waits: b.waits.load(Ordering::Relaxed),
+            timeouts: b.timeouts.load(Ordering::Relaxed),
+        };
+    }
     for chunk in &pool().lock().unwrap().chunks {
         s.pool_bytes += chunk.len as u64;
         if matches!(chunk.reg.get(), Some(Some(_))) {
@@ -267,6 +290,8 @@ pub struct PooledBuf {
     /// narrows it, so `filled()` / `AsRef` / `IoBuf::as_init` never expose
     /// stale pool bytes past a short recv.
     filled_len: usize,
+    /// The use budget it counts against (`acquire_for`), released on drop.
+    charge: Option<Charge>,
 }
 
 enum Storage {
@@ -284,7 +309,9 @@ impl Drop for PooledBuf {
     fn drop(&mut self) {
         if let Storage::Pooled { chunk, alloc, units, .. } = &self.storage {
             chunk.free(*alloc, *units);
+            MEMORY.wake();
         }
+        drop(self.charge.take());
     }
 }
 
@@ -475,7 +502,7 @@ impl compio::buf::IoBufMut for PooledBuf {
 }
 
 fn heap(need: usize) -> PooledBuf {
-    PooledBuf { storage: Storage::Heap(vec![0u8; need]), used: need, filled_len: need }
+    PooledBuf { storage: Storage::Heap(vec![0u8; need]), used: need, filled_len: need, charge: None }
 }
 
 fn pooled(chunk: &Arc<Chunk>, alloc: Allocation, units: u32, need: usize) -> PooledBuf {
@@ -485,20 +512,36 @@ fn pooled(chunk: &Arc<Chunk>, alloc: Allocation, units: u32, need: usize) -> Poo
         storage: Storage::Pooled { chunk: chunk.clone(), alloc, units, ptr },
         used: need,
         filled_len: need,
+        charge: None,
     }
 }
 
-/// A buffer of `need` writable bytes: from this thread's chunk when it has
-/// room, else from another chunk (see module doc), else from the heap.
+/// A buffer of `need` writable bytes counted against no use budget: from this
+/// thread's chunk when it has room, else from another chunk (see module doc),
+/// else from the heap. Callers move to `acquire_for`, which never falls back.
 pub fn acquire(need: usize) -> PooledBuf {
-    // A finished orphan recv (`endpoint.rs`) hands its buffer back here first.
-    #[cfg(feature = "ucx")]
-    crate::ucx::endpoint::reap_orphans();
     ACQUIRE_TOTAL.fetch_add(1, Ordering::Relaxed);
     if need > MAX_CHUNK_BYTES {
         OUT_OF_POOL_TOTAL.fetch_add(1, Ordering::Relaxed);
         return heap(need);
     }
+    if let Some(pb) = alloc(need) {
+        return pb;
+    }
+    OVER_CAP_TOTAL.fetch_add(1, Ordering::Relaxed);
+    warn_once(&WARNED_CAP, format_args!(
+        "regpool: no chunk has room for {need} bytes at the {}-byte cap; falling back to unregistered heap buffers",
+        cap_bytes()
+    ));
+    heap(need)
+}
+
+/// Pool memory for `need <= MAX_CHUNK_BYTES` bytes, or `None` when no chunk
+/// has room and none can be made.
+fn alloc(need: usize) -> Option<PooledBuf> {
+    // A finished orphan recv (`endpoint.rs`) hands its buffer back here first.
+    #[cfg(feature = "ucx")]
+    crate::ucx::endpoint::reap_orphans();
     let units = need.div_ceil(UNIT).max(1) as u32;
     let current = CLAIM
         .try_with(|c| {
@@ -510,12 +553,12 @@ pub fn acquire(need: usize) -> PooledBuf {
         .flatten();
     if let Some(pb) = current {
         HIT_TOTAL.fetch_add(1, Ordering::Relaxed);
-        return pb;
+        return Some(pb);
     }
-    acquire_slow(need, units)
+    alloc_slow(need, units)
 }
 
-fn acquire_slow(need: usize, units: u32) -> PooledBuf {
+fn alloc_slow(need: usize, units: u32) -> Option<PooledBuf> {
     let mut pool = pool().lock().unwrap();
     for chunk in &pool.chunks {
         if chunk.claimed.load(Ordering::Relaxed) {
@@ -524,7 +567,7 @@ fn acquire_slow(need: usize, units: u32) -> PooledBuf {
         if let Some(a) = chunk.allocate(units) {
             claim(chunk);
             HIT_TOTAL.fetch_add(1, Ordering::Relaxed);
-            return pooled(chunk, a, units, need);
+            return Some(pooled(chunk, a, units, need));
         }
     }
     let size = if need <= CHUNK_BYTES { CHUNK_BYTES } else { need.next_power_of_two() };
@@ -540,18 +583,15 @@ fn acquire_slow(need: usize, units: u32) -> PooledBuf {
                 pool.chunks.push(chunk.clone());
                 let a = chunk.allocate(units).expect("a new chunk fits the request it was made for");
                 claim(&chunk);
-                return pooled(&chunk, a, units, need);
+                drop(pool);
+                // The rest of the chunk is room a memory waiter may want.
+                MEMORY.wake();
+                return Some(pooled(&chunk, a, units, need));
             }
+            // The mapping failed (warned in `Mapping::new`): share as at the cap.
             None => {
                 pool.bytes -= size;
-                // Not the cap: the mapping failed (warned in `Mapping::new`).
-                for chunk in &pool.chunks {
-                    if let Some(a) = chunk.allocate(units) {
-                        HIT_TOTAL.fetch_add(1, Ordering::Relaxed);
-                        return pooled(chunk, a, units, need);
-                    }
-                }
-                return heap(need);
+                MEMORY.wake();
             }
         }
     }
@@ -559,16 +599,268 @@ fn acquire_slow(need: usize, units: u32) -> PooledBuf {
     for chunk in &pool.chunks {
         if let Some(a) = chunk.allocate(units) {
             HIT_TOTAL.fetch_add(1, Ordering::Relaxed);
-            return pooled(chunk, a, units, need);
+            return Some(pooled(chunk, a, units, need));
         }
     }
-    drop(pool);
-    OVER_CAP_TOTAL.fetch_add(1, Ordering::Relaxed);
-    warn_once(&WARNED_CAP, format_args!(
-        "regpool: no chunk has room for {need} bytes at the {}-byte cap; falling back to unregistered heap buffers",
-        cap_bytes()
-    ));
-    heap(need)
+    None
+}
+
+/// What a buffer holds. Each use has its own share of the cap, so one cannot
+/// starve another: an extent node's append receives (`Receive`) never wait on
+/// its read replies (`Reply`) being fetched, which is what breaks the cycle of
+/// two processes each holding the other's buffers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(usize)]
+pub enum Use {
+    /// Data arriving as a request: a client's value at the PS, an append at
+    /// the extent node.
+    Receive,
+    /// Read data: read into a reply, received from one, forwarded.
+    Reply,
+    /// Bytes copied in to be sent (UCX stream staging, background segments).
+    Staging,
+}
+
+const USES: usize = 3;
+/// Percent of the cap per use, in `Use` order.
+const USE_SHARE: [usize; USES] = [40, 40, 20];
+const _: () = assert!(USE_SHARE[0] + USE_SHARE[1] + USE_SHARE[2] == 100);
+/// One thread (a partition, a shard) holds at most this fraction of a use's
+/// share, so one slow client cannot take a whole use from the others.
+const THREAD_SHARE_DIVISOR: usize = 2;
+
+/// Why `acquire_for` gave no buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PoolError {
+    /// The use's budget, this thread's part of it, or the pool's memory stayed
+    /// full for the whole wait.
+    Full,
+    /// More than one thread may ever hold of this use (or than the largest
+    /// chunk): waiting cannot help.
+    TooLarge,
+}
+
+impl std::fmt::Display for PoolError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            PoolError::Full => "buffer pool full",
+            PoolError::TooLarge => "value too large for the buffer pool",
+        })
+    }
+}
+
+impl std::error::Error for PoolError {}
+
+/// A queue of tasks waiting for room, on cache lines of its own. Returns bump `gen` and wake them all; a
+/// waiter announces itself (`waiting`) before its last try, so a return
+/// between that try and its wait still bumps the generation it compares.
+#[repr(align(128))]
+struct WaitList {
+    gen: AtomicU64,
+    waiting: AtomicUsize,
+    wakers: Mutex<Vec<std::task::Waker>>,
+}
+
+impl WaitList {
+    const fn new() -> Self {
+        Self { gen: AtomicU64::new(0), waiting: AtomicUsize::new(0), wakers: Mutex::new(Vec::new()) }
+    }
+
+    fn wake(&self) {
+        if self.waiting.load(Ordering::SeqCst) == 0 {
+            return;
+        }
+        self.gen.fetch_add(1, Ordering::SeqCst);
+        let wakers = std::mem::take(&mut *self.wakers.lock().unwrap());
+        for w in wakers {
+            w.wake();
+        }
+    }
+}
+
+/// Each on its own cache lines: every acquire and drop of its use writes it.
+#[repr(align(128))]
+struct Budget {
+    in_use: AtomicUsize,
+    high_water: AtomicUsize,
+    waits: AtomicU64,
+    timeouts: AtomicU64,
+    /// Waiting for this use's budget.
+    room: WaitList,
+}
+
+static BUDGETS: [Budget; USES] = [const {
+    Budget {
+        in_use: AtomicUsize::new(0),
+        high_water: AtomicUsize::new(0),
+        waits: AtomicU64::new(0),
+        timeouts: AtomicU64::new(0),
+        room: WaitList::new(),
+    }
+}; USES];
+
+/// Waiting for pool memory (budget left, but no chunk had room).
+static MEMORY: WaitList = WaitList::new();
+
+fn use_quota(i: usize) -> usize {
+    cap_bytes() / 100 * USE_SHARE[i]
+}
+
+fn thread_quota(i: usize) -> usize {
+    use_quota(i) / THREAD_SHARE_DIVISOR
+}
+
+/// Bytes this thread holds per use; shared with its buffers, which may be
+/// dropped elsewhere.
+type Held = Arc<[AtomicUsize; USES]>;
+
+thread_local! {
+    static HELD: Held = Arc::new([const { AtomicUsize::new(0) }; USES]);
+}
+
+/// A buffer's share of its use budget and of its acquiring thread's.
+struct Charge {
+    u: Use,
+    bytes: usize,
+    held: Held,
+}
+
+impl Drop for Charge {
+    fn drop(&mut self) {
+        let i = self.u as usize;
+        self.held[i].fetch_sub(self.bytes, Ordering::SeqCst);
+        BUDGETS[i].in_use.fetch_sub(self.bytes, Ordering::SeqCst);
+        BUDGETS[i].room.wake();
+    }
+}
+
+/// Counts `bytes` against `u` and this thread, or `None` when either is full.
+/// Nothing is counted on refusal, so a refused try never makes another look full.
+fn charge(u: Use, bytes: usize) -> Option<Charge> {
+    let i = u as usize;
+    // During thread teardown: a count of its own, the use budget still applies.
+    let held = HELD.try_with(Held::clone).unwrap_or_else(|_| Arc::new([const { AtomicUsize::new(0) }; USES]));
+    // Only this thread adds to its own count.
+    if held[i].load(Ordering::SeqCst) + bytes > thread_quota(i) {
+        return None;
+    }
+    let budget = &BUDGETS[i];
+    let mut cur = budget.in_use.load(Ordering::SeqCst);
+    loop {
+        if cur + bytes > use_quota(i) {
+            return None;
+        }
+        match budget.in_use.compare_exchange_weak(cur, cur + bytes, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => break,
+            Err(now) => cur = now,
+        }
+    }
+    held[i].fetch_add(bytes, Ordering::Relaxed);
+    if cur + bytes > budget.high_water.load(Ordering::Relaxed) {
+        budget.high_water.fetch_max(cur + bytes, Ordering::Relaxed);
+    }
+    Some(Charge { u, bytes, held })
+}
+
+/// Why one try failed: which list a wait belongs on.
+enum Short {
+    Budget,
+    Memory,
+    TooLarge,
+}
+
+fn try_once(u: Use, need: usize) -> Result<PooledBuf, Short> {
+    let bytes = need.div_ceil(UNIT).max(1) * UNIT;
+    if need > MAX_CHUNK_BYTES || bytes > thread_quota(u as usize) {
+        return Err(Short::TooLarge);
+    }
+    let c = charge(u, bytes).ok_or(Short::Budget)?;
+    let mut pb = alloc(need).ok_or(Short::Memory)?;
+    pb.charge = Some(c);
+    Ok(pb)
+}
+
+/// A buffer for `u` now, or `Full` / `TooLarge`.
+pub fn try_acquire_for(u: Use, need: usize) -> Result<PooledBuf, PoolError> {
+    ACQUIRE_TOTAL.fetch_add(1, Ordering::Relaxed);
+    try_once(u, need).map_err(|e| match e {
+        Short::TooLarge => PoolError::TooLarge,
+        Short::Budget | Short::Memory => PoolError::Full,
+    })
+}
+
+/// A buffer for `u`, waiting up to `wait` for room; `Full` after it. The wait
+/// is woken by returns to the same use, or to the pool's memory when that was
+/// what ran short.
+pub async fn acquire_for(u: Use, need: usize, wait: std::time::Duration) -> Result<PooledBuf, PoolError> {
+    ACQUIRE_TOTAL.fetch_add(1, Ordering::Relaxed);
+    let mut short = match try_once(u, need) {
+        Ok(pb) => return Ok(pb),
+        Err(Short::TooLarge) => return Err(PoolError::TooLarge),
+        Err(s) => s,
+    };
+    let budget = &BUDGETS[u as usize];
+    budget.waits.fetch_add(1, Ordering::Relaxed);
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        let list = match short {
+            Short::Memory => &MEMORY,
+            _ => &budget.room,
+        };
+        let _waiting = Waiting::announce(list);
+        let seen = list.gen.load(Ordering::SeqCst);
+        short = match try_once(u, need) {
+            Ok(pb) => return Ok(pb),
+            Err(Short::TooLarge) => return Err(PoolError::TooLarge),
+            Err(s) => s,
+        };
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        // Short of something else now: wait on that list instead.
+        if !left.is_zero() && !std::ptr::eq(list, if matches!(short, Short::Memory) { &MEMORY } else { &budget.room }) {
+            continue;
+        }
+        if left.is_zero() || compio::time::timeout(left, Freed { list, seen }).await.is_err() {
+            budget.timeouts.fetch_add(1, Ordering::Relaxed);
+            return Err(PoolError::Full);
+        }
+    }
+}
+
+struct Waiting(&'static WaitList);
+
+impl Waiting {
+    fn announce(list: &'static WaitList) -> Self {
+        list.waiting.fetch_add(1, Ordering::SeqCst);
+        Waiting(list)
+    }
+}
+
+impl Drop for Waiting {
+    fn drop(&mut self) {
+        self.0.waiting.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Resolves once `list` was woken after `seen` was read.
+struct Freed {
+    list: &'static WaitList,
+    seen: u64,
+}
+
+impl std::future::Future for Freed {
+    type Output = ();
+    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
+        if self.list.gen.load(Ordering::SeqCst) != self.seen {
+            return std::task::Poll::Ready(());
+        }
+        let mut w = self.list.wakers.lock().unwrap();
+        // Checked again under the lock a wake takes to empty the list.
+        if self.list.gen.load(Ordering::SeqCst) != self.seen {
+            return std::task::Poll::Ready(());
+        }
+        w.push(cx.waker().clone());
+        std::task::Poll::Pending
+    }
 }
 
 #[cfg(test)]

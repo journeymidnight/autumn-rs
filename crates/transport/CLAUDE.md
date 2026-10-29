@@ -39,6 +39,41 @@ pool): with one buffer in ten dropped on another thread, old 98–200 µs per
 acquire+drop, every acquire over the cap, against 1.5–2.1 µs; with none, old
 2.0–3.0 µs and 1671 MiB registered against 1.27–1.90 µs and 832–896 MiB.
 
+### Use budgets and waiting (`acquire_for`)
+
+`acquire_for(use, need, wait)` / `try_acquire_for` count a buffer against one of
+three shares of the cap — `Receive` 40% (a client's value at the PS, an append
+at the extent node), `Reply` 40% (read data, read into a reply, received,
+forwarded), `Staging` 20% (bytes copied in to be sent) — and against its
+acquiring thread, which may hold at most half of a share. The budgets are what
+break the cross-process cycle a single "wait when full" pool would have: a PS
+whose pool is full of values waiting for append acks and of read replies cannot
+take an extent node's read reply, which keeps the node's reply buffers held, so
+the node could take no append, so no ack ever came; with shares, an append
+receive never waits on read replies being fetched. Half a share per thread keeps
+one slow client (or one partition) from taking a whole use. A full budget makes
+`acquire_for` wait and give `PoolError::Full` after `wait`. A wait sits on its
+use's list when the budget was short, on the pool's memory list when the budget
+had room but no chunk did; a returned charge wakes its use's list, returned
+memory the memory list, so returns of one use do not stir waiters of another.
+Each list has a generation a wake bumps; a waiter announces itself before its
+last try, so a return between that try and the wait is not missed; a new chunk
+(or a failed mapping giving its reservation back) wakes the memory list too. The
+use budget is taken with a compare-exchange and nothing is counted when the
+budget refuses, so that never makes it look full to another thread; when the
+budget had room but memory did not, the charge is taken and given back, which
+wakes the use's list once for nothing. More than a thread may ever hold, or more
+than the largest chunk (256 MiB), is `TooLarge` at once — so a single value is
+at most the smaller of 256 MiB and a tenth (`Staging`) or a fifth (`Receive`,
+`Reply`) of the cap. A value between 64 and 256 MiB needs a chunk of its own
+size; at the cap with only 64 MiB chunks it cannot fit and waits out `wait` to
+`Full`. `acquire` (no budget; a heap buffer over 256 MiB
+or at the cap) remains for callers not moved yet. `snapshot().uses` reports each
+budget's quota, bytes in use, high water, waits and timeouts. Test: `tests/regpool_budget.rs` (64 MiB cap:
+per-thread half, uses independent, `TooLarge`, timeout counted, a waiter woken by
+a return on another thread, a memory waiter woken by memory coming back; red
+without the per-thread check, and without either wake it times out).
+
 The integration test `tcp_recycles_buffers_including_in_a_ucx_capable_binary`
 explicitly selects TCP and verifies pool hits, buffer reuse, and zero registered
 bytes; run it both with and without `--features ucx`. `tests/ucx_regpool_cap.rs`

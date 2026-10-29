@@ -2,8 +2,9 @@ Date: 2026-10-29 (2)
 TaskStatus: not_completed
 Task scope: data-path redesign (design page https://claude.ai/artifact/E18oSqzHKbg2Vx1HqKKyo1), F-DP-* in feature_list.md. Step 1 (AM memh) done in e8a4c621.
 Current summary: step 2a done: regpool is a process chunk pool (64 MiB chunks, up to 256 MiB for big requests; offset-allocator per chunk behind a mutex; per-thread claim; cross-thread frees lock the chunk; chunks never unregistered; TCP same pool unregistered; lazy registration of chunks made before init_with(Ucx); cap now process-wide, default 16 GiB, floor 64 MiB). Tests: transport lib + ucx_regpool_cap (rewritten) + ucx_regpool_late_init (new, ablated red) + ucx_immediate_recv (made deterministic: receiver waits 100 ms so all 200 recvs are in place; ablation with NO_IMM_CMPL red) and the rest green; microbench regpool_alloc and perf-check four cells ABAB recorded in transport CLAUDE.md / ledger notes. Reviews: fable (no high; mediums fixed: cap floor, chunk made outside the pool lock, lazy registration, warn flags; at-cap cliff deferred to 2b and documented) + opus on the fix delta.
-Main gaps: step 2b (quotas, bounded wait, Unavailable, no unregistered fallback, batch acquire, unauth limit incl. value, high-water metrics, liveness test); steps 3–9.
-Next steps: F-DP-CHUNK-POOL 2b.
+2b-1 done: per-use budgets (Receive/Reply/Staging 40/40/20 %, a thread at most half a share) and bounded waiting (`acquire_for` / `try_acquire_for`, per-use and memory wait lists, CAS budget), stats per use; test regpool_budget (ablations red: per-thread check, budget wake, memory wake). Two reviews (fable + opus), findings fixed or documented. No production caller uses it yet.
+Main gaps: 2b-2 (move callers: PS value receive / EN append = Receive, EN pread / PS+client reply receive = Reply, UCX staging = Staging; timeout -> Unavailable, TCP drains the value, UCX releases the rendezvous; sends < 478 B skip staging; no long waits on shared connection read loops; remove `acquire`'s heap fallback), 2b-3 (liveness test, unauth limit incl. value, /metrics); steps 3–9.
+Next steps: F-DP-CHUNK-POOL 2b-2.
 
 Date: 2026-10-28 (3)
 TaskStatus: completed

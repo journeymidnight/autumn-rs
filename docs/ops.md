@@ -3449,7 +3449,11 @@ another thread's chunk; only when no chunk has room does the pool hand out
 unregistered memory (still correct, slower: faulted in, and UCX registers it per
 send). The perf-check client prints `regpool: ... over_cap=N ... pool_bytes=
 registered_bytes= in_use_bytes=` for its own process; a nonzero `over_cap` means
-the working set does not fit the budget.
+the working set does not fit the budget. Inside the cap each use has a share —
+receive 40%, reply 40%, staging 20% — and one thread (a partition, a shard) at
+most half of a share, so the cap also bounds a single value: the smaller of
+256 MiB and a fifth of the cap for a received or read value (16 GiB: 256 MiB;
+1 GiB: about 200 MiB).
 
 ```bash
 UCX_TLS=rc_mlx5,ud_mlx5,tcp,self UCX_NET_DEVICES=<dev>:1 \
