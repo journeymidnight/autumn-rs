@@ -23,6 +23,7 @@
 - **Scope**: 进程级块池（块按需注册、从不注销、Arc 持有、一块一个 memh 和一个带锁的 `offset-allocator`，4 KiB 单位）；按用途配额（接收 / 读回复 / 后台中转段），前台再分每分区上限 + 公共余量；有上限的等待，超时回 `Unavailable`，控制帧和 PING 不经池；批量请求一次申请；未鉴权连接限额连 value 一起算；单条超过块大小直接报错；TCP 同一个池但不注册；删掉未注册回退；`/metrics` 计数。
 - **Acceptance**: 微基准（混合大小在途负载，分配耗时与高水位）不差于现在；"池满 + 读写混合 + ≥64 KiB 读回复"的活性测试 PS、EN 都不卡死且超时请求重试成功；从大块中间发 64 KiB rendezvous 的测试通过；perf-check 四格 TCP/UCX 交替对照不降。
 - `passes: false`
+- **notes** (2026-10-29，2a 完成): 进程级块池 + 块内带锁的 offset-allocator 已上（每线程认领一块；跨线程释放直接加锁；块不注销；TCP 同池不注册；UCX 初始化前建的块首次使用时补注册；`--ucx-regpool-cap-bytes` 改为整个进程、默认 16 GiB、下限 64 MiB）。微基准 8 线程混合大小：旧池有 1/10 跨线程释放时 98–200 µs/次且全部超上限回退（计数漂移），新池 1.5–2.1 µs；无跨线程时旧 2.0–3.0 µs / 注册 1671 MiB，新 1.27–1.90 µs / 832–896 MiB。perf-check 四格交替两轮不降。未做（2b）：按用途配额、有上限的等待与 `Unavailable`、删掉未注册回退、批量一次申请、未鉴权连接限额连 value、高水位指标、活性测试。`ucx_immediate_recv` 前提在新池上不再出现的原因未查明（UCX 协议表两边相同）。
 
 ### F-DP-CALLER-REGISTER — 调用方内存显式注册，禁止隐式注册（第 3 步）
 - **Trigger**: UCX 用调用方内存（Python buffer、kvcache 页）今天靠 rcache 隐式注册；`RecvDest` 只有指针和长度。

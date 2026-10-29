@@ -93,10 +93,10 @@ compio 没有 work-stealing 调度器 —— 一个 runtime 就是一个线程�
 - **就绪等待有上限**（`READY_TIMEOUT` 20s）。建池时 fuse session **已经挂载**，请求正在
   桥里排队，所以一个连不上的 worker 会卡住整个挂载点的系统调用；而裸 TCP connect 到黑洞
   manager 只受 SYN 重试约束（分钟级）。放弃一个 worker 只损吞吐，不损正确性。
-- **代价**：每线程一个 client ⇒ 每个 mount N 套连接池 + N 条 manager 连接。**更大的一项是
-  每线程的注册缓冲池**——`--ucx-regpool-cap-bytes` 是 **per-thread** 上限（默认 2 GiB），规则是
-  `cap × threads < RLIMIT_MEMLOCK`。默认 4 把带池线程从 1 抬到 5，最坏情况下 mount 常驻的
-  缓冲内存跟着抬（TCP 上是普通堆内存，UCX 上是 **pin 住的页**，计入 RLIMIT_MEMLOCK）。
+- **代价**：每线程一个 client ⇒ 每个 mount N 套连接池 + N 条 manager 连接。缓冲池是整个进程
+  一份（`--ucx-regpool-cap-bytes`，默认 16 GiB，按需长块），线程多了不再按线程数放大；每个
+  线程认领一块（默认 64 MiB），所以 5 个线程至少各有一块。TCP 上是普通堆内存（只占写到的页），
+  UCX 上是 **pin 住的页**，计入 RLIMIT_MEMLOCK。
 - ⚠️ **UCX 下未测**。上面全部数字是 loopback TCP。`--transport ucx` 时池子会按线程数多开
   UCX worker，而本仓库记录过 UCX worker 创建走**宿主级 devx 自旋锁**、以及 fuse 在 UCX 上
   的 daemon 崩溃（TCP 不崩）。默认二进制不带 `ucx` feature（`--transport ucx` 直接 panic），
@@ -474,8 +474,8 @@ runtime 参数。
 
 `--read-io-threads` 的依据：派发线程是单线程，四个以上并发读时它满核
 成了天花板；0 / 2 / 4 线程时 8 个并发读 2211 → 3705 → 4763 MiB/s（8 个独立 CLI 进程同
-文件 5466），4 线程约 87-99%，更高未测。每个线程有自己的注册缓冲池（每线程上限
-`--ucx-regpool-cap-bytes`，默认 2 GiB），线程越多最坏驻留越大，UCX 下计入
+文件 5466），4 线程约 87-99%，更高未测。缓冲池整个进程共用
+（`--ucx-regpool-cap-bytes`，默认 16 GiB），每个线程认领一块（64 MiB），UCX 下计入
 RLIMIT_MEMLOCK。
 
 ## 关键依赖文件

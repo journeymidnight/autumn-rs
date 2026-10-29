@@ -1,18 +1,55 @@
 # Transport buffer ownership
 
-TCP and UCX share a thread-local size-class pool. Runtime TCP must recycle ordinary
-unregistered slabs even when the binary enables the `ucx` feature. Only UCX-runtime
-registration fallbacks skip recycling, so registration can be retried later.
-Eviction decrements registration counters only for registered slabs. Cross-thread
-returns retain the existing home-thread ownership rule.
+One process-wide pool (`ucx/regpool.rs`) serves both transports. It is made of
+chunks: anonymous mappings (64 MiB, or a power of two up to 256 MiB for a larger
+request; larger still is a plain heap buffer, `out_of_pool_total`), registered
+once with `ucp_mem_map` when the runtime transport is UCX and never on TCP,
+never unmapped or unregistered while the process lives. A chunk made before
+`init_with(Ucx)` is registered on its first use after it
+(`tests/ucx_regpool_late_init.rs`, red when only creation registers); a failed
+registration is not retried (`register_failed_total`). A chunk is mapped and
+registered outside the pool lock, so other threads' slow paths do not wait for
+it. Inside a chunk an
+`offset_allocator::Allocator` behind a mutex hands out 4 KiB-granular ranges
+(page-aligned, so O_DIRECT-aligned); a `PooledBuf` holds its chunk (`Arc`), so
+the chunk's memh stays valid for every `Bytes` made from it, and its drop frees
+the range under the chunk's lock on whatever thread it runs.
+
+Each thread claims one chunk and allocates from it, so the chunk lock is
+uncontended except for frees from other threads. With no room it claims a chunk
+nobody holds, or makes one while the pool is under the process cap
+(`--ucx-regpool-cap-bytes`, default 16 GiB, floor one 64 MiB chunk — below it
+no chunk could ever be made); at the
+cap it allocates from any chunk with room, claimed or not, and only when none
+has room does it fall back to an unregistered heap buffer (`over_cap_total`,
+warned once). A thread's claim ends with the thread. So every live thread that
+has used the pool holds a chunk (64 MiB, pinned under UCX), whether or not it is
+busy; others pass it by until the cap. At the cap every acquire that misses its
+own chunk takes the pool lock and walks the chunks — the step that follows
+(per-purpose quotas, waiting instead of falling back) replaces that path.
+
+What it replaced: a per-thread free list of power-of-two slabs, each registered
+on its own, with a per-thread cap, eviction of idle slabs to make room for
+another size, and cross-thread drops that freed the slab while the home thread's
+registered count only grew — so a thread that handed buffers to another one
+(S3 gateway bodies, kvcache reads) eventually fell back to unregistered memory
+for every acquire. Measured (`benches/regpool_alloc.rs`: 8 threads, 64 buffers
+in flight each, 4 KiB / 64 KiB / 1 MiB / 8 MiB mix, interleaved with the old
+pool): with one buffer in ten dropped on another thread, old 98–200 µs per
+acquire+drop, every acquire over the cap, against 1.5–2.1 µs; with none, old
+2.0–3.0 µs and 1671 MiB registered against 1.27–1.90 µs and 832–896 MiB.
 
 The integration test `tcp_recycles_buffers_including_in_a_ucx_capable_binary`
 explicitly selects TCP and verifies pool hits, buffer reuse, and zero registered
-bytes; run it both with and without `--features ucx`.
+bytes; run it both with and without `--features ucx`. `tests/ucx_regpool_cap.rs`
+(64 MiB cap): a second thread shares the first thread's chunk rather than fall
+back, a request no chunk has room for falls back, a range freed on another
+thread is reusable, and no chunk is made past the cap.
 
-Current UCX I/O uses UCP Stream. A registered stable slab benefits send registration
-reuse and application buffer ownership; it does not imply receiver-side end-to-end
-zero-copy. Upstream UCX 1.16/1.18 Stream receive unpacks AM data into the destination.
+Current UCX I/O uses UCP Stream. A registered stable buffer benefits send
+registration reuse and application buffer ownership; it does not imply
+receiver-side end-to-end zero-copy. Upstream UCX 1.16/1.18 Stream receive
+unpacks AM data into the destination.
 
 ## Compio 0.19 migration
 
@@ -33,32 +70,6 @@ receive/scheduler benchmark; it does not set production runtime defaults.
 
 The registered-pool UCX tests explicitly call init_with(Ucx); merely
 constructing UcxTransport does not enable regpool registration.
-
-A fresh slab that would push the thread's registered bytes over the cap first
-unregisters and frees idle pooled slabs — the smallest idle class that covers
-the shortfall, else the largest — and only when the slabs in use fill the cap
-on their own (so freeing idle ones could not make room, and nothing is freed)
-does it fall back to an unregistered buffer. `RegpoolStats::evicted_total` /
-`evicted_bytes` count the frees (the perf-check client prints them).
-Without it the budget was held by whatever size came last in bulk: an extent
-node that received 256 MiB appends as frame values kept those slabs idle and
-registered, and every 8 MiB read reply after them was a fresh allocation —
-faulted in, zeroed, registered by UCX's cache for the send, deregistered when
-freed. Profile of the extent-owner shard thread on one partition's 8 MiB reads
-(UCX, 16 threads x depth 8): page faults 22%, registration 12%, read 3386 MB/s;
-with the eviction neither shows and the read is 5963 MB/s. perf-check against
-the build before (3 disks, interleaved): one partition 8M read 3123/3160 ->
-5164/5988/6275 MB/s (p50 270–283 -> 115–125 ms), writes unchanged (906–944 vs
-923–945); eight partitions, three pairs: write 2336–2425 vs 2361–2457, read
-8134–9133 vs 8462–8787, and no eviction at all on the extent nodes. One
-partition's run evicts ~33 slabs over three nodes, mostly 128/256 MiB append
-buffers trading places, with no visible cost. Test:
-`tests/ucx_regpool_cap.rs` (two idle 32 MiB slabs fill a 64 MiB cap; an 8 MiB
-buffer is still registered — red without the eviction; with every slab in use,
-a request that cannot fit frees nothing — red without that check). Not
-measured: a working set larger than the cap with sizes interleaved (big
-appends and 8 MiB reads at once on one thread) would cycle a large slab
-through unregister and register; the eviction counters show it.
 
 ## UCX library version and two worked-around defects
 
@@ -97,11 +108,16 @@ bisecting the `#if UCS_ENABLE_ASSERT` blocks of 1.16 (blocks on, `ucs_assert`
 off → no stall; ucp/stream block off → stall), confirmed by a one-line UCX patch
 (3/3 clean) and by autumn-side changes on a stock 1.20.1 (3/3 clean each).
 `RECV_IN_PLACE` / `RECV_VIA_CALLBACK` count the two completion shapes;
-`tests/ucx_immediate_recv.rs` has the sender write 200 messages before the
-receiver posts its first recv; that recv finds nothing queued (the receiver's
-worker has not progressed yet), the progress it triggers pulls a backlog into
-rdescs, and the following recvs find data queued. It fails if any completed
-through the callback (it did with the flag: 22–33 of 200).
+`tests/ucx_immediate_recv.rs` has the sender write 200 messages and the
+receiver let its progress loop queue them (100 ms) before posting its first
+recv, so every recv finds its data queued; it fails unless all 200 complete in
+place and none through the callback (with the flag the receive reports the
+stale status and fails). It used to rely on the first recv's progress pulling a
+backlog, which queued 11–38 of 200 on the per-thread pool but 0 in some runs,
+and 0 in every run once stream sends were staged from the chunk pool. The UCX
+protocol tables (`UCX_PROTO_INFO=y`) are the same on both pools — 4 KiB stream
+sends are "multi-frag stream zero-copy copy-out" either way — so what moved the
+receive-side timing is not known.
 
 PS connection-handler errors are logged at debug, which hid the stale-status
 exits.
@@ -264,8 +280,8 @@ dead-peer class as a stream read.
 
 ### Stream sends leave from the registered pool
 
-`ucx_send` / `ucx_send_vectored` copy the parts into one regpool slab and send it
-with the slab's memh (`ucx_send_staged`). Handed the caller's memory, UCP Stream
+`ucx_send` / `ucx_send_vectored` copy the parts into one pool buffer and send it
+with its chunk's memh (`ucx_send_staged`). Handed the caller's memory, UCP Stream
 sends 478 bytes and up zero-copy and registers every iovec through the
 registration cache; memory that turns over misses that cache on every send. The
 PS's reply to a 4 KiB GET is a slice of the SST block it read, and on a block
@@ -290,22 +306,23 @@ part): single writes 9.7–12.1K vs 11.1–12.0K ops/s and single reads 237–27
 vs 243–284K over four alternating rounds each, within each other's spread;
 `--bulk 64` writes 47–50K -> 54–57K, `--bulk 64` reads 16.1–16.5K vs
 15.7–18.4K.
-A thread whose slabs in use fill the regpool cap gets unregistered buffers —
-for its receives and for this staging alike — which UCX registers on every
-send and which are freed afterwards. That is the cost the cap's default (2 GiB
-per thread, `--ucx-regpool-cap-bytes` on every binary and the transport's own
-default for the Python binding) is sized against: 16 MiB bulk reads with the
-PS, the EN and the client over a 512 MiB cap fell from 8.5 to 3.0–3.7 GB/s
-(docs/ops.md, "Per-connection admission and the registered pool").
+When no chunk has room at the pool's cap, buffers are unregistered — for
+receives and for this staging alike — which UCX registers on every send and
+which are freed afterwards. That is the cost the cap (process-wide,
+`--ucx-regpool-cap-bytes` on every binary, 16 GiB by default and in the
+transport's own default for the Python binding) is sized against: with the old
+per-thread pool, 16 MiB bulk reads with the PS, the EN and the client over a
+512 MiB cap fell from 8.5 to 3.0–3.7 GB/s (docs/ops.md, "Per-connection
+admission and the registered pool").
 `RegpoolStats::over_cap_total` counts it; the PS and EN do not export it.
 Test: `tests/ucx_send_staged.rs` (a send and a vectored send out of `.rodata`,
 which cannot be registered, arrive; red without the staging: `ibv_reg_mr`
 fails with Bad address).
 
-### A pool slab's value carries its memh (`RegBytes`)
+### A pool buffer's value carries its memh (`RegBytes`)
 
-`PooledBuf::freeze` turns a slab into a `RegBytes`: the filled bytes (owning the
-slab, which keeps the registration mapped) and the slab's memh. `send_am` passes
+`PooledBuf::freeze` turns a buffer into a `RegBytes`: the filled bytes (owning
+the buffer, whose chunk keeps the registration mapped) and the chunk's memh. `send_am` passes
 that memh (`UCP_OP_ATTR_FIELD_MEMH`), so UCX does not look the memory up;
 `From<Bytes>` carries none and falls back to the cache. `am::Sender` and
 autumn-rpc's `AmOut` / `encode_am_frame` take `impl Into<RegBytes>`. Today the

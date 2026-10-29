@@ -1014,16 +1014,16 @@ async fn cmd_perf_check(client: &ClusterClient, threads: usize, duration_secs: u
     let pool = autumn_transport::regpool_snapshot();
     println!(
         "regpool: acquire={} hit={} ({:.1}% hit), out_of_pool={}, \
-         over_cap={}, register_failed={}, registered_bytes={}, evicted={} ({} B)",
+         over_cap={}, register_failed={}, pool_bytes={}, registered_bytes={}, in_use_bytes={}",
         pool.acquire_total,
         pool.hit_total,
         pool.hit_rate() * 100.0,
         pool.out_of_pool_total,
         pool.over_cap_total,
         pool.register_failed_total,
+        pool.pool_bytes,
         pool.registered_bytes,
-        pool.evicted_total,
-        pool.evicted_bytes,
+        pool.in_use_bytes,
     );
 
     // ---- Regression check ----

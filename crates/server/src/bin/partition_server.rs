@@ -195,7 +195,9 @@ async fn main() -> Result<()> {
                         out_of_pool = s.out_of_pool_total,
                         over_cap = s.over_cap_total,
                         register_failed = s.register_failed_total,
+                        pool_bytes = s.pool_bytes,
                         registered_bytes = s.registered_bytes,
+                        in_use_bytes = s.in_use_bytes,
                         "regpool"
                     );
                 }

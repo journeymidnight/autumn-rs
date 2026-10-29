@@ -3320,45 +3320,51 @@ connections per partition, every batch was 8 ops and 4 KiB writes stopped near
 8K ops/s per partition whatever the client's depth.
 
 Under UCX every large value in flight (a GET answered from the log, a bulk PUT,
-64 KiB and up) sits in a buffer from the thread's registered pool,
-`--ucx-regpool-cap-bytes` per thread (default 2 GiB; one PS partition thread,
-one EN shard thread, one client worker thread each have their own). Past the
-pool the buffer is fresh, unregistered memory: zeroed, faulted in, registered
-with the NIC on every send and dropped afterwards, and the throughput falls
-with it. Size the pool on every side for the largest values in flight at once:
+64 KiB and up) sits in a buffer from the process's registered pool,
+`--ucx-regpool-cap-bytes` for the whole process (default 16 GiB; the PS's
+partitions, the EN's shards and a client's workers share it). Past the pool the
+buffer is fresh, unregistered memory: zeroed, faulted in, registered with the
+NIC on every send and dropped afterwards, and the throughput falls with it.
+Size the pool on every side for the largest values in flight at once:
 
-    pool per thread >= connections per partition x --conn-inflight-cap x largest value
+    pool >= partitions busy at once x connections per partition x --conn-inflight-cap x largest value
 
-kvcache under a TP8 engine: 8 connections x 16 x 16 MiB pages = 2 GiB, the
-default. The PS checks one side of this at start under UCX and logs a WARN when
-`--ucx-regpool-cap-bytes` < `--conn-inflight-cap` x 128 MiB (8 connections x
-16 MiB); it cannot see connection counts or value sizes, so a larger deployment
-must still be sized by hand. The extent node holding a partition's log extent
-needs the same headroom for the PS's concurrent reads, and the client for its
-own concurrency (`batch_get_concurrency` x value size per worker thread). The
-pool only grows with use, but idle slabs stay registered until pressure from a
-new size evicts them, so a thread can keep up to its cap pinned after a burst (on
-TCP the same cap bounds the idle heap a thread keeps pooled).
+kvcache under a TP8 engine: 8 connections x 16 x 16 MiB pages = 2 GiB per busy
+partition. The PS checks one partition's worth at start under UCX and logs a
+WARN when `--ucx-regpool-cap-bytes` < `--conn-inflight-cap` x 128 MiB (8
+connections x 16 MiB); it cannot see connection counts or value sizes, so a
+larger deployment must still be sized by hand. The extent node holding a
+partition's log extent needs the same headroom for the PS's concurrent reads,
+and the client for its own concurrency (`batch_get_concurrency` x value size).
+The pool grows in chunks (64 MiB, larger for a larger request) as in-flight
+data needs them and never gives one back, so the process keeps its in-flight
+peak pinned (on TCP: allocated, only the touched pages resident).
 
-Measured (one host, UCX, one partition, 16 MiB values, 4 threads x
-`--bulk 32`, so the PS holds 4 connections x the cap of reads):
+Measured with the earlier per-thread pool, so each "pool" below was one
+partition / shard / client thread's cap (one host, UCX, one partition, 16 MiB
+values, 4 threads x `--bulk 32`, so the PS holds 4 connections x the cap of
+reads):
 
-| `--conn-inflight-cap` | pool (PS / EN / client) | 16 MiB reads |
+| `--conn-inflight-cap` | per-thread pool (PS / EN / client) | 16 MiB reads |
 |---|---|---|
 | 4 | 512 MiB | 8.5–9.2 GB/s |
 | 16 | 512 MiB | 6.0–6.3 GB/s |
 | 32 | 512 MiB | 3.0–3.7 GB/s (PS partition thread 0.54 cores registering) |
 | 32 | 4 GiB on the PS only | 5.6 GB/s |
 | 32 | 4 GiB everywhere | 8.5 GB/s |
-| 16 | 2 GiB (defaults) | 8.8 GB/s |
+| 16 | 2 GiB (the defaults then) | 8.8 GB/s |
 
 TCP registers nothing: the same reads went 1.37 → 1.88 GB/s from cap 4 to 32.
 `cluster.sh` passes `AUTUMN_UCX_REGPOOL_CAP_BYTES` to the PS and the extent
-nodes; the client takes `--ucx-regpool-cap-bytes`. Check the warning:
+nodes; the client takes `--ucx-regpool-cap-bytes`. The value is now the whole
+process's: a deployment that set it per thread (e.g. 2 GiB) must raise it to
+cover all its busy partitions or shards at once. Check the warning (2 GiB is
+under one partition's 32 x 128 MiB):
 
 ```bash
 AUTUMN_TRANSPORT=ucx AUTUMN_BIND_HOST='[<roce-ip>]' UCX_TLS=rc_mlx5,ud_mlx5,tcp,self \
-  UCX_NET_DEVICES=<dev>:1 AUTUMN_PS_CONN_INFLIGHT_CAP=32 bash cluster.sh start 3
+  UCX_NET_DEVICES=<dev>:1 AUTUMN_PS_CONN_INFLIGHT_CAP=32 AUTUMN_UCX_REGPOOL_CAP_BYTES=$((2<<30)) \
+  bash cluster.sh start 3
 grep 'is below --conn-inflight-cap' /tmp/autumn-rs-logs/ps.log   # one WARN
 ```
 
@@ -3433,20 +3439,25 @@ EOF
 
 ## Registered buffer pool budget (`--ucx-regpool-cap-bytes`)
 
-Each thread registers at most this many bytes of pooled receive/send buffers
-(default 2 GiB; sizing against the PS's admission: "Per-connection admission and
-the registered pool"). On TCP nothing is registered, but the same cap bounds the
-idle buffers a thread keeps pooled after a burst, so a thread can hold up to 2 GiB
-of heap that way. When a buffer of a new size would exceed it, idle buffers are
-unregistered and freed first; only buffers in use filling the budget make the
-pool hand out unregistered memory (still correct, slower: faulted in, and UCX
-registers it per send). The perf-check client prints `regpool: ... over_cap=N
-... evicted=N (B)` for its own process; a steadily climbing `evicted` means the
-working set does not fit the budget.
+The process's pooled receive/send buffers live in chunks of at most this many
+bytes in total (default 16 GiB, at least 64 MiB; sizing against the PS's admission:
+"Per-connection admission and the registered pool"). Chunks are made as
+in-flight data needs them (64 MiB each, a power of two up to 256 MiB for a
+larger request), registered once under UCX, and kept; on TCP they are not
+registered and only touched pages are resident. At the cap a thread shares
+another thread's chunk; only when no chunk has room does the pool hand out
+unregistered memory (still correct, slower: faulted in, and UCX registers it per
+send). The perf-check client prints `regpool: ... over_cap=N ... pool_bytes=
+registered_bytes= in_use_bytes=` for its own process; a nonzero `over_cap` means
+the working set does not fit the budget.
 
 ```bash
 UCX_TLS=rc_mlx5,ud_mlx5,tcp,self UCX_NET_DEVICES=<dev>:1 \
-  cargo test -p autumn-transport --features ucx --test ucx_regpool_cap
+  cargo test -p autumn-transport --features ucx --test ucx_regpool_cap --test ucx_regpool_late_init
+# allocation cost and registered bytes against another build of the pool (copy
+# the bench file there); REGPOOL_XTHREAD=0 drops every buffer on its own thread
+UCX_TLS=rc_mlx5,ud_mlx5,tcp,self UCX_NET_DEVICES=<dev>:1 \
+  taskset -c <idle cores> cargo bench -p autumn-transport --features ucx --bench regpool_alloc
 ```
 
 ## Large values over UCX as frame values (wire 77)

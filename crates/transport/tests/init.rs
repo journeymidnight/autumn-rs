@@ -3,7 +3,7 @@ use autumn_transport::{init_with, TransportKind};
 #[test]
 fn tcp_recycles_buffers_including_in_a_ucx_capable_binary() {
     init_with(TransportKind::Tcp);
-    // Pool state is thread-local, so other tests cannot supply the hit.
+    // A thread of its own: its claim is the chunk this test frees into.
     std::thread::spawn(|| {
         let before = autumn_transport::regpool_snapshot();
         let mut first = autumn_transport::regpool_acquire(200_000);

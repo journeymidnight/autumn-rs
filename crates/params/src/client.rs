@@ -26,8 +26,8 @@ crate::params! {
         token_renew_margin_secs: u64 = 300, [10, 86_400];
         /// Chunk size of a striped put when the caller names none.
         stripe_chunk_bytes: u32 = 4 * MIB as u32, [64 * 1024, 64 * MIB as u32];
-        /// UCX registered buffer pool cap per thread.
-        ucx_regpool_cap_bytes: usize = 2 * crate::GIB as usize, [16 * MIB as usize, 64 * crate::GIB as usize];
+        /// Buffer pool cap for the whole process (chunks, registered under UCX).
+        ucx_regpool_cap_bytes: usize = 16 * crate::GIB as usize, [64 * MIB as usize, 64 * crate::GIB as usize];
     }
 }
 

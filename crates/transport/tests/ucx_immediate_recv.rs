@@ -36,10 +36,11 @@ fn queued_data_completes_in_place() {
     let (addr_tx, addr_rx) = std::sync::mpsc::channel();
     let (sent_tx, sent_rx) = std::sync::mpsc::channel::<()>();
 
-    // The sender writes everything before the receiver posts its first recv.
-    // That recv finds nothing queued (the receiver's worker has not progressed
-    // yet); the progress it drives pulls a backlog of messages into the ep's
-    // queue, and the recvs after it find their data already there.
+    // The sender writes everything before the receiver posts its first recv,
+    // and the receiver lets its progress loop queue all of it first, so every
+    // recv finds its data already there. (Relying on the first recv's progress
+    // to pull a backlog left how many were queued to timing: 0 of 200 in some
+    // runs, every run once the pool's buffers came from one large chunk.)
     let receiver = std::thread::spawn(move || {
         compio::runtime::Runtime::new().unwrap().block_on(async move {
             let mut listener = UcxTransport.bind(bind_addr()).await.unwrap();
@@ -47,6 +48,7 @@ fn queued_data_completes_in_place() {
             let (c, _) = listener.accept().await.unwrap();
             let (mut r, _w) = c.into_split();
             sent_rx.recv().unwrap();
+            compio::time::sleep(std::time::Duration::from_millis(100)).await;
             let mut buf = vec![0u8; MSG];
             for round in 0..ROUNDS {
                 let mut got = 0;
@@ -75,6 +77,6 @@ fn queued_data_completes_in_place() {
     });
     let (in_place, via_callback) = receiver.join().unwrap();
     eprintln!("recvs completed in place: {in_place}, through the request callback: {via_callback}");
-    assert!(in_place > 0, "no recv found its data already queued; the test did not exercise the path");
+    assert_eq!(in_place as usize, ROUNDS, "every recv should have found its data already queued");
     assert_eq!(via_callback, 0, "a queued-data recv completed through UCX's request callback");
 }

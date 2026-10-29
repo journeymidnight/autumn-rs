@@ -84,8 +84,8 @@ crate::params! {
         inflight_cap: usize = 64, [1, 65_536];
         /// Per-connection read window.
         conn_read_buf_bytes: usize = 512 * KIB as usize, [4 * KIB as usize, 64 * MIB as usize];
-        /// UCX registered buffer pool cap per thread.
-        ucx_regpool_cap_bytes: usize = 2 * GIB as usize, [16 * MIB as usize, 64 * GIB as usize];
+        /// Buffer pool cap for the whole process (chunks, registered under UCX).
+        ucx_regpool_cap_bytes: usize = 16 * GIB as usize, [64 * MIB as usize, 64 * GIB as usize];
     }
 
     removed {

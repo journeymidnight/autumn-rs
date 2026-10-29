@@ -4789,16 +4789,16 @@ fn ps_conn_inflight_cap() -> usize {
     params().conn_inflight_cap.get()
 }
 
-/// Registered-pool bytes one admission slot stands for on a partition thread:
-/// eight connections (a TP8 engine's ranks) each holding one 16 MiB kvcache
-/// page in a pooled buffer while it is read and sent.
+/// Pool bytes one admission slot stands for on one partition: eight
+/// connections (a TP8 engine's ranks) each holding one 16 MiB kvcache page in a
+/// pooled buffer while it is read and sent.
 pub const REGPOOL_BYTES_PER_ADMITTED_REQUEST: usize = 8 * (16 << 20);
 
-/// Under UCX, a partition thread holds a pooled buffer for every large value it
-/// has admitted, and the buffers past `--ucx-regpool-cap-bytes` are fresh,
-/// unregistered memory that every send registers again. `Some(warning)` when
-/// `--conn-inflight-cap` slots of `REGPOOL_BYTES_PER_ADMITTED_REQUEST` do not
-/// fit the pool.
+/// Under UCX, a partition holds a pooled buffer for every large value it has
+/// admitted, and the buffers past the process pool (`--ucx-regpool-cap-bytes`)
+/// are fresh, unregistered memory that every send registers again.
+/// `Some(warning)` when even one partition's `--conn-inflight-cap` slots of
+/// `REGPOOL_BYTES_PER_ADMITTED_REQUEST` do not fit the pool.
 pub fn regpool_admission_mismatch(regpool_cap_bytes: usize, conn_inflight_cap: usize) -> Option<String> {
     let need = conn_inflight_cap.saturating_mul(REGPOOL_BYTES_PER_ADMITTED_REQUEST);
     (regpool_cap_bytes < need).then(|| {

@@ -1,81 +1,58 @@
-//! thread-local pool of UCX-registered, reusable buffers.
+//! Process-wide pool of reusable buffers, carved out of large chunks.
 //!
-//! `ucp_mem_map` is expensive (tens of µs), so we register a buffer ONCE and
-//! reuse it across ops. Each `PooledBuf` owns a stable-address `Vec<u8>` plus a
-//! `RegisteredMem` over it; on drop the buffer returns to a thread-local
-//! free-list keyed by power-of-two size class (so non-uniform value sizes don't
-//! fragment unboundedly). Recv-into-`PooledBuf` avoids the application's frame
-//! accumulation buffer. UCX Stream still unpacks incoming AM data into the
-//! destination; registration benefits stable-address sends and PS forwarding,
-//! and does not itself make Stream receive end-to-end zero-copy. Every UCX
-//! stream send is staged through a slab from here and sent with its memh
-//! (`endpoint.rs`, `ucx_send_staged`).
+//! A chunk is one anonymous mapping, registered with the NIC once when the
+//! process transport is UCX (`ucp_mem_map`, never unmapped while the process
+//! lives) and never registered on TCP, where the pool only saves the allocation
+//! and the zeroing. Inside a chunk an `offset_allocator::Allocator` (TLSF-like,
+//! O(1), metadata outside the memory) hands out 4 KiB-granular ranges; each
+//! buffer keeps its chunk alive (`Arc`), so its memh stays valid for as long as
+//! any `Bytes` made from it (`PooledBuf::freeze`).
 //!
-//! ## Why thread-local
-//! The PS runs one partition per OS thread and the EN one shard per OS thread
-//! (single-threaded compio runtimes), so a thread-local free-list needs no
-//! locking. The `RegisteredMem` handle is bound to the process-global
-//! `ucp_context` and is `Send+Sync`, so a buffer registered on one thread is
-//! technically usable from another — but we never share `PooledBuf` across
-//! threads; each thread pools its own.
+//! Each thread claims one chunk and allocates from it; the chunk's lock is then
+//! uncontended except for frees from other threads, which lock it directly (no
+//! return queue to drain). A thread whose chunk has no room claims another one
+//! nobody holds, or creates one while the pool is under its process cap
+//! (`--ucx-regpool-cap-bytes`); at the cap it allocates from any chunk with
+//! room, claimed or not. A thread that exits gives its claim up. Chunks are
+//! never freed: in-flight peaks recur, and a dropped chunk would have to be
+//! registered again.
+//!
+//! When nothing fits at the cap the buffer is a plain heap allocation (counted
+//! as `over_cap_total`); so is a request larger than the largest chunk
+//! (`out_of_pool_total`).
 //!
 //! ## Lifetime / cancel-safety (load-bearing)
-//! UCX writes into the slab until the recv completes, and a stream recv cannot
-//! be cancelled. So a recv takes the `PooledBuf` by value (`recv_pooled`) and
-//! hands it back with the result; a recv dropped mid-await keeps the buffer on
-//! the transport's orphan list until UCX is done, then drops it here — back to
-//! the free-list, registration kept (`endpoint.rs`).
-//!
-//! ## memlock
-//! Registration pins pages (counts against `RLIMIT_MEMLOCK`). The per-thread
-//! pool is capped (`--ucx-regpool-cap-bytes`); an `acquire` that would exceed the cap
-//! first frees idle slabs to make room, and only if the slabs in use fill the
-//! cap returns an UNREGISTERED buffer (correctness preserved — recv falls back
-//! to copy-out — just not zero-copy), logged once. For a staged send it means
-//! UCX registers that fresh buffer itself, and the buffer is freed on drop.
+//! UCX writes into the buffer until the recv completes, and a stream recv
+//! cannot be cancelled. So a recv takes the `PooledBuf` by value (`recv_pooled`)
+//! and hands it back with the result; a recv dropped mid-await keeps the buffer
+//! on the transport's orphan list until UCX is done, then drops it here
+//! (`endpoint.rs`).
 
-// Transport-agnostic pool (declared as a top-level `mod regpool` in lib.rs, so
-// it compiles with AND without `ucx`). On `ucx` a fresh slab is registered with
-// the NIC (ibv_reg_mr via `register_memory`); without `ucx`, `RegisteredMem` is
-// the uninhabited stub so `reg` is always `None` (recv falls back to copy-out —
-// the path autumn-rpc takes on TCP anyway). This keeps the "only the transport
-// leaf is cfg-gated, everyone above is uniform" pattern: autumn-rpc/stream use
-// `PooledBuf` with no `cfg`.
 use crate::RegisteredMem;
+use offset_allocator::{Allocation, Allocator};
 use std::cell::RefCell;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
-// ---------------------------------------------------------------------------
-// Process-global counters (cross-thread aggregate). All `Relaxed`: these are
-// observability counters, not synchronisation. A snapshot may interleave
-// updates from other threads — that's fine for surfacing pool health
-// (hit rate, register-failure rate, over-cap fallbacks). The hot-path cost
-// is one atomic increment, ~3 ns on x86.
-// ---------------------------------------------------------------------------
+/// Allocation granule: page-sized, so every buffer is O_DIRECT-aligned.
+const UNIT: usize = 4096;
+/// Size of a chunk made for requests up to its size.
+const CHUNK_BYTES: usize = 64 << 20;
+/// Largest chunk; a larger request is an out-of-pool heap buffer.
+const MAX_CHUNK_BYTES: usize = 256 << 20;
+
 static ACQUIRE_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Acquires served from a chunk that already existed.
 static HIT_TOTAL: AtomicU64 = AtomicU64::new(0);
-#[cfg(feature = "ucx")]
 static REGISTER_FAILED_TOTAL: AtomicU64 = AtomicU64::new(0);
-#[cfg(feature = "ucx")]
 static OVER_CAP_TOTAL: AtomicU64 = AtomicU64::new(0);
-/// Idle slabs unregistered and freed to make room for another size (count,
-/// bytes): a steady climb means the working set does not fit the cap.
-#[cfg(feature = "ucx")]
-static EVICTED_TOTAL: AtomicU64 = AtomicU64::new(0);
-#[cfg(feature = "ucx")]
-static EVICTED_BYTES: AtomicU64 = AtomicU64::new(0);
 static OUT_OF_POOL_TOTAL: AtomicU64 = AtomicU64::new(0);
-/// Sum (over all threads' TLS pools) of `registered_bytes`. Approximate:
-/// updated only at acquire-success and at eviction-decrement; a snapshot
-/// taken concurrently with allocs may read a stale value. Useful as a
-/// trend gauge, not a precise instantaneous measure.
+static WARNED_MAP: AtomicBool = AtomicBool::new(false);
 #[cfg(feature = "ucx")]
-static REGISTERED_BYTES_GAUGE: AtomicU64 = AtomicU64::new(0);
+static WARNED_REGISTER: AtomicBool = AtomicBool::new(false);
+static WARNED_CAP: AtomicBool = AtomicBool::new(false);
 
-/// Counter snapshot for ops surfacing pool health to logs / a future metrics
-/// endpoint. Read with `snapshot()`; do not rely on the counters being
-/// monotonic within a single snapshot (they're each atomic but the read is
-/// non-atomic across counters).
+/// Counter snapshot for logs and the perf client (process-wide).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RegpoolStats {
     pub acquire_total: u64,
@@ -83,14 +60,16 @@ pub struct RegpoolStats {
     pub register_failed_total: u64,
     pub over_cap_total: u64,
     pub out_of_pool_total: u64,
+    /// Bytes of all chunks.
+    pub pool_bytes: u64,
+    /// Bytes of the chunks registered with the NIC.
     pub registered_bytes: u64,
-    /// Idle slabs freed to make room for another size: (count, bytes).
-    pub evicted_total: u64,
-    pub evicted_bytes: u64,
+    /// Bytes handed out and not yet returned (4 KiB granular).
+    pub in_use_bytes: u64,
 }
 
 impl RegpoolStats {
-    /// Pool hit rate (0.0..=1.0); 0 if no acquires yet.
+    /// Share of acquires served without making a chunk (0 if none yet).
     pub fn hit_rate(&self) -> f64 {
         if self.acquire_total == 0 {
             0.0
@@ -100,233 +79,266 @@ impl RegpoolStats {
     }
 }
 
-/// Snapshot the regpool counters. Aggregates cross-thread (process-global
-/// atomics). The `registered_bytes` field is across-all-threads.
 pub fn snapshot() -> RegpoolStats {
-    RegpoolStats {
+    let mut s = RegpoolStats {
         acquire_total: ACQUIRE_TOTAL.load(Ordering::Relaxed),
         hit_total: HIT_TOTAL.load(Ordering::Relaxed),
-        #[cfg(feature = "ucx")]
         register_failed_total: REGISTER_FAILED_TOTAL.load(Ordering::Relaxed),
-        #[cfg(not(feature = "ucx"))]
-        register_failed_total: 0,
-        #[cfg(feature = "ucx")]
         over_cap_total: OVER_CAP_TOTAL.load(Ordering::Relaxed),
-        #[cfg(not(feature = "ucx"))]
-        over_cap_total: 0,
         out_of_pool_total: OUT_OF_POOL_TOTAL.load(Ordering::Relaxed),
-        #[cfg(feature = "ucx")]
-        registered_bytes: REGISTERED_BYTES_GAUGE.load(Ordering::Relaxed),
-        #[cfg(not(feature = "ucx"))]
-        registered_bytes: 0,
-        #[cfg(feature = "ucx")]
-        evicted_total: EVICTED_TOTAL.load(Ordering::Relaxed),
-        #[cfg(not(feature = "ucx"))]
-        evicted_total: 0,
-        #[cfg(feature = "ucx")]
-        evicted_bytes: EVICTED_BYTES.load(Ordering::Relaxed),
-        #[cfg(not(feature = "ucx"))]
-        evicted_bytes: 0,
+        ..Default::default()
+    };
+    for chunk in &pool().lock().unwrap().chunks {
+        s.pool_bytes += chunk.len as u64;
+        if matches!(chunk.reg.get(), Some(Some(_))) {
+            s.registered_bytes += chunk.len as u64;
+        }
+        s.in_use_bytes += (chunk.used_units.load(Ordering::Relaxed) * UNIT) as u64;
     }
+    s
 }
 
-/// Smallest size class. Values below this still round up to it.
-const MIN_CLASS: usize = 4096;
-/// Power-of-two exponent for `MIN_CLASS` — used as the bucket-index offset
-/// so `class.trailing_zeros() - MIN_CLASS_SHIFT` is the bucket array index.
-const MIN_CLASS_SHIFT: u32 = MIN_CLASS.trailing_zeros(); // = 12
+static CAP_CELL: OnceLock<usize> = OnceLock::new();
 
-/// Largest size class. Caller-requested `need` above this is rejected (the
-/// pool returns an unregistered, in-place `Vec` of exactly `need` bytes, NOT
-/// a power-of-two slab — registering >256 MiB through the pool is almost
-/// certainly a frame-length corruption or DoS attempt, and `next_power_of_two`
-/// would panic on `need > usize::MAX/2` anyway). 256 MiB matches autumn's
-/// largest single value (8 MiB extent) × 32 — generous headroom.
-const MAX_CLASS: usize = 256 * 1024 * 1024;
-const MAX_CLASS_SHIFT: u32 = MAX_CLASS.trailing_zeros(); // = 28
-
-/// One bucket per power-of-two size class from `MIN_CLASS` (2^12 = 4 KiB) to
-/// `MAX_CLASS` (2^28 = 256 MiB), inclusive. Indexed by
-/// `class.trailing_zeros() - MIN_CLASS_SHIFT`. Sized as a `const` so the
-/// fixed-array allocation lives on the stack (or in TLS — see `POOL`) with
-/// no heap indirection per acquire/drop hot-path lookup.
-const NUM_CLASSES: usize = (MAX_CLASS_SHIFT - MIN_CLASS_SHIFT + 1) as usize; // = 17
-
-/// Map a power-of-two `class` byte-count to its bucket index.
-/// Panics in debug if `class` isn't a valid in-pool size; the public
-/// callers (`acquire` / `PooledBuf::Drop` after the `class > MAX_CLASS`
-/// guard) always pass a valid class.
-#[inline]
-fn class_index(class: usize) -> usize {
-    debug_assert!((MIN_CLASS..=MAX_CLASS).contains(&class) && class.is_power_of_two());
-    (class.trailing_zeros() - MIN_CLASS_SHIFT) as usize
-}
-
-/// Per-thread cap on total registered (pinned) bytes held by the pool's
-/// free-list. Operators must keep `cap × threads < RLIMIT_MEMLOCK`. Default
-/// 2 GiB, the same as every binary's `--ucx-regpool-cap-bytes` (the Python
-/// binding sets none); overridable once via [`set_regpool_cap_bytes`].
-static REGPOOL_CAP_CELL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-
-/// Set the per-thread registered-buffer-pool cap (first-call-wins). Clamp
-/// `[16 MiB, 64 GiB]`. Wire from `--ucx-regpool-cap-bytes`.
+/// Set the process cap on chunk bytes (first call wins), clamped to
+/// [one chunk, 64 GiB]. From `--ucx-regpool-cap-bytes`.
 pub fn set_regpool_cap_bytes(n: usize) -> bool {
-    REGPOOL_CAP_CELL
-        .set(n.clamp(16 * 1024 * 1024, 64 * 1024 * 1024 * 1024))
-        .is_ok()
+    CAP_CELL.set(n.clamp(CHUNK_BYTES, 64 << 30)).is_ok()
 }
 
 fn cap_bytes() -> usize {
-    *REGPOOL_CAP_CELL.get_or_init(|| 2 << 30)
+    *CAP_CELL.get_or_init(|| 16 << 30)
 }
 
-struct Slab {
-    /// `Some` = registered (zero-copy capable); `None` = over-cap fallback.
-    ///
-    /// MUST be declared BEFORE `buf` so it drops first: `RegisteredMem::drop`
-    /// runs `ucp_mem_unmap` on the address range backed by `buf`; if `buf`
-    /// dropped first, UCX would unmap freed memory (the C-side rcache + verbs
-    /// driver may keep that address live for a brief window after unmap, so
-    /// the use-after-free is occasionally observable as a driver error or
-    /// SIGSEGV during process shutdown / over-cap eviction). Rust drops in
-    /// declaration order.
-    reg: Option<RegisteredMem>,
-    /// Capacity == the buffer's size class; address is stable for the slab's
-    /// life (allocated zeroed, never re-grown), so `reg` stays valid.
-    buf: Vec<u8>,
+struct Chunk {
+    /// Before `mem`: unregistered before it is unmapped. Set by the first
+    /// `reg()` call once the process transport is UCX (a chunk can predate
+    /// `init_with`); `None` inside when registration failed.
+    reg: OnceLock<Option<RegisteredMem>>,
+    mem: Mapping,
+    len: usize,
+    alloc: Mutex<Allocator>,
+    used_units: AtomicUsize,
+    /// A thread allocates from it (`CLAIM`).
+    claimed: AtomicBool,
 }
 
-struct PoolState {
-    /// Free slabs grouped by power-of-two size class. Bucket index =
-    /// `class.trailing_zeros() - MIN_CLASS_SHIFT`, so 4 KiB → 0, 8 KiB → 1,
-    /// …, 256 MiB → 16. Replaces the prior `HashMap<usize, Vec<Slab>>` —
-    /// the hot path was `buckets.get_mut(&class)` (hash + bucket walk) and
-    /// `entry(class).or_default()` (hash + maybe alloc) on every Drop;
-    /// `[Vec<Slab>; 17]` is a single index, and the Vecs amortise their
-    /// own allocations.
-    buckets: [Vec<Slab>; NUM_CLASSES],
-    /// Registered bytes sitting on the free-list (subset of `registered_bytes`).
-    pooled_bytes: usize,
-    /// Total registered (pinned) bytes for this thread — free-list AND
-    /// in-flight (currently owned by some `PooledBuf`). This is the value
-    /// `cap_bytes()` actually constrains. The previous accounting only
-    /// summed free-list, so a pipelined worker holding N `PooledBuf`s of
-    /// 8 MiB in-flight could pin far more than cap before any pressure was
-    /// observed. Now `acquire` of a fresh slab checks this counter BEFORE
-    /// `register_memory`; eviction (in `acquire`, to make room) decrements it
-    /// as it takes a slab off the free-list, which then drops (unregisters). Always 0 on the
-    /// non-ucx build (the type-erased `RegisteredMem` is uninhabited there),
-    /// so flagged `dead_code` for that build only.
-    #[allow(dead_code)]
-    registered_bytes: usize,
-    /// Read only on the `#[cfg(feature = "ucx")]` warn-once path (ucp_mem_map
-    /// failure); the field + its init are always compiled, so the default
-    /// (non-ucx) build sees it as never-read.
-    #[allow(dead_code)]
-    warned_over_cap: bool,
-}
+impl Chunk {
+    fn new(len: usize) -> Option<Self> {
+        let mem = Mapping::new(len)?;
+        let units = (len / UNIT) as u32;
+        // A free region between every two allocations: at most 2n + 1 nodes.
+        let nodes = (2 * units + 2).min(u32::MAX - 2);
+        let chunk = Self {
+            reg: OnceLock::new(),
+            mem,
+            len,
+            alloc: Mutex::new(Allocator::with_max_allocs(units, nodes)),
+            used_units: AtomicUsize::new(0),
+            claimed: AtomicBool::new(false),
+        };
+        chunk.reg();
+        Some(chunk)
+    }
 
-impl PoolState {
-    fn new() -> Self {
-        Self {
-            // [const { Vec::new() }; N] needs the inline-const stabilised in
-            // 1.79 — autumn-rs's MSRV is well past that. `Vec::new()` doesn't
-            // allocate, so this is one stack-array init, no heap.
-            buckets: [const { Vec::new() }; NUM_CLASSES],
-            pooled_bytes: 0,
-            registered_bytes: 0,
-            warned_over_cap: false,
+    /// The registration, made on first use under UCX.
+    fn reg(&self) -> Option<&RegisteredMem> {
+        if let Some(r) = self.reg.get() {
+            return r.as_ref();
         }
+        #[cfg(feature = "ucx")]
+        if crate::runtime_transport_is_ucx() {
+            return self
+                .reg
+                .get_or_init(|| match crate::register_memory(self.mem.ptr.cast(), self.len) {
+                    Ok(r) => Some(r),
+                    Err(e) => {
+                        REGISTER_FAILED_TOTAL.fetch_add(1, Ordering::Relaxed);
+                        warn_once(
+                            &WARNED_REGISTER,
+                            format_args!("regpool: ucp_mem_map of a {}-byte chunk failed ({e}); its buffers are unregistered", self.len),
+                        );
+                        None
+                    }
+                })
+                .as_ref();
+        }
+        None
+    }
+
+    fn allocate(&self, units: u32) -> Option<Allocation> {
+        let a = self.alloc.lock().unwrap().allocate(units)?;
+        self.used_units.fetch_add(units as usize, Ordering::Relaxed);
+        Some(a)
+    }
+
+    fn free(&self, a: Allocation, units: u32) {
+        self.alloc.lock().unwrap().free(a);
+        self.used_units.fetch_sub(units as usize, Ordering::Relaxed);
+    }
+}
+
+/// An anonymous private mapping; the kernel hands its pages out zeroed.
+struct Mapping {
+    ptr: *mut u8,
+    len: usize,
+}
+
+// SAFETY: plain memory; who may touch which range is the allocator's business.
+unsafe impl Send for Mapping {}
+unsafe impl Sync for Mapping {}
+
+impl Mapping {
+    fn new(len: usize) -> Option<Self> {
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            warn_once(&WARNED_MAP, format_args!("regpool: mmap of a {len}-byte chunk failed: {}", std::io::Error::last_os_error()));
+            return None;
+        }
+        // Fewer TLB and NIC translation entries; a hint, its failure is harmless.
+        unsafe { libc::madvise(ptr, len, libc::MADV_HUGEPAGE) };
+        Some(Self { ptr: ptr.cast(), len })
+    }
+}
+
+impl Drop for Mapping {
+    fn drop(&mut self) {
+        unsafe { libc::munmap(self.ptr.cast(), self.len) };
+    }
+}
+
+fn warn_once(flag: &AtomicBool, msg: std::fmt::Arguments<'_>) {
+    if !flag.swap(true, Ordering::Relaxed) {
+        tracing::warn!("{msg}");
+    }
+}
+
+struct Pool {
+    chunks: Vec<Arc<Chunk>>,
+    bytes: usize,
+}
+
+fn pool() -> &'static Mutex<Pool> {
+    static POOL: OnceLock<Mutex<Pool>> = OnceLock::new();
+    POOL.get_or_init(|| Mutex::new(Pool { chunks: Vec::new(), bytes: 0 }))
+}
+
+/// This thread's chunk; dropping it (switching chunks, thread exit) gives the
+/// claim up.
+struct Claim(Arc<Chunk>);
+
+impl Drop for Claim {
+    fn drop(&mut self) {
+        self.0.claimed.store(false, Ordering::Relaxed);
     }
 }
 
 thread_local! {
-    static POOL: RefCell<PoolState> = RefCell::new(PoolState::new());
+    static CLAIM: RefCell<Option<Claim>> = const { RefCell::new(None) };
 }
 
-/// Round `need` up to its size class (power of two, min `MIN_CLASS`).
-/// Returns `None` if `need` exceeds `MAX_CLASS` (caller decides whether to
-/// allocate an unregistered out-of-pool buffer or reject the request).
-fn size_class(need: usize) -> Option<usize> {
-    if need > MAX_CLASS {
-        return None;
+fn claim(chunk: &Arc<Chunk>) {
+    chunk.claimed.store(true, Ordering::Relaxed);
+    let new = Claim(chunk.clone());
+    // During thread teardown there is nothing to claim for.
+    if let Ok(old) = CLAIM.try_with(|c| c.borrow_mut().replace(new)) {
+        drop(old);
     }
-    // `checked_next_power_of_two` covers any future change to MAX_CLASS that
-    // accidentally pushes near `usize::MAX/2`.
-    need.max(MIN_CLASS).checked_next_power_of_two()
 }
 
-/// A registered buffer borrowed from the thread-local pool. Returns to the
-/// free-list on drop (if under cap). Hold it for the entire duration of any
-/// in-flight recv that targets it (see module cancel-safety note).
-///
-/// A `PooledBuf` (or a `Bytes::from_owner` of one) MAY be dropped on a
-/// DIFFERENT thread than it was acquired on (e.g. a frozen value handed to
-/// another runtime as an HTTP body): that is safe, but the slab is then FREED
-/// instead of re-pooled — re-pooling into a foreign thread's TLS pool would
-/// corrupt both threads' per-thread pinning accounts. The home thread's
-/// `registered_bytes` then drifts UP only (it hits the unregistered-fallback
-/// cap earlier than strictly necessary — conservative, never over-pins); on a
-/// TCP runtime nothing was registered, so there is no drift at all.
+/// A buffer from the pool. Returns its range to its chunk on drop, on whatever
+/// thread that happens. Hold it for the entire duration of any in-flight recv
+/// that targets it (see module cancel-safety note).
 pub struct PooledBuf {
-    /// `Option` so `Drop` can move the slab back into the pool.
-    slab: Option<Slab>,
-    /// Thread that acquired this buffer — only its TLS pool may take the slab
-    /// back (see the cross-thread-drop note above).
-    home: std::thread::ThreadId,
-    /// size class of the slab (its `buf.capacity()`).
-    class: usize,
-    /// logical length the caller asked for (`<= class`). This is the
-    /// WRITABLE area cap returned by `dest_mut` / `dest_and_reg` /
-    /// `IoBufMut::as_uninit` — the "I want a `used`-byte recv target".
+    storage: Storage,
+    /// Length the caller asked for: the writable area (`dest_mut`,
+    /// `dest_and_reg`, `IoBufMut::as_uninit`).
     used: usize,
-    /// Bytes actually initialized / filled by the most recent I/O.
-    /// Defaults to `used` on acquire (the legacy assumption was "the recv
-    /// will fully fill the requested area" — every current dest_and_reg
-    /// caller's recv loop does exactly that, and breaks early on error
-    /// before exposing `pb`). The UCX owned-read path (`endpoint.rs:ucx_recv`)
-    /// and compio's owned-read path both call `SetLen::set_len(got)` with
-    /// the actual recv count; that now narrows `filled_len` so `filled()`
-    /// / `AsRef<[u8]>` / `IoBuf::as_init` only expose the valid portion
-    /// of the slab — closing coco P2's "stale pool bytes leak on partial
-    /// recv" concern without breaking the all-fill loop callers.
+    /// Bytes filled by the most recent I/O; `used` until `SetLen::set_len`
+    /// narrows it, so `filled()` / `AsRef` / `IoBuf::as_init` never expose
+    /// stale pool bytes past a short recv.
     filled_len: usize,
 }
 
+enum Storage {
+    Pooled { chunk: Arc<Chunk>, alloc: Allocation, units: u32, ptr: *mut u8 },
+    /// Out of pool (larger than any chunk) or over the cap.
+    Heap(Vec<u8>),
+}
+
+// SAFETY: the range `ptr` points at belongs to this buffer alone until its
+// drop returns it to the chunk.
+unsafe impl Send for PooledBuf {}
+unsafe impl Sync for PooledBuf {}
+
+impl Drop for PooledBuf {
+    fn drop(&mut self) {
+        if let Storage::Pooled { chunk, alloc, units, .. } = &self.storage {
+            chunk.free(*alloc, *units);
+        }
+    }
+}
+
 impl PooledBuf {
+    fn base(&self) -> *const u8 {
+        match &self.storage {
+            Storage::Pooled { ptr, .. } => *ptr,
+            Storage::Heap(v) => v.as_ptr(),
+        }
+    }
+
+    fn base_mut(&mut self) -> *mut u8 {
+        match &mut self.storage {
+            Storage::Pooled { ptr, .. } => *ptr,
+            Storage::Heap(v) => v.as_mut_ptr(),
+        }
+    }
+
     /// Mutable view of the requested region, for recv-into-dest.
     pub fn dest_mut(&mut self) -> &mut [u8] {
         let used = self.used;
-        &mut self.slab.as_mut().expect("slab present").buf[..used]
+        // SAFETY: `used` bytes at the base are this buffer's and initialized
+        // (mapped zeroed, or written before).
+        unsafe { std::slice::from_raw_parts_mut(self.base_mut(), used) }
     }
 
-    /// The registered region, or `None` if this buffer is the unregistered
-    /// over-cap fallback. Pass `reg().memh()` to the recv for zero-copy.
+    /// The registration covering this buffer, or `None` (TCP, heap buffer,
+    /// failed registration). Pass `reg().memh()` to the recv for zero-copy.
     pub fn reg(&self) -> Option<&RegisteredMem> {
-        self.slab.as_ref().expect("slab present").reg.as_ref()
+        match &self.storage {
+            Storage::Pooled { chunk, .. } => chunk.reg(),
+            Storage::Heap(_) => None,
+        }
     }
 
-    /// Disjoint split-borrow of the dest slice + its registration (the
-    /// `dest_mut()` + `reg()` pair can't be held simultaneously); the UCX recv
-    /// takes both from the `PooledBuf` it was handed.
+    /// The dest slice and its registration at once (`dest_mut()` and `reg()`
+    /// cannot be held together).
     pub fn dest_and_reg(&mut self) -> (&mut [u8], Option<&RegisteredMem>) {
         let used = self.used;
-        let Slab { buf, reg } = self.slab.as_mut().expect("slab present");
-        (&mut buf[..used], reg.as_ref())
+        let (ptr, reg) = match &mut self.storage {
+            Storage::Pooled { chunk, ptr, .. } => (*ptr, chunk.reg()),
+            Storage::Heap(v) => (v.as_mut_ptr(), None),
+        };
+        // SAFETY: as in `dest_mut`; `reg` borrows the chunk, not the bytes.
+        (unsafe { std::slice::from_raw_parts_mut(ptr, used) }, reg)
     }
 
-    /// Read-only view of the filled region (for sending the value onward).
-    /// Narrowed by `SetLen::set_len` if the most recent recv returned
-    /// fewer bytes than the writable area; defaults to the requested
-    /// length (`used`) before any I/O happens.
+    /// The filled region (for sending the value onward).
     pub fn filled(&self) -> &[u8] {
-        let filled = self.filled_len;
-        &self.slab.as_ref().expect("slab present").buf[..filled]
+        // SAFETY: `filled_len <= used`, initialized as in `dest_mut`.
+        unsafe { std::slice::from_raw_parts(self.base(), self.filled_len) }
     }
 
-    /// Filled-bytes count — Vec-like semantics (initialized data length).
-    /// Defaults to the requested capacity (`used`); narrows to actual recv
-    /// count after `SetLen::set_len`.
+    /// Filled length; `used` until `SetLen::set_len` narrows it.
     pub fn len(&self) -> usize {
         self.filled_len
     }
@@ -342,7 +354,7 @@ impl PooledBuf {
         self.used
     }
 
-    /// The filled bytes as a value that keeps this slab's registration, so a
+    /// The filled bytes as a value that keeps this buffer's registration, so a
     /// UCX send passes the memh instead of looking the memory up.
     pub fn freeze(self) -> RegBytes {
         #[cfg(feature = "ucx")]
@@ -355,8 +367,8 @@ impl PooledBuf {
     }
 }
 
-/// A slab's registration handle. The `Bytes` beside it owns the slab, which
-/// keeps the registration mapped for as long as the handle is held.
+/// A chunk's registration handle. The `Bytes` beside it owns a buffer of the
+/// chunk, which keeps the registration mapped for as long as the handle is held.
 #[cfg(feature = "ucx")]
 #[derive(Clone, Copy)]
 pub(crate) struct Memh(pub(crate) crate::ucx::ffi::ucp_mem_h);
@@ -368,8 +380,8 @@ unsafe impl Send for Memh {}
 unsafe impl Sync for Memh {}
 
 /// Bytes to send, with the registration they live in when they come from a
-/// registered pool slab ([`PooledBuf::freeze`]). Other bytes carry none, and
-/// so does a slab the pool did not register (TCP runtime, over-cap or
+/// registered pool buffer ([`PooledBuf::freeze`]). Other bytes carry none, and
+/// so does a buffer the pool did not register (TCP runtime, over-cap or
 /// out-of-pool buffers): see `is_registered`.
 #[derive(Clone)]
 pub struct RegBytes {
@@ -425,27 +437,21 @@ impl From<bytes::Bytes> for RegBytes {
 }
 
 /// So a `PooledBuf` can back a `bytes::Bytes` via `Bytes::from_owner(pb)` — the
-/// value aliases the pool buffer (no copy) and returns to the pool when the last
-/// `Bytes` clone drops. Used by `resolve_value` (R4) to hand the EN-read value
-/// onward zero-copy.
+/// value aliases the buffer (no copy), which returns to the pool when the last
+/// `Bytes` clone drops.
 impl AsRef<[u8]> for PooledBuf {
     fn as_ref(&self) -> &[u8] {
         self.filled()
     }
 }
 
-// make `PooledBuf` a first-class compio buffer so the EN read path can
-// `read_exact_at(pb, off)` straight into the registered, zeroed-once, pooled
-// slab — eliminating the per-op `vec![0u8; read_size]` (per-op malloc + an 8 MiB
-// memset that the pread immediately overwrites); `freeze` then sends it with
-// the slab's memh.
+// A first-class compio buffer, so the EN read path can `read_exact_at(pb, off)`
+// straight into pooled memory — no per-op `vec![0u8; n]` (malloc + memset the
+// pread overwrites anyway); `freeze` then sends it with the chunk's memh.
 //
 // compio's `read_exact_at` reads exactly `buf_capacity()` (= `as_uninit().len()`)
 // bytes and tracks progress with its own counter, so exposing the requested
-// `used` bytes as the capacity makes it read exactly the value length. `set_len`
-// is a no-op: the slab is fixed-size and always fully initialized (allocated
-// zeroed), and `used` is fixed at acquire — the read loop never relies on
-// `set_len` to size the next read.
+// `used` bytes as the capacity makes it read exactly the value length.
 impl compio::buf::IoBuf for PooledBuf {
     fn as_init(&self) -> &[u8] {
         self.filled()
@@ -453,13 +459,7 @@ impl compio::buf::IoBuf for PooledBuf {
 }
 
 impl compio::buf::SetLen for PooledBuf {
-    /// Mark `len` bytes of the writable area as initialized. compio calls
-    /// this internally after `read_exact_at` / `read_at` fills the slab;
-    /// the UCX recv loops fill the whole area before exposing `pb`. Clamps to `used` to guarantee
-    /// `filled_len <= cap()` even if a buggy caller passes a wild value.
-    /// (The contract is "I just read `len` bytes into `as_uninit`" — `len`
-    /// SHOULD always be `<= as_uninit().len() == used`. The clamp is
-    /// defensive belt-and-braces.)
+    /// Mark `len` bytes of the writable area as filled, clamped to `used`.
     unsafe fn set_len(&mut self, len: usize) {
         self.filled_len = len.min(self.used);
     }
@@ -468,357 +468,224 @@ impl compio::buf::SetLen for PooledBuf {
 impl compio::buf::IoBufMut for PooledBuf {
     fn as_uninit(&mut self) -> &mut [std::mem::MaybeUninit<u8>] {
         let used = self.used;
-        let buf = &mut self.slab.as_mut().expect("slab present").buf[..used];
-        // SAFETY: `u8` and `MaybeUninit<u8>` share layout; these bytes are
-        // already initialized (the slab is zeroed on first alloc), so viewing
-        // them as MaybeUninit is sound. `read_at` writes them before read-back.
-        unsafe {
-            std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut std::mem::MaybeUninit<u8>, used)
-        }
+        // SAFETY: `u8` and `MaybeUninit<u8>` share layout; the range is this
+        // buffer's (see `dest_mut`).
+        unsafe { std::slice::from_raw_parts_mut(self.base_mut().cast(), used) }
     }
 }
 
-impl Drop for PooledBuf {
-    fn drop(&mut self) {
-        let Some(slab) = self.slab.take() else { return };
-        // on **non-ucx** builds every slab is unregistered (there's no NIC
-        // to register against), so they MUST be re-pooled — otherwise TCP
-        // recv-into-pooled (`read_value_into_pooled` / `drain_bulk_writes`) does a
-        // fresh `vec![0u8; class]` (malloc + zero the whole slab) and free on
-        // EVERY op, which is strictly worse than the regular reused-BytesMut
-        // path (measured: 8 MiB TCP write 3× slower before this fix).
-        //
-        // A UCX-capable binary can run TCP: its ordinary unregistered slabs
-        // must also be recycled. Only UCX runtime registration fallbacks are
-        // freed so registration can be retried when pressure eases.
-        #[cfg(feature = "ucx")]
-        if crate::runtime_transport_is_ucx() && slab.reg.is_none() {
-            return;
-        }
-        let class = self.class;
-        // Out-of-pool path (need > MAX_CLASS, see `acquire`): class isn't a
-        // size class, no bucket exists for it, never re-pool.
-        if class > MAX_CLASS {
-            return;
-        }
-        // Cross-thread drop (a frozen value handed to another runtime): FREE
-        // the slab instead of re-pooling — pushing it into the FOREIGN
-        // thread's TLS pool would corrupt both threads' per-thread pinning
-        // accounts (home stays elevated, foreign under-counts → could
-        // over-pin past its cap). Freeing here is safe: `ucp_mem_unmap` is
-        // process-context-global and the `Slab` field order unmaps before the
-        // buf frees. Keep the process-wide gauge truthful; the HOME thread's
-        // TLS `registered_bytes` is unreachable from here and drifts UP only
-        // (conservative — earlier unregistered-fallback, never over-pinning).
-        if std::thread::current().id() != self.home {
-            #[cfg(feature = "ucx")]
-            if slab.reg.is_some() {
-                REGISTERED_BYTES_GAUGE.fetch_sub(class as u64, Ordering::Relaxed);
-            }
-            drop(slab);
-            return;
-        }
-        // `try_with`, not `with`: a `PooledBuf` that escaped into another TLS
-        // or task-local can outlive the regpool's TLS destructor; `with` would
-        // then panic, and a Drop panic during stack-unwind aborts the process.
-        // On TLS-shutdown we just let the slab drop directly (the Slab field
-        // order above keeps that FFI-safe: RegisteredMem unmaps before buf
-        // frees).
-        // Returns the slab back to the caller iff we're evicting it. The slab
-        // is then dropped OUTSIDE `POOL.borrow_mut`, so a hypothetical future
-        // hook in `RegisteredMem::drop` that touches POOL won't deadlock on
-        // the RefCell. (`RegisteredMem::drop` today only calls
-        // `ucp_mem_unmap` — the safety is purely defensive.)
-        let to_drop = POOL
-            .try_with(|p| {
-                let mut p = p.borrow_mut();
-                if p.pooled_bytes + class <= cap_bytes() {
-                    p.pooled_bytes += class;
-                    p.buckets[class_index(class)].push(slab);
-                    None
-                } else {
-                    // Eviction: keep `registered_bytes` in lockstep with what's
-                    // actually pinned. TCP slabs in a UCX-capable binary did
-                    // not contribute to either registration counter.
-                    #[cfg(feature = "ucx")]
-                    if slab.reg.is_some() {
-                        p.registered_bytes = p.registered_bytes.saturating_sub(class);
-                        REGISTERED_BYTES_GAUGE.fetch_sub(class as u64, Ordering::Relaxed);
-                    }
-                    Some(slab)
-                }
-            })
-            .ok()
-            .flatten();
-        drop(to_drop); // borrow_mut released; safe to run Slab::drop now.
+fn heap(need: usize) -> PooledBuf {
+    PooledBuf { storage: Storage::Heap(vec![0u8; need]), used: need, filled_len: need }
+}
+
+fn pooled(chunk: &Arc<Chunk>, alloc: Allocation, units: u32, need: usize) -> PooledBuf {
+    // SAFETY: the allocation lies inside the chunk's mapping.
+    let ptr = unsafe { chunk.mem.ptr.add(alloc.offset as usize * UNIT) };
+    PooledBuf {
+        storage: Storage::Pooled { chunk: chunk.clone(), alloc, units, ptr },
+        used: need,
+        filled_len: need,
     }
 }
 
-/// Acquire a registered buffer with usable length `need` from the thread-local
-/// pool. Reuses a pooled slab of the right size class, or allocates+registers a
-/// fresh one. If registering would exceed the per-thread memlock cap, idle
-/// slabs are freed to make room first; if the slabs in use fill the cap, it
-/// returns an unregistered buffer (recv falls back to copy-out — still correct).
-///
-/// Registration is RUNTIME-transport gated, not just compile-feature gated: a
-/// ucx-feature binary whose process transport is TCP gets plain buffers (memh
-/// is never used on TCP; `ucp_mem_map` would only init a UCX context + pin
-/// memlock for nothing). See `runtime_transport_is_ucx`.
-///
-/// For `need > MAX_CLASS` (256 MiB), returns an unregistered out-of-pool
-/// buffer of EXACTLY `need` bytes (no rounding, no pooling) — keeps the API
-/// total while making "absurdly large" allocations cheap-and-non-pinning
-/// instead of OOM-aborting via `next_power_of_two` panic.
+/// A buffer of `need` writable bytes: from this thread's chunk when it has
+/// room, else from another chunk (see module doc), else from the heap.
 pub fn acquire(need: usize) -> PooledBuf {
-    // A finished orphan recv (`endpoint.rs`) hands its slab back here first.
+    // A finished orphan recv (`endpoint.rs`) hands its buffer back here first.
     #[cfg(feature = "ucx")]
     crate::ucx::endpoint::reap_orphans();
     ACQUIRE_TOTAL.fetch_add(1, Ordering::Relaxed);
-    let Some(class) = size_class(need) else {
-        // Out-of-pool: allocate exact size, never register, never pool.
-        // Marked by `class > MAX_CLASS` so `Drop` skips the re-pool path
-        // even on non-ucx builds (where `reg.is_none()` is normal).
+    if need > MAX_CHUNK_BYTES {
         OUT_OF_POOL_TOTAL.fetch_add(1, Ordering::Relaxed);
-        let buf = vec![0u8; need];
-        return PooledBuf {
-            slab: Some(Slab { reg: None, buf }),
-            class: need,
-            used: need,
-            filled_len: need,
-            home: std::thread::current().id(),
-        };
-    };
-    let slab = POOL.with(|p| {
-        let mut p = p.borrow_mut();
-        let idx = class_index(class);
-        if let Some(slab) = p.buckets[idx].pop() {
-            p.pooled_bytes -= class;
-            return Some(slab);
-        }
-        None
-    });
-
-    if let Some(slab) = slab {
+        return heap(need);
+    }
+    let units = need.div_ceil(UNIT).max(1) as u32;
+    let current = CLAIM
+        .try_with(|c| {
+            let c = c.borrow();
+            let chunk = &c.as_ref()?.0;
+            chunk.allocate(units).map(|a| pooled(chunk, a, units, need))
+        })
+        .ok()
+        .flatten();
+    if let Some(pb) = current {
         HIT_TOTAL.fetch_add(1, Ordering::Relaxed);
-        return PooledBuf {
-            slab: Some(slab),
-            class,
-            used: need,
-            filled_len: need,
-            home: std::thread::current().id(),
-        };
+        return pb;
     }
+    acquire_slow(need, units)
+}
 
-    // Allocate a fresh slab. zeroed (avoids reading uninit before recv).
-    #[cfg_attr(not(feature = "ucx"), allow(unused_mut))]
-    let mut buf = vec![0u8; class];
-    #[cfg(feature = "ucx")]
-    let reg = if !crate::runtime_transport_is_ucx() {
-        // Runtime-transport gate (compile-feature gating can't see the
-        // runtime choice): a ucx-feature build running the TCP transport
-        // never recvs via memh, so registering would only initialise a UCX
-        // context + pin memlock for nothing. Hand out a plain buffer — on
-        // TCP the pool's benefit is recycling alone.
-        None
-    } else {
-        // PRE-FLIGHT cap check: would registering `class` more bytes push the
-        // thread's total pinned mem above cap? If so, skip register_memory —
-        // an over-budget `ucp_mem_map` would either fail (memlock) or succeed
-        // and silently push the process past its memlock allowance. Either
-        // way the right answer is "fall back to unregistered + copy-out".
-        // Idle slabs give their registration back first: otherwise a burst
-        // of large values (a 256 MiB append) leaves its slabs pinning the
-        // budget, and every later buffer of another size is a fresh,
-        // faulted-in, unregistered allocation. Only when that makes room
-        // (slabs in use do not fill the cap alone), and the smallest idle
-        // class that covers the shortfall goes first.
-        let evicted = POOL.with(|p| {
-            let mut p = p.borrow_mut();
-            let mut evicted = Vec::new();
-            let cap = cap_bytes();
-            if p.registered_bytes.saturating_sub(p.pooled_bytes).saturating_add(class) > cap {
-                return evicted;
+fn acquire_slow(need: usize, units: u32) -> PooledBuf {
+    let mut pool = pool().lock().unwrap();
+    for chunk in &pool.chunks {
+        if chunk.claimed.load(Ordering::Relaxed) {
+            continue;
+        }
+        if let Some(a) = chunk.allocate(units) {
+            claim(chunk);
+            HIT_TOTAL.fetch_add(1, Ordering::Relaxed);
+            return pooled(chunk, a, units, need);
+        }
+    }
+    let size = if need <= CHUNK_BYTES { CHUNK_BYTES } else { need.next_power_of_two() };
+    if pool.bytes + size <= cap_bytes() {
+        // Reserve, then map and register without the lock: other threads'
+        // slow paths must not wait for a registration.
+        pool.bytes += size;
+        drop(pool);
+        let made = Chunk::new(size).map(Arc::new);
+        pool = self::pool().lock().unwrap();
+        match made {
+            Some(chunk) => {
+                pool.chunks.push(chunk.clone());
+                let a = chunk.allocate(units).expect("a new chunk fits the request it was made for");
+                claim(&chunk);
+                return pooled(&chunk, a, units, need);
             }
-            while p.registered_bytes.saturating_add(class) > cap {
-                let short = p.registered_bytes + class - cap;
-                let fits = (0..NUM_CLASSES).find(|&i| MIN_CLASS << i >= short && !p.buckets[i].is_empty());
-                let Some(idx) = fits.or_else(|| (0..NUM_CLASSES).rev().find(|&i| !p.buckets[i].is_empty())) else {
-                    break;
-                };
-                let slab = p.buckets[idx].pop().expect("non-empty bucket");
-                let size = MIN_CLASS << idx;
-                p.pooled_bytes -= size;
-                if slab.reg.is_some() {
-                    p.registered_bytes = p.registered_bytes.saturating_sub(size);
-                    REGISTERED_BYTES_GAUGE.fetch_sub(size as u64, Ordering::Relaxed);
+            None => {
+                pool.bytes -= size;
+                // Not the cap: the mapping failed (warned in `Mapping::new`).
+                for chunk in &pool.chunks {
+                    if let Some(a) = chunk.allocate(units) {
+                        HIT_TOTAL.fetch_add(1, Ordering::Relaxed);
+                        return pooled(chunk, a, units, need);
+                    }
                 }
-                EVICTED_TOTAL.fetch_add(1, Ordering::Relaxed);
-                EVICTED_BYTES.fetch_add(size as u64, Ordering::Relaxed);
-                evicted.push(slab);
-            }
-            evicted
-        });
-        // Unregistered and freed outside the borrow (`Slab::drop`).
-        drop(evicted);
-        let cap_ok = POOL.with(|p| {
-            let p = p.borrow();
-            p.registered_bytes.saturating_add(class) <= cap_bytes()
-        });
-        if !cap_ok {
-            OVER_CAP_TOTAL.fetch_add(1, Ordering::Relaxed);
-            POOL.with(|p| {
-                let mut p = p.borrow_mut();
-                if !p.warned_over_cap {
-                    p.warned_over_cap = true;
-                    tracing::warn!(
-                        class,
-                        registered = p.registered_bytes,
-                        cap = cap_bytes(),
-                        "regpool: total registered would exceed cap; falling \
-                         back to unregistered buffers (copy-out, not zero-copy)"
-                    );
-                }
-            });
-            None
-        } else {
-            match crate::register_memory(buf.as_mut_ptr() as *mut std::os::raw::c_void, class) {
-                Ok(r) => {
-                    POOL.with(|p| {
-                        let mut p = p.borrow_mut();
-                        p.registered_bytes = p.registered_bytes.saturating_add(class);
-                    });
-                    REGISTERED_BYTES_GAUGE.fetch_add(class as u64, Ordering::Relaxed);
-                    Some(r)
-                }
-                Err(e) => {
-                    REGISTER_FAILED_TOTAL.fetch_add(1, Ordering::Relaxed);
-                    POOL.with(|p| {
-                        let mut p = p.borrow_mut();
-                        if !p.warned_over_cap {
-                            p.warned_over_cap = true;
-                            tracing::warn!(
-                                class, error = %e,
-                                "regpool: ucp_mem_map failed (memlock?); falling \
-                                 back to unregistered buffers (copy-out, not zero-copy)"
-                            );
-                        }
-                    });
-                    None
-                }
+                return heap(need);
             }
         }
-    };
-    // No-ucx: RegisteredMem is uninhabited, so `reg` is always None.
-    #[cfg(not(feature = "ucx"))]
-    let reg: Option<RegisteredMem> = None;
-    PooledBuf {
-        slab: Some(Slab { buf, reg }),
-        class,
-        used: need,
-        filled_len: need,
-        home: std::thread::current().id(),
     }
+    // At the cap: share any chunk with room.
+    for chunk in &pool.chunks {
+        if let Some(a) = chunk.allocate(units) {
+            HIT_TOTAL.fetch_add(1, Ordering::Relaxed);
+            return pooled(chunk, a, units, need);
+        }
+    }
+    drop(pool);
+    OVER_CAP_TOTAL.fetch_add(1, Ordering::Relaxed);
+    warn_once(&WARNED_CAP, format_args!(
+        "regpool: no chunk has room for {need} bytes at the {}-byte cap; falling back to unregistered heap buffers",
+        cap_bytes()
+    ));
+    heap(need)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn class_index_covers_all_buckets() {
-        assert_eq!(class_index(MIN_CLASS), 0);
-        assert_eq!(class_index(8 * 1024), 1);
-        assert_eq!(class_index(1 << 20), 8); // 1 MiB
-        assert_eq!(class_index(8 * 1024 * 1024), 11);
-        assert_eq!(class_index(MAX_CLASS), NUM_CLASSES - 1);
-        // NUM_CLASSES sized exactly = exponent range + 1, covers every
-        // valid in-pool class. Bucket index never escapes the array.
-        assert!(class_index(MAX_CLASS) < NUM_CLASSES);
+    fn chunk_of(pb: &PooledBuf) -> Option<*const Chunk> {
+        match &pb.storage {
+            Storage::Pooled { chunk, .. } => Some(Arc::as_ptr(chunk)),
+            Storage::Heap(_) => None,
+        }
     }
 
     #[test]
-    fn size_class_rounds_to_pow2_min_4k() {
-        assert_eq!(size_class(1), Some(4096));
-        assert_eq!(size_class(4096), Some(4096));
-        assert_eq!(size_class(4097), Some(8192));
-        assert_eq!(size_class(256 * 1024), Some(256 * 1024));
-        assert_eq!(size_class(256 * 1024 + 1), Some(512 * 1024));
-        assert_eq!(size_class(MAX_CLASS), Some(MAX_CLASS));
-        // Above MAX_CLASS: out-of-pool sentinel.
-        assert_eq!(size_class(MAX_CLASS + 1), None);
-        // Stress: previously panicked via `next_power_of_two` overflow.
-        assert_eq!(size_class(usize::MAX), None);
+    fn a_freed_range_is_reused_and_counts_as_a_hit() {
+        std::thread::spawn(|| {
+            let mut first = acquire(200_000);
+            first.dest_mut().fill(0xa5);
+            let addr = first.filled().as_ptr();
+            drop(first);
+            let before = snapshot().hit_total;
+            let next = acquire(250_000);
+            assert_eq!(next.filled().as_ptr(), addr, "the freed range comes back");
+            assert!(snapshot().hit_total > before);
+        })
+        .join()
+        .unwrap();
     }
 
-    /// Counters: every acquire bumps `acquire_total`; a hit (pooled-slab
-    /// reuse) bumps `hit_total`; out-of-pool path bumps `out_of_pool_total`.
-    /// Use the snapshot delta within the test to be robust to other tests
-    /// running in parallel.
     #[test]
-    fn snapshot_increments_on_acquire() {
-        let before = snapshot();
-        let pb1 = acquire(64 * 1024);
-        let pb2_huge = acquire(MAX_CLASS + 1); // out-of-pool
-        let after_alloc = snapshot();
-        assert!(
-            after_alloc.acquire_total >= before.acquire_total + 2,
-            "acquire_total monotonic +2"
-        );
-        assert!(
-            after_alloc.out_of_pool_total >= before.out_of_pool_total + 1,
-            "out_of_pool bumped"
-        );
-        drop(pb1);
-        drop(pb2_huge);
-        // Reacquire same class → must be a hit (slab returned to free-list).
-        let _pb3 = acquire(64 * 1024);
-        let after_hit = snapshot();
-        assert!(
-            after_hit.hit_total >= after_alloc.hit_total + 1,
-            "hit_total bumped on reuse, before={} after={}",
-            after_alloc.hit_total,
-            after_hit.hit_total
-        );
-        let s = snapshot();
-        // hit_rate is bounded.
-        assert!((0.0..=1.0).contains(&s.hit_rate()));
+    fn a_buffer_dropped_on_another_thread_returns_to_its_chunk() {
+        std::thread::spawn(|| {
+            let pb = acquire(1 << 20);
+            let chunk = chunk_of(&pb).unwrap();
+            let addr = pb.filled().as_ptr() as usize;
+            std::thread::spawn(move || drop(pb)).join().unwrap();
+            let again = acquire(1 << 20);
+            assert_eq!(chunk_of(&again), Some(chunk));
+            assert_eq!(again.filled().as_ptr() as usize, addr, "freed by the other thread, reused here");
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn a_thread_that_exits_lets_another_claim_its_chunk() {
+        let chunk = std::thread::spawn(|| {
+            let pb = acquire(4096);
+            chunk_of(&pb).unwrap() as usize
+        })
+        .join()
+        .unwrap();
+        // Unclaimed now: some thread can take it over (other tests run beside
+        // this one, so only check that it is not held by the exited thread).
+        let pool = pool().lock().unwrap();
+        let c = pool.chunks.iter().find(|c| Arc::as_ptr(c) as usize == chunk).unwrap();
+        assert!(!c.claimed.load(Ordering::Relaxed) || Arc::strong_count(c) > 1);
+    }
+
+    #[test]
+    fn a_request_larger_than_a_chunk_gets_its_own_and_one_larger_than_any_goes_to_the_heap() {
+        std::thread::spawn(|| {
+            let big = acquire(CHUNK_BYTES + 1);
+            let c = chunk_of(&big).expect("pooled");
+            assert_eq!(unsafe { (*c).len }, (CHUNK_BYTES + 1).next_power_of_two());
+            let before = snapshot().out_of_pool_total;
+            let huge = acquire(MAX_CHUNK_BYTES + 1);
+            assert!(chunk_of(&huge).is_none());
+            assert_eq!(huge.cap(), MAX_CHUNK_BYTES + 1);
+            assert!(snapshot().out_of_pool_total > before);
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[test]
+    fn buffers_are_page_aligned_and_do_not_overlap() {
+        std::thread::spawn(|| {
+            let bufs: Vec<_> = [1usize, 4096, 4097, 100_000, 1 << 20].iter().map(|&n| acquire(n)).collect();
+            let mut ranges: Vec<_> = bufs.iter().map(|b| (b.filled().as_ptr() as usize, b.cap())).collect();
+            assert!(ranges.iter().all(|(p, _)| p % UNIT == 0));
+            ranges.sort();
+            for w in ranges.windows(2) {
+                assert!(w[0].0 + w[0].1 <= w[1].0, "{w:?}");
+            }
+        })
+        .join()
+        .unwrap();
     }
 
     /// Partial-recv narrowing: after `set_len(n)`, `filled()` / `AsRef` /
     /// `IoBuf::as_init()` must only expose `[..n]`, never the stale
-    /// pool bytes between `[n..used]`. This is what coco P2 #4 was about.
+    /// pool bytes between `[n..used]`.
     #[test]
     fn set_len_narrows_filled_view() {
         use compio::buf::{IoBuf, SetLen};
-        let mut pb = acquire(8000); // class=8192
+        let mut pb = acquire(8000);
         assert_eq!(pb.cap(), 8000, "cap = requested capacity");
         assert_eq!(pb.len(), 8000, "default filled_len = used (legacy contract)");
-        // Simulate an owned read receiving fewer bytes than asked.
         unsafe { pb.set_len(3000) };
         assert_eq!(pb.len(), 3000, "set_len narrows filled_len");
         assert_eq!(pb.filled().len(), 3000, "filled() narrows");
         assert_eq!(pb.as_init().len(), 3000, "IoBuf::as_init narrows");
         assert_eq!(pb.cap(), 8000, "cap unchanged by set_len");
-        // dest_mut still exposes the FULL writable area (unchanged).
         assert_eq!(pb.dest_mut().len(), 8000, "dest_mut returns writable cap");
-        // Defensive clamp: set_len(> used) is clamped, never out-of-bounds.
         unsafe { pb.set_len(usize::MAX) };
         assert_eq!(pb.len(), 8000, "set_len clamps to used");
     }
 
-    // `read_exact_at` into a PooledBuf must read exactly `used` bytes,
-    // NOT the full slab `class`. `used=5000` rounds to `class=8192`; a file of
-    // 5000 bytes would EOF-error if the read targeted the whole 8192-slab.
-    // Validates the IoBufMut impl (as_uninit exposes `used`) on the no-ucx
-    // build too (regpool returns an unregistered slab there; trait impl is the
-    // same). Runs without UCX — pure compio file I/O.
+    // `read_exact_at` into a PooledBuf must read exactly `used` bytes, not the
+    // 4 KiB-rounded range: a 5000-byte file would hit EOF otherwise.
     #[test]
-    fn read_exact_at_into_pooled_reads_used_not_class() {
+    fn read_exact_at_into_pooled_reads_used_not_the_rounded_range() {
         use compio::io::{AsyncReadAtExt, AsyncWriteAtExt};
         let n = 5000usize;
         let pattern: Vec<u8> = (0..n).map(|i| (i % 251) as u8).collect();
-        let path =
-            std::env::temp_dir().join(format!("autumn_regpool_pread_{}.bin", std::process::id()));
+        let path = std::env::temp_dir().join(format!("autumn_regpool_pread_{}.bin", std::process::id()));
         let rt = compio::runtime::Runtime::new().expect("compio rt");
         rt.block_on(async {
             {
@@ -828,15 +695,10 @@ mod tests {
             }
             let f = compio::fs::File::open(&path).await.expect("open");
             let pb = acquire(n);
-            assert_eq!(pb.class, 8192, "5000 rounds to 8192");
             let compio::BufResult(res, pb) = f.read_exact_at(pb, 0).await;
-            res.expect("read_exact_at must fill exactly `used` bytes (not class)");
+            res.expect("read_exact_at must fill exactly `used` bytes");
             assert_eq!(pb.len(), n);
-            assert_eq!(
-                pb.filled(),
-                &pattern[..],
-                "pooled slab must hold file bytes"
-            );
+            assert_eq!(pb.filled(), &pattern[..]);
             let _ = compio::fs::remove_file(&path).await;
         });
     }

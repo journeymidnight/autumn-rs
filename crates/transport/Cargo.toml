@@ -18,6 +18,7 @@ tracing = "0.1"
 bytes.workspace = true
 thiserror.workspace = true
 libc = "0.2"
+offset-allocator = "0.2"
 ucx-sys-mini = { path = "ucx-sys-mini", optional = true }
 socket2 = { version = "0.5", optional = true, features = ["all"] }
 
@@ -36,6 +37,10 @@ harness = false
 
 [[bench]]
 name = "am_memh"
+harness = false
+
+[[bench]]
+name = "regpool_alloc"
 harness = false
 
 [lints]

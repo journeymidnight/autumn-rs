@@ -385,13 +385,14 @@ partition whatever the client's depth (UCX, 16 threads, depth 32: 28–33K
 ops/s for 8 partitions, batch 8.0).
 
 The cap is bounded from above by the UCX registered pool: every admitted large
-value holds a pooled buffer on the partition thread, and past
-`--ucx-regpool-cap-bytes` the buffers are fresh memory that every send
-registers again (docs/ops.md, "Per-connection admission and the registered
-pool"). 16 with a 2 GiB pool fits kvcache under a TP8 engine (8 connections x
-16 x 16 MiB pages); at startup under UCX the PS warns when the pool is under
-`--conn-inflight-cap` x 128 MiB (`regpool_admission_mismatch`). 32 with the old
-512 MiB pool cut 16 MiB bulk reads from 8.5–9.2 to 3.0–3.7 GB/s.
+value holds a pooled buffer, and past the process pool
+(`--ucx-regpool-cap-bytes`, 16 GiB) the buffers are fresh memory that every
+send registers again (docs/ops.md, "Per-connection admission and the registered
+pool"). One partition at 16 holds up to 2 GiB for kvcache under a TP8 engine (8
+connections x 16 x 16 MiB pages); at startup under UCX the PS warns when the
+pool is under `--conn-inflight-cap` x 128 MiB (`regpool_admission_mismatch`,
+one partition's worth). 32 with the old 512 MiB per-thread pool cut 16 MiB
+bulk reads from 8.5–9.2 to 3.0–3.7 GB/s.
 
 From 4 to 16 (perf bench, 16 threads x depth 8, alternating, 2 runs): TCP 4 KiB
 writes 38.8–42.3K -> 44.8–48.1K (batch 8.0 -> 13.3), 8 MiB reads 5.0–5.9 ->
