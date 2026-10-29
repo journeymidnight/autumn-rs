@@ -341,6 +341,87 @@ impl PooledBuf {
     pub fn cap(&self) -> usize {
         self.used
     }
+
+    /// The filled bytes as a value that keeps this slab's registration, so a
+    /// UCX send passes the memh instead of looking the memory up.
+    pub fn freeze(self) -> RegBytes {
+        #[cfg(feature = "ucx")]
+        let memh = self.reg().map(|r| Memh(r.memh()));
+        RegBytes {
+            bytes: bytes::Bytes::from_owner(self),
+            #[cfg(feature = "ucx")]
+            memh,
+        }
+    }
+}
+
+/// A slab's registration handle. The `Bytes` beside it owns the slab, which
+/// keeps the registration mapped for as long as the handle is held.
+#[cfg(feature = "ucx")]
+#[derive(Clone, Copy)]
+pub(crate) struct Memh(pub(crate) crate::ucx::ffi::ucp_mem_h);
+
+// SAFETY: a memh belongs to the process-global UCX context, not a thread.
+#[cfg(feature = "ucx")]
+unsafe impl Send for Memh {}
+#[cfg(feature = "ucx")]
+unsafe impl Sync for Memh {}
+
+/// Bytes to send, with the registration they live in when they come from a
+/// registered pool slab ([`PooledBuf::freeze`]). Other bytes carry none, and
+/// so does a slab the pool did not register (TCP runtime, over-cap or
+/// out-of-pool buffers): see `is_registered`.
+#[derive(Clone)]
+pub struct RegBytes {
+    bytes: bytes::Bytes,
+    #[cfg(feature = "ucx")]
+    memh: Option<Memh>,
+}
+
+impl RegBytes {
+    pub fn bytes(&self) -> &bytes::Bytes {
+        &self.bytes
+    }
+
+    pub fn into_bytes(self) -> bytes::Bytes {
+        self.bytes
+    }
+
+    pub fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+
+    pub fn is_registered(&self) -> bool {
+        #[cfg(feature = "ucx")]
+        return self.memh.is_some();
+        #[cfg(not(feature = "ucx"))]
+        false
+    }
+
+    #[cfg(feature = "ucx")]
+    pub(crate) fn memh(&self) -> Option<Memh> {
+        self.memh
+    }
+}
+
+impl std::fmt::Debug for RegBytes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RegBytes").field("len", &self.len()).field("registered", &self.is_registered()).finish()
+    }
+}
+
+impl From<bytes::Bytes> for RegBytes {
+    fn from(bytes: bytes::Bytes) -> Self {
+        Self {
+            bytes,
+            #[cfg(feature = "ucx")]
+            memh: None,
+        }
+    }
 }
 
 /// So a `PooledBuf` can back a `bytes::Bytes` via `Bytes::from_owner(pb)` — the
@@ -356,8 +437,8 @@ impl AsRef<[u8]> for PooledBuf {
 // make `PooledBuf` a first-class compio buffer so the EN read path can
 // `read_exact_at(pb, off)` straight into the registered, zeroed-once, pooled
 // slab — eliminating the per-op `vec![0u8; read_size]` (per-op malloc + an 8 MiB
-// memset that the pread immediately overwrites) and letting the UCX send find
-// the `ucp_mem_map` registration in the rcache (stable address = rcache hit).
+// memset that the pread immediately overwrites); `freeze` then sends it with
+// the slab's memh.
 //
 // compio's `read_exact_at` reads exactly `buf_capacity()` (= `as_uninit().len()`)
 // bytes and tracks progress with its own counter, so exposing the requested

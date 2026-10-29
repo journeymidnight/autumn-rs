@@ -1,6 +1,6 @@
 # autumn-rs feature list — OPEN backlog
 
-**Last updated:** 2026-10-23 (KV-cache tiering measured; four F-KVC-* entries)
+**Last updated:** 2026-10-29 (data-path redesign: F-DP-* entries)
 
 **Rules:**
 - This file tracks the **OPEN backlog only**. A feature that reaches `passes: true`
@@ -13,6 +13,53 @@
 ---
 
 ## Active
+
+> 数据通路重设计（2026-10-29 用户定稿）：设计页 https://claude.ai/artifact/E18oSqzHKbg2Vx1HqKKyo1 。
+> 三条规则：一种操作一种消息；数据永远在 value 区（ctrl 只放元数据）；前台数据在注册池里，UCX 不允许隐式注册。
+> 小于 64 KiB 允许拷贝一次，大于等于 64 KiB 全程零拷贝。以下 F-DP-* 按顺序实施。
+
+### F-DP-CHUNK-POOL — 注册池改为全局块池 + 块内带锁的 offset-allocator（第 2 步）
+- **Trigger**: 每线程一份、2 的幂分档、超上限退回未注册内存（违反不允许隐式注册）、跨线程 drop 计数只涨不降、换档注册/注销抖动。
+- **Scope**: 进程级块池（块按需注册、从不注销、Arc 持有、一块一个 memh 和一个带锁的 `offset-allocator`，4 KiB 单位）；按用途配额（接收 / 读回复 / 后台中转段），前台再分每分区上限 + 公共余量；有上限的等待，超时回 `Unavailable`，控制帧和 PING 不经池；批量请求一次申请；未鉴权连接限额连 value 一起算；单条超过块大小直接报错；TCP 同一个池但不注册；删掉未注册回退；`/metrics` 计数。
+- **Acceptance**: 微基准（混合大小在途负载，分配耗时与高水位）不差于现在；"池满 + 读写混合 + ≥64 KiB 读回复"的活性测试 PS、EN 都不卡死且超时请求重试成功；从大块中间发 64 KiB rendezvous 的测试通过；perf-check 四格 TCP/UCX 交替对照不降。
+- `passes: false`
+
+### F-DP-CALLER-REGISTER — 调用方内存显式注册，禁止隐式注册（第 3 步）
+- **Trigger**: UCX 用调用方内存（Python buffer、kvcache 页）今天靠 rcache 隐式注册；`RecvDest` 只有指针和长度。
+- **Scope**: Python `register(buf) -> handle` / `unregister`（TCP 空操作，只读内存注册时报错）；地址落在已注册区域的 put/get 自动带 memh，否则 UCX 下拷进 slab；UCX 收发接口只收带 memh 的切片（类型保证）；TCP 直接读写调用方内存；调用返回后传输层不再引用调用方内存（一并关闭 BUG-PY-PUT-BORROWED-MEMORY）。
+- **Acceptance**: 传裸指针或普通 `Bytes` 给 UCX 收发编译不过；只读 buffer 注册报错、不卡连接；超时返回后重用 buffer 不会被晚到的发送读到（去掉修复变红）；perf-check 不降。
+- `passes: false`
+
+### F-KVC-REGISTERED-L2 — autumn_kvcache 注册 L2，vLLM 换可复用缓冲（第 4 步，隔壁仓库）
+- **Trigger**: sglang 的 L2 host 池长期存在却每次靠 rcache；vLLM 每次 `.cpu()` / `np.empty` 新内存，UCX 上每次现注册。
+- **Scope**: sglang 后端在 `register_mem_pool_host` 注册整块 L2，`copy` 布局 scratch 也注册，关闭时注销；vLLM 连接器改用可复用 staging（注册一次）或 SDK 池缓冲；`AUTUMN_REV` 跟进。
+- **Acceptance**: UCX 上 sglang、vLLM e2e 输出正确（命中与不命中生成一致）；L3 读写不再拷进 slab；TCP 不变；L3 读写带宽与改前对比。
+- `passes: false`
+
+### F-DP-WAL-IN-POOL — WAL 批在池里拼，后台大块用堆（第 5 步）
+- **Scope**: WAL 批记录头另起一段、value 用收到的原 slab；大 value 只活到请求结束；后台大块（SST、compaction、GC、恢复、回放、EC）用堆，UCX 分段经池中转、TCP 直接收发；SST `finish()` 交出块列表不再拼接，flush 去掉整份拷贝。
+- **Acceptance**: 4K/8M 写 perf-check 不降；flush/compaction 输出在 TCP 上零拷贝、UCX 上每段一次；"隐式注册对比分段中转"测量定下段大小与在途段数。
+- `passes: false`
+
+### F-DP-ONE-READ — 读统一成一种消息（第 6 步）
+- **Scope**: PS 读 EN、client 直读、后台读共用 READ（长度模式：精确 / 按本地截短 / 读到尾；可选落点标签；可选附带块 CRC）；GET / BATCH_GET 回复"value 或位置"；接收合并为"落点"一种机制；删除 GET_BULK、GET_AM、GET_REDIRECT*、BATCH_GET_BULK、READ_BYTES*。
+- **Acceptance**: 读路径拷贝次数符合设计页的表；perf-check 读四格不降；直读失败回退经 PS 的测试；wire 升级按全停全启写进 ops.md。
+- `passes: false`
+
+### F-DP-ONE-WRITE — 写统一成一种消息（第 7 步）
+- **Scope**: PUT / BATCH_PUT / COMPARE_* 去掉 _BULK，数据一律在 value 区；rkyv 结构里的 `value: Vec<u8>` 字段全部删除；APPEND 统一为 payload CRC 在 ctrl；手写固定头（PUT_BULK 44 B、APPEND 32 B、WRITE_SHARD 52 B）改 rkyv，4K 写有可测回退则留作例外。
+- **Acceptance**: 写路径拷贝次数符合设计页的表；perf-check 写四格不降；wire 升级写进 ops.md，Python wheel 重建。
+- `passes: false`
+
+### F-DP-BACKGROUND — 后台数据传输统一（第 8 步）
+- **Scope**: 所有后台读改用 READ（恢复、peer copy、EC 重建、回放、checkpoint 读附带块 CRC，恢复出的副本直接写 `.ck`）；UCX 上写盘类与窗口类直接用 slab（0 拷贝），回放拷进堆；flush / compaction APPEND 在 UCX 上分段中转、EN 按段 pwritev；WRITE_SHARD 改 value 区 + CRC 在 ctrl；EN 之间复用连接、扇出并行；后台读与前台分开连接；删除 `MSG_COPY_EXTENT`。
+- **Acceptance**: 各后台任务拷贝次数符合设计页；恢复副本的块 CRC 核对能发现源端腐坏（测试）；前台 4K 写 p99 在 compaction / flush 进行中不变差；perf-check 不降。
+- `passes: false`
+
+### F-DP-CRC — CRC 整理（第 9 步）
+- **Scope**: payload CRC 在编码循环里顺带算、每批一次（不用 `crc32c_combine`）；EN 写入时记下写满的块（开放形态随 fsync 落盘），scrub 按 sealed_length 定稿、只重读尾块，首次记录只留作兜底；WRITE_SHARD 带 stripe CRC，分片持有者生成分片 `.ck`。
+- **Acceptance**: 写入后不经 scrub 首次记录即有 `.ck` 的测试；`truncate_to_commit` / fsync 失败后块 CRC 正确回退的测试；scrub 能用写入时的基准发现腐坏；perf-check 写不降。
+- `passes: false`
 
 ### BUG-PY-PUT-BORROWED-MEMORY — Python 写路径把调用方内存当 'static 交给传输层
 - **Trigger** (2026-10-24 评审): `python/src/lib.rs` 的 `BatchPutFrom`（带 TTL）与 `BatchClient` 的 Put 把调用方 buffer 包成 `Bytes::from_static` 交给 `put_many`。UCX 上 ≥64 KiB 的值走帧值 rendezvous（PS 取走前一直引用这块内存），小值拼进 ≥478 B 的流发送（零拷贝，逐段注册）。

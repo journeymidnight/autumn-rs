@@ -3665,17 +3665,16 @@ fn build_read_future(
                 }
                 // pread straight into a registered, pooled, zeroed-once
                 // slab — no per-op `vec![0u8; read_size]` alloc, no per-op 8 MiB
-                // memset (the pread overwrites it anyway), and the UCX send finds
-                // the `ucp_mem_map` registration via the rcache (stable slab
-                // address). The value `Bytes` aliases the slab
-                // (`Bytes::from_owner`) and returns it to the pool when the
-                // response write completes. 2 Bytes on the wire:
-                // [header+bulk_ctrl], [value] — no ReadBytesResp/Frame encode copy.
+                // memset (the pread overwrites it anyway). The value aliases the
+                // slab and keeps its memh, which the UCX send passes on; the slab
+                // returns to the pool when the response write completes. 2 Bytes
+                // on the wire: [header+bulk_ctrl], [value] — no
+                // ReadBytesResp/Frame encode copy.
                 let pb = autumn_transport::regpool_acquire(read_size as usize);
                 let BufResult(result, pb) = f.read_exact_at(pb, read_offset).await;
                 match result {
                     Ok(_) => {
-                        let value = Bytes::from_owner(pb);
+                        let value = pb.freeze();
                         match am_out.as_ref().filter(|_| value.len() >= autumn_rpc::BULK_MIN_BYTES) {
                             Some(am) => out.extend(am.frame_now(
                                 slot.req_id,
@@ -3686,7 +3685,7 @@ fn build_read_future(
                             )),
                             None => {
                                 out.push(bulk_read_head(slot.req_id, CODE_OK, "", value.len()));
-                                out.push(value);
+                                out.push(value.into_bytes());
                             }
                         }
                     }

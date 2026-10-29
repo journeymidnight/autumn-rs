@@ -20,14 +20,13 @@
 //!   connection.
 
 use crate::recv_dest::RecvDest;
-use crate::regpool::PooledBuf;
+use crate::regpool::{Memh, PooledBuf, RegBytes};
 use crate::ucx::endpoint::{
     await_pending, cb_send, classify_ptr, inline_storage, inline_storage_err, slot_acquire, slot_release, PtrStatus,
     UcxEp, SPIN_ITERS,
 };
 use crate::ucx::ffi::*;
 use crate::ucx::worker::ucs_err;
-use bytes::Bytes;
 use std::any::Any;
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
@@ -123,11 +122,18 @@ thread_local! {
     static NEXT_TAG: Cell<u64> = const { Cell::new(1) };
     /// Values received on this thread: (eager, rendezvous).
     static RECEIVED: Cell<(u64, u64)> = const { Cell::new((0, 0)) };
+    /// Values sent from this thread: (with a memh, without).
+    static SENT: Cell<(u64, u64)> = const { Cell::new((0, 0)) };
 }
 
 /// This thread's values received (eager copies, rendezvous receives).
 pub fn received_counts() -> (u64, u64) {
     RECEIVED.with(|c| c.get())
+}
+
+/// This thread's values sent (with their slab's memh, without one).
+pub fn sent_counts() -> (u64, u64) {
+    SENT.with(|c| c.get())
 }
 
 /// A tag no other value expected on this thread carries.
@@ -487,8 +493,9 @@ impl FrameValue {
 
 /// Send `value` as the AM `am_id` tagged `tag`. Completes once UCX no longer
 /// needs `value` (for a rendezvous: once the receiver fetched or dropped it).
-async fn send_am(ep: &UcxEp, am_id: u32, tag: u64, value: Bytes, extra_flags: u32) -> io::Result<()> {
-    let mut payload = ManuallyDrop::new(value);
+async fn send_am(ep: &UcxEp, am_id: u32, tag: u64, value: RegBytes, extra_flags: u32) -> io::Result<()> {
+    let memh = value.memh();
+    let mut payload = ManuallyDrop::new(value.into_bytes());
     let (ptr_v, len) = (payload.as_ptr() as *const c_void, payload.len());
     if len > 0 && inline_storage(&payload, ptr_v) {
         drop(ManuallyDrop::into_inner(payload));
@@ -510,6 +517,19 @@ async fn send_am(ep: &UcxEp, am_id: u32, tag: u64, value: Bytes, extra_flags: u3
         ucp_send_am_flags::UCP_AM_SEND_FLAG_EAGER
     };
     p.flags = (ucp_send_am_flags::UCP_AM_SEND_FLAG_COPY_HEADER | protocol) as u32 | extra_flags;
+    // A slab's own registration: UCX need not look the memory up.
+    let registered = match memh {
+        Some(Memh(memh)) => {
+            p.op_attr_mask |= ucp_op_attr_t::UCP_OP_ATTR_FIELD_MEMH as u32;
+            p.memh = memh;
+            true
+        }
+        None => false,
+    };
+    SENT.with(|c| {
+        let (with, without) = c.get();
+        c.set(if registered { (with + 1, without) } else { (with, without + 1) })
+    });
     let r = unsafe { ucp_am_send_nbx(ep.ptr(), am_id, header.as_ptr() as *const c_void, 8, ptr_v, len, &p) };
     let out = match classify_ptr(r) {
         PtrStatus::Done => {
@@ -534,12 +554,12 @@ async fn send_am(ep: &UcxEp, am_id: u32, tag: u64, value: Bytes, extra_flags: u3
 }
 
 /// Send `value` as the value the receiver asked for with `tag`.
-pub(crate) async fn send(ep: &UcxEp, tag: u64, value: Bytes) -> io::Result<()> {
+pub(crate) async fn send(ep: &UcxEp, tag: u64, value: RegBytes) -> io::Result<()> {
     send_am(ep, VALUE_AM_ID, tag, value, 0).await
 }
 
 /// Send `value` as the frame value tagged `tag`. The receiver keys it by
 /// the endpoint it arrived on, which the reply flag hands its handler.
-pub(crate) async fn send_frame_value(ep: &UcxEp, tag: u64, value: Bytes) -> io::Result<()> {
+pub(crate) async fn send_frame_value(ep: &UcxEp, tag: u64, value: RegBytes) -> io::Result<()> {
     send_am(ep, FRAME_VALUE_AM_ID, tag, value, ucp_send_am_flags::UCP_AM_SEND_FLAG_REPLY as u32).await
 }

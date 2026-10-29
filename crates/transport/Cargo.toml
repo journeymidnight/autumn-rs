@@ -34,5 +34,9 @@ harness = false
 name = "compio_features"
 harness = false
 
+[[bench]]
+name = "am_memh"
+harness = false
+
 [lints]
 workspace = true

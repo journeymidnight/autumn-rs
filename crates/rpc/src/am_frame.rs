@@ -9,7 +9,7 @@
 //! (`receive_value`) before the frame goes on, so frames keep their order.
 
 use crate::frame::{encode_am_frame, Frame};
-use autumn_transport::{am, PooledBuf, ReadHalf, WriteHalf};
+use autumn_transport::{am, PooledBuf, ReadHalf, RegBytes, WriteHalf};
 use bytes::Bytes;
 use std::cell::Cell;
 use std::rc::Rc;
@@ -36,14 +36,14 @@ impl AmOut {
 
     /// The stream buffers of the frame, and the values to `post` once it is
     /// certain to be written.
-    pub fn encode(
+    pub fn encode<V: Into<RegBytes>>(
         &self,
         req_id: u32,
         msg_type: u8,
         flags: u8,
         ctrl_parts: Vec<Bytes>,
-        value_parts: Vec<Bytes>,
-    ) -> (Vec<Bytes>, Vec<(u64, Bytes)>) {
+        value_parts: Vec<V>,
+    ) -> (Vec<Bytes>, Vec<(u64, RegBytes)>) {
         encode_am_frame(req_id, msg_type, flags, ctrl_parts, value_parts, || {
             let tag = self.next_tag.get();
             self.next_tag.set(tag + 1);
@@ -51,7 +51,7 @@ impl AmOut {
         })
     }
 
-    pub fn post(&self, values: Vec<(u64, Bytes)>) {
+    pub fn post(&self, values: Vec<(u64, RegBytes)>) {
         for (tag, v) in values {
             self.sender.post_frame_value(tag, v);
         }
@@ -59,13 +59,13 @@ impl AmOut {
 
     /// `encode` and `post` at once, for a reply that is written whatever
     /// happens (a server's): the frame's stream buffers.
-    pub fn frame_now(
+    pub fn frame_now<V: Into<RegBytes>>(
         &self,
         req_id: u32,
         msg_type: u8,
         flags: u8,
         ctrl_parts: Vec<Bytes>,
-        value_parts: Vec<Bytes>,
+        value_parts: Vec<V>,
     ) -> Vec<Bytes> {
         let (bufs, values) = self.encode(req_id, msg_type, flags, ctrl_parts, value_parts);
         self.post(values);

@@ -241,12 +241,12 @@ enum SubmitMsg {
         req_id: u32,
         /// Frame values to send beside the frame (`am_frame`), posted when
         /// the frame is written.
-        am: Vec<(u64, Bytes)>,
+        am: Vec<(u64, autumn_transport::RegBytes)>,
     },
     Prepared {
         bufs: Vec<Bytes>,
         req_id: u32,
-        am: Vec<(u64, Bytes)>,
+        am: Vec<(u64, autumn_transport::RegBytes)>,
     },
     /// A keepalive ping. Written like `Single`; the writer counts it once it
     /// is on the wire, which is when the keepalive starts timing the reply.
@@ -261,7 +261,7 @@ impl SubmitMsg {
         match self {
             SubmitMsg::Single { bytes, .. } | SubmitMsg::Ping { bytes, .. } => bytes.len() >= WINDOWED_FRAME_MIN_BYTES,
             SubmitMsg::Vectored { bufs, am, .. } | SubmitMsg::Prepared { bufs, am, .. } => {
-                bufs.iter().chain(am.iter().map(|(_, v)| v)).map(Bytes::len).sum::<usize>()
+                bufs.iter().map(Bytes::len).chain(am.iter().map(|(_, v)| v.len())).sum::<usize>()
                     >= WINDOWED_FRAME_MIN_BYTES
             }
         }
@@ -958,7 +958,7 @@ impl RpcClient {
         msg_type: u8,
         ctrl_parts: Vec<Bytes>,
         values: Vec<Bytes>,
-    ) -> (Vec<Bytes>, Vec<(u64, Bytes)>) {
+    ) -> (Vec<Bytes>, Vec<(u64, autumn_transport::RegBytes)>) {
         if let Some(out) = self.am_out.as_ref().filter(|_| AmOut::wants(&values)) {
             return out.encode(req_id, msg_type, 0, ctrl_parts, values);
         }
@@ -1430,7 +1430,7 @@ async fn writer_task(
                 (bufs.len(), total)
             }
         };
-        let post = |am: Vec<(u64, Bytes)>| {
+        let post = |am: Vec<(u64, autumn_transport::RegBytes)>| {
             if !am.is_empty() {
                 am_out.as_ref().expect("frame values only on a connection that sends them").post(am);
             }

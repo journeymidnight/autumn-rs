@@ -50,6 +50,7 @@
 //  error, no log, just wrong data. That has happened here before.
 // ═══════════════════════════════════════════════════════════════════════════
 
+use autumn_transport::RegBytes;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
 /// Frame header size in bytes.
@@ -369,18 +370,19 @@ fn split_am_pieces(region: &[u8], stream_len: usize) -> Result<(usize, Vec<AmPie
 /// at least `BULK_MIN_BYTES` becomes its own message (rendezvous moves only
 /// contiguous memory without a copy); smaller parts stay on the stream, one
 /// piece per run of them. `next_tag` gives tags unique on the connection.
-pub fn encode_am_frame(
+pub fn encode_am_frame<V: Into<RegBytes>>(
     req_id: u32,
     msg_type: u8,
     flags: u8,
     ctrl_parts: Vec<Bytes>,
-    value_parts: Vec<Bytes>,
+    value_parts: Vec<V>,
     mut next_tag: impl FnMut() -> u64,
-) -> (Vec<Bytes>, Vec<(u64, Bytes)>) {
+) -> (Vec<Bytes>, Vec<(u64, RegBytes)>) {
     let mut pieces: Vec<AmPiece> = Vec::new();
     let mut inline = Vec::new();
     let mut am = Vec::new();
     for part in value_parts {
+        let part = part.into();
         if part.len() >= autumn_transport::BULK_MIN_BYTES {
             let tag = next_tag();
             pieces.push((part.len(), tag));
@@ -390,7 +392,7 @@ pub fn encode_am_frame(
                 Some((len, 0)) => *len += part.len(),
                 _ => pieces.push((part.len(), 0)),
             }
-            inline.push(part);
+            inline.push(part.into_bytes());
         }
     }
     let mut list = BytesMut::with_capacity(pieces.len() * AM_PIECE_LEN + AM_COUNT_LEN);
@@ -1014,6 +1016,7 @@ mod tests {
         let parts: Vec<Bytes> = [100, big, 50, 30, 1 << 20].iter().map(|&n| Bytes::from(vec![n as u8; n])).collect();
         let mut tags = 41..;
         let (bufs, am) = encode_am_frame(9, 0x51, 0, vec![Bytes::from_static(b"meta")], parts.clone(), || tags.next().unwrap());
+        let am: Vec<(u64, Bytes)> = am.into_iter().map(|(t, v)| (t, v.into_bytes())).collect();
         assert_eq!(am, vec![(41, parts[1].clone()), (42, parts[4].clone())]);
         let wire = bufs.concat();
         let mut list = Vec::new();

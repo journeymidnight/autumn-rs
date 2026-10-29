@@ -14,6 +14,11 @@ fn rendezvous_count() -> u64 {
     autumn_transport::am::received_counts().1
 }
 
+/// AM values sent from this thread: (with their slab's memh, without).
+fn sent_counts() -> (u64, u64) {
+    autumn_transport::am::sent_counts()
+}
+
 /// Both tests share the process, so either may be the one that arms zerocopy.
 fn arm_zerocopy_if_requested() {
     if std::env::var_os("AUTUMN_TEST_ZEROCOPY").is_some() {
@@ -24,12 +29,13 @@ fn arm_zerocopy_if_requested() {
 /// An extent node serving on its own thread (its own UCX worker, so the
 /// connection takes the NIC as between processes rather than UCX's `self`
 /// transport, which registers no memory). Stop it with the sender; it answers
-/// with its thread's rendezvous receives.
+/// with its thread's rendezvous receives and its AM values sent (with their
+/// slab's memh, without).
 fn node_on_its_own_thread(
     bind: std::net::SocketAddr,
     kind: autumn_transport::TransportKind,
     dir: std::path::PathBuf,
-) -> (std::net::SocketAddr, std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<u64>) {
+) -> (std::net::SocketAddr, std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<(u64, (u64, u64))>) {
     let (addr_tx, addr_rx) = std::sync::mpsc::channel();
     let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
     let (count_tx, count_rx) = std::sync::mpsc::channel();
@@ -51,7 +57,7 @@ fn node_on_its_own_thread(
             while matches!(stop_rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)) {
                 compio::time::sleep(Duration::from_millis(20)).await;
             }
-            count_tx.send(rendezvous_count()).unwrap();
+            count_tx.send((rendezvous_count(), sent_counts())).unwrap();
         })
     });
     (addr_rx.recv().unwrap(), stop_tx, count_rx)
@@ -153,11 +159,14 @@ async fn prepared_large_appends_preserve_content_and_offsets() {
     let disk = std::fs::read(dir.path().join(format!("{shard:02x}/extent-701.dat"))).unwrap();
     assert_eq!(disk.as_slice(), reply.buf.as_ref());
     stop_node.send(()).unwrap();
-    let node_rendezvous = node_rendezvous.recv().unwrap();
+    let (node_rendezvous, node_sent) = node_rendezvous.recv().unwrap();
     if ucx() {
         // The single-part appends came to the node as frame values; the
         // 1 KiB-part append stayed on the stream.
         assert_eq!(node_rendezvous, 3);
+        // Every read reply (the whole extent, then 64 of 64 KiB) left as a
+        // frame value from its pool slab, handing UCX the slab's memh.
+        assert_eq!(node_sent, (65, 0));
     }
 }
 

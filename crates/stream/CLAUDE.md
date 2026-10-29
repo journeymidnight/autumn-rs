@@ -365,9 +365,11 @@ nothing is appended (the stream client treats it as a failed replica). One
 read pass over the payload per replica replaces the unpack copy. A burst whose
 value is still on its way holds the connection loop, as a stream value did.
 `READ_BYTES_BULK` replies of 64 KiB or more go the same way (`AmOut::frame_now`),
-to the PS and to a client reading directly. Test: `tests/prepared_append.rs`
-over UCX (`AUTUMN_TEST_UCX_BIND`): appends and the read reply counted as
-rendezvous receives, a payload that misses its crc refused.
+to the PS and to a client reading directly; the reply value is the pool slab
+it was read into (`PooledBuf::freeze`), so the send hands UCX the slab's memh.
+Test: `tests/prepared_append.rs` over UCX (`AUTUMN_TEST_UCX_BIND`): appends and
+the read reply counted as rendezvous receives, the 65 read replies counted as
+sent with a memh, a payload that misses its crc refused.
 
 **Extent-len reservation**: `build_append_future` stores `extent.len =
 total_end` BEFORE returning the I/O future into FU, so overlapping same-extent

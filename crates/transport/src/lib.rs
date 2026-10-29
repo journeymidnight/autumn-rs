@@ -37,7 +37,7 @@ mod regpool;
 
 pub use regpool::{
     acquire as regpool_acquire, set_regpool_cap_bytes,
-    snapshot as regpool_snapshot, PooledBuf, RegpoolStats,
+    snapshot as regpool_snapshot, PooledBuf, RegBytes, RegpoolStats,
 };
 pub use recv_dest::{RecvDest, Released};
 
@@ -70,6 +70,14 @@ pub mod am {
     pub fn received_counts() -> (u64, u64) {
         #[cfg(feature = "ucx")]
         return crate::ucx::am::received_counts();
+        #[cfg(not(feature = "ucx"))]
+        (0, 0)
+    }
+
+    /// This thread's values sent: (with their slab's memh, without).
+    pub fn sent_counts() -> (u64, u64) {
+        #[cfg(feature = "ucx")]
+        return crate::ucx::am::sent_counts();
         #[cfg(not(feature = "ucx"))]
         (0, 0)
     }
@@ -119,9 +127,9 @@ pub mod am {
 
     impl Sender {
         /// Completes once the receiver fetched or dropped `value`.
-        pub async fn send(&self, tag: u64, value: bytes::Bytes) -> io::Result<()> {
+        pub async fn send(&self, tag: u64, value: impl Into<crate::RegBytes>) -> io::Result<()> {
             #[cfg(feature = "ucx")]
-            return crate::ucx::am::send(&self.ep, tag, value).await;
+            return crate::ucx::am::send(&self.ep, tag, value.into()).await;
             #[cfg(not(feature = "ucx"))]
             {
                 let _ = (tag, value);
@@ -133,9 +141,10 @@ pub mod am {
         /// connection) and return at once; the send runs on its own task,
         /// holding `value` until the receiver fetched it. The frame that names
         /// the tag may go before or after it.
-        pub fn post_frame_value(&self, tag: u64, value: bytes::Bytes) {
+        pub fn post_frame_value(&self, tag: u64, value: impl Into<crate::RegBytes>) {
             #[cfg(feature = "ucx")]
             {
+                let value = value.into();
                 let ep = self.ep.clone();
                 compio::runtime::spawn(async move {
                     if let Err(e) = crate::ucx::am::send_frame_value(&ep, tag, value).await {

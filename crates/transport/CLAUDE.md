@@ -63,9 +63,9 @@ through unregister and register; the eviction counters show it.
 ## UCX library version and two worked-around defects
 
 `init_with(Ucx)` exits 2 on UCX < 1.17 (`check_library`, `ucp_get_version`); the
-Python binding checks first and raises. An active-message value is sent with no
-memh, so its memory goes through UCX's registration cache (stream sends leave
-from the registered pool, below).
+Python binding checks first and raises. An active-message value that is not a
+`RegBytes` from a pool slab is sent with no memh, so its memory goes through
+UCX's registration cache (stream sends leave from the registered pool, below).
 In 1.16 the cache's worker fast path (`ucs_rcache_lookup_unsafe`, non-atomic
 refcount under the context mt_lock only) raced the memory-event callback, which
 invalidated regions on whatever thread called `munmap`/`madvise` (jemalloc purges);
@@ -301,6 +301,30 @@ PS, the EN and the client over a 512 MiB cap fell from 8.5 to 3.0–3.7 GB/s
 Test: `tests/ucx_send_staged.rs` (a send and a vectored send out of `.rodata`,
 which cannot be registered, arrive; red without the staging: `ibv_reg_mr`
 fails with Bad address).
+
+### A pool slab's value carries its memh (`RegBytes`)
+
+`PooledBuf::freeze` turns a slab into a `RegBytes`: the filled bytes (owning the
+slab, which keeps the registration mapped) and the slab's memh. `send_am` passes
+that memh (`UCP_OP_ATTR_FIELD_MEMH`), so UCX does not look the memory up;
+`From<Bytes>` carries none and falls back to the cache. `am::Sender` and
+autumn-rpc's `AmOut` / `encode_am_frame` take `impl Into<RegBytes>`. Today the
+extent node's bulk read reply sends that way; the other producers still hand
+plain `Bytes` (the data-path redesign converts them and then forbids values with
+no memh). `am::sent_counts()` reports this thread's sends with and without a
+memh. Without a memh, UCX takes the context lock the workers share for every
+cache lookup (`ucp_memh_get`); with one it skips the lookup and the lock.
+Measured (`benches/am_memh.rs`: slabs sent over and over, each sender thread to
+its own receiver thread, rc_mlx5, alternating arms): one sender, no difference
+(~10.8 GB/s NIC-bound; sender CPU per message 64 KiB 2.5–2.6 µs, 1 MiB
+7.3–7.9 µs, 8 MiB ~17.5 µs either way); eight senders, the lock shows: CPU per
+message with the memh 3.3–4.6 / 8.9–9.5 / 28–29 µs against 9.4–31.8 /
+13.5–90.8 / 32–38 µs through the cache, and one 64 KiB cache round fell from
+~30 to 11.4 GB/s. perf-check (`--ucx --3disk`, 8 partitions, 8 MiB, 20 s,
+interleaved against the build before): read 12195 / 11264 → 13736 / 13948 MB/s
+(p99 528 / 704 → 466 / 482 ms), write 2707 / 2615 vs 2630 / 2597 MB/s. Test:
+autumn-stream `tests/prepared_append.rs` over UCX counts the node's 65 read
+replies as sent with a memh (red with `RegBytes::from(Bytes::from_owner(pb))`).
 
 ### An active-message value must be registrable: never `Bytes::from_static`
 

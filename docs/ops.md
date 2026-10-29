@@ -3467,9 +3467,17 @@ cargo test -p autumn-rpc --lib -- am_frame prepared_payload frame_value
 AUTUMN_UCX_TEST_BIND='[<roce-ip>]:0' UCX_TLS=rc_mlx5,ud_mlx5,tcp,self UCX_NET_DEVICES=<dev>:1 \
   cargo test -p autumn-transport --features ucx --test ucx_am_frame
 # needs the RoCE bind and this UCX_TLS: the read burst only goes red over a
-# transport that registers memory (rc_mlx5), never over `self` or shared memory
+# transport that registers memory (rc_mlx5), never over `self` or shared memory;
+# it also checks the node's read replies were sent with their slab's memh (65, 0)
 AUTUMN_TEST_UCX_BIND='[<roce-ip>]:0' UCX_TLS=rc_mlx5,ud_mlx5,tcp,self UCX_NET_DEVICES=<dev>:1 \
   cargo test -p autumn-stream --features autumn-rpc/ucx --test prepared_append
+# frame values from pool slabs with their memh vs through UCX's cache; build
+# first, then pin to idle cores on the NIC's NUMA node (each sender has its own
+# receiver thread). One sender: the arms match. Eight: "slab" needs a fraction of
+# the sender cpu/msg of "rcache" (64 KiB ~4 vs ~10+ µs).
+cargo bench -p autumn-transport --features ucx --bench am_memh --no-run
+AUTUMN_UCX_TEST_BIND='[<roce-ip>]:0' UCX_TLS=rc_mlx5,ud_mlx5,tcp,self UCX_NET_DEVICES=<dev>:1 \
+  AM_MEMH_SENDERS=8 taskset -c <16 idle cores> cargo bench -p autumn-transport --features ucx --bench am_memh
 # live (UCX cluster up, namespace bench created): sizes around the 64 KiB cut, compared byte for byte
 AC=(target/release/autumn-client --manager "[<roce-ip>]:9001" --transport ucx --namespace bench/perf)
 for n in 1000 65535 65536 100000 1048583 8388608 34603017; do
