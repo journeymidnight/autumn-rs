@@ -3591,7 +3591,7 @@ fn decode_append(frame: &Frame) -> Result<AppendReq, &'static str> {
     if frame.value.is_empty() {
         AppendReq::decode(frame.payload.clone())
     } else {
-        AppendReq::decode_checked(frame.payload.clone(), frame.value.clone())
+        AppendReq::decode_checked(frame.payload.clone(), frame.value.bytes().clone())
     }
 }
 

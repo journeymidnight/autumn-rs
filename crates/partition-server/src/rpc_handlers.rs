@@ -945,7 +945,7 @@ pub(crate) struct Conditional {
     pub(crate) key: Vec<u8>,
     pub(crate) expected: Option<Vec<u8>>,
     /// Some writes this value; None deletes the key.
-    pub(crate) value: Option<Bytes>,
+    pub(crate) value: Option<autumn_transport::RegBytes>,
     pub(crate) expires_at: u64,
     pub(crate) inode_hint: u64,
     pub(crate) lease_epoch: u64,
@@ -954,7 +954,7 @@ pub(crate) struct Conditional {
 pub(crate) fn decode_conditional(
     msg_type: u8,
     payload: &Bytes,
-    bulk_value: Option<Bytes>,
+    bulk_value: Option<autumn_transport::RegBytes>,
 ) -> Result<Conditional, (StatusCode, String)> {
     let invalid = |e| (StatusCode::InvalidArgument, e);
     let too_large = || (StatusCode::InvalidArgument, "compare_put value exceeds 64 KiB".to_string());
@@ -1002,7 +1002,7 @@ pub(crate) fn decode_conditional(
                 region_epoch: req.region_epoch,
                 key: req.key,
                 expected: req.expected,
-                value: req.value.map(Bytes::from),
+                value: req.value.map(|v| Bytes::from(v).into()),
                 expires_at: 0,
                 inode_hint: req.inode_hint,
                 lease_epoch: req.lease_epoch,
@@ -1015,7 +1015,7 @@ pub(crate) fn decode_conditional(
                 region_epoch: req.region_epoch,
                 key: req.key,
                 expected: req.expected,
-                value: Some(Bytes::from(req.value)),
+                value: Some(Bytes::from(req.value).into()),
                 expires_at: 0,
                 inode_hint: 0,
                 lease_epoch: 0,
@@ -1044,7 +1044,7 @@ pub(crate) async fn compare_write_admit(
     let key = req.key.clone();
     // In the body, as `enqueue_put_bulk` does: a frame-level error reads as a
     // routing miss and the client would re-send the value until it gave up.
-    if let Some(len) = req.value.as_ref().map(Bytes::len).filter(|&n| n > AUTUMN_PS_MAX_INLINE_BYTES_DEFAULT as usize) {
+    if let Some(len) = req.value.as_ref().map(|v| v.len()).filter(|&n| n > AUTUMN_PS_MAX_INLINE_BYTES_DEFAULT as usize) {
         let message = format!("value {len} bytes exceeds inline cap {AUTUMN_PS_MAX_INLINE_BYTES_DEFAULT}");
         let _ = outer.send(Ok(rkyv_encode(&PutResp { code: CODE_VALUE_TOO_LARGE, message, key })));
         return;

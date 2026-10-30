@@ -164,7 +164,13 @@ first frame with CrcMismatch instead of reaching the version handshake).
 ### Prepared replica payloads
 
 `PreparedPayload` owns the message head (an append's 32-byte header), the body
-segments and their total length.
+segments (`RegBytes`: a segment from a pool buffer keeps its memh, which the
+frame-value send hands UCX) and their total length. `Frame.value` is a
+`RegBytes` too: `am_frame::into_frame` and `read_loop` freeze the pool buffer a
+value was received into, keeping its memh (`tests/am_value_budget.rs` asserts
+it; stream `tests/prepared_append.rs`
+`an_append_from_a_pool_buffer_carries_its_memh` counts the append sent with
+it — each red when the memh is dropped).
 `frame_parts` gives each replica connection a frame carrying its own req_id,
 and the checksum cannot be paired with different bytes through the public API.
 The frame's bytes and full header/control coverage are unchanged; no

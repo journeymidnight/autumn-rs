@@ -2,7 +2,7 @@
 //!
 //! A chunk is one anonymous mapping, registered with the NIC once when the
 //! process transport is UCX (`ucp_mem_map`, never unmapped while the process
-//! lives) and never registered on TCP, where the pool only saves the allocation
+//! lives, overflow chunks aside — below) and never registered on TCP, where the pool only saves the allocation
 //! and the zeroing. Inside a chunk an `offset_allocator::Allocator` (TLSF-like,
 //! O(1), metadata outside the memory) hands out 4 KiB-granular ranges; each
 //! buffer keeps its chunk alive (`Arc`), so its memh stays valid for as long as
@@ -140,6 +140,8 @@ pub fn log_snapshot() {
         receive = %format_args!("{rx}"),
         reply = %format_args!("{reply}"),
         staging = %format_args!("{staging}"),
+        am_sent_bytes_memh = am_sent_bytes().0,
+        am_sent_bytes_no_memh = am_sent_bytes().1,
         "regpool"
     );
 }
@@ -189,6 +191,10 @@ pub fn render_prometheus(prefix: &str) -> String {
         ("use_refused_total", "counter", |u| u.refused as f64),
         ("use_too_large_total", "counter", |u| u.too_large as f64),
     ];
+    let (with, without) = am_sent_bytes();
+    out.push_str(&format!(
+        "# TYPE {prefix}_ucx_am_sent_bytes_total counter\n{prefix}_ucx_am_sent_bytes_total{{memh=\"yes\"}} {with}\n{prefix}_ucx_am_sent_bytes_total{{memh=\"no\"}} {without}\n"
+    ));
     for (name, kind, f) in per_use {
         out.push_str(&format!("# TYPE {prefix}_regpool_{name} {kind}\n"));
         for (label, u) in USE_NAMES.iter().zip(&s.uses) {
@@ -196,6 +202,14 @@ pub fn render_prometheus(prefix: &str) -> String {
         }
     }
     out
+}
+
+/// Active-message bytes sent with a memh and without (0 without UCX).
+fn am_sent_bytes() -> (u64, u64) {
+    #[cfg(feature = "ucx")]
+    return crate::ucx::am::sent_bytes();
+    #[cfg(not(feature = "ucx"))]
+    (0, 0)
 }
 
 pub fn snapshot() -> RegpoolStats {
@@ -514,7 +528,7 @@ impl PooledBuf {
     /// UCX send passes the memh instead of looking the memory up.
     pub fn freeze(self) -> RegBytes {
         #[cfg(feature = "ucx")]
-        let memh = self.reg().map(|r| Memh(r.memh()));
+        let memh = self.reg().and_then(|r| std::ptr::NonNull::new(r.memh()).map(Memh));
         RegBytes {
             bytes: bytes::Bytes::from_owner(self),
             #[cfg(feature = "ucx")]
@@ -527,7 +541,14 @@ impl PooledBuf {
 /// chunk, which keeps the registration mapped for as long as the handle is held.
 #[cfg(feature = "ucx")]
 #[derive(Clone, Copy)]
-pub(crate) struct Memh(pub(crate) crate::ucx::ffi::ucp_mem_h);
+pub(crate) struct Memh(std::ptr::NonNull<crate::ucx::ffi::ucp_mem>);
+
+#[cfg(feature = "ucx")]
+impl Memh {
+    pub(crate) fn raw(self) -> crate::ucx::ffi::ucp_mem_h {
+        self.0.as_ptr()
+    }
+}
 
 // SAFETY: a memh belongs to the process-global UCX context, not a thread.
 #[cfg(feature = "ucx")]
@@ -573,6 +594,42 @@ impl RegBytes {
     #[cfg(feature = "ucx")]
     pub(crate) fn memh(&self) -> Option<Memh> {
         self.memh
+    }
+
+    /// A part of these bytes, keeping their registration. An empty part is
+    /// a static `Bytes` that no longer holds the buffer, so it keeps none.
+    pub fn slice(&self, range: impl std::ops::RangeBounds<usize>) -> Self {
+        let bytes = self.bytes.slice(range);
+        Self {
+            #[cfg(feature = "ucx")]
+            memh: self.memh.filter(|_| !bytes.is_empty()),
+            bytes,
+        }
+    }
+}
+
+impl Default for RegBytes {
+    fn default() -> Self {
+        bytes::Bytes::new().into()
+    }
+}
+
+impl AsRef<[u8]> for RegBytes {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+impl std::ops::Deref for RegBytes {
+    type Target = bytes::Bytes;
+    fn deref(&self) -> &bytes::Bytes {
+        &self.bytes
+    }
+}
+
+impl From<RegBytes> for bytes::Bytes {
+    fn from(r: RegBytes) -> Self {
+        r.bytes
     }
 }
 

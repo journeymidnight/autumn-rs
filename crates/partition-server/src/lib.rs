@@ -1808,7 +1808,9 @@ pub(crate) struct RowInvalidateBarrierReq {
 pub(crate) enum WriteOp {
     Put {
         user_key: Bytes,
-        value: Bytes,
+        /// A value received into a pool buffer keeps its registration through
+        /// to the log append.
+        value: autumn_transport::RegBytes,
         expires_at: u64,
     },
     Delete {
@@ -2244,7 +2246,9 @@ pub struct PartitionRequest {
     /// instead of slicing the value out of `payload` (which would require
     /// concatenating it back in — the copy we're avoiding). `None` for every
     /// other request (the value, if any, is sliced from `payload` as before).
-    bulk_value: Option<Bytes>,
+    /// A value received into a pool buffer keeps its registration, which the
+    /// append to the extent nodes hands UCX.
+    bulk_value: Option<autumn_transport::RegBytes>,
 }
 
 /// Handle to a running partition thread.
@@ -5124,7 +5128,7 @@ async fn drain_bulk_writes(
                     anyhow!("eof/io mid bulk write value (msg_type={msg_type:#x}, tcp bulk-recv): {e}")
                 })?;
         }
-        let value = Bytes::from_owner(pb);
+        let value = pb.freeze();
         // Receiving may yield long enough for a namespace removal, key
         // revocation or token expiry. Match normal dispatch's admission-time
         // check rather than relying on the pre-receive snapshot.
@@ -5267,7 +5271,7 @@ async fn delegate_round_trip(
     req_id: u32,
     msg_type: u8,
     payload: Bytes,
-    bulk_value: Option<Bytes>,
+    bulk_value: Option<autumn_transport::RegBytes>,
     owner_part: u64,
 ) -> Bytes {
     let (resp_tx, resp_rx) = oneshot::channel();
@@ -8498,7 +8502,7 @@ fn mem_tier_put(
             }
             let key = req.payload.slice(PUT_BULK_HEADER_LEN..meta.value_offset);
             let value = match &req.bulk_value {
-                Some(v) => v.clone(),
+                Some(v) => v.bytes().clone(),
                 None => req.payload.slice(meta.value_offset..),
             };
             (key, value, meta.expires_at, meta.region_epoch)
@@ -8561,7 +8565,7 @@ fn mem_tier_batch_put(
         (b.region_epoch, ops)
     } else {
         let Ok(b) = partition_rpc::rkyv_decode::<partition_rpc::BatchPutBulkReq>(&req.payload) else { return Some(req) };
-        let values = req.bulk_value.clone().unwrap_or_default();
+        let values = req.bulk_value.as_ref().map(|v| v.bytes().clone()).unwrap_or_default();
         if b.ops.iter().map(|o| o.value_len as u64).sum::<u64>() != values.len() as u64 {
             return Some(req);
         }
@@ -8745,7 +8749,7 @@ fn enqueue_put(
             pending.push(WriteRequest {
                 op: WriteOp::Put {
                     user_key: Bytes::from(put_req.key),
-                    value: Bytes::from(put_req.value),
+                    value: Bytes::from(put_req.value).into(),
                     expires_at: put_req.expires_at,
                 },
                 resp: WriteResponder::Put {
@@ -8863,7 +8867,7 @@ fn enqueue_batch_put(
         pending.push(WriteRequest {
             op: WriteOp::Put {
                 user_key: Bytes::from(op.key),
-                value: Bytes::from(op.value),
+                value: Bytes::from(op.value).into(),
                 expires_at: op.expires_at,
             },
             resp: WriteResponder::BatchPut {
@@ -9122,7 +9126,7 @@ fn enqueue_put_bulk(
     // before. `payload` holds only `[meta][key]` in the bulk_value case.
     let value = match req.bulk_value {
         Some(v) => v,
-        None => req.payload.slice(meta.value_offset..),
+        None => req.payload.slice(meta.value_offset..).into(),
     };
     if value.len() > AUTUMN_PS_MAX_INLINE_BYTES_DEFAULT as usize {
         let resp = PutResp {
@@ -12591,7 +12595,7 @@ mod merged_loop_tests {
                 msg_type: MSG_PUT_BULK,
                 payload: partition_rpc::encode_put_bulk_meta(0, 0, 0, b"f/7", 7, lease_epoch),
                 resp_tx,
-                bulk_value: Some(Bytes::from(value)),
+                bulk_value: Some(Bytes::from(value).into()),
             };
             (req, resp_rx)
         };
@@ -14980,7 +14984,7 @@ mod write_batch_ceiling_tests {
         WriteRequest {
             op: WriteOp::Put {
                 user_key: Bytes::from_static(b"k"),
-                value: Bytes::from(vec![0u8; value_len]),
+                value: Bytes::from(vec![0u8; value_len]).into(),
                 expires_at: 0,
             },
             resp: WriteResponder::Put {

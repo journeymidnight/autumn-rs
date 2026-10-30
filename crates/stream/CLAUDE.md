@@ -1151,7 +1151,10 @@ durable, manager unreachable). Chaining is only where it was first observed.
 
 `launch_append` creates one `PreparedPayload` including the AppendReq header for
 every star-replicated append, at every size and replica count, and sends it to
-each replica with `send_prepared`. The wire bytes are identical to a per-replica
+each replica with `send_prepared`. Its body is the caller's segments as
+`RegBytes` (`append_segments`): a PS's segment that is a value it received into
+a pool buffer keeps that buffer's memh, and a UCX frame-value send hands it to
+UCX instead of having UCX look the memory up. The wire bytes are identical to a per-replica
 vectored send, so this site has nothing to choose between; submission order,
 full transit CRC and all-replica ACK behavior are unchanged.
 

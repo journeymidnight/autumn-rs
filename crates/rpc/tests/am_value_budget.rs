@@ -64,6 +64,7 @@ async fn a_read_loop_takes_values_against_the_budget() {
     let frame = send(&sender, &mut writer, 1, 11, &big).await;
     let got = take(&reader, frame, WhenFull::Refuse).await.unwrap_or_else(|e| panic!("refused: {e}"));
     assert_eq!(&got.value[..], &big[..]);
+    assert!(got.value.is_registered(), "a value received into a pool buffer keeps its memh");
 
     // This thread's share held: a refusing loop answers Unavailable.
     let mut held = Vec::new();

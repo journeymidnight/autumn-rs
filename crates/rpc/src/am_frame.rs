@@ -31,8 +31,8 @@ impl AmOut {
     }
 
     /// Whether a frame with these value parts goes with active messages.
-    pub fn wants(value_parts: &[Bytes]) -> bool {
-        value_parts.iter().any(|p| p.len() >= autumn_transport::BULK_MIN_BYTES)
+    pub fn wants<V: AsRef<[u8]>>(value_parts: &[V]) -> bool {
+        value_parts.iter().any(|p| p.as_ref().len() >= autumn_transport::BULK_MIN_BYTES)
     }
 
     /// The stream buffers of the frame, and the values to `post` once it is
@@ -215,7 +215,7 @@ impl Incoming {
     pub async fn into_frame(self, reader: &ReadHalf) -> Result<Frame, IncomingError> {
         let (mut frame, value) = self.into_parts(reader).await?;
         if let Some(pb) = value {
-            frame.value = Bytes::from_owner(pb);
+            frame.value = pb.freeze();
         }
         Ok(frame)
     }

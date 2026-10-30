@@ -105,8 +105,10 @@ pub struct Frame {
     pub payload: Bytes,
     /// Raw value tail — NOT covered by the frame CRC (transport + storage
     /// integrity). Empty for non-value-separable frames. For a frame with
-    /// `am_pieces`, only the pieces that came on the stream.
-    pub value: Bytes,
+    /// `am_pieces`, only the pieces that came on the stream. A value received
+    /// into a pool buffer keeps its registration, so sending it on (a PS's
+    /// append to the extent nodes) hands UCX the buffer's memh.
+    pub value: RegBytes,
     /// The value's pieces when some come as active messages
     /// (`FLAG_AM_VALUE`); the receiver assembles it (`am_frame::receive_value`).
     pub am_pieces: Option<Vec<AmPiece>>,
@@ -120,7 +122,7 @@ impl Frame {
             msg_type,
             flags: 0,
             payload,
-            value: Bytes::new(),
+            value: RegBytes::default(),
             am_pieces: None,
         }
     }
@@ -132,7 +134,7 @@ impl Frame {
             msg_type,
             flags: FLAG_RESPONSE,
             payload,
-            value: Bytes::new(),
+            value: RegBytes::default(),
             am_pieces: None,
         }
     }
@@ -145,7 +147,7 @@ impl Frame {
             msg_type,
             flags: FLAG_RESPONSE | FLAG_ERROR,
             payload,
-            value: Bytes::new(),
+            value: RegBytes::default(),
             am_pieces: None,
         }
     }
@@ -158,7 +160,7 @@ impl Frame {
             msg_type,
             flags: 0,
             payload: ctrl,
-            value,
+            value: value.into(),
             am_pieces: None,
         }
     }
@@ -171,7 +173,7 @@ impl Frame {
             msg_type,
             flags: FLAG_RESPONSE,
             payload: ctrl,
-            value,
+            value: value.into(),
             am_pieces: None,
         }
     }
@@ -447,7 +449,9 @@ const COMBINE_MIN_BYTES: usize = 1024 * 1024;
 pub struct PreparedPayload {
     /// The message header ahead of the body (an append's 32 bytes).
     head: Bytes,
-    body: Vec<Bytes>,
+    /// Each part keeps the registration it came with: a value received into a
+    /// pool buffer goes out with that buffer's memh.
+    body: Vec<RegBytes>,
     len: usize,
     /// Whether sharing one scan across `frames` beats re-scanning; otherwise
     /// every `frame_parts` scans for itself, which is what a per-frame vectored
@@ -467,19 +471,20 @@ impl PreparedPayload {
     /// replica. It is an input because the trade-off depends on it: the shared
     /// scan is only amortised over the frames AFTER the first, so a single
     /// frame can never win it back, however large the payload.
-    pub fn new(head: Bytes, body: Vec<Bytes>, frames: usize) -> Self {
-        let len = head.len() + body.iter().map(Bytes::len).sum::<usize>();
+    pub fn new<B: Into<RegBytes>>(head: Bytes, body: Vec<B>, frames: usize) -> Self {
+        let body: Vec<RegBytes> = body.into_iter().map(Into::into).collect();
+        let len = head.len() + body.iter().map(|p| p.len()).sum::<usize>();
         let shared = frames > 1 && len >= COMBINE_MIN_BYTES;
         Self { head, body, len, shared, crc: std::cell::OnceCell::new(), body_crc: std::cell::OnceCell::new() }
     }
 
-    pub fn body(&self) -> &[Bytes] {
+    pub fn body(&self) -> &[RegBytes] {
         &self.body
     }
 
     pub(crate) fn frame_parts(&self, req_id: u32, msg_type: u8) -> Vec<Bytes> {
         let head = encode_vectored_head(req_id, msg_type, 0, self.len, 0);
-        let parts = || std::iter::once(&self.head).chain(&self.body);
+        let parts = || std::iter::once(&self.head).chain(self.body.iter().map(|p| p.bytes()));
         let crc = if self.shared {
             let payload_crc = *self.crc.get_or_init(|| parts().fold(0, |crc, p| crc32c::crc32c_append(crc, p)));
             crc32c::crc32c_combine(crc32c::crc32c(&head), payload_crc, self.len).to_le_bytes()
@@ -496,7 +501,7 @@ impl PreparedPayload {
     /// The ctrl and value parts of a frame whose body travels as frame
     /// values: ctrl = `[head][crc32c(body): u32 LE]`, which keeps the body
     /// end-to-end checked though no frame CRC covers it.
-    pub(crate) fn am_parts(&self) -> (Vec<Bytes>, Vec<Bytes>) {
+    pub(crate) fn am_parts(&self) -> (Vec<Bytes>, Vec<RegBytes>) {
         let crc = *self.body_crc.get_or_init(|| self.body.iter().fold(0, |crc, p| crc32c::crc32c_append(crc, p)));
         (vec![self.head.clone(), Bytes::copy_from_slice(&crc.to_le_bytes())], self.body.clone())
     }
@@ -737,7 +742,7 @@ impl FrameDecoder {
             msg_type,
             flags,
             payload,
-            value,
+            value: value.into(),
             am_pieces,
         }))
     }
@@ -1033,7 +1038,7 @@ mod tests {
         decoder.feed(&wire);
         let frame = decoder.try_decode().unwrap().unwrap();
         assert_eq!(frame.payload.as_ref(), b"meta");
-        assert_eq!(frame.value, [parts[0].clone(), parts[2].clone(), parts[3].clone()].concat());
+        assert_eq!(*frame.value, [parts[0].clone(), parts[2].clone(), parts[3].clone()].concat());
         assert_eq!(frame.am_pieces, Some(vec![(100, 0), (big, 41), (80, 0), (1 << 20, 42)]));
         assert_eq!(decoder.buffered_len(), 0);
 
@@ -1101,7 +1106,7 @@ mod tests {
         let (ctrl, value) = prepared.am_parts();
         let crc = crc32c::crc32c(&body.concat());
         assert_eq!(ctrl, vec![head, Bytes::copy_from_slice(&crc.to_le_bytes())]);
-        assert_eq!(value, body);
+        assert_eq!(value.iter().map(|v| v.bytes().clone()).collect::<Vec<_>>(), body);
         assert_eq!(prepared.am_parts().0, ctrl);
     }
 
@@ -1316,7 +1321,7 @@ mod tests {
         let (code, msg) = parse_bulk_ctrl(&decoded.payload).unwrap();
         assert_eq!(code, 0);
         assert!(msg.is_empty());
-        assert_eq!(decoded.value, value);
+        assert_eq!(*decoded.value, value);
     }
 
     /// bulk error responses carry a readable message in the CRC'd ctrl.
@@ -1353,7 +1358,7 @@ mod tests {
         assert_eq!(decoded.req_id, 77);
         assert_eq!(decoded.msg_type, 0x51);
         assert_eq!(decoded.payload, meta);
-        assert_eq!(decoded.value, value);
+        assert_eq!(*decoded.value, value);
 
         // Corrupt a VALUE byte → still decodes fine (value is raw; its
         // integrity is the transport's + the storage layer's).

@@ -1853,7 +1853,7 @@ pub(crate) struct ValidatedEntry {
     internal_key: Vec<u8>,
     user_key: Bytes,
     op: u8,
-    value: Bytes,
+    value: autumn_transport::RegBytes,
     expires_at: u64,
     /// direct responder. On Phase 3 success we call `send_ok` which
     /// encodes the `PutResp` / `DeleteResp` frame bytes and forwards to the
@@ -1958,7 +1958,7 @@ pub(crate) async fn start_write_batch(
                 WriteOp::Delete { user_key } => (
                     Bytes::from(user_key),
                     crate::OP_TOMBSTONE,
-                    Bytes::new(),
+                    Default::default(),
                     0u64,
                 ),
                 // BUG-LEASE-2 Phase 2: fence-floor bump record. key = raw
@@ -1968,7 +1968,7 @@ pub(crate) async fn start_write_batch(
                 WriteOp::FenceBump { ino, epoch } => (
                     Bytes::copy_from_slice(&ino.to_be_bytes()),
                     crate::OP_FENCE_BUMP,
-                    Bytes::copy_from_slice(&epoch.to_le_bytes()),
+                    Bytes::copy_from_slice(&epoch.to_le_bytes()).into(),
                     0u64,
                 ),
             };
@@ -2035,7 +2035,7 @@ pub(crate) async fn start_write_batch(
         // So we stage `(op, internal_key, value: Bytes, expires_at)`
         // tuples into a Send Vec, and clone `value` (Bytes::clone =
         // Arc::clone, ~free for both small + large values).
-        let inputs: Vec<(u8, Vec<u8>, Bytes, u64)> = valid
+        let inputs: Vec<(u8, Vec<u8>, autumn_transport::RegBytes, u64)> = valid
             .iter()
             .map(|e| {
                 let wal_op = if e.value.len() > VALUE_THROTTLE {
@@ -2052,18 +2052,17 @@ pub(crate) async fn start_write_batch(
             })
             .collect();
         let result = compio::runtime::spawn_blocking(move || {
-            let mut segments: Vec<Bytes> = Vec::with_capacity(inputs.len() * 3);
+            let mut segments: Vec<autumn_transport::RegBytes> = Vec::with_capacity(inputs.len() * 3);
             let mut record_sizes: Vec<u32> = Vec::with_capacity(inputs.len());
             for (wal_op, internal_key, value, expires_at) in inputs {
-                let value_empty = value.is_empty();
-                let (hdr_seg, val_seg, crc_seg) =
-                    crate::wal_record::encode_v1_segments(wal_op, &internal_key, value, expires_at);
-                let total = hdr_seg.len() + val_seg.len() + crc_seg.len();
-                segments.push(hdr_seg);
-                if !value_empty {
-                    segments.push(val_seg);
+                let (hdr_seg, crc_seg) =
+                    crate::wal_record::encode_v1_head_and_crc(wal_op, &internal_key, &value, expires_at);
+                let total = hdr_seg.len() + value.len() + crc_seg.len();
+                segments.push(hdr_seg.into());
+                if !value.is_empty() {
+                    segments.push(value);
                 }
-                segments.push(crc_seg);
+                segments.push(crc_seg.into());
                 record_sizes.push(total as u32);
             }
             (segments, record_sizes)
@@ -2085,7 +2084,7 @@ pub(crate) async fn start_write_batch(
         // Small-batch fast path: encode inline. Spawn overhead would
         // dominate sub-4 MiB batches. Move each value's Bytes into the
         // segments.
-        let mut segments: Vec<Bytes> = Vec::with_capacity(valid.len() * 3);
+        let mut segments: Vec<autumn_transport::RegBytes> = Vec::with_capacity(valid.len() * 3);
         let mut record_sizes: Vec<u32> = Vec::with_capacity(valid.len());
         for e in valid.iter_mut() {
             let wal_op = if e.value.len() > VALUE_THROTTLE {
@@ -2097,20 +2096,14 @@ pub(crate) async fn start_write_batch(
             // ValidatedEntry for Phase 3 memtable insert (small values
             // go inline; large VP-path values aren't needed but the
             // clone cost is irrelevant since we're below 4 MiB total).
-            let value_for_encode = e.value.clone();
-            let value_empty = value_for_encode.is_empty();
-            let (hdr_seg, val_seg, crc_seg) = crate::wal_record::encode_v1_segments(
-                wal_op,
-                &e.internal_key,
-                value_for_encode,
-                e.expires_at,
-            );
-            let total = hdr_seg.len() + val_seg.len() + crc_seg.len();
-            segments.push(hdr_seg);
-            if !value_empty {
-                segments.push(val_seg);
+            let (hdr_seg, crc_seg) =
+                crate::wal_record::encode_v1_head_and_crc(wal_op, &e.internal_key, &e.value, e.expires_at);
+            let total = hdr_seg.len() + e.value.len() + crc_seg.len();
+            segments.push(hdr_seg.into());
+            if !e.value.is_empty() {
+                segments.push(e.value.clone());
             }
-            segments.push(crc_seg);
+            segments.push(crc_seg.into());
             record_sizes.push(total as u32);
         }
         (segments, record_sizes)
@@ -3710,7 +3703,7 @@ struct GcRecord {
 /// into the memtable, walking the tail offset returned by
 /// `append_segments`.
 struct GcWriteBatch {
-    segments: Vec<Bytes>,
+    segments: Vec<autumn_transport::RegBytes>,
     pending: Vec<GcRecord>,
     bytes: u64,
     record_cap: usize,
@@ -4387,11 +4380,11 @@ async fn process_gc_chunk(
             expires_at,
         );
         let record_size = (hdr_seg.len() + val_seg.len() + crc_seg.len()) as u32;
-        batch.segments.push(hdr_seg);
+        batch.segments.push(hdr_seg.into());
         if !value.is_empty() {
-            batch.segments.push(val_seg);
+            batch.segments.push(val_seg.into());
         }
-        batch.segments.push(crc_seg);
+        batch.segments.push(crc_seg.into());
         batch.bytes = batch.bytes.saturating_add(record_size as u64);
         batch.pending.push(GcRecord {
             user_key,

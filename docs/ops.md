@@ -2075,6 +2075,7 @@ alike, process-wide (see "Registered buffer pool budget"):
 | `_regpool_out_of_pool_total`, `_register_failed_total` | heap buffers (over 256 MiB, or an overflow mapping failed); chunks UCX would not register |
 | `_regpool_use_{quota,in_use,high_water}_bytes{use}` | per use (`receive`, `reply`, `staging`): its share, held now, most held |
 | `_regpool_use_{waits,timeouts,refused,too_large}_total{use}`, `_use_wait_seconds_total{use}` | waits and their time, waits run out, refusals with no wait, requests over a thread's share |
+| `_ucx_am_sent_bytes_total{memh}` | bytes sent as UCX active messages with the buffer's registration (`yes`) or for UCX to look up itself (`no`) |
 
 Manual verify: write a few keys with `autumn-client put`, then confirm
 `autumn_ps_requests_total` increments and

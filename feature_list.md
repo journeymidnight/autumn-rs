@@ -38,6 +38,7 @@
 - **Scope**: Python `register(buf) -> handle` / `unregister`（TCP 空操作，只读内存注册时报错）；地址落在已注册区域的 put/get 自动带 memh，否则 UCX 下拷进 slab；UCX 收发接口只收带 memh 的切片（类型保证）；TCP 直接读写调用方内存；调用返回后传输层不再引用调用方内存（一并关闭 BUG-PY-PUT-BORROWED-MEMORY）。
 - **Acceptance**: 传裸指针或普通 `Bytes` 给 UCX 收发编译不过；只读 buffer 注册报错、不卡连接；超时返回后重用 buffer 不会被晚到的发送读到（去掉修复变红）；perf-check 不降。
 - `passes: false`
+- **notes** (2026-10-30，3a 链 1): 用户定：不用按地址二分查表找回 memh，而是让值一路带着 memh 走（`RegBytes`，即设计页"带注册信息的 Bytes"）。链 1（PS 收值 → WAL → 发给 EN）已改：`Frame.value`、`PartitionRequest.bulk_value`、`WriteOp::Put.value`、`Conditional.value`、组提交段、stream client 追加、`PreparedPayload` 都是 `RegBytes`；`RegBytes` 加了 Deref/slice/Default。加了进程级 AM 发送字节计数（带/不带 memh，日志与 `/metrics`）。UCX 8M 写实测：PS 以 AM 发出约 180 GB，全部带 memh，不带的为 0。测试：`am_value_budget` 断言收进池的帧值带 memh、`prepared_append` 断言池缓冲的追加带 memh 发出（各自去掉即红）。读走 EN 直读，PS 的 GET 回复（链 2）只在代理读时出现。评审：空切片（静态空 Bytes，不持有缓冲）不再带 memh（测试去掉即红）；`Memh` 改 `NonNull`，`RegBytes` 48→40 字节。perf-check（ABAB 换序）：TCP/UCX 8M 与 UCX 4K 持平；TCP 4K 写 patch 九次 25.3/41.0/44.2/25.5/42.3/42.3/28.7/42.7/46.6K（中位 42.3K），基线八次 38.0–44.3K（中位 39.9K）；patch 三次落在低态（p50 不变、p95 26–28 ms 对 18–21 ms，即延后排查的 4K 写长尾），基线这次没有，但 2b-1 时基线也测到过 28.9K；TCP 4K 路径上只改了类型，没有新增等待。
 
 ### F-KVC-REGISTERED-L2 — autumn_kvcache 注册 L2，vLLM 换可复用缓冲（第 4 步，隔壁仓库）
 - **Trigger**: sglang 的 L2 host 池长期存在却每次靠 rcache；vLLM 每次 `.cpu()` / `np.empty` 新内存，UCX 上每次现注册。

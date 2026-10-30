@@ -20,7 +20,7 @@
 //!   connection.
 
 use crate::recv_dest::RecvDest;
-use crate::regpool::{Memh, PooledBuf, RegBytes};
+use crate::regpool::{PooledBuf, RegBytes};
 use crate::ucx::endpoint::{
     await_pending, cb_send, classify_ptr, inline_storage, inline_storage_err, slot_acquire, slot_release, PtrStatus,
     UcxEp, SPIN_ITERS,
@@ -134,6 +134,16 @@ pub fn received_counts() -> (u64, u64) {
 /// This thread's values sent (with their slab's memh, without one).
 pub fn sent_counts() -> (u64, u64) {
     SENT.with(|c| c.get())
+}
+
+/// Bytes sent as active messages by the whole process: with a memh, without.
+static SENT_BYTES: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Bytes this process sent as active messages: (with a memh, without one —
+/// memory UCX had to look up or register itself).
+pub fn sent_bytes() -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (SENT_BYTES[0].load(Relaxed), SENT_BYTES[1].load(Relaxed))
 }
 
 /// A tag no other value expected on this thread carries.
@@ -540,9 +550,9 @@ async fn send_am(ep: &UcxEp, am_id: u32, tag: u64, value: RegBytes, extra_flags:
     p.flags = (ucp_send_am_flags::UCP_AM_SEND_FLAG_COPY_HEADER | protocol) as u32 | extra_flags;
     // A slab's own registration: UCX need not look the memory up.
     let registered = match memh {
-        Some(Memh(memh)) => {
+        Some(memh) => {
             p.op_attr_mask |= ucp_op_attr_t::UCP_OP_ATTR_FIELD_MEMH as u32;
-            p.memh = memh;
+            p.memh = memh.raw();
             true
         }
         None => false,
@@ -551,6 +561,7 @@ async fn send_am(ep: &UcxEp, am_id: u32, tag: u64, value: RegBytes, extra_flags:
         let (with, without) = c.get();
         c.set(if registered { (with + 1, without) } else { (with, without + 1) })
     });
+    SENT_BYTES[!registered as usize].fetch_add(len as u64, std::sync::atomic::Ordering::Relaxed);
     let r = unsafe { ucp_am_send_nbx(ep.ptr(), am_id, header.as_ptr() as *const c_void, 8, ptr_v, len, &p) };
     let out = match classify_ptr(r) {
         PtrStatus::Done => {

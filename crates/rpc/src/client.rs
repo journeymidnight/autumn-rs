@@ -1721,7 +1721,7 @@ async fn read_loop(
                     (am_value, pending.borrow_mut().remove(&frame.req_id))
                 } {
                     (Some(pb), Some(Pending::Frame(tx))) => {
-                        frame.value = Bytes::from_owner(pb);
+                        frame.value = pb.freeze();
                         let _ = tx.send(frame);
                     }
                     (Some(pb), Some(Pending::IntoPooled(tx))) => {

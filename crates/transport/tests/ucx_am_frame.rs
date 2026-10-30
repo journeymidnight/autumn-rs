@@ -196,3 +196,16 @@ async fn a_value_from_the_middle_of_a_pool_chunk_arrives_by_rendezvous() {
     assert_eq!(am::sent_counts().0, sent.0 + 1, "sent with its memh");
     drop(head);
 }
+
+/// An empty slice of a registered value is a static `Bytes` that does not hold
+/// the pool buffer, so it must not claim the buffer's registration.
+#[compio::test]
+async fn an_empty_slice_of_a_registered_value_keeps_no_memh() {
+    let (_tx, _rx, _keep) = pair().await;
+    let reg = autumn_transport::regpool_acquire(64 << 10).freeze();
+    assert!(reg.is_registered());
+    assert!(reg.slice(10..20).is_registered(), "a part keeps it");
+    let empty = reg.slice(7..7);
+    drop(reg);
+    assert!(!empty.is_registered(), "nothing holds the buffer behind an empty slice");
+}

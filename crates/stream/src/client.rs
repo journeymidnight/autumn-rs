@@ -1531,7 +1531,7 @@ enum StreamSubmitMsg {
     /// Every append is durable via the extent-node's per-extent
     /// fsync coalescer.
     Append {
-        payload_parts: Vec<Bytes>,
+        payload_parts: Vec<autumn_transport::RegBytes>,
         owner_epoch: i64,
         ack_tx: oneshot::Sender<Result<AppendResult>>,
     },
@@ -2107,7 +2107,7 @@ async fn launch_append(
     state: &mut StreamAppendState,
     pool: &Rc<ConnPool>,
     inflight: &mut FuturesUnordered<InflightFut>,
-    payload_parts: Vec<Bytes>,
+    payload_parts: Vec<autumn_transport::RegBytes>,
     owner_epoch: i64,
     ack_tx: oneshot::Sender<Result<AppendResult>>,
     // + BUG-FLUSH-TIMEOUT-LEAK: per-replica deadline policy. Passed by
@@ -3461,7 +3461,7 @@ impl StreamClient {
     /// Core append implementation.  Thin wrapper that wraps a single Bytes
     /// payload into the segments vec expected by the worker path.
     async fn append_payload(&self, stream_id: u64, payload: Bytes) -> Result<AppendResult> {
-        self.append_payload_segments(stream_id, vec![payload]).await
+        self.append_payload_segments(stream_id, vec![payload.into()]).await
     }
 
     /// R4 4.3 public-API retry loop.  The worker is a stateful single-op
@@ -3489,7 +3489,7 @@ impl StreamClient {
     async fn append_payload_segments(
         &self,
         stream_id: u64,
-        segments: Vec<Bytes>,
+        segments: Vec<autumn_transport::RegBytes>,
     ) -> Result<AppendResult> {
         let sent = std::cell::Cell::new(false);
         self.append_payload_attempts(stream_id, segments, &sent)
@@ -3507,7 +3507,7 @@ impl StreamClient {
     async fn append_payload_attempts(
         &self,
         stream_id: u64,
-        segments: Vec<Bytes>,
+        segments: Vec<autumn_transport::RegBytes>,
         sent: &std::cell::Cell<bool>,
     ) -> Result<AppendResult> {
         let payload_len_u32: u32 = segments.iter().map(|s| s.len() as u32).sum();
@@ -4013,10 +4013,12 @@ impl StreamClient {
     }
 
     /// Append multiple Bytes segments without copying them into a single buffer.
+    /// A segment received into a pool buffer goes to the extent nodes with
+    /// that buffer's registration.
     pub async fn append_segments(
         &self,
         stream_id: u64,
-        segments: Vec<Bytes>,
+        segments: Vec<autumn_transport::RegBytes>,
     ) -> Result<AppendResult> {
         self.append_payload_segments(stream_id, segments).await
     }

@@ -201,6 +201,13 @@ pub(crate) fn encode_v1_segments(
     value: Bytes,
     expires_at: u64,
 ) -> (Bytes, Bytes, Bytes) {
+    let (header, crc) = encode_v1_head_and_crc(op, key, &value, expires_at);
+    (header, value, crc)
+}
+
+/// The record's head and CRC around a value the caller keeps as its own
+/// segment (`encode_v1_segments` without moving the value).
+pub(crate) fn encode_v1_head_and_crc(op: u8, key: &[u8], value: &[u8], expires_at: u64) -> (Bytes, Bytes) {
     let payload_len = PAYLOAD_HEADER + key.len() + value.len();
     let mut header = Vec::with_capacity(1 + 4 + PAYLOAD_HEADER + key.len());
     header.push(V1_SENTINEL);
@@ -219,7 +226,7 @@ pub(crate) fn encode_v1_segments(
     crc = crc32c::crc32c_append(crc, &value);
 
     let crc_bytes = crc.to_le_bytes().to_vec();
-    (Bytes::from(header), value, Bytes::from(crc_bytes))
+    (Bytes::from(header), Bytes::from(crc_bytes))
 }
 
 /// Encode one WAL record as a single contiguous V1 envelope buffer. Used by

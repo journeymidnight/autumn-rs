@@ -302,3 +302,49 @@ async fn a_frame_value_append_whose_payload_misses_its_crc_is_refused() {
     assert_eq!((appended.code, appended.offset), (CODE_OK, 0));
     drop(server);
 }
+
+/// An append whose body is a pool buffer goes out with that buffer's memh (a
+/// PS appending a value it received into one); a plain `Bytes` body goes
+/// without. UCX only.
+#[compio::test]
+async fn an_append_from_a_pool_buffer_carries_its_memh() {
+    let Ok(bind) = std::env::var("AUTUMN_TEST_UCX_BIND") else {
+        eprintln!("memh needs UCX: set AUTUMN_TEST_UCX_BIND");
+        return;
+    };
+    let transport = autumn_transport::init_with(autumn_transport::TransportKind::Ucx);
+    let mut listener = transport.bind(bind.parse().unwrap()).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let node = ExtentNode::new(ExtentNodeConfig::new(dir.path().to_path_buf(), 1)).await.unwrap();
+    let server = compio::runtime::spawn(async move {
+        let (conn, _) = listener.accept().await.unwrap();
+        ExtentNode::handle_connection(conn, node).await
+    });
+    let client = RpcClient::connect(addr).await.unwrap();
+    let allocated = client.call(MSG_ALLOC_EXTENT, rkyv_encode(&AllocExtentReq { extent_id: 704 })).await.unwrap();
+    assert_eq!(rkyv_decode::<AllocExtentResp>(&allocated).unwrap().code, CODE_OK);
+
+    let len = 1 << 20;
+    let mut pb = autumn_transport::regpool_acquire(len);
+    pb.dest_mut().fill(0x3c);
+    let pooled = pb.freeze();
+    let plain = Bytes::from(vec![0x4du8; len]);
+    let mut offset = 0u64;
+    for (body, with_memh) in [(pooled, true), (plain.into(), false)] {
+        let body: autumn_transport::RegBytes = body;
+        let before = autumn_transport::am::sent_counts();
+        let payload = PreparedPayload::new(AppendReq::encode_header(704, 1, offset, 1), vec![body], 1);
+        let frame = client.send_prepared(MSG_APPEND, &payload).await.unwrap().await.unwrap();
+        assert!(!frame.is_error());
+        assert_eq!(AppendResp::decode(frame.payload).unwrap().code, CODE_OK);
+        let after = autumn_transport::am::sent_counts();
+        let counted = if with_memh { after.0 - before.0 } else { after.1 - before.1 };
+        assert_eq!(counted, 1, "with_memh={with_memh}: {before:?} -> {after:?}");
+        offset += len as u64;
+    }
+    let shard = crc32c::crc32c(&704u64.to_le_bytes()) & 0xff;
+    let disk = std::fs::read(dir.path().join(format!("{shard:02x}/extent-704.dat"))).unwrap();
+    assert!(disk[..len].iter().all(|&b| b == 0x3c) && disk[len..].iter().all(|&b| b == 0x4d));
+    drop(server);
+}

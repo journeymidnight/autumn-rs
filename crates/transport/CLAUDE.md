@@ -435,11 +435,17 @@ fails with Bad address).
 the buffer, whose chunk keeps the registration mapped) and the chunk's memh. `send_am` passes
 that memh (`UCP_OP_ATTR_FIELD_MEMH`), so UCX does not look the memory up;
 `From<Bytes>` carries none and falls back to the cache. `am::Sender` and
-autumn-rpc's `AmOut` / `encode_am_frame` take `impl Into<RegBytes>`. Today the
-extent node's bulk read reply sends that way; the other producers still hand
-plain `Bytes` (the data-path redesign converts them and then forbids values with
-no memh). `am::sent_counts()` reports this thread's sends with and without a
-memh. Without a memh, UCX takes the context lock the workers share for every
+autumn-rpc's `AmOut` / `encode_am_frame` take `impl Into<RegBytes>`.
+`RegBytes` derefs to its `Bytes`, `slice` keeps the memh — except an empty
+slice, a static `Bytes` that no longer holds the buffer, so a memh never
+outlives its chunk (`ucx_am_frame.rs`
+`an_empty_slice_of_a_registered_value_keeps_no_memh`, red without) — and
+`Default` is empty. `Memh` is a `NonNull`, so `RegBytes` is 40 bytes. The extent node's bulk read reply and the PS's appends of values it
+received (`Frame.value`, `PreparedPayload` body) send that way; other
+producers still hand plain `Bytes` (the data-path redesign converts them and
+then forbids values with no memh). `am::sent_counts()` reports this thread's
+sends with and without a memh, `am::sent_bytes()` the process's bytes (on the
+regpool log line and `/metrics` as `*_ucx_am_sent_bytes_total{memh}`). Without a memh, UCX takes the context lock the workers share for every
 cache lookup (`ucp_memh_get`); with one it skips the lookup and the lock.
 Measured (`benches/am_memh.rs`: slabs sent over and over, each sender thread to
 its own receiver thread, rc_mlx5, alternating arms): one sender, no difference

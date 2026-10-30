@@ -1038,12 +1038,20 @@ Mechanics:
   value; 0.8% of an 8 MiB one), recv the remainder (UCX `recv_pooled` / TCP
   `read_exact_into_pooled` owned). Nothing follows the tail (v28 removed the
   per-value CRC — value integrity is the transport's job).
-- The tail rides onward as `Bytes::from_owner(pb)` via a
-  `PartitionRequest.bulk_value: Option<Bytes>` field; `payload` carries the ctrl.
-  `enqueue_put_bulk` / `enqueue_batch_put_bulk` use `bulk_value` directly when
-  present — provenance-blind, so a frame behaves identically whichever path
-  delivered it. The PS→EN `append_batch` send is already rcache-zero-copy (UCX) /
-  Arc-Bytes (TCP).
+- The tail rides onward as `pb.freeze()` — a `RegBytes`, the bytes with the
+  pool chunk's memh — via a `PartitionRequest.bulk_value: Option<RegBytes>`
+  field; `payload` carries the ctrl. A frame value comes the same way
+  (`Frame.value`, autumn-rpc). `enqueue_put_bulk` / `enqueue_batch_put_bulk` use
+  `bulk_value` directly when present (a batch's items are `RegBytes::slice`s
+  of it) — provenance-blind, so a frame behaves identically whichever path
+  delivered it. The memh stays with the value through `WriteOp::Put.value`,
+  `Conditional.value`, `ValidatedEntry.value` and the WAL segments
+  (`encode_v1_head_and_crc` builds a record's head and CRC around the value,
+  which is its own segment), so the PS→EN append hands UCX the buffer's
+  registration (no lookup); TCP sends the same `Bytes`. The mem tier copies
+  into plain `Bytes`, as it always did. UCX, 8 MiB writes: the PS sent ~180 GB
+  as active messages, all with a memh (`am_sent_bytes_memh` on its regpool
+  log line; 0 without).
 - Cancel-safe on both transports: `drain_bulk_writes` hands the `PooledBuf` to each
   recv by value (UCX keeps a dropped recv's buffer on its orphan list until the
   NIC is done; TCP compio retains the owned buffer until the read CQE lands).
