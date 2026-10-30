@@ -105,13 +105,18 @@ serves the unbudgeted callers; `acquire_charged_if_room`
 charges a use when it has room and is `acquire` when not (for a value already
 in memory, which refusing would not save). `snapshot().uses` reports each
 budget's quota, bytes in use, high water, waits, timeouts, `refused` (`Full`
-with no wait: `try_acquire_for`, or `acquire_for` past its deadline) and
+with no wait: `try_acquire_for`, or `acquire_for` given no wait, as a batch
+past its deadline is; a wait that runs out is a timeout) and
 `too_large` (the `TooLarge` those two return; `acquire_charged_if_room` counts
 neither); `log_snapshot` (`regpool_log`) puts them on one INFO line, which
-the PS and the extent node emit every `--regpool-log-interval-secs`. Test: `tests/regpool_budget.rs` (64 MiB cap:
-per-thread half, uses independent, `TooLarge`, timeout counted, a waiter woken by
-a return on another thread, a memory waiter woken by memory coming back; red
-without the per-thread check, and without either wake it times out).
+the PS and the extent node emit every `--regpool-log-interval-secs`, and
+`render_prometheus` (`render_regpool_metrics(prefix)`) into each one's
+`/metrics`, together with each use's wait time (`wait_ns`, added by a guard
+when a wait ends, a dropped one included). Test: `tests/regpool_budget.rs` (64 MiB cap:
+per-thread half, uses independent, `TooLarge`, timeout counted with its wait
+time, the rendered series, a waiter woken by a return on another thread, a
+memory waiter woken by memory coming back; red without the per-thread check,
+without the wait-time guard, and without either wake it times out).
 
 The integration test `tcp_recycles_buffers_including_in_a_ucx_capable_binary`
 explicitly selects TCP and verifies pool hits, buffer reuse, and zero registered

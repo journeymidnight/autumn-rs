@@ -169,7 +169,7 @@ pub(crate) static EN_APPEND_TOTALS: EnAppendTotals = EnAppendTotals {
     ns: std::sync::atomic::AtomicU64::new(0),
 };
 
-/// The EN's Prometheus text: append batches, bytes and time.
+/// The EN's Prometheus text: append batches, bytes and time, and the buffer pool.
 pub fn render_en_metrics() -> String {
     use autumn_common::metrics_http::{push_metric, push_type};
     use std::sync::atomic::Ordering::Relaxed;
@@ -195,6 +195,7 @@ pub fn render_en_metrics() -> String {
         &[],
         EN_APPEND_TOTALS.ns.load(Relaxed) as f64,
     );
+    out.push_str(&autumn_transport::render_regpool_metrics("autumn_en"));
     out
 }
 

@@ -3258,6 +3258,9 @@ Three fixes bound the restart replay window (worst case per partition =
     per batch with `n = ops` (zero new hot-path timing); GET adds one `Instant` pair +
     RefCell borrow in `serve_get_local`.
 
+    The buffer pool's counters follow, from `autumn_transport::render_regpool_metrics`
+    (`autumn_ps_regpool_*`, a `use` label on the per-use series; the EN's
+    `/metrics` carries the same under `autumn_en_`).
     **`/metrics` is PS-wide only — no partition label.** Per-partition detail goes to
     the manager on the load report, for scheduling; Prometheus sums PSes. The binary
     serves it on its own thread and compio runtime, pinned to no core

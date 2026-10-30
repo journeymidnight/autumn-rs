@@ -93,6 +93,8 @@ pub struct UseStats {
     pub waits: u64,
     /// Waits that ended without a buffer.
     pub timeouts: u64,
+    /// Time spent waiting, in nanoseconds.
+    pub wait_ns: u64,
     /// `Full` without waiting: `try_acquire_for`, or `acquire_for` with no
     /// wait left.
     pub refused: u64,
@@ -146,10 +148,54 @@ impl std::fmt::Display for UseStats {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "high_water={} waits={} timeouts={} refused={} too_large={}",
-            self.high_water_bytes, self.waits, self.timeouts, self.refused, self.too_large
+            "high_water={} waits={} wait_ms={} timeouts={} refused={} too_large={}",
+            self.high_water_bytes,
+            self.waits,
+            self.wait_ns / 1_000_000,
+            self.timeouts,
+            self.refused,
+            self.too_large
         )
     }
+}
+
+/// The pool's counters in Prometheus text, each name under `prefix`
+/// (`autumn_ps`, `autumn_en`); per-use series carry a `use` label.
+pub fn render_prometheus(prefix: &str) -> String {
+    const USE_NAMES: [&str; USES] = ["receive", "reply", "staging"];
+    let s = snapshot();
+    let mut out = String::with_capacity(2048);
+    let pool: [(&str, &str, u64); 9] = [
+        ("pool_bytes", "gauge", s.pool_bytes),
+        ("registered_bytes", "gauge", s.registered_bytes),
+        ("in_use_bytes", "gauge", s.in_use_bytes),
+        ("overflow_bytes", "gauge", s.overflow_bytes),
+        ("acquires_total", "counter", s.acquire_total),
+        ("over_cap_total", "counter", s.over_cap_total),
+        ("overflow_chunks_total", "counter", s.overflow_made_total),
+        ("out_of_pool_total", "counter", s.out_of_pool_total),
+        ("register_failed_total", "counter", s.register_failed_total),
+    ];
+    for (name, kind, v) in pool {
+        out.push_str(&format!("# TYPE {prefix}_regpool_{name} {kind}\n{prefix}_regpool_{name} {v}\n"));
+    }
+    let per_use: [(&str, &str, fn(&UseStats) -> f64); 8] = [
+        ("use_quota_bytes", "gauge", |u| u.quota_bytes as f64),
+        ("use_in_use_bytes", "gauge", |u| u.in_use_bytes as f64),
+        ("use_high_water_bytes", "gauge", |u| u.high_water_bytes as f64),
+        ("use_waits_total", "counter", |u| u.waits as f64),
+        ("use_wait_seconds_total", "counter", |u| u.wait_ns as f64 / 1e9),
+        ("use_timeouts_total", "counter", |u| u.timeouts as f64),
+        ("use_refused_total", "counter", |u| u.refused as f64),
+        ("use_too_large_total", "counter", |u| u.too_large as f64),
+    ];
+    for (name, kind, f) in per_use {
+        out.push_str(&format!("# TYPE {prefix}_regpool_{name} {kind}\n"));
+        for (label, u) in USE_NAMES.iter().zip(&s.uses) {
+            out.push_str(&format!("{prefix}_regpool_{name}{{use=\"{label}\"}} {}\n", f(u)));
+        }
+    }
+    out
 }
 
 pub fn snapshot() -> RegpoolStats {
@@ -169,6 +215,7 @@ pub fn snapshot() -> RegpoolStats {
             high_water_bytes: b.high_water.load(Ordering::Relaxed) as u64,
             waits: b.waits.load(Ordering::Relaxed),
             timeouts: b.timeouts.load(Ordering::Relaxed),
+            wait_ns: b.wait_ns.load(Ordering::Relaxed),
             refused: b.refused.load(Ordering::Relaxed),
             too_large: b.too_large.load(Ordering::Relaxed),
         };
@@ -790,6 +837,8 @@ struct Budget {
     timeouts: AtomicU64,
     refused: AtomicU64,
     too_large: AtomicU64,
+    /// Time spent in waits, whatever ended them.
+    wait_ns: AtomicU64,
     /// Waiting for this use's budget.
     room: WaitList,
 }
@@ -802,6 +851,7 @@ static BUDGETS: [Budget; USES] = [const {
         timeouts: AtomicU64::new(0),
         refused: AtomicU64::new(0),
         too_large: AtomicU64::new(0),
+        wait_ns: AtomicU64::new(0),
         room: WaitList::new(),
     }
 }; USES];
@@ -942,6 +992,7 @@ pub async fn acquire_for(u: Use, need: usize, wait: std::time::Duration) -> Resu
         return Err(PoolError::Full);
     }
     budget.waits.fetch_add(1, Ordering::Relaxed);
+    let _clock = WaitClock(budget, std::time::Instant::now());
     let deadline = std::time::Instant::now() + wait;
     loop {
         let list = match short {
@@ -967,6 +1018,16 @@ pub async fn acquire_for(u: Use, need: usize, wait: std::time::Duration) -> Resu
             budget.timeouts.fetch_add(1, Ordering::Relaxed);
             return Err(PoolError::Full);
         }
+    }
+}
+
+/// Adds a wait's duration to its use when the wait ends, by return or by the
+/// caller dropping it.
+struct WaitClock(&'static Budget, std::time::Instant);
+
+impl Drop for WaitClock {
+    fn drop(&mut self) {
+        self.0.wait_ns.fetch_add(self.1.elapsed().as_nanos() as u64, Ordering::Relaxed);
     }
 }
 

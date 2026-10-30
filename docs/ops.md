@@ -2065,6 +2065,17 @@ partition moves away or reopens, and reset only when the PS restarts):
 | `autumn_ps_major_compactions_total`, `_compaction_write_bytes_total{kind}` | majors, and what compactions wrote |
 | `autumn_ps_requests_total`, `_write_bytes_total`, `_read_bytes_total` | requests, value bytes written / served |
 
+Buffer pool, on the PS (`autumn_ps_regpool_*`) and the EN (`autumn_en_regpool_*`)
+alike, process-wide (see "Registered buffer pool budget"):
+
+| Metric | Means |
+|---|---|
+| `_regpool_pool_bytes`, `_registered_bytes`, `_in_use_bytes` | chunk bytes, of them registered (UCX), handed out now |
+| `_regpool_overflow_bytes`, `_over_cap_total`, `_overflow_chunks_total` | overflow chunks alive, acquires served past the cap, overflow chunks made |
+| `_regpool_out_of_pool_total`, `_register_failed_total` | heap buffers (over 256 MiB, or an overflow mapping failed); chunks UCX would not register |
+| `_regpool_use_{quota,in_use,high_water}_bytes{use}` | per use (`receive`, `reply`, `staging`): its share, held now, most held |
+| `_regpool_use_{waits,timeouts,refused,too_large}_total{use}`, `_use_wait_seconds_total{use}` | waits and their time, waits run out, refusals with no wait, requests over a thread's share |
+
 Manual verify: write a few keys with `autumn-client put`, then confirm
 `autumn_ps_requests_total` increments and
 `autumn_en_append_bytes_total` grows. Read them back twice: the second read's
@@ -2072,7 +2083,9 @@ blocks come from the cache (`hits` grows), and each GET adds to
 `get_sst_checks_total` once its key is flushed out of the memtable. A `flush`
 bumps `flushes_total` and `sst_tables`; with small flushes (`--flush-mem-bytes`
 4 MiB) and a perf-check write run, `minor_compactions_total{trigger="flush"}`
-climbs and `sst_tables` stays low. `autumn-op split` a partition: the
+climbs and `sst_tables` stays low. Every PS and EN lists the `*_regpool_*`
+series; on an idle cluster the refusal, wait and overflow counters are 0.
+`autumn-op split` a partition: the
 counters keep climbing through it (no reset). Notes: PS and EN render at
 scrape time from their atomics (EN per-shard gauges refresh every 2 s); PS
 counters reset on PS restart

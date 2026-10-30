@@ -46,8 +46,9 @@ fn uses_and_threads_are_budgeted_and_a_full_budget_waits() {
     // Another use is not touched by it.
     let reply = regpool_try_acquire_for(PoolUse::Reply, 8 * MIB).expect("Reply has its own share");
 
-    // A full use times out without a buffer.
+    // A full use times out without a buffer, and the wait is timed.
     let timeouts = receive_stats().timeouts;
+    let waited = receive_stats().wait_ns;
     let started = Instant::now();
     let got = std::thread::spawn(|| {
         compio::runtime::Runtime::new().unwrap().block_on(regpool_acquire_for(PoolUse::Receive, 8 * MIB, Duration::from_millis(100)))
@@ -57,6 +58,15 @@ fn uses_and_threads_are_budgeted_and_a_full_budget_waits() {
     assert_eq!(got.err(), Some(PoolError::Full));
     assert!(started.elapsed() >= Duration::from_millis(100));
     assert_eq!(receive_stats().timeouts, timeouts + 1);
+    assert!(receive_stats().wait_ns - waited >= 100_000_000, "the wait's time is counted");
+    let text = autumn_transport::render_regpool_metrics("autumn_x");
+    let series = |name: &str| -> f64 {
+        text.lines().find_map(|l| l.strip_prefix(name)?.strip_prefix(' ')?.parse().ok()).unwrap_or_else(|| panic!("no {name} in\n{text}"))
+    };
+    assert_eq!(series(r#"autumn_x_regpool_use_timeouts_total{use="receive"}"#), receive_stats().timeouts as f64);
+    assert!(series(r#"autumn_x_regpool_use_wait_seconds_total{use="receive"}"#) >= 0.1);
+    let staging = autumn_transport::regpool_snapshot().uses[PoolUse::Staging as usize].quota_bytes;
+    assert_eq!(series(r#"autumn_x_regpool_use_quota_bytes{use="staging"}"#), staging as f64);
 
     // A waiter gets the room a buffer gives back, here from another thread.
     let waits = receive_stats().waits;

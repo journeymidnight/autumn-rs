@@ -576,6 +576,7 @@ impl PsMetrics {
             push_metric(&mut out, &format!("{name}_count"), &[], h.count as f64);
         }
         self.plog_load.render(&mut out);
+        out.push_str(&autumn_transport::render_regpool_metrics("autumn_ps"));
         out
     }
 }
