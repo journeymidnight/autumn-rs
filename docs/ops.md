@@ -3322,10 +3322,10 @@ connections per partition, every batch was 8 ops and 4 KiB writes stopped near
 Every large value in flight (a GET answered from the log, a bulk PUT, 64 KiB and
 up) sits in a buffer from the process's pool (registered under UCX),
 `--ucx-regpool-cap-bytes` for the whole process (default 16 GiB; the PS's
-partitions, the EN's shards and a client's workers share it). Past the pool the
-buffer is fresh, unregistered memory (where a path still takes it unbudgeted):
-zeroed, faulted in, registered with the NIC on every send and dropped
-afterwards, and the throughput falls with it.
+partitions, the EN's shards and a client's workers share it). Past the pool a
+budgeted value is refused or waits; one taken unbudgeted comes from an overflow
+chunk, mapped, faulted in and registered when it is made and freed when its
+last buffer returns, and the throughput falls with that churn.
 Size the pool on every side for the largest values in flight at once:
 
     pool / 5 >= connections per partition x --conn-inflight-cap x largest value
@@ -3449,11 +3449,13 @@ bytes in total (default 16 GiB, at least 64 MiB; sizing against the PS's admissi
 in-flight data needs them (64 MiB each, a power of two up to 256 MiB for a
 larger request), registered once under UCX, and kept; on TCP they are not
 registered and only touched pages are resident. At the cap a thread shares
-another thread's chunk; only when no chunk has room does the pool hand out
-unregistered memory (still correct, slower: faulted in, and UCX registers it per
-send). The perf-check client prints `regpool: ... over_cap=N ... pool_bytes=
+another thread's chunk; when no chunk has room, an unbudgeted buffer comes from
+an overflow chunk outside the cap, registered when made and freed when its last
+buffer returns (budgeted ones are refused or wait instead). The perf-check
+client prints `regpool: ... over_cap=N overflow_made=M ... pool_bytes=
 registered_bytes= in_use_bytes=` for its own process; a nonzero `over_cap` means
-the working set does not fit the budget. Inside the cap each use has a share —
+the working set does not fit the budget, and `overflow_made` close to it means
+overflow chunks are made and freed over and over. Inside the cap each use has a share —
 receive 40%, reply 40%, staging 20% — and one thread (a partition, a shard) at
 most half of a share, so the cap also bounds a single value: the smaller of
 256 MiB and a fifth of the cap for a received or read value (16 GiB: 256 MiB;

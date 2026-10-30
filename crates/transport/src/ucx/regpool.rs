@@ -17,9 +17,15 @@
 //! never freed: in-flight peaks recur, and a dropped chunk would have to be
 //! registered again.
 //!
-//! When nothing fits at the cap the buffer is a plain heap allocation (counted
-//! as `over_cap_total`); so is a request larger than the largest chunk
-//! (`out_of_pool_total`).
+//! An unbudgeted request (`acquire`) that nothing fits at the cap takes an
+//! overflow chunk instead: made and registered like any chunk, outside the cap
+//! and outside the chunk list, shared only by other such requests, and freed
+//! (unregistered, unmapped) when its last buffer returns. The budgets keep
+//! budgeted traffic inside the cap; overflow is what the unbudgeted callers
+//! (an extent node's appends, send staging, values over a thread's share) take
+//! past it, never memory UCX would have to register on its own. A request
+//! larger than the largest chunk is still a plain heap buffer
+//! (`out_of_pool_total`), and so is an overflow chunk whose mapping failed.
 //!
 //! ## Lifetime / cancel-safety (load-bearing)
 //! UCX writes into the buffer until the recv completes, and a stream recv
@@ -45,7 +51,9 @@ static ACQUIRE_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// Acquires served from a chunk that already existed.
 static HIT_TOTAL: AtomicU64 = AtomicU64::new(0);
 static REGISTER_FAILED_TOTAL: AtomicU64 = AtomicU64::new(0);
+/// Acquires served from an overflow chunk.
 static OVER_CAP_TOTAL: AtomicU64 = AtomicU64::new(0);
+static OVERFLOW_MADE_TOTAL: AtomicU64 = AtomicU64::new(0);
 static OUT_OF_POOL_TOTAL: AtomicU64 = AtomicU64::new(0);
 static WARNED_MAP: AtomicBool = AtomicBool::new(false);
 #[cfg(feature = "ucx")]
@@ -58,10 +66,15 @@ pub struct RegpoolStats {
     pub acquire_total: u64,
     pub hit_total: u64,
     pub register_failed_total: u64,
+    /// Acquires served from an overflow chunk (past the cap).
     pub over_cap_total: u64,
+    /// Overflow chunks made.
+    pub overflow_made_total: u64,
     pub out_of_pool_total: u64,
-    /// Bytes of all chunks.
+    /// Bytes of all chunks, overflow chunks included.
     pub pool_bytes: u64,
+    /// Bytes of the overflow chunks alive now.
+    pub overflow_bytes: u64,
     /// Bytes of the chunks registered with the NIC.
     pub registered_bytes: u64,
     /// Bytes handed out and not yet returned (4 KiB granular).
@@ -88,6 +101,14 @@ pub struct UseStats {
 }
 
 impl RegpoolStats {
+    fn add_chunk(&mut self, chunk: &Chunk) {
+        self.pool_bytes += chunk.len as u64;
+        if matches!(chunk.reg.get(), Some(Some(_))) {
+            self.registered_bytes += chunk.len as u64;
+        }
+        self.in_use_bytes += (chunk.used_units.load(Ordering::Relaxed) * UNIT) as u64;
+    }
+
     /// Share of acquires served without making a chunk (0 if none yet).
     pub fn hit_rate(&self) -> f64 {
         if self.acquire_total == 0 {
@@ -108,6 +129,8 @@ pub fn log_snapshot() {
         hit_rate_pct = (s.hit_rate() * 100.0) as u32,
         out_of_pool = s.out_of_pool_total,
         over_cap = s.over_cap_total,
+        overflow_made = s.overflow_made_total,
+        overflow_bytes = s.overflow_bytes,
         register_failed = s.register_failed_total,
         pool_bytes = s.pool_bytes,
         registered_bytes = s.registered_bytes,
@@ -135,6 +158,7 @@ pub fn snapshot() -> RegpoolStats {
         hit_total: HIT_TOTAL.load(Ordering::Relaxed),
         register_failed_total: REGISTER_FAILED_TOTAL.load(Ordering::Relaxed),
         over_cap_total: OVER_CAP_TOTAL.load(Ordering::Relaxed),
+        overflow_made_total: OVERFLOW_MADE_TOTAL.load(Ordering::Relaxed),
         out_of_pool_total: OUT_OF_POOL_TOTAL.load(Ordering::Relaxed),
         ..Default::default()
     };
@@ -149,12 +173,17 @@ pub fn snapshot() -> RegpoolStats {
             too_large: b.too_large.load(Ordering::Relaxed),
         };
     }
-    for chunk in &pool().lock().unwrap().chunks {
-        s.pool_bytes += chunk.len as u64;
-        if matches!(chunk.reg.get(), Some(Some(_))) {
-            s.registered_bytes += chunk.len as u64;
+    let overflow: Vec<Arc<Chunk>> = {
+        let pool = pool().lock().unwrap();
+        for chunk in &pool.chunks {
+            s.add_chunk(chunk);
         }
-        s.in_use_bytes += (chunk.used_units.load(Ordering::Relaxed) * UNIT) as u64;
+        pool.overflow.iter().filter_map(std::sync::Weak::upgrade).collect()
+    };
+    // Counted outside the lock: the last reference may be ours.
+    for chunk in &overflow {
+        s.add_chunk(chunk);
+        s.overflow_bytes += chunk.len as u64;
     }
     s
 }
@@ -182,10 +211,12 @@ struct Chunk {
     used_units: AtomicUsize,
     /// A thread allocates from it (`CLAIM`).
     claimed: AtomicBool,
+    /// Outside the cap; its free room is no use to a budgeted waiter.
+    overflow: bool,
 }
 
 impl Chunk {
-    fn new(len: usize) -> Option<Self> {
+    fn new(len: usize, overflow: bool) -> Option<Self> {
         let mem = Mapping::new(len)?;
         let units = (len / UNIT) as u32;
         // A free region between every two allocations: at most 2n + 1 nodes.
@@ -197,6 +228,7 @@ impl Chunk {
             alloc: Mutex::new(Allocator::with_max_allocs(units, nodes)),
             used_units: AtomicUsize::new(0),
             claimed: AtomicBool::new(false),
+            overflow,
         };
         chunk.reg();
         Some(chunk)
@@ -285,12 +317,15 @@ fn warn_once(flag: &AtomicBool, msg: std::fmt::Arguments<'_>) {
 
 struct Pool {
     chunks: Vec<Arc<Chunk>>,
+    /// Bytes of `chunks`, held to the cap.
     bytes: usize,
+    /// Overflow chunks; their buffers keep them alive.
+    overflow: Vec<std::sync::Weak<Chunk>>,
 }
 
 fn pool() -> &'static Mutex<Pool> {
     static POOL: OnceLock<Mutex<Pool>> = OnceLock::new();
-    POOL.get_or_init(|| Mutex::new(Pool { chunks: Vec::new(), bytes: 0 }))
+    POOL.get_or_init(|| Mutex::new(Pool { chunks: Vec::new(), bytes: 0, overflow: Vec::new() }))
 }
 
 /// This thread's chunk; dropping it (switching chunks, thread exit) gives the
@@ -334,7 +369,7 @@ pub struct PooledBuf {
 
 enum Storage {
     Pooled { chunk: Arc<Chunk>, alloc: Allocation, units: u32, ptr: *mut u8 },
-    /// Out of pool (larger than any chunk) or over the cap.
+    /// Out of pool: larger than any chunk, or an overflow chunk could not be mapped.
     Heap(Vec<u8>),
 }
 
@@ -347,7 +382,9 @@ impl Drop for PooledBuf {
     fn drop(&mut self) {
         if let Storage::Pooled { chunk, alloc, units, .. } = &self.storage {
             chunk.free(*alloc, *units);
-            MEMORY.wake();
+            if !chunk.overflow {
+                MEMORY.wake();
+            }
         }
         drop(self.charge.take());
     }
@@ -446,7 +483,7 @@ unsafe impl Sync for Memh {}
 
 /// Bytes to send, with the registration they live in when they come from a
 /// registered pool buffer ([`PooledBuf::freeze`]). Other bytes carry none, and
-/// so does a buffer the pool did not register (TCP runtime, over-cap or
+/// so does a buffer the pool did not register (TCP runtime, failed registration, or
 /// out-of-pool buffers): see `is_registered`.
 #[derive(Clone)]
 pub struct RegBytes {
@@ -555,23 +592,51 @@ fn pooled(chunk: &Arc<Chunk>, alloc: Allocation, units: u32, need: usize) -> Poo
 }
 
 /// A buffer of `need` writable bytes counted against no use budget: from this
-/// thread's chunk when it has room, else from another chunk (see module doc),
-/// else from the heap. Callers move to `acquire_for`, which never falls back.
+/// thread's chunk when it has room, else from another chunk, else from an
+/// overflow chunk (see module doc).
 pub fn acquire(need: usize) -> PooledBuf {
     ACQUIRE_TOTAL.fetch_add(1, Ordering::Relaxed);
     if need > MAX_CHUNK_BYTES {
         OUT_OF_POOL_TOTAL.fetch_add(1, Ordering::Relaxed);
         return heap(need);
     }
-    if let Some(pb) = alloc(need) {
-        return pb;
+    alloc(need).or_else(|| alloc_overflow(need)).unwrap_or_else(|| {
+        OUT_OF_POOL_TOTAL.fetch_add(1, Ordering::Relaxed);
+        heap(need)
+    })
+}
+
+fn chunk_size(need: usize) -> usize {
+    if need <= CHUNK_BYTES { CHUNK_BYTES } else { need.next_power_of_two() }
+}
+
+/// A buffer from an overflow chunk with room, or from a new one; `None` when
+/// the mapping failed (warned in `Mapping::new`).
+fn alloc_overflow(need: usize) -> Option<PooledBuf> {
+    let units = need.div_ceil(UNIT).max(1) as u32;
+    let live: Vec<Arc<Chunk>> = {
+        let mut pool = pool().lock().unwrap();
+        pool.overflow.retain(|w| w.strong_count() > 0);
+        pool.overflow.iter().filter_map(std::sync::Weak::upgrade).collect()
+    };
+    for chunk in &live {
+        if let Some(a) = chunk.allocate(units) {
+            OVER_CAP_TOTAL.fetch_add(1, Ordering::Relaxed);
+            return Some(pooled(chunk, a, units, need));
+        }
     }
-    OVER_CAP_TOTAL.fetch_add(1, Ordering::Relaxed);
+    drop(live);
     warn_once(&WARNED_CAP, format_args!(
-        "regpool: no chunk has room for {need} bytes at the {}-byte cap; falling back to unregistered heap buffers",
+        "regpool: no chunk has room for {need} bytes at the {}-byte cap; unbudgeted buffers come from overflow chunks, freed when empty",
         cap_bytes()
     ));
-    heap(need)
+    let chunk = Arc::new(Chunk::new(chunk_size(need), true)?);
+    OVER_CAP_TOTAL.fetch_add(1, Ordering::Relaxed);
+    OVERFLOW_MADE_TOTAL.fetch_add(1, Ordering::Relaxed);
+    let a = chunk.allocate(units).expect("a new chunk fits the request it was made for");
+    let pb = pooled(&chunk, a, units, need);
+    pool().lock().unwrap().overflow.push(Arc::downgrade(&chunk));
+    Some(pb)
 }
 
 /// Pool memory for `need <= MAX_CHUNK_BYTES` bytes, or `None` when no chunk
@@ -608,13 +673,13 @@ fn alloc_slow(need: usize, units: u32) -> Option<PooledBuf> {
             return Some(pooled(chunk, a, units, need));
         }
     }
-    let size = if need <= CHUNK_BYTES { CHUNK_BYTES } else { need.next_power_of_two() };
+    let size = chunk_size(need);
     if pool.bytes + size <= cap_bytes() {
         // Reserve, then map and register without the lock: other threads'
         // slow paths must not wait for a registration.
         pool.bytes += size;
         drop(pool);
-        let made = Chunk::new(size).map(Arc::new);
+        let made = Chunk::new(size, false).map(Arc::new);
         pool = self::pool().lock().unwrap();
         match made {
             Some(chunk) => {

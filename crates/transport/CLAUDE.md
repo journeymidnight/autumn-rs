@@ -4,7 +4,8 @@ One process-wide pool (`ucx/regpool.rs`) serves both transports. It is made of
 chunks: anonymous mappings (64 MiB, or a power of two up to 256 MiB for a larger
 request; larger still is a plain heap buffer, `out_of_pool_total`), registered
 once with `ucp_mem_map` when the runtime transport is UCX and never on TCP,
-never unmapped or unregistered while the process lives. A chunk made before
+never unmapped or unregistered while the process lives (overflow chunks,
+below, are the exception). A chunk made before
 `init_with(Ucx)` is registered on its first use after it
 (`tests/ucx_regpool_late_init.rs`, red when only creation registers); a failed
 registration is not retried (`register_failed_total`). A chunk is mapped and
@@ -20,9 +21,35 @@ uncontended except for frees from other threads. With no room it claims a chunk
 nobody holds, or makes one while the pool is under the process cap
 (`--ucx-regpool-cap-bytes`, default 16 GiB, floor one 64 MiB chunk — below it
 no chunk could ever be made); at the
-cap it allocates from any chunk with room, claimed or not, and only when none
-has room does it fall back to an unregistered heap buffer (`over_cap_total`,
-warned once). A thread's claim ends with the thread. So every live thread that
+cap it allocates from any chunk with room, claimed or not. When none has room,
+an unbudgeted request (`acquire`) takes an overflow chunk: made and registered
+like any chunk but outside the cap and off the chunk list, shared only by other
+such requests (the pool keeps a `Weak` to it), and released when its last
+buffer returns, on whatever thread that is: `ucp_mem_unmap` (from any thread:
+the context is `mt_workers_shared`) then `munmap`, after which UCX's memory
+hooks drop the pinned region (`over_cap_total` acquires, `overflow_made_total`
+chunks, `overflow_bytes` alive; warned once). Returning an overflow range wakes
+no memory waiter: only budgeted requests wait, and they cannot use it. Not
+covered by a test: the last buffer dropped inside a UCX completion callback
+(an abandoned frame value), which unmaps from inside worker progress. Measured (UCX, 3 disks, 8 partitions, 8 MiB,
+20 s, two rounds): at a 256 MiB cap an extent node made 5–9 overflow chunks in
+a run, one request each; throughput fell 30–45% against the default cap, from
+the budgets (the PS refused thousands of values and replies, the node waited
+for reply buffers ~5,000 times), not from overflow. At 1 GiB nothing
+overflowed and throughput matched the default.
+Budgeted requests never take one: the budgets keep them inside the cap. So the
+cap bounds budgeted traffic, and what the unbudgeted callers (an extent node's
+appends, send staging, values over a thread's share) take past it is
+explicitly registered and temporary, never memory UCX registers on its own
+(user decision 2026-10-30; the alternatives were keeping overflow chunks, which
+leaves the process above the cap after a spike, and failing at the cap, which
+an extent node's append may not). A heap buffer remains only for a request
+over 256 MiB and for an overflow chunk whose mapping failed (both counted in
+`out_of_pool_total`).
+`tests/ucx_regpool_cap.rs`: at the cap a registered overflow buffer, the next
+over-cap request shares its chunk, the chunk is gone once both buffers return
+(one on another thread); red with the heap fallback back, and with the chunk
+kept. A thread's claim ends with the thread. So every live thread that
 has used the pool holds a chunk (64 MiB, pinned under UCX), whether or not it is
 busy; others pass it by until the cap. At the cap every acquire that misses its
 own chunk takes the pool lock and walks the chunks — the step that follows
@@ -67,8 +94,8 @@ than the largest chunk (256 MiB), is `TooLarge` at once — so a single value is
 at most the smaller of 256 MiB and a tenth (`Staging`) or a fifth (`Receive`,
 `Reply`) of the cap. A value between 64 and 256 MiB needs a chunk of its own
 size; at the cap with only 64 MiB chunks it cannot fit and waits out `wait` to
-`Full`. `acquire` (no budget; a heap buffer over 256 MiB
-or at the cap) remains for callers not moved yet; `acquire_charged_if_room`
+`Full`. `acquire` (no budget; an overflow chunk at the cap, a heap buffer over 256 MiB)
+serves the unbudgeted callers; `acquire_charged_if_room`
 charges a use when it has room and is `acquire` when not (for a value already
 in memory, which refusing would not save). `snapshot().uses` reports each
 budget's quota, bytes in use, high water, waits, timeouts, `refused` (`Full`
@@ -359,15 +386,16 @@ part): single writes 9.7–12.1K vs 11.1–12.0K ops/s and single reads 237–27
 vs 243–284K over four alternating rounds each, within each other's spread;
 `--bulk 64` writes 47–50K -> 54–57K, `--bulk 64` reads 16.1–16.5K vs
 15.7–18.4K.
-When no chunk has room at the pool's cap, buffers are unregistered — for
-receives and for this staging alike — which UCX registers on every send and
-which are freed afterwards. That is the cost the cap (process-wide,
+When no chunk has room at the pool's cap, staging buffers come from an overflow
+chunk (registered when it is made, freed when empty), so a send past the cap
+pays a chunk registration now and then instead of one per send. The cap (process-wide,
 `--ucx-regpool-cap-bytes` on every binary, 16 GiB by default and in the
 transport's own default for the Python binding) is sized against: with the old
 per-thread pool, 16 MiB bulk reads with the PS, the EN and the client over a
 512 MiB cap fell from 8.5 to 3.0–3.7 GB/s (docs/ops.md, "Per-connection
 admission and the registered pool").
-`RegpoolStats::over_cap_total` counts it; the PS and EN do not export it.
+`RegpoolStats::over_cap_total` counts it; the PS and EN log it with
+`--regpool-log-interval-secs`.
 Test: `tests/ucx_send_staged.rs` (a send and a vectored send out of `.rodata`,
 which cannot be registered, arrive; red without the staging: `ibv_reg_mr`
 fails with Bad address).
