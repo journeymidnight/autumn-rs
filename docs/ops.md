@@ -3473,6 +3473,8 @@ waited the 1 s out); its appends are never refused and never counted as refused.
 caller met (taken unbudgeted).
 
 ```bash
+# a full pool refuses and every request still completes (in-process, TCP)
+cargo test -p autumn-manager --test pool_full_liveness -- --nocapture
 UCX_TLS=rc_mlx5,ud_mlx5,tcp,self UCX_NET_DEVICES=<dev>:1 \
   cargo test -p autumn-transport --features ucx --test ucx_regpool_cap --test ucx_regpool_late_init
 # allocation cost and registered bytes against another build of the pool (copy

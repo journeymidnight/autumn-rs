@@ -46,6 +46,12 @@ leaves the process above the cap after a spike, and failing at the cap, which
 an extent node's append may not). A heap buffer remains only for a request
 over 256 MiB and for an overflow chunk whose mapping failed (both counted in
 `out_of_pool_total`).
+Liveness with the pool full: `crates/manager/tests/pool_full_liveness.rs` — an
+in-process cluster (manager, two extent nodes, PS, client) on one 64 MiB pool,
+six writers and six readers of 4–8 MiB log values at once; refusals happen on
+`Receive` and on `Reply` (each asserted; a reply waited out counts), every request completes byte-exact,
+and no gap between completions reaches 10 s (measured: about 1 s). Red when the client does not read
+a refused reply past. TCP only (the in-process helpers bind TCP).
 `tests/ucx_regpool_cap.rs`: at the cap a registered overflow buffer, the next
 over-cap request shares its chunk, the chunk is gone once both buffers return
 (one on another thread); red with the heap fallback back, and with the chunk
