@@ -168,3 +168,31 @@ async fn an_abandoned_value_lets_its_sender_complete_whether_it_came_first_or_no
     tx.post_frame_value(32, late);
     until("a value abandoned before it came let its sender complete", || late_sent.load(Ordering::Relaxed)).await;
 }
+
+/// A pool buffer from the middle of its chunk goes out with the chunk's memh
+/// and arrives whole by rendezvous: the receiver's read starts at the buffer,
+/// not at the start of the registered region.
+#[compio::test]
+async fn a_value_from_the_middle_of_a_pool_chunk_arrives_by_rendezvous() {
+    let (tx, rx, _keep) = pair().await;
+    let head = autumn_transport::regpool_acquire(3 << 20);
+    let mut pb = autumn_transport::regpool_acquire(64 << 10);
+    let value = pattern(64 << 10, 77);
+    pb.dest_mut().copy_from_slice(&value);
+    let reg = pb.freeze();
+    assert!(reg.is_registered(), "a pool buffer carries its chunk's memh");
+    let at = (reg.bytes().as_ptr() as usize).wrapping_sub(head.filled().as_ptr() as usize);
+    assert!(at >= 3 << 20 && at < 64 << 20, "above the 3 MiB buffer in the same chunk, {at} bytes on");
+
+    let sent = am::sent_counts();
+    let received = autumn_transport::ucx_am_received_counts();
+    let tag = 4242;
+    let segments = [(64usize << 10, tag)];
+    let receive = am::receive_frame_value(&rx, &segments, &[]);
+    tx.post_frame_value(tag, reg);
+    let got = compio::time::timeout(Duration::from_secs(10), receive).await.expect("received").unwrap();
+    assert_eq!(got.filled(), value.as_slice());
+    assert_eq!(autumn_transport::ucx_am_received_counts().1, received.1 + 1, "by rendezvous");
+    assert_eq!(am::sent_counts().0, sent.0 + 1, "sent with its memh");
+    drop(head);
+}

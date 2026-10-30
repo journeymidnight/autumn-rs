@@ -369,7 +369,9 @@ must not wait for it, the receiver only fetches once it has read the frame.
 Tests: `tests/ucx_am_frame.rs` (value before / after its frame; stream and AM
 pieces joined in order; wrong length refused and its sender completes; a
 given-up value, a value held for a dropped connection and one sent after it
-let their senders complete; values started together waited in either order).
+let their senders complete; values started together waited in either order; a
+64 KiB pool buffer at least 3 MiB into its chunk sent with the chunk's memh and
+received whole by rendezvous).
 
 Not handled (inferred, not tested): a sender whose spawned send fails only logs
 `frame value send failed`, and the receiver's connection loop then waits for
