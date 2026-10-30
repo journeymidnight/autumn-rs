@@ -3319,20 +3319,24 @@ the cap bounds small-write batching: at 4, with the perf bench's two writing
 connections per partition, every batch was 8 ops and 4 KiB writes stopped near
 8K ops/s per partition whatever the client's depth.
 
-Under UCX every large value in flight (a GET answered from the log, a bulk PUT,
-64 KiB and up) sits in a buffer from the process's registered pool,
+Every large value in flight (a GET answered from the log, a bulk PUT, 64 KiB and
+up) sits in a buffer from the process's pool (registered under UCX),
 `--ucx-regpool-cap-bytes` for the whole process (default 16 GiB; the PS's
 partitions, the EN's shards and a client's workers share it). Past the pool the
-buffer is fresh, unregistered memory: zeroed, faulted in, registered with the
-NIC on every send and dropped afterwards, and the throughput falls with it.
+buffer is fresh, unregistered memory (where a path still takes it unbudgeted):
+zeroed, faulted in, registered with the NIC on every send and dropped
+afterwards, and the throughput falls with it.
 Size the pool on every side for the largest values in flight at once:
 
-    pool >= partitions busy at once x connections per partition x --conn-inflight-cap x largest value
+    pool / 5 >= connections per partition x --conn-inflight-cap x largest value
 
-kvcache under a TP8 engine: 8 connections x 16 x 16 MiB pages = 2 GiB per busy
-partition. The PS checks one partition's worth at start under UCX and logs a
-WARN when `--ucx-regpool-cap-bytes` < `--conn-inflight-cap` x 128 MiB (8
-connections x 16 MiB); it cannot see connection counts or value sizes, so a
+(received values have 40% of the pool and one partition at most half of that).
+kvcache under a TP8 engine: 8 connections x 16 x 16 MiB pages = 2 GiB per
+partition, so a pool a little over 10 GiB (11 GiB: the shares round down). A
+value past a partition's share the PS refuses `Unavailable` (the SDK retries);
+an extent node takes its appends unbudgeted, the PS already bounds them. The PS checks this at start (TCP or
+UCX) and logs a WARN when a fifth of `--ucx-regpool-cap-bytes` < `--conn-inflight-cap`
+x 128 MiB (8 connections x 16 MiB); it cannot see connection counts or value sizes, so a
 larger deployment must still be sized by hand. The extent node holding a
 partition's log extent needs the same headroom for the PS's concurrent reads,
 and the client for its own concurrency (`batch_get_concurrency` x value size).

@@ -1689,7 +1689,12 @@ async fn read_loop(
                     break;
                 }
                 match decoder.try_decode()? {
-                    Some(frame) => run.push(crate::am_frame::start(&reader, frame)?),
+                    Some(frame) => run.push(crate::am_frame::start(
+                        &reader,
+                        frame,
+                        autumn_transport::PoolUse::Reply,
+                        crate::am_frame::WhenFull::Refuse,
+                    )?),
                     None => break,
                 }
             }
@@ -1697,7 +1702,12 @@ async fn read_loop(
                 break;
             }
             for incoming in run {
-                let (mut frame, am_value) = incoming.into_parts().await?;
+                // No buffer for a reply's value: its caller gets the error.
+                let (mut frame, am_value) = match incoming.into_parts(&reader).await {
+                    Ok(parts) => parts,
+                    Err(crate::am_frame::IncomingError::Io(e)) => return Err(e.into()),
+                    Err(e) => (e.refusal().expect("not an i/o error"), None),
+                };
                 match {
                     send_window.answered(frame.req_id);
                     (am_value, pending.borrow_mut().remove(&frame.req_id))

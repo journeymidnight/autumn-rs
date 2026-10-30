@@ -5067,6 +5067,21 @@ impl StreamClient {
                     self.extent_info_cache.remove(&extent_id);
                     return Ok(None);
                 }
+                // Refused on this side: no buffer here for the reply (this
+                // process's `Reply` budget is full), which another replica would
+                // meet too, or a send queue full, which the copy path's own
+                // replica loop gets past.
+                Err(e)
+                    if e.chain().any(|c| {
+                        matches!(
+                            c.downcast_ref::<autumn_rpc::RpcError>(),
+                            Some(autumn_rpc::RpcError::Status { code: autumn_rpc::StatusCode::Unavailable, .. })
+                        )
+                    }) =>
+                {
+                    tracing::debug!(extent_id, error = %format_args!("{e:#}"), "bulk proxy read refused; using the copy path");
+                    return Ok(None);
+                }
                 Err(e) => {
                     // transport/timeout error → evict + try next replica.
                     // Classify like the client-side direct read: a

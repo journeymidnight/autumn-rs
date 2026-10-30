@@ -4791,21 +4791,22 @@ fn ps_conn_inflight_cap() -> usize {
 
 /// Pool bytes one admission slot stands for on one partition: eight
 /// connections (a TP8 engine's ranks) each holding one 16 MiB kvcache page in a
-/// pooled buffer while it is read and sent.
+/// pooled buffer while it is received (a put) or read and sent (a get).
 pub const REGPOOL_BYTES_PER_ADMITTED_REQUEST: usize = 8 * (16 << 20);
 
-/// Under UCX, a partition holds a pooled buffer for every large value it has
-/// admitted, and the buffers past the process pool (`--ucx-regpool-cap-bytes`)
-/// are fresh, unregistered memory that every send registers again.
-/// `Some(warning)` when even one partition's `--conn-inflight-cap` slots of
-/// `REGPOOL_BYTES_PER_ADMITTED_REQUEST` do not fit the pool.
+/// A partition holds a pooled buffer for every large value it has admitted,
+/// against its part of the pool's `Receive` budget (a fifth of
+/// `--ucx-regpool-cap-bytes`); a value past it is refused `Unavailable`.
+/// `Some(warning)` when `--conn-inflight-cap` slots of
+/// `REGPOOL_BYTES_PER_ADMITTED_REQUEST` do not fit that part.
 pub fn regpool_admission_mismatch(regpool_cap_bytes: usize, conn_inflight_cap: usize) -> Option<String> {
     let need = conn_inflight_cap.saturating_mul(REGPOOL_BYTES_PER_ADMITTED_REQUEST);
-    (regpool_cap_bytes < need).then(|| {
+    let partition_share = autumn_transport::regpool_thread_share_of(regpool_cap_bytes, autumn_transport::PoolUse::Receive);
+    (partition_share < need).then(|| {
         format!(
-            "--ucx-regpool-cap-bytes {regpool_cap_bytes} is below --conn-inflight-cap {conn_inflight_cap} x {} MiB = {need}: \
-             large values past the pool are sent from unregistered memory, re-registered on every send (docs/ops.md, \
-             \"Per-connection admission and the registered pool\")",
+            "--ucx-regpool-cap-bytes {regpool_cap_bytes} gives a partition {partition_share} of received values, below \
+             --conn-inflight-cap {conn_inflight_cap} x {} MiB = {need}: values past it are refused \
+             Unavailable (docs/ops.md, \"Per-connection admission and the registered pool\")",
             REGPOOL_BYTES_PER_ADMITTED_REQUEST >> 20
         )
     })
@@ -4826,7 +4827,8 @@ mod regpool_admission_tests {
     #[test]
     fn a_cap_past_the_pool_warns() {
         assert!(regpool_admission_mismatch(2 << 30, 32).is_some());
-        assert_eq!(regpool_admission_mismatch(4 << 30, 32), None);
+        assert!(regpool_admission_mismatch(16 << 30, 32).is_some(), "a fifth of 16 GiB is under 32 x 128 MiB");
+        assert_eq!(regpool_admission_mismatch(21 << 30, 32), None);
     }
 }
 
@@ -5072,7 +5074,27 @@ async fn drain_bulk_writes(
         // Commit: drop header + ctrl_len + ctrl + crc; recv the value into a
         // pooled buf. The value ends the frame — no trailer after it (v28).
         decoder.consume_bulk_prologue(ctrl_len);
-        let mut pb = autumn_transport::regpool_acquire(value_len);
+        // Never waited for: the read loop would hold up the connection's other
+        // frames and its pings.
+        let mut pb = match autumn_transport::regpool_try_acquire_for(autumn_transport::PoolUse::Receive, value_len) {
+            Ok(pb) => pb,
+            // Larger than a budget allows one holder: unbudgeted, as before,
+            // until large transfers are segmented.
+            Err(autumn_transport::PoolError::TooLarge) => autumn_transport::regpool_acquire(value_len),
+            // No buffer: the value is read past and the request refused, so
+            // the connection stays in step and the client may retry.
+            Err(e) => {
+                discard_value(decoder, reader, value_len).await?;
+                let reply = Frame::error(
+                    req_id,
+                    msg_type,
+                    autumn_rpc::RpcError::encode_status(StatusCode::Unavailable, &e.to_string()),
+                )
+                .encode();
+                inflight.push(async move { (reply, Vec::new()) }.boxed_local());
+                continue;
+            }
+        };
         // Drain any buffered value prefix into the pool buffer (no socket).
         let filled = {
             let (dest, _reg) = pb.dest_and_reg();
@@ -5135,6 +5157,25 @@ async fn drain_bulk_writes(
         );
         // Loop to handle a possible next large bulk write at the new front.
     }
+}
+
+/// Read past a value of `len` bytes that follows on the connection: the part
+/// `decoder` already holds, then the rest from `reader`.
+async fn discard_value(decoder: &mut FrameDecoder, reader: &mut autumn_transport::ReadHalf, len: usize) -> Result<()> {
+    use compio::buf::{IntoInner, IoBuf};
+    use compio::io::AsyncReadExt;
+    let held = decoder.buffered_len().min(len);
+    decoder.consume(held);
+    let mut left = len - held;
+    let mut scratch = vec![0u8; left.min(1 << 20)];
+    while left > 0 {
+        let n = left.min(scratch.len());
+        let BufResult(r, slice) = reader.read_exact(scratch.slice(..n)).await;
+        r.map_err(|e| anyhow!("eof/io reading past a refused value: {e}"))?;
+        scratch = slice.into_inner();
+        left -= n;
+    }
+    Ok(())
 }
 
 /// Mis-routed-frame error (part_id != owner_part): a `NotFound` frame, no mpsc
@@ -5747,16 +5788,24 @@ async fn push_frames_to_inflight(
         let value_budget = decoder.max_payload() as usize;
         let mut value_bytes = 0;
         let mut run = Vec::new();
+        let start = |frame| {
+            autumn_rpc::am_frame::start(
+                reader,
+                frame,
+                autumn_transport::PoolUse::Receive,
+                autumn_rpc::am_frame::WhenFull::Refuse,
+            )
+        };
         if let Some(frame) = first.take() {
             value_bytes += autumn_rpc::am_frame::am_value_len(&frame);
-            run.push(autumn_rpc::am_frame::start(reader, frame)?);
+            run.push(start(frame)?);
         }
         while run.len() < cap && value_bytes < value_budget {
             match decoder.try_decode().map_err(|e| anyhow!(e))? {
                 Some(frame) if frame.req_id != 0 => {
                     let auth = frame.msg_type == partition_rpc::MSG_CLIENT_AUTH;
                     value_bytes += autumn_rpc::am_frame::am_value_len(&frame);
-                    run.push(autumn_rpc::am_frame::start(reader, frame)?);
+                    run.push(start(frame)?);
                     if auth {
                         break;
                     }
@@ -5770,7 +5819,17 @@ async fn push_frames_to_inflight(
         }
         // In order, each with its whole value: this connection's requests stay in order.
         for incoming in run {
-            let frame = incoming.into_frame().await?;
+            let frame = match incoming.into_frame(reader).await {
+                Ok(frame) => frame,
+                // No buffer for its value: refused, the connection goes on.
+                Err(e) => match e.refusal() {
+                    Some(error) => {
+                        tx_bufs.push(error.encode());
+                        continue;
+                    }
+                    None => return Err(anyhow!("{e}")),
+                },
+            };
             // Back-pressure: drain one completion if we're at cap.
             while inflight.len() >= cap {
                 if let Some(done) = inflight.next().await {
@@ -13614,6 +13673,72 @@ fn memtable_snapshot_cost_scales_with_memtable_not_page_size() {
                 2,
                 "only the authorized value is admitted"
             );
+            drop(req);
+            drop(client);
+            drop(rx);
+            let _ = conn.await;
+        });
+    }
+
+    /// No buffer for a bulk value: the request is answered `Unavailable`, the
+    /// value read past, and the next frame on the connection still lands.
+    #[test]
+    fn a_bulk_value_with_no_buffer_is_refused_and_the_connection_goes_on() {
+        let _guard = fast_path_counter_lock();
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            // This thread's whole share of Receive, held (pool chunks only
+            // mapped, not touched, on TCP).
+            let mut held = Vec::new();
+            for size in [256 << 20, 1 << 20, 4 << 10] {
+                while let Ok(pb) = autumn_transport::regpool_try_acquire_for(autumn_transport::PoolUse::Receive, size) {
+                    held.push(pb);
+                }
+            }
+            assert!(!held.is_empty());
+            let listener = compio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut client = compio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+            let (server, _) = listener.accept().await.unwrap();
+            let (tx, mut rx) = mpsc::channel(8);
+            let conn = compio::runtime::spawn(handle_ps_connection(
+                autumn_transport::Conn::Tcp(server),
+                tx,
+                None,
+                11,
+                namespace_authz(),
+            ));
+            client = test_protocol::initiate_tcp(client, autumn_rpc::version_hello::Service::PartitionServer).await;
+            let put = |id: u32| {
+                Frame::request_zc(
+                    id,
+                    MSG_PUT_BULK,
+                    partition_rpc::encode_put_bulk_meta(11, 0, 0, b"fs/k", 0, 0),
+                    Bytes::from(vec![id as u8; 128 * 1024]),
+                )
+                .encode()
+            };
+            client.write_all(put(1)).await.0.unwrap();
+            let mut decoder = FrameDecoder::new();
+            let refused = compio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if let Some(f) = decoder.try_decode().unwrap() {
+                        break f;
+                    }
+                    let BufResult(n, buf) = client.read(vec![0u8; 64 * 1024]).await;
+                    decoder.feed(&buf[..n.unwrap()]);
+                }
+            })
+            .await
+            .expect("a value with no buffer must be answered");
+            assert_eq!(refused.req_id, 1);
+            assert!(refused.is_error());
+            assert_eq!(autumn_rpc::RpcError::decode_status(&refused.payload).0, StatusCode::Unavailable);
+            drop(held);
+            client.write_all(put(2)).await.0.unwrap();
+            let req = compio::time::timeout(Duration::from_secs(5), rx.next())
+                .await
+                .expect("the connection stopped after a refused value")
+                .unwrap();
+            assert_eq!(req.bulk_value.as_ref().unwrap()[0], 2);
             drop(req);
             drop(client);
             drop(rx);

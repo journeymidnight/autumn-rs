@@ -8,8 +8,9 @@
 //! `BULK_MIN_BYTES`. Every receive loop of such a peer assembles the value
 //! (`receive_value`) before the frame goes on, so frames keep their order.
 
+use crate::error::{RpcError, StatusCode};
 use crate::frame::{encode_am_frame, Frame};
-use autumn_transport::{am, PooledBuf, ReadHalf, RegBytes, WriteHalf};
+use autumn_transport::{am, PoolError, PoolUse, PooledBuf, ReadHalf, RegBytes, WriteHalf};
 use bytes::Bytes;
 use std::cell::Cell;
 use std::rc::Rc;
@@ -95,7 +96,66 @@ impl AmOut {
 /// A decoded frame whose value may still be arriving (`start`).
 pub struct Incoming {
     frame: Frame,
-    value: Option<am::FrameValue>,
+    value: Value,
+}
+
+enum Value {
+    None,
+    Started(am::FrameValue),
+    /// No buffer: the value is let go when the frame is taken. Dropped without
+    /// being taken (only on the way to ending the connection) its senders wait
+    /// until the endpoint is forgotten.
+    Refused { pieces: Vec<(usize, u64)> },
+}
+
+/// What `start` does when the use's budget has no room for a value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WhenFull {
+    /// Refuse the frame (`Unavailable`): a read loop must not wait, it would
+    /// hold up every other frame and the pings on its connection.
+    Refuse,
+    /// Take an unbudgeted pool buffer: for values whose in-flight count the
+    /// sender already bounds (the PS's appends to an extent node).
+    Unbudgeted,
+}
+
+/// Why a frame came without its value.
+pub enum IncomingError {
+    /// No pool buffer for the value: the value was let go (its senders
+    /// complete) and the request should be answered, not the connection
+    /// dropped.
+    NoBuffer { req_id: u32, msg_type: u8 },
+    Io(std::io::Error),
+}
+
+impl IncomingError {
+    /// The `Unavailable` error frame standing for a frame refused for want of
+    /// a buffer, `None` for errors that end the connection.
+    pub fn refusal(&self) -> Option<Frame> {
+        match self {
+            IncomingError::NoBuffer { req_id, msg_type } => Some(Frame::error(
+                *req_id,
+                *msg_type,
+                RpcError::encode_status(StatusCode::Unavailable, &PoolError::Full.to_string()),
+            )),
+            IncomingError::Io(_) => None,
+        }
+    }
+}
+
+impl std::fmt::Display for IncomingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            IncomingError::NoBuffer { .. } => write!(f, "frame value: {}", PoolError::Full),
+            IncomingError::Io(e) => write!(f, "frame value: {e}"),
+        }
+    }
+}
+
+impl From<std::io::Error> for IncomingError {
+    fn from(e: std::io::Error) -> Self {
+        IncomingError::Io(e)
+    }
 }
 
 /// Bytes of a decoded frame's value that come as active messages.
@@ -104,34 +164,54 @@ pub fn am_value_len(frame: &Frame) -> usize {
 }
 
 /// Start receiving a decoded frame's value if part of it comes as active
-/// messages. Start every frame of a burst before waiting for the first, so
-/// their values are received together; then take them in order.
-pub fn start(reader: &ReadHalf, mut frame: Frame) -> std::io::Result<Incoming> {
+/// messages, into a buffer counted against `u` (a request's value is
+/// `Receive`, a reply's `Reply`); with no room, as `when_full` says. Start every
+/// frame of a burst before waiting for the first, so their values are received
+/// together; then take them in order. A value larger than a thread may hold of
+/// the budget (a compaction output appended whole) is received unbudgeted until
+/// background transfers are segmented.
+pub fn start(reader: &ReadHalf, mut frame: Frame, u: PoolUse, when_full: WhenFull) -> std::io::Result<Incoming> {
     let value = match frame.am_pieces.take() {
-        Some(pieces) => Some(am::start_frame_value(reader, &pieces, &frame.value)?),
-        None => None,
+        Some(pieces) => {
+            let total = pieces.iter().map(|p| p.0).sum();
+            let pb = match autumn_transport::regpool_try_acquire_for(u, total) {
+                Ok(pb) => Some(pb),
+                Err(PoolError::TooLarge) => Some(autumn_transport::regpool_acquire(total)),
+                Err(PoolError::Full) if when_full == WhenFull::Unbudgeted => Some(autumn_transport::regpool_acquire(total)),
+                Err(PoolError::Full) => None,
+            };
+            match pb {
+                Some(pb) => Value::Started(am::start_frame_value(reader, &pieces, &frame.value, pb)?),
+                None => Value::Refused { pieces },
+            }
+        }
+        None => Value::None,
     };
     Ok(Incoming { frame, value })
 }
 
 impl Incoming {
     /// The frame, and the whole value in a pool buffer if it came as active
-    /// messages (then `frame.value` holds only the stream pieces).
-    pub async fn into_parts(self) -> std::io::Result<(Frame, Option<PooledBuf>)> {
-        let value = match self.value {
-            Some(v) => {
-                let pb = v.wait().await?;
-                log_first_receive(pb.len());
-                Some(pb)
+    /// messages (then `frame.value` holds only the stream pieces). A refused
+    /// value is let go here.
+    pub async fn into_parts(self, reader: &ReadHalf) -> Result<(Frame, Option<PooledBuf>), IncomingError> {
+        let Incoming { frame, value } = self;
+        let started = match value {
+            Value::None => return Ok((frame, None)),
+            Value::Started(v) => v,
+            Value::Refused { pieces } => {
+                am::abandon_frame_value(reader, &pieces);
+                return Err(IncomingError::NoBuffer { req_id: frame.req_id, msg_type: frame.msg_type });
             }
-            None => None,
         };
-        Ok((self.frame, value))
+        let pb = started.wait().await?;
+        log_first_receive(pb.len());
+        Ok((frame, Some(pb)))
     }
 
     /// The frame with its whole value in `frame.value`.
-    pub async fn into_frame(self) -> std::io::Result<Frame> {
-        let (mut frame, value) = self.into_parts().await?;
+    pub async fn into_frame(self, reader: &ReadHalf) -> Result<Frame, IncomingError> {
+        let (mut frame, value) = self.into_parts(reader).await?;
         if let Some(pb) = value {
             frame.value = Bytes::from_owner(pb);
         }
@@ -144,5 +224,21 @@ fn log_first_receive(len: usize) {
     static SEEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if !SEEN.swap(true, std::sync::atomic::Ordering::Relaxed) {
         tracing::info!(value_len = len, "received a frame value by UCX rendezvous (first in this process)");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A frame with no buffer for its value is answered with an error frame
+    /// for its request; other errors end the connection.
+    #[test]
+    fn a_refused_frame_is_answered_for_its_request() {
+        let f = IncomingError::NoBuffer { req_id: 7, msg_type: 0x51 }.refusal().expect("answered");
+        assert_eq!((f.req_id, f.msg_type), (7, 0x51));
+        assert!(f.is_error());
+        assert_eq!(RpcError::decode_status(&f.payload).0, StatusCode::Unavailable);
+        assert!(IncomingError::Io(std::io::Error::other("gone")).refusal().is_none());
     }
 }

@@ -707,7 +707,16 @@ fn use_quota(i: usize) -> usize {
 }
 
 fn thread_quota(i: usize) -> usize {
-    use_quota(i) / THREAD_SHARE_DIVISOR
+    thread_share(cap_bytes(), i)
+}
+
+fn thread_share(cap: usize, i: usize) -> usize {
+    cap / 100 * USE_SHARE[i] / THREAD_SHARE_DIVISOR
+}
+
+/// What one thread may hold of `u` under a pool cap of `cap` bytes.
+pub fn thread_share_of(cap: usize, u: Use) -> usize {
+    thread_share(cap, u as usize)
 }
 
 /// Bytes this thread holds per use; shared with its buffers, which may be

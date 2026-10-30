@@ -145,8 +145,26 @@ async fn values_started_together_are_waited_in_any_order() {
     let (a, b) = (pattern(4 << 20, 7), pattern(1 << 20, 8));
     tx.post_frame_value(21, Bytes::from(a.clone()));
     tx.post_frame_value(22, Bytes::from(b.clone()));
-    let first = am::start_frame_value(&rx, &[(a.len(), 21)], &[]).unwrap();
-    let second = am::start_frame_value(&rx, &[(b.len(), 22)], &[]).unwrap();
+    let first = am::start_frame_value(&rx, &[(a.len(), 21)], &[], autumn_transport::regpool_acquire(a.len())).unwrap();
+    let second = am::start_frame_value(&rx, &[(b.len(), 22)], &[], autumn_transport::regpool_acquire(b.len())).unwrap();
     assert_eq!(second.wait().await.unwrap().filled(), b.as_slice());
     assert_eq!(first.wait().await.unwrap().filled(), a.as_slice());
+}
+
+/// A frame refused for want of a buffer gives its value up: one already held
+/// is released, one still to come is dropped on arrival; both senders complete.
+#[compio::test]
+async fn an_abandoned_value_lets_its_sender_complete_whether_it_came_first_or_not() {
+    let (tx, rx, _keep) = pair().await;
+    let (held, held_sent) = tracked(vec![4u8; 1 << 20]);
+    tx.post_frame_value(31, held);
+    compio::time::sleep(Duration::from_millis(50)).await;
+    assert!(!held_sent.load(Ordering::Relaxed), "held for its frame");
+    am::abandon_frame_value(&rx, &[(1 << 20, 31)]);
+    until("a held value's sender completed once abandoned", || held_sent.load(Ordering::Relaxed)).await;
+
+    am::abandon_frame_value(&rx, &[(1 << 20, 32)]);
+    let (late, late_sent) = tracked(vec![5u8; 1 << 20]);
+    tx.post_frame_value(32, late);
+    until("a value abandoned before it came let its sender complete", || late_sent.load(Ordering::Relaxed)).await;
 }

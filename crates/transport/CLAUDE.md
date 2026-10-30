@@ -292,7 +292,12 @@ the handler (`on_frame_value`) gets the receiving endpoint and keys the value by
   (`FORGOTTEN`) because UCX keeps it and later values still arrive on it — they
   are dropped on arrival (red without it: such a sender never completes).
 
-`start_frame_value(reader, pieces, inline)` assembles one pool buffer: tag-0
+`start_frame_value(reader, pieces, inline, pb)` assembles the value in `pb`, a
+pool buffer the caller took for the whole length (autumn-rpc takes it against a
+use budget, see "Use budgets and waiting"); when it can get none,
+`abandon_frame_value(reader, pieces)` lets the value go: a piece already held is
+released, a later one dropped on arrival, and either sender completes
+(`ucx_am_frame.rs`, red when abandoning does nothing). In the buffer, tag-0
 pieces are copied from the bytes that came on the stream, every other piece is
 registered at once, and `FrameValue::wait` waits for them; a receive loop starts
 the values of every frame it has buffered before waiting for the first, so they

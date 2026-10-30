@@ -38,7 +38,8 @@ mod regpool;
 pub use regpool::{
     acquire as regpool_acquire, set_regpool_cap_bytes,
     acquire_for as regpool_acquire_for, snapshot as regpool_snapshot, try_acquire_for as regpool_try_acquire_for,
-    PoolError, PooledBuf, RegBytes, RegpoolStats, Use as PoolUse, UseStats as PoolUseStats,
+    thread_share_of as regpool_thread_share_of, PoolError, PooledBuf, RegBytes, RegpoolStats, Use as PoolUse,
+    UseStats as PoolUseStats,
 };
 pub use recv_dest::{RecvDest, Released};
 
@@ -169,25 +170,39 @@ pub mod am {
         inner: crate::ucx::am::FrameValue,
     }
 
-    /// Start receiving a frame's value into one pool buffer: `segments` are
-    /// its pieces in order, `(len, tag)`, where tag 0 is the next piece of
-    /// `inline` (bytes that came on the stream) and any other tag a frame value
-    /// on this connection. Every piece is registered now, so values started
-    /// before any is waited for are received together. Dropped before `wait`
-    /// ends, a receive under way keeps the buffer until it ends. UCX only.
+    /// Start receiving a frame's value into `pb`, a pool buffer of the
+    /// value's whole length: `segments` are its pieces in order, `(len, tag)`,
+    /// where tag 0 is the next piece of `inline` (bytes that came on the
+    /// stream) and any other tag a frame value on this connection. Every piece
+    /// is registered now, so values started before any is waited for are
+    /// received together. Dropped before `wait` ends, a receive under way keeps
+    /// the buffer until it ends. UCX only.
     pub fn start_frame_value(
         reader: &crate::ReadHalf,
         segments: &[(usize, u64)],
         inline: &[u8],
+        pb: crate::PooledBuf,
     ) -> io::Result<FrameValue> {
         match reader {
             #[cfg(feature = "ucx")]
             crate::ReadHalf::Ucx(r) => {
-                Ok(FrameValue { inner: crate::ucx::am::start_value(r.ep(), segments, inline)? })
+                Ok(FrameValue { inner: crate::ucx::am::start_value(r.ep(), segments, inline, pb)? })
             }
             crate::ReadHalf::Tcp(_) => {
-                let _ = (segments, inline);
+                let _ = (segments, inline, pb);
                 Err(io::Error::new(io::ErrorKind::Unsupported, "frame values need the UCX transport"))
+            }
+        }
+    }
+
+    /// Give up a frame's value that was never started (no buffer for it): its
+    /// senders complete, a piece already here is released, a later one dropped.
+    pub fn abandon_frame_value(reader: &crate::ReadHalf, segments: &[(usize, u64)]) {
+        match reader {
+            #[cfg(feature = "ucx")]
+            crate::ReadHalf::Ucx(r) => crate::ucx::am::abandon_value(r.ep(), segments),
+            crate::ReadHalf::Tcp(_) => {
+                let _ = segments;
             }
         }
     }
@@ -202,13 +217,14 @@ pub mod am {
         }
     }
 
-    /// `start_frame_value`, then `wait`.
+    /// `start_frame_value` into an unbudgeted pool buffer, then `wait`.
     pub async fn receive_frame_value(
         reader: &crate::ReadHalf,
         segments: &[(usize, u64)],
         inline: &[u8],
     ) -> io::Result<crate::PooledBuf> {
-        start_frame_value(reader, segments, inline)?.wait().await
+        let pb = crate::regpool_acquire(segments.iter().map(|s| s.0).sum());
+        start_frame_value(reader, segments, inline, pb)?.wait().await
     }
 }
 pub use tcp::TcpTransport;

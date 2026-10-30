@@ -356,7 +356,11 @@ until its pwritev + fsync complete, exactly as its decoder slice did before.
 append whose payload has a part of at least 64 KiB arrives as a frame value
 (autumn-rpc "Frame values"): the large parts come by rendezvous straight into a
 registered pool buffer (no unpack copy), and the ctrl carries the payload's
-crc32c after the 32-byte header. `process_frames_backpressured` receives the
+crc32c after the 32-byte header. The buffer counts against the pool's `Receive`
+budget; with the budget full (or the value too large for it, such as a whole
+compaction output) it is an unbudgeted pool buffer, never a refusal: the PS
+bounds its appends in flight, and the stream client would take a refused append
+as a failed replica (mark the node, report it, seal and move on). `process_frames_backpressured` receives the
 values of every frame of a burst together (`am_frame::complete`, `join_all`)
 before it handles any of them, so frames keep their order; `decode_append`
 takes the frame-value form through `AppendReq::decode_checked`, which

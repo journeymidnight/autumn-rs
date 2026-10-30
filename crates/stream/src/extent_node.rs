@@ -2432,10 +2432,17 @@ async fn process_frames_backpressured(
             while run.len() < cap && value_bytes < value_budget {
                 let Some(f) = rest.next() else { break };
                 value_bytes += autumn_rpc::am_frame::am_value_len(&f);
-                run.push(autumn_rpc::am_frame::start(reader, f)?);
+                // The PS bounds its appends in flight, so a full budget takes
+                // an unbudgeted buffer rather than refusing an append.
+                run.push(autumn_rpc::am_frame::start(
+                    reader,
+                    f,
+                    autumn_transport::PoolUse::Receive,
+                    autumn_rpc::am_frame::WhenFull::Unbudgeted,
+                )?);
             }
             for incoming in run {
-                ready.push(incoming.into_frame().await.map_err(|e| anyhow::anyhow!("frame value: {e}"))?);
+                ready.push(incoming.into_frame(reader).await.map_err(|e| anyhow::anyhow!("{e}"))?);
             }
         }
         frames = ready;

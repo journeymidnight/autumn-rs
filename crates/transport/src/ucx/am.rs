@@ -312,6 +312,23 @@ pub(crate) fn forget_ep(ep: *mut ucp_ep) {
     let _ = ABANDONED.try_with(|a| a.borrow_mut().retain(|k| k.0 != ep));
 }
 
+/// Give up a frame's value that was never started: a piece already held is
+/// released, one still to come is dropped on arrival; either way its sender
+/// completes.
+pub(crate) fn abandon_value(ep: &UcxEp, segments: &[(usize, u64)]) {
+    let ep = ep.ptr() as usize;
+    let worker = WORKER.with(|w| w.get());
+    for &(_, tag) in segments.iter().filter(|s| s.1 != 0) {
+        let key = (ep, tag);
+        match EARLY.with(|e| e.borrow_mut().remove(&key)) {
+            Some(early) => unsafe { ucp_am_data_release(worker, early.desc) },
+            None => {
+                ABANDONED.with(|a| a.borrow_mut().insert(key));
+            }
+        }
+    }
+}
+
 /// Where a value goes, from registration until [`Expected::finish`].
 pub(crate) struct Expected(Rc<Slot>);
 
@@ -407,15 +424,19 @@ pub(crate) struct FrameValue {
     pending: Vec<Expected>,
 }
 
-/// Start receiving a frame's value into one pool buffer. `segments` are its
-/// pieces in order, `(len, tag)`: tag 0 is the next piece of `inline` (bytes
-/// that came on the stream), any other tag a value on `ep`. Every piece is
-/// registered here, so the values of several frames started before any is
-/// waited for are received together. Dropped before `wait` ends, a receive
-/// under way keeps the buffer until it ends.
-pub(crate) fn start_value(ep: &UcxEp, segments: &[(usize, u64)], inline: &[u8]) -> io::Result<FrameValue> {
-    let total = segments.iter().map(|s| s.0).sum();
-    let mut pb = crate::regpool::acquire(total);
+/// Start receiving a frame's value into `pb`, a pool buffer of the value's
+/// whole length. `segments` are its pieces in order, `(len, tag)`: tag 0 is the
+/// next piece of `inline` (bytes that came on the stream), any other tag a
+/// value on `ep`. Every piece is registered here, so the values of several
+/// frames started before any is waited for are received together. Dropped
+/// before `wait` ends, a receive under way keeps the buffer until it ends.
+pub(crate) fn start_value(
+    ep: &UcxEp,
+    segments: &[(usize, u64)],
+    inline: &[u8],
+    mut pb: PooledBuf,
+) -> io::Result<FrameValue> {
+    debug_assert_eq!(pb.cap(), segments.iter().map(|s| s.0).sum::<usize>());
     let (base, memh) = {
         let (dest, reg) = pb.dest_and_reg();
         (dest.as_mut_ptr(), reg.map_or(ptr::null_mut(), |r| r.memh()))

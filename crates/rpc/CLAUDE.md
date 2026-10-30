@@ -92,8 +92,27 @@ the values. Who sends them:
 | PS `GET_BULK` / `BATCH_GET_BULK` reply | reply | same (`reframe`) |
 
 Every receive loop decodes the frames it has buffered, starts all their values
-(`am_frame::start`, which registers every piece) and then takes the frames in
-order, each once its value is in (`Incoming::into_parts` / `into_frame`): the
+(`am_frame::start`, which takes a buffer against the use budget — `Receive` on
+the PS and EN server loops, `Reply` in `read_loop` — and registers every piece)
+and then takes the frames in order, each once its value is in
+(`Incoming::into_parts` / `into_frame`). A read loop never waits for a buffer:
+the wait would hold up every other frame and the pings on its connection, and
+the frames already started would keep the budget it waits for. With the budget
+full, `WhenFull::Refuse` (the PS's loop, `read_loop`; so far only for values
+that come as active messages — a bulk reply received from the stream,
+`recv_value_pooled`, is not budgeted yet) lets the value go
+(`abandon_frame_value`, its sender completes) and `IncomingError::refusal` is the
+`Unavailable` error frame for its request — the PS writes it back and goes on,
+`read_loop` hands it to the caller, the SDK retries; only an i/o error ends the
+connection. `WhenFull::Unbudgeted` (the extent node's appends, which the PS
+already bounds in flight) takes an unbudgeted pool buffer instead. Refusing also
+breaks the cycle the budgets exist for: a PS that cannot take an extent node's
+read reply lets it go, so the node's reply buffer is freed, not held. A value
+larger than a thread may hold of the budget (a compaction output appended
+whole) is received unbudgeted until background transfers are segmented
+(`tests/am_value_budget.rs`, 64 MiB cap: a 16 MiB value received by a refusing
+loop; with the thread's share held, a 4 MiB value refused and a second one
+taken unbudgeted; red without either fallback). Otherwise the
 values of a burst are fetched together and the connection's frames keep their
 order. `read_loop` decodes a run up to the next bulk fast-path frame (the
 value lands in the pooled buffer a `call_into_pooled` caller gets; a

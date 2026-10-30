@@ -384,14 +384,13 @@ that append (1.6–2 ms) before the next: 4 KiB writes stopped near 8K ops/s per
 partition whatever the client's depth (UCX, 16 threads, depth 32: 28–33K
 ops/s for 8 partitions, batch 8.0).
 
-The cap is bounded from above by the UCX registered pool: every admitted large
-value holds a pooled buffer, and past the process pool
-(`--ucx-regpool-cap-bytes`, 16 GiB) the buffers are fresh memory that every
-send registers again (docs/ops.md, "Per-connection admission and the registered
-pool"). One partition at 16 holds up to 2 GiB for kvcache under a TP8 engine (8
-connections x 16 x 16 MiB pages); at startup under UCX the PS warns when the
-pool is under `--conn-inflight-cap` x 128 MiB (`regpool_admission_mismatch`,
-one partition's worth). 32 with the old 512 MiB per-thread pool cut 16 MiB
+The cap is bounded from above by the pool: every admitted large value holds a
+pooled buffer against the partition's part of the `Receive` budget (a fifth of
+`--ucx-regpool-cap-bytes`, 16 GiB), and a value past it is refused `Unavailable`
+(docs/ops.md, "Per-connection admission and the registered pool"). One partition at 16 holds up to 2 GiB for kvcache under a TP8 engine (8
+connections x 16 x 16 MiB pages). At startup (TCP or UCX) the PS warns when a partition's
+part of the pool — a fifth: half of a 40% share — is under
+`--conn-inflight-cap` x 128 MiB (`regpool_admission_mismatch`). 32 with the old 512 MiB per-thread pool cut 16 MiB
 bulk reads from 8.5–9.2 to 3.0–3.7 GB/s.
 
 From 4 to 16 (perf bench, 16 threads x depth 8, alternating, 2 runs): TCP 4 KiB
@@ -1009,7 +1008,15 @@ land there. `drain_bulk_writes` (`lib.rs`) runs right after the read, BEFORE the
 normal decode: if the FRONT frame
 is a bulk write whose raw tail is `>= --bulk-recv-min-bytes` (64 KiB), it
 recvs that tail straight into a `PooledBuf` instead of letting `FrameDecoder`
-accumulate (and copy) it. BOTH value-separable write shapes qualify —
+accumulate (and copy) it. The buffer is taken against the pool's `Receive`
+budget, never waited for (the wait would hold up the connection's other frames
+and its pings); with none the tail is read past (`discard_value`) and the
+request answered `Unavailable`, so the connection stays in step and the client
+retries; a tail larger than a thread may hold of the budget is received
+unbudgeted, as before (test
+`a_bulk_value_with_no_buffer_is_refused_and_the_connection_goes_on`: this
+thread's `Receive` share held, the value refused, the next frame admitted; red
+with the unbudgeted acquire). BOTH value-separable write shapes qualify —
 `MSG_PUT_BULK` (one value, fixed 44-byte binary meta then the key) and
 `MSG_BATCH_PUT_BULK` (rkyv ctrl, tail = every op's value back to back). The batch
 form is where the biggest tails are, since the client routes any individually-large
