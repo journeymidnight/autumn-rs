@@ -100,8 +100,24 @@ than the largest chunk (256 MiB), is `TooLarge` at once — so a single value is
 at most the smaller of 256 MiB and a tenth (`Staging`) or a fifth (`Receive`,
 `Reply`) of the cap. A value between 64 and 256 MiB needs a chunk of its own
 size; at the cap with only 64 MiB chunks it cannot fit and waits out `wait` to
-`Full`. `acquire` (no budget; an overflow chunk at the cap, a heap buffer over 256 MiB)
-serves the unbudgeted callers; `acquire_charged_if_room`
+`Full`. `acquire_many_for(use, needs, wait)` takes a batch's buffers all or none: one
+charge for the total split among them, a wait that holds nothing, `TooLarge`
+at once when the total is more than a thread may hold. A try that runs short of
+memory part way gives back what it took without waking the memory list
+(`give_back_quietly`): that is no new room, and the wake let the batch, itself
+waiting on that list, wake itself and spin its whole wait (a review found it;
+1.0 s of CPU over a 1 s wait). The cost, inferred and accepted: a memory waiter
+on another thread that missed its try only because the batch briefly held that
+room is not woken when the batch gives it back, and sleeps until the next
+return or its deadline (the extent node's 1 s, then the copy path). A batch
+counts a hit per buffer (and per buffer given back) against one acquire, so the
+logged hit rate can read above 100%. `tests/regpool_batch.rs`: over the share refused
+without waiting, a timed-out or waiting batch holds nothing, room for all wakes
+it, each buffer gives its share back, a batch short of memory sleeps (thread
+CPU < 200 ms over its 1 s wait); red with the total check removed — the batch
+then waits its full second — and with the quiet give-back removed. The extent node's
+bulk read batch is its caller. `acquire` (no budget; an overflow chunk at the
+cap, a heap buffer over 256 MiB) serves the unbudgeted callers; `acquire_charged_if_room`
 charges a use when it has room and is `acquire` when not (for a value already
 in memory, which refusing would not save). `snapshot().uses` reports each
 budget's quota, bytes in use, high water, waits, timeouts, `refused` (`Full`

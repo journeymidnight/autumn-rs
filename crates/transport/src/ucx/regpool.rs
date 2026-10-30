@@ -438,6 +438,13 @@ impl Drop for PooledBuf {
 }
 
 impl PooledBuf {
+    /// Returns its range to its chunk without waking memory waiters.
+    fn give_back_quietly(mut self) {
+        if let Storage::Pooled { chunk, alloc, units, .. } = std::mem::replace(&mut self.storage, Storage::Heap(Vec::new())) {
+            chunk.free(alloc, units);
+        }
+    }
+
     fn base(&self) -> *const u8 {
         match &self.storage {
             Storage::Pooled { ptr, .. } => *ptr,
@@ -891,8 +898,19 @@ struct Charge {
     held: Held,
 }
 
+impl Charge {
+    /// `bytes` of this charge as a charge of its own.
+    fn split_off(&mut self, bytes: usize) -> Charge {
+        self.bytes -= bytes;
+        Charge { u: self.u, bytes, held: self.held.clone() }
+    }
+}
+
 impl Drop for Charge {
     fn drop(&mut self) {
+        if self.bytes == 0 {
+            return;
+        }
         let i = self.u as usize;
         self.held[i].fetch_sub(self.bytes, Ordering::SeqCst);
         BUDGETS[i].in_use.fetch_sub(self.bytes, Ordering::SeqCst);
@@ -946,6 +964,32 @@ fn try_once(u: Use, need: usize) -> Result<PooledBuf, Short> {
     Ok(pb)
 }
 
+/// `try_once` for several buffers, all or none: the total is charged once.
+fn try_once_many(u: Use, needs: &[usize]) -> Result<Vec<PooledBuf>, Short> {
+    let units = |need: usize| need.div_ceil(UNIT).max(1) * UNIT;
+    let total: usize = needs.iter().map(|&n| units(n)).sum();
+    if needs.iter().any(|&n| n > MAX_CHUNK_BYTES) || total > thread_quota(u as usize) {
+        return Err(Short::TooLarge);
+    }
+    let mut c = charge(u, total).ok_or(Short::Budget)?;
+    let mut out = Vec::with_capacity(needs.len());
+    for &need in needs {
+        match alloc(need) {
+            Some(pb) => out.push(pb),
+            None => {
+                // What this try took is no new room: returned without a wake,
+                // else the batch, waiting for memory, would wake itself and spin.
+                out.into_iter().for_each(PooledBuf::give_back_quietly);
+                return Err(Short::Memory);
+            }
+        }
+    }
+    for (pb, &need) in out.iter_mut().zip(needs) {
+        pb.charge = Some(c.split_off(units(need)));
+    }
+    Ok(out)
+}
+
 /// A buffer for `u`, charged when the budget has room and unbudgeted when
 /// not; never refused and never counted as refused.
 pub fn acquire_charged_if_room(u: Use, need: usize) -> PooledBuf {
@@ -977,16 +1021,31 @@ pub fn try_acquire_for(u: Use, need: usize) -> Result<PooledBuf, PoolError> {
 /// is woken by returns to the same use, or to the pool's memory when that was
 /// what ran short.
 pub async fn acquire_for(u: Use, need: usize, wait: std::time::Duration) -> Result<PooledBuf, PoolError> {
+    wait_for(u, wait, || try_once(u, need)).await
+}
+
+/// Buffers for every one of `needs`, all or none, waiting up to `wait`: a
+/// batch charges its total once, so it never holds some of its buffers while
+/// it waits for room for the rest. `TooLarge` when the total is more than one
+/// thread may hold.
+pub async fn acquire_many_for(u: Use, needs: &[usize], wait: std::time::Duration) -> Result<Vec<PooledBuf>, PoolError> {
+    if needs.is_empty() {
+        return Ok(Vec::new());
+    }
+    wait_for(u, wait, || try_once_many(u, needs)).await
+}
+
+async fn wait_for<T>(u: Use, wait: std::time::Duration, mut attempt: impl FnMut() -> Result<T, Short>) -> Result<T, PoolError> {
     ACQUIRE_TOTAL.fetch_add(1, Ordering::Relaxed);
-    let mut short = match try_once(u, need) {
-        Ok(pb) => return Ok(pb),
+    let budget = &BUDGETS[u as usize];
+    let mut short = match attempt() {
+        Ok(got) => return Ok(got),
         Err(Short::TooLarge) => {
-            BUDGETS[u as usize].too_large.fetch_add(1, Ordering::Relaxed);
+            budget.too_large.fetch_add(1, Ordering::Relaxed);
             return Err(PoolError::TooLarge);
         }
         Err(s) => s,
     };
-    let budget = &BUDGETS[u as usize];
     if wait.is_zero() {
         budget.refused.fetch_add(1, Ordering::Relaxed);
         return Err(PoolError::Full);
@@ -1001,10 +1060,10 @@ pub async fn acquire_for(u: Use, need: usize, wait: std::time::Duration) -> Resu
         };
         let _waiting = Waiting::announce(list);
         let seen = list.gen.load(Ordering::SeqCst);
-        short = match try_once(u, need) {
-            Ok(pb) => return Ok(pb),
+        short = match attempt() {
+            Ok(got) => return Ok(got),
             Err(Short::TooLarge) => {
-                BUDGETS[u as usize].too_large.fetch_add(1, Ordering::Relaxed);
+                budget.too_large.fetch_add(1, Ordering::Relaxed);
                 return Err(PoolError::TooLarge);
             }
             Err(s) => s,

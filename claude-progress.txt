@@ -5,7 +5,8 @@ Current summary: 2b-2b done: rpc read_loop takes stream-received bulk replies fr
 2b-2c done (user 2026-10-30 "用完就释放"): at the cap an unbudgeted `acquire` takes an overflow chunk — registered like any chunk, outside the cap and the chunk list, shared by other over-cap requests, released when its last buffer returns; budgeted requests never use one; heap only for > 256 MiB or a failed mmap. Test ucx_regpool_cap rewritten (red with the heap fallback, red with the chunk kept). Measured: 256 MiB cap → 5–9 overflow chunks per run, the slowdown is the budgets; 1 GiB cap → none, throughput as default. Reviews: fable (no high; spurious memory wake and counter placement fixed), opus on the fixes.
 Main gaps: UCX `discard_value` branch untested; an EN with `Reply` full costs each PS bulk read 1 s before the copy path; overflow chunk released inside a UCX callback untested; batch requests acquire once; one item over a chunk → error (step 5); 2b-3 (liveness test, /metrics); steps 3–9. Decided (user 2026-10-30): no backpressure code for EN appends; EC Unavailable keeps the cache; overflow chunks freed when empty.
 2b-3 liveness test done: manager/tests/pool_full_liveness.rs (in-process cluster on one 64 MiB pool, 6 writers + 6 readers of 4–8 MiB values; Receive and Reply both refuse, all 192 requests complete byte-exact, worst gap ~1 s; red when the client does not read a refused reply past). TCP only.
-Next steps: /metrics for the pool counters; batch requests acquire once; then step 3 (F-DP-CALLER-REGISTER).
+Deferred (user 2026-10-30): the 4K write tail (perf-check TCP 4K p50 0.69 ms, p95 21 ms, p99 36 ms; 128 in flight / 34K ops/s = 3.7 ms mean, so the tail, not --conn-inflight-cap 16, sets the rate) is investigated after the whole redesign, in its final perf check.
+Next steps: commit /metrics (done, f5000368) and batch-acquire-once after its A/B; then step 3 (F-DP-CALLER-REGISTER).
 
 Date: 2026-10-28 (3)
 TaskStatus: completed

@@ -371,18 +371,24 @@ value is still on its way holds the connection loop, as a stream value did.
 `READ_BYTES_BULK` replies of 64 KiB or more go the same way (`AmOut::frame_now`),
 to the PS and to a client reading directly; the reply value is the pool slab
 it was read into (`PooledBuf::freeze`), so the send hands UCX the slab's memh.
-That slab comes from the `Reply` budget: the batch's future waits for it up to
-`READ_BUFFER_WAIT` (1 s, one deadline for the whole batch, inside the reader's
-3 s deadline) while the connection's other frames go on, then answers
+That slab comes from the `Reply` budget, all of a batch's at once
+(`regpool_acquire_many_for`): the batch's future waits up to `READ_BUFFER_WAIT`
+(1 s, inside the reader's 3 s deadline) for room for every slot it will serve,
+holding none of them meanwhile, while the connection's other frames go on.
+Taken slot by slot, a batch waited for room its own earlier slots held, and a
+batch over a thread's share always waited the full second. Short of room for
+all (or over the share, at once), each slot takes a buffer only if one is free
+now, a slot over the share alone is read unbudgeted, and the rest are answered
 `Unavailable`. The PS's `read_value_into_pooled` takes that as it takes its own
 refusal — no cache eviction, no other replica — and reads through its copy
 path (unbudgeted); its EC shard read (`ec_shard_into_pooled`) does the same,
 and drops the cached layout only for other refusals. A direct-reading client tries
 the next replica, then the PS (an EC direct read goes to the PS at once).
 `tests/read_reply_budget.rs`: with `Reply` held process-wide the read is refused
-`Unavailable` after the wait, then served; red without the budget. The shared
-deadline for a batch is not covered: a test cannot make reads arrive in one
-burst through the SDK.
+`Unavailable` after the wait, then served; red without the budget. The
+all-or-none take is covered in the pool (`transport/tests/regpool_batch.rs`),
+not at the node: a test cannot make reads arrive in one burst through the SDK
+(five concurrent reads on one connection were each served alone).
 Test: `tests/prepared_append.rs` over UCX (`AUTUMN_TEST_UCX_BIND`): appends and
 the read reply counted as rendezvous receives, the 65 read replies counted as
 sent with a memh, a payload that misses its crc refused.
