@@ -186,19 +186,7 @@ async fn main() -> Result<()> {
                 ticker.tick().await; // first tick immediate; skip
                 loop {
                     ticker.tick().await;
-                    let s = autumn_transport::regpool_snapshot();
-                    tracing::info!(
-                        acquire = s.acquire_total,
-                        hit = s.hit_total,
-                        hit_rate_pct = (s.hit_rate() * 100.0) as u32,
-                        out_of_pool = s.out_of_pool_total,
-                        over_cap = s.over_cap_total,
-                        register_failed = s.register_failed_total,
-                        pool_bytes = s.pool_bytes,
-                        registered_bytes = s.registered_bytes,
-                        in_use_bytes = s.in_use_bytes,
-                        "regpool"
-                    );
+                    autumn_transport::regpool_log();
                 }
             })
             .detach();

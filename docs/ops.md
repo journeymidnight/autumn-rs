@@ -3457,7 +3457,18 @@ the working set does not fit the budget. Inside the cap each use has a share —
 receive 40%, reply 40%, staging 20% — and one thread (a partition, a shard) at
 most half of a share, so the cap also bounds a single value: the smaller of
 256 MiB and a fifth of the cap for a received or read value (16 GiB: 256 MiB;
-1 GiB: about 200 MiB).
+1 GiB: about 200 MiB). The client also prints one line per share, `regpool
+reply: high_water= waits= timeouts= refused= too_large=`; the PS and the extent
+node log the same per share (`receive=`, `reply=`, `staging=`) with
+`--regpool-log-interval-secs N` (`AUTUMN_REGPOOL_LOG_INTERVAL_SECS` in
+cluster.sh). On the PS and the client a nonzero `refused` is values a read loop
+answered `Unavailable` at once for want of a buffer (the SDK retries, the PS
+reads through its copy path; a small reply already in memory is taken anyway
+and not counted). On an extent node, bulk reads answered `Unavailable` count in
+`reply` `timeouts` (it waited up to 1 s) or `refused` (its batch had already
+waited the 1 s out); its appends are never refused and never counted as refused.
+`too_large` counts values over a thread's share that a refusing or waiting
+caller met (taken unbudgeted).
 
 ```bash
 UCX_TLS=rc_mlx5,ud_mlx5,tcp,self UCX_NET_DEVICES=<dev>:1 \

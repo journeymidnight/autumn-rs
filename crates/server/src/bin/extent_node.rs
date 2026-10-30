@@ -370,6 +370,13 @@ fn main() -> Result<()> {
         tracing::warn!(regpool_cap, "regpool cap already set (ignored — first-call-wins)");
     }
     let _ = autumn_transport::init_with(transport);
+    let regpool_log_secs = autumn_stream::en_params().regpool_log_interval_secs.get();
+    if regpool_log_secs > 0 {
+        std::thread::spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_secs(regpool_log_secs));
+            autumn_transport::regpool_log();
+        });
+    }
 
     // the EN is by far the biggest fd consumer — `ExtentNode::load_extents` opens every
     // owned extent's data file at startup and the fd-LRU cache keeps up to

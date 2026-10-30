@@ -1603,6 +1603,10 @@ async fn read_loop(
                         };
                         let pb = match recv_value_pooled(&mut reader, &mut decoder, value_len, &rx_progress).await {
                             Ok(pb) => pb,
+                            Err(RecvFailed::NoBuffer) => {
+                                finish(Err(no_reply_buffer()));
+                                continue;
+                            }
                             Err(RecvFailed::PeerClosed) => {
                                 finish(Err(RpcError::ConnectionClosed));
                                 return Ok(());
@@ -1660,6 +1664,10 @@ async fn read_loop(
                             // the slot meanwhile (a UCX recv cannot be aborted).
                             let pb = match recv_value_pooled(&mut reader, &mut decoder, value_len, &rx_progress).await {
                                 Ok(pb) => pb,
+                                Err(RecvFailed::NoBuffer) => {
+                                    finish(Err(no_reply_buffer()));
+                                    continue;
+                                }
                                 Err(RecvFailed::PeerClosed) => {
                                     finish(Err(RpcError::ConnectionClosed));
                                     return Ok(());
@@ -1775,6 +1783,72 @@ enum RecvFailed {
     PeerClosed,
     /// Transport error mid-value.
     Io(std::io::Error),
+    /// No buffer in this process's `Reply` budget: the value was read past.
+    NoBuffer,
+}
+
+/// A buffer for a reply's value against the `Reply` budget, never waited for
+/// (the read loop would hold up the connection); `None` when it is full. A
+/// value larger than a thread may hold of the budget is taken unbudgeted.
+fn reply_buffer(len: usize) -> Option<autumn_transport::PooledBuf> {
+    // An empty value (an error reply) holds nothing worth a budget.
+    if len == 0 {
+        return Some(autumn_transport::regpool_acquire(0));
+    }
+    match autumn_transport::regpool_try_acquire_for(autumn_transport::PoolUse::Reply, len) {
+        Ok(pb) => Some(pb),
+        Err(autumn_transport::PoolError::TooLarge) => Some(autumn_transport::regpool_acquire(len)),
+        Err(autumn_transport::PoolError::Full) => None,
+    }
+}
+
+/// A value already decoded is in memory: refusing it saves nothing and makes
+/// the caller read it again, so with `Reply` full it is taken unbudgeted.
+fn decoded_reply_buffer(len: usize) -> autumn_transport::PooledBuf {
+    autumn_transport::regpool_acquire_charged_if_room(autumn_transport::PoolUse::Reply, len)
+}
+
+/// The answer to a caller whose reply had no buffer here.
+fn no_reply_buffer() -> RpcError {
+    RpcError::status(crate::StatusCode::Unavailable, autumn_transport::PoolError::Full.to_string())
+}
+
+/// Read past a value of `len` bytes that follows on the connection: what
+/// `decoder` holds, then the rest of the stream.
+async fn discard_value(
+    reader: &mut ReadHalf,
+    decoder: &mut FrameDecoder,
+    len: usize,
+    rx_progress: &Cell<u64>,
+) -> std::io::Result<()> {
+    let held = decoder.buffered_len().min(len);
+    decoder.consume(held);
+    let mut left = len - held;
+    if reader.is_ucx() {
+        while left > 0 {
+            reader
+                .recv_data_with(|chunk| {
+                    let take = chunk.len().min(left);
+                    left -= take;
+                    decoder.feed(&chunk[take..]);
+                })
+                .await?;
+            rx_progress.set(rx_progress.get().wrapping_add(1));
+        }
+        return Ok(());
+    }
+    use compio::buf::{IntoInner, IoBuf};
+    use compio::io::AsyncReadExt;
+    let mut scratch = vec![0u8; left.min(1 << 20)];
+    while left > 0 {
+        let n = left.min(scratch.len());
+        let BufResult(r, slice) = reader.read_exact(scratch.slice(..n)).await;
+        r?;
+        scratch = slice.into_inner();
+        left -= n;
+        rx_progress.set(rx_progress.get().wrapping_add(1));
+    }
+    Ok(())
 }
 
 /// Receive a bulk value of `value_len` bytes into a fresh pool buffer, starting
@@ -1785,7 +1859,13 @@ async fn recv_value_pooled(
     value_len: usize,
     rx_progress: &Cell<u64>,
 ) -> Result<autumn_transport::PooledBuf, RecvFailed> {
-    let mut pb = autumn_transport::regpool_acquire(value_len);
+    let mut pb = match reply_buffer(value_len) {
+        Some(pb) => pb,
+        None => {
+            discard_value(reader, decoder, value_len, rx_progress).await.map_err(RecvFailed::Io)?;
+            return Err(RecvFailed::NoBuffer);
+        }
+    };
     if reader.is_ucx() {
         return recv_value_ucx(reader, decoder, pb, rx_progress).await;
     }
@@ -1924,7 +2004,7 @@ fn finish_into_pooled_from_frame(
     value: &[u8],
 ) {
     let (code, message, ctrl_tail) = bulk_status(ctrl);
-    let mut pb = autumn_transport::regpool_acquire(value.len());
+    let mut pb = decoded_reply_buffer(value.len());
     {
         let (dest, _reg) = pb.dest_and_reg();
         dest.copy_from_slice(value);
@@ -1956,7 +2036,7 @@ fn finish_into_dest_from_frame(tx: DestWaiter, slot: &DestSlot, ctrl: &[u8], val
             None
         }
         _ => {
-            let mut pb = autumn_transport::regpool_acquire(value.len());
+            let mut pb = decoded_reply_buffer(value.len());
             pb.dest_mut().copy_from_slice(value);
             Some(pb)
         }

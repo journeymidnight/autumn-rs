@@ -37,7 +37,7 @@ mod regpool;
 
 pub use regpool::{
     acquire as regpool_acquire, set_regpool_cap_bytes,
-    acquire_for as regpool_acquire_for, snapshot as regpool_snapshot, try_acquire_for as regpool_try_acquire_for,
+    acquire_for as regpool_acquire_for, acquire_charged_if_room as regpool_acquire_charged_if_room, snapshot as regpool_snapshot, log_snapshot as regpool_log, try_acquire_for as regpool_try_acquire_for,
     thread_share_of as regpool_thread_share_of, PoolError, PooledBuf, RegBytes, RegpoolStats, Use as PoolUse,
     UseStats as PoolUseStats,
 };

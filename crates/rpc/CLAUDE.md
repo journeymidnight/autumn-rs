@@ -98,9 +98,7 @@ and then takes the frames in order, each once its value is in
 (`Incoming::into_parts` / `into_frame`). A read loop never waits for a buffer:
 the wait would hold up every other frame and the pings on its connection, and
 the frames already started would keep the budget it waits for. With the budget
-full, `WhenFull::Refuse` (the PS's loop, `read_loop`; so far only for values
-that come as active messages — a bulk reply received from the stream,
-`recv_value_pooled`, is not budgeted yet) lets the value go
+full, `WhenFull::Refuse` (the PS's loop, `read_loop`) lets the value go
 (`abandon_frame_value`, its sender completes) and `IncomingError::refusal` is the
 `Unavailable` error frame for its request — the PS writes it back and goes on,
 `read_loop` hands it to the caller, the SDK retries; only an i/o error ends the
@@ -112,7 +110,19 @@ larger than a thread may hold of the budget (a compaction output appended
 whole) is received unbudgeted until background transfers are segmented
 (`tests/am_value_budget.rs`, 64 MiB cap: a 16 MiB value received by a refusing
 loop; with the thread's share held, a 4 MiB value refused and a second one
-taken unbudgeted; red without either fallback). Otherwise the
+taken unbudgeted; red without either fallback). `read_loop` treats a reply that
+comes on the stream the same way: `recv_value_pooled` (the bulk fast path)
+takes it from `Reply` (`reply_buffer`; an empty value, an error reply's, needs
+none); a small reply already decoded is in memory, so refusing it would save
+nothing and cost a second read — it is charged when there is room and taken
+unbudgeted when not, without counting a refusal (`decoded_reply_buffer`;
+asserted in the same test, red when it refuses or counts). With no buffer, a
+streamed value is read past (`discard_value`: what the decoder holds, then the
+socket or UCX's queued stream data) and the caller gets `Unavailable`, the
+connection staying in step (`tests/reply_budget.rs`, 64 MiB cap: this thread's
+share held, a 4 MiB reply refused, the next one received whole; red when the
+value is not read past — the next call hangs — and when the budget is not
+asked). Otherwise the
 values of a burst are fetched together and the connection's frames keep their
 order. `read_loop` decodes a run up to the next bulk fast-path frame (the
 value lands in the pooled buffer a `call_into_pooled` caller gets; a

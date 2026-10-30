@@ -455,6 +455,7 @@ launch_extent_node() {
     esac
     local -a regpool_args=()
     [[ -n "${AUTUMN_UCX_REGPOOL_CAP_BYTES:-}" ]] && regpool_args=(--ucx-regpool-cap-bytes "$AUTUMN_UCX_REGPOOL_CAP_BYTES")
+    [[ -n "${AUTUMN_REGPOOL_LOG_INTERVAL_SECS:-}" ]] && regpool_args+=(--regpool-log-interval-secs "$AUTUMN_REGPOOL_LOG_INTERVAL_SECS")
     start_proc "node$i" \
         "$NODE" --port "$port" --data "$disk_arg" --manager "$MANAGER_ADDR" \
         --listen "$BIND_HOST" --transport "$TRANSPORT" \

@@ -2,7 +2,9 @@
 //! read from that shard's node in one `MSG_READ_BYTES_BULK`
 //! (`read_value_into_pooled`), at its offset inside the shard; a range across
 //! two shards is left to the copy path (`Ok(None)`), which splits it; a shard
-//! whose node cannot be reached is rebuilt from the other shards at once.
+//! whose node cannot be reached is rebuilt from the other shards at once; a
+//! read refused for want of a reply buffer goes to the copy path and keeps the
+//! cached layout. The pool is capped at 64 MiB (`Reply` about 25.6 MiB).
 
 mod support;
 
@@ -149,7 +151,12 @@ async fn converted_extent(mgr_addr: SocketAddr, addrs: Vec<SocketAddr>) -> Ec {
     Ec { mgr_str, mgr, addrs, client, extent_id, payload }
 }
 
-fn start_cluster() -> (SocketAddr, Vec<SocketAddr>, Vec<tempfile::TempDir>) {
+/// One test at a time: the refusal test holds the process's `Reply` budget.
+fn start_cluster() -> (SocketAddr, Vec<SocketAddr>, Vec<tempfile::TempDir>, std::sync::MutexGuard<'static, ()>) {
+    static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let serial = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    static CAP: std::sync::Once = std::sync::Once::new();
+    CAP.call_once(|| assert!(autumn_transport::set_regpool_cap_bytes(64 << 20), "set before any pool use"));
     let dirs: Vec<_> = (0..3).map(|_| tempfile::tempdir().unwrap()).collect();
     let mgr_addr = pick_addr();
     start_manager(mgr_addr);
@@ -157,12 +164,12 @@ fn start_cluster() -> (SocketAddr, Vec<SocketAddr>, Vec<tempfile::TempDir>) {
     for (i, a) in addrs.iter().enumerate() {
         start_extent_node(*a, dirs[i].path().to_path_buf(), i as u64 + 1, &mgr_addr.to_string());
     }
-    (mgr_addr, addrs, dirs)
+    (mgr_addr, addrs, dirs, serial)
 }
 
 #[test]
 fn a_range_inside_one_ec_shard_is_one_bulk_read() {
-    let (mgr_addr, addrs, _dirs) = start_cluster();
+    let (mgr_addr, addrs, _dirs, _serial) = start_cluster();
     compio::runtime::Runtime::new().unwrap().block_on(async {
         let ec = converted_extent(mgr_addr, addrs).await;
         for (off, len) in [(100u64, 1000u64), (5000, 1000)] {
@@ -188,7 +195,7 @@ fn a_range_inside_one_ec_shard_is_one_bulk_read() {
 /// try the same node again.
 #[test]
 fn a_shard_that_cannot_be_reached_is_rebuilt_at_once() {
-    let (mgr_addr, addrs, _dirs) = start_cluster();
+    let (mgr_addr, addrs, _dirs, _serial) = start_cluster();
     compio::runtime::Runtime::new().unwrap().block_on(async {
         let ec = converted_extent(mgr_addr, addrs).await;
         let info: ExtentInfoResp =
@@ -227,5 +234,47 @@ fn a_shard_that_cannot_be_reached_is_rebuilt_at_once() {
             .expect("bulk read")
             .expect("rebuilt from the other shards");
         assert_eq!(&buf.filled()[..n], &ec.payload[100..1100], "the rebuilt range");
+    });
+}
+
+/// With `Reply` held process-wide, the shard's node (or this client) refuses
+/// the bulk read `Unavailable`. That says nothing about the layout: the read
+/// goes to the copy path with the cached extent info kept, and the copy path,
+/// which takes no reply buffer, reads the range.
+#[test]
+fn a_read_with_no_reply_buffer_keeps_the_layout_and_uses_the_copy_path() {
+    let (mgr_addr, addrs, _dirs, _serial) = start_cluster();
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        let ec = converted_extent(mgr_addr, addrs).await;
+        let (_, n) = ec.client.read_value_into_pooled(ec.extent_id, 100, 1000).await.expect("bulk read").expect("one shard");
+        assert_eq!(n, 1000);
+        assert!(ec.client.has_cached_extent_info(ec.extent_id), "the read cached the layout");
+
+        // Each thread may hold half of `Reply`, with a sub-unit gap left over:
+        // hold from fresh threads until one gets nothing.
+        let mut held = Vec::new();
+        loop {
+            let got = std::thread::spawn(|| {
+                let mut held = Vec::new();
+                for size in [1 << 20, 64 << 10, 4 << 10] {
+                    while let Ok(pb) = autumn_transport::regpool_try_acquire_for(autumn_transport::PoolUse::Reply, size) {
+                        held.push(pb);
+                    }
+                }
+                held
+            })
+            .join()
+            .unwrap();
+            if got.is_empty() {
+                break;
+            }
+            held.extend(got);
+        }
+        let refused = ec.client.read_value_into_pooled(ec.extent_id, 100, 1000).await.expect("bulk read");
+        assert!(refused.is_none(), "no reply buffer: the copy path's");
+        assert!(ec.client.has_cached_extent_info(ec.extent_id), "a refusal for want of a buffer keeps the layout");
+        let (read, _) = ec.client.read_bytes_from_extent(ec.extent_id, 100, 1000).await.expect("copy path");
+        assert_eq!(read, &ec.payload[100..1100], "and the copy path reads it");
+        drop(held);
     });
 }

@@ -174,11 +174,13 @@ pub fn start(reader: &ReadHalf, mut frame: Frame, u: PoolUse, when_full: WhenFul
     let value = match frame.am_pieces.take() {
         Some(pieces) => {
             let total = pieces.iter().map(|p| p.0).sum();
-            let pb = match autumn_transport::regpool_try_acquire_for(u, total) {
-                Ok(pb) => Some(pb),
-                Err(PoolError::TooLarge) => Some(autumn_transport::regpool_acquire(total)),
-                Err(PoolError::Full) if when_full == WhenFull::Unbudgeted => Some(autumn_transport::regpool_acquire(total)),
-                Err(PoolError::Full) => None,
+            let pb = match when_full {
+                WhenFull::Unbudgeted => Some(autumn_transport::regpool_acquire_charged_if_room(u, total)),
+                WhenFull::Refuse => match autumn_transport::regpool_try_acquire_for(u, total) {
+                    Ok(pb) => Some(pb),
+                    Err(PoolError::TooLarge) => Some(autumn_transport::regpool_acquire(total)),
+                    Err(PoolError::Full) => None,
+                },
             };
             match pb {
                 Some(pb) => Value::Started(am::start_frame_value(reader, &pieces, &frame.value, pb)?),

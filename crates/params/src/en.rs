@@ -86,6 +86,8 @@ crate::params! {
         conn_read_buf_bytes: usize = 512 * KIB as usize, [4 * KIB as usize, 64 * MIB as usize];
         /// Buffer pool cap for the whole process (chunks, registered under UCX).
         ucx_regpool_cap_bytes: usize = 16 * GIB as usize, [64 * MIB as usize, 64 * GIB as usize];
+        /// Log the buffer pool every this many seconds (0 = off).
+        regpool_log_interval_secs: u64 = 0, [0, 86_400];
     }
 
     removed {

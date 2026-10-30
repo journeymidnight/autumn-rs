@@ -2823,6 +2823,11 @@ pub(crate) struct OwnerMailbox {
     running: bool,
 }
 
+/// How long a batch of bulk reads waits for `Reply` buffers before the rest are
+/// answered `Unavailable` (the PS then reads through its copy path): well inside
+/// the reader's own deadline.
+const READ_BUFFER_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// Encode a single error-response frame (`Frame::error` + `encode_status`).
 fn err_bytes(req_id: u32, msg_type: u8, code: StatusCode, msg: &str) -> Bytes {
     Frame::error(
@@ -3622,6 +3627,9 @@ fn build_read_future(
             return out;
         }
 
+        // One wait for the whole batch: its slots are read in turn, so a wait
+        // per slot would add up past the reader's deadline.
+        let buffer_deadline = std::time::Instant::now() + READ_BUFFER_WAIT;
         for slot in slots {
             let req = slot.req;
             // Eversion gate + length semantics live in `read_plan` (shared
@@ -3677,7 +3685,24 @@ fn build_read_future(
                 // returns to the pool when the response write completes. 2 Bytes
                 // on the wire: [header+bulk_ctrl], [value] — no
                 // ReadBytesResp/Frame encode copy.
-                let pb = autumn_transport::regpool_acquire(read_size as usize);
+                // Against the `Reply` budget; this request's own future may
+                // wait, the connection's other frames go on meanwhile.
+                let pb = match autumn_transport::regpool_acquire_for(
+                    autumn_transport::PoolUse::Reply,
+                    read_size as usize,
+                    buffer_deadline.saturating_duration_since(std::time::Instant::now()),
+                )
+                .await
+                {
+                    Ok(pb) => pb,
+                    Err(autumn_transport::PoolError::TooLarge) => autumn_transport::regpool_acquire(read_size as usize),
+                    // `Unavailable`, not a read code: the reader keeps its
+                    // layout and reads through its copy path.
+                    Err(e) => {
+                        out.push(err_bytes(slot.req_id, MSG_READ_BYTES_BULK, StatusCode::Unavailable, &e.to_string()));
+                        continue;
+                    }
+                };
                 let BufResult(result, pb) = f.read_exact_at(pb, read_offset).await;
                 match result {
                     Ok(_) => {

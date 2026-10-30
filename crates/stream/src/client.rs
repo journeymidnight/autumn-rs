@@ -4182,6 +4182,10 @@ impl StreamClient {
         self.extent_info_cache.remove(&extent_id);
     }
 
+    pub fn has_cached_extent_info(&self, extent_id: u64) -> bool {
+        self.extent_info_cache.contains_key(&extent_id)
+    }
+
     /// Forget the cached ADDRESS of a node we could not reach.
     ///
     /// Orthogonal to the extent cache and to the retry classes on purpose. A
@@ -4941,6 +4945,19 @@ impl StreamClient {
                 self.extent_info_cache.remove(&extent_id);
                 Ok(None)
             }
+            // No reply buffer, here or at the node: the layout is fine, so the
+            // copy path reads it as it stands.
+            Err(e)
+                if e.chain().any(|c| {
+                    matches!(
+                        c.downcast_ref::<autumn_rpc::RpcError>(),
+                        Some(autumn_rpc::RpcError::Status { code: autumn_rpc::StatusCode::Unavailable, .. })
+                    )
+                }) =>
+            {
+                tracing::debug!(extent_id, shard, error = %format_args!("{e:#}"), "EC bulk read refused for want of a buffer; using the copy path");
+                Ok(None)
+            }
             // An error frame from the node is a refusal: the copy path refreshes
             // the layout or reconstructs, as for a non-OK code.
             Err(e)
@@ -5067,10 +5084,10 @@ impl StreamClient {
                     self.extent_info_cache.remove(&extent_id);
                     return Ok(None);
                 }
-                // Refused on this side: no buffer here for the reply (this
-                // process's `Reply` budget is full), which another replica would
-                // meet too, or a send queue full, which the copy path's own
-                // replica loop gets past.
+                // Refused for want of a reply buffer — here (this process's
+                // `Reply` budget, which another replica would meet too) or at
+                // the node (its own budget) — or a send queue full: the copy
+                // path reads unbudgeted, through its own replica loop.
                 Err(e)
                     if e.chain().any(|c| {
                         matches!(

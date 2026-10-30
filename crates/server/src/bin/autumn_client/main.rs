@@ -1025,6 +1025,9 @@ async fn cmd_perf_check(client: &ClusterClient, threads: usize, duration_secs: u
         pool.registered_bytes,
         pool.in_use_bytes,
     );
+    for (name, u) in ["receive", "reply", "staging"].iter().zip(pool.uses.iter()) {
+        println!("regpool {name}: {u}");
+    }
 
     // ---- Regression check ----
     let mut regressed = false;

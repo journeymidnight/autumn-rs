@@ -68,8 +68,14 @@ at most the smaller of 256 MiB and a tenth (`Staging`) or a fifth (`Receive`,
 `Reply`) of the cap. A value between 64 and 256 MiB needs a chunk of its own
 size; at the cap with only 64 MiB chunks it cannot fit and waits out `wait` to
 `Full`. `acquire` (no budget; a heap buffer over 256 MiB
-or at the cap) remains for callers not moved yet. `snapshot().uses` reports each
-budget's quota, bytes in use, high water, waits and timeouts. Test: `tests/regpool_budget.rs` (64 MiB cap:
+or at the cap) remains for callers not moved yet; `acquire_charged_if_room`
+charges a use when it has room and is `acquire` when not (for a value already
+in memory, which refusing would not save). `snapshot().uses` reports each
+budget's quota, bytes in use, high water, waits, timeouts, `refused` (`Full`
+with no wait: `try_acquire_for`, or `acquire_for` past its deadline) and
+`too_large` (the `TooLarge` those two return; `acquire_charged_if_room` counts
+neither); `log_snapshot` (`regpool_log`) puts them on one INFO line, which
+the PS and the extent node emit every `--regpool-log-interval-secs`. Test: `tests/regpool_budget.rs` (64 MiB cap:
 per-thread half, uses independent, `TooLarge`, timeout counted, a waiter woken by
 a return on another thread, a memory waiter woken by memory coming back; red
 without the per-thread check, and without either wake it times out).
@@ -319,6 +325,13 @@ which under `UCP_ERR_HANDLING_MODE_NONE` reports no error either — the same
 dead-peer class as a stream read.
 
 ### Stream sends leave from the registered pool
+
+The staging buffer is taken unbudgeted (`acquire`): it is taken on a
+connection's writer task, where waiting for a budget would hold up that
+connection's pings too, and a peer that stops reading would keep its staged
+sends — and so a budget shared with other connections — from coming back.
+Stream sends carry parts under 64 KiB, bounded per connection by its submit
+queue.
 
 `ucx_send` / `ucx_send_vectored` copy the parts into one pool buffer and send it
 with its chunk's memh (`ucx_send_staged`). Handed the caller's memory, UCP Stream

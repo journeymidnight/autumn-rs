@@ -191,6 +191,22 @@ impl TestConn {
             .await
     }
 
+    /// `read_bytes_bulk`, the RPC's error returned instead of panicking.
+    pub async fn try_read_bytes_bulk(
+        &self,
+        extent_id: u64,
+        eversion: u64,
+        offset: u64,
+        length: u64,
+    ) -> anyhow::Result<(u8, Vec<u8>)> {
+        let req = ReadBytesReq::new(extent_id, eversion, offset, length, PayloadRef::in_dat());
+        let z = self
+            .pool
+            .call_into_pooled(&self.addr, MSG_READ_BYTES_BULK, req.encode(), Duration::from_secs(5))
+            .await?;
+        Ok((z.code, z.buf.as_ref().to_vec()))
+    }
+
     /// `read_bytes_bulk` naming a specific payload file.
     pub async fn read_bytes_bulk_from(
         &self,

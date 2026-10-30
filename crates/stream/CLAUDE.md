@@ -371,6 +371,18 @@ value is still on its way holds the connection loop, as a stream value did.
 `READ_BYTES_BULK` replies of 64 KiB or more go the same way (`AmOut::frame_now`),
 to the PS and to a client reading directly; the reply value is the pool slab
 it was read into (`PooledBuf::freeze`), so the send hands UCX the slab's memh.
+That slab comes from the `Reply` budget: the batch's future waits for it up to
+`READ_BUFFER_WAIT` (1 s, one deadline for the whole batch, inside the reader's
+3 s deadline) while the connection's other frames go on, then answers
+`Unavailable`. The PS's `read_value_into_pooled` takes that as it takes its own
+refusal — no cache eviction, no other replica — and reads through its copy
+path (unbudgeted); its EC shard read (`ec_shard_into_pooled`) does the same,
+and drops the cached layout only for other refusals. A direct-reading client tries
+the next replica, then the PS (an EC direct read goes to the PS at once).
+`tests/read_reply_budget.rs`: with `Reply` held process-wide the read is refused
+`Unavailable` after the wait, then served; red without the budget. The shared
+deadline for a batch is not covered: a test cannot make reads arrive in one
+burst through the SDK.
 Test: `tests/prepared_append.rs` over UCX (`AUTUMN_TEST_UCX_BIND`): appends and
 the read reply counted as rendezvous receives, the 65 read replies counted as
 sent with a memh, a payload that misses its crc refused.
@@ -1386,7 +1398,9 @@ read vs 81–83 us on the copy path. Test: `crates/manager/tests/ec_bulk_read.rs
 (a range in shard 0 and one in shard 1 come back from the bulk read, one across
 them is `None` and the copy path reads it — red with EC sent to the copy path;
 shard 0's node moved to a dead address comes back rebuilt — red when a failed
-read returns `None`).
+read returns `None`; with `Reply` held process-wide the read is `None`, the
+layout stays cached and the copy path reads it — red when `Unavailable`
+evicts. The pool is capped at 64 MiB and the suite runs one test at a time).
 
 **Read path** (`read_bytes_from_extent`): the start replica rotates by
 `(extent_id, offset)` hash so read IO spreads across all replicas; failover

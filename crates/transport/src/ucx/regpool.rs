@@ -80,6 +80,11 @@ pub struct UseStats {
     pub waits: u64,
     /// Waits that ended without a buffer.
     pub timeouts: u64,
+    /// `Full` without waiting: `try_acquire_for`, or `acquire_for` with no
+    /// wait left.
+    pub refused: u64,
+    /// Requests over what one thread may hold (`TooLarge`).
+    pub too_large: u64,
 }
 
 impl RegpoolStats {
@@ -90,6 +95,37 @@ impl RegpoolStats {
         } else {
             self.hit_total as f64 / self.acquire_total as f64
         }
+    }
+}
+
+/// One INFO line with the pool's counters and each use's.
+pub fn log_snapshot() {
+    let s = snapshot();
+    let [rx, reply, staging] = &s.uses;
+    tracing::info!(
+        acquire = s.acquire_total,
+        hit = s.hit_total,
+        hit_rate_pct = (s.hit_rate() * 100.0) as u32,
+        out_of_pool = s.out_of_pool_total,
+        over_cap = s.over_cap_total,
+        register_failed = s.register_failed_total,
+        pool_bytes = s.pool_bytes,
+        registered_bytes = s.registered_bytes,
+        in_use_bytes = s.in_use_bytes,
+        receive = %format_args!("{rx}"),
+        reply = %format_args!("{reply}"),
+        staging = %format_args!("{staging}"),
+        "regpool"
+    );
+}
+
+impl std::fmt::Display for UseStats {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "high_water={} waits={} timeouts={} refused={} too_large={}",
+            self.high_water_bytes, self.waits, self.timeouts, self.refused, self.too_large
+        )
     }
 }
 
@@ -109,6 +145,8 @@ pub fn snapshot() -> RegpoolStats {
             high_water_bytes: b.high_water.load(Ordering::Relaxed) as u64,
             waits: b.waits.load(Ordering::Relaxed),
             timeouts: b.timeouts.load(Ordering::Relaxed),
+            refused: b.refused.load(Ordering::Relaxed),
+            too_large: b.too_large.load(Ordering::Relaxed),
         };
     }
     for chunk in &pool().lock().unwrap().chunks {
@@ -685,6 +723,8 @@ struct Budget {
     high_water: AtomicUsize,
     waits: AtomicU64,
     timeouts: AtomicU64,
+    refused: AtomicU64,
+    too_large: AtomicU64,
     /// Waiting for this use's budget.
     room: WaitList,
 }
@@ -695,6 +735,8 @@ static BUDGETS: [Budget; USES] = [const {
         high_water: AtomicUsize::new(0),
         waits: AtomicU64::new(0),
         timeouts: AtomicU64::new(0),
+        refused: AtomicU64::new(0),
+        too_large: AtomicU64::new(0),
         room: WaitList::new(),
     }
 }; USES];
@@ -789,12 +831,30 @@ fn try_once(u: Use, need: usize) -> Result<PooledBuf, Short> {
     Ok(pb)
 }
 
+/// A buffer for `u`, charged when the budget has room and unbudgeted when
+/// not; never refused and never counted as refused.
+pub fn acquire_charged_if_room(u: Use, need: usize) -> PooledBuf {
+    match try_once(u, need) {
+        Ok(pb) => {
+            ACQUIRE_TOTAL.fetch_add(1, Ordering::Relaxed);
+            pb
+        }
+        Err(_) => acquire(need),
+    }
+}
+
 /// A buffer for `u` now, or `Full` / `TooLarge`.
 pub fn try_acquire_for(u: Use, need: usize) -> Result<PooledBuf, PoolError> {
     ACQUIRE_TOTAL.fetch_add(1, Ordering::Relaxed);
     try_once(u, need).map_err(|e| match e {
-        Short::TooLarge => PoolError::TooLarge,
-        Short::Budget | Short::Memory => PoolError::Full,
+        Short::TooLarge => {
+            BUDGETS[u as usize].too_large.fetch_add(1, Ordering::Relaxed);
+            PoolError::TooLarge
+        }
+        Short::Budget | Short::Memory => {
+            BUDGETS[u as usize].refused.fetch_add(1, Ordering::Relaxed);
+            PoolError::Full
+        }
     })
 }
 
@@ -805,10 +865,17 @@ pub async fn acquire_for(u: Use, need: usize, wait: std::time::Duration) -> Resu
     ACQUIRE_TOTAL.fetch_add(1, Ordering::Relaxed);
     let mut short = match try_once(u, need) {
         Ok(pb) => return Ok(pb),
-        Err(Short::TooLarge) => return Err(PoolError::TooLarge),
+        Err(Short::TooLarge) => {
+            BUDGETS[u as usize].too_large.fetch_add(1, Ordering::Relaxed);
+            return Err(PoolError::TooLarge);
+        }
         Err(s) => s,
     };
     let budget = &BUDGETS[u as usize];
+    if wait.is_zero() {
+        budget.refused.fetch_add(1, Ordering::Relaxed);
+        return Err(PoolError::Full);
+    }
     budget.waits.fetch_add(1, Ordering::Relaxed);
     let deadline = std::time::Instant::now() + wait;
     loop {
@@ -820,7 +887,10 @@ pub async fn acquire_for(u: Use, need: usize, wait: std::time::Duration) -> Resu
         let seen = list.gen.load(Ordering::SeqCst);
         short = match try_once(u, need) {
             Ok(pb) => return Ok(pb),
-            Err(Short::TooLarge) => return Err(PoolError::TooLarge),
+            Err(Short::TooLarge) => {
+                BUDGETS[u as usize].too_large.fetch_add(1, Ordering::Relaxed);
+                return Err(PoolError::TooLarge);
+            }
             Err(s) => s,
         };
         let left = deadline.saturating_duration_since(std::time::Instant::now());
