@@ -77,12 +77,12 @@ impl AmOut {
     /// [ctrl][crc]`) and its value parts, as stream buffers: unchanged when no
     /// part is large enough, else re-encoded with the large parts posted as
     /// frame values.
-    pub fn reframe(&self, head: Bytes, values: Vec<Bytes>) -> Vec<Bytes> {
+    pub fn reframe(&self, head: Bytes, values: Vec<RegBytes>) -> Vec<Bytes> {
         use crate::frame::{CTRL_PREFIX_LEN, HEADER_LEN};
         if !Self::wants(&values) {
             let mut bufs = Vec::with_capacity(1 + values.len());
             bufs.push(head);
-            bufs.extend(values);
+            bufs.extend(values.into_iter().map(RegBytes::into_bytes));
             return bufs;
         }
         let req_id = u32::from_le_bytes(head[0..4].try_into().unwrap());

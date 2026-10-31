@@ -4749,7 +4749,7 @@ pub(crate) async fn resolve_value(
     stream_client: &Rc<StreamClient>,
     offset: u64,
     length: u64,
-) -> Result<Bytes> {
+) -> Result<autumn_transport::RegBytes> {
     if op & OP_VALUE_POINTER != 0 {
         if raw_value.len() < VALUE_POINTER_SIZE {
             return Err(anyhow!("ValuePointer too short"));
@@ -4760,7 +4760,7 @@ pub(crate) async fn resolve_value(
         // Inline value already in a memtable Bytes — slice it zero-copy.
         let n = raw_value.len();
         if offset == 0 && length == 0 {
-            Ok(raw_value)
+            Ok(raw_value.into())
         } else {
             let start = (offset as usize).min(n);
             let end = if length == 0 {
@@ -4768,23 +4768,22 @@ pub(crate) async fn resolve_value(
             } else {
                 (start + length as usize).min(n)
             };
-            Ok(raw_value.slice(start..end))
+            Ok(raw_value.slice(start..end).into())
         }
     }
 }
 
 /// Read value bytes from logStream. VP.offset points to value start.
-/// `offset`/`length` = 0/0 means read the entire value. Returns a `Bytes`:
-/// R4 — on the UCX zero-copy fast path the value `Bytes` ALIASES the registered
-/// RegPool buffer (`Bytes::from_owner(pb)`, no copy), so handle_get_bulk can send
-/// it as its own iovec (fully copy-free EN->PS->client); on the copy-path
-/// fallback the Vec is moved into a Bytes.
+/// `offset`/`length` = 0/0 means read the entire value. On the bulk read the
+/// value is the pool buffer it was received into, with that buffer's memh
+/// (`pb.freeze()`, no copy), so a GET reply hands UCX the registration; on the
+/// copy-path fallback the Vec is moved in and carries none.
 pub(crate) async fn read_value_from_log(
     vp: &ValuePointer,
     stream_client: &Rc<StreamClient>,
     offset: u64,
     length: u64,
-) -> Result<Bytes> {
+) -> Result<autumn_transport::RegBytes> {
     let (read_off, read_len) = if offset == 0 && length == 0 {
         (vp.offset, vp.len)
     } else {
@@ -4805,19 +4804,19 @@ pub(crate) async fn read_value_from_log(
     // of zeros (caught by fuse_chaos T2: shrink→grow read non-zero,
     // non-source bytes that changed between reads).
     if read_len == 0 {
-        return Ok(Bytes::new());
+        return Ok(Default::default());
     }
     // R3/R4: zero-copy fast path — recv the value straight into a
     // registered RegPool buffer over UCX (MSG_READ_BYTES_BULK) and hand it onward
-    // as a Bytes ALIASING that buffer (from_owner; pb returns to the pool when
-    // the Bytes drops). No off-wire copy, no pb->Vec. A case the bulk read does
+    // as a RegBytes ALIASING that buffer with its memh (freeze; pb returns to the
+    // pool when the last clone drops). No off-wire copy, no pb->Vec. A case the bulk read does
     // not take (EC across shards, chunked, non-OK) returns None -> the
     // read_bytes_from_extent copy path.
     if let Ok(Some((pb, _n))) = stream_client
         .read_value_into_pooled(vp.extent_id, read_off, read_len)
         .await
     {
-        return Ok(Bytes::from_owner(pb));
+        return Ok(pb.freeze());
     }
     let (data, _) = stream_client
         .read_bytes_from_extent(vp.extent_id, read_off, read_len)
@@ -4831,7 +4830,7 @@ pub(crate) async fn read_value_from_log(
             read_off
         ));
     }
-    Ok(Bytes::from(data))
+    Ok(Bytes::from(data).into())
 }
 
 // ---------------------------------------------------------------------------

@@ -5205,7 +5205,7 @@ async fn serve_get_local(
     msg_type: u8,
     payload: Bytes,
     part: &Rc<RefCell<PartitionData>>,
-) -> (Bytes, Vec<Bytes>) {
+) -> (Bytes, Vec<autumn_transport::RegBytes>) {
     let t0 = Instant::now();
     let out = if msg_type == partition_rpc::MSG_BATCH_GET_BULK {
         // N values, each its own iovec — served here rather than through
@@ -5692,7 +5692,7 @@ fn push_one_frame_to_inflight(
                         let mut bufs = out.reframe(head, values).into_iter();
                         (bufs.next().expect("a frame"), bufs.collect())
                     }
-                    None => (head, values),
+                    None => (head, values.into_iter().map(autumn_transport::RegBytes::into_bytes).collect()),
                 }
             }
             .boxed_local();

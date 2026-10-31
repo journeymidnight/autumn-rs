@@ -964,16 +964,20 @@ The kvcache SDK's `get_into` issues `MSG_GET_BULK` so the value crosses
 pool buffer, then one memcpy into the caller's dest). Each receiving hop still
 pays its transport copy: the TCP kernel copy, or UCX Stream's unpack, which a
 registered buffer does not remove. The seam is
-`resolve_value`/`read_value_from_log` (`background.rs`) returning **`Bytes`**, not
-`Vec<u8>`:
+`resolve_value`/`read_value_from_log` (`background.rs`) returning a
+**`RegBytes`**, not `Vec<u8>`:
 - **VP value (UCX + TCP)**: `read_value_from_log` calls
   `StreamClient::read_value_into_pooled`, which recvs the value straight into a
   `RegPool` `PooledBuf` (EN emits `[bulk head][value]` as 2 `Bytes`, value aliases
   the EN pread buffer — no encode copy). UCX Stream unpacks into the pooled
   buffer; TCP recvs via a compio owned read (`read_exact_into_pooled`) — only the
   kernel copy, no FrameDecoder copy. The PS hands the value onward as
-  `Bytes::from_owner(pb)` (aliases the pool buffer; returns to the pool when that
-  `Bytes` drops after the client write completes). Falls back to the
+  `pb.freeze()` (aliases the pool buffer and keeps its chunk's memh; returns to
+  the pool when the last clone drops after the client write completes), through
+  `GetOutcome::Value`, `handle_get_bulk` / `handle_batch_get_bulk` /
+  `serve_get_local` and `AmOut::reframe` or `handle_get_am`'s `am.send`, so the
+  reply hands UCX the registration; a TCP connection sends the plain `Bytes`.
+  UCX, 8 MiB reads: the PS sent ~325 GB of replies, all with a memh. Falls back to the
   `read_bytes_from_extent` copy path for an EC value across shards / chunked /
   stale-eversion / length==0 (an EC value inside one shard is a bulk read of it).
   No value crc is verified (integrity is the transport's job).

@@ -235,12 +235,13 @@ pub(crate) async fn dispatch_partition_rpc(
 }
 
 /// Outcome of the shared GET resolve core: the value bytes, or a not-found.
-/// `Value` is a `Bytes` that, for a VP read, ALIASES the pooled buffer the
-/// value was received into — `handle_get_bulk` sends it as its own iovec (no
-/// copy).
+/// `Value` is a `RegBytes` that, for a VP read, ALIASES the pooled buffer the
+/// value was received into and carries its memh — `handle_get_bulk` sends it as
+/// its own iovec (no copy).
 pub(crate) enum GetOutcome {
     NotFound,
-    Value(Bytes),
+    /// A value read from the log keeps its pool buffer's memh.
+    Value(autumn_transport::RegBytes),
     /// large full-value VP — the caller (handle_get_redirect) sends
     /// a descriptor instead of resolving the bytes through this PS.
     Redirect { extent_id: u64, value_offset: u64, value_len: u64 },
@@ -274,7 +275,7 @@ async fn answer_get_redirect_inline(
         GetOutcome::Value(value) => Ok(partition_rpc::rkyv_encode(&GetRedirectResp {
             code: CODE_OK,
             message: String::new(),
-            value: value.into(),
+            value: Vec::from(value.into_bytes()),
             extent_id: 0,
             value_offset: 0,
             value_len: 0,
@@ -302,7 +303,7 @@ pub(crate) async fn handle_batch_get_bulk(
     req_id: u32,
     payload: Bytes,
     part: &Rc<RefCell<PartitionData>>,
-) -> (Bytes, Vec<Bytes>) {
+) -> (Bytes, Vec<autumn_transport::RegBytes>) {
     let fail = |code: StatusCode, msg: String| {
         let ctrl = partition_rpc::rkyv_encode(&partition_rpc::BatchGetBulkCtrl {
             message: msg,
@@ -335,7 +336,7 @@ pub(crate) async fn handle_batch_get_bulk(
     let mut total: usize = 0;
     let mut statuses: Vec<u8> = Vec::with_capacity(n);
     let mut value_lens: Vec<u32> = Vec::with_capacity(n);
-    let mut values: Vec<Bytes> = Vec::with_capacity(n);
+    let mut values: Vec<autumn_transport::RegBytes> = Vec::with_capacity(n);
     for key in req.keys.into_iter() {
         // Route each key through `get_value` for the same VP resolution /
         // read-pin / not-found / out-of-range semantics as a per-key MSG_GET_BULK.
@@ -348,9 +349,9 @@ pub(crate) async fn handle_batch_get_bulk(
         });
         let (status, value) = match get_value(inner, part).await {
             Ok(GetOutcome::Value(v)) => (0u8, v),
-            Ok(GetOutcome::NotFound) => (1u8, Bytes::new()),
+            Ok(GetOutcome::NotFound) => (1u8, Default::default()),
             Ok(GetOutcome::Redirect { .. }) => unreachable!("get_value never redirects"),
-            Err(_) => (2u8, Bytes::new()),
+            Err(_) => (2u8, Default::default()),
         };
         statuses.push(status);
         // Safe only because a single inline value is capped at
@@ -550,7 +551,7 @@ pub(crate) async fn handle_get_redirect(
         GetOutcome::Value(value) => Ok(partition_rpc::rkyv_encode(&GetRedirectResp {
             code: CODE_OK,
             message: String::new(),
-            value: value.into(),
+            value: Vec::from(value.into_bytes()),
             extent_id: 0,
             value_offset: 0,
             value_len: 0,
@@ -731,7 +732,7 @@ pub(crate) async fn handle_get_redirect_many(
             }
             GetOutcome::Value(value) => {
                 inlined_bytes += value.len();
-                inline(value.into())
+                inline(Vec::from(value.into_bytes()))
             }
             GetOutcome::Redirect {
                 extent_id,
@@ -844,7 +845,7 @@ pub(crate) async fn handle_get_redirect_many(
 /// (`get`, `get_range`, `get_pooled`, `get_into`): returns the response as TWO
 /// segments — `(head, value)` where `head = [header][ctrl_len][code+message][crc]`
 /// and `value` ALIASES the resolved read (a VP read's pool buffer via
-/// `Bytes::from_owner`, no copy). The ps-conn pushes `head` then `value` into
+/// `PooledBuf::freeze`, no copy, its memh kept). The ps-conn pushes `head` then `value` into
 /// `tx_bufs` so the single `write_vectored_all` emits them as one wire frame with
 /// no concat copy.
 ///
@@ -857,13 +858,13 @@ pub(crate) async fn handle_get_bulk(
     req_id: u32,
     payload: Bytes,
     part: &Rc<RefCell<PartitionData>>,
-) -> (Bytes, Bytes) {
-    let (code, msg, value): (u8, String, Bytes) = match get_value(payload, part).await {
+) -> (Bytes, autumn_transport::RegBytes) {
+    let (code, msg, value): (u8, String, autumn_transport::RegBytes) = match get_value(payload, part).await {
         Ok(GetOutcome::Value(v)) => (CODE_OK, String::new(), v),
-        Ok(GetOutcome::NotFound) => (CODE_NOT_FOUND, String::new(), Bytes::new()),
+        Ok(GetOutcome::NotFound) => (CODE_NOT_FOUND, String::new(), Default::default()),
         // get_value (redirect=false) never yields Redirect.
         Ok(GetOutcome::Redirect { .. }) => unreachable!("get_value never redirects"),
-        Err((status, msg)) => (partition_rpc::code_for_status(status), msg, Bytes::new()),
+        Err((status, msg)) => (partition_rpc::code_for_status(status), msg, Default::default()),
     };
     (ps_bulk_head(req_id, code, &msg, value.len()), value)
 }
