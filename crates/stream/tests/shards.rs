@@ -372,7 +372,7 @@ fn client_routes_by_extent_hash() {
                     eversion: 1,
                     commit: 0,
                     owner_epoch: 1,
-                    payload: Bytes::copy_from_slice(payload),
+                    payload: Bytes::copy_from_slice(payload).into(),
                 };
                 let r = pool
                     .call(&routed, MSG_APPEND, append.encode())
@@ -436,7 +436,7 @@ fn recovery_per_shard() {
                 eversion: 1,
                 commit: 0,
                 owner_epoch: 1,
-                payload: Bytes::from(payload),
+                payload: Bytes::from(payload).into(),
             };
             let r = pool
                 .call(&addr, MSG_APPEND, append.encode())
@@ -562,7 +562,7 @@ fn a_read_addressed_to_the_wrong_shard_is_refused() {
                         eversion: 1,
                         commit: 0,
                         owner_epoch: 1,
-                        payload: Bytes::copy_from_slice(payload),
+                        payload: Bytes::copy_from_slice(payload).into(),
                     }
                     .encode(),
                 )

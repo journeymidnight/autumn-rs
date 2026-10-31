@@ -45,7 +45,7 @@ const UNIT: usize = 4096;
 /// Size of a chunk made for requests up to its size.
 const CHUNK_BYTES: usize = 64 << 20;
 /// Largest chunk; a larger request is an out-of-pool heap buffer.
-pub(crate) const MAX_CHUNK_BYTES: usize = 256 << 20;
+pub const MAX_CHUNK_BYTES: usize = 256 << 20;
 
 static ACQUIRE_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// Acquires served from a chunk that already existed.

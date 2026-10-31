@@ -93,7 +93,7 @@ impl TestConn {
             eversion,
             commit,
             owner_epoch,
-            payload: Bytes::from(payload),
+            payload: Bytes::from(payload).into(),
         };
         let resp = self
             .pool

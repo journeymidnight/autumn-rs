@@ -314,7 +314,7 @@ fn re_avali_still_repairs_when_a_peer_has_the_data() {
                     eversion: 1,
                     commit: 0,
                     owner_epoch: 0,
-                    payload: payload.clone().into(),
+                    payload: bytes::Bytes::from(payload.clone()).into(),
                 }
                 .encode(),
             )

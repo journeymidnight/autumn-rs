@@ -117,7 +117,55 @@ pub struct AppendReq {
     pub eversion: u64,
     pub commit: u64,
     pub owner_epoch: i64,
-    pub payload: Bytes,
+    pub payload: AppendPayload,
+}
+
+/// An append's payload: one buffer, or the parts a frame value too large for
+/// one pool buffer was received in, in order.
+#[derive(Clone, Debug)]
+pub enum AppendPayload {
+    One(Bytes),
+    Parts(Vec<Bytes>),
+}
+
+impl AppendPayload {
+    pub fn len(&self) -> usize {
+        match self {
+            AppendPayload::One(b) => b.len(),
+            AppendPayload::Parts(p) => p.iter().map(Bytes::len).sum(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn parts(&self) -> &[Bytes] {
+        match self {
+            AppendPayload::One(b) => std::slice::from_ref(b),
+            AppendPayload::Parts(p) => p,
+        }
+    }
+
+    /// The payload in one buffer (a copy when it is in parts).
+    pub fn to_bytes(&self) -> Bytes {
+        match self {
+            AppendPayload::One(b) => b.clone(),
+            AppendPayload::Parts(p) => {
+                let mut all = BytesMut::with_capacity(self.len());
+                for part in p {
+                    all.extend_from_slice(part);
+                }
+                all.freeze()
+            }
+        }
+    }
+}
+
+impl From<Bytes> for AppendPayload {
+    fn from(b: Bytes) -> Self {
+        AppendPayload::One(b)
+    }
 }
 
 impl AppendReq {
@@ -127,7 +175,9 @@ impl AppendReq {
         buf.put_u64_le(self.eversion);
         buf.put_u64_le(self.commit);
         buf.put_i64_le(self.owner_epoch);
-        buf.extend_from_slice(&self.payload);
+        for part in self.payload.parts() {
+            buf.extend_from_slice(part);
+        }
         buf.freeze()
     }
 
@@ -149,25 +199,24 @@ impl AppendReq {
         let eversion = data.get_u64_le();
         let commit = data.get_u64_le();
         let owner_epoch = data.get_i64_le();
-        let payload = data;
         Ok(Self {
             extent_id,
             eversion,
             commit,
             owner_epoch,
-            payload,
+            payload: AppendPayload::One(data),
         })
     }
 
     /// The frame-value form (`am_frame`): `ctrl` is the 32-byte header then
     /// the payload's crc32c (u32 LE), and the payload came as the frame's
     /// value, which no frame CRC covers — so it is checked here.
-    pub fn decode_checked(ctrl: Bytes, payload: Bytes) -> Result<Self, &'static str> {
+    pub fn decode_checked(ctrl: Bytes, payload: AppendPayload) -> Result<Self, &'static str> {
         if ctrl.len() != APPEND_HEADER_LEN + 4 {
             return Err("append request: header and payload crc expected");
         }
         let crc = u32::from_le_bytes(ctrl[APPEND_HEADER_LEN..].try_into().unwrap());
-        if crc32c::crc32c(&payload) != crc {
+        if payload.parts().iter().fold(0, |c, p| crc32c::crc32c_append(c, p)) != crc {
             return Err("append payload crc mismatch");
         }
         let mut req = Self::decode(ctrl.slice(..APPEND_HEADER_LEN))?;
@@ -1379,13 +1428,23 @@ mod tests {
             Bytes::from(c)
         };
         let good = crc32c::crc32c(&payload);
-        let req = AppendReq::decode_checked(ctrl(good), payload.clone()).expect("decode");
+        let req = AppendReq::decode_checked(ctrl(good), payload.clone().into()).expect("decode");
         assert_eq!((req.extent_id, req.eversion, req.commit, req.owner_epoch), (7, 2, 4096, 9));
-        assert_eq!(req.payload, payload);
+        assert_eq!(req.payload.to_bytes(), payload);
         let mut flipped = payload.to_vec();
         flipped[50_000] ^= 1;
-        assert_eq!(AppendReq::decode_checked(ctrl(good), Bytes::from(flipped)).err(), Some("append payload crc mismatch"));
-        assert!(AppendReq::decode_checked(header, payload).is_err(), "no crc after the header");
+        assert_eq!(
+            AppendReq::decode_checked(ctrl(good), Bytes::from(flipped.clone()).into()).err(),
+            Some("append payload crc mismatch")
+        );
+        // In parts (a value too large for one pool buffer): the crc runs on
+        // across them, and a flip in a later part is caught.
+        let parts = |b: &[u8]| AppendPayload::Parts(b.chunks(30_000).map(Bytes::copy_from_slice).collect());
+        let req = AppendReq::decode_checked(ctrl(good), parts(&payload)).expect("decode parts");
+        assert_eq!(req.payload.parts().len(), payload.len().div_ceil(30_000));
+        assert_eq!(req.payload.to_bytes(), payload);
+        assert_eq!(AppendReq::decode_checked(ctrl(good), parts(&flipped)).err(), Some("append payload crc mismatch"));
+        assert!(AppendReq::decode_checked(header, payload.into()).is_err(), "no crc after the header");
     }
 
     #[test]
@@ -1488,7 +1547,7 @@ mod extent_rpc_codec_tests {
             eversion: 3,
             commit: 5 * 1024 * 1024 * 1024, // past 4 GiB: the u64 widening
             owner_epoch: -1,
-            payload: Bytes::from_static(b"durable bytes"),
+            payload: Bytes::from_static(b"durable bytes").into(),
         };
         let wire = req.encode();
         assert_eq!(wire.len(), APPEND_HEADER_LEN + req.payload.len());
@@ -1501,7 +1560,7 @@ mod extent_rpc_codec_tests {
         assert_eq!(got.eversion, 3);
         assert_eq!(got.commit, 5 * 1024 * 1024 * 1024);
         assert_eq!(got.owner_epoch, -1);
-        assert_eq!(&got.payload[..], b"durable bytes");
+        assert_eq!(&got.payload.to_bytes()[..], b"durable bytes");
         // A header one byte short must be refused, not read past.
         assert!(AppendReq::decode(Bytes::from(vec![0u8; APPEND_HEADER_LEN - 1])).is_err());
     }

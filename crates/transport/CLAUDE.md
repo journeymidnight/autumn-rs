@@ -484,6 +484,38 @@ its connection stays up only logs `frame value send failed`, and the
 receiver's connection loop then waits for that value until the connection is
 replaced (keepalive, at the client).
 
+### Large values in pieces: staged a few at a time, received one buffer per piece
+
+Background data (an SST, a WAL batch of large values, a GC batch) lives in
+ordinary memory and is far larger than a pool buffer. On the way out,
+autumn-rpc's `encode_am_frame` cuts each value part with no memh larger than
+`am::STAGED_PIECE_BYTES` (4 MiB) into equal pieces of at most that (slices, no
+copy; none under `BULK_MIN_BYTES`, since a frame value must go by rendezvous:
+an eager one that comes before its frame is dropped). `Sender::post_frame_values`
+(what autumn-rpc's `AmOut::post` calls) sends the pieces with a memh each on its
+own task, as before, and the others on one task with at most `STAGED_WINDOW` (4)
+in flight, so a piece is copied into the pool just before its send: a 1 GiB SST
+appended to three replicas holds 3 x 4 x 4 MiB of staging, not 3 GiB (the PS
+builds SSTs in segments of at most `--sst-segment-bytes`, 4 MiB, so each is one
+piece). A
+frame whose value is larger than one pool buffer (`POOL_MAX_BUFFER_BYTES`) is
+received one pool buffer per piece (`start_frame_value_parts`; each piece fits
+a chunk, as the sender cut it so), never into a heap buffer UCX would register;
+autumn-rpc's `am_frame::start` keeps the parts for an extent node's append
+and joins them (a copy) for anyone else. Tests: `ucx_am_frame.rs`
+`a_value_received_in_parts_comes_back_in_order` (each part a registered pool
+buffer, the stream piece copied into its own),
+`unregistered_values_are_staged_a_few_at_a_time` (16 unregistered values, the
+receiver taking none: exactly `STAGED_WINDOW` staged; red with the window
+removed: all 16); stream `prepared_append.rs`
+`an_append_larger_than_a_pool_buffer_arrives_in_parts` (296 MiB: 74 pieces, all
+received with a memh, the bytes on disk intact; red without the parts path: 74
+received without one). The piece size and the window are the measurement's
+to set (data-path step 5). An SDK put of a plain 8 MiB `Bytes` now goes in two
+pieces; perf-check (UCX, 3 disks, 8 partitions, alternating against the build
+before, two rounds): 8M write 2703/2754 vs 2638/2610 MB/s, 8M read 13011/14068
+vs 14428/12898, 4K write 30.6/32.1K vs 28.5/34.2K, read 277/288K vs 277/268K.
+
 ### Stream sends leave from the registered pool
 
 The staging buffer is taken unbudgeted (`acquire`): it is taken on a
@@ -558,9 +590,11 @@ never fails for want of one) and sent with that buffer's memh. The copy is
 counted (`am::staged_bytes()`, regpool log `am_staged_bytes`, `/metrics`
 `*_ucx_am_staged_bytes_total`). It is the one copy the design allows for memory
 the caller did not register (heap values, background data); the sender then
-holds the staged copy, not its own memory, until UCX is done with it. A value
-over the largest chunk (256 MiB) is sent as it is, without a memh (a heap copy
-would buy nothing), until large transfers are segmented. Small values are
+holds the staged copy, not its own memory, until UCX is done with it. An
+unregistered value over the largest chunk (256 MiB) is refused
+(`InvalidInput`): no pool buffer holds it, and handing it to UCX as it is
+would make UCX register it. Frame values never are one (see "Large values in
+pieces"). Small values are
 staged too: on rc_mlx5 an active message from 515 B up is sent zero-copy, i.e.
 registered, and only 514 B and below are copied by UCX (`UCX_PROTO_INFO=y`).
 That costs the PS's small GET replies over UCX (inline memtable/SST values, sent

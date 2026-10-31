@@ -43,6 +43,9 @@ pub use regpool::{
     UseStats as PoolUseStats,
 };
 pub use lend::{lend, Region, Returned};
+/// The largest buffer the pool hands out; a larger value is not sent or
+/// received over UCX as one piece.
+pub use regpool::MAX_CHUNK_BYTES as POOL_MAX_BUFFER_BYTES;
 pub use recv_dest::{RecvDest, Released};
 
 /// Values at least this long take the bulk paths: the SDK's bulk reads and
@@ -56,6 +59,12 @@ pub const BULK_MIN_BYTES: usize = 64 * 1024;
 /// `WriteHalf::am_sender` is `None`.
 pub mod am {
     use std::io;
+
+    /// Largest piece an unregistered frame value is sent in: each is copied
+    /// into the pool on its own, just before its send.
+    pub const STAGED_PIECE_BYTES: usize = 4 << 20;
+    /// Staged pieces of one frame in flight at once.
+    pub const STAGED_WINDOW: usize = 4;
 
     pub enum Arrival {
         /// The value (this many bytes) is in the memory.
@@ -200,6 +209,57 @@ pub mod am {
             }
         }
 
+        /// Send a frame's values (`(tag, value)`) and return at once. Values
+        /// with a memh go each on its own task, as `post_frame_value`; the
+        /// others are copied into the pool to be sent, so they go on one task
+        /// with at most `STAGED_WINDOW` in flight: a large unregistered value
+        /// (an SST, cut into `STAGED_PIECE_BYTES` pieces) never takes more
+        /// pool than that.
+        pub fn post_frame_values(&self, values: Vec<(u64, crate::RegBytes)>) {
+            #[cfg(feature = "ucx")]
+            {
+                use futures::StreamExt;
+                let (direct, staged): (Vec<_>, Vec<_>) =
+                    values.into_iter().partition(|(_, v)| v.is_registered() || v.is_empty());
+                for (tag, v) in direct {
+                    self.post_frame_value(tag, v);
+                }
+                if staged.is_empty() {
+                    return;
+                }
+                let ep = self.ep.clone();
+                compio::runtime::spawn(async move {
+                    let send = |(tag, value): (u64, crate::RegBytes)| {
+                        let ep = ep.clone();
+                        async move {
+                            if let Err(e) = crate::ucx::am::send_frame_value(&ep, tag, value).await {
+                                tracing::warn!(tag, error = %e, "frame value send failed");
+                            }
+                        }
+                    };
+                    let mut rest = staged.into_iter();
+                    let mut running = futures::stream::FuturesUnordered::new();
+                    loop {
+                        while running.len() < STAGED_WINDOW {
+                            match rest.next() {
+                                Some(v) => running.push(send(v)),
+                                None => break,
+                            }
+                        }
+                        if running.next().await.is_none() {
+                            break;
+                        }
+                    }
+                })
+                .detach();
+            }
+            #[cfg(not(feature = "ucx"))]
+            {
+                let _ = values;
+                unreachable!("no Sender without UCX")
+            }
+        }
+
         /// Send `value` as the frame value tagged `tag` (unique on this
         /// connection) and return at once; the send runs on its own task,
         /// holding `value` until the receiver fetched it. The frame that names
@@ -253,6 +313,43 @@ pub mod am {
                 let _ = (segments, inline, pb);
                 Err(io::Error::new(io::ErrorKind::Unsupported, "frame values need the UCX transport"))
             }
+        }
+    }
+
+    /// `start_frame_value` into one pool buffer per piece (charged to `u` when
+    /// there is room), for a value too large for one: `wait` gives the parts
+    /// in order. UCX only.
+    pub fn start_frame_value_parts(
+        reader: &crate::ReadHalf,
+        segments: &[(usize, u64)],
+        inline: &[u8],
+        u: crate::PoolUse,
+    ) -> io::Result<FrameValueParts> {
+        match reader {
+            #[cfg(feature = "ucx")]
+            crate::ReadHalf::Ucx(r) => {
+                Ok(FrameValueParts { inner: crate::ucx::am::start_value_parts(r.ep(), segments, inline, u)? })
+            }
+            crate::ReadHalf::Tcp(_) => {
+                let _ = (segments, inline, u);
+                Err(io::Error::new(io::ErrorKind::Unsupported, "frame values need the UCX transport"))
+            }
+        }
+    }
+
+    /// A frame's value being received in parts (`start_frame_value_parts`).
+    pub struct FrameValueParts {
+        #[cfg(feature = "ucx")]
+        inner: crate::ucx::am::FrameValueParts,
+    }
+
+    impl FrameValueParts {
+        /// The value's parts, in order, once every piece is in.
+        pub async fn wait(self) -> io::Result<Vec<crate::RegBytes>> {
+            #[cfg(feature = "ucx")]
+            return self.inner.wait().await;
+            #[cfg(not(feature = "ucx"))]
+            unreachable!("no FrameValueParts without UCX")
         }
     }
 

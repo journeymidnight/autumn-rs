@@ -30,7 +30,12 @@ fn pattern(n: usize, seed: u8) -> Vec<u8> {
 
 /// Send `value` as the value of frame `req_id` (tag `tag`) and decode the frame.
 async fn send(sender: &am::Sender, writer: &mut autumn_transport::WriteHalf, req_id: u32, tag: u64, value: &[u8]) -> Frame {
-    let (bufs, values) = encode_am_frame(req_id, 0x51, 0, vec![Bytes::from_static(b"k")], vec![Bytes::from(value.to_vec())], || tag);
+    // A value over `STAGED_PIECE_BYTES` goes in several pieces, each its own tag.
+    let mut piece = 0;
+    let (bufs, values) = encode_am_frame(req_id, 0x51, 0, vec![Bytes::from_static(b"k")], vec![Bytes::from(value.to_vec())], || {
+        piece += 1;
+        tag * 1000 + piece
+    });
     for (tag, v) in values {
         sender.post_frame_value(tag, v);
     }

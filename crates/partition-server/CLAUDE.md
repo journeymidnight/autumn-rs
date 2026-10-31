@@ -1109,9 +1109,10 @@ P-log: continuation (under publish_lock)
 
 `SstBuilder` writes each block straight into a segment buffer (reserved once
 at the segment size, so it never grows by doubling), starts a new one at a
-block boundary once a segment reaches `--sst-segment-bytes` (1–128 MiB, so a
-segment plus a block and the MetaBlock stays under a 256 MiB pool chunk; only
-the last segment may grow once, for the MetaBlock), and `finish`
+block boundary once the segment can no longer take a whole block, so it stays
+within `--sst-segment-bytes` (1–128 MiB; only the last segment may grow, once,
+for the MetaBlock): over UCX a segment is then exactly one staged piece, where a
+segment a block over 4 MiB went as two (a review caught it), and `finish`
 returns `BuiltSst`: the segments, and the MetaBlock as a view into the last.
 Flush and compaction append the segments as they are (`append_segments`;
 compaction through P-sst's `RowAppendReq.sst_segments`) and open the reader

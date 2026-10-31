@@ -112,6 +112,10 @@ pub struct Frame {
     /// The value's pieces when some come as active messages
     /// (`FLAG_AM_VALUE`); the receiver assembles it (`am_frame::receive_value`).
     pub am_pieces: Option<Vec<AmPiece>>,
+    /// The whole value in parts, in order, when it came as active messages
+    /// too large for one pool buffer (`am_frame::start`); `value` is then
+    /// empty. Empty otherwise.
+    pub value_parts: Vec<RegBytes>,
 }
 
 impl Frame {
@@ -124,6 +128,7 @@ impl Frame {
             payload,
             value: RegBytes::default(),
             am_pieces: None,
+            value_parts: Vec::new(),
         }
     }
 
@@ -136,6 +141,7 @@ impl Frame {
             payload,
             value: RegBytes::default(),
             am_pieces: None,
+            value_parts: Vec::new(),
         }
     }
 
@@ -149,6 +155,7 @@ impl Frame {
             payload,
             value: RegBytes::default(),
             am_pieces: None,
+            value_parts: Vec::new(),
         }
     }
 
@@ -162,6 +169,7 @@ impl Frame {
             payload: ctrl,
             value: value.into(),
             am_pieces: None,
+            value_parts: Vec::new(),
         }
     }
 
@@ -175,6 +183,7 @@ impl Frame {
             payload: ctrl,
             value: value.into(),
             am_pieces: None,
+            value_parts: Vec::new(),
         }
     }
 
@@ -370,8 +379,12 @@ fn split_am_pieces(region: &[u8], stream_len: usize) -> Result<(usize, Vec<AmPie
 /// A `FLAG_AM_VALUE` frame: the buffers to write on the stream, and the
 /// `(tag, value part)` active messages to send beside them. Each value part of
 /// at least `BULK_MIN_BYTES` becomes its own message (rendezvous moves only
-/// contiguous memory without a copy); smaller parts stay on the stream, one
-/// piece per run of them. `next_tag` gives tags unique on the connection.
+/// contiguous memory without a copy), except that one with no memh larger than
+/// `STAGED_PIECE_BYTES` is cut into equal pieces of at most that (no copy; each
+/// is staged on its own, a few at a time, and none is under `BULK_MIN_BYTES`,
+/// as every frame value must go by rendezvous); smaller parts stay on the
+/// stream, one piece per run of them. `next_tag` gives tags unique on the
+/// connection.
 pub fn encode_am_frame<V: Into<RegBytes>>(
     req_id: u32,
     msg_type: u8,
@@ -386,9 +399,16 @@ pub fn encode_am_frame<V: Into<RegBytes>>(
     for part in value_parts {
         let part = part.into();
         if part.len() >= autumn_transport::BULK_MIN_BYTES {
-            let tag = next_tag();
-            pieces.push((part.len(), tag));
-            am.push((tag, part));
+            let max = autumn_transport::am::STAGED_PIECE_BYTES;
+            let n = if part.is_registered() { 1 } else { part.len().div_ceil(max) };
+            let (each, mut at) = (part.len().div_ceil(n), 0);
+            while at < part.len() {
+                let piece = part.slice(at..(at + each).min(part.len()));
+                at += piece.len();
+                let tag = next_tag();
+                pieces.push((piece.len(), tag));
+                am.push((tag, piece));
+            }
         } else if !part.is_empty() {
             match pieces.last_mut() {
                 Some((len, 0)) => *len += part.len(),
@@ -403,7 +423,7 @@ pub fn encode_am_frame<V: Into<RegBytes>>(
         list.put_u32_le(len as u32);
         list.put_u64_le(tag);
     }
-    debug_assert!(pieces.len() <= u16::MAX as usize);
+    assert!(pieces.len() <= u16::MAX as usize, "{} value pieces in one frame", pieces.len());
     list.put_u16_le(pieces.len() as u16);
     let list = list.freeze();
     let ctrl_len = ctrl_parts.iter().map(Bytes::len).sum::<usize>() + list.len();
@@ -744,6 +764,7 @@ impl FrameDecoder {
             payload,
             value: value.into(),
             am_pieces,
+            value_parts: Vec::new(),
         }))
     }
 
@@ -1057,6 +1078,36 @@ mod tests {
 
     /// A piece list naming an empty or a repeated tagged piece is refused: its
     /// receiver would wait for a value that never comes.
+    /// A value part with no memh larger than `STAGED_PIECE_BYTES` goes in
+    /// equal pieces of at most that, none under `BULK_MIN_BYTES`, in order;
+    /// a registered part goes whole whatever its size.
+    #[test]
+    fn an_unregistered_value_goes_in_staged_pieces() {
+        let max = autumn_transport::am::STAGED_PIECE_BYTES;
+        let big: Vec<u8> = (0..(3 * max + 100)).map(|i| (i % 251) as u8).collect();
+        let small = vec![9u8; 100];
+        let mut next = 0u64;
+        let (_bufs, values) = encode_am_frame(1, 2, 0, vec![Bytes::from_static(b"c")], vec![Bytes::from(big.clone()), Bytes::from(small)], || {
+            next += 1;
+            next
+        });
+        assert_eq!(values.len(), 4, "3 x STAGED_PIECE_BYTES + 100 in four pieces");
+        let lens: Vec<usize> = values.iter().map(|(_, v)| v.len()).collect();
+        assert!(lens.iter().all(|&l| l <= max && l >= autumn_transport::BULK_MIN_BYTES), "{lens:?}");
+        let joined: Vec<u8> = values.iter().flat_map(|(_, v)| v.iter().copied()).collect();
+        assert_eq!(joined, big, "the pieces are the value, in order");
+        let tags: Vec<u64> = values.iter().map(|(t, _)| *t).collect();
+        assert_eq!(tags, vec![1, 2, 3, 4]);
+
+        let mut pb = autumn_transport::regpool_acquire(2 * max);
+        pb.dest_mut().fill(3);
+        let registered = pb.freeze();
+        let (_bufs, values) = encode_am_frame(1, 2, 0, vec![], vec![registered.clone()], || 7);
+        if registered.is_registered() {
+            assert_eq!(values.len(), 1, "a registered part is not cut");
+        }
+    }
+
     #[test]
     fn an_am_frame_with_an_empty_or_repeated_piece_is_refused() {
         let frame_with = |pieces: &[(u32, u64)]| {

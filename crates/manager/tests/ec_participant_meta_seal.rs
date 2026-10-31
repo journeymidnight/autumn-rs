@@ -425,7 +425,7 @@ fn ec_flip_persists_seal_on_every_shard_holder() {
                         eversion: ex.eversion,
                         commit: 0,
                         owner_epoch: 0,
-                        payload: vec![0xABu8; 64].into(),
+                        payload: bytes::Bytes::from(vec![0xABu8; 64]).into(),
                     }
                     .encode(),
                 )

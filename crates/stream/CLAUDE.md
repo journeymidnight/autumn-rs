@@ -357,15 +357,21 @@ append whose payload has a part of at least 64 KiB arrives as a frame value
 (autumn-rpc "Frame values"): the large parts come by rendezvous straight into a
 registered pool buffer (no unpack copy), and the ctrl carries the payload's
 crc32c after the 32-byte header. The buffer counts against the pool's `Receive`
-budget; with the budget full (or the value too large for it, such as a whole
-compaction output) it is an unbudgeted pool buffer, never a refusal: the PS
+budget; with the budget full (or the value too large for it) it is an
+unbudgeted pool buffer, never a refusal: the PS
 bounds its appends in flight, and the stream client would take a refused append
 as a failed replica (mark the node, report it, seal and move on). `process_frames_backpressured` receives the
 values of every frame of a burst together (`am_frame::complete`, `join_all`)
 before it handles any of them, so frames keep their order; `decode_append`
 takes the frame-value form through `AppendReq::decode_checked`, which
 recomputes the crc over the received buffer — a mismatch is an error frame and
-nothing is appended (the stream client treats it as a failed replica). One
+nothing is appended (the stream client treats it as a failed replica). A frame
+value larger than a pool buffer (256 MiB: an SST, a WAL batch of large values)
+comes in pieces, each in its own pool buffer (`Frame::value_parts`); the append
+keeps them as `AppendPayload::Parts`, checks the crc across them and writes each
+as its own iovec, so no buffer holds the whole value and UCX registers nothing
+(transport "Large values in pieces";
+`prepared_append.rs::an_append_larger_than_a_pool_buffer_arrives_in_parts`). One
 read pass over the payload per replica replaces the unpack copy. A burst whose
 value is still on its way holds the connection loop, as a stream value did.
 `READ_BYTES_BULK` replies of 64 KiB or more go the same way (`AmOut::frame_now`),

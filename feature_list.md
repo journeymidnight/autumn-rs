@@ -57,6 +57,9 @@
 - **Scope**: WAL 批记录头另起一段、value 用收到的原 slab；大 value 只活到请求结束；后台大块（SST、compaction、GC、恢复、回放、EC）用堆，UCX 分段经池中转、TCP 直接收发；SST `finish()` 交出块列表不再拼接，flush 去掉整份拷贝。
 - **Acceptance**: 4K/8M 写 perf-check 不降；flush/compaction 输出在 TCP 上零拷贝、UCX 上每段一次；"隐式注册对比分段中转"测量定下段大小与在途段数。
 - `passes: false`
+- **notes** (2026-10-31，5a e639ef4a): SST 构建与追加分段：builder 把块直接写进 `--sst-segment-bytes`（默认 4 MiB，1–128 MiB）大小的段，段在放不下一个整块时关闭（不超过段大小），`finish` 交出段列表与 MetaBlock 视图，flush/compaction `append_segments` 原样发出，reader 只用 meta 打开——flush 原来两次整表拷贝、compaction 一次，都删了。WAL 批"记录头一段、value 原 slab"在 3a 已完成。perf：UCX 各格持平；TCP 4K 写噪声大（六对、同一构建 4 vs 256 MiB 段区间重叠，bpftrace 量写阶段缺页/munmap/TLB shootdown 两边相同）。
+- **notes** (2026-10-31，5b): 大值分段：`encode_am_frame` 把无 memh、大于 `STAGED_PIECE_BYTES`（4 MiB）的值切成等长片（切片不拷贝、每片 ≥64 KiB），`post_frame_values` 让需要拷贝的片最多 `STAGED_WINDOW`（4）个同时在途（1 GiB SST 三副本占 48 MiB 中转而非 3 GiB）；帧值总长超过一个池缓冲（256 MiB）时接收方每片一个池缓冲（`start_frame_value_parts`），EN 的 append 以 `AppendPayload::Parts` 按片 pwritev，其他接收方合并成一块堆内存；无注册又超过 256 MiB 的值发送即报错（第 2 步"单条超过块大小直接报错"由此关闭）。测试：分片单测、按片接收、窗口（去掉即红）、296 MiB append 74 片全带 memh 落盘正确（去掉分片接收即红：74 片无 memh）。评审：段比 4 MiB 多一块导致每段切两片（已改段关闭规则），片数上限改成 assert。未完成：5c 测量（段/片大小与窗口，隐式注册对比）。
+
 
 ### F-DP-ONE-READ — 读统一成一种消息（第 6 步）
 - **Scope**: PS 读 EN、client 直读、后台读共用 READ（长度模式：精确 / 按本地截短 / 读到尾；可选落点标签；可选附带块 CRC）；GET / BATCH_GET 回复"value 或位置"；接收合并为"落点"一种机制；删除 GET_BULK、GET_AM、GET_REDIRECT*、BATCH_GET_BULK、READ_BYTES*。

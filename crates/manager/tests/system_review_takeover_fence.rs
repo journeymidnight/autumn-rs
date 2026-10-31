@@ -155,7 +155,7 @@ async fn check_takeover_fence() {
                 eversion: tail.eversion,
                 commit: 0,
                 owner_epoch: old_epoch,
-                payload: bytes::Bytes::from_static(b"stale owner write"),
+                payload: bytes::Bytes::from_static(b"stale owner write").into(),
             }
             .encode(),
         )

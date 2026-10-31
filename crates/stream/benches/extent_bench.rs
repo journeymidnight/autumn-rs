@@ -147,7 +147,7 @@ async fn run_bench() {
                 eversion: 1,
                 commit,
                 owner_epoch: 1,
-                payload: payload.clone(),
+                payload: payload.clone().into(),
             };
             let resp = AppendResp::decode(conn.call(MSG_APPEND, req.encode()).await).unwrap();
             commit = resp.end;
@@ -189,7 +189,7 @@ async fn run_bench() {
                 eversion: 1,
                 commit,
                 owner_epoch: 1,
-                payload: payload.clone(),
+                payload: payload.clone().into(),
             };
             let resp = AppendResp::decode(conn.call(MSG_APPEND, req.encode()).await).unwrap();
             commit = resp.end;
@@ -242,7 +242,7 @@ async fn bench_append(addr: SocketAddr, extent_id: u64, depth: usize, total_ops:
             eversion: 1,
             commit,
             owner_epoch: 1,
-            payload: payload.clone(),
+            payload: payload.clone().into(),
         };
         conn.send(MSG_APPEND, req.encode()).await;
         sent += 1;
@@ -261,7 +261,7 @@ async fn bench_append(addr: SocketAddr, extent_id: u64, depth: usize, total_ops:
                 eversion: 1,
                 commit: resp.end,
                 owner_epoch: 1,
-                payload: payload.clone(),
+                payload: payload.clone().into(),
             };
             conn.send(MSG_APPEND, req.encode()).await;
             sent += 1;
@@ -411,7 +411,7 @@ async fn bench_mixed(
                     eversion: 1,
                     commit,
                     owner_epoch: 1,
-                    payload: payload.clone(),
+                    payload: payload.clone().into(),
                 };
                 conn.send(MSG_APPEND, req.encode()).await;
                 sent += 1;
@@ -429,7 +429,7 @@ async fn bench_mixed(
                         eversion: 1,
                         commit: resp.end,
                         owner_epoch: 1,
-                        payload: payload.clone(),
+                        payload: payload.clone().into(),
                     };
                     conn.send(MSG_APPEND, req.encode()).await;
                     sent += 1;

@@ -105,8 +105,17 @@ connection. `WhenFull::Unbudgeted` (the extent node's appends, which the PS
 already bounds in flight) takes an unbudgeted pool buffer instead. Refusing also
 breaks the cycle the budgets exist for: a PS that cannot take an extent node's
 read reply lets it go, so the node's reply buffer is freed, not held. A value
-larger than a thread may hold of the budget (a compaction output appended
-whole) is received unbudgeted until background transfers are segmented
+larger than a thread may hold of the budget (up to a pool buffer) is received
+unbudgeted; one larger than a pool buffer (`POOL_MAX_BUFFER_BYTES`, 256 MiB: an
+SST, a WAL batch of large values) one pool buffer per piece, each charged to the
+budget while there is room (so a PS taking one holds that thread's `Receive`
+share while it is in flight) (transport "Large values in pieces"):
+an extent node's append keeps the parts (`Frame::value_parts`, which its
+`AppendReq` takes as `AppendPayload::Parts` and writes one iovec each; the
+payload crc runs on across them), any other receiver gets them joined into one
+heap buffer. On the way out `encode_am_frame` cuts a value part with no memh
+larger than `STAGED_PIECE_BYTES` into pieces, so no piece exceeds a chunk
+(`frame::tests::an_unregistered_value_goes_in_staged_pieces`)
 (`tests/am_value_budget.rs`, 64 MiB cap: a 16 MiB value received by a refusing
 loop; with the thread's share held, a 4 MiB value refused and a second one
 taken unbudgeted; red without either fallback). `read_loop` treats a reply that

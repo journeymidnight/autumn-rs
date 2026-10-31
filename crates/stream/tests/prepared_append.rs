@@ -389,3 +389,42 @@ async fn a_bulk_call_with_a_pool_buffer_carries_its_memh() {
     }
     drop(server);
 }
+
+/// An append too large for one pool buffer (an SST or a WAL batch of large
+/// values) reaches the extent node in pieces of at most `STAGED_PIECE_BYTES`,
+/// each received into its own pool buffer and written as it is: no receive
+/// into memory UCX would register itself, and the bytes land intact. UCX only.
+#[compio::test]
+async fn an_append_larger_than_a_pool_buffer_arrives_in_parts() {
+    let Ok(bind) = std::env::var("AUTUMN_TEST_UCX_BIND") else {
+        eprintln!("parts need UCX: set AUTUMN_TEST_UCX_BIND");
+        return;
+    };
+    let transport = autumn_transport::init_with(autumn_transport::TransportKind::Ucx);
+    let mut listener = transport.bind(bind.parse().unwrap()).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let node = ExtentNode::new(ExtentNodeConfig::new(dir.path().to_path_buf(), 1)).await.unwrap();
+    let server = compio::runtime::spawn(async move {
+        let (conn, _) = listener.accept().await.unwrap();
+        ExtentNode::handle_connection(conn, node).await
+    });
+    let client = RpcClient::connect(addr).await.unwrap();
+    let allocated = client.call(MSG_ALLOC_EXTENT, rkyv_encode(&AllocExtentReq { extent_id: 706 })).await.unwrap();
+    assert_eq!(rkyv_decode::<AllocExtentResp>(&allocated).unwrap().code, CODE_OK);
+
+    let len = autumn_transport::POOL_MAX_BUFFER_BYTES + (40 << 20);
+    let body: Vec<u8> = (0..len).map(|i| (i / 4096 % 251) as u8).collect();
+    let before = autumn_transport::am::received_memh_counts();
+    let payload = PreparedPayload::new(AppendReq::encode_header(706, 1, 0, 1), vec![Bytes::from(body.clone())], 1);
+    let frame = client.send_prepared(MSG_APPEND, &payload).await.unwrap().await.unwrap();
+    assert!(!frame.is_error());
+    assert_eq!(AppendResp::decode(frame.payload).unwrap().code, CODE_OK);
+    let after = autumn_transport::am::received_memh_counts();
+    let pieces = len.div_ceil(autumn_transport::am::STAGED_PIECE_BYTES) as u64;
+    assert_eq!((after.0 - before.0, after.1 - before.1), (pieces, 0), "every piece received with a memh");
+    let shard = crc32c::crc32c(&706u64.to_le_bytes()) & 0xff;
+    let disk = std::fs::read(dir.path().join(format!("{shard:02x}/extent-706.dat"))).unwrap();
+    assert!(disk == body, "the bytes on disk are the append");
+    drop(server);
+}

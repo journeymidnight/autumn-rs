@@ -3448,7 +3448,7 @@ async fn append_burst_frames(
         offsets.push(cursor);
         cursor += slot.req.payload.len() as u64;
         total_payload += slot.req.payload.len();
-        bufs.push(slot.req.payload.clone());
+        bufs.extend(slot.req.payload.parts().iter().cloned());
         req_ids.push(slot.req_id);
     }
     let total_end = cursor;
@@ -3588,10 +3588,13 @@ fn bulk_read_head(req_id: u32, code: u8, msg: &str, value_len: usize) -> Bytes {
 /// An append request: the payload inside ctrl, or (frame-value form) in the
 /// frame's value with its crc32c after the header, checked here.
 fn decode_append(frame: &Frame) -> Result<AppendReq, &'static str> {
-    if frame.value.is_empty() {
+    if !frame.value_parts.is_empty() {
+        let parts = frame.value_parts.iter().map(|p| p.bytes().clone()).collect();
+        AppendReq::decode_checked(frame.payload.clone(), AppendPayload::Parts(parts))
+    } else if frame.value.is_empty() {
         AppendReq::decode(frame.payload.clone())
     } else {
-        AppendReq::decode_checked(frame.payload.clone(), frame.value.bytes().clone())
+        AppendReq::decode_checked(frame.payload.clone(), frame.value.bytes().clone().into())
     }
 }
 
@@ -8414,7 +8417,7 @@ impl ExtentNode {
             ));
         };
         if let Err(e) =
-            write_append_burst(&af, vec![data_payload.clone()], start, self.direct_io).await
+            write_append_burst(&af, data_payload.parts().to_vec(), start, self.direct_io).await
         {
             let msg = e.to_string();
             self.mark_disk_error_for_extent(req.extent_id, &msg).await;
@@ -11122,7 +11125,7 @@ mod enospc_disk_health_tests {
                 eversion: 1,
                 commit: (id as u64 - 1) * 128,
                 owner_epoch: 1,
-                payload: Bytes::from(vec![id as u8; 128]),
+                payload: Bytes::from(vec![id as u8; 128]).into(),
             };
             client
                 .write_all(Frame::request(id, MSG_APPEND, req.encode()).encode())
@@ -11493,7 +11496,7 @@ mod sealed_append_guard_tests {
             eversion: 1,
             commit,
             owner_epoch: 0,
-            payload: p.clone(),
+            payload: p.clone().into(),
         };
         let mut want: Vec<u8> = Vec::new();
 
@@ -11627,7 +11630,7 @@ mod sealed_append_guard_tests {
             eversion: 1,
             commit: 0,
             owner_epoch: 0,
-            payload: Bytes::from(vec![0u8; 100]),
+            payload: Bytes::from(vec![0u8; 100]).into(),
         };
         let write_result = node.handle_append(write_req.encode()).await;
         assert!(write_result.is_ok(), "first append should succeed");
@@ -11654,7 +11657,7 @@ mod sealed_append_guard_tests {
             eversion: 1,
             commit: 50,
             owner_epoch: 0,
-            payload: Bytes::from(b"x".to_vec()),
+            payload: Bytes::from(b"x".to_vec()).into(),
         };
         let stale_result = node.handle_append(stale_req.encode()).await;
         assert!(
@@ -11684,7 +11687,7 @@ mod sealed_append_guard_tests {
             eversion: 2,
             commit: 0,
             owner_epoch: 0,
-            payload: Bytes::from(b"ghost".to_vec()),
+            payload: Bytes::from(b"ghost".to_vec()).into(),
         };
 
         // ---- node #1: alloc an open extent, then apply a sealed-EMPTY seal ----
@@ -11942,7 +11945,7 @@ mod sealed_append_guard_tests {
                         eversion: 1,
                         commit: 0,
                         owner_epoch: 10,
-                        payload: Bytes::from(vec![1u8; 64]),
+                        payload: Bytes::from(vec![1u8; 64]).into(),
                     }
                     .encode(),
                 )
@@ -11959,7 +11962,7 @@ mod sealed_append_guard_tests {
                         eversion: 1,
                         commit: 0,
                         owner_epoch: 5,
-                        payload: Bytes::from(vec![2u8; 8]),
+                        payload: Bytes::from(vec![2u8; 8]).into(),
                     }
                     .encode(),
                 )
@@ -12010,7 +12013,7 @@ mod sealed_append_guard_tests {
                         eversion: 1,
                         commit: 0,
                         owner_epoch: 5,
-                        payload: Bytes::from(vec![3u8; 8]),
+                        payload: Bytes::from(vec![3u8; 8]).into(),
                     }
                     .encode(),
                 )
@@ -12061,7 +12064,7 @@ mod sealed_append_guard_tests {
                             eversion: 1,
                             commit: 0,
                             owner_epoch: 10,
-                            payload: Bytes::from(vec![7u8; 64]),
+                            payload: Bytes::from(vec![7u8; 64]).into(),
                         }
                         .encode(),
                     )
@@ -12148,7 +12151,7 @@ mod sealed_append_guard_tests {
             eversion: 1,
             commit: 0,
             owner_epoch: 0,
-            payload: Bytes::from(vec![7u8; 100]),
+            payload: Bytes::from(vec![7u8; 100]).into(),
         };
         let wr = AppendResp::decode(node.handle_append(w.encode()).await.unwrap()).unwrap();
         assert_eq!(wr.code, CODE_OK);
@@ -12333,7 +12336,7 @@ mod copy_extent_tests {
             eversion: 1,
             commit: 0,
             owner_epoch: 0,
-            payload: Bytes::from(vec![0u8; 256]),
+            payload: Bytes::from(vec![0u8; 256]).into(),
         };
         let write_result = node.handle_append(write_req.encode()).await;
         assert!(write_result.is_ok(), "first append should succeed");
@@ -12397,7 +12400,7 @@ mod copy_extent_tests {
             eversion: 1,
             commit: 0,
             owner_epoch: 0,
-            payload: Bytes::from(payload_bytes.clone()),
+            payload: Bytes::from(payload_bytes.clone()).into(),
         };
         let write_result = node.handle_append(write_req.encode()).await;
         assert!(write_result.is_ok());
@@ -12809,7 +12812,7 @@ mod copy_extent_eversion_tests {
             eversion: 1,
             commit: 0,
             owner_epoch: 0,
-            payload: Bytes::from(payload),
+            payload: Bytes::from(payload).into(),
         };
         node.handle_append(write_req.encode())
             .await
@@ -13253,7 +13256,7 @@ mod fd_lru_chaos_tests {
                             eversion: 1,
                             commit: 0,
                             owner_epoch: 0,
-                            payload: Bytes::from(payload(i)),
+                            payload: Bytes::from(payload(i)).into(),
                         }
                         .encode(),
                     )
@@ -13373,7 +13376,7 @@ mod owner_burst_splitter_tests {
                 eversion,
                 commit,
                 owner_epoch,
-                payload: Bytes::copy_from_slice(payload),
+                payload: Bytes::copy_from_slice(payload).into(),
             },
             req_id,
             resp: tx,
@@ -14958,7 +14961,7 @@ mod client_direct_read_auth_tests {
                 eversion: 1,
                 commit: 0,
                 owner_epoch: 1,
-                payload: Bytes::from_static(PAYLOAD),
+                payload: Bytes::from_static(PAYLOAD).into(),
             };
             match peer.call(&addr, MSG_APPEND, req.encode()).await {
                 Ok(r) => {
@@ -15107,7 +15110,7 @@ mod client_direct_read_auth_tests {
             eversion: 1,
             commit: 0,
             owner_epoch: 1,
-            payload: Bytes::from_static(b"injected"),
+            payload: Bytes::from_static(b"injected").into(),
         }
         .encode();
         for (op, payload) in [(MSG_DELETE_EXTENT, delete), (MSG_FENCE_EXTENT, fence), (MSG_APPEND, append)] {
@@ -15124,7 +15127,7 @@ mod client_direct_read_auth_tests {
             eversion: 1,
             commit: PAYLOAD.len() as u64,
             owner_epoch: 1,
-            payload: Bytes::from_static(b"!"),
+            payload: Bytes::from_static(b"!").into(),
         };
         let resp = AppendResp::decode(
             peer.call(&addr, MSG_APPEND, append.encode()).await.expect("append after a refused Client FENCE"),

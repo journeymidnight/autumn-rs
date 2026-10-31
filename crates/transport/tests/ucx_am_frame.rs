@@ -301,3 +301,44 @@ async fn a_value_in_read_only_memory_arrives() {
     let got = compio::time::timeout(Duration::from_secs(10), receive).await.expect("a read-only value arrives").unwrap();
     assert_eq!(got.filled(), pattern(len, 61).as_slice());
 }
+
+/// A value too large for one pool buffer is received one buffer per piece:
+/// the parts come back in order, each a registered pool buffer, the stream
+/// piece copied into its own.
+#[compio::test]
+async fn a_value_received_in_parts_comes_back_in_order() {
+    let (tx, rx, _keep) = pair().await;
+    let (a, b, c) = (pattern(100, 1), pattern(1 << 20, 2), pattern(3 << 20, 3));
+    tx.post_frame_value(81, Bytes::from(b.clone()));
+    tx.post_frame_value(82, Bytes::from(c.clone()));
+    let segments = [(a.len(), 0), (b.len(), 81), (c.len(), 82)];
+    let started = am::start_frame_value_parts(&rx, &segments, &a, autumn_transport::PoolUse::Receive).unwrap();
+    let parts = compio::time::timeout(Duration::from_secs(10), started.wait()).await.expect("arrived").unwrap();
+    assert_eq!(parts.len(), 3);
+    for (part, want) in parts.iter().zip([&a, &b, &c]) {
+        assert_eq!(&part[..], want.as_slice());
+        assert!(part.is_registered(), "each part in a pool buffer");
+    }
+}
+
+/// A frame's values with no memh are copied into the pool a few at a time:
+/// while the receiver takes none, only `STAGED_WINDOW` of them are staged.
+#[compio::test]
+async fn unregistered_values_are_staged_a_few_at_a_time() {
+    let (tx, rx, _keep) = pair().await;
+    let n = 16usize;
+    let values: Vec<(u64, autumn_transport::RegBytes)> =
+        (0..n).map(|i| (90 + i as u64, Bytes::from(pattern(1 << 20, i as u8)).into())).collect();
+    tx.post_frame_values(values);
+    until("the window was staged", || staged() >= am::STAGED_WINDOW << 20).await;
+    compio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(staged(), am::STAGED_WINDOW << 20, "only the window is staged while the receiver waits");
+    let segments: Vec<(usize, u64)> = (0..n).map(|i| (1 << 20, 90 + i as u64)).collect();
+    let got = compio::time::timeout(Duration::from_secs(10), am::receive_frame_value(&rx, &segments, &[]))
+        .await
+        .expect("arrived")
+        .unwrap();
+    let want: Vec<u8> = (0..n).flat_map(|i| pattern(1 << 20, i as u8)).collect();
+    assert_eq!(got.filled(), want.as_slice());
+    until("every staged value was let go", || staged() == 0).await;
+}

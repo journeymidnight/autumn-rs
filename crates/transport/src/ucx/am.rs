@@ -591,6 +591,109 @@ pub(crate) fn start_value(
     Ok(FrameValue { owner, pending })
 }
 
+/// A frame's value received in parts: each piece in its own pool buffer, for
+/// a value too large for one (`start_value_parts`).
+pub(crate) struct FrameValueParts {
+    parts: Vec<Part>,
+}
+
+enum Part {
+    /// A piece that came on the stream, copied into its own pool buffer.
+    Here(RegBytes),
+    Coming { owner: Rc<PooledBuf>, expected: Expected },
+}
+
+/// `start_value` with one pool buffer per piece (`u`, charged when there is
+/// room): none of them larger than a sender may send unregistered, so all fit
+/// a pool chunk.
+pub(crate) fn start_value_parts(
+    ep: &UcxEp,
+    segments: &[(usize, u64)],
+    inline: &[u8],
+    u: crate::regpool::Use,
+) -> io::Result<FrameValueParts> {
+    let mut parts = Vec::with_capacity(segments.len());
+    let mut inline_at = 0;
+    for &(len, tag) in segments {
+        let mut pb = crate::regpool::acquire_charged_if_room(u, len);
+        if pb.reg().is_none() && len > 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("frame value: a {len}-byte piece fits no pool buffer"),
+            ));
+        }
+        if tag == 0 {
+            let piece = inline
+                .get(inline_at..inline_at + len)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "frame value: inline piece past the frame"))?;
+            pb.dest_mut().copy_from_slice(piece);
+            inline_at += len;
+            parts.push(Part::Here(pb.freeze()));
+            continue;
+        }
+        let (ptr, memh) = {
+            let (dest, reg) = pb.dest_and_reg();
+            (dest.as_mut_ptr(), reg.map_or(ptr::null_mut(), |r| r.memh()))
+        };
+        let owner = Rc::new(pb);
+        let dest = Target::Pooled { ptr, len, memh, _owner: owner.clone() };
+        parts.push(Part::Coming { owner, expected: expect_frame_value(ep, tag, dest) });
+    }
+    let receiving = |parts: &[Part]| {
+        parts.iter().any(|p| matches!(p, Part::Coming { expected, .. } if expected.0.state.get() == State::Receiving))
+    };
+    // As in `start_value`.
+    if receiving(&parts) {
+        let worker = WORKER.with(|w| w.get());
+        for _ in 0..SPIN_ITERS {
+            if !receiving(&parts) {
+                break;
+            }
+            unsafe { ucp_worker_progress(worker) };
+        }
+        crate::ucx::endpoint::wake_stream_waiters();
+    }
+    Ok(FrameValueParts { parts })
+}
+
+impl FrameValueParts {
+    /// The value's parts, in order, once every piece is in.
+    pub(crate) async fn wait(self) -> io::Result<Vec<RegBytes>> {
+        let mut failure = None;
+        for p in &self.parts {
+            let Part::Coming { expected, .. } = p else { continue };
+            if failure.is_some() {
+                break;
+            }
+            match expected.arrived().await {
+                Ok(Arrival::Received(_)) => {}
+                Ok(Arrival::TooLong(n)) => {
+                    failure = Some(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("frame value: {n} bytes arrived for a piece of another length"),
+                    ))
+                }
+                Err(e) => failure = Some(e),
+            }
+        }
+        let mut out = Vec::with_capacity(self.parts.len());
+        for p in self.parts {
+            match p {
+                Part::Here(b) => out.push(b),
+                Part::Coming { owner, expected } => {
+                    expected.finish().await;
+                    let pb = Rc::try_unwrap(owner).map_err(|_| io::Error::other("frame value: piece still held"))?;
+                    out.push(pb.freeze());
+                }
+            }
+        }
+        match failure {
+            Some(e) => Err(e),
+            None => Ok(out),
+        }
+    }
+}
+
 impl FrameValue {
     /// The whole value, once every piece is in.
     pub(crate) async fn wait(self) -> io::Result<PooledBuf> {
@@ -638,21 +741,28 @@ pub fn staged_count() -> u64 {
 
 /// A value UCX may send: bytes with the memh of the pool buffer they live in.
 /// Only `of` builds one, copying a value that has no memh into a pool buffer,
-/// so UCX is never handed memory it would register itself. A value larger than
-/// the largest chunk (256 MiB) has no pool buffer to go into and is sent as it
-/// is, until large transfers are sent in segments.
+/// so UCX is never handed memory it would register itself. An unregistered
+/// value larger than the largest chunk (256 MiB) has no pool buffer to go
+/// into and is refused; frame values never are one (`encode_am_frame` cuts
+/// them into `STAGED_PIECE_BYTES` pieces).
 struct Staged(RegBytes);
 
 impl Staged {
-    fn of(value: RegBytes) -> Self {
-        if value.is_registered() || value.is_empty() || value.len() > crate::regpool::MAX_CHUNK_BYTES {
-            return Self(value);
+    fn of(value: RegBytes) -> io::Result<Self> {
+        if value.is_registered() || value.is_empty() {
+            return Ok(Self(value));
+        }
+        if value.len() > crate::regpool::MAX_CHUNK_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("an unregistered {}-byte value fits no pool buffer to be sent from", value.len()),
+            ));
         }
         let mut pb = crate::regpool::acquire_charged_if_room(crate::regpool::Use::Staging, value.len());
         pb.dest_mut().copy_from_slice(&value);
         STAGED_BYTES.fetch_add(value.len() as u64, std::sync::atomic::Ordering::Relaxed);
         STAGED.with(|c| c.set(c.get() + 1));
-        Self(pb.freeze())
+        Ok(Self(pb.freeze()))
     }
 }
 
@@ -722,11 +832,11 @@ async fn send_am(ep: &UcxEp, am_id: u32, tag: u64, value: Staged, extra_flags: u
 
 /// Send `value` as the value the receiver asked for with `tag`.
 pub(crate) async fn send(ep: &UcxEp, tag: u64, value: RegBytes) -> io::Result<()> {
-    send_am(ep, VALUE_AM_ID, tag, Staged::of(value), 0).await
+    send_am(ep, VALUE_AM_ID, tag, Staged::of(value)?, 0).await
 }
 
 /// Send `value` as the frame value tagged `tag`. The receiver keys it by
 /// the endpoint it arrived on, which the reply flag hands its handler.
 pub(crate) async fn send_frame_value(ep: &UcxEp, tag: u64, value: RegBytes) -> io::Result<()> {
-    send_am(ep, FRAME_VALUE_AM_ID, tag, Staged::of(value), ucp_send_am_flags::UCP_AM_SEND_FLAG_REPLY as u32).await
+    send_am(ep, FRAME_VALUE_AM_ID, tag, Staged::of(value)?, ucp_send_am_flags::UCP_AM_SEND_FLAG_REPLY as u32).await
 }

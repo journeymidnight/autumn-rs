@@ -53,9 +53,7 @@ impl AmOut {
     }
 
     pub fn post(&self, values: Vec<(u64, RegBytes)>) {
-        for (tag, v) in values {
-            self.sender.post_frame_value(tag, v);
-        }
+        self.sender.post_frame_values(values);
     }
 
     /// `encode` and `post` at once, for a reply that is written whatever
@@ -102,6 +100,10 @@ pub struct Incoming {
 enum Value {
     None,
     Started(am::FrameValue),
+    /// Too large for one pool buffer: one per piece. `keep`: the frame keeps
+    /// them as parts (`Frame::value_parts`); otherwise they are joined into
+    /// one heap buffer.
+    Parts { started: am::FrameValueParts, keep: bool },
     /// No buffer: the value is let go when the frame is taken. Dropped without
     /// being taken (only on the way to ending the connection) its senders wait
     /// until the endpoint is forgotten.
@@ -168,10 +170,17 @@ pub fn am_value_len(frame: &Frame) -> usize {
 /// `Receive`, a reply's `Reply`); with no room, as `when_full` says. Start every
 /// frame of a burst before waiting for the first, so their values are received
 /// together; then take them in order. A value larger than a thread may hold of
-/// the budget (a compaction output appended whole) is received unbudgeted until
-/// background transfers are segmented.
+/// the budget is received unbudgeted. One larger than a pool buffer
+/// (`POOL_MAX_BUFFER_BYTES`: an SST appended in segments, a WAL batch of large
+/// values) is received one pool buffer per piece, never into memory UCX would
+/// register itself: an extent node's appends (`WhenFull::Unbudgeted`) keep the
+/// parts, anything else gets them joined into one heap buffer (a copy).
 pub fn start(reader: &ReadHalf, mut frame: Frame, u: PoolUse, when_full: WhenFull) -> std::io::Result<Incoming> {
     let value = match frame.am_pieces.take() {
+        Some(pieces) if pieces.iter().map(|p| p.0).sum::<usize>() > autumn_transport::POOL_MAX_BUFFER_BYTES => {
+            let started = am::start_frame_value_parts(reader, &pieces, &frame.value, u)?;
+            Value::Parts { started, keep: when_full == WhenFull::Unbudgeted }
+        }
         Some(pieces) => {
             let total = pieces.iter().map(|p| p.0).sum();
             let pb = match when_full {
@@ -197,9 +206,23 @@ impl Incoming {
     /// messages (then `frame.value` holds only the stream pieces). A refused
     /// value is let go here.
     pub async fn into_parts(self, reader: &ReadHalf) -> Result<(Frame, Option<PooledBuf>), IncomingError> {
-        let Incoming { frame, value } = self;
+        let Incoming { mut frame, value } = self;
         let started = match value {
             Value::None => return Ok((frame, None)),
+            Value::Parts { started, keep } => {
+                let parts = started.wait().await?;
+                frame.value = RegBytes::default();
+                if keep {
+                    frame.value_parts = parts;
+                } else {
+                    let mut all = Vec::with_capacity(parts.iter().map(|p| p.len()).sum());
+                    for p in &parts {
+                        all.extend_from_slice(p);
+                    }
+                    frame.value = Bytes::from(all).into();
+                }
+                return Ok((frame, None));
+            }
             Value::Started(v) => v,
             Value::Refused { pieces } => {
                 am::abandon_frame_value(reader, &pieces);

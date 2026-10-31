@@ -120,7 +120,7 @@ impl SstBuilder {
             // Once per segment, so it does not grow by doubling (each doubling
             // copies everything written so far); only the last may grow once,
             // for the MetaBlock.
-            self.seg.reserve(self.segment_bytes + 2 * BLOCK_SIZE_TARGET);
+            self.seg.reserve(self.segment_bytes);
         }
 
         // Track metadata
@@ -265,7 +265,9 @@ impl SstBuilder {
 
         self.running_offset += block_len;
         self.entry_offsets.clear();
-        if self.seg.len() >= self.segment_bytes {
+        // Closed while it can no longer take a whole block, so it stays within
+        // `segment_bytes` (a UCX send cuts anything larger into pieces).
+        if self.seg.len() + MAX_BLOCK_BYTES > self.segment_bytes {
             self.segments.push(std::mem::take(&mut self.seg));
         }
         self.block_start = self.seg.len();
@@ -302,6 +304,11 @@ impl BuiltSst {
         Bytes::from(all)
     }
 }
+
+/// The largest ordinary block: its entries up to `BLOCK_SIZE_TARGET` (an entry
+/// holds a ValuePointer or a value of at most 4 KiB) and its footer. A block
+/// with one huge key can be larger; its segment then goes in two pieces.
+const MAX_BLOCK_BYTES: usize = BLOCK_SIZE_TARGET + 4 * MAX_ENTRIES_PER_BLOCK + 8;
 
 /// Length of the common prefix of two byte slices.
 fn common_prefix_len(a: &[u8], b: &[u8]) -> usize {
@@ -495,7 +502,8 @@ mod tests {
             meta.block_offsets.iter().map(|o| u64::from(o.relative_offset) + u64::from(o.block_len)).collect();
         let mut at = 0u64;
         for seg in &cut.segments[..cut.segments.len() - 1] {
-            assert!(seg.len() >= 1 << 20, "a full segment holds at least its size");
+            assert!(seg.len() <= 1 << 20, "a segment stays within its size: {}", seg.len());
+            assert!(seg.len() + 2 * MAX_BLOCK_BYTES > 1 << 20, "and closes only when a block no longer fits: {}", seg.len());
             at += seg.len() as u64;
             assert!(ends.contains(&at), "segment ends at {at}, inside a block");
         }
