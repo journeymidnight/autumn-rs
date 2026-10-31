@@ -198,3 +198,70 @@ async fn an_empty_slice_of_a_registered_value_keeps_no_memh() {
     drop(reg);
     assert!(!empty.is_registered(), "nothing holds the buffer behind an empty slice");
 }
+
+/// A value lent from a registered region goes out with the region's memh (no
+/// copy into the pool) and is returned once its send let go of it; one lent
+/// from memory no region holds is copied into the pool and returned at once.
+#[compio::test]
+async fn a_lent_value_is_sent_from_its_region_and_returned_after() {
+    let (tx, rx, _keep) = pair().await;
+    let mut mem = pattern(2 << 20, 41);
+    let region = unsafe { autumn_transport::Region::register(mem.as_mut_ptr(), mem.len()) }.unwrap();
+    assert!(region.is_registered());
+    let (value, returned) = unsafe { autumn_transport::lend(mem.as_ptr().add(1 << 20), 1 << 20, Some(&region)) };
+    assert!(value.is_registered(), "inside the region: its memh");
+    let (sent, staged) = (am::sent_counts(), am::staged_bytes());
+    let segments = [(1usize << 20, 51)];
+    let receive = am::receive_frame_value(&rx, &segments, &[]);
+    tx.post_frame_value(51, value);
+    let got = compio::time::timeout(Duration::from_secs(10), receive).await.expect("received").unwrap();
+    assert_eq!(got.filled(), &mem[1 << 20..]);
+    compio::time::timeout(Duration::from_secs(10), returned).await.expect("returned once sent");
+    assert_eq!(am::sent_counts().0, sent.0 + 1, "sent with the region's memh");
+    assert_eq!(am::staged_bytes(), staged, "not copied");
+
+    let other = pattern(1 << 20, 42);
+    let (value, returned) = unsafe { autumn_transport::lend(other.as_ptr(), other.len(), Some(&region)) };
+    assert!(!value.is_registered(), "outside the region: none");
+    let receive = am::receive_frame_value(&rx, &[(1 << 20, 52)], &[]);
+    tx.post_frame_value(52, value);
+    compio::time::timeout(Duration::from_secs(10), returned).await.expect("returned once copied");
+    assert_eq!(compio::time::timeout(Duration::from_secs(10), receive).await.unwrap().unwrap().filled(), other.as_slice());
+    drop(region);
+}
+
+/// A value in memory the process maps read-only (a read-only file mapping,
+/// `np.memmap(mode='r')`) arrives: it is copied into a pool buffer at the send.
+/// Handed to UCX as it is, the rendezvous never completes and the value never
+/// arrives.
+#[compio::test]
+async fn a_value_in_read_only_memory_arrives() {
+    let (tx, rx, _keep) = pair().await;
+    let len = 2 << 20;
+    // SAFETY: a private anonymous mapping, filled, then made read-only; it is
+    // unmapped by the owner below, which nothing outlives.
+    let ptr = unsafe {
+        let p = libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0);
+        assert_ne!(p, libc::MAP_FAILED);
+        std::slice::from_raw_parts_mut(p as *mut u8, len).copy_from_slice(&pattern(len, 61));
+        assert_eq!(libc::mprotect(p, len, libc::PROT_READ), 0);
+        p as *const u8
+    };
+    struct ReadOnly(*const u8, usize);
+    unsafe impl Send for ReadOnly {}
+    impl AsRef<[u8]> for ReadOnly {
+        fn as_ref(&self) -> &[u8] {
+            unsafe { std::slice::from_raw_parts(self.0, self.1) }
+        }
+    }
+    impl Drop for ReadOnly {
+        fn drop(&mut self) {
+            unsafe { libc::munmap(self.0 as *mut libc::c_void, self.1) };
+        }
+    }
+    let segments = [(len, 71)];
+    let receive = am::receive_frame_value(&rx, &segments, &[]);
+    tx.post_frame_value(71, Bytes::from_owner(ReadOnly(ptr, len)));
+    let got = compio::time::timeout(Duration::from_secs(10), receive).await.expect("a read-only value arrives").unwrap();
+    assert_eq!(got.filled(), pattern(len, 61).as_slice());
+}

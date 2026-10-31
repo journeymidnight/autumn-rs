@@ -2732,12 +2732,12 @@ impl ClusterClient {
     /// take the bulk path would have silently traded a bounded wait for an
     /// unbounded one — and the bound exists for a specific case: a PS killed
     /// with `kill -9` leaves connections that accept writes and never answer.
-    pub async fn ps_call_bulk_multi(
+    pub async fn ps_call_bulk_multi<V: Into<RegBytes> + AsRef<[u8]>>(
         &self,
         ps_addr: &str,
         msg_type: u8,
         ctrl: Bytes,
-        values: Vec<Bytes>,
+        values: Vec<V>,
         timeout: Option<Duration>,
     ) -> Result<Bytes> {
         let client = self
@@ -3165,7 +3165,7 @@ impl ClusterClient {
         part_id: u64,
         msg_type: u8,
         ctrl: Bytes,
-        values: Vec<Bytes>,
+        values: Vec<RegBytes>,
     ) -> (std::result::Result<Bytes, AutumnError>, bool) {
         let mut attempt: u32 = 0;
         let mut last_err: Option<String> = None;
@@ -4730,12 +4730,13 @@ impl ClusterClient {
     /// `MSG_BATCH_PUT` (or `MSG_BATCH_PUT_BULK`) per owning partition. A key
     /// written twice keeps the later value. `opts` (TTL, lease) applies to
     /// every item.
-    pub async fn put_many(
+    pub async fn put_many<V: Clone + Into<RegBytes>>(
         &self,
-        items: &[(&[u8], Bytes)],
+        items: &[(&[u8], V)],
         opts: WriteOptions,
     ) -> Vec<std::result::Result<(), AutumnError>> {
-        self.batch_put(items, opts.expires_at(), opts.lease).await
+        let items: Vec<(&[u8], RegBytes)> = items.iter().map(|(k, v)| (*k, v.clone().into())).collect();
+        self.batch_put(&items, opts.expires_at(), opts.lease).await
     }
 
     /// **The batched-read API that does not require caller-owned
@@ -4918,7 +4919,7 @@ impl ClusterClient {
     ///   one entry per input item in input order.
     pub(crate) async fn batch_put(
         &self,
-        items: &[(&[u8], bytes::Bytes)],
+        items: &[(&[u8], RegBytes)],
         expires_at: u64,
         lease: WriteLease,
     ) -> Vec<std::result::Result<(), AutumnError>> {
@@ -4930,9 +4931,9 @@ impl ClusterClient {
         // D7: each tuple's 2nd element is the BOUND wire key (owned) —
         // routing + the batch payload + the bulk/put fallbacks all use it, so a key
         // is bound exactly ONCE. Bind is infallible under Prepend-only.
-        let mut groups: std::collections::HashMap<u64, Vec<(usize, Vec<u8>, bytes::Bytes)>> =
+        let mut groups: std::collections::HashMap<u64, Vec<(usize, Vec<u8>, RegBytes)>> =
             std::collections::HashMap::new();
-        let mut bulk_only: Vec<(usize, Vec<u8>, bytes::Bytes)> = Vec::new();
+        let mut bulk_only: Vec<(usize, Vec<u8>, RegBytes)> = Vec::new();
         let bound: Vec<Option<Vec<u8>>> = items
             .iter()
             .enumerate()
@@ -5005,7 +5006,7 @@ impl ClusterClient {
                 });
                 // `clone` on a `Bytes` is a refcount bump: the values reach
                 // `writev` as the caller's own buffers, never copied.
-                let values: Vec<bytes::Bytes> =
+                let values: Vec<RegBytes> =
                     group.iter().map(|(_, _, v)| v.clone()).collect();
                 self.call_ps_for_part_bulk(CallKind::Idempotent, part_id, partition_rpc::MSG_BATCH_PUT_BULK, ctrl, values)
                     .await
@@ -5146,7 +5147,7 @@ impl ClusterClient {
                 // A small value is here only because its key also has a bulk
                 // value in this batch (see `classes`).
                 let r = if bulk_worthwhile(v.len()) {
-                    this.put_bulk_opts(k, v.clone().into(), expires_at, lease).await
+                    this.put_bulk_opts(k, v.clone(), expires_at, lease).await
                 } else {
                     this.put_opts(k, v.as_ref(), expires_at, lease).await
                 };

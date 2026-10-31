@@ -172,7 +172,7 @@ async fn client_status_errors_preserve_connections_and_transport_failures_evict(
                             &peer.addr,
                             failure,
                             Bytes::new(),
-                            vec![],
+                            Vec::<Bytes>::new(),
                             Some(Duration::from_millis(50)),
                         )
                         .await

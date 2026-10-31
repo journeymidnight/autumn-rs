@@ -541,7 +541,7 @@ impl PooledBuf {
     /// UCX send passes the memh instead of looking the memory up.
     pub fn freeze(self) -> RegBytes {
         #[cfg(feature = "ucx")]
-        let memh = self.reg().and_then(|r| std::ptr::NonNull::new(r.memh()).map(Memh));
+        let memh = self.reg().and_then(Memh::of);
         RegBytes {
             bytes: bytes::Bytes::from_owner(self),
             #[cfg(feature = "ucx")]
@@ -560,6 +560,10 @@ pub(crate) struct Memh(std::ptr::NonNull<crate::ucx::ffi::ucp_mem>);
 impl Memh {
     pub(crate) fn raw(self) -> crate::ucx::ffi::ucp_mem_h {
         self.0.as_ptr()
+    }
+
+    pub(crate) fn of(reg: &RegisteredMem) -> Option<Self> {
+        std::ptr::NonNull::new(reg.memh()).map(Memh)
     }
 }
 
@@ -607,6 +611,13 @@ impl RegBytes {
     #[cfg(feature = "ucx")]
     pub(crate) fn memh(&self) -> Option<Memh> {
         self.memh
+    }
+
+    /// Bytes and the registration that covers them; the bytes' owner must keep
+    /// that registration alive.
+    #[cfg(feature = "ucx")]
+    pub(crate) fn from_parts(bytes: bytes::Bytes, memh: Option<Memh>) -> Self {
+        Self { bytes, memh }
     }
 
     /// A part of these bytes, keeping their registration. An empty part is

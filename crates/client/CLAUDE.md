@@ -92,7 +92,8 @@ re-exported as `autumn_client::RegBytes`). `IntoValue` produces a `RegBytes`, an
 `put_bound` / `put_bulk_opts` and rpc's `call_vectored_bulk` carry it, so over UCX a
 value of 64 KiB or more goes out as a frame value with the slab's memh and UCX does
 no lookup (a smaller one is copied inline, as before); `Bytes` / `Vec<u8>` / slices
-carry none, nor do `put_many` / `compare_put`, which take `Bytes`: over UCX such a
+carry none (nor does `compare_put`, which takes `Bytes`; `put_many` takes any
+`Clone + Into<RegBytes>`, so lent or pool values keep theirs): over UCX such a
 value is copied into a pool buffer at the send (autumn-transport, "UCX is never
 handed memory to register itself"). The test
 (stream `prepared_append.rs` `a_bulk_call_with_a_pool_buffer_carries_its_memh`)

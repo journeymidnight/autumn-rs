@@ -269,9 +269,8 @@ async fn handle_op(client: &ClusterClient, op: Op) {
             let value = unsafe {
                 std::slice::from_raw_parts(buf.buf_ptr() as *const u8, buf.item_count())
             };
-            // Copies the pinned bytes. The kvcache bulk write path is
-            // `BatchClient.put_from` (run_job `BatchOp::Put`), which stays
-            // zero-copy via `Bytes::from_static`.
+            // Copies the pinned bytes; `BatchClient.put_from` lends them
+            // instead (`put_lent`).
             let res = client.put(&key, value, write_opts(ttl_secs)).await;
             match res {
                 Ok(()) => handle.resolve(|py| Ok(py.None())),
@@ -338,20 +337,14 @@ async fn handle_op(client: &ClusterClient, op: Op) {
                 });
                 futures::future::join_all(futs).await.iter().map(|r| r.is_ok()).collect()
             } else {
-                // TTL path: one `put_many`. The pinned pages stay zero-copy via
-                // `Bytes::from_static` (bufs outlive the await; freed at
-                // `drop(bufs)` below).
-                let pitems: Vec<(&[u8], bytes::Bytes)> = keys
+                // TTL path: one `put_many` of the pinned pages, lent (bufs are
+                // held until `drop(bufs)` below, after every page is returned).
+                let items: Vec<WorkItem> = keys
                     .iter()
                     .zip(bufs.iter())
-                    .map(|(k, buf)| {
-                        let page: &'static [u8] = unsafe {
-                            std::slice::from_raw_parts(buf.buf_ptr() as *const u8, buf.item_count())
-                        };
-                        (k.as_slice(), bytes::Bytes::from_static(page))
-                    })
+                    .map(|(k, buf)| WorkItem { key: k.clone(), ptr: buf.buf_ptr() as usize, len: buf.item_count() })
                     .collect();
-                client.put_many(&pitems, write_opts(ttl_secs)).await.iter().map(|r| r.is_ok()).collect()
+                put_lent(&client, &items, ttl_secs, None).await
             };
             handle.resolve(move |py| {
                 Ok(pyo3::types::PyList::new(py, oks)?.into_any().unbind())
@@ -665,7 +658,7 @@ impl Client {
         Ok(fut)
     }
 
-    /// Batched zero-copy put. `keys` and `bufs` are parallel lists; all puts
+    /// Batched put. `keys` and `bufs` are parallel lists; all puts
     /// are pipelined concurrently on the worker thread (the partition server
     /// group-commits them). One awaitable resolves to a `list[bool]`, where
     /// element i is True iff `keys[i]` was stored successfully.
@@ -862,6 +855,61 @@ fn set_transport(kind: &str) -> PyResult<()> {
 
 use std::sync::mpsc as smpsc;
 
+/// Caller memory registered once (`autumn.register(buf)`) so a `put_from` of
+/// pages inside it is sent zero-copy over UCX with the region's registration.
+/// On TCP it only records the bounds. It keeps `buf` alive; `unregister()` (or
+/// dropping it) ends the registration once no send still uses it.
+#[pyclass]
+struct Region {
+    inner: Option<(std::sync::Arc<autumn_transport::Region>, PyBuffer<u8>)>,
+}
+
+#[pymethods]
+impl Region {
+    /// Whether UCX registered the memory (False on TCP).
+    fn registered(&self) -> bool {
+        self.inner.as_ref().is_some_and(|(r, _)| r.is_registered())
+    }
+
+    /// Drop the registration; sends already under way keep it until they end.
+    fn unregister(&mut self) {
+        self.inner = None;
+    }
+}
+
+/// This process's UCX active-message byte counts: values sent with a
+/// registration (`sent_memh`), without one (`sent_no_memh`, only values over
+/// 256 MiB), and those copied into a pool buffer first because they had none
+/// (`staged`). All 0 on TCP.
+#[pyfunction]
+fn ucx_am_counters(py: Python<'_>) -> PyResult<PyObject> {
+    let (sent_memh, sent_no_memh) = autumn_transport::am::sent_bytes();
+    let d = pyo3::types::PyDict::new(py);
+    d.set_item("sent_memh", sent_memh)?;
+    d.set_item("sent_no_memh", sent_no_memh)?;
+    d.set_item("staged", autumn_transport::am::staged_bytes())?;
+    Ok(d.into_any().unbind())
+}
+
+/// Register a writable, C-contiguous buffer for zero-copy `put_from`: call
+/// `set_transport` first. A read-only buffer is refused (it cannot be
+/// registered for the NIC).
+#[pyfunction]
+fn register(buf: PyBuffer<u8>) -> PyResult<Region> {
+    if buf.readonly() {
+        return Err(PyValueError::new_err("a read-only buffer cannot be registered"));
+    }
+    if !buf.is_c_contiguous() {
+        return Err(PyValueError::new_err("buf must be C-contiguous"));
+    }
+    // SAFETY: `buf` is kept in the `Region` until `unregister()`; a value lent
+    // from it later is kept valid by the page buffers its `put_from` holds
+    // until every lent value is returned.
+    let region = unsafe { autumn_transport::Region::register(buf.buf_ptr() as *mut u8, buf.item_count()) }
+        .map_err(|e| PyRuntimeError::new_err(format!("register: {e}")))?;
+    Ok(Region { inner: Some((region, buf)) })
+}
+
 #[derive(Clone, Copy)]
 enum BatchOp {
     Get,
@@ -889,6 +937,8 @@ struct BatchJob {
     /// Relative TTL in seconds for a `Put` batch; `0` = no expiry. Ignored by
     /// `Get` and `Head`.
     ttl_secs: u64,
+    /// A `Put`'s pages that lie inside it are sent with its registration.
+    region: Option<std::sync::Arc<autumn_transport::Region>>,
     done: smpsc::Sender<Vec<bool>>,
 }
 
@@ -924,7 +974,15 @@ async fn connect_worker_client(
     Ok(c)
 }
 
-async fn run_job(client: &ClusterClient, op: BatchOp, items: Vec<WorkItem>, ttl_secs: u64, cap: usize, direct: bool) -> Vec<bool> {
+async fn run_job(
+    client: &ClusterClient,
+    op: BatchOp,
+    items: Vec<WorkItem>,
+    ttl_secs: u64,
+    region: Option<std::sync::Arc<autumn_transport::Region>>,
+    cap: usize,
+    direct: bool,
+) -> Vec<bool> {
     let cap = cap.max(1);
     match op {
         BatchOp::Get => {
@@ -970,25 +1028,8 @@ async fn run_job(client: &ClusterClient, op: BatchOp, items: Vec<WorkItem>, ttl_
                 .collect()
         }
         BatchOp::Put => {
-            // `ClusterClient::put_many` — the write mirror of the Get arm; it
-            // picks inline or bulk per value. The value is a
-            // `Bytes::from_static` view aliasing the pinned source page.
-            // SAFETY: each `it.ptr/len` addresses a pinned source page the caller
-            // keeps alive for the whole batch (until `allow_threads` returns); the
-            // `Bytes::from_static` view is consumed within the call and its Drop is a
-            // no-op (never frees the page).
-            let pitems: Vec<(&[u8], bytes::Bytes)> = items
-                .iter()
-                .map(|it| {
-                    let page: &'static [u8] =
-                        unsafe { std::slice::from_raw_parts(it.ptr as *const u8, it.len) };
-                    (it.key.as_slice(), bytes::Bytes::from_static(page))
-                })
-                .collect();
             let _ = cap; // unused — put_many no longer takes a concurrency arg
-            let results = client.put_many(&pitems, write_opts(ttl_secs)).await;
-            drop(pitems);
-            results.iter().map(|r| r.is_ok()).collect()
+            put_lent(client, &items, ttl_secs, region.as_ref()).await
         }
         BatchOp::Head => {
             let keys: Vec<&[u8]> = items.iter().map(|it| it.key.as_slice()).collect();
@@ -1069,7 +1110,7 @@ impl BatchClient {
                         let data_client = client.clone();
                         compio::runtime::spawn(async move {
                             while let Some(job) = data_rx.next().await {
-                                let job_fut = run_job(&data_client, job.op, job.items, job.ttl_secs, per_worker_cap, direct);
+                                let job_fut = run_job(&data_client, job.op, job.items, job.ttl_secs, job.region, per_worker_cap, direct);
                                 // Gets receive straight into the caller's pages; a job
                                 // abandoned by a panic may leave a receive writing one
                                 // after the batch returned to Python. Stop instead.
@@ -1088,7 +1129,7 @@ impl BatchClient {
                             if let BatchOp::Head = job.op {
                                 let probe_client = client.clone();
                                 compio::runtime::spawn(async move {
-                                    let res = run_job(&probe_client, job.op, job.items, 0, per_worker_cap, direct).await;
+                                    let res = run_job(&probe_client, job.op, job.items, 0, None, per_worker_cap, direct).await;
                                     let _ = job.done.send(res);
                                 })
                                 .detach();
@@ -1131,14 +1172,25 @@ impl BatchClient {
     /// key was found AND its stored size == the buffer length (value copied into
     /// the buffer). Runs on the worker thread with the GIL released.
     fn get_into(&self, py: Python<'_>, keys: Vec<Vec<u8>>, bufs: Vec<PyBuffer<u8>>) -> PyResult<Vec<bool>> {
-        self.run_batch(py, BatchOp::Get, keys, bufs, true, 0)
+        self.run_batch(py, BatchOp::Get, keys, bufs, true, 0, None)
     }
 
-    /// Batched zero-copy put. Returns list[bool] aligned to `keys`. `ttl_secs`
-    /// (default `0` = no expiry) applies one relative TTL to every key.
-    #[pyo3(signature = (keys, bufs, ttl_secs=0))]
-    fn put_from(&self, py: Python<'_>, keys: Vec<Vec<u8>>, bufs: Vec<PyBuffer<u8>>, ttl_secs: u64) -> PyResult<Vec<bool>> {
-        self.run_batch(py, BatchOp::Put, keys, bufs, false, ttl_secs)
+    /// Batched put from the caller's buffers. Returns list[bool] aligned to
+    /// `keys`. `ttl_secs` (default `0` = no expiry) applies one relative TTL to
+    /// every key. With `region` (from `autumn.register`), buffers inside it are
+    /// sent zero-copy over UCX; others are copied once. Returns only when the
+    /// transport no longer reads any buffer, so they may be reused at once.
+    #[pyo3(signature = (keys, bufs, ttl_secs=0, region=None))]
+    fn put_from(
+        &self,
+        py: Python<'_>,
+        keys: Vec<Vec<u8>>,
+        bufs: Vec<PyBuffer<u8>>,
+        ttl_secs: u64,
+        region: Option<PyRef<'_, Region>>,
+    ) -> PyResult<Vec<bool>> {
+        let region = region.and_then(|r| r.inner.as_ref().map(|(r, _)| r.clone()));
+        self.run_batch(py, BatchOp::Put, keys, bufs, false, ttl_secs, region)
     }
 
     /// Batched existence probe: list[bool] aligned to `keys` (an RPC error
@@ -1148,7 +1200,7 @@ impl BatchClient {
     /// same client; its requests go ahead of queued writes on the connection.
     fn exists(&self, py: Python<'_>, keys: Vec<Vec<u8>>) -> PyResult<Vec<bool>> {
         let items = keys.into_iter().map(|key| WorkItem { key, ptr: 0, len: 0 }).collect();
-        Ok(self.run_items(py, BatchOp::Head, items, 0))
+        Ok(self.run_items(py, BatchOp::Head, items, 0, None))
     }
 }
 
@@ -1161,6 +1213,7 @@ impl BatchClient {
         bufs: Vec<PyBuffer<u8>>,
         writable: bool,
         ttl_secs: u64,
+        region: Option<std::sync::Arc<autumn_transport::Region>>,
     ) -> PyResult<Vec<bool>> {
         let n = keys.len();
         if bufs.len() != n {
@@ -1181,23 +1234,61 @@ impl BatchClient {
                 len: buf.item_count(),
             });
         }
-        let results = self.run_items(py, op, items, ttl_secs);
+        let results = self.run_items(py, op, items, ttl_secs, region);
         drop(bufs); // release pinned buffers only after the worker finished
         Ok(results)
     }
 
     /// Hands `items` to the worker and waits for them with the GIL released.
-    fn run_items(&self, py: Python<'_>, op: BatchOp, items: Vec<WorkItem>, ttl_secs: u64) -> Vec<bool> {
+    fn run_items(
+        &self,
+        py: Python<'_>,
+        op: BatchOp,
+        items: Vec<WorkItem>,
+        ttl_secs: u64,
+        region: Option<std::sync::Arc<autumn_transport::Region>>,
+    ) -> Vec<bool> {
         let n = items.len();
         py.allow_threads(|| {
             let (done, result) = smpsc::channel::<Vec<bool>>();
-            let job = BatchJob { op, items, ttl_secs, done };
+            let job = BatchJob { op, items, ttl_secs, region, done };
             if self.worker.job_tx.unbounded_send(job).is_err() {
                 return vec![false; n];
             }
             result.recv().unwrap_or_else(|_| vec![false; n])
         })
     }
+}
+
+/// `put_many` of the caller's pages, lent rather than copied: a page inside
+/// `region` goes with its registration (zero-copy over UCX), any other is copied
+/// into a pool buffer at the UCX send, and TCP writes from the page. Returns
+/// only once every page is returned, so the caller may reuse them — a send that
+/// outlived its put (a timeout) never reads a page afterwards. A region page
+/// is returned when UCX completes its send: with a peer that died mid-transfer
+/// that may be never (endpoints run without peer error handling), and the
+/// call waits with it.
+async fn put_lent(
+    client: &ClusterClient,
+    items: &[WorkItem],
+    ttl_secs: u64,
+    region: Option<&std::sync::Arc<autumn_transport::Region>>,
+) -> Vec<bool> {
+    let mut returned = Vec::with_capacity(items.len());
+    let lent: Vec<(&[u8], autumn_client::RegBytes)> = items
+        .iter()
+        .map(|it| {
+            // SAFETY: the caller keeps each page pinned and unmodified until this
+            // function returns, which is after every page is returned.
+            let (value, back) = unsafe { autumn_transport::lend(it.ptr as *const u8, it.len, region) };
+            returned.push(back);
+            (it.key.as_slice(), value)
+        })
+        .collect();
+    let results = client.put_many(&lent, write_opts(ttl_secs)).await;
+    drop(lent);
+    futures::future::join_all(returned).await;
+    results.iter().map(|r| r.is_ok()).collect()
 }
 
 // ── Python module ───────────────────────────────────────────────────────────
@@ -1208,5 +1299,8 @@ fn autumn(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<BatchClient>()?;
     m.add_class::<fs::Fs>()?;
     m.add_function(wrap_pyfunction!(set_transport, m)?)?;
+    m.add_function(wrap_pyfunction!(register, m)?)?;
+    m.add_function(wrap_pyfunction!(ucx_am_counters, m)?)?;
+    m.add_class::<Region>()?;
     Ok(())
 }

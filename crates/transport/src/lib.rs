@@ -21,6 +21,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::sync::OnceLock;
 
+mod lend;
 mod recv_dest;
 mod tcp;
 mod zerocopy;
@@ -41,6 +42,7 @@ pub use regpool::{
     thread_share_of as regpool_thread_share_of, thread_held as regpool_thread_held, PoolError, PooledBuf, RegBytes, RegpoolStats, Use as PoolUse,
     UseStats as PoolUseStats,
 };
+pub use lend::{lend, Region, Returned};
 pub use recv_dest::{RecvDest, Released};
 
 /// Values at least this long take the bulk paths: the SDK's bulk reads and
@@ -80,6 +82,14 @@ pub mod am {
     pub fn sent_counts() -> (u64, u64) {
         #[cfg(feature = "ucx")]
         return crate::ucx::am::sent_counts();
+        #[cfg(not(feature = "ucx"))]
+        (0, 0)
+    }
+
+    /// Bytes this process sent as active messages: (with a memh, without).
+    pub fn sent_bytes() -> (u64, u64) {
+        #[cfg(feature = "ucx")]
+        return crate::ucx::am::sent_bytes();
         #[cfg(not(feature = "ucx"))]
         (0, 0)
     }

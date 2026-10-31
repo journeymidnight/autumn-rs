@@ -468,7 +468,27 @@ append and bulk call each sent with a memh and counted as staged; red without
 the staging), `ucx_am_frame.rs` (a sender lets go of its staged copy when the
 receiver takes, refuses or abandons the value, or the connection goes —
 watched through `regpool_thread_held(Staging)` together with the thread's send
-count, since the send is spawned and nothing is staged before it runs).
+count, since the send is spawned and nothing is staged before it runs), and
+`a_value_in_read_only_memory_arrives` (a value in an `mprotect(PROT_READ)`
+mapping: staged, it arrives; handed to UCX as it is, the rendezvous never
+completes — red without the staging).
+
+**Caller memory: `Region` and `lend` (`lend.rs`).** `Region::register(ptr, len)`
+registers caller memory once (`ucp_mem_map` under UCX; on TCP it only records
+the bounds); dropping the last `Arc` unregisters it. `lend(ptr, len, region)`
+makes a `RegBytes` over caller memory without copying — with the region's memh
+when the region holds all of it — and a `Returned` future that resolves once
+every clone is gone (a `Send` owner; `RecvDest`'s `Released` is `Rc`-only). A
+lent value outside any region is staged at the UCX send like any other and
+returned once copied; inside one it goes zero-copy and is returned when UCX
+lets go. The caller must keep the memory valid and unmodified until `Returned`
+resolves. A lent value drops its `Arc<Region>` before signalling, so the
+registration cannot outlive memory the caller frees on `Returned`. A value in
+a region is returned when UCX completes its send, which, with a peer that died
+mid-transfer and no peer error handling on the endpoint, may be never. Tests: `lend::tests` (returned only after the last clone; region
+bounds), `ucx_am_frame.rs` `a_lent_value_is_sent_from_its_region_and_returned_after`
+(sent with the region's memh, not staged, returned after the send; outside the
+region staged and returned at once).
 
 Without a memh, UCX takes the context lock the workers share for every
 cache lookup (`ucp_memh_get`); with one it skips the lookup and the lock.

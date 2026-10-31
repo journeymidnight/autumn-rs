@@ -3498,6 +3498,36 @@ UCX_TLS=rc_mlx5,ud_mlx5,tcp,self UCX_NET_DEVICES=<dev>:1 \
   taskset -c <idle cores> cargo bench -p autumn-transport --features ucx --bench regpool_alloc
 ```
 
+## Caller memory over UCX: registered regions and the staging copy
+
+Memory UCX sends must carry a registration autumn made: a pool buffer's, or a
+region the caller registered. Anything else is copied into a pool buffer at the
+send (`*_ucx_am_staged_bytes_total`), so UCX never registers memory itself — a
+read-only mapping (`np.memmap(mode='r')`) would hang its send. Python:
+
+```python
+import autumn, numpy as np
+autumn.set_transport("ucx")
+bc = autumn.BatchClient("[<roce-ip>]:9001", scope="kvc/")
+pool = np.empty(32 << 20, np.uint8)          # long-lived pages (kvcache L2)
+region = autumn.register(pool)                # once; read-only buffers are refused
+pages = [memoryview(pool[i << 21:(i + 1) << 21]) for i in range(16)]
+before = autumn.ucx_am_counters()
+bc.put_from([f"kvc/p/{i}".encode() for i in range(16)], pages, 0, region)
+print(autumn.ucx_am_counters(), before)       # staged unchanged: zero-copy
+bc.put_from([b"kvc/q"], [memoryview(np.zeros(2 << 20, np.uint8))])  # staged += 2 MiB
+region.unregister()
+```
+
+`put_from` returns only once the transport no longer reads any of the buffers
+(a send that outlived a timeout included), so they may be reused at once. A
+registered page is read by UCX until its send completes: if the PS dies in the
+middle, that may be never (UCX endpoints run without peer error handling), and
+`put_from` — and the `BatchClient` behind it — waits with it. Unregistered
+pages are copied at the send and do not wait on the peer. Check:
+overwrite the pages right after `put_from` returns, then `get_into` them — the
+stored values are the old bytes.
+
 ## Large values over UCX as frame values (wire 77)
 
 On UCX, every value part of 64 KiB and up that crosses a hop as part of a frame
