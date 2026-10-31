@@ -32,7 +32,7 @@ async fn a_value_under_the_bulk_cut_goes_eager() {
         let mut mem = vec![0u8; n];
         let tag = am::next_tag();
         let (dest, _released) = unsafe { RecvDest::new(mem.as_mut_ptr(), n) };
-        let expected = am::expect(tag, dest).unwrap();
+        let expected = am::expect(tag, dest, None).unwrap();
         let before = autumn_transport::ucx_am_received_counts();
         let (sent, got) = futures::join!(tx.send(tag, Bytes::from(value.clone())), expected.arrived());
         sent.unwrap();

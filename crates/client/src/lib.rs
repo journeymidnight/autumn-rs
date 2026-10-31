@@ -1240,9 +1240,12 @@ pub struct RawGetItem<'a> {
 }
 
 /// One `MSG_GET_AM` attempt: register `[ptr, ptr + len)` for the value's AM,
-/// ask, and wait for the value when the reply says it was sent. `None` when
-/// the value is longer than the memory (not sent): the caller reads it the
-/// other way. Returns only once nothing writes the memory any more.
+/// ask, and wait for the value when the reply says it was sent. Inside
+/// `region` the value lands in the memory; elsewhere in a pool buffer, copied
+/// in once it is there. `None` when the value is longer than the memory (not
+/// sent) or the memory cannot take an AM value (unregistered, over 256 MiB):
+/// the caller reads it the other way. Returns only once nothing writes the
+/// memory any more.
 ///
 /// # Safety
 /// As `ClusterClient::get_range_into_raw`.
@@ -1251,12 +1254,20 @@ async unsafe fn get_am_attempt(
     req: &GetReq,
     ptr: *mut u8,
     len: usize,
+    region: Option<&std::sync::Arc<autumn_rpc::Region>>,
     timeout: Option<Duration>,
 ) -> std::result::Result<Option<(u8, String, (usize, Option<autumn_rpc::PooledBuf>))>, RpcError> {
     use autumn_rpc::am::{self, Arrival};
     let tag = am::next_tag();
     let (dest, released) = autumn_rpc::RecvDest::new(ptr, len);
-    let expected = am::expect(tag, dest)?;
+    let expected = match am::expect(tag, dest, region) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
+            released.await;
+            return Ok(None);
+        }
+        Err(e) => return Err(e.into()),
+    };
     let ask = rkyv_encode(&GetAmReq {
         part_id: req.part_id,
         key: req.key.clone(),
@@ -4584,10 +4595,12 @@ impl ClusterClient {
         Err(self.routing_exhausted(what, attempt, last_err))
     }
 
-    /// `get_range_into` whose value is received straight into `[ptr, ptr +
-    /// len)`: no copy out of a pool buffer. A value longer than `len` is
-    /// received into a pool buffer and its first `len` bytes copied, as
-    /// `get_range_into` does. Returns the value's length.
+    /// `get_range_into` whose value is received into `[ptr, ptr + len)`. Over
+    /// UCX that is without a copy only when `region` (registered by the
+    /// caller) holds the memory; otherwise the value lands in a pool buffer
+    /// and is copied in, since UCX never registers memory itself. A value
+    /// longer than `len` is received into a pool buffer and its first `len`
+    /// bytes copied, as `get_range_into` does. Returns the value's length.
     ///
     /// # Safety
     /// `[ptr, ptr + len)` must be valid for writes and touched by nobody else
@@ -4598,17 +4611,18 @@ impl ClusterClient {
         key: &[u8],
         ptr: *mut u8,
         len: usize,
+        region: Option<&std::sync::Arc<autumn_rpc::Region>>,
     ) -> std::result::Result<Option<usize>, AutumnError> {
         let key = self.binding.bind_key(key)?;
         // Over UCX the value can come as an active message, moved by
-        // rendezvous into the memory with no receive copy (`MSG_GET_AM`).
+        // rendezvous into the memory or a pool buffer (`MSG_GET_AM`).
         let am = autumn_rpc::runtime_transport_is_ucx()
             && self.negotiated_cluster_wire.get() >= autumn_rpc::WIRE_VERSION_WITH_GET_AM;
         let got = self
             .get_bulk_bound(&key, 0, 0, "get_range_into_raw", |client, req, timeout| async move {
                 if am {
                     // SAFETY: as below.
-                    if let Some(r) = unsafe { get_am_attempt(&client, &req, ptr, len, timeout) }.await? {
+                    if let Some(r) = unsafe { get_am_attempt(&client, &req, ptr, len, region, timeout) }.await? {
                         return Ok(r);
                     }
                 }
@@ -4701,6 +4715,7 @@ impl ClusterClient {
     pub async unsafe fn get_many_into_raw(
         &self,
         items: &[RawGetItem<'_>],
+        region: Option<&std::sync::Arc<autumn_rpc::Region>>,
     ) -> Vec<std::result::Result<Option<usize>, AutumnError>> {
         if !items.is_empty() && items.iter().all(|it| !bulk_worthwhile(it.len)) {
             let keys: Vec<&[u8]> = items.iter().map(|it| it.key).collect();
@@ -4720,7 +4735,7 @@ impl ClusterClient {
                 })
                 .collect();
         }
-        let futs = items.iter().map(|it| unsafe { self.get_range_into_raw(it.key, it.ptr, it.len) });
+        let futs = items.iter().map(|it| unsafe { self.get_range_into_raw(it.key, it.ptr, it.len, region) });
         fan_out_collect(futs, batch_get_concurrency()).await
     }
 

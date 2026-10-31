@@ -855,10 +855,11 @@ fn set_transport(kind: &str) -> PyResult<()> {
 
 use std::sync::mpsc as smpsc;
 
-/// Caller memory registered once (`autumn.register(buf)`) so a `put_from` of
-/// pages inside it is sent zero-copy over UCX with the region's registration.
-/// On TCP it only records the bounds. It keeps `buf` alive; `unregister()` (or
-/// dropping it) ends the registration once no send still uses it.
+/// Caller memory registered once (`autumn.register(buf)`) so pages inside it
+/// are sent (`put_from`) and received (`get_into`) zero-copy over UCX with the
+/// region's registration. On TCP it only records the bounds. It keeps `buf`
+/// alive; `unregister()` (or dropping it) ends the registration once no
+/// transfer still uses it.
 #[pyclass]
 struct Region {
     inner: Option<(std::sync::Arc<autumn_transport::Region>, PyBuffer<u8>)>,
@@ -880,7 +881,8 @@ impl Region {
 /// This process's UCX active-message byte counts: values sent with a
 /// registration (`sent_memh`), without one (`sent_no_memh`, only values over
 /// 256 MiB), and those copied into a pool buffer first because they had none
-/// (`staged`). All 0 on TCP.
+/// (`staged`); bytes of values read into memory outside a registered region,
+/// which land in a pool buffer and are copied in (`landed`). All 0 on TCP.
 #[pyfunction]
 fn ucx_am_counters(py: Python<'_>) -> PyResult<PyObject> {
     let (sent_memh, sent_no_memh) = autumn_transport::am::sent_bytes();
@@ -888,6 +890,7 @@ fn ucx_am_counters(py: Python<'_>) -> PyResult<PyObject> {
     d.set_item("sent_memh", sent_memh)?;
     d.set_item("sent_no_memh", sent_no_memh)?;
     d.set_item("staged", autumn_transport::am::staged_bytes())?;
+    d.set_item("landed", autumn_transport::am::landed_bytes_total())?;
     Ok(d.into_any().unbind())
 }
 
@@ -937,7 +940,7 @@ struct BatchJob {
     /// Relative TTL in seconds for a `Put` batch; `0` = no expiry. Ignored by
     /// `Get` and `Head`.
     ttl_secs: u64,
-    /// A `Put`'s pages that lie inside it are sent with its registration.
+    /// Pages inside it are sent (`Put`) and received (`Get`) with its registration.
     region: Option<std::sync::Arc<autumn_transport::Region>>,
     done: smpsc::Sender<Vec<bool>>,
 }
@@ -1017,7 +1020,7 @@ async fn run_job(
                     .iter()
                     .map(|it| autumn_client::RawGetItem { key: &it.key, ptr: it.ptr as *mut u8, len: it.len })
                     .collect();
-                unsafe { client.get_many_into_raw(&ritems).await }
+                unsafe { client.get_many_into_raw(&ritems, region.as_ref()).await }
             };
             // Success = the value was found AND its length matches the page size
             // the caller reserved (same contract as the former per-item path).
@@ -1168,11 +1171,21 @@ impl BatchClient {
         self.direct
     }
 
-    /// Batched zero-copy get. Returns list[bool] aligned to `keys`: True iff the
-    /// key was found AND its stored size == the buffer length (value copied into
-    /// the buffer). Runs on the worker thread with the GIL released.
-    fn get_into(&self, py: Python<'_>, keys: Vec<Vec<u8>>, bufs: Vec<PyBuffer<u8>>) -> PyResult<Vec<bool>> {
-        self.run_batch(py, BatchOp::Get, keys, bufs, true, 0, None)
+    /// Batched get into the caller's buffers. Returns list[bool] aligned to
+    /// `keys`: True iff the key was found AND its stored size == the buffer
+    /// length. Over UCX, buffers inside `region` (from `autumn.register`)
+    /// receive the value with no copy; any other buffer gets it copied out of
+    /// a pool buffer. Runs on the worker thread with the GIL released.
+    #[pyo3(signature = (keys, bufs, region=None))]
+    fn get_into(
+        &self,
+        py: Python<'_>,
+        keys: Vec<Vec<u8>>,
+        bufs: Vec<PyBuffer<u8>>,
+        region: Option<PyRef<'_, Region>>,
+    ) -> PyResult<Vec<bool>> {
+        let region = region.and_then(|r| r.inner.as_ref().map(|(r, _)| r.clone()));
+        self.run_batch(py, BatchOp::Get, keys, bufs, true, 0, region)
     }
 
     /// Batched put from the caller's buffers. Returns list[bool] aligned to

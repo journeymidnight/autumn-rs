@@ -67,10 +67,15 @@ enum Key {
     Frame(FrameKey),
 }
 
-/// Where a value goes.
+/// Where a value goes. UCX only ever receives into memory with a memh.
 enum Target {
-    /// Memory lent by the caller; released by dropping it.
-    Lent(RecvDest),
+    /// Memory the caller lent, inside a region it registered; released by
+    /// dropping it. The region is held until then, so a receive left running
+    /// by a dropped call never outlives the registration.
+    Lent { dest: RecvDest, _region: std::sync::Arc<crate::Region>, memh: ucp_mem_h },
+    /// Memory the caller lent outside any registered region: received into
+    /// `landing`, copied into `dest` once in.
+    Landed { dest: RecvDest, landing: PooledBuf },
     /// `len` bytes at `ptr` inside a pool buffer `owner` keeps alive for as
     /// long as a receive may write them.
     Pooled { ptr: *mut u8, len: usize, memh: ucp_mem_h, _owner: Rc<dyn Any> },
@@ -79,8 +84,21 @@ enum Target {
 impl Target {
     fn region(&mut self) -> (*mut u8, usize, ucp_mem_h) {
         match self {
-            Target::Lent(d) => (d.region_mut().as_mut_ptr(), d.cap(), ptr::null_mut()),
+            Target::Lent { dest, memh, .. } => (dest.region_mut().as_mut_ptr(), dest.cap(), *memh),
+            Target::Landed { landing, .. } => {
+                let (buf, reg) = landing.dest_and_reg();
+                (buf.as_mut_ptr(), buf.len(), reg.map_or(ptr::null_mut(), |r| r.memh()))
+            }
             Target::Pooled { ptr, len, memh, .. } => (*ptr, *len, *memh),
+        }
+    }
+
+    /// The value (`n` bytes) is in: a landed one goes on to the caller's memory.
+    fn arrived(&mut self, n: usize) {
+        if let Target::Landed { dest, landing } = self {
+            dest.region_mut()[..n].copy_from_slice(&landing.dest_mut()[..n]);
+            LANDED_BYTES.with(|c| c.set(c.get() + n as u64));
+            LANDED_TOTAL.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
         }
     }
 }
@@ -95,7 +113,10 @@ struct Slot {
 impl Slot {
     /// The value is in (or will never be): release the memory, then tell the waiter.
     fn finish(&self, state: State) {
-        drop(self.dest.borrow_mut().take());
+        let target = self.dest.borrow_mut().take();
+        if let (Some(mut t), State::Done(n)) = (target, state) {
+            t.arrived(n);
+        }
         self.state.set(state);
         if let Some(w) = self.waker.take() {
             w.wake();
@@ -122,15 +143,37 @@ thread_local! {
     static NEXT_TAG: Cell<u64> = const { Cell::new(1) };
     /// Values received on this thread: (eager, rendezvous).
     static RECEIVED: Cell<(u64, u64)> = const { Cell::new((0, 0)) };
+    /// Rendezvous receives posted on this thread: (with a memh, without).
+    static RECEIVED_MEMH: Cell<(u64, u64)> = const { Cell::new((0, 0)) };
     /// Values sent from this thread: (with a memh, without).
     static SENT: Cell<(u64, u64)> = const { Cell::new((0, 0)) };
     /// Values this thread copied into a pool buffer to send them.
     static STAGED: Cell<u64> = const { Cell::new(0) };
+    /// Bytes of asked-for values this thread received into a pool buffer and
+    /// copied into the caller's memory (it had no registration).
+    static LANDED_BYTES: Cell<u64> = const { Cell::new(0) };
+}
+
+/// This thread's asked-for value bytes copied out of a pool buffer.
+pub fn landed_bytes() -> u64 {
+    LANDED_BYTES.with(|c| c.get())
+}
+
+static LANDED_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `landed_bytes` of the whole process.
+pub fn landed_bytes_total() -> u64 {
+    LANDED_TOTAL.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// This thread's worker; null once the thread is being torn down.
 pub(crate) fn this_worker() -> *mut ucp_worker {
     WORKER.try_with(|w| w.get()).unwrap_or(ptr::null_mut())
+}
+
+/// This thread's rendezvous receives posted with a memh, and without one.
+pub fn received_memh_counts() -> (u64, u64) {
+    RECEIVED_MEMH.with(|c| c.get())
 }
 
 /// This thread's values received (eager copies, rendezvous receives).
@@ -280,6 +323,10 @@ unsafe fn receive(slot: Rc<Slot>, data: *mut c_void, length: usize, rndv: bool, 
         p.op_attr_mask |= ucp_op_attr_t::UCP_OP_ATTR_FIELD_MEMH as u32;
         p.memh = memh;
     }
+    RECEIVED_MEMH.with(|c| {
+        let (with, without) = c.get();
+        c.set(if memh.is_null() { (with, without + 1) } else { (with + 1, without) })
+    });
     p.cb.recv_am = Some(on_received);
     // The in-flight receive holds the slot (and with it the buffer) until it completes.
     p.user_data = Rc::into_raw(slot.clone()) as *mut c_void;
@@ -388,8 +435,24 @@ fn register(key: Key, dest: Target) -> Expected {
 /// Where the value tagged `tag` goes. Register it before the value can be
 /// sent; then await [`Expected::arrived`], and end with
 /// [`Expected::finish`], after which nothing writes `dest`'s memory.
-pub(crate) fn expect(tag: u64, dest: RecvDest) -> Expected {
-    register(Key::Asked(tag), Target::Lent(dest))
+pub(crate) fn expect(tag: u64, dest: RecvDest, region: Option<&std::sync::Arc<crate::Region>>) -> io::Result<Expected> {
+    let mut dest = dest;
+    let lent = region.and_then(|r| r.memh_for(dest.region_mut().as_ptr(), dest.cap()).map(|m| (r.clone(), m)));
+    let target = match lent {
+        Some((region, memh)) => Target::Lent { dest, _region: region, memh },
+        // No pool buffer that large: it would be heap memory UCX registers itself.
+        None if dest.cap() > crate::regpool::MAX_CHUNK_BYTES => {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "an unregistered destination over 256 MiB cannot take an AM value",
+            ))
+        }
+        None => {
+            let landing = crate::regpool::acquire_charged_if_room(crate::regpool::Use::Reply, dest.cap());
+            Target::Landed { dest, landing }
+        }
+    };
+    Ok(register(Key::Asked(tag), target))
 }
 
 /// Where the frame value tagged `tag` on `ep` goes; starts receiving it at

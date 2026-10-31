@@ -1,3 +1,10 @@
+Date: 2026-10-31 (2)
+TaskStatus: not_completed
+Task scope: user /loop 完成data-path重构 — data-path redesign steps 3d..9 (design page https://claude.ai/artifact/E18oSqzHKbg2Vx1HqKKyo1).
+Current summary: 3d done — asked-for AM values (MSG_GET_AM) never go into memory UCX registers: inside a caller Region straight in (Target::Lent holds the Arc), otherwise land in a pool buffer and are copied (landed counters, Python ucx_am_counters()["landed"]); unregistered over 256 MiB -> Unsupported -> stream read. SDK get_range_into_raw/get_many_into_raw + Python get_into take a region. Live: region 7.0-9.1 GB/s (= old implicit 7.6-9.1), plain 4.7-5.9 (one copy). Reviewed (fable): Arc held, receive memh counted + asserted, docs fixed.
+Main gaps: step 3 acceptance waits on >256 MiB values (step 5); kvcache reads without a region pay the copy until step 4; landing buffer past the Reply budget = overflow chunk per burst (inferred, unmeasured); Unsupported fallback untested; BUG-PY-PUT (2) red test missing (user decides).
+Next steps: step 4 (autumn_kvcache registers the sglang host pool / copy scratch, vLLM reusable staging; sglang + vLLM e2e on UCX), then 5..9.
+
 Date: 2026-10-31
 TaskStatus: completed
 Task scope: user 2026-10-31 — UCX peer error handling as core data-path work (F-UCX-PEER-ERRORS, removed from the ledger as done).

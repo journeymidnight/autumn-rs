@@ -50,7 +50,7 @@ async fn values_land_in_the_registered_memory_and_strangers_are_dropped() {
         let mut mem = vec![0u8; n];
         let tag = am::next_tag();
         let (dest, released) = unsafe { RecvDest::new(mem.as_mut_ptr(), n) };
-        let expected = am::expect(tag, dest).unwrap();
+        let expected = am::expect(tag, dest, None).unwrap();
         let before = autumn_transport::ucx_am_received_counts();
         let send = tx.send(tag, Bytes::from(value.clone()));
         let (sent, got) = futures::join!(send, expected.arrived());
@@ -77,7 +77,7 @@ async fn given_up_and_too_long_values_leave_the_memory_alone() {
     let mut mem = vec![0u8; 16 << 20];
     let tag = am::next_tag();
     let (dest, released) = unsafe { RecvDest::new(mem.as_mut_ptr(), mem.len()) };
-    am::expect(tag, dest).unwrap().finish().await;
+    am::expect(tag, dest, None).unwrap().finish().await;
     assert!(released.is_released());
     let late = compio::time::timeout(Duration::from_secs(5), tx.send(tag, Bytes::from(vec![9u8; 16 << 20])));
     late.await.expect("a late value's send completes").unwrap();
@@ -87,11 +87,40 @@ async fn given_up_and_too_long_values_leave_the_memory_alone() {
     let mut small = vec![0u8; 1 << 20];
     let tag = am::next_tag();
     let (dest, released) = unsafe { RecvDest::new(small.as_mut_ptr(), small.len()) };
-    let expected = am::expect(tag, dest).unwrap();
+    let expected = am::expect(tag, dest, None).unwrap();
     let (sent, got) = futures::join!(tx.send(tag, Bytes::from(vec![7u8; 2 << 20])), expected.arrived());
     sent.unwrap();
     assert!(matches!(got.unwrap(), Arrival::TooLong(n) if n == 2 << 20));
     expected.finish().await;
     assert!(released.is_released());
     assert!(small.iter().all(|&b| b == 0), "a too-long value was written");
+}
+
+/// UCX only receives into memory with a registration: memory inside a region
+/// the caller registered takes the value directly; any other memory gets it
+/// copied out of a pool buffer the value landed in. Either way it arrives whole.
+#[compio::test]
+async fn a_value_reaches_caller_memory_directly_only_through_its_registration() {
+    let (tx, _client) = pair_with_rndv_thresh("1m").await;
+    let n = 4 << 20;
+    let mut mem = vec![0u8; 2 * n];
+    let region = unsafe { autumn_transport::Region::register(mem.as_mut_ptr(), n) }.unwrap();
+    for (at, inside) in [(0usize, true), (n, false)] {
+        let value = pattern(n, at as u8 ^ 5);
+        let tag = am::next_tag();
+        let (dest, released) = unsafe { RecvDest::new(mem.as_mut_ptr().add(at), n) };
+        let expected = am::expect(tag, dest, Some(&region)).unwrap();
+        let (landed, posted) = (am::landed_bytes(), am::received_memh_counts());
+        let (sent, got) = futures::join!(tx.send(tag, Bytes::from(value.clone())), expected.arrived());
+        sent.unwrap();
+        assert!(matches!(got.unwrap(), Arrival::Received(m) if m == n), "inside={inside}");
+        expected.finish().await;
+        assert!(released.is_released());
+        assert_eq!(&mem[at..at + n], value.as_slice(), "inside={inside}");
+        let copied = am::landed_bytes() - landed;
+        assert_eq!(copied, if inside { 0 } else { n as u64 }, "inside={inside}");
+        let after = am::received_memh_counts();
+        assert_eq!((after.0 - posted.0, after.1 - posted.1), (1, 0), "inside={inside}: received with a memh");
+    }
+    drop(region);
 }

@@ -3529,6 +3529,19 @@ Unregistered pages are copied at the send and do not wait on the peer. Check:
 overwrite the pages right after `put_from` returns, then `get_into` them — the
 stored values are the old bytes.
 
+Reads into caller memory follow the same rule: `bc.get_into(keys, pages,
+region)` receives straight into pages inside `region`; pages outside any
+region land in a pool buffer and are copied in (`landed` in
+`autumn.ucx_am_counters()`):
+
+```python
+dest = np.zeros(16 << 24, np.uint8); r = autumn.register(dest)
+pages = [memoryview(dest[i << 24:(i + 1) << 24]) for i in range(16)]
+c0 = autumn.ucx_am_counters()
+bc.get_into([f"kvc/p/{i}".encode() for i in range(16)], pages, r)
+print(autumn.ucx_am_counters()["landed"] - c0["landed"])   # 0; without r: 256 MiB
+```
+
 ## UCX peer failure: a closed or dead peer fails its transfers
 
 Every UCX endpoint runs with peer error handling (`UCP_ERR_HANDLING_MODE_PEER`).

@@ -158,10 +158,10 @@ through each method, small and large values; ablating any one hand-off is red).
   TRUNCATED to fit — same contract as `get_many_into`/`get_many_direct`) or `None`.
   A borrowed `&mut [u8]` cannot be lent to a receive (dropping the future would end
   the borrow while the receive writes), hence the copy.
-- `get_range_into_raw(key, ptr, len)` / `get_many_into_raw(items: &[RawGetItem])` —
-  **unsafe**, whole values received straight into caller memory over
-  `RpcClient::call_into_dest` (autumn-rpc CLAUDE.md "Receiving into caller memory"):
-  no copy out of a pool buffer. Contract: the memory stays valid and untouched until
+- `get_range_into_raw(key, ptr, len, region)` / `get_many_into_raw(items: &[RawGetItem], region)` —
+  **unsafe**, whole values received into caller memory: over the stream with
+  `RpcClient::call_into_dest` (autumn-rpc CLAUDE.md "Receiving into caller memory"),
+  or as a UCX active message (below). Contract: the memory stays valid and untouched until
   the future completes, and the future runs to completion. For callers that know the
   value's size and own the memory for the call — the python `BatchClient.get_into`
   (kvcache pages); everything else uses the pooled reads. Shares routing, retries and
@@ -169,12 +169,16 @@ through each method, small and large values; ablating any one hand-off is red).
   the memory again only after the previous attempt returned it. Over UCX, against a
   cluster at `WIRE_VERSION_WITH_GET_AM` or later, an attempt is `get_am_attempt`:
   register the memory under a fresh AM tag, send `MSG_GET_AM`, and for an OK reply
-  wait (bounded) for the value's arrival; UCX moves it by rendezvous with no receive
-  copy. A value too long for the memory falls back to `MSG_GET_BULK` in the same
-  attempt. Not handled: a PS still at wire 75 in a cluster whose manager is at 76
-  refuses `MSG_GET_AM` (PermissionDenied, terminal) — upgrades stop the whole
-  cluster; and a PS dying in the middle of the value's rendezvous may leave the
-  attempt waiting for UCX (transport CLAUDE.md, "Large values as active messages"). Small batches go
+  wait (bounded) for the value's arrival. Memory inside `region` (registered by the
+  caller, `autumn.register`) takes the value by rendezvous with no receive copy;
+  other memory gets it through a pool buffer and one copy, since UCX never
+  registers memory itself (transport CLAUDE.md, "Large values as active messages").
+  A value too long for the memory, or unregistered memory over 256 MiB, falls back
+  to `MSG_GET_BULK` in the same attempt. Not handled: a PS still at wire 75 in a
+  cluster whose manager is at 76 refuses `MSG_GET_AM` (PermissionDenied, terminal) —
+  upgrades stop the whole cluster. A PS dying mid-rendezvous: UCX completes the
+  receive with an error once it reports the endpoint (inferred from peer error
+  handling, not tested for asked-for values). Small batches go
   through `get_many` + copy as in `get_many_into`.
 - The large-value `put` is the **zero-copy write**: NO client-side copy AND no value
   crc scan via `MSG_PUT_BULK` + `RpcClient::call_vectored_bulk` (v28: `[meta][key]` is

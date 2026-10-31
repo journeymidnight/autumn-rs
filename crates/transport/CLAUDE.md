@@ -363,8 +363,8 @@ an 8-byte header; from `BULK_MIN_BYTES` (64 KiB) on it asks for rendezvous,
 and the receiver's handler gets a descriptor and fetches the value straight into its memory
 (`ucp_am_recv_data_nbx`). One handler per worker (`register_handler`, AM id 1,
 `WHOLE_MSG`) looks the tag up in the thread's registry (`am::expect(tag,
-dest)`): a registered buffer receives the value (rendezvous, or a copy for an
-eager value); an unregistered tag is dropped by returning `UCS_OK`, which also
+dest, region)`): the buffer registered for the tag receives the value
+(rendezvous, or a copy for an eager value); an unregistered tag is dropped by returning `UCS_OK`, which also
 completes a rendezvous sender (`ucx_am.rs` checks that). This is why it is
 AM and not the tag API: a tagged rendezvous nobody receives never completes,
 and a caller that gave up leaves exactly that. `Expected` unregisters on drop
@@ -388,6 +388,37 @@ counted with `ucx_am_received_counts`; a stranger is dropped and its send
 completes; a given-up value writes nothing — red with no unregister on drop;
 a too-long value is reported, not received), `tests/ucx_am_eager.rs` (a value
 under the cut goes eager under a 4 KiB UCX threshold).
+
+UCX receives only into memory with a memh, as it sends only from such memory.
+Caller memory inside `region` (a `Region` the caller registered) takes the
+value directly with the region's memh (`Target::Lent`); any other caller
+memory gets a pool buffer of its size (`Reply`, charged if room), the value
+lands there and is copied into the caller's memory when it is in
+(`Target::Landed`, `landed_bytes` per thread, `landed_bytes_total` for the
+process; the copy runs where the receive completes, inside worker progress).
+Over 256 MiB there is no pool buffer to land in, so `expect` answers
+`Unsupported` and the SDK reads the value on the stream instead. Before, the
+caller's memory went to UCX with no memh and was registered through its cache.
+Measured (UCX, 3 extent nodes, PS memory tier, Python
+`BatchClient.get_into` of 64 x 16 MiB pages, one client worker, four rounds):
+into a registered region 7.1–9.1 GB/s, the same as the old implicit
+registration on reused memory (7.6–9.1); plain memory now 5.0–5.6 GB/s, the
+one copy. A caller that passes no region pays it: today that is every
+kvcache read (`get_into` without a region) until the adapter registers its L2
+pool, and `scripts/mem_tier_hot_set.py`. A `Lent` target holds the region's
+`Arc`, so a receive left running by a dropped call keeps the registration.
+The landing buffer is taken when the value is asked for and held until it is
+in (the whole round trip); past the `Reply` budget it comes from an overflow
+chunk, made and registered on the spot (inferred, not measured: a client with
+more than its share of unregistered values in flight registers a chunk per
+burst). A landing buffer whose chunk mapping failed is heap memory, received
+without a memh, as for frame values. The `Unsupported` fallback over 256 MiB
+has no test. Test: `ucx_am.rs`
+`a_value_reaches_caller_memory_directly_only_through_its_registration` (inside
+the region nothing copied, outside every byte copied, every receive posted
+with a memh (`received_memh_counts`), both arrive whole; red when the region
+is ignored, with caller memory handed to UCX without a memh, and with the
+region's memh dropped).
 
 ### Frame values (AM id 2)
 

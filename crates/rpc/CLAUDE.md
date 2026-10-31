@@ -633,8 +633,10 @@ could otherwise write a page after Python has it back).
 
 On UCX against a wire-76 cluster the SDK sends `MSG_GET_AM` instead and the
 value comes as an active message that UCX moves by rendezvous into the memory
-with no receive copy (below, and autumn-client `get_am_attempt`); this call
-remains the path for older clusters and for a value longer than the memory.
+(registered by the caller) or a pool buffer it is copied out of (below, and
+autumn-client `get_am_attempt`); this call remains the path for older
+clusters, for a value longer than the memory, and for unregistered memory over
+256 MiB.
 
 On UCX the direct path does not post a receive into the memory: a posted
 stream recv cannot be cancelled, so a peer stalled mid-value would hold it with

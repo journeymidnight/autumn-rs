@@ -52,6 +52,12 @@ impl Region {
         p >= self.start && p.checked_add(len).is_some_and(|end| end <= self.start + self.len)
     }
 
+    /// The registration's memh when it holds all of `[ptr, ptr + len)`.
+    #[cfg(feature = "ucx")]
+    pub(crate) fn memh_for(&self, ptr: *const u8, len: usize) -> Option<crate::ucx::ffi::ucp_mem_h> {
+        self.reg.as_ref().filter(|_| self.contains(ptr, len)).map(|r| r.memh())
+    }
+
     /// Whether UCX registered it.
     pub fn is_registered(&self) -> bool {
         #[cfg(feature = "ucx")]

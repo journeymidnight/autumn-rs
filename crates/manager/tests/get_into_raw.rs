@@ -29,7 +29,7 @@ async fn read(c: &ClusterClient, keys: &[&[u8]], lens: &[usize]) -> (Vec<Option<
         .map(|(k, b)| RawGetItem { key: k, ptr: b.as_mut_ptr(), len: b.len() })
         .collect();
     // SAFETY: `bufs` outlives the call, which runs to completion.
-    let res = unsafe { c.get_many_into_raw(&items).await };
+    let res = unsafe { c.get_many_into_raw(&items, None).await };
     (res.into_iter().map(|r| r.expect("read")).collect(), bufs)
 }
 

@@ -103,6 +103,32 @@ pub mod am {
         0
     }
 
+    /// Bytes of asked-for values this thread received into a pool buffer and
+    /// copied into the caller's memory, which had no registration.
+    pub fn landed_bytes() -> u64 {
+        #[cfg(feature = "ucx")]
+        return crate::ucx::am::landed_bytes();
+        #[cfg(not(feature = "ucx"))]
+        0
+    }
+
+    /// This thread's rendezvous receives posted with a memh, and without one
+    /// (memory UCX had to register itself).
+    pub fn received_memh_counts() -> (u64, u64) {
+        #[cfg(feature = "ucx")]
+        return crate::ucx::am::received_memh_counts();
+        #[cfg(not(feature = "ucx"))]
+        (0, 0)
+    }
+
+    /// `landed_bytes` of the whole process.
+    pub fn landed_bytes_total() -> u64 {
+        #[cfg(feature = "ucx")]
+        return crate::ucx::am::landed_bytes_total();
+        #[cfg(not(feature = "ucx"))]
+        0
+    }
+
     /// This thread's values copied into a pool buffer to be sent.
     pub fn staged_count() -> u64 {
         #[cfg(feature = "ucx")]
@@ -120,12 +146,20 @@ pub mod am {
     }
 
     /// Register `dest` for the value tagged `tag`, before it can be sent.
-    pub fn expect(tag: u64, dest: crate::RecvDest) -> io::Result<Expected> {
+    /// Inside `region` the value is received straight into `dest`; anywhere
+    /// else into a pool buffer and copied into `dest` once in (UCX is never
+    /// handed memory to register itself). `Unsupported` for an unregistered
+    /// `dest` over 256 MiB (no pool buffer that large).
+    pub fn expect(
+        tag: u64,
+        dest: crate::RecvDest,
+        region: Option<&std::sync::Arc<crate::Region>>,
+    ) -> io::Result<Expected> {
         #[cfg(feature = "ucx")]
         if crate::runtime_transport_is_ucx() {
-            return Ok(Expected { inner: crate::ucx::am::expect(tag, dest) });
+            return Ok(Expected { inner: crate::ucx::am::expect(tag, dest, region)? });
         }
-        let _ = (tag, dest);
+        let _ = (tag, dest, region);
         Err(io::Error::new(io::ErrorKind::Unsupported, "AM values need the UCX transport"))
     }
 
