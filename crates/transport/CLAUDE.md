@@ -510,8 +510,14 @@ receiver taking none: exactly `STAGED_WINDOW` staged; red with the window
 removed: all 16); stream `prepared_append.rs`
 `an_append_larger_than_a_pool_buffer_arrives_in_parts` (296 MiB: 74 pieces, all
 received with a memh, the bytes on disk intact; red without the parts path: 74
-received without one). The piece size and the window are the measurement's
-to set (data-path step 5). An SDK put of a plain 8 MiB `Bytes` now goes in two
+received without one). The piece size (4 MiB, with the PS's SST segments) and
+the window (4) were set by a sweep of 1 / 4 / 16 MiB (UCX perf-check, 3 disks,
+8 partitions, order 1-4-16-16-4-1): no measure separated beyond its own
+run-to-run spread (4K write 37–43K / 39–41K / 37–40K ops/s; 8M write
+2649–2725 / 2468–2718 / 2610–2666 MB/s; 8M read 13.3–14.6 GB/s in all; the
+compaction before the read phase 44–79 s / 64–74 s / 44–59 s), so the size that
+keeps the least staging in flight per append (window x piece x replicas =
+48 MiB) stays. An SDK put of a plain 8 MiB `Bytes` now goes in two
 pieces; perf-check (UCX, 3 disks, 8 partitions, alternating against the build
 before, two rounds): 8M write 2703/2754 vs 2638/2610 MB/s, 8M read 13011/14068
 vs 14428/12898, 4K write 30.6/32.1K vs 28.5/34.2K, read 277/288K vs 277/268K.

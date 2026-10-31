@@ -1,3 +1,10 @@
+Date: 2026-10-31 (4)
+TaskStatus: not_completed
+Task scope: user /loop 完成data-path重构 — data-path redesign (design https://claude.ai/artifact/E18oSqzHKbg2Vx1HqKKyo1).
+Current summary: steps 2 (F-DP-CHUNK-POOL) and 5 (F-DP-WAL-IN-POOL) closed and removed from the ledger. Step 2's last item (a value larger than a chunk is an error) came with 5b: an unregistered value over 256 MiB is refused at the send, frame values are cut into pieces. Step 5: 5a e639ef4a (SST segments), 5b b73f05f4 (pieces + window + per-piece receive), 5c sweep 1/4/16 MiB: nothing separated beyond run spread, 4 MiB / window 4 kept (least staging: 48 MiB per append). Earlier this stretch: 3d 349b5b85, step 4 kvcache 1836e03, PS fix c4b3240c.
+Main gaps: step 3 stays open on BUG-PY-PUT (2)'s missing red test (user decides). Step 4: vLLM e2e pending GPUs. TCP 4K write noisy, no mechanism found. Steps 6–9 not started (step 6 surveyed: 7 read opcodes + COPY_EXTENT to delete, client floor rises, freeze test rows change).
+Next steps: step 6 (unified READ / GET / BATCH_GET, one landing mechanism).
+
 Date: 2026-10-31 (3)
 TaskStatus: not_completed
 Task scope: user /loop 完成data-path重构 — data-path redesign steps 3d..9 (design https://claude.ai/artifact/E18oSqzHKbg2Vx1HqKKyo1).
