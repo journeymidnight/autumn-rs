@@ -2561,12 +2561,11 @@ async fn process_frames_backpressured(
                 }
                 out
             }));
-        } else if msg_type == MSG_READ_BYTES {
-            let first_req = match ReadBytesReq::decode(frames[i].payload.clone()) {
+        } else if let Some(kind) = ReadReply::of(msg_type) {
+            let (first_req, first_mode) = match kind.decode(frames[i].payload.clone()) {
                 Ok(r) => r,
                 Err(e) => {
-                    let req_id = frames[i].req_id;
-                    let bytes = err_bytes(req_id, MSG_READ_BYTES, StatusCode::InvalidArgument, e);
+                    let bytes = kind.malformed(frames[i].req_id, e);
                     inflight.push(Box::pin(async move { vec![bytes] }));
                     i += 1;
                     continue;
@@ -2579,39 +2578,27 @@ async fn process_frames_backpressured(
             // answer one of them out of the other's file.
             let anchor_payload = first_req.payload_ref();
             let mut slots: Vec<ReadSlot> = Vec::with_capacity(8);
-            slots.push(ReadSlot {
-                req: first_req,
-                req_id: frames[i].req_id,
-            });
+            slots.push(ReadSlot { req: first_req, req_id: frames[i].req_id, mode: first_mode });
             i += 1;
-            while i < frames.len() && frames[i].msg_type == MSG_READ_BYTES {
-                match ReadBytesReq::decode(frames[i].payload.clone()) {
-                    Ok(r) if r.extent_id == anchor_extent && r.payload_ref() == anchor_payload => {
-                        slots.push(ReadSlot {
-                            req: r,
-                            req_id: frames[i].req_id,
-                        });
+            while i < frames.len() && frames[i].msg_type == msg_type {
+                match kind.decode(frames[i].payload.clone()) {
+                    Ok((r, mode)) if r.extent_id == anchor_extent && r.payload_ref() == anchor_payload => {
+                        slots.push(ReadSlot { req: r, req_id: frames[i].req_id, mode });
                         i += 1;
                     }
                     Ok(_) => break,
                     Err(e) => {
-                        let req_id = frames[i].req_id;
-                        let bytes =
-                            err_bytes(req_id, MSG_READ_BYTES, StatusCode::InvalidArgument, e);
+                        let bytes = kind.malformed(frames[i].req_id, e);
                         inflight.push(Box::pin(async move { vec![bytes] }));
                         i += 1;
                     }
                 }
             }
-
             let extent = match node.get_extent(anchor_extent).await {
                 Ok(e) => e,
                 Err((code, msg)) => {
-                    let p = autumn_rpc::RpcError::encode_status(code, &msg);
-                    let bytes_list: Vec<Bytes> = slots
-                        .iter()
-                        .map(|s| Frame::error(s.req_id, MSG_READ_BYTES, p.clone()).encode())
-                        .collect();
+                    let bytes_list: Vec<Bytes> =
+                        slots.iter().map(|s| err_bytes(s.req_id, kind.msg_type(), code, &msg)).collect();
                     inflight.push(Box::pin(async move { bytes_list }));
                     continue;
                 }
@@ -2620,10 +2607,8 @@ async fn process_frames_backpressured(
             // Every slot in this batch names the SAME file (the grouping rule
             // above), so one refusal answers all of them.
             if !extent.holds_payload(anchor_payload) {
-                let bytes_list: Vec<Bytes> = slots
-                    .iter()
-                    .map(|s| read_refusal_resp(s.req_id, false, ReadRefusal::PayloadNotHere))
-                    .collect();
+                let bytes_list: Vec<Bytes> =
+                    slots.iter().map(|s| kind.refusal(s.req_id, ReadRefusal::PayloadNotHere)).collect();
                 inflight.push(Box::pin(async move { bytes_list }));
                 continue;
             }
@@ -2632,98 +2617,16 @@ async fn process_frames_backpressured(
             let file_rc = match node.payload_file(&extent, anchor_payload).await {
                 Ok(f) => f,
                 Err(msg) => {
-                    let p = autumn_rpc::RpcError::encode_status(StatusCode::Internal, &msg);
                     let bytes_list: Vec<Bytes> = slots
                         .iter()
-                        .map(|s| Frame::error(s.req_id, MSG_READ_BYTES, p.clone()).encode())
+                        .map(|s| err_bytes(s.req_id, kind.msg_type(), StatusCode::Internal, &msg))
                         .collect();
                     inflight.push(Box::pin(async move { bytes_list }));
                     continue;
                 }
             };
-            inflight.push(build_read_future(extent, file_rc, slots, false, None));
-        } else if msg_type == MSG_READ_BYTES_BULK {
-            // zero-copy read grouping — mirrors MSG_READ_BYTES but every
-            // value response is bulk-shaped (`bulk_read_head` + value Bytes)
-            // while handler refusals use typed error frames, which call_into_pooled
-            // also understands before decoding bulk control data.
-            let first_req = match ReadBytesReq::decode(frames[i].payload.clone()) {
-                Ok(r) => r,
-                Err(_) => {
-                    let bytes =
-                        bulk_read_head(frames[i].req_id, CODE_ERROR, "malformed ReadBytesReq", 0);
-                    inflight.push(Box::pin(async move { vec![bytes] }));
-                    i += 1;
-                    continue;
-                }
-            };
-            let anchor_extent = first_req.extent_id;
-            // Same file-identity grouping as the non-bulk path above.
-            let anchor_payload = first_req.payload_ref();
-            let mut slots: Vec<ReadSlot> = Vec::with_capacity(8);
-            slots.push(ReadSlot {
-                req: first_req,
-                req_id: frames[i].req_id,
-            });
-            i += 1;
-            while i < frames.len() && frames[i].msg_type == MSG_READ_BYTES_BULK {
-                match ReadBytesReq::decode(frames[i].payload.clone()) {
-                    Ok(r) if r.extent_id == anchor_extent && r.payload_ref() == anchor_payload => {
-                        slots.push(ReadSlot {
-                            req: r,
-                            req_id: frames[i].req_id,
-                        });
-                        i += 1;
-                    }
-                    Ok(_) => break,
-                    Err(_) => {
-                        let bytes = bulk_read_head(
-                            frames[i].req_id,
-                            CODE_ERROR,
-                            "malformed ReadBytesReq",
-                            0,
-                        );
-                        inflight.push(Box::pin(async move { vec![bytes] }));
-                        i += 1;
-                    }
-                }
-            }
-            let extent = match node.get_extent(anchor_extent).await {
-                Ok(e) => e,
-                Err((code, msg)) => {
-                    let bytes_list: Vec<Bytes> = slots
-                        .iter()
-                        .map(|s| err_bytes(s.req_id, MSG_READ_BYTES_BULK, code, &msg))
-                        .collect();
-                    inflight.push(Box::pin(async move { bytes_list }));
-                    continue;
-                }
-            };
-            backpressure!();
-            // Same file-identity rule as the non-bulk path: one refusal covers
-            // the batch, because the batch is one file.
-            if !extent.holds_payload(anchor_payload) {
-                let bytes_list: Vec<Bytes> = slots
-                    .iter()
-                    .map(|s| read_refusal_resp(s.req_id, true, ReadRefusal::PayloadNotHere))
-                    .collect();
-                inflight.push(Box::pin(async move { bytes_list }));
-                continue;
-            }
-            let file_rc = match node.payload_file(&extent, anchor_payload).await {
-                Ok(f) => f,
-                Err(msg) => {
-                    let bytes_list: Vec<Bytes> = slots
-                        .iter()
-                        .map(|s| {
-                            err_bytes(s.req_id, MSG_READ_BYTES_BULK, StatusCode::Internal, &msg)
-                        })
-                        .collect();
-                    inflight.push(Box::pin(async move { bytes_list }));
-                    continue;
-                }
-            };
-            inflight.push(build_read_future(extent, file_rc, slots, true, am_out.cloned()));
+            let am = if kind.pooled() { am_out.cloned() } else { None };
+            inflight.push(build_read_future(extent, file_rc, slots, kind, am));
         } else if msg_type == autumn_rpc::MSG_TYPE_PING {
             // Keepalive: answered here, not through `dispatch`, so a reply
             // never waits behind back-pressure or a slow control RPC — the
@@ -2763,6 +2666,98 @@ struct AppendSlot {
 struct ReadSlot {
     req: ReadBytesReq,
     req_id: u32,
+    /// `READ_EXACT`, `READ_UP_TO` or `READ_TO_END` (as `length == 0`).
+    mode: u8,
+}
+
+impl ReadSlot {
+    /// A read this replica holds fewer bytes for than it must serve exactly.
+    fn short(&self, read_size: u64) -> bool {
+        self.mode == READ_EXACT && self.req.length > 0 && read_size < self.req.length
+    }
+}
+
+/// Which read message a batch answers: the reply's shape follows it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ReadReply {
+    /// `MSG_READ_BYTES`: `[code][end][value]` inside ctrl; up to the range.
+    Bytes,
+    /// `MSG_READ_BYTES_BULK`: `[code][message]` ctrl, value tail; exact.
+    Bulk,
+    /// `MSG_READ`: `[code][rkyv ReadResp]` ctrl, value tail; as its mode says.
+    Read,
+}
+
+impl ReadReply {
+    fn of(msg_type: u8) -> Option<Self> {
+        match msg_type {
+            MSG_READ_BYTES => Some(Self::Bytes),
+            MSG_READ_BYTES_BULK => Some(Self::Bulk),
+            MSG_READ => Some(Self::Read),
+            _ => None,
+        }
+    }
+
+    fn msg_type(self) -> u8 {
+        match self {
+            Self::Bytes => MSG_READ_BYTES,
+            Self::Bulk => MSG_READ_BYTES_BULK,
+            Self::Read => MSG_READ,
+        }
+    }
+
+    /// Read into a pool buffer and sent as the value (not copied into ctrl).
+    fn pooled(self) -> bool {
+        self != Self::Bytes
+    }
+
+    /// The request and its mode (`READ_TO_END` as `length == 0`).
+    fn decode(self, payload: Bytes) -> Result<(ReadBytesReq, u8), &'static str> {
+        match self {
+            Self::Bytes => Ok((ReadBytesReq::decode(payload)?, READ_UP_TO)),
+            Self::Bulk => Ok((ReadBytesReq::decode(payload)?, READ_EXACT)),
+            Self::Read => {
+                let r = autumn_rpc::partition_rpc::rkyv_decode::<ReadReq>(&payload).map_err(|_| "malformed ReadReq")?;
+                let payload = r.payload_ref().ok_or("read request names an unknown payload location")?;
+                // Inside, `length == 0` means to the end; only TO_END may say so.
+                let length = match r.mode {
+                    READ_TO_END => 0,
+                    READ_EXACT | READ_UP_TO if r.length > 0 => r.length,
+                    READ_EXACT | READ_UP_TO => return Err("read of length 0"),
+                    _ => return Err("unknown read mode"),
+                };
+                Ok((ReadBytesReq::new(r.extent_id, r.eversion, r.offset, length, payload), r.mode))
+            }
+        }
+    }
+
+    fn malformed(self, req_id: u32, why: &str) -> Bytes {
+        match self {
+            Self::Bytes => err_bytes(req_id, MSG_READ_BYTES, StatusCode::InvalidArgument, why),
+            Self::Bulk => bulk_read_head(req_id, CODE_ERROR, why, 0),
+            Self::Read => read_head(req_id, CODE_ERROR, 0, why, 0),
+        }
+    }
+
+    fn refusal(self, req_id: u32, why: ReadRefusal) -> Bytes {
+        match self {
+            Self::Bytes => Frame::response(
+                req_id,
+                MSG_READ_BYTES,
+                ReadBytesResp { code: why.code(), end: 0, payload: Bytes::new() }.encode(),
+            )
+            .encode(),
+            Self::Bulk => bulk_read_head(req_id, why.code(), why.message(), 0),
+            Self::Read => read_head(req_id, why.code(), 0, why.message(), 0),
+        }
+    }
+}
+
+/// A `MSG_READ` reply head: ctrl `[code][rkyv ReadResp]`, then `value_len` raw
+/// value bytes the caller sends after it.
+fn read_head(req_id: u32, code: u8, end: u64, message: &str, value_len: usize) -> Bytes {
+    let tail = autumn_rpc::partition_rpc::rkyv_encode(&ReadResp { end, message: message.to_string() });
+    autumn_rpc::frame::encode_bulk_response_head_bytes(req_id, MSG_READ, code, &tail, value_len)
 }
 
 // ==================================================================
@@ -2840,29 +2835,6 @@ fn err_bytes(req_id: u32, msg_type: u8, code: StatusCode, msg: &str) -> Bytes {
     .encode()
 }
 
-/// Build a `CODE_EVERSION_MISMATCH` read response for one slot — the bulk head
-/// or a full `ReadBytesResp` frame, matching the connection's `bulk` mode.
-/// Typed CODE (not a frame-level error) so the client's
-/// `read_bytes_from_extent` retry self-heals (invalidate cache + refetch)
-/// instead of seeing a generic transport error.
-fn read_refusal_resp(req_id: u32, bulk: bool, why: ReadRefusal) -> Bytes {
-    if bulk {
-        bulk_read_head(req_id, why.code(), why.message(), 0)
-    } else {
-        Frame::response(
-            req_id,
-            MSG_READ_BYTES,
-            ReadBytesResp {
-                code: why.code(),
-                end: 0,
-                payload: Bytes::new(),
-            }
-            .encode(),
-        )
-        .encode()
-    }
-}
-
 /// A read's serving plan, computed from the extent's local state — the ONE
 /// place holding the eversion gate + logical-length semantics for reads.
 /// Shared by the batched hot path (`build_read_future`) and the single-op
@@ -2931,13 +2903,10 @@ fn read_plan(extent: &ExtentEntry, req: &ReadBytesReq) -> Result<(u64, u64, u64)
     // resort for frames this node builds itself, not the thing a remote
     // request trips.
     //
-    // The budget is the payload MINUS the reply's own ctrl, and the two reply
-    // shapes do not cost the same: bulk sends `[code][message]` with an empty
-    // message (`CTRL_OVERHEAD + 1`), the non-bulk `ReadBytesResp` prefixes 9
-    // bytes of its own (`CTRL_OVERHEAD + 9`). `read_plan` does not know which
-    // one answers, so it has to budget for the larger — subtracting only
-    // `CTRL_OVERHEAD` leaves a band of sizes that pass here and then build a
-    // frame whose length wraps, which the peer reports as corruption.
+    // The budget is the payload MINUS the reply's own ctrl, which differs by
+    // reply shape (`READ_REPLY_MAX_VALUE_BYTES`); budgeting for less than the
+    // largest leaves a band of sizes that pass here and then build a frame
+    // whose length wraps, which the peer reports as corruption.
     if read_size > READ_REPLY_MAX_VALUE_BYTES {
         return Err(ReadRefusal::TooLargeForOneFrame);
     }
@@ -2998,16 +2967,16 @@ impl ReadRefusal {
 pub(crate) const COPY_REPLY_MAX_VALUE_BYTES: u64 =
     autumn_rpc::frame::MAX_PAYLOAD_LEN as u64 - (1 << 20);
 
-/// The most value bytes a read reply can carry, for either reply shape.
+/// The most value bytes a read reply can carry, for any reply shape.
 ///
-/// Both go through the frame encoder's `payload_len: u32`, and both spend some
-/// of it on their own ctrl: the bulk head writes `[code][message]` with an
-/// empty message, and `ReadBytesResp` writes 9 bytes before the value. The
-/// budget is the ceiling minus the LARGER of the two, because `read_plan`
-/// decides before anything knows which shape will answer.
+/// All go through the frame encoder's `payload_len: u32`, and all spend some
+/// of it on their own ctrl: `[code]` for `READ_BYTES_BULK`, 9 bytes for
+/// `ReadBytesResp`, `READ_RESP_OK_CTRL_BYTES` (17) for `MSG_READ`. The budget
+/// is the ceiling minus the largest, because `read_plan` decides before
+/// anything knows which shape will answer.
 pub(crate) const READ_REPLY_MAX_VALUE_BYTES: u64 = autumn_rpc::frame::MAX_PAYLOAD_LEN as u64
     - autumn_rpc::frame::CTRL_OVERHEAD as u64
-    - 9;
+    - READ_RESP_OK_CTRL_BYTES as u64;
 
 /// The authoritative committed length reported to a length probe — shared by
 /// `handle_commit_length` and `handle_probe_extent` (their length-source
@@ -3598,12 +3567,6 @@ fn decode_append(frame: &Frame) -> Result<AppendReq, &'static str> {
     }
 }
 
-/// A bulk read is exact: a range this replica holds only part of is refused,
-/// never answered short.
-fn bulk_read_short(req: &ReadBytesReq, read_size: u64) -> bool {
-    req.length > 0 && read_size < req.length
-}
-
 fn build_read_future(
     extent: std::rc::Rc<ExtentEntry>,
     // the fd is resolved ONCE at the call site (which has the
@@ -3613,7 +3576,7 @@ fn build_read_future(
     // eviction can't yank it mid-scan.
     file_rc: std::rc::Rc<CompioFile>,
     slots: Vec<ReadSlot>,
-    bulk: bool,
+    kind: ReadReply,
     // Sends a large value beside its reply frame.
     am_out: Option<std::rc::Rc<autumn_rpc::am_frame::AmOut>>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<Bytes>>>> {
@@ -3629,14 +3592,11 @@ fn build_read_future(
         // client fails over to a healthy replica.
         if extent.corrupt_meta.load(Ordering::SeqCst) {
             for slot in slots {
-                out.push(read_refusal_resp(
-                    slot.req_id,
-                    bulk,
-                    ReadRefusal::EversionStale,
-                ));
+                out.push(kind.refusal(slot.req_id, ReadRefusal::EversionStale));
             }
             return out;
         }
+        let bulk = kind.pooled();
 
         // Eversion gate + length semantics live in `read_plan` (shared with
         // handle_read_bytes — see its doc for the eversion gate / P0-C). A bulk
@@ -3652,7 +3612,7 @@ fn build_read_future(
                 .iter()
                 .zip(&plans)
                 .filter_map(|(slot, plan)| match plan {
-                    Ok((_, _, size)) if !bulk_read_short(&slot.req, *size) => Some(*size as usize),
+                    Ok((_, _, size)) if !slot.short(*size) => Some(*size as usize),
                     _ => None,
                 })
                 .collect();
@@ -3665,15 +3625,14 @@ fn build_read_future(
         };
         let mut plans = plans.into_iter();
         for slot in slots {
-            let req = slot.req;
             let plan = match bulk {
                 true => plans.next().expect("one plan per slot"),
-                false => read_plan(&extent, &req),
+                false => read_plan(&extent, &slot.req),
             };
             let (end, read_offset, read_size) = match plan {
                 Ok(plan) => plan,
                 Err(why) => {
-                    out.push(read_refusal_resp(slot.req_id, bulk, why));
+                    out.push(kind.refusal(slot.req_id, why));
                     continue;
                 }
             };
@@ -3683,35 +3642,32 @@ fn build_read_future(
             // evicted sealed one, resolved once at the call site).
             let f: &CompioFile = &file_rc;
             if bulk {
-                // BULK-EXACT invariant: a bulk read is always an EXACT-length value
-                // read (the VP's `(offset, length)` — callers never pass
-                // length=0/to-end). `read_plan` CLAMPS `read_size` to the local
-                // bytes (correct for the non-bulk scanner path, whose callers
-                // handle short reads), but for bulk a clamp means THIS REPLICA
+                // EXACT invariant: `read_plan` CLAMPS `read_size` to the local
+                // bytes (right for up-to and to-end reads, whose callers handle
+                // short reads), but for an exact read a clamp means THIS REPLICA
                 // cannot serve the requested range — answering CODE_OK with a
-                // silently SHORT payload made every bulk consumer responsible for
-                // its own length check (the copy path had one, the bulk proxy
-                // path did not → a truncated value could reach a client).
+                // silently SHORT payload made every consumer responsible for its
+                // own length check (the copy path had one, the bulk proxy path
+                // did not → a truncated value could reach a client).
                 // Reject here — the producer — with CODE_PRECONDITION; clients
                 // treat any non-OK as failover (next replica / copy path).
                 // Under all-replica-ACK a committed VP is on every replica, so
                 // this fires only for a genuinely stale/over-range request or a
                 // diverged replica — never on the healthy path.
-                if bulk_read_short(&req, read_size) {
+                if slot.short(read_size) {
                     tracing::warn!(
-                        extent_id = req.extent_id,
-                        offset = req.offset,
-                        want = req.length,
+                        extent_id = slot.req.extent_id,
+                        offset = slot.req.offset,
+                        want = slot.req.length,
                         have = read_size,
                         local_len = end,
-                        "bulk read cannot serve full range; rejecting (no short CODE_OK)"
+                        "exact read cannot serve full range; rejecting (no short CODE_OK)"
                     );
-                    out.push(bulk_read_head(
-                        slot.req_id,
-                        CODE_PRECONDITION,
-                        "bulk read cannot serve full range",
-                        0,
-                    ));
+                    let why = "exact read cannot serve full range";
+                    out.push(match kind {
+                        ReadReply::Read => read_head(slot.req_id, CODE_PRECONDITION, end, why, 0),
+                        _ => bulk_read_head(slot.req_id, CODE_PRECONDITION, why, 0),
+                    });
                     continue;
                 }
                 // pread straight into a registered, pooled, zeroed-once
@@ -3731,7 +3687,7 @@ fn build_read_future(
                     // `Unavailable`, not a read code: the reader keeps its
                     // layout and reads through its copy path.
                     Err(e) => {
-                        out.push(err_bytes(slot.req_id, MSG_READ_BYTES_BULK, StatusCode::Unavailable, &e.to_string()));
+                        out.push(err_bytes(slot.req_id, kind.msg_type(), StatusCode::Unavailable, &e.to_string()));
                         continue;
                     }
                 };
@@ -3739,22 +3695,32 @@ fn build_read_future(
                 match result {
                     Ok(_) => {
                         let value = pb.freeze();
+                        let ctrl = match kind {
+                            ReadReply::Read => ReadResp::ctrl(CODE_OK, end, ""),
+                            _ => Bytes::copy_from_slice(&[CODE_OK]),
+                        };
                         match am_out.as_ref().filter(|_| value.len() >= autumn_rpc::BULK_MIN_BYTES) {
                             Some(am) => out.extend(am.frame_now(
                                 slot.req_id,
-                                MSG_READ_BYTES_BULK,
+                                kind.msg_type(),
                                 autumn_rpc::frame::FLAG_RESPONSE,
-                                vec![Bytes::copy_from_slice(&[CODE_OK])],
+                                vec![ctrl],
                                 vec![value],
                             )),
                             None => {
-                                out.push(bulk_read_head(slot.req_id, CODE_OK, "", value.len()));
+                                out.push(autumn_rpc::frame::encode_bulk_response_head_bytes(
+                                    slot.req_id,
+                                    kind.msg_type(),
+                                    CODE_OK,
+                                    &ctrl[1..],
+                                    value.len(),
+                                ));
                                 out.push(value.into_bytes());
                             }
                         }
                     }
                     Err(_e) => {
-                        out.push(bulk_read_head(slot.req_id, CODE_ERROR, "pread failed", 0));
+                        out.push(kind.malformed(slot.req_id, "pread failed"));
                     }
                 }
             } else {

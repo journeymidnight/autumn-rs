@@ -3620,6 +3620,20 @@ for n in 1000 65535 65536 100000 1048583 8388608 34603017; do
 grep -l "frame value by UCX rendezvous" /tmp/autumn-rs-logs/*.log   # ps.log and every node*.log
 ```
 
+## One extent read message (wire 78)
+
+The partition server reads extent nodes with `MSG_READ`: a range and a mode
+(exact, up to, to end); an exact read the replica cannot serve in full is
+refused, never answered short. Wire 78 changes only what cluster members say
+to each other, so upgrade the manager, partition servers and extent nodes
+together (stop all, start all); clients of wire 43 and up keep working, and
+their direct reads still use `READ_BYTES_BULK`. To check:
+
+```bash
+cargo test -p autumn-stream --test extent_append_semantics -- read_serves_each_mode_as_it_says
+cargo test -p autumn-rpc --lib -- an_ok_read_reply_ctrl
+```
+
 ## Write options and conditional writes (wire 75)
 
 Every SDK write takes `WriteOptions { ttl, lease }`: `put`, `put_many` and

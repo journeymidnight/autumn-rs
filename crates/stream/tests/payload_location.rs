@@ -83,11 +83,11 @@ async fn the_bulk_path_refuses_a_missing_payload_file_too() {
         CODE_OK
     );
 
-    let ok = conn.read_bytes_bulk(extent_id, 1, 0, 512).await;
+    let ok = conn.read_exact(extent_id, 1, 0, 512).await;
     assert_eq!(ok.0, CODE_OK, "the bulk path still serves .dat");
 
     let refused = conn
-        .read_bytes_bulk_from(extent_id, 1, 0, 512, PayloadRef::shard(1))
+        .read_exact_from(extent_id, 1, 0, 512, PayloadRef::shard(1))
         .await;
     assert_eq!(refused.0, CODE_PAYLOAD_NOT_HERE);
 }

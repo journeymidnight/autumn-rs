@@ -784,7 +784,7 @@ overflows the frame.
 
 ## Wire version, and the two checks over it
 
-`WIRE_VERSION` (currently **77**) is the schema this binary speaks.
+`WIRE_VERSION` (currently **78**: the extent node's `MSG_READ`) is the schema this binary speaks.
 `MIN_CLIENT_WIRE_VERSION` (**43**) is the oldest CLIENT it serves. Both are maintained
 **BY HAND**. There is no schema fingerprint — hashing the sources byte for byte cost
 more than it caught (a translated comment once split a rolling cluster, and each false

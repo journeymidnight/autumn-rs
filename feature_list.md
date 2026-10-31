@@ -41,6 +41,7 @@
 ### F-DP-ONE-READ — 读统一成一种消息（第 6 步）
 - **Scope**: PS 读 EN、client 直读、后台读共用 READ（长度模式：精确 / 按本地截短 / 读到尾；可选落点标签；可选附带块 CRC）；GET / BATCH_GET 回复"value 或位置"；接收合并为"落点"一种机制；删除 GET_BULK、GET_AM、GET_REDIRECT*、BATCH_GET_BULK、READ_BYTES*。
 - **Acceptance**: 读路径拷贝次数符合设计页的表；perf-check 读四格不降；直读失败回退经 PS 的测试；wire 升级按全停全启写进 ops.md。
+- Notes: 6a — EN `MSG_READ`（ReadReq 带模式：EXACT / UP_TO / TO_END；回复 ctrl `[code][rkyv ReadResp{end,message}]`，数据在 value），wire 78；PS 的池化读（read_value_into_pooled、EC 分片）已改用它；三种读消息共用一个分组与 `ReadSlot::short`。待做：6b GET/BATCH_GET 回"value 或位置"；6c 落点统一、SDK 直读改 READ、删旧 opcode、抬客户端下限；后台读在第 8 步。
 - `passes: false`
 
 ### F-DP-ONE-WRITE — 写统一成一种消息（第 7 步）

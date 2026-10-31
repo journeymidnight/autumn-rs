@@ -122,9 +122,9 @@ async fn prepared_large_appends_preserve_content_and_offsets() {
         assert_eq!(appended.offset, (i * size) as u64);
         assert_eq!(appended.end, ((i + 1) * size) as u64);
     }
-    let req = ReadBytesReq::new(701, 1, 0, (4 * size) as u64, PayloadRef::in_dat());
+    let req = rkyv_encode(&ReadReq::new(701, 1, 0, (4 * size) as u64, READ_EXACT, PayloadRef::in_dat()));
     let reply = client
-        .call_into_pooled(MSG_READ_BYTES_BULK, req.encode())
+        .call_into_pooled(MSG_READ, req)
         .await
         .unwrap();
     assert_eq!(reply.code, CODE_OK);
@@ -136,18 +136,18 @@ async fn prepared_large_appends_preserve_content_and_offsets() {
         // The read's value came as a frame value by rendezvous.
         assert_eq!(rendezvous_count() - rndv_before, 1);
     }
-    // Many bulk reads at once: the node flushes their replies together, which
+    // Many reads at once: the node flushes their replies together, which
     // over UCX makes a stream send large enough to go zero-copy (every iovec
     // registered). A reply frame built from read-only memory then stopped the
     // connection's stream dead under UCX's default protocols.
     let reads = (0..64u64).map(|i| {
-        let req = ReadBytesReq::new(701, 1, i * 65536, 65536, PayloadRef::in_dat());
+        let req = rkyv_encode(&ReadReq::new(701, 1, i * 65536, 65536, READ_EXACT, PayloadRef::in_dat()));
         let client = client.clone();
-        async move { client.call_into_pooled(MSG_READ_BYTES_BULK, req.encode()).await }
+        async move { client.call_into_pooled(MSG_READ, req).await }
     });
     let replies = compio::time::timeout(Duration::from_secs(10), futures::future::join_all(reads))
         .await
-        .expect("64 concurrent bulk reads did not all complete");
+        .expect("64 concurrent reads did not all complete");
     for (i, r) in replies.into_iter().enumerate() {
         let r = r.unwrap();
         assert_eq!(r.code, CODE_OK);

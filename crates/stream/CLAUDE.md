@@ -374,7 +374,7 @@ as its own iovec, so no buffer holds the whole value and UCX registers nothing
 `prepared_append.rs::an_append_larger_than_a_pool_buffer_arrives_in_parts`). One
 read pass over the payload per replica replaces the unpack copy. A burst whose
 value is still on its way holds the connection loop, as a stream value did.
-`READ_BYTES_BULK` replies of 64 KiB or more go the same way (`AmOut::frame_now`),
+`READ` and `READ_BYTES_BULK` replies of 64 KiB or more go the same way (`AmOut::frame_now`),
 to the PS and to a client reading directly; the reply value is the pool slab
 it was read into (`PooledBuf::freeze`), so the send hands UCX the slab's memh.
 That slab comes from the `Reply` budget, all of a batch's at once
@@ -1350,8 +1350,9 @@ Two invariants make this safe rather than merely present:
   different slots would look like different files.
 - **The server's read batching groups by the FILE, not the extent.** One batch
   resolves one fd for every slot in it, so two requests naming different files
-  must never share a batch. Both grouping sites (`MSG_READ_BYTES` and
-  `MSG_READ_BYTES_BULK`) key on `(extent_id, payload_ref())`.
+  must never share a batch. The one grouping site (`MSG_READ_BYTES`,
+  `MSG_READ_BYTES_BULK` and `MSG_READ`, a batch holding one of them) keys on
+  `(extent_id, payload_ref())`.
 
 `read_plan` returns a typed `ReadRefusal` (`EversionStale` | `PayloadNotHere` |
 `TooLargeForOneFrame`) rather than a bare `None`, so each refusal reaches the
@@ -1399,7 +1400,7 @@ note-29 damping and the note-34 address-forgetting are untouched.
 
 **Bulk read of an EC extent** (`read_value_into_pooled` → `ec_shard_into_pooled`):
 a range inside one data shard whose node is not Suspected is one
-`MSG_READ_BYTES_BULK` to that shard's node, at the offset inside the shard (the
+exact `MSG_READ` to that shard's node, at the offset inside the shard (the
 layout `ec_subrange_read` plans with). A range across shards, past the data
 shards or on a Suspected node, and a refused read, return `Ok(None)` and the copy
 path splits it, reconstructs it or refreshes the layout, as it did for every EC
@@ -1426,12 +1427,25 @@ on replica[0] created a hotspot). Appends stay replica[0]-first
 (`launch_append`, unaffected — rotation is in the read-only
 `replicated_read_order`).
 
-- **BULK-EXACT invariant**: the EN's bulk read (`build_read_future` bulk branch)
-  REJECTS an unservable exact-length range with `CODE_PRECONDITION`, NOT
-  `CODE_OK` + a silently short payload (`read_plan`'s clamp is only for the
-  non-bulk scanner whose callers handle short reads). So `CODE_OK` on
-  `MSG_READ_BYTES_BULK` implies the FULL requested length; no bulk consumer needs a
-  defensive length check. **Never re-introduce a clamped-OK on the bulk path.**
+- **`MSG_READ` and its modes.** One read message, `ReadReq` with a mode:
+  `READ_EXACT` (a value: the whole range or `CODE_PRECONDITION`), `READ_UP_TO`
+  (a scan: what this replica holds of the range), `READ_TO_END` (everything from
+  the offset). Length 0 under the first two, or an unknown mode, is malformed
+  (`CODE_ERROR`): only a to-end read leaves the length open. The value budget
+  (`READ_REPLY_MAX_VALUE_BYTES`) subtracts the largest OK ctrl, `MSG_READ`'s 17
+  bytes (`READ_RESP_OK_CTRL_BYTES`, pinned by a unit test). The reply ctrl is `[code][rkyv ReadResp { end, message }]`, the
+  value the bytes. `ReadSlot::short` is the one exact check, shared with
+  `MSG_READ_BYTES_BULK` (always exact) and `MSG_READ_BYTES` (always up to).
+  The PS's pooled reads (`read_value_into_pooled`, `ec_shard_into_pooled`) send
+  it; the SDK's direct read and the background readers still send the old two
+  until they move over and those go. Test:
+  `extent_append_semantics.rs::read_serves_each_mode_as_it_says` (red when an
+  exact read is answered short).
+- **EXACT invariant**: an exact read REJECTS an unservable range with
+  `CODE_PRECONDITION`, NOT `CODE_OK` + a silently short payload (`read_plan`'s
+  clamp is only for up-to reads, whose callers handle short reads). So `CODE_OK`
+  on an exact read implies the FULL requested length; no consumer needs a
+  defensive length check. **Never re-introduce a clamped-OK on an exact read.**
 - Optional **hedged read** (`set_read_hedge_ms`, default 0=off): if the first
   replica hasn't answered within the window, race the second and take the first
   Ok (eversion-stale still fails fast; loser drop is cancel-safe).

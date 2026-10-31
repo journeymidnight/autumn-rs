@@ -7,9 +7,9 @@ use std::time::{Duration, Instant};
 use crate::extent_rpc::{
     AppendReq, AppendResp, CommitLengthReq, CommitLengthResp, ExtentInfo, FenceExtentReq,
     FenceExtentResp, PayloadLocation, PayloadRef, ProbeExtentReq, ProbeExtentResp, ReadBytesReq,
-    ReadBytesResp, StreamInfo, CODE_EVERSION_MISMATCH,
+    ReadBytesResp, ReadReq, ReadResp, StreamInfo, CODE_EVERSION_MISMATCH,
     CODE_LOCKED_BY_OTHER, CODE_NOT_FOUND, CODE_OK, MSG_APPEND, MSG_COMMIT_LENGTH,
-    MSG_FENCE_EXTENT, MSG_PROBE_EXTENT, MSG_READ_BYTES, MSG_READ_BYTES_BULK,
+    MSG_FENCE_EXTENT, MSG_PROBE_EXTENT, MSG_READ, MSG_READ_BYTES, MSG_READ_BYTES_BULK, READ_EXACT,
     PAYLOAD_LOCATION_IN_DAT,
 };
 use crate::ConnPool;
@@ -427,6 +427,11 @@ fn parse_read_bytes_resp(
         ));
     }
     Ok(resp)
+}
+
+/// The reason a `MSG_READ` reply gives (its ctrl after the code).
+fn read_message(z: &autumn_rpc::client::BulkResp) -> String {
+    crate::extent_rpc::rkyv_decode::<ReadResp>(&z.ctrl).map(|r| r.message).unwrap_or_default()
 }
 
 /// structured sentinel for "VP points past manager-recorded
@@ -4927,23 +4932,23 @@ impl StreamClient {
             return Ok(None);
         }
         let addrs = self.replica_addrs_for_extent(ex).await?;
-        let req = ReadBytesReq::new(
+        let req = rkyv_encode(&ReadReq::new(
             extent_id,
             ex.eversion,
             offset % shard_size,
             length,
+            READ_EXACT,
             PayloadRef::for_extent(published_payload(ex)?, shard as u32),
-        )
-        .encode();
+        ));
         match self
             .pool
-            .call_into_pooled(&addrs[shard], MSG_READ_BYTES_BULK, req, self.config.read_deadline().for_len(length))
+            .call_into_pooled(&addrs[shard], MSG_READ, req, self.config.read_deadline().for_len(length))
             .await
         {
-            // BULK-EXACT: CODE_OK means the buffer holds exactly `length` bytes.
+            // READ_EXACT: CODE_OK means the buffer holds exactly `length` bytes.
             Ok(z) if z.code == CODE_OK => Ok(Some((z.buf, length as usize))),
             Ok(z) => {
-                tracing::debug!(extent_id, shard, code = z.code, message = %z.message, "EC bulk read non-OK; using the copy path");
+                tracing::debug!(extent_id, shard, code = z.code, message = %read_message(&z), "EC bulk read non-OK; using the copy path");
                 self.extent_info_cache.remove(&extent_id);
                 Ok(None)
             }
@@ -4991,7 +4996,7 @@ impl StreamClient {
     }
 
     /// UCX / TCP recv-side copy-elimination fast path: recv the
-    /// value straight into a read_loop-owned `PooledBuf` (MSG_READ_BYTES_BULK +
+    /// value straight into a read_loop-owned `PooledBuf` (`MSG_READ` exact +
     /// call_into_pooled). UCX → one Stream unpack into the pooled slab; TCP →
     /// compio owned read (one kernel copy). No app-level copy of the value. Returns `Some((pb, len))`
     /// on a clean OK; returns `Ok(None)` for ANYTHING it can't handle (an EC range
@@ -5011,7 +5016,7 @@ impl StreamClient {
         // pooled buffer by the rpc read_loop — UCX Stream unpacks into it, TCP
         // reads into it — so its only copy is the receive itself (no
         // FrameDecoder accumulation copy).
-        // The EN `MSG_READ_BYTES_BULK` response is value-separable + pooled on both
+        // The EN `MSG_READ` response is value-separable + pooled on both
         // transports, so the EN send side also drops its per-op alloc/zeroing +
         // encode copy.
         if length == 0 {
@@ -5049,30 +5054,25 @@ impl StreamClient {
         let loc = published_payload(&ex)?;
         for &slot in &order {
             let addr = &addrs[slot];
-            let req = ReadBytesReq::new(
+            let req = rkyv_encode(&ReadReq::new(
                 extent_id,
                 ex.eversion,
                 offset,
                 length,
+                READ_EXACT,
                 PayloadRef::for_extent(loc, slot as u32),
-            )
-            .encode();
+            ));
             match self
                 .pool
                 // BUG-READ-TIMEOUT-STORM: size-scale (was fixed 3 s). `length`
                 // is chunk-bounded ≤ read_chunk_bytes by the caller.
-                .call_into_pooled(
-                    addr,
-                    MSG_READ_BYTES_BULK,
-                    req,
-                    self.config.read_deadline().for_len(length),
-                )
+                .call_into_pooled(addr, MSG_READ, req, self.config.read_deadline().for_len(length))
                 .await
             {
-                // EN-side guarantee (BULK-EXACT, extent_node `build_read_future`):
-                // a bulk read that cannot serve the FULL requested range returns a
-                // non-OK code, never CODE_OK + a short payload — so CODE_OK here
-                // implies the buffer holds exactly `length` bytes.
+                // READ_EXACT (extent_node `build_read_future`): a read that
+                // cannot serve the FULL requested range returns a non-OK code,
+                // never CODE_OK + a short payload — so CODE_OK here implies the
+                // buffer holds exactly `length` bytes.
                 Ok(z) if z.code == CODE_OK => return Ok(Some((z.buf, length as usize))),
                 Ok(z) => {
                     // eversion mismatch / EN-side error → bail to the copy path
@@ -5080,7 +5080,7 @@ impl StreamClient {
                     tracing::debug!(
                         extent_id,
                         code = z.code,
-                        message = %z.message,
+                        message = %read_message(&z),
                         "bulk proxy read non-OK; falling back to copy path"
                     );
                     self.extent_info_cache.remove(&extent_id);

@@ -1,6 +1,6 @@
 mod test_helpers;
 
-use autumn_stream::extent_rpc::{CODE_LOCKED_BY_OTHER, CODE_OK, CODE_PRECONDITION};
+use autumn_stream::extent_rpc::{CODE_ERROR, CODE_LOCKED_BY_OTHER, CODE_OK, CODE_PRECONDITION, READ_EXACT, READ_TO_END, READ_UP_TO};
 use test_helpers::{pick_addr, start_node, TestConn};
 
 #[compio::test]
@@ -110,12 +110,12 @@ async fn bulk_read_rejects_short_range_instead_of_short_ok() {
     assert_eq!(w.end, 10);
 
     // Exact in-range bulk read → OK + the full requested bytes.
-    let (code, payload) = conn.read_bytes_bulk(eid, 1, 2, 5).await;
+    let (code, payload) = conn.read_exact(eid, 1, 2, 5).await;
     assert_eq!(code, CODE_OK);
     assert_eq!(&payload, b"23456", "in-range bulk read returns exact bytes");
 
     // Over-range bulk read (want 20, extent holds 10) → REJECTED, not OK+short.
-    let (code, payload) = conn.read_bytes_bulk(eid, 1, 0, 20).await;
+    let (code, payload) = conn.read_exact(eid, 1, 0, 20).await;
     assert_eq!(
         code,
         CODE_PRECONDITION,
@@ -125,9 +125,35 @@ async fn bulk_read_rejects_short_range_instead_of_short_ok() {
     );
 
     // Offset past the end entirely → same rejection.
-    let (code, _p) = conn.read_bytes_bulk(eid, 1, 15, 4).await;
+    let (code, _p) = conn.read_exact(eid, 1, 15, 4).await;
     assert_eq!(
         code, CODE_PRECONDITION,
         "past-end bulk read must be rejected"
     );
+}
+
+/// `MSG_READ`'s modes over a replica holding 10 bytes: an exact read serves
+/// exactly its range or is refused (never a short OK); a read up to `length`
+/// serves what the replica holds; a read to the end serves everything from
+/// the offset. Every OK reply names the replica's end.
+#[compio::test]
+async fn read_serves_each_mode_as_it_says() {
+    let node_dir = tempfile::tempdir().expect("node tempdir");
+    let addr = pick_addr();
+    start_node(node_dir.path(), addr).await;
+    let conn = TestConn::new(addr);
+    let eid = 4002u64;
+    assert_eq!(conn.alloc_extent(eid).await.code, CODE_OK);
+    assert_eq!(conn.append(eid, 1, 0, 20, b"0123456789".to_vec()).await.code, CODE_OK);
+
+    assert_eq!(conn.read(eid, 1, 2, 5, READ_EXACT).await, (CODE_OK, 10, b"23456".to_vec()));
+    let (code, _, got) = conn.read(eid, 1, 0, 20, READ_EXACT).await;
+    assert_eq!((code, got.len()), (CODE_PRECONDITION, 0), "an exact read past the end is refused");
+    assert_eq!(conn.read(eid, 1, 6, 20, READ_UP_TO).await, (CODE_OK, 10, b"6789".to_vec()));
+    assert_eq!(conn.read(eid, 1, 15, 4, READ_UP_TO).await, (CODE_OK, 10, Vec::new()), "past the end: nothing");
+    assert_eq!(conn.read(eid, 1, 3, 2, READ_TO_END).await, (CODE_OK, 10, b"3456789".to_vec()), "length ignored");
+    // Only a to-end read may leave the length open, and only known modes are read.
+    assert_eq!(conn.read(eid, 1, 2, 0, READ_EXACT).await.0, CODE_ERROR, "an exact read of nothing");
+    assert_eq!(conn.read(eid, 1, 2, 0, READ_UP_TO).await.0, CODE_ERROR);
+    assert_eq!(conn.read(eid, 1, 2, 4, 9).await.0, CODE_ERROR, "an unknown mode");
 }

@@ -177,57 +177,42 @@ impl TestConn {
         ReadBytesResp::decode(resp).expect("decode ReadBytesResp")
     }
 
-    /// bulk value read (MSG_READ_BYTES_BULK). Returns `(code, payload_bytes)` —
-    /// the payload is copied out of the pooled recv buffer for assertion
-    /// convenience.
-    pub async fn read_bytes_bulk(
-        &self,
-        extent_id: u64,
-        eversion: u64,
-        offset: u64,
-        length: u64,
-    ) -> (u8, Vec<u8>) {
-        self.read_bytes_bulk_from(extent_id, eversion, offset, length, PayloadRef::in_dat())
-            .await
+    /// An exact `MSG_READ` of `.dat`: `(code, bytes)`, copied out of the pooled
+    /// receive buffer for assertion convenience.
+    pub async fn read_exact(&self, extent_id: u64, eversion: u64, offset: u64, length: u64) -> (u8, Vec<u8>) {
+        self.read_exact_from(extent_id, eversion, offset, length, PayloadRef::in_dat()).await
     }
 
-    /// `read_bytes_bulk`, the RPC's error returned instead of panicking.
-    pub async fn try_read_bytes_bulk(
-        &self,
-        extent_id: u64,
-        eversion: u64,
-        offset: u64,
-        length: u64,
-    ) -> anyhow::Result<(u8, Vec<u8>)> {
-        let req = ReadBytesReq::new(extent_id, eversion, offset, length, PayloadRef::in_dat());
-        let z = self
-            .pool
-            .call_into_pooled(&self.addr, MSG_READ_BYTES_BULK, req.encode(), Duration::from_secs(5))
-            .await?;
-        Ok((z.code, z.buf.as_ref().to_vec()))
+    /// `read_exact`, the RPC's error returned instead of panicking.
+    pub async fn try_read_exact(&self, extent_id: u64, eversion: u64, offset: u64, length: u64) -> anyhow::Result<(u8, Vec<u8>)> {
+        let (code, _, got) = self.try_read(extent_id, eversion, offset, length, READ_EXACT, PayloadRef::in_dat()).await?;
+        Ok((code, got))
     }
 
-    /// `read_bytes_bulk` naming a specific payload file.
-    pub async fn read_bytes_bulk_from(
+    /// `read_exact` naming a specific payload file.
+    pub async fn read_exact_from(&self, extent_id: u64, eversion: u64, offset: u64, length: u64, payload: PayloadRef) -> (u8, Vec<u8>) {
+        let (code, _, got) = self.try_read(extent_id, eversion, offset, length, READ_EXACT, payload).await.expect("read RPC");
+        (code, got)
+    }
+
+    /// One `MSG_READ` of `.dat`: the code, the replica's end, and the bytes.
+    pub async fn read(&self, extent_id: u64, eversion: u64, offset: u64, length: u64, mode: u8) -> (u8, u64, Vec<u8>) {
+        self.try_read(extent_id, eversion, offset, length, mode, PayloadRef::in_dat()).await.expect("read RPC")
+    }
+
+    async fn try_read(
         &self,
         extent_id: u64,
         eversion: u64,
         offset: u64,
         length: u64,
+        mode: u8,
         payload: PayloadRef,
-    ) -> (u8, Vec<u8>) {
-        let req = ReadBytesReq::new(extent_id, eversion, offset, length, payload);
-        let z = self
-            .pool
-            .call_into_pooled(
-                &self.addr,
-                MSG_READ_BYTES_BULK,
-                req.encode(),
-                Duration::from_secs(5),
-            )
-            .await
-            .expect("read_bytes_bulk RPC");
-        (z.code, z.buf.as_ref().to_vec())
+    ) -> anyhow::Result<(u8, u64, Vec<u8>)> {
+        let req = ReadReq::new(extent_id, eversion, offset, length, mode, payload);
+        let z = self.pool.call_into_pooled(&self.addr, MSG_READ, rkyv_encode(&req), Duration::from_secs(5)).await?;
+        let resp = rkyv_decode::<ReadResp>(&z.ctrl).map_err(anyhow::Error::msg)?;
+        Ok((z.code, resp.end, z.buf.as_ref().to_vec()))
     }
 
     pub async fn df(&self, tasks: Vec<RecoveryTask>, disk_ids: Vec<u64>) -> DfResp {

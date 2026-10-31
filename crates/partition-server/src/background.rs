@@ -4808,7 +4808,7 @@ pub(crate) async fn read_value_from_log(
         return Ok(Default::default());
     }
     // R3/R4: zero-copy fast path — recv the value straight into a
-    // registered RegPool buffer over UCX (MSG_READ_BYTES_BULK) and hand it onward
+    // registered RegPool buffer over UCX (exact `MSG_READ`) and hand it onward
     // as a RegBytes ALIASING that buffer with its memh (freeze; pb returns to the
     // pool when the last clone drops). No off-wire copy, no pb->Vec. A case the bulk read does
     // not take (EC across shards, chunked, non-OK) returns None -> the

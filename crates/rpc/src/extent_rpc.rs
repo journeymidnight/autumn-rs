@@ -94,6 +94,24 @@ pub const MSG_FENCE_EXTENT: u8 = 17;
 /// `df` (`DfResp.scrub_done`). Nothing but the request and the outcomes
 /// crosses the network.
 pub const MSG_SCRUB_EXTENTS: u8 = 18;
+/// Read a range of an extent's payload file: the one read message. Request =
+/// rkyv `ReadReq` (ctrl); reply = a value-separable frame whose ctrl is
+/// `[code][rkyv ReadResp]` and whose value is the bytes read (over UCX, from
+/// `BULK_MIN_BYTES` on, a frame value). `ReadReq::mode` says what a range this
+/// replica holds only part of gets.
+pub const MSG_READ: u8 = 19;
+
+/// `ReadReq::mode`: exactly `length` bytes, or a refusal
+/// (`CODE_PRECONDITION`) when this replica holds fewer — a value read.
+pub const READ_EXACT: u8 = 0;
+/// Up to `length` bytes, as many as this replica holds — a scan in chunks.
+pub const READ_UP_TO: u8 = 1;
+/// Everything from `offset` to this replica's end (`length` ignored).
+pub const READ_TO_END: u8 = 2;
+
+/// Length of an OK `MSG_READ` reply's ctrl: the code byte and an archived
+/// `ReadResp` with an empty message. A reply's value budget subtracts it.
+pub const READ_RESP_OK_CTRL_BYTES: usize = 17;
 
 // MSG_TYPE_PING = 0xFF is reserved by autumn-rpc for heartbeat
 
@@ -356,6 +374,59 @@ impl ReadBytesReq {
             payload_location,
             shard_index,
         })
+    }
+}
+
+/// `MSG_READ` request.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct ReadReq {
+    pub extent_id: u64,
+    pub eversion: u64,
+    pub offset: u64,
+    pub length: u64,
+    /// `READ_EXACT`, `READ_UP_TO` or `READ_TO_END`.
+    pub mode: u8,
+    /// `PayloadLocation` wire byte and shard index: the file to read.
+    pub payload_location: u8,
+    pub shard_index: u32,
+}
+
+impl ReadReq {
+    pub fn new(extent_id: u64, eversion: u64, offset: u64, length: u64, mode: u8, payload: PayloadRef) -> Self {
+        Self {
+            extent_id,
+            eversion,
+            offset,
+            length,
+            mode,
+            payload_location: payload.location.as_byte(),
+            shard_index: payload.shard_index,
+        }
+    }
+
+    /// The file named, or `None` for a location byte this build cannot name.
+    pub fn payload_ref(&self) -> Option<PayloadRef> {
+        PayloadLocation::from_wire_byte(self.payload_location).map(|l| PayloadRef::for_extent(l, self.shard_index))
+    }
+}
+
+/// `MSG_READ` reply ctrl after its code byte: the replica's end (its local
+/// length, or the shard file's) on an OK and on an exact read refused short
+/// (0 on other refusals), and, on a refusal, why.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+pub struct ReadResp {
+    pub end: u64,
+    pub message: String,
+}
+
+impl ReadResp {
+    /// The reply ctrl: `[code][rkyv ReadResp]`.
+    pub fn ctrl(code: u8, end: u64, message: &str) -> Bytes {
+        let body = rkyv::to_bytes::<RkyvError>(&ReadResp { end, message: message.to_string() }).expect("rkyv encode");
+        let mut c = BytesMut::with_capacity(1 + body.len());
+        c.put_u8(code);
+        c.extend_from_slice(&body);
+        c.freeze()
     }
 }
 
@@ -1480,6 +1551,12 @@ mod tests {
 
         // Truncated (empty) response is a decode error, not a panic.
         assert!(FenceExtentResp::decode(Bytes::new()).is_err());
+    }
+
+    #[test]
+    fn an_ok_read_reply_ctrl_has_the_budgeted_length() {
+        assert_eq!(ReadResp::ctrl(CODE_OK, u64::MAX, "").len(), READ_RESP_OK_CTRL_BYTES);
+        assert_eq!(ReadResp::ctrl(CODE_OK, 0, "").len(), READ_RESP_OK_CTRL_BYTES);
     }
 
     /// rkyv_decode rejects malformed input via bytecheck instead of UB.

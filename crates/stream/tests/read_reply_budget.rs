@@ -37,7 +37,7 @@ async fn a_read_with_no_reply_buffer_is_answered_after_a_bounded_wait() {
 
     let held: Vec<_> = (0..2).flat_map(|_| std::thread::spawn(hold_share).join().unwrap()).collect();
     let started = Instant::now();
-    let refused = conn.try_read_bytes_bulk(901, 1, 0, value.len() as u64).await;
+    let refused = conn.try_read_exact(901, 1, 0, value.len() as u64).await;
     let err = refused.err().expect("no reply buffer: the read is refused");
     assert!(
         err.chain().any(|c| matches!(
@@ -50,7 +50,7 @@ async fn a_read_with_no_reply_buffer_is_answered_after_a_bounded_wait() {
     assert!(waited >= Duration::from_millis(900) && waited < Duration::from_millis(2500), "after the 1 s wait: {waited:?}");
 
     drop(held);
-    let (code, got) = conn.read_bytes_bulk(901, 1, 0, value.len() as u64).await;
+    let (code, got) = conn.read_exact(901, 1, 0, value.len() as u64).await;
     assert_eq!(code, CODE_OK);
     assert_eq!(got, value);
 }
