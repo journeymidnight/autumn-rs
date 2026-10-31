@@ -70,7 +70,7 @@ Partition threads — 2 OS threads per partition (both anywhere in the cpuset):
 │     • dedicated StreamClient + ConnPool for log_stream/meta_stream
 ├─ part-N-sst (P-sst): flush_worker_loop
 │     • own compio runtime + io_uring + ConnPool + StreamClient
-│     • runs build_sst_bytes + row_stream.append + save_table_locs_raw
+│     • runs build_sst + row_stream.append + save_table_locs_raw
 │
 P-log → P-sst: mpsc::Sender<FlushReq> (capacity 1 → sequential flushes)
 P-sst → P-log: oneshot::Sender<Result<(TableMeta, SstReader)>>
@@ -449,7 +449,7 @@ distinct contiguous offsets regardless of completion order).
 Same FuturesUnordered + select pattern on the bulk thread, cap = 2 (env
 `--ps-bulk-inflight-cap`, range [1, 16]). Each in-flight flush holds a 128 MB
 SST buffer, so the cap is deliberately small. The overlap benefit: while one SST
-uploads via `row_stream.append`, the next flush can start its `build_sst_bytes`
+uploads via `row_stream.append`, the next flush can start its `build_sst`
 `spawn_blocking` — CPU (build) overlaps network (upload) without ballooning peak
 memory. P-sst needs no special `StreamClientConfig`; the stream client derives
 every append deadline from the actual payload size (256 MiB → ~37 s), which also
@@ -1093,9 +1093,9 @@ P-log: background_flush_loop
 
 P-sst: flush_worker_loop
   1. recv FlushReq
-  2. build_sst_bytes(imm, vp_eid, vp_off)         ← spawn_blocking (CPU)
-  3. sst_sc.append(row_stream_id, sst_bytes)     ← 128 MB network upload
-  4. SstReader::from_bytes(...)
+  2. build_sst(imm, vp_eid, vp_off)               ← spawn_blocking (CPU)
+  3. sst_sc.append_segments(row_stream_id, segments)  ← the table as built
+  4. SstReader::open_paged_from_meta(meta, ...)
   5. resp_tx.send(Ok((new_meta, reader)))
 
 P-log: continuation (under publish_lock)
@@ -1104,6 +1104,36 @@ P-log: continuation (under publish_lock)
   8. part.sst_readers.push(Arc::new(reader))
   9. part.imm.pop_front()
 ```
+
+### SST segments (`--sst-segment-bytes`, 4 MiB)
+
+`SstBuilder` writes each block straight into a segment buffer (reserved once
+at the segment size, so it never grows by doubling), starts a new one at a
+block boundary once a segment reaches `--sst-segment-bytes` (1–128 MiB, so a
+segment plus a block and the MetaBlock stays under a 256 MiB pool chunk; only
+the last segment may grow once, for the MetaBlock), and `finish`
+returns `BuiltSst`: the segments, and the MetaBlock as a view into the last.
+Flush and compaction append the segments as they are (`append_segments`;
+compaction through P-sst's `RowAppendReq.sst_segments`) and open the reader
+from the meta alone (`open_paged_from_meta`, the recovery path's), so no
+buffer ever holds a whole table: before, flush copied it twice (the builder
+joining its blocks, then `StreamClient::append`'s `copy_from_slice`) and
+compaction once. Over TCP the segments go out as they are; over UCX each is
+one frame-value piece, staged once into the pool. `from_bytes` / `into_paged` (a reader over resident
+bytes) are test-only now. Test: `sstable::builder::tests::segments_join_into_the_same_table`
+(1 MiB segments join into the bytes of one, each ends on a block boundary,
+the paged reader from the meta matches the resident one). Measured (perf-check, 3 disks, 8 partitions, 20 s,
+cpuset-isolated, alternating against the build before): UCX equal in every
+cell (4K write 29.7/30.6K vs 31.3/26.4K, read 269/263K vs 273/271K; 8M write
+2515/2728 vs 2563/2724 MB/s, read 12769/12540 vs 12268/13199); TCP 4K read and
+8M equal or better (8M read 6719/6730 vs 6237/6590). TCP 4K write spread too
+wide to call: six pairs 18.2–44.6K vs 28.2–44.7K (lower in four, equal and
+higher in the last two); the same build at 4 MiB vs 256 MiB segments
+31–36K vs 28–45K, and the PS's memory churn during the write phase the same
+at both (bpftrace, 15 s: page faults 781K vs 752K, munmap 29 vs 21, remote
+TLB shootdowns 50K vs 46K). One patched run stalled its reads (PS silent for
+8 s at a time, 31 ops/s), right after a run killed mid-way left sockets
+lingering; it did not recur in nine more runs, and its logs were lost.
 
 P-sst spawn failure is fatal-for-this-partition: `open_partition` returns Err and
 the manager reschedules. There is no in-thread fallback (see row_stream
@@ -2007,7 +2037,7 @@ SstReaders.
   batch (`batch_log_bytes - VP value bytes`), GC relocation the same way, and
   recovery replay per kept record (records an SST already covers were counted by
   that SST's flush; fence bumps are not counted on replay). The tally rides the
-  memtable into the imm and `build_sst_bytes` attaches it.
+  memtable into the imm and `build_sst` attaches it.
 - **Compaction**: dropping a VP entry (dedup/range/tombstone/expiry) adds its
   extent_id + value length. The two never count the same bytes: flush leaves
   the VP value out, compaction counts only the VP value.
@@ -2866,7 +2896,7 @@ Three fixes bound the restart replay window (worst case per partition =
    SstReaders. Break any link and GC won't collect dead VP data. Upstream of all
    of it: a delete still in the memtable is invisible to compaction, which is why
    a major compaction flushes first. The WAL bytes themselves enter at flush
-   (`Memtable::wal_dead` → `build_sst_bytes`); a new path that appends to the log
+   (`Memtable::wal_dead` → `build_sst`); a new path that appends to the log
    or fills a memtable from it must tally them too, or its extents never become
    collectable.
 
@@ -2926,7 +2956,7 @@ Three fixes bound the restart replay window (worst case per partition =
       on the owning `PartitionData` — safe because it runs exclusively on P-log inside
       a `RefCell::borrow_mut`.
     - `imm: VecDeque<Arc<Memtable>>` — frozen memtables are read-only from P-log (flush
-      + GC + compaction) and P-sst (`build_sst_bytes`); multiple readers acquire the
+      + GC + compaction) and P-sst (`build_sst`); multiple readers acquire the
       read lock concurrently.
     - Hot path uses `insert_batch(iter)` (one write lock per 256 inserts) and
       `for_each(closure)` (read lock held for the iteration). The `bytes: AtomicU64`

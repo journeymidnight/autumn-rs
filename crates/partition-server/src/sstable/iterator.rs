@@ -520,7 +520,7 @@ mod tests {
         for (uk, seq, val) in entries {
             b.add(&ikey(uk, *seq), 1, val, 0);
         }
-        let data = b.finish();
+        let data = b.finish().to_bytes().to_vec();
         Arc::new(SstReader::from_bytes(bytes::Bytes::from(data)).expect("reader"))
     }
 

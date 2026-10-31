@@ -50,6 +50,8 @@
 - **Scope**: sglang 后端在 `register_mem_pool_host` 注册整块 L2，`copy` 布局 scratch 也注册，关闭时注销；vLLM 连接器改用可复用 staging（注册一次）或 SDK 池缓冲；`AUTUMN_REV` 跟进。
 - **Acceptance**: UCX 上 sglang、vLLM e2e 输出正确（命中与不命中生成一致）；L3 读写不再拷进 slab；TCP 不变；L3 读写带宽与改前对比。
 - `passes: false`
+- **notes** (2026-10-31): autumn_kvcache 1836e03（AUTUMN_REV aec2c23e）。sglang：页直接进出池的布局在 `register_mem_pool_host` 时注册池的整块存储（失败即启动失败），`copy` 布局注册每线程 scratch；vLLM：每线程一块复用的注册缓冲（存时 GPU 张量直接拷进去，字节与原 `.cpu()` 相同，不用升存储格式）；所有 put_from / get_into 带 region。sglang e2e（Qwen3-VL-4B TP1、UCX、PS 内存层、B 实例读 A 写的页）：答案全同，69120/69280 token 来自 L3；layer_first 拷贝 10.2 GB 进 + 10.2 GB 出 → 0，时间不变；page_first_direct 20.4 GB → 0，128 页读 362/269 → 201/239 ms，写不变；首次注册 32 GB 池 +160 ms。顺带修了 PS bug（c4b3240c）：内存层大值在批量重定向里被内联进 rkyv 回复（vLLM 一次 1.2 GB、7 s、全部 miss）。未完成：vLLM e2e——修复后重跑时整机 8 张卡被他租占满（各 138 GB、100%），等 GPU；vLLM 默认直读 EN，读仍经池拷贝（第 6 步统一 READ 落点后才零拷贝）。
+
 
 ### F-DP-WAL-IN-POOL — WAL 批在池里拼，后台大块用堆（第 5 步）
 - **Scope**: WAL 批记录头另起一段、value 用收到的原 slab；大 value 只活到请求结束；后台大块（SST、compaction、GC、恢复、回放、EC）用堆，UCX 分段经池中转、TCP 直接收发；SST `finish()` 交出块列表不再拼接，flush 去掉整份拷贝。

@@ -95,6 +95,11 @@ crate::params! {
         /// Data bytes at which a compaction cuts an output SST (at least twice
         /// the flush size; SST block offsets are u32).
         compact_max_sst_bytes: u64 = GIB, [4 * KIB, 3 * GIB];
+        /// Size of the buffers an SST is built in and appended as (never
+        /// joined): a buffer closes at the first block boundary past it. Over
+        /// UCX each is one staged piece, so it stays well under a pool chunk
+        /// (256 MiB) with room for a block and the last one's MetaBlock.
+        sst_segment_bytes: usize = 4 * MIB as usize, [MIB as usize, 128 * MIB as usize];
         /// The head extent of the row stream is rewritten once its live tables
         /// are below this percent of its sealed bytes.
         compact_reclaim_live_percent: u64 = 30, [1, 99];

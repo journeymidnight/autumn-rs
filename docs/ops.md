@@ -1870,7 +1870,9 @@ flags, sizes in bytes; defaults shown): `--compact-min-files 3`,
 1048576` (1 MiB), `--compact-large-size-bytes 134217728` (128 MiB; tables this
 large never enter a minor window), `--compact-blocking-files 16`,
 `--compact-max-sst-bytes 1073741824` (1 GiB output SSTs, at least 2 × the
-flush size; each running compaction holds one in memory). A major leaves about one table
+flush size; each running compaction holds one in memory). An SST is built and
+appended in `--sst-segment-bytes` buffers (default 4 MiB, 1–128 MiB;
+cluster.sh: `AUTUMN_PS_SST_SEGMENT_BYTES`), never joined into one. A major leaves about one table
 per 1 GiB of data. A partition of small SSTs (large
 values in the log stream) stays at a handful of tables; one of flush-sized
 tables (4K inline values, 256 MiB SSTs) keeps one table per flush until a

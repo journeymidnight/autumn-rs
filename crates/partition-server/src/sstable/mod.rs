@@ -5,7 +5,7 @@ pub mod format;
 pub mod iterator;
 pub mod reader;
 
-pub use builder::SstBuilder;
+pub use builder::{BuiltSst, SstBuilder};
 pub use iterator::{AsyncMergeIterator, AsyncTableIterator, FetchMode, IterItem, MemtableIterator};
 pub use block_cache::BlockCache;
 pub use reader::SstReader;

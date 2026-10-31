@@ -29,9 +29,9 @@ pub enum SstSource {
     },
 }
 
-/// SSTable reader. Holds the full SSTable bytes in memory (Arc-shared).
+/// SSTable reader. Paged in production (blocks read from the row stream on
+/// demand, `open_paged_from_meta`); tests also open one over resident bytes.
 ///
-/// Blocks are decoded on demand from the in-memory bytes.
 /// The MetaBlock (block index + bloom filter) is parsed at open time.
 /// Decoded blocks are cached to avoid repeated CRC checks and memcpy.
 pub struct SstReader {
@@ -70,11 +70,13 @@ pub struct SstReader {
 
 impl SstReader {
     /// Open an SSTable from a Bytes buffer containing the full SSTable bytes.
+    #[cfg(test)]
     pub fn from_bytes(data: Bytes) -> Result<Self> {
         Self::open_at(data, 0)
     }
 
     /// Open an SSTable starting at `sst_base` within a larger buffer.
+    #[cfg(test)]
     pub fn open_at(data: Bytes, sst_base: u64) -> Result<Self> {
         let base = sst_base as usize;
         if data.len() < base + 8 {
@@ -273,6 +275,7 @@ impl SstReader {
     /// `read_block_via`. `base_in_extent` is where this SST starts inside
     /// `extent_id` on row_stream (`TableMeta.offset`), `len_in_extent` its
     /// byte length (`TableMeta.len`).
+    #[cfg(test)]
     pub fn into_paged(mut self, extent_id: u64, base_in_extent: u64, len_in_extent: u64) -> Self {
         self.source = SstSource::Paged {
             extent_id,
@@ -656,7 +659,7 @@ mod window_tests {
             let user = format!("key{i:06}");
             b.add(&ikey(user.as_bytes(), i as u64 + 1), 1, b"v", 0);
         }
-        SstReader::from_bytes(Bytes::from(b.finish())).expect("reader")
+        SstReader::from_bytes(b.finish().to_bytes()).expect("reader")
     }
 
     /// A key outside the table's range is never read, even when the bloom
@@ -667,7 +670,7 @@ mod window_tests {
         for i in 100..1100u32 {
             b.add(&ikey(format!("key{i:06}").as_bytes(), i as u64), 1, b"v", 0);
         }
-        let r = SstReader::from_bytes(Bytes::from(b.finish())).expect("reader");
+        let r = SstReader::from_bytes(b.finish().to_bytes()).expect("reader");
         let fp = (0..100_000u32)
             .map(|i| format!("zzz{i:06}"))
             .find(|k| r.bloom_may_contain(k.as_bytes()))
@@ -675,7 +678,7 @@ mod window_tests {
         assert!(!r.may_contain(fp.as_bytes()), "{fp} is past the range");
         assert!(!r.may_contain(b"key000099") && !r.may_contain(b"key001100"));
         assert!(r.may_contain(b"key000100") && r.may_contain(b"key001099"));
-        let empty = SstReader::from_bytes(Bytes::from(SstBuilder::new(0, 0, 1).finish()))
+        let empty = SstReader::from_bytes(SstBuilder::new(0, 0, 1).finish().to_bytes())
             .expect("empty reader");
         assert!(!empty.may_contain(b"key000500"));
     }
@@ -691,7 +694,7 @@ mod window_tests {
             b.add(&ikey(user.as_bytes(), 2 * i as u64 + 2), 1, b"v", 0);
             b.add(&ikey(user.as_bytes(), 2 * i as u64 + 1), 1, b"v", 0);
         }
-        let r = SstReader::from_bytes(Bytes::from(b.finish())).expect("reader");
+        let r = SstReader::from_bytes(b.finish().to_bytes()).expect("reader");
         for i in 0..20_000u32 {
             assert!(r.bloom_may_contain(format!("key{i:06}").as_bytes()));
         }
@@ -783,7 +786,7 @@ mod discards_only_tests {
     fn an_sst_without_entries_carries_its_discards_and_holds_no_key() {
         let mut b = SstBuilder::new(7, 4096, 1024);
         b.set_discards(HashMap::from([(7u64, 16 << 30)]));
-        let r = Arc::new(SstReader::from_bytes(Bytes::from(b.finish())).expect("reader"));
+        let r = Arc::new(SstReader::from_bytes(b.finish().to_bytes()).expect("reader"));
 
         assert_eq!(r.discards, HashMap::from([(7u64, 16 << 30)]));
         assert_eq!(r.block_count(), 0);

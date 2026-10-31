@@ -1,5 +1,7 @@
 use std::collections::{BTreeSet, HashMap};
 
+use bytes::Bytes;
+
 use super::bloom::BloomFilterBuilder;
 use super::format::{
     BlockOffset, EntryHeader, MetaBlock, BLOCK_SIZE_TARGET, ENTRY_VALUE_HEADER,
@@ -9,20 +11,24 @@ use super::format::{
 
 /// Builds a block-based SSTable in memory.
 ///
-/// Call `add()` for each entry (internal keys in sorted order), then `finish()` to get
-/// the complete SSTable bytes ready for a single `stream_client.append()` call.
+/// Call `add()` for each entry (internal keys in sorted order), then `finish()`
+/// for the table as the segments its blocks were written into, appended as
+/// they are (`append_segments`): no buffer ever holds the whole table.
 ///
 /// SSTable layout:
 ///   [Block 0][Block 1]...[Block N][MetaBlock bytes][meta_len: u32 LE]
 pub struct SstBuilder {
-    // Finished blocks
-    blocks: Vec<Vec<u8>>,
+    /// Full segments: runs of whole blocks, each at least `segment_bytes`.
+    segments: Vec<Vec<u8>>,
+    /// The segment being written; the open block is its tail from `block_start`.
+    seg: Vec<u8>,
+    block_start: usize,
+    segment_bytes: usize,
     block_offsets: Vec<BlockOffset>,
     running_offset: u32,
 
     // Current block state
-    current: Vec<u8>,        // accumulated entry bytes (before footer)
-    entry_offsets: Vec<u32>, // byte offsets of entries in `current`
+    entry_offsets: Vec<u32>, // byte offsets of entries in the open block
     base_key: Vec<u8>,       // first key in current block
 
     // Bloom filter over all entries
@@ -50,10 +56,12 @@ impl SstBuilder {
     /// table holding more keys degrades its filter, never its correctness.
     pub fn new(vp_extent_id: u64, vp_offset: u64, expected_keys: usize) -> Self {
         SstBuilder {
-            blocks: Vec::new(),
+            segments: Vec::new(),
+            seg: Vec::new(),
+            block_start: 0,
+            segment_bytes: crate::params().sst_segment_bytes.get(),
             block_offsets: Vec::new(),
             running_offset: 0,
-            current: Vec::new(),
             entry_offsets: Vec::new(),
             base_key: Vec::new(),
             bloom: BloomFilterBuilder::new(expected_keys, crate::params().sst_bloom_fp_rate.get()),
@@ -69,6 +77,13 @@ impl SstBuilder {
             num_entries: 0,
             num_deletions: 0,
         }
+    }
+
+    /// Segments of `n` bytes instead of `--sst-segment-bytes`.
+    #[cfg(test)]
+    pub fn with_segment_bytes(mut self, n: usize) -> Self {
+        self.segment_bytes = n;
+        self
     }
 
     /// Set the discard map to embed in this SSTable's MetaBlock.
@@ -95,11 +110,17 @@ impl SstBuilder {
     pub fn add(&mut self, internal_key: &[u8], op: u8, value: &[u8], expires_at: u64) {
         // Estimate if adding this entry would exceed the block size target.
         let entry_size = EntryHeader::SIZE + internal_key.len() + ENTRY_VALUE_HEADER + value.len();
-        if !self.current.is_empty()
-            && (self.current.len() + entry_size > BLOCK_SIZE_TARGET
+        if !self.entry_offsets.is_empty()
+            && (self.block_len() + entry_size > BLOCK_SIZE_TARGET
                 || self.entry_offsets.len() >= MAX_ENTRIES_PER_BLOCK)
         {
             self.finish_block();
+        }
+        if self.seg.capacity() == 0 {
+            // Once per segment, so it does not grow by doubling (each doubling
+            // copies everything written so far); only the last may grow once,
+            // for the MetaBlock.
+            self.seg.reserve(self.segment_bytes + 2 * BLOCK_SIZE_TARGET);
         }
 
         // Track metadata
@@ -137,20 +158,19 @@ impl SstBuilder {
         }
 
         // Record entry offset (from start of current block)
-        self.entry_offsets.push(self.current.len() as u32);
+        self.entry_offsets.push(self.block_len() as u32);
 
         // Write entry: [header:4][diff_key][op:1][val_len:4][expires_at:8][value]
         let hdr = EntryHeader {
             overlap: overlap as u16,
             diff_len: diff_key.len() as u16,
         };
-        self.current.extend_from_slice(&hdr.encode());
-        self.current.extend_from_slice(diff_key);
-        self.current.push(op);
-        self.current
-            .extend_from_slice(&(value.len() as u32).to_le_bytes());
-        self.current.extend_from_slice(&expires_at.to_le_bytes());
-        self.current.extend_from_slice(value);
+        self.seg.extend_from_slice(&hdr.encode());
+        self.seg.extend_from_slice(diff_key);
+        self.seg.push(op);
+        self.seg.extend_from_slice(&(value.len() as u32).to_le_bytes());
+        self.seg.extend_from_slice(&expires_at.to_le_bytes());
+        self.seg.extend_from_slice(value);
 
         if op & crate::OP_VALUE_POINTER != 0 && value.len() >= crate::VALUE_POINTER_SIZE {
             let extent_id = u64::from_le_bytes(value[0..8].try_into().unwrap());
@@ -163,26 +183,27 @@ impl SstBuilder {
     /// Encoded bytes so far: finished blocks plus the open block and its
     /// offset table (the MetaBlock, bloom and index come on top at `finish`).
     pub fn encoded_len(&self) -> u64 {
-        self.running_offset as u64 + self.current.len() as u64 + 4 * self.entry_offsets.len() as u64
+        self.running_offset as u64 + self.block_len() as u64 + 4 * self.entry_offsets.len() as u64
     }
 
     /// Returns `true` if no entries have been added yet.
     pub fn is_empty(&self) -> bool {
-        self.blocks.is_empty() && self.entry_offsets.is_empty()
+        self.block_offsets.is_empty() && self.entry_offsets.is_empty()
     }
 
-    /// Finalise the SSTable and return its bytes.
-    ///
-    /// The bytes can be passed directly to `stream_client.append()`.
-    pub fn finish(mut self) -> Vec<u8> {
+    /// Bytes of the open block written so far (entries, before its footer).
+    fn block_len(&self) -> usize {
+        self.seg.len() - self.block_start
+    }
+
+    /// Finalise the SSTable: its segments, in order, the MetaBlock and its
+    /// length closing the last.
+    pub fn finish(mut self) -> BuiltSst {
         // Flush last block
         if !self.entry_offsets.is_empty() {
             self.finish_block();
         }
 
-        // MetaBlock first, so the output is allocated once at its final size
-        // and each block is freed as it is copied (a compaction output is up
-        // to `--compact-max-sst-bytes`; growing a Vec held ~3× that).
         let bloom_filter = self.bloom.finish();
         let meta = MetaBlock {
             block_offsets: self.block_offsets,
@@ -201,14 +222,15 @@ impl SstBuilder {
         };
         let meta_bytes = meta.encode();
         let meta_len = meta_bytes.len() as u32;
-        let mut sst = Vec::with_capacity(self.running_offset as usize + meta_bytes.len() + 4);
-        for block in self.blocks.drain(..) {
-            sst.extend_from_slice(&block);
-        }
-        sst.extend_from_slice(&meta_bytes);
+        let meta_at = self.seg.len();
+        self.seg.extend_from_slice(&meta_bytes);
         // Trailer: meta_len (4 bytes LE). Used by reader to locate the MetaBlock.
-        sst.extend_from_slice(&meta_len.to_le_bytes());
-        sst
+        self.seg.extend_from_slice(&meta_len.to_le_bytes());
+        let last = Bytes::from(std::mem::take(&mut self.seg));
+        let meta = last.slice(meta_at..meta_at + meta_bytes.len());
+        let mut segments: Vec<Bytes> = self.segments.drain(..).map(Bytes::from).collect();
+        segments.push(last);
+        BuiltSst { segments, meta }
     }
 
     // -----------------------------------------------------------------------
@@ -223,16 +245,16 @@ impl SstBuilder {
 
         // Append footer: [entry_offsets * 4B LE][num_entries: 4B LE]
         for &off in &self.entry_offsets {
-            self.current.extend_from_slice(&off.to_le_bytes());
+            self.seg.extend_from_slice(&off.to_le_bytes());
         }
         let num = self.entry_offsets.len() as u32;
-        self.current.extend_from_slice(&num.to_le_bytes());
+        self.seg.extend_from_slice(&num.to_le_bytes());
 
         // CRC32C over everything so far (entries + offsets + num_entries)
-        let crc = crc32c::crc32c(&self.current);
-        self.current.extend_from_slice(&crc.to_le_bytes());
+        let crc = crc32c::crc32c(&self.seg[self.block_start..]);
+        self.seg.extend_from_slice(&crc.to_le_bytes());
 
-        let block_len = self.current.len() as u32;
+        let block_len = self.block_len() as u32;
         let base_key = std::mem::take(&mut self.base_key);
 
         self.block_offsets.push(BlockOffset {
@@ -242,8 +264,42 @@ impl SstBuilder {
         });
 
         self.running_offset += block_len;
-        self.blocks.push(std::mem::take(&mut self.current));
         self.entry_offsets.clear();
+        if self.seg.len() >= self.segment_bytes {
+            self.segments.push(std::mem::take(&mut self.seg));
+        }
+        self.block_start = self.seg.len();
+    }
+}
+
+/// A finished SSTable: `segments` in order are its bytes.
+pub struct BuiltSst {
+    pub segments: Vec<Bytes>,
+    /// The MetaBlock (without the trailing length), a view into the last segment.
+    meta: Bytes,
+}
+
+impl BuiltSst {
+    pub fn len(&self) -> u64 {
+        self.segments.iter().map(|s| s.len() as u64).sum()
+    }
+
+    /// The MetaBlock, for `SstReader::open_paged_from_meta`.
+    pub fn meta(&self) -> &[u8] {
+        &self.meta
+    }
+
+    /// The whole table in one buffer (a copy), for a reader over resident bytes.
+    #[cfg(test)]
+    pub fn to_bytes(&self) -> Bytes {
+        if let [one] = self.segments.as_slice() {
+            return one.clone();
+        }
+        let mut all = Vec::with_capacity(self.len() as usize);
+        for s in &self.segments {
+            all.extend_from_slice(s);
+        }
+        Bytes::from(all)
     }
 }
 
@@ -274,7 +330,7 @@ mod tests {
         for (uk, seq) in &keys {
             b.add(&ikey(uk, *seq), 1, b"value", 0);
         }
-        let data = b.finish();
+        let data = b.finish().to_bytes().to_vec();
         assert!(!data.is_empty());
 
         let reader = SstReader::from_bytes(bytes::Bytes::from(data)).expect("reader");
@@ -291,7 +347,7 @@ mod tests {
     fn crc_corruption_detected() {
         let mut b = SstBuilder::new(0, 0, 1024);
         b.add(&ikey(b"key", 1), 1, b"val", 0);
-        let mut data = b.finish();
+        let mut data = b.finish().to_bytes().to_vec();
         // Corrupt a byte in the first block
         if data.len() > 5 {
             data[5] ^= 0xFF;
@@ -311,7 +367,7 @@ mod tests {
         discards.insert(10u64, 500i64);
         discards.insert(20u64, 1024i64);
         b.set_discards(discards.clone());
-        let data = b.finish();
+        let data = b.finish().to_bytes().to_vec();
 
         let reader = SstReader::from_bytes(bytes::Bytes::from(data)).expect("reader");
         assert_eq!(reader.discards.get(&10), Some(&500i64));
@@ -326,7 +382,7 @@ mod tests {
         b.add(&ikey(b"b", 2), 1, b"v2", 500);
         b.add(&ikey(b"c", 3), 1, b"v3", 0); // no expiry
         b.add(&ikey(b"d", 4), 1, b"v4", 800);
-        let data = b.finish();
+        let data = b.finish().to_bytes().to_vec();
         let reader = SstReader::from_bytes(bytes::Bytes::from(data)).expect("reader");
         assert_eq!(reader.min_expires_at, 500);
     }
@@ -345,7 +401,7 @@ mod tests {
             b.add(&ikey(key, seq as u64 + 1), 1, b"value", 0);
         }
 
-        let data = b.finish();
+        let data = b.finish().to_bytes().to_vec();
         let reader =
             std::sync::Arc::new(SstReader::from_bytes(bytes::Bytes::from(data)).expect("reader"));
         let mut it = TableIterator::new(reader);
@@ -378,7 +434,7 @@ mod tests {
             b.add(&ikey(key, seq as u64 + 1), 1, b"value", 0);
         }
 
-        let data = b.finish();
+        let data = b.finish().to_bytes().to_vec();
         let reader =
             std::sync::Arc::new(SstReader::from_bytes(bytes::Bytes::from(data)).expect("reader"));
         let mut it = TableIterator::new(reader);
@@ -403,12 +459,49 @@ mod tests {
         b.add(&ikey(b"b", 8), crate::OP_TOMBSTONE, b"", 0);
         b.add(&ikey(b"b", 2), 1 | crate::OP_VALUE_POINTER, &vp, 0);
         b.add(&ikey(b"c", 7), crate::OP_TOMBSTONE, b"", 0);
-        let reader = SstReader::from_bytes(bytes::Bytes::from(b.finish())).expect("reader");
+        let reader = SstReader::from_bytes(b.finish().to_bytes()).expect("reader");
         assert_eq!(reader.num_entries, 5);
         assert_eq!(reader.num_deletions, 2);
 
-        let empty = SstReader::from_bytes(bytes::Bytes::from(SstBuilder::new(0, 0, 1024).finish()))
+        let empty = SstReader::from_bytes(SstBuilder::new(0, 0, 1024).finish().to_bytes())
             .expect("empty reader");
         assert_eq!((empty.num_entries, empty.num_deletions), (0, 0));
+    }
+
+    /// A table written into small segments is the table written into one:
+    /// every segment ends on a block boundary, and a reader opened from the
+    /// meta alone sees the blocks a reader of the whole bytes does.
+    #[test]
+    fn segments_join_into_the_same_table() {
+        let build = |segment_bytes: Option<usize>| {
+            let mut b = SstBuilder::new(7, 9, 20_000);
+            if let Some(n) = segment_bytes {
+                b = b.with_segment_bytes(n);
+            }
+            for i in 0..20_000u32 {
+                let key = crate::key_with_ts(format!("key-{i:08}").as_bytes(), u64::from(i) + 1);
+                b.add(&key, crate::OP_PUT, &vec![(i % 251) as u8; 200 + (i % 7) as usize * 40], 0);
+            }
+            b.finish()
+        };
+        let whole = build(Some(64 << 20)); // one segment for this table
+        let cut = build(Some(1 << 20));
+        assert_eq!(whole.segments.len(), 1);
+        assert!(cut.segments.len() >= 4, "{} segments", cut.segments.len());
+        assert_eq!(cut.to_bytes(), whole.to_bytes());
+        let meta = MetaBlock::decode(cut.meta()).expect("meta");
+        assert_eq!(meta.num_entries, 20_000);
+        let ends: Vec<u64> =
+            meta.block_offsets.iter().map(|o| u64::from(o.relative_offset) + u64::from(o.block_len)).collect();
+        let mut at = 0u64;
+        for seg in &cut.segments[..cut.segments.len() - 1] {
+            assert!(seg.len() >= 1 << 20, "a full segment holds at least its size");
+            at += seg.len() as u64;
+            assert!(ends.contains(&at), "segment ends at {at}, inside a block");
+        }
+        let resident = SstReader::from_bytes(whole.to_bytes()).expect("reader");
+        let paged = SstReader::open_paged_from_meta(cut.meta(), 3, 0, cut.len()).expect("paged reader");
+        assert_eq!(paged.block_count(), resident.block_count());
+        assert_eq!((paged.smallest_key(), paged.biggest_key()), (resident.smallest_key(), resident.biggest_key()));
     }
 }

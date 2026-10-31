@@ -364,7 +364,7 @@ pub(crate) fn ps_inflight_cap() -> usize {
 /// R4 4.4 — maximum number of P-sst (flush) in-flight SST uploads per
 /// partition. Each in-flight request holds a full 128 MB SSTable buffer
 /// (peak), so this cap is deliberately small. Default = 2 lets the next
-/// flush start its `build_sst_bytes` while the previous one's 128 MB
+/// flush start its `build_sst` while the previous one's 128 MB
 /// `row_stream.append` is streaming. Range clamped to [1, 16].
 /// `--ps-bulk-inflight-cap`.
 ///
@@ -788,7 +788,7 @@ pub(crate) struct Memtable {
     /// once it is flushed: every record byte except a ValuePointer's value,
     /// which only lives in the log. An inline value (<= `VALUE_THROTTLE`) is
     /// copied into the SST, so its WAL record is needed only until then.
-    /// `build_sst_bytes` stores this as the SST's discard map. Compaction
+    /// `build_sst` stores this as the SST's discard map. Compaction
     /// cannot count these bytes later: an inline entry does not record where
     /// its WAL record is. Without it, a log extent of small values never
     /// showed a dead byte and GC never took it.
@@ -965,7 +965,7 @@ impl Memtable {
     }
 
     /// Iterate the memtable entries in ascending key order under a read lock
-    /// and hand each entry to `f`. Used by `build_sst_bytes` and `rotate_active`
+    /// and hand each entry to `f`. Used by `build_sst` and `rotate_active`
     /// to avoid allocating an intermediate snapshot Vec when the caller just
     /// needs read access to (&[u8], &MemEntry).
     pub(crate) fn for_each<F: FnMut(&[u8], &MemEntry)>(&self, mut f: F) {
@@ -1727,7 +1727,7 @@ pub(crate) struct GcAutoParams {
 // ---------------------------------------------------------------------------
 //
 // background_flush_loop on the P-log thread no longer runs
-// build_sst_bytes + row_stream.append itself. Instead it ships a FlushReq
+// build_sst + row_stream.append itself. Instead it ships a FlushReq
 // over to a dedicated P-sst OS thread (its own compio runtime + io_uring +
 // ConnPool), which does the heavy lifting and replies with the new TableMeta
 // + SstReader. P-log then atomically pushes the new table/reader, pops imm,
@@ -1748,7 +1748,8 @@ pub(crate) struct FlushReq {
 }
 
 pub(crate) struct RowAppendReq {
-    pub(crate) sst_bytes: Bytes,
+    /// The table's segments (`BuiltSst::segments`), appended as they are.
+    pub(crate) sst_segments: Vec<Bytes>,
     pub(crate) row_stream_id: u64,
     pub(crate) resp_tx: oneshot::Sender<Result<autumn_stream::AppendResult>>,
 }
@@ -10542,7 +10543,7 @@ async fn publish_freeze_checkpoint(part: &Rc<RefCell<PartitionData>>) -> Result<
 // SSTable building
 // ---------------------------------------------------------------------------
 
-pub(crate) fn build_sst_bytes(imm: &Memtable, vp_extent_id: u64, vp_offset: u64) -> (Vec<u8>, u64) {
+pub(crate) fn build_sst(imm: &Memtable, vp_extent_id: u64, vp_offset: u64) -> (sstable::BuiltSst, u64) {
     let mut builder = SstBuilder::new(vp_extent_id, vp_offset, imm.len());
     let mut last_seq = 0u64;
     imm.for_each(|ikey, me| {
@@ -11495,13 +11496,14 @@ async fn flush_worker_loop(
             }
             SqMsg::RowAppend(req) => {
                 let RowAppendReq {
-                    sst_bytes,
+                    sst_segments,
                     row_stream_id,
                     resp_tx,
                 } = req;
                 let sst_sc = sst_sc.clone();
                 Some(Box::pin(async move {
-                    let result = sst_sc.append_bytes(row_stream_id, sst_bytes).await;
+                    let segments = sst_segments.into_iter().map(Into::into).collect();
+                    let result = sst_sc.append_segments(row_stream_id, segments).await;
                     BulkCompletion::RowAppend { resp_tx, result }
                 }))
             }
@@ -11604,23 +11606,19 @@ async fn do_flush_on_bulk(
     row_stream_id: u64,
 ) -> Result<(TableMeta, SstReader)> {
     let imm_clone = imm.clone();
-    let (sst_bytes, last_seq) =
-        compio::runtime::spawn_blocking(move || build_sst_bytes(&imm_clone, vp_eid, vp_off))
-            .await
-            .map_err(|_| anyhow::anyhow!("SSTable build task failed"))?;
+    let (sst, last_seq) = compio::runtime::spawn_blocking(move || build_sst(&imm_clone, vp_eid, vp_off))
+        .await
+        .map_err(|_| anyhow::anyhow!("SSTable build task failed"))?;
 
-    let append_result = sst_sc.append(row_stream_id, &sst_bytes).await?;
-    let estimated_size = sst_bytes.len() as u64;
-    let sst_len = sst_bytes.len() as u64;
-    // parse the meta then DROP the resident bytes — blocks are
-    // served on demand from row_stream through the bounded global cache.
-    // (No cache invalidation needed on later GC: extent ids are never
-    // reused, stale entries simply age out of the LRU.)
-    let reader = SstReader::from_bytes(Bytes::from(sst_bytes))?.into_paged(
-        append_result.extent_id,
-        append_result.offset,
-        sst_len,
-    );
+    let sst_len = sst.len();
+    let segments = sst.segments.iter().cloned().map(Into::into).collect();
+    let append_result = sst_sc.append_segments(row_stream_id, segments).await?;
+    let estimated_size = sst_len;
+    // A paged reader from the meta alone — blocks are served on demand from
+    // row_stream through the bounded global cache. (No cache invalidation
+    // needed on later GC: extent ids are never reused, stale entries simply
+    // age out of the LRU.)
+    let reader = SstReader::open_paged_from_meta(sst.meta(), append_result.extent_id, append_result.offset, sst_len)?;
     let new_meta = TableMeta {
         extent_id: append_result.extent_id,
         offset: append_result.offset,
@@ -12049,7 +12047,8 @@ mod tests {
                 10,
             );
         }
-        let (bytes, _last_seq) = build_sst_bytes(&mt, 0, 0);
+        let (sst, _last_seq) = build_sst(&mt, 0, 0);
+        let bytes = sst.to_bytes().to_vec();
         let reader = SstReader::from_bytes(bytes::Bytes::from(bytes)).expect("reader");
         for (uk, want) in [
             (b"a".as_ref(), b"shallow".as_ref()),
@@ -12077,7 +12076,8 @@ mod tests {
                 10,
             );
         }
-        let (bytes, _) = build_sst_bytes(&mt, 0, 0);
+        let (sst, _) = build_sst(&mt, 0, 0);
+        let bytes = sst.to_bytes().to_vec();
         let reader = SstReader::from_bytes(bytes::Bytes::from(bytes)).expect("reader");
         let fp = (0..20_000u32)
             .filter(|i| reader.bloom_may_contain(format!("absent{i:06}").as_bytes()))
@@ -12434,7 +12434,7 @@ mod tests {
         assert_eq!(decoded.vp_offset, 100);
     }
 
-    // ── build_sst_bytes test ─────────────────────────────────────────────────
+    // ── build_sst test ─────────────────────────────────────────────────
 
 }
 

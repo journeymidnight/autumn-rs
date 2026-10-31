@@ -2877,11 +2877,11 @@ async fn checkpoint_and_truncate_row_prefix(
 async fn compact_row_append(
     row_append_tx: &futures::channel::mpsc::Sender<crate::RowAppendReq>,
     row_stream_id: u64,
-    sst_bytes: Bytes,
+    sst_segments: Vec<Bytes>,
 ) -> Result<autumn_stream::AppendResult> {
     let (resp_tx, resp_rx) = futures::channel::oneshot::channel();
     let req = crate::RowAppendReq {
-        sst_bytes,
+        sst_segments,
         row_stream_id,
         resp_tx,
     };
@@ -2910,22 +2910,23 @@ async fn emit_compact_chunk(
     chunk_last_seq: u64,
     new_readers: &mut Vec<(TableMeta, Arc<SstReader>)>,
 ) -> Result<u64> {
-    // Build SST bytes off the compio runtime (spawn_blocking): ~256 MiB
-    // memcpy at max chunk + bloom finalize + meta encode + CRC32C — the same
-    // offload flush_one_imm does via build_sst_bytes (note 17).
-    let sst_bytes = compio::runtime::spawn_blocking(move || Bytes::from(builder.finish()))
+    // Finish off the compio runtime (spawn_blocking): bloom finalize, meta
+    // encode and the last block's CRC32C — the same offload flush does via
+    // build_sst (note 17).
+    let sst = compio::runtime::spawn_blocking(move || builder.finish())
         .await
         .map_err(|_| anyhow!("compact builder finish join failed"))?;
-    let chunk_bytes = sst_bytes.len() as u64;
+    let chunk_bytes = sst.len();
     // Sleep BEFORE the append so the counter reflects "intent to write".
     rate_ctrl.account_compact(chunk_bytes).await;
     // Route through P-sst's StreamClient to preserve the single-writer
     // invariant on row_stream.
-    let result = compact_row_append(row_append_tx, row_stream_id, sst_bytes.clone()).await?;
-    let reader = compio::runtime::spawn_blocking(move || SstReader::from_bytes(sst_bytes))
-        .await
-        .map_err(|_| anyhow!("compact SstReader join failed"))??
-        .into_paged(result.extent_id, result.offset, result.end - result.offset);
+    let result = compact_row_append(row_append_tx, row_stream_id, sst.segments.clone()).await?;
+    let reader = compio::runtime::spawn_blocking(move || {
+        SstReader::open_paged_from_meta(sst.meta(), result.extent_id, result.offset, result.end - result.offset)
+    })
+    .await
+    .map_err(|_| anyhow!("compact SstReader join failed"))??;
     new_readers.push((
         TableMeta {
             extent_id: result.extent_id,
@@ -4943,7 +4944,7 @@ mod lookup_block_boundary_tests {
             let seq = (i as u64) + 1;
             b.add(&key_with_ts(&uk, seq), 1, &val, 0);
         }
-        let reader = SstReader::from_bytes(bytes::Bytes::from(b.finish())).expect("reader");
+        let reader = SstReader::from_bytes(b.finish().to_bytes()).expect("reader");
 
         // The bug only exists with >1 block; assert we actually exercise it.
         assert!(
@@ -5337,7 +5338,7 @@ mod splice_tests {
     fn t(offset: u64, last_seq: u64) -> (TableMeta, Arc<SstReader>) {
         let mut b = SstBuilder::new(0, 0, 1);
         b.add(&key_with_ts(b"k", last_seq), 1, b"v", 0);
-        let reader = SstReader::from_bytes(bytes::Bytes::from(b.finish())).expect("reader");
+        let reader = SstReader::from_bytes(b.finish().to_bytes()).expect("reader");
         let meta = TableMeta { extent_id: 1, offset, len: 1, estimated_size: 1, last_seq };
         (meta, Arc::new(reader))
     }
