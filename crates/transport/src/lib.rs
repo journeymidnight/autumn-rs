@@ -38,7 +38,7 @@ mod regpool;
 pub use regpool::{
     acquire as regpool_acquire, set_regpool_cap_bytes,
     acquire_for as regpool_acquire_for, acquire_many_for as regpool_acquire_many_for, acquire_charged_if_room as regpool_acquire_charged_if_room, snapshot as regpool_snapshot, log_snapshot as regpool_log, render_prometheus as render_regpool_metrics, try_acquire_for as regpool_try_acquire_for,
-    thread_share_of as regpool_thread_share_of, PoolError, PooledBuf, RegBytes, RegpoolStats, Use as PoolUse,
+    thread_share_of as regpool_thread_share_of, thread_held as regpool_thread_held, PoolError, PooledBuf, RegBytes, RegpoolStats, Use as PoolUse,
     UseStats as PoolUseStats,
 };
 pub use recv_dest::{RecvDest, Released};
@@ -82,6 +82,15 @@ pub mod am {
         return crate::ucx::am::sent_counts();
         #[cfg(not(feature = "ucx"))]
         (0, 0)
+    }
+
+    /// Bytes this process copied into a pool buffer before sending them,
+    /// because they came without a memh.
+    pub fn staged_bytes() -> u64 {
+        #[cfg(feature = "ucx")]
+        return crate::ucx::am::staged_bytes();
+        #[cfg(not(feature = "ucx"))]
+        0
     }
 
     /// A tag no other value expected on this thread carries.

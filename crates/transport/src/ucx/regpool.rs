@@ -45,7 +45,7 @@ const UNIT: usize = 4096;
 /// Size of a chunk made for requests up to its size.
 const CHUNK_BYTES: usize = 64 << 20;
 /// Largest chunk; a larger request is an out-of-pool heap buffer.
-const MAX_CHUNK_BYTES: usize = 256 << 20;
+pub(crate) const MAX_CHUNK_BYTES: usize = 256 << 20;
 
 static ACQUIRE_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// Acquires served from a chunk that already existed.
@@ -142,6 +142,7 @@ pub fn log_snapshot() {
         staging = %format_args!("{staging}"),
         am_sent_bytes_memh = am_sent_bytes().0,
         am_sent_bytes_no_memh = am_sent_bytes().1,
+        am_staged_bytes = am_staged_bytes(),
         "regpool"
     );
 }
@@ -195,6 +196,10 @@ pub fn render_prometheus(prefix: &str) -> String {
     out.push_str(&format!(
         "# TYPE {prefix}_ucx_am_sent_bytes_total counter\n{prefix}_ucx_am_sent_bytes_total{{memh=\"yes\"}} {with}\n{prefix}_ucx_am_sent_bytes_total{{memh=\"no\"}} {without}\n"
     ));
+    out.push_str(&format!(
+        "# TYPE {prefix}_ucx_am_staged_bytes_total counter\n{prefix}_ucx_am_staged_bytes_total {}\n",
+        am_staged_bytes()
+    ));
     for (name, kind, f) in per_use {
         out.push_str(&format!("# TYPE {prefix}_regpool_{name} {kind}\n"));
         for (label, u) in USE_NAMES.iter().zip(&s.uses) {
@@ -202,6 +207,14 @@ pub fn render_prometheus(prefix: &str) -> String {
         }
     }
     out
+}
+
+/// Bytes copied into a pool buffer to be sent as active messages (0 without UCX).
+fn am_staged_bytes() -> u64 {
+    #[cfg(feature = "ucx")]
+    return crate::ucx::am::staged_bytes();
+    #[cfg(not(feature = "ucx"))]
+    0
 }
 
 /// Active-message bytes sent with a memh and without (0 without UCX).
@@ -933,6 +946,12 @@ fn thread_quota(i: usize) -> usize {
 
 fn thread_share(cap: usize, i: usize) -> usize {
     cap / 100 * USE_SHARE[i] / THREAD_SHARE_DIVISOR
+}
+
+/// Bytes this thread holds of `u` (charges taken here, wherever they are
+/// returned from).
+pub fn thread_held(u: Use) -> usize {
+    HELD.try_with(|h| h[u as usize].load(Ordering::Relaxed)).unwrap_or(0)
 }
 
 /// What one thread may hold of `u` under a pool cap of `cap` bytes.

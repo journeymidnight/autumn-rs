@@ -304,8 +304,8 @@ async fn a_frame_value_append_whose_payload_misses_its_crc_is_refused() {
 }
 
 /// An append whose body is a pool buffer goes out with that buffer's memh (a
-/// PS appending a value it received into one); a plain `Bytes` body goes
-/// without. UCX only.
+/// PS appending a value it received into one); a plain `Bytes` body is copied
+/// into a pool buffer first and goes with that one's. UCX only.
 #[compio::test]
 async fn an_append_from_a_pool_buffer_carries_its_memh() {
     let Ok(bind) = std::env::var("AUTUMN_TEST_UCX_BIND") else {
@@ -334,13 +334,15 @@ async fn an_append_from_a_pool_buffer_carries_its_memh() {
     for (body, with_memh) in [(pooled, true), (plain.into(), false)] {
         let body: autumn_transport::RegBytes = body;
         let before = autumn_transport::am::sent_counts();
+        let staged_before = autumn_transport::am::staged_bytes();
         let payload = PreparedPayload::new(AppendReq::encode_header(704, 1, offset, 1), vec![body], 1);
         let frame = client.send_prepared(MSG_APPEND, &payload).await.unwrap().await.unwrap();
         assert!(!frame.is_error());
         assert_eq!(AppendResp::decode(frame.payload).unwrap().code, CODE_OK);
         let after = autumn_transport::am::sent_counts();
-        let counted = if with_memh { after.0 - before.0 } else { after.1 - before.1 };
-        assert_eq!(counted, 1, "with_memh={with_memh}: {before:?} -> {after:?}");
+        assert_eq!((after.0 - before.0, after.1 - before.1), (1, 0), "with_memh={with_memh}");
+        let staged = autumn_transport::am::staged_bytes() - staged_before;
+        assert_eq!(staged, if with_memh { 0 } else { len as u64 }, "with_memh={with_memh}");
         offset += len as u64;
     }
     let shard = crc32c::crc32c(&704u64.to_le_bytes()) & 0xff;
@@ -350,9 +352,10 @@ async fn an_append_from_a_pool_buffer_carries_its_memh() {
 }
 
 /// A bulk call whose value is a pool buffer (an SDK `put` of a `ValueBuf`)
-/// sends it as a frame value with that buffer's memh; a plain `Bytes` goes
-/// without. The extent node refuses the opcode; the send is what is counted.
-/// UCX only.
+/// sends it as a frame value with that buffer's memh; a plain `Bytes` is
+/// copied into a pool buffer first. Either way UCX gets a memh, never memory
+/// to register itself. The extent node refuses the opcode; the send is what is
+/// counted. UCX only.
 #[compio::test]
 async fn a_bulk_call_with_a_pool_buffer_carries_its_memh() {
     let Ok(bind) = std::env::var("AUTUMN_TEST_UCX_BIND") else {
@@ -376,11 +379,13 @@ async fn a_bulk_call_with_a_pool_buffer_carries_its_memh() {
     let plain: autumn_transport::RegBytes = Bytes::from(vec![0x22u8; len]).into();
     for (value, with_memh) in [(pooled, true), (plain, false)] {
         let before = autumn_transport::am::sent_counts();
+        let staged_before = autumn_transport::am::staged_bytes();
         let reply = client.call_vectored_bulk(autumn_rpc::partition_rpc::MSG_PUT_BULK, vec![Bytes::from_static(b"x")], value).await;
         assert!(reply.is_err(), "an extent node does not take MSG_PUT_BULK");
         let after = autumn_transport::am::sent_counts();
-        let counted = if with_memh { after.0 - before.0 } else { after.1 - before.1 };
-        assert_eq!(counted, 1, "with_memh={with_memh}: {before:?} -> {after:?}");
+        assert_eq!((after.0 - before.0, after.1 - before.1), (1, 0), "with_memh={with_memh}");
+        let staged = autumn_transport::am::staged_bytes() - staged_before;
+        assert_eq!(staged, if with_memh { 0 } else { len as u64 }, "with_memh={with_memh}");
     }
     drop(server);
 }

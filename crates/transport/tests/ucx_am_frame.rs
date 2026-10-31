@@ -9,8 +9,6 @@ use autumn_transport::am;
 use autumn_transport::{AutumnTransport, ReadHalf, TransportKind, UcxTransport};
 use bytes::Bytes;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use std::time::Duration;
 
 fn bind_addr() -> SocketAddr {
@@ -37,21 +35,20 @@ async fn pair() -> (am::Sender, ReadHalf, impl Sized) {
     (server_w.am_sender().expect("a UCX connection"), client_r, (server_r, client_w))
 }
 
-/// A value whose memory reports when the sender let go of it.
-fn tracked(data: Vec<u8>) -> (Bytes, Arc<AtomicBool>) {
-    struct Owner(Vec<u8>, Arc<AtomicBool>);
-    impl AsRef<[u8]> for Owner {
-        fn as_ref(&self) -> &[u8] {
-            &self.0
-        }
-    }
-    impl Drop for Owner {
-        fn drop(&mut self) {
-            self.1.store(true, Ordering::Relaxed);
-        }
-    }
-    let gone = Arc::new(AtomicBool::new(false));
-    (Bytes::from_owner(Owner(data, gone.clone())), gone)
+/// Staging bytes this thread holds: a plain value is sent from a copy in a
+/// pool buffer (charged here, where the send runs), released when the sender
+/// lets go of it.
+fn staged() -> usize {
+    autumn_transport::regpool_thread_held(autumn_transport::PoolUse::Staging)
+}
+
+/// Post a plain value and wait until its sender has let go of its staged
+/// copy. The send is spawned, so "nothing staged" alone would also hold before
+/// it ran: it must have been sent too.
+async fn post_until_released(tx: &am::Sender, tag: u64, value: Vec<u8>, what: &str) {
+    let sent = am::sent_counts();
+    tx.post_frame_value(tag, Bytes::from(value));
+    until(what, || am::sent_counts() != sent && staged() == 0).await;
 }
 
 async fn until(what: &str, f: impl Fn() -> bool) {
@@ -106,11 +103,11 @@ async fn pieces_from_the_stream_and_from_values_join_in_order() {
 #[compio::test]
 async fn a_value_of_another_length_is_refused_and_its_sender_completes() {
     let (tx, rx, _keep) = pair().await;
-    let (value, sent) = tracked(vec![5u8; 1 << 20]);
-    tx.post_frame_value(9, value);
+    let sent = am::sent_counts();
+    tx.post_frame_value(9, Bytes::from(vec![5u8; 1 << 20]));
     let Err(err) = am::receive_frame_value(&rx, &[(2 << 20, 9)], &[]).await else { panic!("received") };
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "{err}");
-    until("the sender let go of the refused value", || sent.load(Ordering::Relaxed)).await;
+    until("the sender let go of the refused value", || am::sent_counts() != sent && staged() == 0).await;
 }
 
 #[compio::test]
@@ -120,23 +117,18 @@ async fn values_nobody_will_receive_let_their_senders_complete() {
     let segments = [(1 << 20, 11)];
     let receive = am::receive_frame_value(&rx, &segments, &[]);
     assert!(compio::time::timeout(Duration::from_millis(20), receive).await.is_err());
-    let (value, sent) = tracked(vec![1u8; 1 << 20]);
-    tx.post_frame_value(11, value);
-    until("a given-up value's sender completed", || sent.load(Ordering::Relaxed)).await;
+    post_until_released(&tx, 11, vec![1u8; 1 << 20], "a given-up value's sender completed").await;
 
     // Held for a frame that never comes: released with the connection.
-    let (value, sent) = tracked(vec![2u8; 1 << 20]);
-    tx.post_frame_value(12, value);
+    tx.post_frame_value(12, Bytes::from(vec![2u8; 1 << 20]));
     compio::time::sleep(Duration::from_millis(50)).await;
-    assert!(!sent.load(Ordering::Relaxed), "the value should wait for its frame");
+    assert!(staged() >= 1 << 20, "the value should wait for its frame");
     drop(rx);
     drop(keep);
-    until("a held value's sender completed after its connection went", || sent.load(Ordering::Relaxed)).await;
+    until("a held value's sender completed after its connection went", || staged() == 0).await;
 
     // Sent after its connection went (UCX keeps the endpoint): dropped on arrival.
-    let (value, sent) = tracked(vec![3u8; 1 << 20]);
-    tx.post_frame_value(13, value);
-    until("a value for a connection already gone let its sender complete", || sent.load(Ordering::Relaxed)).await;
+    post_until_released(&tx, 13, vec![3u8; 1 << 20], "a value for a connection already gone let its sender complete").await;
 }
 
 #[compio::test]
@@ -156,17 +148,14 @@ async fn values_started_together_are_waited_in_any_order() {
 #[compio::test]
 async fn an_abandoned_value_lets_its_sender_complete_whether_it_came_first_or_not() {
     let (tx, rx, _keep) = pair().await;
-    let (held, held_sent) = tracked(vec![4u8; 1 << 20]);
-    tx.post_frame_value(31, held);
+    tx.post_frame_value(31, Bytes::from(vec![4u8; 1 << 20]));
     compio::time::sleep(Duration::from_millis(50)).await;
-    assert!(!held_sent.load(Ordering::Relaxed), "held for its frame");
+    assert!(staged() >= 1 << 20, "held for its frame");
     am::abandon_frame_value(&rx, &[(1 << 20, 31)]);
-    until("a held value's sender completed once abandoned", || held_sent.load(Ordering::Relaxed)).await;
+    until("a held value's sender completed once abandoned", || staged() == 0).await;
 
     am::abandon_frame_value(&rx, &[(1 << 20, 32)]);
-    let (late, late_sent) = tracked(vec![5u8; 1 << 20]);
-    tx.post_frame_value(32, late);
-    until("a value abandoned before it came let its sender complete", || late_sent.load(Ordering::Relaxed)).await;
+    post_until_released(&tx, 32, vec![5u8; 1 << 20], "a value abandoned before it came let its sender complete").await;
 }
 
 /// A pool buffer from the middle of its chunk goes out with the chunk's memh

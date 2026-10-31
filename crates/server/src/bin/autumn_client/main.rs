@@ -1029,6 +1029,10 @@ async fn cmd_perf_check(client: &ClusterClient, threads: usize, duration_secs: u
     for (name, u) in ["receive", "reply", "staging"].iter().zip(pool.uses.iter()) {
         println!("regpool {name}: {u}");
     }
+    println!(
+        "ucx am: staged_bytes={} (values sent from a copy in the pool)",
+        autumn_transport::am::staged_bytes()
+    );
 
     // ---- Regression check ----
     let mut regressed = false;

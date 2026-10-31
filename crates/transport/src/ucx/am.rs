@@ -522,9 +522,38 @@ impl FrameValue {
     }
 }
 
+/// Bytes copied into a pool buffer to be sent (`Staged::of`).
+static STAGED_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Bytes this process copied into a pool buffer before sending them as an
+/// active message, because they came without a memh.
+pub fn staged_bytes() -> u64 {
+    STAGED_BYTES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// A value UCX may send: bytes with the memh of the pool buffer they live in.
+/// Only `of` builds one, copying a value that has no memh into a pool buffer,
+/// so UCX is never handed memory it would register itself. A value larger than
+/// the largest chunk (256 MiB) has no pool buffer to go into and is sent as it
+/// is, until large transfers are sent in segments.
+struct Staged(RegBytes);
+
+impl Staged {
+    fn of(value: RegBytes) -> Self {
+        if value.is_registered() || value.is_empty() || value.len() > crate::regpool::MAX_CHUNK_BYTES {
+            return Self(value);
+        }
+        let mut pb = crate::regpool::acquire_charged_if_room(crate::regpool::Use::Staging, value.len());
+        pb.dest_mut().copy_from_slice(&value);
+        STAGED_BYTES.fetch_add(value.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        Self(pb.freeze())
+    }
+}
+
 /// Send `value` as the AM `am_id` tagged `tag`. Completes once UCX no longer
 /// needs `value` (for a rendezvous: once the receiver fetched or dropped it).
-async fn send_am(ep: &UcxEp, am_id: u32, tag: u64, value: RegBytes, extra_flags: u32) -> io::Result<()> {
+async fn send_am(ep: &UcxEp, am_id: u32, tag: u64, value: Staged, extra_flags: u32) -> io::Result<()> {
+    let Staged(value) = value;
     let memh = value.memh();
     let mut payload = ManuallyDrop::new(value.into_bytes());
     let (ptr_v, len) = (payload.as_ptr() as *const c_void, payload.len());
@@ -587,11 +616,11 @@ async fn send_am(ep: &UcxEp, am_id: u32, tag: u64, value: RegBytes, extra_flags:
 
 /// Send `value` as the value the receiver asked for with `tag`.
 pub(crate) async fn send(ep: &UcxEp, tag: u64, value: RegBytes) -> io::Result<()> {
-    send_am(ep, VALUE_AM_ID, tag, value, 0).await
+    send_am(ep, VALUE_AM_ID, tag, Staged::of(value), 0).await
 }
 
 /// Send `value` as the frame value tagged `tag`. The receiver keys it by
 /// the endpoint it arrived on, which the reply flag hands its handler.
 pub(crate) async fn send_frame_value(ep: &UcxEp, tag: u64, value: RegBytes) -> io::Result<()> {
-    send_am(ep, FRAME_VALUE_AM_ID, tag, value, ucp_send_am_flags::UCP_AM_SEND_FLAG_REPLY as u32).await
+    send_am(ep, FRAME_VALUE_AM_ID, tag, Staged::of(value), ucp_send_am_flags::UCP_AM_SEND_FLAG_REPLY as u32).await
 }

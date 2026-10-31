@@ -8,7 +8,8 @@ Main gaps: UCX `discard_value` branch untested; an EN with `Reply` full costs ea
 Deferred (user 2026-10-30): the 4K write tail (perf-check TCP 4K p50 0.69 ms, p95 21 ms, p99 36 ms; 128 in flight / 34K ops/s = 3.7 ms mean, so the tail, not --conn-inflight-cap 16, sets the rate) is investigated after the whole redesign, in its final perf check.
 Step 2 committed through 261e138f (metrics f5000368, batch acquire 969d7d0b, mid-chunk rendezvous test); only "one item over a chunk → error" waits for step 5.
 Step 3 in progress (user 2026-10-30: carry the memh with the value as RegBytes, not an address lookup). 3a: chain 1 (PS receive → WAL → EN append) 5cec2ea3, chain 2 (PS GET replies) fd5115ee, chain 3 (SDK ValueBuf/put) done; GC relocation needs no chain of its own — background data is staged at the UCX send (3b), as the design says. Then chain 2 (PS GET replies), chain 3 (SDK ValueBuf/put), chain 4 (GC); 3b (UCX send takes only memh-carrying values, others staged into the pool), 3c (register/unregister + handle-based put_from, BUG-PY-PUT), 3d (GET_AM into caller memory).
-Next steps: 3b (UCX send takes only values with a memh; others staged into the pool), then a perf A/B covering chains 3 and 3b.
+3a chain 3 1280e579; 3b (UCX send takes only staged values: memh or copied into the pool) done — UCX 4K reads −3.5% from staging small inline GET_AM replies (UCX zero-copies from 515 B), recorded.
+Next steps: 3c (register/unregister for caller memory + handle-based put_from, BUG-PY-PUT), 3d (GET_AM into caller memory).
 
 Date: 2026-10-28 (3)
 TaskStatus: completed

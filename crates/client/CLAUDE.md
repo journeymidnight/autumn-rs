@@ -92,18 +92,19 @@ re-exported as `autumn_client::RegBytes`). `IntoValue` produces a `RegBytes`, an
 `put_bound` / `put_bulk_opts` and rpc's `call_vectored_bulk` carry it, so over UCX a
 value of 64 KiB or more goes out as a frame value with the slab's memh and UCX does
 no lookup (a smaller one is copied inline, as before); `Bytes` / `Vec<u8>` / slices
-carry none, nor do `put_many` / `compare_put`, which take `Bytes`. The test
+carry none, nor do `put_many` / `compare_put`, which take `Bytes`: over UCX such a
+value is copied into a pool buffer at the send (autumn-transport, "UCX is never
+handed memory to register itself"). The test
 (stream `prepared_append.rs` `a_bulk_call_with_a_pool_buffer_carries_its_memh`)
 drives rpc's `call_vectored_bulk`, not `put`; the SDK hops above it are typed. Read side: `get_pooled` hands the recv'd
 pool buffer back as a `ValueBuf` (zero SDK-side copies); read in place or
 `freeze().into_bytes()` for a framework sink (HTTP body). Dropping
-either returns the slab to the pool. Cross-thread drop of a frozen `RegBytes` is legal but
-frees the slab instead of re-pooling (regpool home-thread guard — foreign-TLS re-pooling
-would corrupt per-thread pinning accounts). Fresh per-op allocations are the
-anti-pattern: on UCX every send from a fresh address re-registers (~100 µs × rails) and
-the rcache entry dies with the free: memory without a memh is registered by UCX's
-own cache (to be replaced by a copy into the pool at the UCX send for unregistered
-memory, and an explicit registration API — data-path redesign steps 3b, 3c).
+either returns the slab to the pool. A frozen `RegBytes` may be dropped on any
+thread: its range goes back to its chunk under the chunk's lock. Writing into a `ValueBuf` is
+the zero-copy way: on UCX memory without a memh (a fresh allocation, a caller's
+`Bytes`) is copied into a pool buffer at the send, one memcpy per value; an
+explicit registration API for long-lived caller memory is data-path redesign
+step 3c.
 
 **What `bulk` names (naming contract):** `MSG_*_BULK` (wire) = value-separable
 framing — the value rides in the v28 frame's raw value region, never encoded or

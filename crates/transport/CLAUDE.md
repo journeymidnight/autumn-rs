@@ -440,12 +440,37 @@ autumn-rpc's `AmOut` / `encode_am_frame` take `impl Into<RegBytes>`.
 slice, a static `Bytes` that no longer holds the buffer, so a memh never
 outlives its chunk (`ucx_am_frame.rs`
 `an_empty_slice_of_a_registered_value_keeps_no_memh`, red without) — and
-`Default` is empty. `Memh` is a `NonNull`, so `RegBytes` is 40 bytes. The extent node's bulk read reply and the PS's appends of values it
-received (`Frame.value`, `PreparedPayload` body) send that way; other
-producers still hand plain `Bytes` (the data-path redesign converts them and
-then forbids values with no memh). `am::sent_counts()` reports this thread's
-sends with and without a memh, `am::sent_bytes()` the process's bytes (on the
-regpool log line and `/metrics` as `*_ucx_am_sent_bytes_total{memh}`). Without a memh, UCX takes the context lock the workers share for every
+`Default` is empty. `Memh` is a `NonNull`, so `RegBytes` is 40 bytes. The
+extent node's bulk read reply, the PS's appends of values it received
+(`Frame.value`, `PreparedPayload` body), its GET replies and an SDK `put` of a
+`ValueBuf` send that way. `am::sent_counts()` reports this thread's sends with
+and without a memh, `am::sent_bytes()` the process's bytes (on the regpool log
+line and `/metrics` as `*_ucx_am_sent_bytes_total{memh}`).
+
+**UCX is never handed memory to register itself.** `send_am` takes a `Staged`,
+which only `Staged::of` builds: a value with a memh (or empty) passes through, any
+other is copied into a pool buffer (`acquire_charged_if_room(Staging)`, so a send
+never fails for want of one) and sent with that buffer's memh. The copy is
+counted (`am::staged_bytes()`, regpool log `am_staged_bytes`, `/metrics`
+`*_ucx_am_staged_bytes_total`). It is the one copy the design allows for memory
+the caller did not register (heap values, background data); the sender then
+holds the staged copy, not its own memory, until UCX is done with it. A value
+over the largest chunk (256 MiB) is sent as it is, without a memh (a heap copy
+would buy nothing), until large transfers are segmented. Small values are
+staged too: on rc_mlx5 an active message from 515 B up is sent zero-copy, i.e.
+registered, and only 514 B and below are copied by UCX (`UCX_PROTO_INFO=y`).
+That costs the PS's small GET replies over UCX (inline memtable/SST values, sent
+by `MSG_GET_AM`) a pool buffer and a copy each: perf-check UCX 4K reads
+281K/277K vs 289K/288K ops/s before (two rounds, alternating). UCX, 8 MiB perf-check: the client staged
+~59 GB (its heap values), the PS and extent nodes staged nothing and sent
+everything with a memh. Tests: stream `prepared_append.rs` (a plain `Bytes`
+append and bulk call each sent with a memh and counted as staged; red without
+the staging), `ucx_am_frame.rs` (a sender lets go of its staged copy when the
+receiver takes, refuses or abandons the value, or the connection goes —
+watched through `regpool_thread_held(Staging)` together with the thread's send
+count, since the send is spawned and nothing is staged before it runs).
+
+Without a memh, UCX takes the context lock the workers share for every
 cache lookup (`ucp_memh_get`); with one it skips the lookup and the lock.
 Measured (`benches/am_memh.rs`: slabs sent over and over, each sender thread to
 its own receiver thread, rc_mlx5, alternating arms): one sender, no difference
