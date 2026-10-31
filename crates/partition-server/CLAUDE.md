@@ -724,7 +724,8 @@ is written durably behind it — held, it would be dropped when the older write
 landed and reads would go back to the older value.
 Reads look in the tier first: `get_value_inner` (GET, batched GET, redirects,
 `compare`) and `lookup_live` (HEAD, presence checks) — a hit is shaped as an
-inline memtable hit, so a redirect request gets the value inline.
+inline memtable hit, so a redirect request gets the value inline (a batch
+redirect declines one of 64 KiB or more, see "Direct reads" below).
 
 - **Not durable**: a restart, reopen, split, merge or move drops the shard
   with `PartitionData`; a key that also has a durable value reads that older
@@ -771,6 +772,17 @@ inline memtable hit, so a redirect request gets the value inline.
   falls back to a value older than the held one; a later memory put clears
   the mark. GC relocation writes the memtable through its own path, so it
   never drops an entry.
+- **Direct reads.** A held value has no extent to point a client at, so
+  `get_value_inner` returns the value itself. `MSG_GET_REDIRECT_MANY` declines
+  one at or past the bulk cut (64 KiB, `CODE_PRECONDITION`, which the client
+  reads through the PS like any declined item) instead of inlining it into its
+  rkyv reply; inlined, 36 held 33 MiB layers of one vLLM request came back as
+  a single 1.2 GB reply and took 7.0 s (0.5 s declined; UCX, `BatchClient(direct=True)`),
+  and in vLLM the load missed every layer. `MSG_GET_REDIRECT` (one key) still
+  inlines a held value of any size: its callers (`get_direct`,
+  `get_range_direct_into`, also `get_many_direct`'s fallback when a whole batch
+  call fails) take a decline as an error, and the message goes with the
+  unified READ (data-path step 6).
 - Not covered: RANGE does not list keys held only in memory.
 - Metrics: `autumn_ps_mem_tier_{bytes,capacity_bytes,hits_total,
   inserts_total,refused_total,evicted_entries_total,evicted_bytes_total}`.
@@ -784,8 +796,10 @@ inline memtable hit, so a redirect request gets the value inline.
   `crates/manager/tests/mem_tier.rs` (held keys gone after a restart, durable
   fallbacks back, a durable write replacing the held value, delete, TTL,
   conditional write, the oldest burst evicted whole, a held put behind an
-  older durable write of its key written durably; ablations red: no drop on
-  apply, GET or presence lookup skipping the tier, no older-write check).
+  older durable write of its key written durably, a held bulk value declined
+  by a batch redirect and still read whole; ablations red: no drop on
+  apply, GET or presence lookup skipping the tier, no older-write check, the
+  held value inlined).
 
 ## Read Path: Get
 

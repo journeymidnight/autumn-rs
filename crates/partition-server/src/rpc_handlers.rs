@@ -714,6 +714,12 @@ pub(crate) async fn handle_get_redirect_many(
         });
         let resp = match get_value_inner(item_payload, part, true).await? {
             GetOutcome::NotFound => not_found(),
+            // A value past the bulk cut that is on no extent (held by the
+            // memory tier) goes through the PS's bulk read, not inside this
+            // rkyv reply.
+            GetOutcome::Value(value) if value.len() >= autumn_rpc::BULK_MIN_BYTES => {
+                declined("held in memory; read it through the partition server".to_string())
+            }
             // Each inlined value is small — `get_value_inner` redirects any VP
             // sub-range at or above the 64 KiB threshold — but the reply holds
             // ONE PER ITEM and the SDK puts every same-partition item in one

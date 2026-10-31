@@ -66,6 +66,24 @@ fn memory_tier_holds_covered_puts_until_restart() {
             assert_eq!(get(&c, format!("kvc/C{i}").as_bytes()).await, Some(vec![3; page]), "C{i}: the newest stayed");
         }
 
+        // A held value past the bulk cut is not inlined into a batch redirect
+        // reply (an rkyv reply, every value inside it): it is declined, and
+        // the client reads it through the PS.
+        let ps = RpcClient::connect(ps_addr).await.unwrap();
+        let ask = autumn_rpc::partition_rpc::rkyv_encode(&autumn_rpc::partition_rpc::GetRedirectManyReq {
+            part_id: PART,
+            region_epoch: 0,
+            items: vec![autumn_rpc::partition_rpc::GetRedirectItem { key: b"kvc/B0".to_vec(), offset: 0, length: 0 }],
+        });
+        let reply = ps.call(autumn_rpc::partition_rpc::MSG_GET_REDIRECT_MANY, ask).await.unwrap();
+        let reply: autumn_rpc::partition_rpc::GetRedirectManyResp = autumn_rpc::partition_rpc::rkyv_decode(&reply).unwrap();
+        assert_eq!(reply.results[0].code, autumn_rpc::partition_rpc::CODE_PRECONDITION, "declined, not inlined");
+        assert!(reply.results[0].value.is_empty());
+        let mut dest = vec![0u8; page];
+        let mut items = [autumn_client::GetManyItem { key: b"kvc/B0", offset: 0, length: 0, dest: &mut dest }];
+        assert_eq!(c.get_many_direct(&mut items).await[0].as_ref().unwrap(), &Some(page));
+        assert_eq!(dest, vec![2; page], "read through the PS");
+
         let big = 100 << 10; // a bulk put: what the tier holds
         let fenced = WriteOptions::fenced(WriteLease { inode_hint: 5, lease_epoch: 1 });
 
