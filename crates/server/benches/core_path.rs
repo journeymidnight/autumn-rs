@@ -42,7 +42,7 @@ fn cpu_snapshot() -> serde_json::Value {
 async fn run(
     client: &ClusterClient,
     keys: &[Vec<u8>],
-    value: &bytes::Bytes,
+    value: &autumn_client::RegBytes,
     seconds: u64,
     depth: usize,
     mode: &str,

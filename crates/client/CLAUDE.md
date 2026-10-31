@@ -84,17 +84,26 @@ Semantics / invariants:
 ## Public API — data operations
 
 **`ValueBuf` is the data-plane buffer currency**: a RegPool-backed slab
-with a STABLE, recycled address (UCX runtime: `ucp_mem_map`-registered at slab creation
-→ rcache/memh zero-copy; TCP runtime: plain recycler, no per-op alloc/zero). Write side:
-`alloc_value_buf(len)` → fill `as_mut_slice()` → `truncate(n)` → `freeze() → Bytes` →
-`put`. Read side: `get_pooled` hands the recv'd pool buffer back as a `ValueBuf`
-(zero SDK-side copies); read in place or `freeze()` for a framework sink. Dropping
-either returns the slab to the pool. Cross-thread drop of a frozen `Bytes` is legal but
+with a STABLE, recycled address (UCX runtime: `ucp_mem_map`-registered at slab creation;
+TCP runtime: plain recycler, no per-op alloc/zero). Write side:
+`alloc_value_buf(len)` → fill `as_mut_slice()` → `truncate(n)` → `put` (the
+`ValueBuf` itself, or `freeze()`, a `RegBytes`: the bytes plus the slab's memh,
+re-exported as `autumn_client::RegBytes`). `IntoValue` produces a `RegBytes`, and
+`put_bound` / `put_bulk_opts` and rpc's `call_vectored_bulk` carry it, so over UCX a
+value of 64 KiB or more goes out as a frame value with the slab's memh and UCX does
+no lookup (a smaller one is copied inline, as before); `Bytes` / `Vec<u8>` / slices
+carry none, nor do `put_many` / `compare_put`, which take `Bytes`. The test
+(stream `prepared_append.rs` `a_bulk_call_with_a_pool_buffer_carries_its_memh`)
+drives rpc's `call_vectored_bulk`, not `put`; the SDK hops above it are typed. Read side: `get_pooled` hands the recv'd
+pool buffer back as a `ValueBuf` (zero SDK-side copies); read in place or
+`freeze().into_bytes()` for a framework sink (HTTP body). Dropping
+either returns the slab to the pool. Cross-thread drop of a frozen `RegBytes` is legal but
 frees the slab instead of re-pooling (regpool home-thread guard — foreign-TLS re-pooling
 would corrupt per-thread pinning accounts). Fresh per-op allocations are the
 anti-pattern: on UCX every send from a fresh address re-registers (~100 µs × rails) and
-the rcache entry dies with the free — there is NO explicit registration anywhere;
-UCX zero-copy is decided by the value's memory provenance via the implicit rcache.
+the rcache entry dies with the free: memory without a memh is registered by UCX's
+own cache (to be replaced by a copy into the pool at the UCX send for unregistered
+memory, and an explicit registration API — data-path redesign steps 3b, 3c).
 
 **What `bulk` names (naming contract):** `MSG_*_BULK` (wire) = value-separable
 framing — the value rides in the v28 frame's raw value region, never encoded or

@@ -23,7 +23,7 @@ fn keys(part: usize, partitions: usize, size: usize) -> Vec<Vec<u8>> {
 async fn batch(
     client: &ClusterClient,
     keys: &[Vec<u8>],
-    value: &bytes::Bytes,
+    value: &autumn_client::RegBytes,
     count: usize,
     depth: usize,
     write: bool,

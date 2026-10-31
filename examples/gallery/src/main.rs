@@ -1707,7 +1707,7 @@ async fn thumb_handler_inner(
                     &headers,
                     &method,
                     "image/svg+xml",
-                    vb.freeze(),
+                    vb.freeze().into_bytes(),
                     modified,
                     true,
                 )
@@ -1764,7 +1764,7 @@ async fn thumb_handler_inner(
                 metrics
                     .borrow_mut()
                     .record_get(elapsed_ms(t0), vb.len() as u64);
-                cache::media_response(&headers, &method, "image/jpeg", vb.freeze(), modified, true)
+                cache::media_response(&headers, &method, "image/jpeg", vb.freeze().into_bytes(), modified, true)
             }
             Ok(None) => error_response(StatusCode::NOT_FOUND, "thumbnail disappeared".into()),
             Err(error) => error_response(

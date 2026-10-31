@@ -348,3 +348,39 @@ async fn an_append_from_a_pool_buffer_carries_its_memh() {
     assert!(disk[..len].iter().all(|&b| b == 0x3c) && disk[len..].iter().all(|&b| b == 0x4d));
     drop(server);
 }
+
+/// A bulk call whose value is a pool buffer (an SDK `put` of a `ValueBuf`)
+/// sends it as a frame value with that buffer's memh; a plain `Bytes` goes
+/// without. The extent node refuses the opcode; the send is what is counted.
+/// UCX only.
+#[compio::test]
+async fn a_bulk_call_with_a_pool_buffer_carries_its_memh() {
+    let Ok(bind) = std::env::var("AUTUMN_TEST_UCX_BIND") else {
+        eprintln!("memh needs UCX: set AUTUMN_TEST_UCX_BIND");
+        return;
+    };
+    let transport = autumn_transport::init_with(autumn_transport::TransportKind::Ucx);
+    let mut listener = transport.bind(bind.parse().unwrap()).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let node = ExtentNode::new(ExtentNodeConfig::new(dir.path().to_path_buf(), 1)).await.unwrap();
+    let server = compio::runtime::spawn(async move {
+        let (conn, _) = listener.accept().await.unwrap();
+        ExtentNode::handle_connection(conn, node).await
+    });
+    let client = RpcClient::connect(addr).await.unwrap();
+    let len = 1 << 20;
+    let mut pb = autumn_transport::regpool_acquire(len);
+    pb.dest_mut().fill(0x21);
+    let pooled = pb.freeze();
+    let plain: autumn_transport::RegBytes = Bytes::from(vec![0x22u8; len]).into();
+    for (value, with_memh) in [(pooled, true), (plain, false)] {
+        let before = autumn_transport::am::sent_counts();
+        let reply = client.call_vectored_bulk(autumn_rpc::partition_rpc::MSG_PUT_BULK, vec![Bytes::from_static(b"x")], value).await;
+        assert!(reply.is_err(), "an extent node does not take MSG_PUT_BULK");
+        let after = autumn_transport::am::sent_counts();
+        let counted = if with_memh { after.0 - before.0 } else { after.1 - before.1 };
+        assert_eq!(counted, 1, "with_memh={with_memh}: {before:?} -> {after:?}");
+    }
+    drop(server);
+}

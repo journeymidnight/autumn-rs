@@ -313,43 +313,63 @@ impl WriteLease {
 
 /// A value `put` takes: `Bytes` and `Vec<u8>` move in without a copy (a large
 /// `Bytes` is then sent straight from its memory); a borrowed slice is copied.
+/// A frozen [`ValueBuf`] keeps its pool buffer's registration, which a UCX
+/// send hands on.
 pub trait IntoValue {
-    fn into_value(self) -> Bytes;
+    fn into_value(self) -> RegBytes;
 }
 
-impl IntoValue for Bytes {
-    fn into_value(self) -> Bytes {
+impl IntoValue for RegBytes {
+    fn into_value(self) -> RegBytes {
         self
     }
 }
 
-impl IntoValue for Vec<u8> {
-    fn into_value(self) -> Bytes {
-        Bytes::from(self)
-    }
-}
-
-impl IntoValue for &[u8] {
-    fn into_value(self) -> Bytes {
-        Bytes::copy_from_slice(self)
-    }
-}
-
-impl<const N: usize> IntoValue for &[u8; N] {
-    fn into_value(self) -> Bytes {
-        Bytes::copy_from_slice(self)
-    }
-}
-
-impl IntoValue for &Bytes {
-    fn into_value(self) -> Bytes {
+impl IntoValue for &RegBytes {
+    fn into_value(self) -> RegBytes {
         self.clone()
     }
 }
 
+impl IntoValue for ValueBuf {
+    fn into_value(self) -> RegBytes {
+        self.freeze()
+    }
+}
+
+impl IntoValue for Bytes {
+    fn into_value(self) -> RegBytes {
+        self.into()
+    }
+}
+
+impl IntoValue for Vec<u8> {
+    fn into_value(self) -> RegBytes {
+        Bytes::from(self).into()
+    }
+}
+
+impl IntoValue for &[u8] {
+    fn into_value(self) -> RegBytes {
+        Bytes::copy_from_slice(self).into()
+    }
+}
+
+impl<const N: usize> IntoValue for &[u8; N] {
+    fn into_value(self) -> RegBytes {
+        Bytes::copy_from_slice(self).into()
+    }
+}
+
+impl IntoValue for &Bytes {
+    fn into_value(self) -> RegBytes {
+        self.clone().into()
+    }
+}
+
 impl IntoValue for &Vec<u8> {
-    fn into_value(self) -> Bytes {
-        Bytes::copy_from_slice(self)
+    fn into_value(self) -> RegBytes {
+        Bytes::copy_from_slice(self).into()
     }
 }
 
@@ -538,13 +558,13 @@ pub fn bulk_worthwhile(value_size: usize) -> bool {
 ///
 /// Two directions, same currency:
 /// - **Write**: [`alloc_value_buf`] → fill via [`ValueBuf::as_mut_slice`] →
-///   [`ValueBuf::truncate`] to the written length → [`ValueBuf::freeze`] →
-///   [`ClusterClient::put_bulk`].
+///   [`ValueBuf::truncate`] to the written length → `put` it (or its
+///   [`ValueBuf::freeze`]), which sends it with the slab's registration.
 /// - **Read**: [`ClusterClient::get_pooled`] / `get_range_pooled` hand the
 ///   recv'd pool buffer straight back as a `ValueBuf` — zero SDK-side copies.
-///   Read it in place (`Deref<[u8]>`), or `freeze()` into a `Bytes` to hand
-///   to a framework (HTTP body, channel); dropping either returns the slab to
-///   the pool.
+///   Read it in place (`Deref<[u8]>`), or `freeze().into_bytes()` into a
+///   `Bytes` to hand to a framework (HTTP body, channel); dropping either
+///   returns the slab to the pool.
 pub struct ValueBuf {
     pb: autumn_rpc::PooledBuf,
 }
@@ -566,6 +586,9 @@ pub fn alloc_value_buf(len: usize) -> ValueBuf {
 /// (file reads, generated data) skip the trade entirely and win on both
 /// transports.
 pub use autumn_rpc::runtime_transport_is_ucx;
+/// A value with the registration of the pool buffer it lives in, if any
+/// ([`ValueBuf::freeze`]); derefs to its `Bytes`.
+pub use autumn_rpc::RegBytes;
 
 impl ValueBuf {
     fn from_pooled(pb: autumn_rpc::PooledBuf) -> Self {
@@ -604,12 +627,12 @@ impl ValueBuf {
         unsafe { compio::buf::SetLen::set_len(&mut self.pb, n) }
     }
 
-    /// Convert into a `Bytes` exposing the filled bytes, WITHOUT copying (the
-    /// `Bytes` aliases the slab; the slab returns to the pool when it drops).
-    /// Feed this to `put_bulk` / `put_many`, or hand it to any `Bytes`-consuming
-    /// sink (HTTP body, channel).
-    pub fn freeze(self) -> Bytes {
-        Bytes::from_owner(self.pb)
+    /// The filled bytes WITHOUT copying, with the slab's registration (the
+    /// value aliases the slab, which returns to the pool when the last clone
+    /// drops). `put` sends it with that registration over UCX; `into_bytes()`
+    /// gives a plain `Bytes` for any other sink (HTTP body, channel).
+    pub fn freeze(self) -> RegBytes {
+        self.pb.freeze()
     }
 }
 
@@ -3366,7 +3389,7 @@ impl ClusterClient {
     async fn put_bound(
         &self,
         key: &[u8],
-        value: Bytes,
+        value: RegBytes,
         expires_at: u64,
         lease: WriteLease,
     ) -> std::result::Result<(), AutumnError> {
@@ -3520,7 +3543,7 @@ impl ClusterClient {
     pub(crate) async fn put_bulk_opts(
         &self,
         key: &[u8],
-        value: Bytes,
+        value: RegBytes,
         expires_at: u64,
         lease: WriteLease,
     ) -> std::result::Result<(), AutumnError> {
@@ -3539,7 +3562,7 @@ impl ClusterClient {
     async fn put_bulk_attempts(
         &self,
         key: &[u8],
-        value: Bytes,
+        value: RegBytes,
         expires_at: u64,
         lease: WriteLease,
         any_applied: &mut bool,
@@ -5123,7 +5146,7 @@ impl ClusterClient {
                 // A small value is here only because its key also has a bulk
                 // value in this batch (see `classes`).
                 let r = if bulk_worthwhile(v.len()) {
-                    this.put_bulk_opts(k, v.clone(), expires_at, lease).await
+                    this.put_bulk_opts(k, v.clone().into(), expires_at, lease).await
                 } else {
                     this.put_opts(k, v.as_ref(), expires_at, lease).await
                 };

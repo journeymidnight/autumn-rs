@@ -903,11 +903,11 @@ impl RpcClient {
     /// a bulk transfer exists to avoid; the writer already took a `Vec<Bytes>`,
     /// so only this entry point was missing. The receiver splits the tail using
     /// lengths the caller put in `ctrl_parts`.
-    pub async fn call_vectored_bulk_multi(
+    pub async fn call_vectored_bulk_multi<V: Into<autumn_transport::RegBytes> + AsRef<[u8]>>(
         &self,
         msg_type: u8,
         ctrl_parts: Vec<Bytes>,
-        values: Vec<Bytes>,
+        values: Vec<V>,
     ) -> Result<Bytes, RpcError> {
         if self.closed.get() {
             return Err(RpcError::ConnectionClosed);
@@ -926,11 +926,13 @@ impl RpcClient {
         Self::await_response(rx).await
     }
 
+    /// A value with a memh (a `RegBytes` from a pool buffer) goes out as a
+    /// UCX frame value with that registration.
     pub async fn call_vectored_bulk(
         &self,
         msg_type: u8,
         ctrl_parts: Vec<Bytes>,
-        value: Bytes,
+        value: impl Into<autumn_transport::RegBytes> + AsRef<[u8]>,
     ) -> Result<Bytes, RpcError> {
         if self.closed.get() {
             return Err(RpcError::ConnectionClosed);
@@ -952,25 +954,25 @@ impl RpcClient {
     /// A value-separable request's stream buffers
     /// (`[head][ctrl parts…][crc][values…]`), or on a connection that sends
     /// frame values, a `FLAG_AM_VALUE` frame and its values.
-    fn value_frame(
+    fn value_frame<V: Into<autumn_transport::RegBytes> + AsRef<[u8]>>(
         &self,
         req_id: u32,
         msg_type: u8,
         ctrl_parts: Vec<Bytes>,
-        values: Vec<Bytes>,
+        values: Vec<V>,
     ) -> (Vec<Bytes>, Vec<(u64, autumn_transport::RegBytes)>) {
         if let Some(out) = self.am_out.as_ref().filter(|_| AmOut::wants(&values)) {
             return out.encode(req_id, msg_type, 0, ctrl_parts, values);
         }
         let ctrl_len: usize = ctrl_parts.iter().map(|p| p.len()).sum();
-        let value_len: usize = values.iter().map(|v| v.len()).sum();
+        let value_len: usize = values.iter().map(|v| v.as_ref().len()).sum();
         let head = crate::frame::encode_vectored_head(req_id, msg_type, 0, ctrl_len, value_len);
         let crc = crate::frame::compute_ctrl_crc(&head, &ctrl_parts);
         let mut bufs: Vec<Bytes> = Vec::with_capacity(3 + ctrl_parts.len() + values.len());
         bufs.push(Bytes::copy_from_slice(&head));
         bufs.extend(ctrl_parts);
         bufs.push(Bytes::copy_from_slice(&crc));
-        bufs.extend(values);
+        bufs.extend(values.into_iter().map(|v| v.into().into_bytes()));
         (bufs, Vec::new())
     }
 

@@ -86,7 +86,7 @@ the values. Who sends them:
 
 | Sender | Frame | Posted |
 |---|---|---|
-| `RpcClient::call_vectored_bulk(_multi)` (SDK `PUT_BULK` family) | request | by `writer_task`, just before the frame is written (the `SubmitMsg` carries them, and they count toward the send window) |
+| `RpcClient::call_vectored_bulk(_multi)` (SDK `PUT_BULK` family; values `impl Into<RegBytes>`, so a `ValueBuf`'s memh goes along) | request | by `writer_task`, just before the frame is written (the `SubmitMsg` carries them, and they count toward the send window) |
 | `RpcClient::send_prepared` (PS→EN `MSG_APPEND`) | request | same |
 | EN `READ_BYTES_BULK` reply (PS reads, client direct reads) | reply | when the reply is built (`frame_now`) |
 | PS `GET_BULK` / `BATCH_GET_BULK` reply | reply | same (`reframe`, whose values are `RegBytes`: a value read into a pool buffer keeps its memh) |
