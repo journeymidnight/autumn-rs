@@ -1278,9 +1278,8 @@ impl BatchClient {
 /// into a pool buffer at the UCX send, and TCP writes from the page. Returns
 /// only once every page is returned, so the caller may reuse them — a send that
 /// outlived its put (a timeout) never reads a page afterwards. A region page
-/// is returned when UCX completes its send: with a peer that died mid-transfer
-/// that may be never (endpoints run without peer error handling), and the
-/// call waits with it.
+/// is returned when UCX completes its send, with an error once UCX reports a
+/// peer that died mid-transfer; the call waits until then.
 async fn put_lent(
     client: &ClusterClient,
     items: &[WorkItem],
