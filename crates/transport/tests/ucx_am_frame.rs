@@ -127,8 +127,44 @@ async fn values_nobody_will_receive_let_their_senders_complete() {
     drop(keep);
     until("a held value's sender completed after its connection went", || staged() == 0).await;
 
-    // Sent after its connection went (UCX keeps the endpoint): dropped on arrival.
+    // Sent after its peer closed the connection: the send fails.
     post_until_released(&tx, 13, vec![3u8; 1 << 20], "a value for a connection already gone let its sender complete").await;
+}
+
+/// A peer that closes its connection fails the frame values still awaited from
+/// it, and any asked for afterwards: the sender of a value that will never
+/// come is gone, and the receiver must not wait for it.
+#[compio::test]
+async fn a_value_awaited_from_a_closed_connection_fails() {
+    let (tx, rx, keep) = pair().await;
+    let segments = [(1usize << 20, 61)];
+    let mut awaited = Box::pin(am::receive_frame_value(&rx, &segments, &[]));
+    assert!(compio::time::timeout(Duration::from_millis(20), &mut awaited).await.is_err(), "nothing sent yet");
+    // The peer's end: its sender and its read half.
+    drop(tx);
+    drop(keep);
+    let failed = compio::time::timeout(Duration::from_secs(10), awaited).await.expect("failed, not waiting");
+    assert!(failed.is_err(), "nothing was sent");
+
+    let later = am::receive_frame_value(&rx, &[(1 << 20, 62)], &[]);
+    let failed = compio::time::timeout(Duration::from_secs(1), later).await.expect("failed at once");
+    assert!(failed.is_err(), "asked for after the connection failed");
+}
+
+/// A value still awaited when its own connection is dropped fails: the
+/// endpoint is closed and its address may be reused, so nothing stays
+/// registered for it.
+#[compio::test]
+async fn a_value_awaited_past_its_connection_fails() {
+    let (tx, rx, keep) = pair().await;
+    let pending = am::start_frame_value(&rx, &[(1 << 20, 71)], &[], autumn_transport::regpool_acquire(1 << 20)).unwrap();
+    // Our end goes (its write half is the last holder); the peer's, held by
+    // `tx`, stays up, so no failure comes from its side.
+    drop(rx);
+    drop(keep);
+    let failed = compio::time::timeout(Duration::from_secs(5), pending.wait()).await.expect("failed, not waiting");
+    assert!(failed.is_err(), "nothing was sent");
+    drop(tx);
 }
 
 #[compio::test]
@@ -210,7 +246,7 @@ async fn a_lent_value_is_sent_from_its_region_and_returned_after() {
     assert!(region.is_registered());
     let (value, returned) = unsafe { autumn_transport::lend(mem.as_ptr().add(1 << 20), 1 << 20, Some(&region)) };
     assert!(value.is_registered(), "inside the region: its memh");
-    let (sent, staged) = (am::sent_counts(), am::staged_bytes());
+    let (sent, staged) = (am::sent_counts(), am::staged_count());
     let segments = [(1usize << 20, 51)];
     let receive = am::receive_frame_value(&rx, &segments, &[]);
     tx.post_frame_value(51, value);
@@ -218,7 +254,7 @@ async fn a_lent_value_is_sent_from_its_region_and_returned_after() {
     assert_eq!(got.filled(), &mem[1 << 20..]);
     compio::time::timeout(Duration::from_secs(10), returned).await.expect("returned once sent");
     assert_eq!(am::sent_counts().0, sent.0 + 1, "sent with the region's memh");
-    assert_eq!(am::staged_bytes(), staged, "not copied");
+    assert_eq!(am::staged_count(), staged, "not copied");
 
     let other = pattern(1 << 20, 42);
     let (value, returned) = unsafe { autumn_transport::lend(other.as_ptr(), other.len(), Some(&region)) };

@@ -46,6 +46,7 @@ fn main() {
         .allowlist_function("ucp_worker_destroy")
         .allowlist_function("ucp_worker_get_efd")
         .allowlist_function("ucp_worker_arm")
+        .allowlist_function("ucp_worker_signal")
         .allowlist_function("ucp_worker_progress")
         .allowlist_function("ucp_ep_create")
         .allowlist_function("ucp_ep_flush_nbx")

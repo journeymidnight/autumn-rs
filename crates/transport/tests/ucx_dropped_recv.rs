@@ -142,9 +142,10 @@ async fn a_pending_orphan_costs_later_operations_no_scan() {
     const ROUNDS: usize = 200;
     const MSG: usize = 64;
 
-    // First connection: silent. Second: echo.
+    // First connection: silent, kept open (closing it would complete the
+    // orphan). Second: echo.
     let server = compio::runtime::spawn(async move {
-        let (_silent, _) = listener.accept().await.unwrap();
+        let (silent, _) = listener.accept().await.unwrap();
         let (c, _) = listener.accept().await.unwrap();
         let (mut r, mut w) = c.into_split();
         for _ in 0..ROUNDS {
@@ -152,6 +153,7 @@ async fn a_pending_orphan_costs_later_operations_no_scan() {
             res.unwrap();
             w.write_all(b).await.0.unwrap();
         }
+        silent
     });
 
     let silent = t.connect(bound).await.unwrap();
@@ -171,9 +173,37 @@ async fn a_pending_orphan_costs_later_operations_no_scan() {
         res.unwrap();
         assert!(b.iter().all(|&v| v == (i & 0xff) as u8));
     }
-    server.await.expect("server task");
+    let _silent = server.await.expect("server task");
     let (orphaned, reaped, scans) = ucx_orphan_counts();
     assert_eq!(orphaned, orphaned0, "no further orphan");
     assert_eq!(reaped, reaped0, "the silent orphan cannot complete");
     assert_eq!(scans, scans0, "a pending orphan put later operations on the scan path");
+}
+
+/// Closing a connection completes the receives still posted on it (as
+/// cancelled), so a dropped recv's buffer comes back even though its peer
+/// never sends again.
+#[compio::test]
+async fn an_orphan_is_freed_when_its_connection_closes() {
+    autumn_transport::init_with(autumn_transport::TransportKind::Ucx);
+    let t = UcxTransport;
+    let mut listener = t.bind(bind_addr()).await.unwrap();
+    let bound = listener.local_addr().unwrap();
+    let server = compio::runtime::spawn(async move { listener.accept().await.unwrap().0 });
+    let c = t.connect(bound).await.unwrap();
+    let _silent = server.await.expect("server task");
+
+    let (mut r, w) = c.into_split();
+    let race = async {
+        let _ = r.read(vec![0u8; 64]).await;
+    };
+    let _ = compio::time::timeout(Duration::from_millis(1), race).await;
+    let (orphaned0, reaped0, _) = ucx_orphan_counts();
+    assert!(orphaned0 > 0, "the recv was dropped in flight");
+    drop(r);
+    drop(w);
+    // A pool acquire reaps.
+    drop(regpool_acquire(4096));
+    let (_, reaped, _) = ucx_orphan_counts();
+    assert_eq!(reaped, reaped0 + 1, "the closed connection's orphan was freed");
 }

@@ -20,35 +20,24 @@
 //! An orphaned recv still takes the connection's next bytes, which no later
 //! recv can get back, so the ep is marked and every later recv on it fails.
 //!
-//! ## EP lifetime
+//! ## EP lifetime and peer failure
+//!
+//! Every endpoint is created with `UCP_ERR_HANDLING_MODE_PEER`
+//! (`peer_error_handling`). When the peer closes its endpoint or dies, UCX
+//! completes every request on ours with an error (sends, stream recvs, a
+//! rendezvous receive under way) and calls `on_ep_error`, which fails the frame
+//! values still awaited from that peer (`am::ep_failed`); nothing waits on a
+//! dead peer for longer than UCX takes to notice it.
 //!
 //! `*mut ucp_ep` lives inside `Rc<UcxEp>` so `UcxConn` and the two halves
-//! produced by `into_split` can share ownership. When the last `Rc` drops,
-//! `UcxEp::Drop` simply releases the Rust-side handle. We deliberately
-//! do **not** call `ucp_ep_close_nbx`:
-//!
-//! * With the default `UCP_ERR_HANDLING_MODE_NONE` (set in `connect` /
-//!   `accept`), `ucp_ep_close_nbx(ep, FORCE)` is rejected with
-//!   `UCS_ERR_INVALID_PARAM (-5)` and the EP isn't actually closed — so
-//!   the call is a noisy no-op.
-//! * `ucp_ep_close_nbx(ep, /*FLUSH*/ NULL)` *is* accepted, but a
-//!   loopback close (both peers in the same compio runtime) deadlocks:
-//!   each side's blocking close waits for an ack the other side can't
-//!   deliver until *its* close runs. Bounded waits time out, but only
-//!   after 30 s+ of UCX-internal retries.
-//! * Switching to `UCP_ERR_HANDLING_MODE_PEER` (which would let FORCE
-//!   succeed) enables UCX's RC-layer dead-peer detection. Under high
-//!   fan-out write load (16 client threads × 16 inflight against 8 PS
-//!   workers) the rc_mlx5 RNR/timeout fires *mid-test* and tears down
-//!   live EPs, which is much worse than a teardown warning.
-//!
-//! Skipping the close call means each EP stays allocated in its UCX
-//! worker context until the worker is destroyed (`ucp_worker_destroy`,
-//! invoked when the OS thread exits or the process exits). For our
-//! deployment this is fine: connection pools (autumn-stream::conn_pool,
-//! the manager's RpcConn map) reuse one EP per (peer-address, thread)
-//! pair for the life of the process, so EPs do not accumulate. Long-
-//! running servers reclaim them on normal shutdown via worker destroy.
+//! produced by `into_split` share it. The last drop closes it with
+//! `UCP_EP_CLOSE_FLAG_FORCE`: requests still on it (orphans, below) complete
+//! as cancelled — posted stream recvs inside the close call, sends once UCX has
+//! discarded the lanes they use — and the peer sees the close.
+//! A flushing close would wait for the peer (two ends in one runtime would wait
+//! for each other), and FORCE is refused without PEER mode. Once closed, its
+//! address may be reused for a new endpoint, so nothing keyed by it outlives
+//! the drop.
 
 use crate::ucx::ffi::*;
 use crate::ucx::sockaddr;
@@ -144,10 +133,25 @@ impl UcxEp {
 }
 
 impl Drop for UcxEp {
-    /// The ep itself stays allocated (see "EP lifetime"); frame values held
-    /// for it are released, so their senders complete.
+    /// Releases the frame values held for it, so their senders complete, and
+    /// closes it (see "EP lifetime and peer failure").
     fn drop(&mut self) {
         crate::ucx::am::forget_ep(self.raw);
+        let mut p: ucp_request_param_t = unsafe { std::mem::zeroed() };
+        p.op_attr_mask = ucp_op_attr_t::UCP_OP_ATTR_FIELD_FLAGS as u32;
+        p.flags = ucp_ep_close_flags_t::UCP_EP_CLOSE_FLAG_FORCE as u32;
+        match classify_ptr(unsafe { ucp_ep_close_nbx(self.raw, &p) }) {
+            PtrStatus::Done => {}
+            // A FORCE close returns no request (UCX 1.20); freed if one does.
+            PtrStatus::Pending(req) => unsafe { ucp_request_free(req) },
+            PtrStatus::Err(st) => tracing::warn!(status = st, "ucp_ep_close_nbx failed"),
+        }
+        // The lanes are discarded from worker progress, which UCX schedules
+        // without waking an idle worker: until then the peer is not told.
+        let worker = crate::ucx::am::this_worker();
+        if !worker.is_null() {
+            unsafe { ucp_worker_signal(worker) };
+        }
     }
 }
 
@@ -469,6 +473,24 @@ pub struct UcxConn {
     peer: SocketAddr,
 }
 
+/// UCX found the peer gone: a close from its side (`CONNECTION_RESET`), a dial
+/// that never connected, or a failure. Debug only: every request on the
+/// endpoint fails with the status, and its caller reports it. Runs inside
+/// worker progress.
+unsafe extern "C" fn on_ep_error(_arg: *mut c_void, ep: ucp_ep_h, status: ucs_status_t::Type) {
+    tracing::debug!(ep = ?ep, error = %ucs_err(status, "ucx endpoint failed"), "ucx endpoint failed");
+    crate::ucx::am::ep_failed(ep, status);
+}
+
+/// UCX reports a peer that closed or failed instead of leaving requests on its
+/// endpoint pending (see "EP lifetime and peer failure").
+pub(crate) fn peer_error_handling(params: &mut ucp_ep_params_t) {
+    params.field_mask |= (ucp_ep_params_field::UCP_EP_PARAM_FIELD_ERR_HANDLING_MODE
+        | ucp_ep_params_field::UCP_EP_PARAM_FIELD_ERR_HANDLER) as u64;
+    params.err_mode = ucp_err_handling_mode_t::UCP_ERR_HANDLING_MODE_PEER;
+    params.err_handler = ucp_err_handler { cb: Some(on_ep_error), arg: ptr::null_mut() };
+}
+
 impl UcxConn {
     pub(crate) async fn connect(addr: SocketAddr) -> io::Result<Self> {
         let ep = with_thread_ctx(|ctx| -> io::Result<*mut ucp_ep> {
@@ -480,6 +502,7 @@ impl UcxConn {
             params.flags = ucp_ep_params_flags_field::UCP_EP_PARAMS_FLAGS_CLIENT_SERVER as u32;
             params.sockaddr.addr = &sa as *const _ as *const _;
             params.sockaddr.addrlen = sa_len;
+            peer_error_handling(&mut params);
             let mut ep: *mut ucp_ep = ptr::null_mut();
             let st = unsafe { ucp_ep_create(ctx.worker, &params, &mut ep) };
             if st != ucs_status_t::UCS_OK {
@@ -494,13 +517,12 @@ impl UcxConn {
         Ok(Self { ep, peer: addr })
     }
 
-    /// Internal constructor used by `UcxListener::accept` after `ucp_ep_create`
-    /// has already been driven from a `ucp_conn_request_h`.
-    pub(crate) fn from_raw_ep(ep: *mut ucp_ep, peer: SocketAddr) -> Self {
-        Self {
-            ep: UcxEp::new(ep),
-            peer,
-        }
+    /// The connection `UcxListener::accept` created `ep` for; closed if its
+    /// flush fails.
+    pub(crate) async fn accepted(ep: *mut ucp_ep, peer: SocketAddr) -> io::Result<Self> {
+        let ep = UcxEp::new(ep);
+        ucx_flush(ep.ptr()).await?;
+        Ok(Self { ep, peer })
     }
 }
 

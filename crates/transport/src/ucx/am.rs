@@ -116,14 +116,21 @@ thread_local! {
     static EARLY: RefCell<HashMap<FrameKey, Early>> = RefCell::new(HashMap::new());
     /// Frame values whose receiver stopped waiting before they arrived.
     static ABANDONED: RefCell<HashSet<FrameKey>> = RefCell::new(HashSet::new());
-    /// Endpoints whose connection is gone. UCX keeps them (never closed, see
-    /// endpoint.rs "EP lifetime"), so values can still arrive on them.
-    static FORGOTTEN: RefCell<HashSet<usize>> = RefCell::new(HashSet::new());
+    /// Endpoints UCX reported failed, until they are dropped: no value comes
+    /// on them any more.
+    static FAILED: RefCell<HashMap<usize, ucs_status_t::Type>> = RefCell::new(HashMap::new());
     static NEXT_TAG: Cell<u64> = const { Cell::new(1) };
     /// Values received on this thread: (eager, rendezvous).
     static RECEIVED: Cell<(u64, u64)> = const { Cell::new((0, 0)) };
     /// Values sent from this thread: (with a memh, without).
     static SENT: Cell<(u64, u64)> = const { Cell::new((0, 0)) };
+    /// Values this thread copied into a pool buffer to send them.
+    static STAGED: Cell<u64> = const { Cell::new(0) };
+}
+
+/// This thread's worker; null once the thread is being torn down.
+pub(crate) fn this_worker() -> *mut ucp_worker {
+    WORKER.try_with(|w| w.get()).unwrap_or(ptr::null_mut())
 }
 
 /// This thread's values received (eager copies, rendezvous receives).
@@ -224,7 +231,7 @@ unsafe extern "C" fn on_frame_value(
         return ucs_status_t::UCS_OK;
     }
     // Nobody will ask for it: dropping it completes the sender.
-    if ABANDONED.with(|a| a.borrow_mut().remove(&key)) || FORGOTTEN.with(|f| f.borrow().contains(&key.0)) {
+    if ABANDONED.with(|a| a.borrow_mut().remove(&key)) {
         return ucs_status_t::UCS_OK;
     }
     // Ahead of its frame: held. Only a rendezvous request is (frame values are
@@ -297,15 +304,40 @@ unsafe extern "C" fn on_received(request: *mut c_void, status: ucs_status_t::Typ
     slot.finish(if status == ucs_status_t::UCS_OK { State::Done(length) } else { State::Failed(status, length) });
 }
 
-/// The endpoint is gone: let go of the frame values held for it, and drop the
-/// ones still to come.
+/// UCX reported `ep` failed (its peer closed or died): the frame values still
+/// awaited on it, and any asked for later, fail with `status`.
+pub(crate) fn ep_failed(ep: *mut ucp_ep, status: ucs_status_t::Type) {
+    let ep = ep as usize;
+    FAILED.with(|f| f.borrow_mut().insert(ep, status));
+    fail_awaited(ep, status);
+}
+
+/// Fail the frame values still awaited on `ep`.
+fn fail_awaited(ep: usize, status: ucs_status_t::Type) {
+    let waiting: Vec<Rc<Slot>> = EXPECTED
+        .try_with(|e| {
+            let mut e = e.borrow_mut();
+            let keys: Vec<Key> = e.keys().filter(|k| matches!(k, Key::Frame((p, _)) if *p == ep)).copied().collect();
+            keys.into_iter().filter_map(|k| e.remove(&k)).collect()
+        })
+        .unwrap_or_default();
+    for slot in waiting {
+        slot.finish(State::Failed(status, 0));
+    }
+}
+
+/// The endpoint is about to be closed: fail the values still awaited on it, let
+/// go of the ones held for it, and forget it, since its address may be reused
+/// (an awaited value left registered would take the next endpoint's value of
+/// the same tag).
 pub(crate) fn forget_ep(ep: *mut ucp_ep) {
     let ep = ep as usize;
     // `try_with` throughout: an endpoint dropped during thread teardown has
     // nothing left to release (no one progresses the worker any more).
-    if FORGOTTEN.try_with(|f| f.borrow_mut().insert(ep)).is_err() {
+    if FAILED.try_with(|f| f.borrow_mut().remove(&ep)).is_err() {
         return;
     }
+    fail_awaited(ep, ucs_status_t::UCS_ERR_CANCELED);
     let held: Vec<Early> = EARLY
         .try_with(|e| {
             let mut e = e.borrow_mut();
@@ -365,6 +397,11 @@ pub(crate) fn expect(tag: u64, dest: RecvDest) -> Expected {
 fn expect_frame_value(ep: &UcxEp, tag: u64, dest: Target) -> Expected {
     let key = (ep.ptr() as usize, tag);
     let expected = register(Key::Frame(key), dest);
+    if let Some(status) = FAILED.with(|f| f.borrow().get(&key.0).copied()) {
+        EXPECTED.with(|e| e.borrow_mut().remove(&Key::Frame(key)));
+        expected.0.finish(State::Failed(status, 0));
+        return expected;
+    }
     if let Some(early) = EARLY.with(|e| e.borrow_mut().remove(&key)) {
         let slot = EXPECTED.with(|e| e.borrow_mut().remove(&Key::Frame(key))).expect("just registered");
         unsafe { receive(slot, early.desc, early.len, true, true, true) };
@@ -531,6 +568,11 @@ pub fn staged_bytes() -> u64 {
     STAGED_BYTES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// This thread's values copied into a pool buffer to be sent.
+pub fn staged_count() -> u64 {
+    STAGED.with(|c| c.get())
+}
+
 /// A value UCX may send: bytes with the memh of the pool buffer they live in.
 /// Only `of` builds one, copying a value that has no memh into a pool buffer,
 /// so UCX is never handed memory it would register itself. A value larger than
@@ -546,6 +588,7 @@ impl Staged {
         let mut pb = crate::regpool::acquire_charged_if_room(crate::regpool::Use::Staging, value.len());
         pb.dest_mut().copy_from_slice(&value);
         STAGED_BYTES.fetch_add(value.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        STAGED.with(|c| c.set(c.get() + 1));
         Self(pb.freeze())
     }
 }

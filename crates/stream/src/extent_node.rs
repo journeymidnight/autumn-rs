@@ -5665,12 +5665,7 @@ impl ExtentNode {
             // a single failed handshake (on UCX, accept flushes the new ep,
             // so a peer dying mid-handshake surfaced as an accept Err).
             // Same fix shape as the manager serve loop + the PS
-            // per-partition accept task. Known residual (coco P1,
-            // accepted): the half-created UCX ep from a failed accept
-            // stays allocated until worker destroy — no working close
-            // path under MODE_NONE (see transport endpoint.rs "EP
-            // lifetime"); one ep per failed handshake, bounded, strictly
-            // better than process death.
+            // per-partition accept task.
             let (conn, peer) = match listener.accept().await {
                 Ok(v) => v,
                 Err(e) => {

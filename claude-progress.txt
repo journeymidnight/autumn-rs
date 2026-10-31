@@ -1,3 +1,10 @@
+Date: 2026-10-31
+TaskStatus: completed
+Task scope: user 2026-10-31 — UCX peer error handling as core data-path work (F-UCX-PEER-ERRORS, removed from the ledger as done).
+Current summary: every UCX endpoint PEER mode + error handler (fails awaited frame values; FAILED fails later asks); UcxEp drop = forget_ep (fails values still awaited — closed addresses are reused) + FORCE close + ucp_worker_signal; failed accept closes its ep; FORGOTTEN removed; callback logs at debug (callers report). Old NONE reason re-measured: no live ep torn down under load. Final UCX perf 4K 35.3K/290K, 8M 2658/13821, 4K 32x16 62.2K/262K, 8M 16x16 2697/14764. EN kill: reset 11 ms after, ~2 s dip, all keys read. put_from with PS killed returns (13.4 s). NONE-built clients cannot connect to a PEER cluster (rebuild clients with it; user: all PEER). Tests: ucx_dead_peer (1.5 ms), closed connection, value awaited past its connection, orphan freed; each ablation red. Review (fable): M1 purge in forget_ep done + test; doc fixes; dead-peer test bounded.
+Main gaps: scripts/transport_chaos.sh ucx binds 127.0.0.1 with a loopback UCX_TLS (against the UCX rule), not run. Asked-for AM (MSG_GET_AM) is not keyed by ep, so ep_failed cannot fail it (reply comes after the send completes, so unreachable).
+Next steps: data-path step 3d (MSG_GET_AM into caller memory: region memh, else pool + copy).
+
 Date: 2026-10-30
 TaskStatus: not_completed
 Task scope: data-path redesign (design page https://claude.ai/artifact/E18oSqzHKbg2Vx1HqKKyo1), F-DP-* in feature_list.md. Steps 1, 2a, 2b-1, 2b-2a committed (e8a4c621..5362c20e).

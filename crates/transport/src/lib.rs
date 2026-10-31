@@ -103,6 +103,14 @@ pub mod am {
         0
     }
 
+    /// This thread's values copied into a pool buffer to be sent.
+    pub fn staged_count() -> u64 {
+        #[cfg(feature = "ucx")]
+        return crate::ucx::am::staged_count();
+        #[cfg(not(feature = "ucx"))]
+        0
+    }
+
     /// A tag no other value expected on this thread carries.
     pub fn next_tag() -> u64 {
         #[cfg(feature = "ucx")]

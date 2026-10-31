@@ -3522,11 +3522,51 @@ region.unregister()
 `put_from` returns only once the transport no longer reads any of the buffers
 (a send that outlived a timeout included), so they may be reused at once. A
 registered page is read by UCX until its send completes: if the PS dies in the
-middle, that may be never (UCX endpoints run without peer error handling), and
-`put_from` — and the `BatchClient` behind it — waits with it. Unregistered
-pages are copied at the send and do not wait on the peer. Check:
+middle, UCX fails the send once it notices (at once for a killed process,
+through its keepalive for a lost host), which gives the page back, and
+`put_from` ends as the put does (an error, or a retry that succeeded).
+Unregistered pages are copied at the send and do not wait on the peer. Check:
 overwrite the pages right after `put_from` returns, then `get_into` them — the
 stored values are the old bytes.
+
+## UCX peer failure: a closed or dead peer fails its transfers
+
+Every UCX endpoint runs with peer error handling (`UCP_ERR_HANDLING_MODE_PEER`).
+A peer that closes its connection or dies fails every request on the endpoint —
+a send UCX was reading from caller memory, a value being received, a stream
+read — and the endpoint is closed (`FORCE`) when its connection is dropped.
+The callers log what their requests got (`rpc client reader exited ...
+Connection reset by remote peer`, `append soft-error`); the endpoint's own
+report is at debug (`RUST_LOG=autumn_transport=debug`, `ucx endpoint failed`).
+
+Tests (RoCE host):
+
+```bash
+AUTUMN_UCX_TEST_BIND='[<roce-ip>]:0' UCX_TLS=rc_mlx5,ud_mlx5,tcp,self UCX_NET_DEVICES=<dev>:1 \
+  cargo test -p autumn-transport --features ucx --test ucx_dead_peer --test ucx_am_frame --test ucx_dropped_recv
+# ucx_dead_peer: a child process holding a lent value is SIGKILLed; the value
+# comes back and the value awaited from it fails (prints how long it took)
+```
+
+Live (UCX cluster, `kvc` namespace): `put_from` of registered pages while the
+PS is killed. The call in flight returns (measured: 13.4 s, 10 of 16 pages
+written); it never blocks. A client built before peer error handling cannot
+connect to a cluster with it: rebuild the wheel and the SDK binaries with the
+cluster.
+
+```python
+import autumn, numpy as np, time
+autumn.set_transport("ucx")
+bc = autumn.BatchClient("[<roce-ip>]:9001", scope="kvc/")
+pool = np.random.randint(0, 255, 16 << 24, dtype=np.uint8)
+region = autumn.register(pool)
+pages = [memoryview(pool[i << 24:(i + 1) << 24]) for i in range(16)]
+for r in range(100):            # kill -9 "$(cat $AUTUMN_DATA_ROOT/pids/ps.pid)" meanwhile
+    t = time.time()
+    try: ok = sum(bc.put_from([f"kvc/live/{i}".encode() for i in range(16)], pages, 0, region))
+    except Exception as e: ok = e
+    print(r, f"{time.time() - t:.1f}s", ok)   # every round prints; none hangs
+```
 
 ## Large values over UCX as frame values (wire 77)
 

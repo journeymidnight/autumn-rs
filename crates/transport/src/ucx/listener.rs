@@ -6,7 +6,7 @@
 //! `ucp_conn_request_h` onto a futures mpsc; `accept().await` pulls them
 //! off the receiver and finishes the handshake via `ucp_ep_create`.
 
-use crate::ucx::endpoint::{ucx_flush, UcxConn};
+use crate::ucx::endpoint::UcxConn;
 use crate::ucx::ffi::*;
 use crate::ucx::sockaddr;
 use crate::ucx::worker::{ucs_err, with_thread_ctx};
@@ -171,6 +171,7 @@ impl UcxListener {
             let mut params: ucp_ep_params_t = unsafe { std::mem::zeroed() };
             params.field_mask = ucp_ep_params_field::UCP_EP_PARAM_FIELD_CONN_REQUEST as u64;
             params.conn_request = req;
+            crate::ucx::endpoint::peer_error_handling(&mut params);
             let mut ep: *mut ucp_ep = ptr::null_mut();
             let st = unsafe { ucp_ep_create(ctx.worker, &params, &mut ep) };
             if st != ucs_status_t::UCS_OK {
@@ -178,9 +179,7 @@ impl UcxListener {
             }
             Ok(ep)
         })?;
-        ucx_flush(ep).await?;
-
-        Ok((UcxConn::from_raw_ep(ep, peer), peer))
+        Ok((UcxConn::accepted(ep, peer).await?, peer))
     }
 
     pub(crate) fn local_addr(&self) -> io::Result<SocketAddr> {

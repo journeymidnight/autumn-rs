@@ -217,6 +217,77 @@ receive-side timing is not known.
 PS connection-handler errors are logged at debug, which hid the stale-status
 exits.
 
+## Peer failure and endpoint close (`UCP_ERR_HANDLING_MODE_PEER`)
+
+Every endpoint, dialed or accepted, is created in PEER mode with an error
+handler (`endpoint.rs` `peer_error_handling`). When the peer closes its
+endpoint (`UCS_ERR_CONNECTION_RESET`, every ordinary disconnect) or fails (a
+dial that never connects is `UCS_ERR_NOT_CONNECTED`), UCX completes every request on
+ours with an error — sends, posted stream recvs, a rendezvous receive under way
+— and calls `on_ep_error`, which fails the frame values still awaited on it and
+any asked for afterwards (`am::ep_failed`). The callback logs at debug only:
+the callers report the errors their requests get (an extent node killed under
+load gave 349 `NOT_CONNECTED` dials in one minute, each already logged by its
+dialer). So no caller waits on a dead peer
+longer than UCX takes to notice: a process that dies is noticed through its
+connection manager at once (the kernel tears its RDMA CM ids down), a host that
+vanishes through UCX's keepalive. Before, with `UCP_ERR_HANDLING_MODE_NONE`, a
+send to a dead peer never completed (a lent value was never returned, so
+`BatchClient.put_from` could block for good), and only the rpc keepalive closed
+the connection, leaking its endpoint.
+
+The last drop of a `UcxEp` closes it with `UCP_EP_CLOSE_FLAG_FORCE` (refused
+without PEER mode): the requests still on it complete as cancelled — posted
+stream recvs inside the close call itself (`ucp_stream_ep_cleanup`), sends and
+rendezvous receives once UCX has discarded the lanes they use
+(`ucp_ep_reqs_purge`) — so an orphaned recv is reaped at the next reap and its
+slab comes back (synchronously, which `an_orphan_is_freed_when_its_connection_closes`
+relies on), and the peer is told. Frame values still awaited on it fail too
+(`forget_ep`): its address can be reused, and a value left registered would
+take the next endpoint's value of the same tag. The
+discard runs from worker progress, scheduled without waking an idle worker, so
+the drop also calls `ucp_worker_signal`; without it the peer of an idle process
+learned of the close only when other traffic woke the worker (the test below
+waited out its 10 s). A failed accept now closes its half-made endpoint too
+(`UcxConn::accepted`). A flushing close is still not used: it waits for the
+peer, and two ends in one runtime would wait for each other. A closed
+endpoint's address can be reused by the next one, which is why the frame-value
+bookkeeping keyed by it (`FAILED`, `ABANDONED`, `EARLY`) is dropped with it and
+the old `FORGOTTEN` set (values arriving on a never-closed endpoint) is gone.
+
+Why it was off: the earlier note said PEER mode made rc_mlx5 tear down live
+endpoints under 16 x 16 fan-out write load. Measured 2026-10-31 (UCX perf-check,
+3 disks, 8 partitions, 20 s per phase, an error handler that counted every
+failure; 4 KiB and 8 MiB at 16 threads x depth 8 and 16, 4 KiB at 32 x 16):
+300–450 failures per run, every one `CONNECTION_RESET` from a peer closing — a
+client process exiting, the partition opens of the start-up split, the cluster's
+own teardown — none during the load phases, no request failed, throughput as
+before. With this code (same setup, cluster cpuset-isolated beside a
+tenant): 4 KiB 16 x 8 write 35.3K / read 290K ops/s, 8 MiB 16 x 8 2658 / 13821
+MB/s, 4 KiB 32 x 16 62.2K / 262K, 8 MiB 16 x 16 2697 / 14764; no failure and no
+keepalive eviction during the load phases (one `NOT_CONNECTED`, the manager's
+df dialing a node the teardown had just killed). An extent node killed under a
+4 KiB write load (4 nodes, so writes have somewhere to go): the PS's appends
+saw the reset 11 ms after the kill and retried; writes fell for about 2 s
+(6.4K, 10.5K ops/s against ~50K) and every key was read back. A PS killed under
+`BatchClient.put_from` of registered 16 MiB pages: the call in flight returned
+after 13.4 s with 10 of 16 written. A client built in NONE mode could not
+connect to a PEER cluster at all, so UCX clients are rebuilt with the
+cluster.
+
+Tests: `tests/ucx_dead_peer.rs` (the test binary re-run as a peer process that
+holds a lent value's rendezvous and sends nothing, then SIGKILLed: the value is
+returned and the value awaited from it fails, 1.5 ms after the kill; red in NONE mode,
+and red on the awaited value when `ep_failed` fails nothing),
+`ucx_am_frame.rs` `a_value_awaited_from_a_closed_connection_fails` (red in NONE
+mode, without the close, without the worker signal, and — for the value asked
+for afterwards — without the `FAILED` check), `a_value_awaited_past_its_connection_fails`
+(a frame value still awaited when its own connection is dropped; red when
+`forget_ep` leaves it registered), `ucx_dropped_recv.rs`
+`an_orphan_is_freed_when_its_connection_closes` (red in NONE mode and without
+the close). `values_nobody_will_receive_let_their_senders_complete` (a value
+sent after its peer closed) is red in NONE mode as well.
+
 ## A dropped in-flight operation cannot be cancelled
 
 `ucp_request_cancel` handles tag receives only; a stream send or recv stays in
@@ -245,9 +316,10 @@ UCX would keep a pointer into the moved-from frame. `reap_orphans` frees orphans
 whose callback has fired and the slab returns to its pool with its
 registration. The callback of an orphaned slot counts the completion
 (`ORPHANS_DONE`), and the reap's fast path compares that with the reaped count:
-an orphan that never completes — every recv dropped on a connection the peer
-never writes again, i.e. every rpc client teardown — must not put later
-operations on the scan path (which allocates). Reaping runs after the progress
+an orphan that has not completed — a recv dropped on a connection still open
+whose peer sends nothing — must not put later operations on the scan path
+(which allocates). Closing the connection completes it (as cancelled, see
+"Peer failure and endpoint close"). Reaping runs after the progress
 loop's drain and in `regpool::acquire`, which wants the slab back; the `self`
 transport and the inline spin complete receives inside another call without
 waking the loop, and a done orphan's slab is pushed back before the acquire
@@ -298,10 +370,10 @@ AM and not the tag API: a tagged rendezvous nobody receives never completes,
 and a caller that gave up leaves exactly that. `Expected` unregisters on drop
 while the value has not arrived; `finish` waits out a rendezvous receive
 already under way (it cannot be stopped), so the memory is released when it
-returns. That wait is bounded by the peer, not by us: with
-`UCP_ERR_HANDLING_MODE_NONE` a sender that dies between the rendezvous request
-and the end of the RDMA read may never complete it (inferred, not tested), the
-same window the stream path avoids by never posting into caller memory. Eager
+returns. That wait is bounded by the peer and by UCX noticing its failure: a
+sender that dies between the rendezvous request and the end of the RDMA read
+fails the receive once UCX reports the endpoint (see "Peer failure and endpoint
+close"). Eager
 or rendezvous is ours, not UCX's: rendezvous from `BULK_MIN_BYTES` (64 KiB,
 the same constant as the SDK's bulk cut and the TCP pooled receive) on, eager
 below, whatever `UCX_RNDV_THRESH` says (`ucx_am.rs` runs with it at 1 MiB and
@@ -348,9 +420,11 @@ the handler (`on_frame_value`) gets the receiving endpoint and keys the value by
 - a piece of another length than the frame said is refused (`InvalidData`) and
   its descriptor released;
 - values held for an endpoint that goes away (`UcxEp` drop → `forget_ep`) are
-  released, so their senders complete; the endpoint is remembered
-  (`FORGOTTEN`) because UCX keeps it and later values still arrive on it — they
-  are dropped on arrival (red without it: such a sender never completes).
+  released, so their senders complete; the endpoint is then closed, so a value
+  sent to it later fails at its sender;
+- values awaited on an endpoint UCX reports failed fail (`ep_failed`), and so
+  does any asked for on it afterwards (`FAILED`, until the endpoint is
+  dropped).
 
 `start_frame_value(reader, pieces, inline, pb)` assembles the value in `pb`, a
 pool buffer the caller took for the whole length (autumn-rpc takes it against a
@@ -371,14 +445,13 @@ pieces joined in order; wrong length refused and its sender completes; a
 given-up value, a value held for a dropped connection and one sent after it
 let their senders complete; values started together waited in either order; a
 64 KiB pool buffer at least 3 MiB into its chunk sent with the chunk's memh and
-received whole by rendezvous).
+received whole by rendezvous; a value awaited from a closed connection fails,
+and so does one asked for afterwards).
 
-Not handled (inferred, not tested): a sender whose spawned send fails only logs
-`frame value send failed`, and the receiver's connection loop then waits for
-that value until the connection is replaced (keepalive, at the client); a
-receiver waiting for a value whose sender died cannot be woken by the stream,
-which under `UCP_ERR_HANDLING_MODE_NONE` reports no error either — the same
-dead-peer class as a stream read.
+Not handled (inferred, not tested): a sender whose spawned send fails while
+its connection stays up only logs `frame value send failed`, and the
+receiver's connection loop then waits for that value until the connection is
+replaced (keepalive, at the client).
 
 ### Stream sends leave from the registered pool
 
@@ -484,11 +557,12 @@ returned once copied; inside one it goes zero-copy and is returned when UCX
 lets go. The caller must keep the memory valid and unmodified until `Returned`
 resolves. A lent value drops its `Arc<Region>` before signalling, so the
 registration cannot outlive memory the caller frees on `Returned`. A value in
-a region is returned when UCX completes its send, which, with a peer that died
-mid-transfer and no peer error handling on the endpoint, may be never. Tests: `lend::tests` (returned only after the last clone; region
+a region is returned when UCX completes its send — with an error, if the peer
+dies first (`tests/ucx_dead_peer.rs`). Tests: `lend::tests` (returned only after the last clone; region
 bounds), `ucx_am_frame.rs` `a_lent_value_is_sent_from_its_region_and_returned_after`
 (sent with the region's memh, not staged, returned after the send; outside the
-region staged and returned at once).
+region staged and returned at once; counted with the thread's `staged_count`,
+since `staged_bytes` is the process's and other tests stage beside it).
 
 Without a memh, UCX takes the context lock the workers share for every
 cache lookup (`ucp_memh_get`); with one it skips the lookup and the lock.

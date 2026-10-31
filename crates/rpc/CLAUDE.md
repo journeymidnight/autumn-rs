@@ -72,9 +72,8 @@ connection drops): every manager connection (its loop never assembles a value),
 an EN Client connection, and a PS client held to control messages (before
 CLIENT_AUTH under authz, `ConnGateState::limit_decoder`). Those connections
 have no business sending values, and a value declared and never sent would hold
-the loop and its buffer with nothing to end the wait — the dead-peer class a
-stream read has under `UCP_ERR_HANDLING_MODE_NONE`, but reachable from an
-unauthenticated client with one tiny frame. The connection's payload limit
+the loop and its buffer, from a peer that is alive, with nothing to end the
+wait — reachable from an unauthenticated client with one tiny frame. The connection's payload limit
 (`set_max_payload`) covers the whole value, so an unauthenticated client
 cannot make a server fetch more than it could have streamed (per frame; runs
 are bounded, below).
@@ -330,9 +329,9 @@ down with a UCX read pending.
 ## Dead-peer detection (`Keepalive`, `MSG_TYPE_PING = 0xFF`)
 
 A peer can be dead while its transport is not: a frozen or wedged process whose
-kernel still ACKs, a flow a middlebox dropped without a RST, a UCX endpoint with
-peer-failure detection off (`UCP_ERR_HANDLING_MODE_NONE`, see transport). None of
-those produce the read/write error `closed` used to wait for. The 2026-09-22
+kernel still ACKs, a flow a middlebox dropped without a RST. UCX endpoints
+report a peer that closes or dies (PEER mode, see transport), but a frozen
+process looks alive to them too. None of those produce the read/write error `closed` used to wait for. The 2026-09-22
 incident was this: fuse reads answered EIO after 30 s for hours over connections
 that were ESTABLISHED with empty queues.
 
@@ -417,9 +416,9 @@ SDK's `ps_conns` / `mgr_conn`.
 - **Cost.** Loaded connections: one `Cell` increment per socket read, no ping.
   Idle connections: an 18-byte frame each way every ~4 s. Every TCP connection:
   one `TCP_INFO` getsockopt per 2 s tick.
-- **UCX.** Detection works (verified with SIGSTOP), but the evicted endpoint is
-  still leaked by design (`UCP_ERR_HANDLING_MODE_NONE`, see transport); PEER
-  mode is a separate decision.
+- **UCX.** Detection works (verified with SIGSTOP); the evicted connection's
+  endpoint is closed when the client drops (transport, "Peer failure and
+  endpoint close"), which completes whatever was still in flight on it.
 - The task holds a `Weak<RpcClient>` and upgrades only between awaits, so it never
   keeps a connection alive and never drops the last `Rc` (its own `JoinHandle`)
   from inside itself.

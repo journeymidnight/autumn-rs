@@ -129,16 +129,6 @@ impl AutumnManager {
             // brief backoff (avoid a busy error loop on a persistent
             // failure like EMFILE) + keep accepting. Mirrors the
             // partition-server per-partition accept task.
-            //
-            // Known residual (coco P1, accepted): on UCX a failed accept
-            // leaves the half-created server-side ep allocated until
-            // worker destroy — there is NO working close path under
-            // UCP_ERR_HANDLING_MODE_NONE (FORCE close is rejected, FLUSH
-            // close deadlocks on loopback, MODE_PEER tears down live EPs
-            // under load — see crates/transport/src/ucx/endpoint.rs "EP
-            // lifetime" doc). The leak is one ep per FAILED handshake,
-            // bounded by the storm size, and strictly better than the
-            // previous behavior (whole-process death on the same event).
             let (conn, peer) = match listener.accept().await {
                 Ok(v) => v,
                 Err(e) => {
