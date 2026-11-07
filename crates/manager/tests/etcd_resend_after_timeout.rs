@@ -22,14 +22,24 @@ use support::{pick_addr, start_etcd, start_extent_node, start_toxiproxy, Toxipro
 
 const OWNER_KEY: &str = "owner/resend-test";
 
-/// A manager whose etcd requests time out after 1 s; stops when the flag is set.
+/// The manager's etcd request timeout. Every other time in these tests is a
+/// multiple of it: what they set up is an ordering around the timeout, and on
+/// a slow runner a 1 s timeout left too little room for the settle between it
+/// and the next step.
+const ETCD_TIMEOUT_MS: u64 = 3000;
+
+fn at(fraction_of_timeout: f64) -> Duration {
+    Duration::from_millis((ETCD_TIMEOUT_MS as f64 * fraction_of_timeout) as u64)
+}
+
+/// A manager whose etcd requests time out after `ETCD_TIMEOUT_MS`; stops when the flag is set.
 fn start_manager(mgr_addr: SocketAddr, endpoints: Vec<String>) -> Arc<AtomicBool> {
     let flag = Arc::new(AtomicBool::new(false));
     let flag_thread = flag.clone();
     std::thread::spawn(move || {
         compio::runtime::Runtime::new().unwrap().block_on(async {
             let params = ManagerParams::default();
-            params.etcd_request_timeout_ms.set(1000);
+            params.etcd_request_timeout_ms.set(ETCD_TIMEOUT_MS);
             let manager = AutumnManager::new_with_etcd_params(endpoints, support::manager_identity(), params)
                 .await
                 .expect("new manager with etcd");
@@ -151,15 +161,16 @@ fn an_alloc_whose_reply_was_lost_does_not_wedge_the_stream() {
         assert_eq!(before.len(), 1);
 
         // Hold every etcd reply; requests still reach etcd and commit.
-        toxi.add_toxic("etcd", "latency", "hold", false, &[("latency", "5000"), ("jitter", "0")])
+        let hold_ms = (5 * ETCD_TIMEOUT_MS).to_string();
+        toxi.add_toxic("etcd", "latency", "hold", false, &[("latency", hold_ms.as_str()), ("jitter", "0")])
             .expect("toxic add");
         let t0 = std::time::Instant::now();
-        // The alloc's txn commits; its reply is held; at t=1.0 s the client
-        // re-sends it on the direct endpoint, where its CAS meets its own write.
+        // The alloc's txn commits; its reply is held; at the timeout the manager
+        // settles it, reading back on the direct endpoint, and finds it committed.
         let first = alloc(&mgr1, stream_id, lock.owner_epoch).await;
         let first_at = t0.elapsed();
         eprintln!("first alloc at {first_at:?}: code {} {}", first.code, first.message);
-        assert!(first_at >= Duration::from_secs(1), "harness timing: the first reply was not held");
+        assert!(first_at >= at(1.0), "harness timing: the first reply was not held");
         toxi.remove_toxic("etcd", "hold").expect("toxic remove");
         compio::time::sleep(Duration::from_millis(300)).await;
 
@@ -232,11 +243,12 @@ fn a_txn_arriving_after_it_was_settled_is_fenced_out() {
             toxi.set_enabled("etcd-b", true).expect("enable b");
             let held = "etcd-a";
             // Hold requests on their way to etcd; replies are free.
-            toxi.add_toxic(held, "latency", "hold", true, &[("latency", "5000"), ("jitter", "0")])
+            let hold_ms = (5 * ETCD_TIMEOUT_MS).to_string();
+            toxi.add_toxic(held, "latency", "hold", true, &[("latency", hold_ms.as_str()), ("jitter", "0")])
                 .expect("toxic add");
             let t0 = std::time::Instant::now();
-            // X times out at 1 s, is settled as not landed, and is sent again on
-            // the new connection.
+            // Times in this loop are in units of the timeout. X times out at 1.0,
+            // is settled as not landed, and is sent again on the new connection.
             let mgr_x = mgr.clone();
             let x = compio::runtime::spawn(async move {
                 let e = acquire(mgr_x).await;
@@ -245,7 +257,9 @@ fn a_txn_arriving_after_it_was_settled_is_fenced_out() {
             // Y keeps the OLD connection open past X's reconnect, so X's held
             // original is still delivered when the hold is released. Without it
             // the connection closes with the hold and the copy is simply lost.
-            compio::time::sleep(Duration::from_millis(600)).await;
+            // Y is sent at 0.6, so it times out at 1.6; the release has to come
+            // before then, after X has settled and re-sent.
+            compio::time::sleep(at(0.6)).await;
             let mgr_y = mgr.clone();
             let y = compio::runtime::spawn(async move {
                 let resp = mgr_y
@@ -258,12 +272,12 @@ fn a_txn_arriving_after_it_was_settled_is_fenced_out() {
                 let r: AcquireOwnerLockResp = rkyv_decode(&resp).expect("decode");
                 (t0.elapsed(), r.code)
             });
-            compio::time::sleep(Duration::from_millis(700)).await;
+            compio::time::sleep(at(0.7)).await;
             let (settled_at, settled) = x.await.expect("x");
             eprintln!("cycle {cycle}: settled acquire at {settled_at:?}: epoch {settled} (first {first})");
-            assert!(settled_at >= Duration::from_secs(1), "harness timing: the request was not held");
+            assert!(settled_at >= at(1.0), "harness timing: the request was not held");
             assert!(settled > first);
-            // t=1.3 s: the held originals arrive now; Y's is answered, X's meets
+            // t=1.3: the held originals arrive now; Y's is answered, X's meets
             // the fence it was sent under.
             let released_at = t0.elapsed();
             toxi.remove_toxic(held, "hold").expect("toxic remove");
