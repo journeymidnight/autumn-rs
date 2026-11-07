@@ -1,0 +1,2739 @@
+//! RPC client with request multiplexing over a single TCP connection.
+//!
+//! One `RpcClient` per remote address. Multiple concurrent requests are
+//! multiplexed via `req_id` and, as of R4 (step 4.1), an **SQ/CQ pipeline**:
+//!
+//! - **SQ (submit queue)**: callers push encoded frames into a bounded mpsc;
+//!   a single background `writer_task` owns the `WriteHalf` and drains the
+//!   queue sequentially (no write-side mutex). The bound REFUSES rather than
+//!   waits — a full queue means the peer stopped reading, which callers
+//!   already handle and waiting only hides.
+//! - **CQ (completion queue)**: a background `read_loop` task owns the
+//!   `ReadHalf`, decodes response frames and routes each to the matching
+//!   `oneshot::Sender<Frame>` in the `pending` inflight map.
+//!
+//! Callers never block on the wire. They insert their oneshot sender into
+//! `pending`, push a `SubmitMsg` into the submit channel (which REFUSES rather
+//! than parks when full — see `submit`), and then await their own receiver. This decouples
+//! submission order from completion order: whichever response CQE arrives
+//! first wakes its specific caller, independent of which caller submitted
+//! first.
+
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::rc::{Rc, Weak};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
+
+use crate::am_frame::AmOut;
+use bytes::Bytes;
+use compio::io::{AsyncRead, AsyncWriteExt};
+use compio::runtime::{spawn, JoinHandle};
+use compio::BufResult;
+use futures::channel::{mpsc, oneshot};
+use futures::StreamExt;
+
+use crate::error::RpcError;
+#[cfg(test)]
+#[path = "../tests/support/protocol.rs"]
+mod test_protocol;
+use crate::frame::{Frame, FrameDecoder};
+
+// ── zero-copy GET (recv-into-pooled) ─────────────────────────────────────────
+//
+// `call_into_pooled` recvs a value-response's raw value tail straight into a
+// read_loop-owned RegPool `PooledBuf` (registered, for UCX) instead of a fresh
+// `Vec`. Wire v28 uses ONE frame shape for everything:
+//
+//   [header 10][ctrl_len 4][ctrl…][crc32c 4][value…]
+//
+// For the bulk read response ctrl = `[code:1][message…]`; the crc covers
+// header+ctrl (so a flipped code/req_id fails loud) while the value tail is
+// raw — its integrity is the transport's (UCX NIC ICRC / TCP kernel segment
+// checksum; the per-value crc was measured at ~20% of a core @ 8 MiB).
+//
+// The recv-into-CALLER-dest sibling (`call_into_dest`, raw `*mut u8` + optional
+// explicit `RegisteredMem`) was REMOVED: its cancel-safety contract (dest must
+// outlive the call, no per-call timeout ever) made it the one SDK RPC that
+// could hang unboundedly, its `reg` was always `None` in production (implicit
+// rcache registration), and the default-on EN-direct read path had already
+// switched to pooled-recv-plus-memcpy deliberately. Callers needing the value
+// at a specific address copy out of the returned `PooledBuf` (one memcpy).
+
+/// Minimum value size at which the **TCP** `call_into_pooled` read path recvs
+/// the value straight into a `PooledBuf` (compio owned read) instead of
+/// letting the `FrameDecoder` accumulate it then copying into the pool buffer.
+/// Below this the FrameDecoder path is cheaper (it batch-decodes multiple small
+/// frames per socket read and a small value's whole payload is usually already
+/// buffered, so recv-into-pooled would only add a pool acquire + an extra
+/// syscall). Mirrors the UCX read threshold (`BULK_MIN_BYTES`); TCP
+/// can't be true zero-copy (the kernel copy is unavoidable) but this removes the
+/// extra app-level copy for large values.
+pub const TCP_RECV_INTO_POOLED_MIN_BYTES: usize = autumn_transport::BULK_MIN_BYTES;
+
+/// Outcome of a `call_into_pooled`: the raw value (possibly empty) in a
+/// read_loop-owned pool buffer, plus the bulk status ctrl — application `code`
+/// and a human-readable `message` (usually empty on success), both
+/// CRC-protected on the wire.
+pub struct BulkResp {
+    pub buf: autumn_transport::PooledBuf,
+    pub code: u8,
+    pub message: String,
+    /// The ctrl block after the leading code byte, verbatim. `message` is the
+    /// same bytes read as text, which is right for the single-value bulk reads
+    /// whose ctrl IS an error string — but a batched reply puts binary there
+    /// (per-key statuses and value lengths), and lossy UTF-8 would corrupt it.
+    pub ctrl: Bytes,
+}
+
+impl std::fmt::Debug for BulkResp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BulkResp")
+            .field("code", &self.code)
+            .field("message", &self.message)
+            .field("value_len", &self.buf.len())
+            .finish()
+    }
+}
+
+/// CQ-side inflight entry. A normal request awaits a `Frame`; a bulk request
+/// gets its value recv'd into a read_loop-owned `PooledBuf`.
+enum Pending {
+    Frame(oneshot::Sender<Frame>),
+    /// `call_into_pooled`: the READ_LOOP owns the dest buffer — it acquires a
+    /// `PooledBuf` at recv time, recvs the value into it, and hands the filled
+    /// buffer back here. On caller-cancel the receiver is gone → the read_loop
+    /// drops the `PooledBuf` → returns to pool (no leak; cancel-safe, since the
+    /// cancellable caller never owns the in-flight buffer).
+    IntoPooled(oneshot::Sender<Result<BulkResp, RpcError>>),
+    /// `call_into_dest`: the value is received into the caller's memory,
+    /// lent through the slot (see `DestSlot`).
+    IntoDest(DestWaiter, Rc<DestSlot>),
+}
+
+/// The sender a `call_into_pooled` caller awaits.
+type BulkWaiter = oneshot::Sender<Result<BulkResp, RpcError>>;
+/// The sender a `call_into_dest` caller awaits.
+type DestWaiter = oneshot::Sender<Result<DestResp, RpcError>>;
+
+/// The caller of the bulk value receive `read_loop` is in the middle of.
+enum Receiving {
+    Pooled(BulkWaiter),
+    Dest(DestWaiter),
+}
+
+/// Outcome of a `call_into_dest`: the status ctrl (as in [`BulkResp`]) and the
+/// value's length. The value is in the caller's memory, or in `spill` when it
+/// was longer than that memory.
+pub struct DestResp {
+    pub code: u8,
+    pub message: String,
+    pub ctrl: Bytes,
+    pub value_len: usize,
+    pub spill: Option<autumn_transport::PooledBuf>,
+}
+
+impl std::fmt::Debug for DestResp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DestResp")
+            .field("code", &self.code)
+            .field("message", &self.message)
+            .field("value_len", &self.value_len)
+            .field("spilled", &self.spill.is_some())
+            .finish()
+    }
+}
+
+/// The caller's memory while its request is pending. The caller takes `dest`
+/// back if the read loop has not started on it; once started, `abort` stops
+/// the receive. Either way the caller then waits for the `RecvDest` to drop.
+#[derive(Default)]
+struct DestSlot {
+    dest: RefCell<Option<autumn_transport::RecvDest>>,
+    abort: RefCell<Option<futures::future::AbortHandle>>,
+}
+
+type WriteHalf = autumn_transport::WriteHalf;
+type ReadHalf = autumn_transport::ReadHalf;
+
+/// Capacity of the submit mpsc channel between callers and the writer task.
+///
+/// Bounded, and the bound REFUSES rather than parks: 1024 undrained messages
+/// means the peer has stopped reading, which is a condition every caller here
+/// already handles (roll to a fresh extent, try another replica) and which
+/// parking hides. See `submit` for what parking costs.
+const SUBMIT_CHANNEL_CAP: usize = 1024;
+
+/// Which of the writer's two queues a message joins. The writer takes the next
+/// URGENT message before any NORMAL one; a frame already being written is never
+/// interrupted, so an urgent request waits at most for that one frame instead of
+/// for every bulk write queued ahead of it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Lane {
+    Normal,
+    Urgent,
+}
+
+/// Frames at least this large count against the send window.
+const WINDOWED_FRAME_MIN_BYTES: usize = 64 * 1024;
+
+/// How many LARGE normal-lane requests a connection may have written and not
+/// yet seen answered (`RpcClient::set_send_window`; 0 = no limit). A server
+/// that admits a few requests per connection and reads the rest in order (the
+/// PS: `--conn-inflight-cap`) otherwise holds the surplus in its transport,
+/// where nothing can overtake it — UCX accepts a stream send whether or not the
+/// peer reads. Held here instead, they wait in the client's queue and an urgent
+/// request goes first. Small frames are never held.
+#[derive(Default)]
+struct SendWindow {
+    limit: Cell<usize>,
+    unanswered: RefCell<std::collections::HashSet<u32>>,
+    writer: RefCell<Option<std::task::Waker>>,
+}
+
+impl SendWindow {
+    fn is_open(&self) -> bool {
+        let limit = self.limit.get();
+        limit == 0 || self.unanswered.borrow().len() < limit
+    }
+
+    fn written(&self, req_id: u32) {
+        if self.limit.get() != 0 && req_id != 0 {
+            self.unanswered.borrow_mut().insert(req_id);
+        }
+    }
+
+    fn answered(&self, req_id: u32) {
+        if self.unanswered.borrow_mut().remove(&req_id) {
+            self.wake_writer();
+        }
+    }
+
+    /// The reader is gone: nothing will be answered, so stop holding frames.
+    fn close(&self) {
+        self.limit.set(0);
+        self.wake_writer();
+    }
+
+    fn wake_writer(&self) {
+        if let Some(w) = self.writer.borrow_mut().take() {
+            w.wake();
+        }
+    }
+}
+
+/// Submission message pushed onto the writer_task's queue.
+///
+/// The caller has already (a) assigned `req_id`, (b) inserted its oneshot
+/// sender into `pending`, and (c) encoded the frame bytes (or prepared the
+/// vectored bufs). The writer_task simply writes to the socket.
+enum SubmitMsg {
+    /// A single-buffer frame (used by `call()`, `send_oneshot()`, etc.).
+    Single {
+        bytes: Bytes,
+        req_id: u32,
+    },
+    /// A vectored frame `[header][part0][part1]...` (used by `call_vectored`,
+    /// `send_vectored`). Zero-copy for the payload parts.
+    Vectored {
+        bufs: Vec<Bytes>,
+        req_id: u32,
+        /// Frame values to send beside the frame (`am_frame`), posted when
+        /// the frame is written.
+        am: Vec<(u64, autumn_transport::RegBytes)>,
+    },
+    Prepared {
+        bufs: Vec<Bytes>,
+        req_id: u32,
+        am: Vec<(u64, autumn_transport::RegBytes)>,
+    },
+    /// A keepalive ping. Written like `Single`; the writer counts it once it
+    /// is on the wire, which is when the keepalive starts timing the reply.
+    Ping {
+        bytes: Bytes,
+        req_id: u32,
+    },
+}
+
+impl SubmitMsg {
+    fn is_large(&self) -> bool {
+        match self {
+            SubmitMsg::Single { bytes, .. } | SubmitMsg::Ping { bytes, .. } => bytes.len() >= WINDOWED_FRAME_MIN_BYTES,
+            SubmitMsg::Vectored { bufs, am, .. } | SubmitMsg::Prepared { bufs, am, .. } => {
+                bufs.iter().map(Bytes::len).chain(am.iter().map(|(_, v)| v.len())).sum::<usize>()
+                    >= WINDOWED_FRAME_MIN_BYTES
+            }
+        }
+    }
+
+    fn req_id(&self) -> u32 {
+        match self {
+            SubmitMsg::Single { req_id, .. } => *req_id,
+            SubmitMsg::Vectored { req_id, .. } => *req_id,
+            SubmitMsg::Prepared { req_id, .. } => *req_id,
+            SubmitMsg::Ping { req_id, .. } => *req_id,
+        }
+    }
+}
+
+/// How a connection notices a peer that has stopped answering.
+///
+/// A peer can be dead while its transport is not: a frozen or wedged process
+/// whose kernel still ACKs, a flow a middlebox dropped without a RST, a UCX
+/// endpoint running with peer-failure detection off. None of those ever
+/// produce the read or write error that `closed` used to wait for, so the
+/// connection stayed "open" for as long as the process lived, and every caller
+/// found out one timeout at a time — or never, when an outer deadline
+/// cancelled the call before its own timeout could evict it.
+///
+/// The rule is about SILENCE, not about the ping: any byte received resets the
+/// clock, so a connection whose replies arrive at least every `interval` never
+/// pings, and a peer that is slow on one request but answers others — or the
+/// ping — is never judged. After `interval` without a sign of life the client
+/// queues `MSG_TYPE_PING`; once the silence has lasted `dead_after` in all
+/// (TCP), or `dead_after` since the ping was written (UCX), the connection is
+/// closed — `is_closed()` turns true, every request waiting
+/// on it fails with `ConnectionClosed` at once, and pools evict it so callers
+/// retry elsewhere without spending their own deadlines. Signs of life and the
+/// exact timing are in `keepalive_task`: any received byte, and on TCP the peer
+/// ACKing our bytes while more wait unsent behind them (a slow link, not a dead
+/// peer).
+///
+/// Any reply to the ping proves the peer alive, including an error frame: a
+/// server that predates `MSG_TYPE_PING` answers `unknown msg_type`, which
+/// counts just the same. That is why the ping needs no wire-version bump.
+///
+/// What the rule cannot tell apart from death, and so may close: a peer whose
+/// connection loop reads nothing for `dead_after` because it is back-pressured
+/// at its per-connection in-flight cap (PS: 4, EN: 64) and every one of those
+/// requests is stalled. The SDK's first attempt already evicts a PS connection
+/// after 5 s in that state, so this adds nothing there.
+#[derive(Clone, Copy, Debug)]
+pub struct Keepalive {
+    /// Silence after which a ping is queued, and the tick of the whole check.
+    pub interval: Duration,
+    /// How long the silence may last, counted from the first silent tick (TCP)
+    /// or from the ping being written (no TCP counters: UCX), before the peer
+    /// is judged dead.
+    pub dead_after: Duration,
+}
+
+impl Keepalive {
+    /// A dead peer is found 8–10 s after its last sign of life (TCP; ~10–12 s
+    /// without the TCP counters): under the 30 s the
+    /// SDK's `rpc_timeout` and the fuse `--reply-timeout-secs` allow a whole request,
+    /// so a request stuck on a dead connection fails in time for its caller to
+    /// retry elsewhere. Idle healthy connections pay one empty frame each way
+    /// every ~4 s.
+    pub const DEFAULT: Keepalive = Keepalive {
+        interval: Duration::from_secs(2),
+        dead_after: Duration::from_secs(8),
+    };
+
+    fn unanswered_ticks_to_dead(&self) -> u64 {
+        let interval = self.interval.as_nanos().max(1);
+        self.dead_after.as_nanos().div_ceil(interval).max(1) as u64
+    }
+}
+
+/// A multiplexed RPC client over a single TCP connection.
+///
+/// Write path: callers push `SubmitMsg` into `submit_tx` (or `urgent_tx`, see
+/// `Lane`); the `writer_task` drains and writes sequentially — no cross-caller
+/// mutex contention.
+/// Read path: the `read_loop` task decodes response frames and dispatches
+/// them via `pending`.
+///
+/// All fields are !Send (single-threaded, compio thread-per-core model).
+/// `pending` uses `RefCell` with scoped borrows — never held across await.
+pub struct RpcClient {
+    protocol: crate::version_hello::Negotiated,
+    /// Sends large values beside their frames (UCX, peer reads them).
+    am_out: Option<Rc<AmOut>>,
+    /// SQ: submit channel to writer_task. Borrowed mutably, never cloned per
+    /// send: `futures::mpsc` grants each SENDER a slot beyond the shared
+    /// buffer, so a clone per call hands every caller its own slot and the
+    /// capacity stops applying at all (see `submit`).
+    submit_tx: RefCell<mpsc::Sender<SubmitMsg>>,
+    /// The urgent lane's queue (`Lane::Urgent`), same bound and refusal.
+    urgent_tx: RefCell<mpsc::Sender<SubmitMsg>>,
+    window: Rc<SendWindow>,
+    /// CQ-side inflight map: `req_id -> oneshot::Sender<Frame>`.
+    /// Borrowed only briefly (insert/remove/get), never across await.
+    pending: Rc<RefCell<HashMap<u32, Pending>>>,
+    /// Monotonic request id. Single-threaded, no await crossing.
+    /// Value 0 is reserved for fire-and-forget (no response expected).
+    next_id: Cell<u32>,
+    peer_addr: SocketAddr,
+    /// Set true when either `read_loop` or `writer_task` exits. After
+    /// that point new submits MUST short-circuit with `ConnectionClosed`
+    /// — otherwise the caller's pending entry would never be dispatched
+    /// (no read_loop alive to deliver the response). Without this flag,
+    /// a stale pooled client whose peer has died blocks callers forever.
+    closed: Rc<Cell<bool>>,
+    /// The connection's teardown: these handles are HELD, not `detach()`ed,
+    /// so dropping the last `Rc<RpcClient>` cancels both background tasks,
+    /// which drops the socket halves and closes the connection.
+    ///
+    /// Detached, the tasks outlived every handle to them and only the PEER
+    /// could end them. `read_loop` is the one that always outlives its client:
+    /// it blocks in `read` until EOF, so it holds an evicted connection open
+    /// even when the connection is IDLE and healthy — which is the common case,
+    /// since a stale-epoch status error and a token renewal each evict one with
+    /// nothing in flight. `writer_task` joins it whenever frames are queued: it
+    /// blocks in `write_all` against a peer that stopped reading and so never
+    /// returns to notice its channel closed, pinning every queued frame behind
+    /// that stalled write. (An idle writer does end on its own — parked on
+    /// `submit_rx.next()`, it sees the channel close.) Measured before this:
+    /// five evictions of a never-reading peer held five ESTABLISHED sockets and
+    /// 70 MiB of queued values, and the peer never got a FIN, so it held its own
+    /// socket and conn task too. Everything was released only when the peer
+    /// closed first.
+    ///
+    /// Cancellation is what a compio `JoinHandle`'s drop does; the task is
+    /// scheduled, runs no further poll, and its future is dropped. That drops
+    /// an in-flight read/write op too — compio keeps the op's buffer until the
+    /// cancel CQE lands, so no buffer is freed under the kernel. Abandoning a
+    /// half-written frame is sound BECAUSE this is a teardown: the peer sees
+    /// the connection close right behind the truncated bytes, and no caller can
+    /// still be waiting (a caller holds its own `Rc`, so `Drop` cannot run
+    /// while one is in flight).
+    ///
+    /// On UCX a cancelled transfer cannot be stopped; the transport keeps its
+    /// buffers on an orphan list until UCX completes it and frees them then
+    /// (a pool slab goes back to its pool). Per closed connection that is at
+    /// most one in-flight recv window plus one in-flight send, held until the
+    /// peer's next bytes or its own send completion arrive.
+    _writer_task: JoinHandle<()>,
+    _reader_task: JoinHandle<()>,
+    /// The caller of the bulk value receive `read_loop` is in the middle of,
+    /// if any. Its entry left `pending` when the receive began, so
+    /// `close_silent_peer` releases it from here. Deliberately not by
+    /// cancelling the reader: on UCX a dropped receive stays posted and takes
+    /// the connection's next bytes, which would be lost to a reader kept alive.
+    receiving: Rc<RefCell<Option<Receiving>>>,
+    /// Watches for a silent peer (see `Keepalive`). Holds only a `Weak` to the
+    /// client, so it never keeps a connection alive, and ends with it.
+    _keepalive_task: JoinHandle<()>,
+}
+
+impl RpcClient {
+    /// Connect to a remote address through the process-global transport
+    /// (`autumn_transport::current()`), then start the background reader +
+    /// writer. Honours `AUTUMN_TRANSPORT={tcp,ucx,auto}` once Phase 4 wires
+    /// the env switch.
+    pub async fn connect(addr: SocketAddr) -> Result<Rc<Self>, RpcError> {
+        Self::connect_as(addr, crate::version_hello::Role::Peer, None).await
+    }
+
+    pub async fn connect_as(
+        addr: SocketAddr,
+        role: crate::version_hello::Role,
+        expected: Option<crate::version_hello::Service>,
+    ) -> Result<Rc<Self>, RpcError> {
+        let deadline = crate::version_hello::TIMEOUT;
+        // Boxed: connect + VERSION_HELLO is a cold path, and its state
+        // machine inline grows every caller's future. Unboxed, autumn-fuse's
+        // `prefetch_ahead` overflowed rustc's layout depth limit, and a flush
+        // on the 2 MiB partition thread overflowed its stack (debug build).
+        Box::pin(compio::time::timeout(deadline, async {
+            let conn = autumn_transport::current_or_init().connect(addr).await?;
+            if let Some(s) = conn.as_tcp() {
+                s.set_nodelay(true)?;
+            }
+            Self::from_conn_as(conn, addr, Keepalive::DEFAULT, role, expected).await
+        }))
+        .await
+        .map_err(|_| RpcError::Timeout(deadline))?
+    }
+
+    /// `connect` with a non-default `Keepalive` (tests shorten it).
+    pub async fn connect_with(
+        addr: SocketAddr,
+        keepalive: Keepalive,
+    ) -> Result<Rc<Self>, RpcError> {
+        let deadline = crate::version_hello::TIMEOUT;
+        compio::time::timeout(deadline, async {
+            let conn = autumn_transport::current_or_init().connect(addr).await?;
+            if let Some(s) = conn.as_tcp() {
+                s.set_nodelay(true)?;
+            }
+            Self::from_conn_with(conn, addr, keepalive).await
+        }).await.map_err(|_| RpcError::Timeout(deadline))?
+    }
+
+    /// Build an RpcClient from an already-connected `autumn_transport::Conn`.
+    ///
+    /// Spawns two background tasks on the current compio runtime:
+    /// - `writer_task`: owns the write half, drains submit_rx, writes frames.
+    /// - `read_loop`: owns the read half, decodes frames, dispatches via pending.
+    ///
+    /// Both tasks terminate on socket close / write error. When either exits,
+    /// `pending` is cleared so callers' receivers see `RecvError` and surface
+    /// `RpcError::ConnectionClosed`.
+    pub async fn from_conn(
+        conn: autumn_transport::Conn,
+        peer_addr: SocketAddr,
+    ) -> Result<Rc<Self>, RpcError> {
+        Self::from_conn_with(conn, peer_addr, Keepalive::DEFAULT).await
+    }
+
+    /// `from_conn` with an explicit `Keepalive`.
+    pub async fn from_conn_with(
+        conn: autumn_transport::Conn,
+        peer_addr: SocketAddr,
+        keepalive: Keepalive,
+    ) -> Result<Rc<Self>, RpcError> {
+        Self::from_conn_as(
+            conn,
+            peer_addr,
+            keepalive,
+            crate::version_hello::Role::Peer,
+            None,
+        )
+        .await
+    }
+
+    pub async fn from_conn_as(
+        conn: autumn_transport::Conn,
+        peer_addr: SocketAddr,
+        keepalive: Keepalive,
+        role: crate::version_hello::Role,
+        expected: Option<crate::version_hello::Service>,
+    ) -> Result<Rc<Self>, RpcError> {
+        // Taken before the split; valid while either half lives, which the
+        // keepalive checks through `closed` (see `keepalive_task`).
+        #[cfg(target_os = "linux")]
+        let ack_probe = conn.as_tcp().map(|s| {
+            use std::os::fd::AsRawFd;
+            AckProbe(s.as_raw_fd())
+        });
+        #[cfg(not(target_os = "linux"))]
+        let ack_probe: Option<AckProbe> = None;
+        let (mut reader, mut writer) = conn.into_split();
+        let protocol = crate::version_hello::initiate(
+            &mut reader,
+            &mut writer,
+            crate::version_hello::Hello::current(role),
+            expected,
+        )
+        .await?;
+        if let Err(e) = crate::peer_auth::initiate(
+            &mut reader,
+            &mut writer,
+            &protocol,
+            crate::peer_auth::installed(),
+        )
+        .await
+        {
+            crate::peer_auth::on_dial_failure(&e, peer_addr, protocol.service);
+            return Err(e);
+        }
+        let pending: Rc<RefCell<HashMap<u32, Pending>>> = Rc::new(RefCell::new(HashMap::new()));
+
+        let am_out = AmOut::for_connection(&writer, protocol.remote_wire);
+        let am_for_writer = am_out.clone();
+        let (submit_tx, submit_rx) = mpsc::channel::<SubmitMsg>(SUBMIT_CHANNEL_CAP);
+        let (urgent_tx, urgent_rx) = mpsc::channel::<SubmitMsg>(SUBMIT_CHANNEL_CAP);
+        let closed: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+
+        // SQ: writer_task drains submit_rx and writes to the socket.
+        // On exit (write error or channel-close) we set `closed` BEFORE
+        // clearing `pending` so any caller racing a fresh `send_*` checks
+        // the flag and short-circuits with `ConnectionClosed`. Without
+        // `closed`, a stale `Rc<RpcClient>` left in a pool would let new
+        // submits insert pending entries that nobody dispatches — the
+        // caller's `rx.await` then hangs forever (the original hang's root cause).
+        let pending_for_writer = pending.clone();
+        let closed_for_writer = closed.clone();
+        // Bumped by `writer_task` each time a keepalive ping reaches the socket.
+        let pings_on_wire: Rc<Cell<u64>> = Rc::new(Cell::new(0));
+        let pings_for_writer = pings_on_wire.clone();
+        let window = Rc::new(SendWindow::default());
+        let window_for_writer = window.clone();
+        let window_for_reader = window.clone();
+        let writer_handle = spawn(async move {
+            writer_task(
+                writer,
+                am_for_writer,
+                urgent_rx,
+                submit_rx,
+                window_for_writer,
+                pending_for_writer.clone(),
+                pings_for_writer,
+                peer_addr,
+            )
+            .await;
+            closed_for_writer.set(true);
+            pending_for_writer.borrow_mut().clear();
+        });
+
+        // CQ: read_loop decodes response frames and dispatches via pending.
+        // Bumped by `read_loop` for every read that returns bytes; the
+        // keepalive only compares it between ticks.
+        let rx_progress: Rc<Cell<u64>> = Rc::new(Cell::new(0));
+        let receiving: Rc<RefCell<Option<Receiving>>> = Rc::new(RefCell::new(None));
+        let pending_for_reader = pending.clone();
+        let closed_for_reader = closed.clone();
+        let progress_for_reader = rx_progress.clone();
+        let receiving_for_reader = receiving.clone();
+        let reader_handle = spawn(async move {
+            if let Err(e) = read_loop(
+                reader,
+                pending_for_reader.clone(),
+                progress_for_reader,
+                receiving_for_reader,
+                window_for_reader.clone(),
+                peer_addr,
+            )
+            .await
+            {
+                tracing::warn!(addr = %peer_addr, error = %e, "rpc client reader exited");
+            }
+            window_for_reader.close();
+            // set closed BEFORE clearing pending so subsequent
+            // `send_*` short-circuits and never inserts a fresh pending
+            // entry that has no read_loop alive to dispatch it.
+            closed_for_reader.set(true);
+            pending_for_reader.borrow_mut().clear();
+        });
+
+        // The handles are FIELDS, not `detach()` — see `_writer_task`. They are
+        // this connection's only teardown.
+        Ok(Rc::new_cyclic(|weak| Self {
+            protocol,
+            am_out,
+            submit_tx: RefCell::new(submit_tx),
+            urgent_tx: RefCell::new(urgent_tx),
+            window,
+            pending,
+            next_id: Cell::new(1),
+            peer_addr,
+            closed,
+            _writer_task: writer_handle,
+            _reader_task: reader_handle,
+            receiving,
+            _keepalive_task: spawn(keepalive_task(
+                weak.clone(),
+                rx_progress,
+                pings_on_wire,
+                ack_probe,
+                keepalive,
+            )),
+        }))
+    }
+
+    /// True when either `read_loop` or `writer_task` has exited.
+    /// Pools should evict the entry; new `send_*` calls return
+    /// `ConnectionClosed` without inserting into `pending`.
+    pub fn protocol(&self) -> &crate::version_hello::Negotiated {
+        &self.protocol
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.closed.get()
+    }
+
+    /// Hold large normal-lane requests once `frames` of them are unanswered
+    /// (see `SendWindow`); 0 = no limit, the default.
+    pub fn set_send_window(&self, frames: usize) {
+        self.window.limit.set(frames);
+        self.window.wake_writer();
+    }
+
+    /// Send a request and wait for the response.
+    pub async fn call(&self, msg_type: u8, payload: Bytes) -> Result<Bytes, RpcError> {
+        self.call_on(Lane::Normal, msg_type, payload).await
+    }
+
+    /// `call` on the given lane. `Lane::Urgent` is for small requests whose
+    /// wait matters (existence probes, read redirects) on a connection that
+    /// also carries large writes.
+    pub async fn call_on(&self, lane: Lane, msg_type: u8, payload: Bytes) -> Result<Bytes, RpcError> {
+        let req_id = self.next_req_id();
+        let frame = Frame::request(req_id, msg_type, payload);
+        let rx = self.send_frame_on(lane, frame).await?;
+        Self::await_response(rx).await
+    }
+
+    /// Await a queued request's response frame and unwrap the error envelope.
+    async fn await_response(rx: oneshot::Receiver<Frame>) -> Result<Bytes, RpcError> {
+        let resp = rx.await.map_err(|_| RpcError::ConnectionClosed)?;
+        if resp.is_error() {
+            let (code, message) = RpcError::decode_status(&resp.payload);
+            return Err(RpcError::status(code, message));
+        }
+        Ok(resp.payload)
+    }
+
+    /// cancel-safe zero-copy read: send a request whose value response
+    /// the READ_LOOP recvs straight into a freshly-acquired `PooledBuf` (which
+    /// the read_loop owns), then hands back here. The caller never owns the
+    /// in-flight buffer — so a cancelled/timed-out caller can NOT leave the
+    /// NIC writing a freed/recycled buffer, and the buffer is always reclaimed
+    /// (handed back on success, dropped→pool on cancel — never leaked).
+    /// Returns a [`BulkResp`] (filled `PooledBuf` + status code + message). The
+    /// value's one receive copy lands in the pool buffer: a UCX Stream unpack
+    /// or the TCP kernel copy.
+    pub async fn call_into_pooled(
+        &self,
+        msg_type: u8,
+        payload: Bytes,
+    ) -> Result<BulkResp, RpcError> {
+        self.call_into_pooled_on(Lane::Normal, msg_type, payload).await
+    }
+
+    /// `call_into_pooled` on the given lane (see `call_on`).
+    pub async fn call_into_pooled_on(&self, lane: Lane, msg_type: u8, payload: Bytes) -> Result<BulkResp, RpcError> {
+        if self.closed.get() {
+            return Err(RpcError::ConnectionClosed);
+        }
+        let req_id = self.next_req_id();
+        let (meta_tx, meta_rx) = oneshot::channel();
+        let bytes = Frame::request(req_id, msg_type, payload).encode();
+        self.register_and_submit_on(lane, req_id, Pending::IntoPooled(meta_tx), bytes)
+            .await?;
+        meta_rx.await.map_err(|_| RpcError::ConnectionClosed)?
+    }
+
+    /// `call_into_pooled` that receives the value into `dest` — the transport's
+    /// receive copy lands there, with no copy out of a pool buffer. A value
+    /// longer than `dest` comes back in `DestResp::spill` instead.
+    ///
+    /// When this returns, whatever the outcome (`timeout` included), `dest`
+    /// has been dropped and `released` has resolved: nothing writes the memory
+    /// any more. A timeout before the value started arriving takes `dest`
+    /// back at once; one in the middle of it ends the receive, and with it
+    /// the connection, whose stream position is lost.
+    pub async fn call_into_dest(
+        &self,
+        msg_type: u8,
+        payload: Bytes,
+        dest: autumn_transport::RecvDest,
+        released: autumn_transport::Released,
+        timeout: Option<Duration>,
+    ) -> Result<DestResp, RpcError> {
+        let slot = Rc::new(DestSlot::default());
+        *slot.dest.borrow_mut() = Some(dest);
+        let outcome = self.call_into_slot(msg_type, payload, &slot, timeout).await;
+        drop(slot.dest.borrow_mut().take());
+        if let Some(abort) = slot.abort.borrow_mut().take() {
+            abort.abort();
+        }
+        released.await;
+        outcome
+    }
+
+    async fn call_into_slot(
+        &self,
+        msg_type: u8,
+        payload: Bytes,
+        slot: &Rc<DestSlot>,
+        timeout: Option<Duration>,
+    ) -> Result<DestResp, RpcError> {
+        if self.closed.get() {
+            return Err(RpcError::ConnectionClosed);
+        }
+        let req_id = self.next_req_id();
+        let (tx, rx) = oneshot::channel();
+        let bytes = Frame::request(req_id, msg_type, payload).encode();
+        self.register_and_submit(req_id, Pending::IntoDest(tx, slot.clone()), bytes)
+            .await?;
+        let rx = async { rx.await.map_err(|_| RpcError::ConnectionClosed)? };
+        match timeout {
+            None => rx.await,
+            Some(t) => compio::time::timeout(t, rx).await.unwrap_or(Err(RpcError::Timeout(t))),
+        }
+    }
+
+    /// Send a request frame and return the oneshot receiver for the response.
+    ///
+    /// On return, the frame has been queued for the writer_task, or REFUSED
+    /// with `Unavailable` because the queue is full (see `submit`).
+    /// The caller awaits the receiver to get the response frame.
+    pub async fn send_frame(&self, frame: Frame) -> Result<oneshot::Receiver<Frame>, RpcError> {
+        self.send_frame_on(Lane::Normal, frame).await
+    }
+
+    async fn send_frame_on(&self, lane: Lane, frame: Frame) -> Result<oneshot::Receiver<Frame>, RpcError> {
+        // short-circuit if the reader/writer task has already
+        // exited. The check + pending.insert below run in one sync block
+        // (single-threaded compio, no awaits), so a concurrent close that
+        // races us either flips `closed` first → we return here, or runs
+        // after we insert → its `pending.clear()` cancels our `tx`.
+        if self.closed.get() {
+            return Err(RpcError::ConnectionClosed);
+        }
+        let req_id = frame.req_id;
+        let (tx, rx) = oneshot::channel();
+        let bytes = frame.encode();
+        self.register_and_submit_on(lane, req_id, Pending::Frame(tx), bytes)
+            .await?;
+        Ok(rx)
+    }
+
+    /// Send a request whose payload is already split into parts.
+    /// Uses vectored write: [frame_header][part0][part1]... — zero payload copy.
+    pub async fn call_vectored(
+        &self,
+        msg_type: u8,
+        payload_parts: Vec<Bytes>,
+    ) -> Result<Bytes, RpcError> {
+        let rx = self.send_vectored(msg_type, payload_parts).await?;
+        Self::await_response(rx).await
+    }
+
+    /// Race `fut` against a timer; keep local deadlines distinct from peer statuses.
+    async fn with_timeout<T>(
+        fut: impl std::future::Future<Output = Result<T, RpcError>>,
+        timeout: Duration,
+    ) -> Result<T, RpcError> {
+        let timer_fut = compio::time::sleep(timeout);
+        futures::pin_mut!(fut, timer_fut);
+        match futures::future::select(fut, timer_fut).await {
+            futures::future::Either::Left((result, _)) => result,
+            futures::future::Either::Right(_) => Err(RpcError::Timeout(timeout)),
+        }
+    }
+
+    /// Send a request and wait for the response with a timeout.
+    pub async fn call_timeout(
+        &self,
+        msg_type: u8,
+        payload: Bytes,
+        timeout: Duration,
+    ) -> Result<Bytes, RpcError> {
+        Self::with_timeout(self.call(msg_type, payload), timeout).await
+    }
+
+    /// `call_on` with a timeout.
+    pub async fn call_on_timeout(
+        &self,
+        lane: Lane,
+        msg_type: u8,
+        payload: Bytes,
+        timeout: Duration,
+    ) -> Result<Bytes, RpcError> {
+        Self::with_timeout(self.call_on(lane, msg_type, payload), timeout).await
+    }
+
+    /// Send a vectored request and return the receiver for the response,
+    /// without awaiting. Enables pipelined submit + parallel await patterns.
+    ///
+    /// The oneshot receiver is inserted into `pending` before the submit, so
+    /// the background reader can dispatch the response as soon as it arrives
+    /// (no lost-wakeup race).
+    pub async fn send_vectored(
+        &self,
+        msg_type: u8,
+        payload_parts: Vec<Bytes>,
+    ) -> Result<oneshot::Receiver<Frame>, RpcError> {
+        // see send_frame for the rationale.
+        if self.closed.get() {
+            return Err(RpcError::ConnectionClosed);
+        }
+        let req_id = self.next_req_id();
+        let ctrl_len: usize = payload_parts.iter().map(|p| p.len()).sum();
+        // Vectored ctrl-only frame: [head(hdr+ctrl_len)][parts…][crc]. The crc
+        // covers head + parts (header always protected).
+        let head = crate::frame::encode_vectored_head(req_id, msg_type, 0, ctrl_len, 0);
+
+        let (tx, rx) = oneshot::channel();
+        // Insert BEFORE submit — see register_and_submit for the rationale.
+        self.pending.borrow_mut().insert(req_id, Pending::Frame(tx));
+
+        // compute CRC32C over head + the multi-segment ctrl BEFORE
+        // moving the parts into bufs (compute_ctrl_crc takes &[Bytes]).
+        let crc = crate::frame::compute_ctrl_crc(&head, &payload_parts);
+        let mut bufs: Vec<Bytes> = Vec::with_capacity(2 + payload_parts.len());
+        bufs.push(Bytes::copy_from_slice(&head));
+        bufs.extend(payload_parts);
+        bufs.push(Bytes::copy_from_slice(&crc));
+
+        if let Err(e) = self.submit(SubmitMsg::Vectored { bufs, req_id, am: Vec::new() }) {
+            self.pending.borrow_mut().remove(&req_id);
+            return Err(e);
+        }
+
+        Ok(rx)
+    }
+
+    /// Send a replica payload whose CRC was computed once by its owner.
+    pub async fn send_prepared(
+        &self,
+        msg_type: u8,
+        payload: &crate::frame::PreparedPayload,
+    ) -> Result<oneshot::Receiver<Frame>, RpcError> {
+        if self.closed.get() {
+            return Err(RpcError::ConnectionClosed);
+        }
+        let req_id = self.next_req_id();
+        let (bufs, am) = match &self.am_out {
+            Some(out) if AmOut::wants(payload.body()) => {
+                let (ctrl, body) = payload.ctrl_and_body();
+                out.encode(req_id, msg_type, 0, ctrl, body)
+            }
+            _ => (payload.stream_parts(req_id, msg_type), Vec::new()),
+        };
+        let (tx, rx) = oneshot::channel();
+        self.pending.borrow_mut().insert(req_id, Pending::Frame(tx));
+        if let Err(e) = self.submit(SubmitMsg::Prepared { bufs, req_id, am }) {
+            self.pending.borrow_mut().remove(&req_id);
+            return Err(e);
+        }
+        Ok(rx)
+    }
+
+    /// `send_prepared`, then wait for the reply's payload.
+    pub async fn call_prepared(&self, msg_type: u8, payload: &crate::frame::PreparedPayload) -> Result<Bytes, RpcError> {
+        Self::await_response(self.send_prepared(msg_type, payload).await?).await
+    }
+
+    /// Send a vectored request with a timeout.
+    pub async fn call_vectored_timeout(
+        &self,
+        msg_type: u8,
+        payload_parts: Vec<Bytes>,
+        timeout: Duration,
+    ) -> Result<Bytes, RpcError> {
+        Self::with_timeout(self.call_vectored(msg_type, payload_parts), timeout).await
+    }
+
+    /// Send a value-separable request (`MSG_PUT`'s shape): the ctrl parts
+    /// (meta + key) are CRC-protected, the raw `value` rides after the crc as
+    /// its own iovec and is NEVER crc-scanned by the sender — value integrity
+    /// is the transport's + the storage layer's. Wire:
+    /// `[head][ctrl parts…][crc][value]`.
+    /// `call_vectored_bulk` with N value buffers instead of one. The frame is
+    /// unchanged — its header carries a single tail LENGTH, and that length is
+    /// the sum — but the buffers stay separate all the way into `writev`, so
+    /// nothing is concatenated to send them. Sending N values used to require
+    /// copying them into one contiguous buffer first, which is exactly the copy
+    /// a bulk transfer exists to avoid; the writer already took a `Vec<Bytes>`,
+    /// so only this entry point was missing. The receiver splits the tail using
+    /// lengths the caller put in `ctrl_parts`.
+    pub async fn call_vectored_bulk_multi<V: Into<autumn_transport::RegBytes> + AsRef<[u8]>>(
+        &self,
+        msg_type: u8,
+        ctrl_parts: Vec<Bytes>,
+        values: Vec<V>,
+    ) -> Result<Bytes, RpcError> {
+        if self.closed.get() {
+            return Err(RpcError::ConnectionClosed);
+        }
+        let req_id = self.next_req_id();
+        let (bufs, am) = self.value_frame(req_id, msg_type, ctrl_parts, values);
+
+        let (tx, rx) = oneshot::channel();
+        self.pending.borrow_mut().insert(req_id, Pending::Frame(tx));
+
+        if let Err(e) = self.submit(SubmitMsg::Vectored { bufs, req_id, am }) {
+            self.pending.borrow_mut().remove(&req_id);
+            return Err(e);
+        }
+
+        Self::await_response(rx).await
+    }
+
+    /// A value with a memh (a `RegBytes` from a pool buffer) goes out as a
+    /// UCX frame value with that registration.
+    pub async fn call_vectored_bulk(
+        &self,
+        msg_type: u8,
+        ctrl_parts: Vec<Bytes>,
+        value: impl Into<autumn_transport::RegBytes> + AsRef<[u8]>,
+    ) -> Result<Bytes, RpcError> {
+        if self.closed.get() {
+            return Err(RpcError::ConnectionClosed);
+        }
+        let req_id = self.next_req_id();
+        let (bufs, am) = self.value_frame(req_id, msg_type, ctrl_parts, vec![value]);
+
+        let (tx, rx) = oneshot::channel();
+        self.pending.borrow_mut().insert(req_id, Pending::Frame(tx));
+
+        if let Err(e) = self.submit(SubmitMsg::Vectored { bufs, req_id, am }) {
+            self.pending.borrow_mut().remove(&req_id);
+            return Err(e);
+        }
+
+        Self::await_response(rx).await
+    }
+
+    /// A value-separable request's stream buffers
+    /// (`[head][ctrl parts…][crc][values…]`), or on a connection that sends
+    /// frame values, a `FLAG_AM_VALUE` frame and its values.
+    fn value_frame<V: Into<autumn_transport::RegBytes> + AsRef<[u8]>>(
+        &self,
+        req_id: u32,
+        msg_type: u8,
+        ctrl_parts: Vec<Bytes>,
+        values: Vec<V>,
+    ) -> (Vec<Bytes>, Vec<(u64, autumn_transport::RegBytes)>) {
+        if let Some(out) = self.am_out.as_ref().filter(|_| AmOut::wants(&values)) {
+            return out.encode(req_id, msg_type, 0, ctrl_parts, values);
+        }
+        let values = values.into_iter().map(|v| v.into().into_bytes()).collect();
+        (crate::frame::value_separable_bufs(req_id, msg_type, ctrl_parts, values), Vec::new())
+    }
+
+    /// Send a fire-and-forget frame (no response expected).
+    ///
+    /// `req_id = 0` tells the remote side not to send a response frame.
+    /// Returns Ok once the frame has been queued for the writer_task; a full
+    /// queue is refused with `Unavailable` rather than waited on.
+    pub async fn send_oneshot(&self, msg_type: u8, payload: Bytes) -> Result<(), RpcError> {
+        // short-circuit on a dead client; the submit channel may
+        // still drain into a writer_task that has nowhere to read replies.
+        if self.closed.get() {
+            return Err(RpcError::ConnectionClosed);
+        }
+        let req_id = 0; // req_id 0 = no response expected
+        let frame = Frame::request(req_id, msg_type, payload);
+        let bytes = frame.encode();
+        self.submit(SubmitMsg::Single { bytes, req_id })
+    }
+
+    pub fn peer_addr(&self) -> SocketAddr {
+        self.peer_addr
+    }
+
+    /// Number of in-flight requests awaiting response.
+    pub fn pending_count(&self) -> usize {
+        self.pending.borrow().len()
+    }
+
+    /// Queue one `MSG_TYPE_PING`; `false` when it could not be queued (the
+    /// submit queue is full or the client is closed). Nobody awaits the reply:
+    /// its only job is to make the peer send bytes, which `read_loop` counts;
+    /// the pending entry exists so the reply is routed and dropped like any
+    /// other.
+    fn send_ping(&self) -> bool {
+        if self.closed.get() {
+            return false;
+        }
+        let req_id = self.next_req_id();
+        let (tx, _rx) = oneshot::channel();
+        let bytes = Frame::request(req_id, crate::MSG_TYPE_PING, Bytes::new()).encode();
+        self.pending.borrow_mut().insert(req_id, Pending::Frame(tx));
+        // Urgent: a full send window must not hold the ping, which on UCX is
+        // what starts the dead-peer clock.
+        if self.submit_on(Lane::Urgent, SubmitMsg::Ping { bytes, req_id }).is_err() {
+            self.pending.borrow_mut().remove(&req_id);
+            return false;
+        }
+        true
+    }
+
+    /// Close the connection from our side: `closed` first, so no new request
+    /// can enter, then every waiting caller is released — the ones in
+    /// `pending` by the clear, and a bulk value receive already in progress by
+    /// dropping its sender from `receiving`. The socket itself goes when the
+    /// last `Rc` does (pools evict on `is_closed`).
+    fn close_silent_peer(&self, silent_for: Duration) {
+        tracing::warn!(
+            addr = %self.peer_addr,
+            silent_ms = silent_for.as_millis() as u64,
+            in_flight = self.pending.borrow().len(),
+            "rpc peer stopped answering (no byte back, no ACK progress while bytes \
+             waited unsent, ping unanswered or unsendable); closing the connection"
+        );
+        self.closed.set(true);
+        self.pending.borrow_mut().clear();
+        drop(self.receiving.borrow_mut().take());
+    }
+
+    /// Assign the next request id. Request id 0 is reserved for fire-and-forget
+    /// so we skip it on wraparound.
+    fn next_req_id(&self) -> u32 {
+        let mut id = self.next_id.get();
+        if id == 0 {
+            id = 1;
+        }
+        self.next_id.set(id.wrapping_add(1));
+        id
+    }
+
+    /// Insert a pending entry, then queue the frame bytes for the writer_task,
+    /// rolling the entry back if the submit fails.
+    ///
+    /// Ordering invariant: pending-insert happens BEFORE submit so the
+    /// read_loop can dispatch a response the moment it arrives (no window
+    /// where the response lands and finds no entry). Callers must check
+    /// `self.closed` first, in the same sync block — see `send_frame`.
+    async fn register_and_submit(
+        &self,
+        req_id: u32,
+        entry: Pending,
+        bytes: Bytes,
+    ) -> Result<(), RpcError> {
+        self.register_and_submit_on(Lane::Normal, req_id, entry, bytes).await
+    }
+
+    async fn register_and_submit_on(
+        &self,
+        lane: Lane,
+        req_id: u32,
+        entry: Pending,
+        bytes: Bytes,
+    ) -> Result<(), RpcError> {
+        self.pending.borrow_mut().insert(req_id, entry);
+        if let Err(e) = self.submit_on(lane, SubmitMsg::Single { bytes, req_id }) {
+            // submit failed (queue full, or writer_task exited / channel
+            // closed) — remove the pending entry so we don't leak it.
+            self.pending.borrow_mut().remove(&req_id);
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// Hand one message to the writer task. REFUSES when the queue is full;
+    /// never parks, and never awaits — so the `RefCell` borrow cannot be held
+    /// across one, which is what the clone here used to be protecting against.
+    ///
+    /// This used to be `tx.send(msg).await`, which parks "until the writer_task
+    /// drains one slot" — and the writer task drains by writing to a socket, so
+    /// a peer that stops reading fills the socket, then this queue, and the park
+    /// has nothing to end it.
+    ///
+    /// A queue this deep is not back-pressure information: 1024 undrained
+    /// messages means the peer has stopped reading, which every caller here
+    /// already knows how to handle — a soft error that rolls to a fresh extent
+    /// or tries another replica. Parking hid exactly the signal they act on,
+    /// and it parked AFTER the message was queued, so the caller could neither
+    /// proceed nor withdraw.
+    ///
+    /// This is hardening, NOT the fix for the upload wedge that prompted it.
+    /// That wedge was `await_response` with no deadline: at most 96 puts are in
+    /// flight per uploader, so a 1024-deep queue was never what blocked them —
+    /// every one was waiting on a reply that never came. Reaching this refusal
+    /// needs more than a thousand concurrent callers on ONE connection, which
+    /// `autumnfs` cannot produce and a PS cannot either. The PS half of that
+    /// rests on a topology invariant, not on arithmetic that will stay true by
+    /// itself: each partition builds its OWN `ConnPool` and each stream caps
+    /// itself at 32 in flight. Share a pool across partitions and this refusal
+    /// becomes reachable — where `launch_append` turns a submit error into
+    /// `mark_bad_node`, so a load spike would be reported to the manager as a
+    /// node failure. An HTTP-fronted caller could reach it today.
+    ///
+    /// So the bound now does what a bound should: it refuses. Callers must treat
+    /// `Unavailable` here as retryable, which is what they already did with the
+    /// transport errors this replaces.
+    fn submit(&self, msg: SubmitMsg) -> Result<(), RpcError> {
+        self.submit_on(Lane::Normal, msg)
+    }
+
+    fn submit_on(&self, lane: Lane, msg: SubmitMsg) -> Result<(), RpcError> {
+        let tx = match lane {
+            Lane::Normal => &self.submit_tx,
+            Lane::Urgent => &self.urgent_tx,
+        };
+        // NO clone: `futures::mpsc` grants each SENDER a guaranteed slot
+        // beyond the buffer, so a fresh clone per call handed every caller its
+        // own slot — the queue then grew without limit in COUNT, and the caller
+        // parked on the flush that followed. Borrowing makes the capacity
+        // exactly `buffer + 1` and makes it refusable.
+        tx.borrow_mut().try_send(msg).map_err(|e| {
+            if e.is_disconnected() {
+                RpcError::ConnectionClosed
+            } else {
+                RpcError::Status {
+                    code: crate::error::StatusCode::Unavailable,
+                    message: format!(
+                        "submit queue full ({SUBMIT_CHANNEL_CAP} undrained): the peer has \
+                         stopped reading"
+                    ),
+                }
+            }
+        })
+    }
+}
+
+/// Kernels cap a single `writev` at `IOV_MAX` iovecs (1024 on both Linux and
+/// macOS) and reject anything longer — EINVAL on Linux, EMSGSIZE on macOS —
+/// regardless of how few BYTES it carries. A 1075-iovec, 57 KB frame hit
+/// exactly that and killed the writer task, surfacing to callers as an opaque
+/// "connection closed" and to the PS as `batch_put op status=1`.
+///
+/// The count scales with the number of KEYS in a batch, not their size, so any
+/// wide `put_many`/`delete_many` can reach it — which is why it only showed up
+/// once ingest started issuing large batches concurrently.
+///
+/// Writing the chunks back to back on the same writer preserves wire order: the
+/// writer task is the sole owner of the socket and awaits each chunk in turn,
+/// so a frame is still contiguous from the peer's point of view.
+const IOV_MAX: usize = 1024;
+
+// Disabled until a deployment has measured a useful threshold on its kernel
+// and link. Applies only to prepared replica payloads, preserving other RPCs.
+static PREPARED_ZEROCOPY_MIN_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+/// Set the minimum prepared frame size for TCP zerocopy. Zero disables it.
+pub fn set_prepared_zerocopy_min_bytes(bytes: usize) {
+    PREPARED_ZEROCOPY_MIN_BYTES.store(bytes, Ordering::Relaxed);
+}
+
+async fn write_prepared(
+    writer: &mut WriteHalf,
+    bufs: Vec<Bytes>,
+    size: usize,
+) -> std::io::Result<()> {
+    let min = PREPARED_ZEROCOPY_MIN_BYTES.load(Ordering::Relaxed);
+    if min == 0 || size < min {
+        return write_vectored_chunked(writer, bufs).await;
+    }
+    let mut rest = bufs;
+    while !rest.is_empty() {
+        let tail = rest.split_off(rest.len().min(IOV_MAX));
+        writer.write_vectored_all_zerocopy(rest).await?;
+        rest = tail;
+    }
+    Ok(())
+}
+
+pub async fn write_vectored_chunked(
+    writer: &mut WriteHalf,
+    bufs: Vec<Bytes>,
+) -> std::io::Result<()> {
+    if bufs.len() <= IOV_MAX {
+        let BufResult(r, _) = writer.write_vectored_all(bufs).await;
+        return r;
+    }
+    let mut rest = bufs;
+    while !rest.is_empty() {
+        let tail = rest.split_off(rest.len().min(IOV_MAX));
+        let BufResult(r, _) = writer.write_vectored_all(rest).await;
+        r?;
+        rest = tail;
+    }
+    Ok(())
+}
+
+/// The kernel's view of how the peer is taking our bytes, for a TCP
+/// connection's fd. It separates a slow LINK from a dead peer: while a large
+/// frame is still in our send buffer or in flight, nothing comes back and a
+/// ping queued behind it cannot be answered, but the peer's kernel keeps
+/// ACKing as the bytes arrive.
+///
+/// An ACK alone proves nothing, though: a stopped process's kernel ACKs every
+/// new request until its receive window fills — thousands of small frames. So
+/// ACK progress counts only while bytes of ours are queued UNSENT behind the
+/// peer's window or our congestion window (`tcpi_notsent_bytes > 0`), which is
+/// the slow-link shape. "Some bytes in flight" (`tcpi_unacked`) is not enough:
+/// the frozen peer's kernel delays each ACK up to ~40 ms, so under steady small
+/// traffic one segment is nearly always in flight at sample time.
+///
+/// The probe also cannot see bytes the peer has received and not read, which
+/// is exactly what a stopped process looks like.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+struct AckProbe(std::os::fd::RawFd);
+
+struct AckSample {
+    /// `tcpi_bytes_acked`: every byte of ours the peer has ACKed, ever.
+    bytes_acked: u64,
+    /// `tcpi_notsent_bytes > 0`: bytes of ours still in the send buffer,
+    /// behind the peer's window or the congestion window.
+    backlog: bool,
+}
+
+impl AckProbe {
+    /// `None` when the kernel does not report the counters (older than 4.6 or
+    /// not Linux); the keepalive then works from received bytes alone.
+    #[cfg(target_os = "linux")]
+    fn sample(&self) -> Option<AckSample> {
+        // `struct tcp_info` up to `tcpi_notsent_bytes`. glibc's definition in
+        // the `libc` crate stops before `tcpi_bytes_acked`; the kernel ABI only
+        // ever appends fields, and the returned length says whether these were
+        // filled.
+        #[repr(C)]
+        #[derive(Default)]
+        struct TcpInfoPrefix {
+            _u8s: [u8; 8],
+            _u32s: [u32; 24],
+            _pacing_rate: u64,
+            _max_pacing_rate: u64,
+            bytes_acked: u64,
+            _bytes_received: u64,
+            _segs_out: u32,
+            _segs_in: u32,
+            notsent_bytes: u32,
+        }
+        let mut info = TcpInfoPrefix::default();
+        let mut len = std::mem::size_of::<TcpInfoPrefix>() as libc::socklen_t;
+        // SAFETY: `info` is a plain-old-data buffer of `len` bytes; the kernel
+        // writes at most `len` bytes and reports how many.
+        let rc = unsafe {
+            libc::getsockopt(
+                self.0,
+                libc::IPPROTO_TCP,
+                libc::TCP_INFO,
+                (&mut info as *mut TcpInfoPrefix).cast(),
+                &mut len,
+            )
+        };
+        let filled = std::mem::offset_of!(TcpInfoPrefix, notsent_bytes) + 4;
+        (rc == 0 && len as usize >= filled).then_some(AckSample {
+            bytes_acked: info.bytes_acked,
+            backlog: info.notsent_bytes > 0,
+        })
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn sample(&self) -> Option<AckSample> {
+        None
+    }
+}
+
+/// Keepalive task: queues a ping after each silent `interval`, and closes the
+/// connection once the peer has shown no sign of life for `dead_after`.
+///
+/// Signs of life: any byte received — which also retires the ping — and, on
+/// TCP, the peer's kernel ACKing more of our bytes while more are queued
+/// behind them (`AckProbe`), which covers a large frame crossing a slow link.
+///
+/// Without the TCP counters (UCX), silent ticks are counted only once our ping
+/// has been WRITTEN: the writer is sequential, so a ping queued behind a large
+/// frame waits for that frame, and the wait says nothing about the peer. A
+/// writer stuck behind a peer that stopped reading then never gets the ping
+/// out, and that case stays with the callers' own deadlines, as before.
+///
+/// Timing from the last sign of life: TCP closes after 8–10 s (counting starts
+/// at the first silent tick, the one that queues the ping); UCX after ~10–12 s
+/// (counting starts once the ping is written).
+///
+/// Every fd sample is taken right after a `closed` check with no await
+/// between: either half's task sets `closed` when it ends, and dropping the
+/// client cancels this task with it, so the fd is always the connection's.
+///
+/// It upgrades its `Weak` only between awaits, so it never holds the last
+/// strong reference across a suspension: the client can be dropped at any
+/// sleep, and then the upgrade fails and the task ends.
+async fn keepalive_task(
+    client: Weak<RpcClient>,
+    rx_progress: Rc<Cell<u64>>,
+    pings_on_wire: Rc<Cell<u64>>,
+    ack_probe: Option<AckProbe>,
+    cfg: Keepalive,
+) {
+    let dead_ticks = cfg.unanswered_ticks_to_dead();
+    let mut seen_rx = rx_progress.get();
+    let mut seen_acked: Option<u64> = None;
+    // `pings_on_wire` when our ping was queued; `None` = none outstanding.
+    let mut queued_at: Option<u64> = None;
+    let mut unanswered_ticks: u64 = 0;
+    loop {
+        compio::time::sleep(cfg.interval).await;
+        let Some(client) = client.upgrade() else {
+            return;
+        };
+        if client.closed.get() {
+            return;
+        }
+        let sample = ack_probe.as_ref().and_then(AckProbe::sample);
+        let acked_more = match (&sample, seen_acked) {
+            (Some(now), Some(before)) => now.bytes_acked > before && now.backlog,
+            _ => false,
+        };
+        seen_acked = sample.as_ref().map(|s| s.bytes_acked);
+        let rx = rx_progress.get();
+        if rx != seen_rx {
+            seen_rx = rx;
+            queued_at = None;
+            unanswered_ticks = 0;
+            continue;
+        }
+        if queued_at.is_none() && client.send_ping() {
+            queued_at = Some(pings_on_wire.get());
+        }
+        if acked_more {
+            unanswered_ticks = 0;
+            continue;
+        }
+        // One ping outstanding at a time and the writer is FIFO, so a count
+        // past the mark is ours.
+        let ping_on_wire = matches!(queued_at, Some(mark) if pings_on_wire.get() > mark);
+        if sample.is_some() || ping_on_wire {
+            unanswered_ticks += 1;
+            if unanswered_ticks >= dead_ticks {
+                client.close_silent_peer(cfg.interval * unanswered_ticks as u32);
+                return;
+            }
+        }
+    }
+}
+
+/// SQ task: owns WriteHalf, drains the submit queue, writes to the socket.
+///
+/// Sequential writes preserve per-caller submit order on the wire. If a
+/// write fails (TCP closed, peer reset, etc.) the task removes the failing
+/// req_id from `pending` (so that caller's receiver surfaces an error) and
+/// exits — subsequent receivers will fail once read_loop's EOF clears the
+/// rest of `pending`.
+async fn writer_task(
+    mut writer: WriteHalf,
+    am_out: Option<Rc<AmOut>>,
+    mut urgent_rx: mpsc::Receiver<SubmitMsg>,
+    mut submit_rx: mpsc::Receiver<SubmitMsg>,
+    window: Rc<SendWindow>,
+    pending: Rc<RefCell<HashMap<u32, Pending>>>,
+    pings_on_wire: Rc<Cell<u64>>,
+    peer_addr: SocketAddr,
+) {
+    use std::task::Poll;
+    let (mut urgent_done, mut normal_done) = (false, false);
+    // A large normal message taken while the window was shut.
+    let mut held: Option<SubmitMsg> = None;
+    loop {
+        // Urgent first, every time; a large normal message waits for the
+        // window. Ends once both queues are closed and nothing is held.
+        let next = futures::future::poll_fn(|cx| {
+            if !urgent_done {
+                match urgent_rx.poll_next_unpin(cx) {
+                    Poll::Ready(Some(msg)) => return Poll::Ready(Some(msg)),
+                    Poll::Ready(None) => urgent_done = true,
+                    Poll::Pending => {}
+                }
+            }
+            if held.is_none() && !normal_done {
+                match submit_rx.poll_next_unpin(cx) {
+                    Poll::Ready(Some(msg)) => held = Some(msg),
+                    Poll::Ready(None) => normal_done = true,
+                    Poll::Pending => {}
+                }
+            }
+            if let Some(msg) = held.take() {
+                let large = msg.is_large();
+                if !large || window.is_open() {
+                    if large {
+                        window.written(msg.req_id());
+                    }
+                    return Poll::Ready(Some(msg));
+                }
+                held = Some(msg);
+                *window.writer.borrow_mut() = Some(cx.waker().clone());
+                return Poll::Pending;
+            }
+            if urgent_done && normal_done { Poll::Ready(None) } else { Poll::Pending }
+        })
+        .await;
+        let Some(msg) = next else { break };
+        let req_id = msg.req_id();
+        // fix instrumentation: capture iov count + total bytes
+        // before the syscall so the EINVAL path can attribute the error
+        // to the exact shape of the Vectored message. Negligible cost
+        // (2 integer ops per msg; the logging formatter only runs on the
+        // rare error branch).
+        let is_ping = matches!(msg, SubmitMsg::Ping { .. });
+        let (iov_count, total_bytes) = match &msg {
+            SubmitMsg::Single { bytes, .. } | SubmitMsg::Ping { bytes, .. } => {
+                (1usize, bytes.len())
+            }
+            SubmitMsg::Vectored { bufs, .. } | SubmitMsg::Prepared { bufs, .. } => {
+                let total: usize = bufs.iter().map(|b| b.len()).sum();
+                (bufs.len(), total)
+            }
+        };
+        let post = |am: Vec<(u64, autumn_transport::RegBytes)>| {
+            if !am.is_empty() {
+                am_out.as_ref().expect("frame values only on a connection that sends them").post(am);
+            }
+        };
+        let result = match msg {
+            SubmitMsg::Single { bytes, .. } | SubmitMsg::Ping { bytes, .. } => {
+                let BufResult(r, _) = writer.write_all(bytes).await;
+                r
+            }
+            SubmitMsg::Vectored { bufs, am, .. } => {
+                post(am);
+                write_vectored_chunked(&mut writer, bufs).await
+            }
+            SubmitMsg::Prepared { bufs, am, .. } => {
+                post(am);
+                write_prepared(&mut writer, bufs, total_bytes).await
+            }
+        };
+
+        if let Err(e) = result {
+            // fix (CAP-EINVAL): ALWAYS log the write error at
+            // WARN so production runs surface the root-cause signature
+            // (iov_count, total_bytes, errno.raw_os_error()) rather than
+            // just a downstream "submit error: connection closed" cascade.
+            // The original concern speculated about `IOV_MAX`
+            // exhaustion, and the instrumentation CONFIRMED it: a 1075-iovec
+            // write of only 57 KB failed with errno 40. `write_vectored_chunked`
+            // now caps the count, so an `iov_count` at or below `IOV_MAX` here
+            // means a genuine socket error, not this shape.
+            tracing::warn!(
+                addr = %peer_addr,
+                req_id,
+                iov_count,
+                total_bytes,
+                errno = ?e.raw_os_error(),
+                kind = ?e.kind(),
+                error = %e,
+                "rpc client writer exited on write error (instrumentation)"
+            );
+            // Remove this request's pending entry so the caller surfaces
+            // ConnectionClosed immediately (req_id 0 never had one).
+            if req_id != 0 {
+                pending.borrow_mut().remove(&req_id);
+            }
+            return;
+        }
+        if is_ping {
+            pings_on_wire.set(pings_on_wire.get() + 1);
+        }
+    }
+
+    // Both queues closed (all Senders dropped / RpcClient dropped). Exit cleanly.
+    tracing::debug!(addr = %peer_addr, "rpc client writer_task exiting (channel closed)");
+}
+
+/// CQ task: owns ReadHalf, decodes response frames, dispatches via pending.
+async fn read_loop(
+    mut reader: ReadHalf,
+    pending: Rc<RefCell<HashMap<u32, Pending>>>,
+    rx_progress: Rc<Cell<u64>>,
+    receiving: Rc<RefCell<Option<Receiving>>>,
+    send_window: Rc<SendWindow>,
+    addr: SocketAddr,
+) -> Result<(), RpcError> {
+    const READ_WINDOW: usize = 64 * 1024;
+    let mut decoder = FrameDecoder::new();
+    let is_ucx = reader.is_ucx();
+
+    // bulk responses bypass FrameDecoder accumulation: always on UCX (recv
+    // straight into the pooled slab); on TCP only when the value is large
+    // enough to beat the batch-decoding normal path (small values fall through
+    // to finish_into_pooled_from_frame below). An ERROR frame (FLAG_ERROR —
+    // e.g. an authz PermissionDenied) carries a status envelope, not a bulk
+    // ctrl: it takes the normal decode path below, where the IntoPooled arm
+    // decodes it into an `RpcError::Status`.
+    //
+    // The value boundary needs `ctrl_len` (v28: variable-length ctrl =
+    // `[code][message]`); on TCP the gate uses the WHOLE payload (a ≥64 KiB
+    // payload of a small-ctrl frame is value-dominated), and the fast path
+    // reads ctrl_len from the verified prologue. The pending entry is checked
+    // without removing it: it must stay pending if the loop waits for more bytes.
+    let bulk_fast_path = |req_id: u32, flags: u8, payload_len: usize| {
+        (flags & (crate::frame::FLAG_ERROR | crate::frame::FLAG_AM_VALUE)) == 0
+            && (is_ucx || payload_len >= TCP_RECV_INTO_POOLED_MIN_BYTES)
+            && matches!(pending.borrow().get(&req_id), Some(Pending::IntoPooled(_) | Pending::IntoDest(..)))
+    };
+
+    loop {
+        // Receive into the decoder's own buffer. A bulk response keeps the
+        // fixed window, so only its prologue and a bounded value prefix land
+        // here before the value is received into its pooled slab; any other
+        // incomplete frame receives the rest of itself in place.
+        let window_len = match decoder.peek_header() {
+            Some((req_id, _, flags, payload_len))
+                if !bulk_fast_path(req_id, flags, payload_len as usize) =>
+            {
+                decoder
+                    .front_frame_remaining()
+                    .map_or(READ_WINDOW, |rest| rest.max(READ_WINDOW))
+            }
+            _ => READ_WINDOW,
+        };
+        let BufResult(result, window) = reader.read(decoder.read_window(window_len)).await;
+        decoder.finish_read(window);
+        let n = result?;
+        if n == 0 {
+            tracing::debug!(addr = %addr, "rpc connection closed by peer");
+            return Ok(());
+        }
+        rx_progress.set(rx_progress.get().wrapping_add(1));
+
+        // Peek the next frame header so a bulk value-response can be recv'd
+        // straight into its destination instead of accumulating in the
+        // FrameDecoder. (Inner `break`s mean "wait for more bytes" — they
+        // exit this while back to the socket read above.)
+        while let Some((req_id, _mt, flags, payload_len)) = decoder.peek_header() {
+            if bulk_fast_path(req_id, flags, payload_len as usize) {
+                // Wait for the full prologue ([header][ctrl_len][ctrl][crc]),
+                // verify the ctrl CRC (header included),
+                // and parse the status ctrl. bulk ctrls are tiny (code+message),
+                // so "prologue buffered" is ~always the very next read.
+                let prologue = match decoder.peek_bulk_prologue() {
+                    Ok(Some(p)) => p,
+                    Ok(None) => break, // need more bytes
+                    Err(e) => {
+                        // Corrupt/malformed prologue: stream position is lost.
+                        // Let read-loop teardown close every pending receiver,
+                        // just like ordinary frame decode failure. Synthesizing
+                        // an Internal status would mislabel it as a peer refusal
+                        // and tell pools to retain the broken connection.
+                        return Err(e.into());
+                    }
+                };
+                let (code, message, ctrl_tail) = {
+                    let ctrl = decoder
+                        .peek_ctrl(prologue.ctrl_len)
+                        .expect("prologue verified => ctrl buffered");
+                    match crate::frame::parse_bulk_ctrl(ctrl) {
+                        Some((c, m)) => (
+                            c,
+                            String::from_utf8_lossy(m).into_owned(),
+                            Bytes::copy_from_slice(m),
+                        ),
+                        None => (0, String::new(), Bytes::new()), // empty ctrl = OK, no msg
+                    }
+                };
+                let value_len = prologue.value_len;
+                decoder.consume_bulk_prologue(prologue.ctrl_len);
+
+                // Bind the removed entry BEFORE matching: a `match` on the
+                // `borrow_mut()` temporary would hold the RefMut across the
+                // awaits in the arms below and panic any concurrent `send_*`
+                // on this thread (the same borrow-across-await class).
+                let entry = pending.borrow_mut().remove(&req_id);
+                send_window.answered(req_id);
+                match entry {
+                    Some(Pending::IntoPooled(tx)) => {
+                        // READ_LOOP acquires + owns the buffer: on caller-cancel
+                        // the send below fails and `pb` drops → pool (no leak);
+                        // the cancellable caller never owns the in-flight buffer.
+                        // The sender waits in `receiving` for the receive, where
+                        // a keepalive close can release it; taken back after,
+                        // it may already be gone.
+                        *receiving.borrow_mut() = Some(Receiving::Pooled(tx));
+                        let finish = |outcome: Result<BulkResp, RpcError>| {
+                            let waiter = receiving.borrow_mut().take();
+                            if let Some(Receiving::Pooled(tx)) = waiter {
+                                let _ = tx.send(outcome);
+                            }
+                        };
+                        let pb = match recv_value_pooled(&mut reader, &mut decoder, value_len, &rx_progress).await {
+                            Ok(pb) => pb,
+                            Err(RecvFailed::NoBuffer) => {
+                                finish(Err(no_reply_buffer()));
+                                continue;
+                            }
+                            Err(RecvFailed::PeerClosed) => {
+                                finish(Err(RpcError::ConnectionClosed));
+                                return Ok(());
+                            }
+                            Err(RecvFailed::Io(e)) => {
+                                finish(Err(e.into()));
+                                return Err(RpcError::ConnectionClosed);
+                            }
+                        };
+                        finish(Ok(BulkResp {
+                            buf: pb,
+                            code,
+                            message,
+                            ctrl: ctrl_tail,
+                        }));
+                    }
+                    Some(Pending::IntoDest(tx, slot)) => {
+                        *receiving.borrow_mut() = Some(Receiving::Dest(tx));
+                        let finish = |outcome: Result<DestResp, RpcError>| {
+                            let waiter = receiving.borrow_mut().take();
+                            if let Some(Receiving::Dest(tx)) = waiter {
+                                let _ = tx.send(outcome);
+                            }
+                        };
+                        let resp = |spill| DestResp { code, message, ctrl: ctrl_tail, value_len, spill };
+                        let direct = slot.dest.borrow().as_ref().is_some_and(|d| value_len <= d.cap());
+                        if direct {
+                            let mut dest = slot.dest.borrow_mut().take().expect("checked above");
+                            let filled = decoder.drain_into(&mut dest.region_mut()[..value_len]);
+                            let (abort, reg) = futures::future::AbortHandle::new_pair();
+                            *slot.abort.borrow_mut() = Some(abort);
+                            let recv = recv_value_into_dest(&mut reader, &mut decoder, dest, filled, value_len, &rx_progress);
+                            let r = futures::future::Abortable::new(recv, reg).await;
+                            slot.abort.borrow_mut().take();
+                            match r {
+                                Ok(Ok(dest)) => {
+                                    drop(dest);
+                                    finish(Ok(resp(None)));
+                                }
+                                Ok(Err(e)) => {
+                                    finish(Err(e.into()));
+                                    return Err(RpcError::ConnectionClosed);
+                                }
+                                // The caller gave up mid-value; the stream
+                                // position is lost with the receive.
+                                Err(futures::future::Aborted) => {
+                                    finish(Err(RpcError::ConnectionClosed));
+                                    return Err(RpcError::ConnectionClosed);
+                                }
+                            }
+                        } else {
+                            // A value longer than the lent memory, or a caller
+                            // that already took it back: receive into a pool
+                            // buffer, then copy what fits. The memory stays in
+                            // the slot meanwhile (a UCX recv cannot be aborted).
+                            let pb = match recv_value_pooled(&mut reader, &mut decoder, value_len, &rx_progress).await {
+                                Ok(pb) => pb,
+                                Err(RecvFailed::NoBuffer) => {
+                                    finish(Err(no_reply_buffer()));
+                                    continue;
+                                }
+                                Err(RecvFailed::PeerClosed) => {
+                                    finish(Err(RpcError::ConnectionClosed));
+                                    return Ok(());
+                                }
+                                Err(RecvFailed::Io(e)) => {
+                                    finish(Err(e.into()));
+                                    return Err(RpcError::ConnectionClosed);
+                                }
+                            };
+                            let dest = slot.dest.borrow_mut().take();
+                            finish(Ok(resp(copy_into_dest(dest, pb))));
+                        }
+                    }
+                    _ => unreachable!("bulk_pending checked above"),
+                }
+                continue;
+            }
+
+            // ── normal path: full frame decode ──
+            // Decode the run of buffered frames that take this path, starting
+            // their values that come as active messages, so those are received
+            // together; then dispatch them in order. A frame's caller stays in
+            // `pending` while its value arrives, where a keepalive close finds it.
+            let mut run = Vec::new();
+            while let Some((req_id, _mt, flags, payload_len)) = decoder.peek_header() {
+                if bulk_fast_path(req_id, flags, payload_len as usize) {
+                    break;
+                }
+                match decoder.try_decode()? {
+                    Some(frame) => run.push(crate::am_frame::start(
+                        &reader,
+                        frame,
+                        autumn_transport::PoolUse::Reply,
+                        crate::am_frame::WhenFull::Refuse,
+                    )?),
+                    None => break,
+                }
+            }
+            if run.is_empty() {
+                break;
+            }
+            for incoming in run {
+                // No buffer for a reply's value: its caller gets the error.
+                let (mut frame, am_value) = match incoming.into_parts(&reader).await {
+                    Ok(parts) => parts,
+                    Err(crate::am_frame::IncomingError::Io(e)) => return Err(e.into()),
+                    Err(e) => (e.refusal().expect("not an i/o error"), None),
+                };
+                match {
+                    send_window.answered(frame.req_id);
+                    (am_value, pending.borrow_mut().remove(&frame.req_id))
+                } {
+                    (Some(pb), Some(Pending::Frame(tx))) => {
+                        frame.value = pb.freeze();
+                        let _ = tx.send(frame);
+                    }
+                    (Some(pb), Some(Pending::IntoPooled(tx))) => {
+                        let (code, message, ctrl) = bulk_status(&frame.payload);
+                        let _ = tx.send(Ok(BulkResp { buf: pb, code, message, ctrl }));
+                    }
+                    (Some(pb), Some(Pending::IntoDest(tx, slot))) => {
+                        let (code, message, ctrl) = bulk_status(&frame.payload);
+                        let value_len = pb.len();
+                        let spill = copy_into_dest(slot.dest.borrow_mut().take(), pb);
+                        let _ = tx.send(Ok(DestResp { code, message, ctrl, value_len, spill }));
+                    }
+                    (_, None) => {
+                        tracing::trace!(
+                            req_id = frame.req_id,
+                            msg_type = frame.msg_type,
+                            "response for unknown req_id, dropped"
+                        );
+                    }
+                    (None, Some(Pending::Frame(tx))) => {
+                        let _ = tx.send(frame);
+                    }
+                    (None, Some(Pending::IntoPooled(tx))) => {
+                        if frame.is_error() {
+                            // Frame-level ERROR (FLAG_ERROR — e.g. an authz
+                            // PermissionDenied from the PS authz_gate, or a
+                            // mis-route NotFound): decode the status envelope
+                            // instead of parsing it as a bulk ctrl. The
+                            // fast-path gate above excludes FLAG_ERROR frames,
+                            // so every error frame for a bulk caller lands here.
+                            let (code, message) = RpcError::decode_status(&frame.payload);
+                            let _ = tx.send(Err(RpcError::status(code, message)));
+                        } else {
+                            // Small-value TCP path: the decoder already split
+                            // ctrl (status) and value; copy the value into a
+                            // (plain) pool buffer and hand it back. The
+                            // read_loop owns it until the send; on
+                            // caller-cancel it drops → pool.
+                            finish_into_pooled_from_frame(tx, &frame.payload, &frame.value);
+                        }
+                    }
+                    (None, Some(Pending::IntoDest(tx, slot))) => {
+                        if frame.is_error() {
+                            let (code, message) = RpcError::decode_status(&frame.payload);
+                            let _ = tx.send(Err(RpcError::status(code, message)));
+                        } else {
+                            finish_into_dest_from_frame(tx, &slot, &frame.payload, &frame.value);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Why a bulk value receive stopped short.
+enum RecvFailed {
+    /// Peer closed the connection mid-value.
+    PeerClosed,
+    /// Transport error mid-value.
+    Io(std::io::Error),
+    /// No buffer in this process's `Reply` budget: the value was read past.
+    NoBuffer,
+}
+
+/// A buffer for a reply's value against the `Reply` budget, never waited for
+/// (the read loop would hold up the connection); `None` when it is full. A
+/// value larger than a thread may hold of the budget is taken unbudgeted.
+fn reply_buffer(len: usize) -> Option<autumn_transport::PooledBuf> {
+    // An empty value (an error reply) holds nothing worth a budget.
+    if len == 0 {
+        return Some(autumn_transport::regpool_acquire(0));
+    }
+    match autumn_transport::regpool_try_acquire_for(autumn_transport::PoolUse::Reply, len) {
+        Ok(pb) => Some(pb),
+        Err(autumn_transport::PoolError::TooLarge) => Some(autumn_transport::regpool_acquire(len)),
+        Err(autumn_transport::PoolError::Full) => None,
+    }
+}
+
+/// A value already decoded is in memory: refusing it saves nothing and makes
+/// the caller read it again, so with `Reply` full it is taken unbudgeted.
+fn decoded_reply_buffer(len: usize) -> autumn_transport::PooledBuf {
+    autumn_transport::regpool_acquire_charged_if_room(autumn_transport::PoolUse::Reply, len)
+}
+
+/// The answer to a caller whose reply had no buffer here.
+fn no_reply_buffer() -> RpcError {
+    RpcError::status(crate::StatusCode::Unavailable, autumn_transport::PoolError::Full.to_string())
+}
+
+/// Read past a value of `len` bytes that follows on the connection: what
+/// `decoder` holds, then the rest of the stream.
+async fn discard_value(
+    reader: &mut ReadHalf,
+    decoder: &mut FrameDecoder,
+    len: usize,
+    rx_progress: &Cell<u64>,
+) -> std::io::Result<()> {
+    let held = decoder.buffered_len().min(len);
+    decoder.consume(held);
+    let mut left = len - held;
+    if reader.is_ucx() {
+        while left > 0 {
+            reader
+                .recv_data_with(|chunk| {
+                    let take = chunk.len().min(left);
+                    left -= take;
+                    decoder.feed(&chunk[take..]);
+                })
+                .await?;
+            rx_progress.set(rx_progress.get().wrapping_add(1));
+        }
+        return Ok(());
+    }
+    use compio::buf::{IntoInner, IoBuf};
+    use compio::io::AsyncReadExt;
+    let mut scratch = vec![0u8; left.min(1 << 20)];
+    while left > 0 {
+        let n = left.min(scratch.len());
+        let BufResult(r, slice) = reader.read_exact(scratch.slice(..n)).await;
+        r?;
+        scratch = slice.into_inner();
+        left -= n;
+        rx_progress.set(rx_progress.get().wrapping_add(1));
+    }
+    Ok(())
+}
+
+/// Receive a bulk value of `value_len` bytes into a fresh pool buffer, starting
+/// with what `decoder` already holds.
+async fn recv_value_pooled(
+    reader: &mut ReadHalf,
+    decoder: &mut FrameDecoder,
+    value_len: usize,
+    rx_progress: &Cell<u64>,
+) -> Result<autumn_transport::PooledBuf, RecvFailed> {
+    let mut pb = match reply_buffer(value_len) {
+        Some(pb) => pb,
+        None => {
+            discard_value(reader, decoder, value_len, rx_progress).await.map_err(RecvFailed::Io)?;
+            return Err(RecvFailed::NoBuffer);
+        }
+    };
+    if reader.is_ucx() {
+        return recv_value_ucx(reader, decoder, pb, rx_progress).await;
+    }
+    let filled = {
+        let (dest, _reg) = pb.dest_and_reg();
+        decoder.drain_into(dest)
+    };
+    read_value_tcp(reader, pb, filled, value_len, rx_progress).await.map_err(RecvFailed::Io)
+}
+
+/// The rest of a bulk value, `[filled, value_len)`, into lent memory. TCP
+/// reads into it; UCX copies each queued chunk in (`recv_data_with`), since a
+/// posted UCX receive could not be taken back, and returns what follows the
+/// value to `decoder`.
+async fn recv_value_into_dest(
+    reader: &mut ReadHalf,
+    decoder: &mut FrameDecoder,
+    mut dest: autumn_transport::RecvDest,
+    mut filled: usize,
+    value_len: usize,
+    rx_progress: &Cell<u64>,
+) -> std::io::Result<autumn_transport::RecvDest> {
+    if !reader.is_ucx() {
+        return read_value_tcp_into_dest(reader, dest, filled, value_len, rx_progress).await;
+    }
+    let mem = &mut dest.region_mut()[..value_len];
+    while filled < value_len {
+        reader
+            .recv_data_with(|chunk| {
+                let take = chunk.len().min(value_len - filled);
+                mem[filled..filled + take].copy_from_slice(&chunk[..take]);
+                filled += take;
+                decoder.feed(&chunk[take..]); // not while a read window is lent: none is
+            })
+            .await?;
+        rx_progress.set(rx_progress.get().wrapping_add(1));
+    }
+    Ok(dest)
+}
+
+/// TCP: the rest of a bulk value, `[filled, value_len)`, into lent memory.
+async fn read_value_tcp_into_dest(
+    reader: &mut ReadHalf,
+    mut dest: autumn_transport::RecvDest,
+    mut filled: usize,
+    value_len: usize,
+    rx_progress: &Cell<u64>,
+) -> std::io::Result<autumn_transport::RecvDest> {
+    while filled < value_len {
+        let upto = value_len.min(filled + TCP_VALUE_PROGRESS_STEP);
+        let BufResult(r, d) = reader.read_exact_into_dest(dest, filled, upto).await;
+        dest = d;
+        r?;
+        rx_progress.set(rx_progress.get().wrapping_add(1));
+        filled = upto;
+    }
+    Ok(dest)
+}
+
+/// Put a value received into a pool buffer where the caller lent memory for
+/// it: copied when it fits (`None`), else handed back as the spill.
+fn copy_into_dest(
+    dest: Option<autumn_transport::RecvDest>,
+    pb: autumn_transport::PooledBuf,
+) -> Option<autumn_transport::PooledBuf> {
+    match dest {
+        Some(mut d) if pb.len() <= d.cap() => {
+            d.region_mut()[..pb.len()].copy_from_slice(pb.as_ref());
+            None
+        }
+        _ => Some(pb),
+    }
+}
+
+/// Largest step of a TCP bulk value receive between two keepalive progress
+/// marks. One `read_exact` over a whole 256 MiB read chunk would count as a
+/// single event at its END, so a slow-but-flowing transfer longer than
+/// `Keepalive::dead_after` would look like a silent peer. 4 MiB is at least
+/// one kernel receive per step anyway, so the split adds no syscalls that
+/// matter.
+const TCP_VALUE_PROGRESS_STEP: usize = 4 * 1024 * 1024;
+
+/// TCP bulk value recv into the pool buffer, `[filled, value_len)`.
+async fn read_value_tcp(
+    reader: &mut ReadHalf,
+    mut pb: autumn_transport::PooledBuf,
+    mut filled: usize,
+    value_len: usize,
+    rx_progress: &Cell<u64>,
+) -> std::io::Result<autumn_transport::PooledBuf> {
+    while filled < value_len {
+        let upto = value_len.min(filled + TCP_VALUE_PROGRESS_STEP);
+        pb = reader.read_exact_into_pooled(pb, filled, upto).await?;
+        rx_progress.set(rx_progress.get().wrapping_add(1));
+        filled = upto;
+    }
+    Ok(pb)
+}
+
+/// UCX bulk value recv: drain the value's already-buffered prefix out of the
+/// decoder, then recv the remainder straight into `pb` (one UCX Stream unpack
+/// per recv; a registered slab names its memh). `pb`'s writable region is the
+/// exact value length. The buffer travels by value: a recv dropped mid-await
+/// keeps it until UCX is done (see `autumn_transport::ReadHalf::recv_pooled`).
+async fn recv_value_ucx(
+    reader: &mut ReadHalf,
+    decoder: &mut FrameDecoder,
+    mut pb: autumn_transport::PooledBuf,
+    rx_progress: &Cell<u64>,
+) -> Result<autumn_transport::PooledBuf, RecvFailed> {
+    let value_len = pb.cap();
+    let mut filled = decoder.drain_into(pb.dest_mut());
+    while filled < value_len {
+        let BufResult(r, p) = reader.recv_pooled(pb, filled).await;
+        pb = p;
+        match r {
+            Ok(0) => return Err(RecvFailed::PeerClosed),
+            Ok(k) => {
+                rx_progress.set(rx_progress.get().wrapping_add(1));
+                filled += k
+            }
+            Err(e) => return Err(RecvFailed::Io(e)),
+        }
+    }
+    Ok(pb)
+}
+
+/// Complete a `call_into_pooled` from a fully-decoded value frame (TCP /
+/// non-UCX small-value path). The decoder already verified the ctrl CRC and
+/// split `ctrl` (`[code][message]`) from the raw `value`. The read_loop
+/// acquires a (plain, on TCP) pool buffer, copies the value in, and hands it
+/// back; on caller-cancel `tx.send` fails and the buffer drops → pool.
+fn finish_into_pooled_from_frame(
+    tx: oneshot::Sender<Result<BulkResp, RpcError>>,
+    ctrl: &[u8],
+    value: &[u8],
+) {
+    let (code, message, ctrl_tail) = bulk_status(ctrl);
+    let mut pb = decoded_reply_buffer(value.len());
+    {
+        let (dest, _reg) = pb.dest_and_reg();
+        dest.copy_from_slice(value);
+    }
+    let _ = tx.send(Ok(BulkResp {
+        buf: pb,
+        code,
+        message,
+        ctrl: ctrl_tail,
+    }));
+}
+
+/// A bulk reply's ctrl as `(code, message, ctrl tail)`; empty = OK, no message.
+fn bulk_status(ctrl: &[u8]) -> (u8, String, Bytes) {
+    match crate::frame::parse_bulk_ctrl(ctrl) {
+        Some((c, m)) => (c, String::from_utf8_lossy(m).into_owned(), Bytes::copy_from_slice(m)),
+        None => (0, String::new(), Bytes::new()),
+    }
+}
+
+/// `finish_into_pooled_from_frame` for a `call_into_dest`: the value is copied
+/// into the lent memory if it fits.
+fn finish_into_dest_from_frame(tx: DestWaiter, slot: &DestSlot, ctrl: &[u8], value: &[u8]) {
+    let (code, message, ctrl_tail) = bulk_status(ctrl);
+    let dest = slot.dest.borrow_mut().take();
+    let spill = match dest {
+        Some(mut d) if value.len() <= d.cap() => {
+            d.region_mut()[..value.len()].copy_from_slice(value);
+            None
+        }
+        _ => {
+            let mut pb = decoded_reply_buffer(value.len());
+            pb.dest_mut().copy_from_slice(value);
+            Some(pb)
+        }
+    };
+    let _ = tx.send(Ok(DestResp { code, message, ctrl: ctrl_tail, value_len: value.len(), spill }));
+}
+
+// ── connection-close tests ─────────────────────────────────────────────
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::StatusCode;
+    use bytes::Bytes;
+    use std::time::Duration;
+
+    /// A peer that ACCEPTS and never ANSWERS holds this path forever — so
+    /// every caller of it must bound it itself.
+    ///
+    /// The wait is `await_response`, not the send. The frames go out fine (the
+    /// writer task keeps draining into the socket until the peer's receive
+    /// window closes, and even then the submit queue holds 1024 more); what
+    /// never arrives is a reply, and nothing in `call_vectored_bulk` or
+    /// `await_response` carries a deadline.
+    ///
+    /// The failure shape: parallel uploads with hundreds of MiB banked in their
+    /// send queues and zero context switches for tens of seconds, while the
+    /// same cluster answered a fresh `put` in under a second. The wedge outlived the
+    /// condition that caused it, because nothing was left running that could
+    /// notice the condition had passed.
+    ///
+    /// This pins the SHAPE the fix uses — `compio::time::timeout` around the
+    /// whole call. Abandoning it cannot truncate a frame: the caller only hands
+    /// a message to the writer task's channel, and the `writev` happens there.
+    ///
+    /// It says nothing about `SUBMIT_CHANNEL_CAP`: at 1 MiB a frame it stops on
+    /// the FIRST call's missing reply, having queued one message against a
+    /// 1024-deep channel. The queue's own bound is pinned separately, below.
+    #[compio::test]
+    async fn a_peer_that_never_answers_holds_the_caller_until_a_deadline_ends_it() {
+        let _ = autumn_transport::current_or_init();
+
+        // Accept, then never read. Holding the socket is the whole fixture:
+        // its receive window closes, the client's send buffer fills, and the
+        // writer task stops draining the submit channel.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let server_addr = listener.local_addr().expect("local_addr");
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+        let accept_thread = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().expect("accept");
+            test_protocol::accept_std(&mut sock, crate::WIRE_VERSION, 1);
+            let _ = stop_rx.recv_timeout(Duration::from_secs(30));
+            drop(sock);
+        });
+
+        let client = RpcClient::connect(server_addr).await.expect("connect");
+
+        // Fill the socket and then the channel. One MiB per frame, more frames
+        // than the channel holds, so the tail of them cannot be drained.
+        let big = Bytes::from(vec![7u8; 1 << 20]);
+        let deadline = Duration::from_millis(300);
+        let mut timed_out = false;
+        for _ in 0..(SUBMIT_CHANNEL_CAP + 64) {
+            let call = client.call_vectored_bulk(9, vec![Bytes::from_static(b"k")], big.clone());
+            match compio::time::timeout(deadline, call).await {
+                // An inner Err would mean the SEND refused, which is a
+                // different fault with a different fix — surface it instead of
+                // letting `continue` spend the whole loop hiding it.
+                Ok(inner) => {
+                    inner.expect("the send must not be what fails here");
+                }
+                Err(_) => {
+                    timed_out = true;
+                    break;
+                }
+            }
+        }
+
+        let _ = stop_tx.send(());
+        accept_thread.join().expect("accept thread");
+
+        assert!(
+            timed_out,
+            "a peer that accepts and never answers must hold this path; if it \
+             did not, the fixture stopped reproducing the hazard the put_bulk \
+             deadline is there for"
+        );
+    }
+
+    /// The submit queue REFUSES at its bound — it does not park, and it does
+    /// not grow past it.
+    ///
+    /// This is the test the one above cannot be: it uses `send_vectored`, so
+    /// nothing waits on a reply and the loop actually reaches the channel, and
+    /// it yields between sends so the writer task runs — otherwise the queue
+    /// fills because the writer never got scheduled, which is a fixture
+    /// artifact rather than a peer that stopped reading.
+    ///
+    /// Ablation: with `submit` restored to `borrow().clone()` + `send().await`,
+    /// every caller gets `futures::mpsc`'s per-SENDER guaranteed slot, no
+    /// refusal ever comes, and this hangs in the loop instead — which is the
+    /// unbounded growth a wedged uploader banks hundreds of MiB into.
+    #[compio::test]
+    async fn the_submit_queue_refuses_once_it_is_full() {
+        let _ = autumn_transport::current_or_init();
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let server_addr = listener.local_addr().expect("local_addr");
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+        let accept_thread = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().expect("accept");
+            test_protocol::accept_std(&mut sock, crate::WIRE_VERSION, 1);
+            let _ = stop_rx.recv_timeout(Duration::from_secs(30));
+            drop(sock);
+        });
+
+        let client = RpcClient::connect(server_addr).await.expect("connect");
+
+        let big = Bytes::from(vec![7u8; 1 << 20]);
+        let mut refused = None;
+        let mut sent = 0usize;
+        for _ in 0..(SUBMIT_CHANNEL_CAP + 64) {
+            match client
+                .send_vectored(9, vec![Bytes::from_static(b"k"), big.clone()])
+                .await
+            {
+                Ok(_rx) => {
+                    sent += 1;
+                    compio::time::sleep(Duration::from_micros(10)).await;
+                }
+                Err(e) => {
+                    refused = Some(e);
+                    break;
+                }
+            }
+        }
+        let pending_at_refusal = client.pending_count();
+
+        let _ = stop_tx.send(());
+        accept_thread.join().expect("accept thread");
+
+        let err = refused.expect(
+            "the bound must engage: a peer that never reads cannot absorb \
+             SUBMIT_CHANNEL_CAP + 64 frames of a MiB each",
+        );
+        assert!(
+            matches!(
+                err,
+                RpcError::Status {
+                    code: StatusCode::Unavailable,
+                    ..
+                }
+            ),
+            "the refusal must be retryable — callers already roll to a fresh \
+             extent or try another replica on these; got {err:?}"
+        );
+        assert!(
+            pending_at_refusal <= sent,
+            "a refused submit must roll its own `pending` entry back, or every \
+             refusal leaks one for the life of the connection; {pending_at_refusal} \
+             entries against {sent} accepted sends"
+        );
+    }
+
+    /// Cloning the sender per call DEFEATS the bound entirely — which is why
+    /// `submit` borrows it instead.
+    ///
+    /// `futures::mpsc` grants each SENDER a guaranteed slot beyond the shared
+    /// buffer. `submit` used to do `self.submit_tx.borrow().clone()`, so every
+    /// call arrived with its own slot and the capacity never applied: measured
+    /// against a peer that accepts and never reads, clone-per-call survived
+    /// 4096 sends of a MiB each without one refusal, while the borrowing form
+    /// refuses as designed.
+    ///
+    /// Pinning the mechanism itself, because reading a clone-per-send as "the
+    /// bound is safe" rather than "the bound is absent" is the easy mistake.
+    #[compio::test]
+    async fn a_cloned_sender_gets_its_own_slot_and_the_bound_stops_applying() {
+        let (tx, _rx) = mpsc::channel::<u32>(2);
+        let tx = RefCell::new(tx);
+
+        // Borrowed: the shared buffer is all there is, so it fills.
+        let mut refused_when_borrowed = false;
+        for i in 0..64u32 {
+            if tx.borrow_mut().try_send(i).is_err() {
+                refused_when_borrowed = true;
+                break;
+            }
+        }
+        assert!(
+            refused_when_borrowed,
+            "a bounded channel must refuse once its buffer is full"
+        );
+
+        // Cloned per send: each clone carries its own guaranteed slot.
+        let (tx2, _rx2) = mpsc::channel::<u32>(2);
+        let tx2 = RefCell::new(tx2);
+        let mut sent_beyond_capacity = 0;
+        for i in 0..64u32 {
+            let mut t = tx2.borrow().clone();
+            if t.try_send(i).is_ok() {
+                sent_beyond_capacity += 1;
+            }
+        }
+        assert!(
+            sent_beyond_capacity > 2,
+            "clone-per-send must be seen to exceed the declared capacity — if this \
+             stops being true, `submit` may go back to cloning"
+        );
+    }
+
+    /// when the peer closes its socket without responding, the
+    /// client's `read_loop` exits, `closed` flips to true, and the very
+    /// next `send_frame`/`send_vectored`/`send_oneshot`/`call` returns
+    /// `ConnectionClosed` immediately instead of inserting a fresh
+    /// pending entry that nobody will ever dispatch (the bug that caused
+    /// the >120 s hang in the original repro).
+    #[compio::test]
+    async fn closed_flag_set_after_peer_disconnect() {
+        // was `autumn_transport::init()` (function removed in a prior
+        // refactor). The transport is now initialised on first use via
+        // `current_or_init()`.
+        let _ = autumn_transport::current_or_init();
+
+        // Bind a server-side listener; accept one connection then drop
+        // both halves so the client sees EOF.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let server_addr = listener.local_addr().expect("local_addr");
+        let accept_thread = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().expect("accept");
+            test_protocol::accept_std(&mut sock, crate::WIRE_VERSION, 1);
+            // Hold for ~50 ms so the client finishes connecting, then
+            // drop — the FIN reaches the client and read_loop exits.
+            std::thread::sleep(Duration::from_millis(50));
+            drop(sock);
+        });
+
+        let client = RpcClient::connect(server_addr).await.expect("connect");
+        accept_thread.join().expect("accept thread");
+
+        // Wait up to 1 s for read_loop to observe EOF and flip closed.
+        let mut waited = Duration::ZERO;
+        while !client.is_closed() && waited < Duration::from_secs(1) {
+            compio::time::sleep(Duration::from_millis(10)).await;
+            waited += Duration::from_millis(10);
+        }
+        assert!(
+            client.is_closed(),
+            "RpcClient.closed should flip true within 1 s of peer FIN"
+        );
+
+        // Each public submit path must short-circuit, NOT hang.
+        let r = client.send_frame(Frame::request(1, 1, Bytes::new())).await;
+        assert!(matches!(r, Err(RpcError::ConnectionClosed)));
+
+        let r = client
+            .send_vectored(2, vec![Bytes::from_static(b"x")])
+            .await;
+        assert!(matches!(r, Err(RpcError::ConnectionClosed)));
+
+        let r = client.send_oneshot(3, Bytes::new()).await;
+        assert!(matches!(r, Err(RpcError::ConnectionClosed)));
+
+        // `call` returns the same error.
+        let r = client.call(4, Bytes::new()).await;
+        assert!(matches!(r, Err(RpcError::ConnectionClosed)));
+    }
+
+    /// A frame-level ERROR response (FLAG_ERROR — the shape the PS authz_gate
+    /// emits for a PermissionDenied, or the ps-conn mis-route NotFound) to a
+    /// `call_into_pooled` caller must surface as the decoded
+    /// `RpcError::Status`, NOT be misparsed as a bulk meta (whose first byte
+    /// would read the StatusCode as a bogus application code and the message
+    /// bytes as value payload).
+    #[compio::test]
+    async fn call_into_pooled_error_frame_surfaces_status() {
+        use std::io::{Read, Write};
+        let _ = autumn_transport::current_or_init(); // TCP
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let server_addr = listener.local_addr().expect("local_addr");
+
+        let srv = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().expect("accept");
+            test_protocol::accept_std(&mut sock, crate::WIRE_VERSION, 1);
+            let mut hdr = [0u8; 10];
+            sock.read_exact(&mut hdr).expect("read req hdr");
+            let req_id = u32::from_le_bytes(hdr[0..4].try_into().unwrap());
+            let plen = u32::from_le_bytes(hdr[6..10].try_into().unwrap()) as usize;
+            let mut req_payload = vec![0u8; plen];
+            sock.read_exact(&mut req_payload).expect("read req payload");
+            // Normal CRC'd error frame, exactly what authz_gate emits.
+            let status = RpcError::encode_status(
+                crate::error::StatusCode::PermissionDenied,
+                "key requires a capability token",
+            );
+            let bytes = Frame::error(req_id, 9, status).encode();
+            sock.write_all(&bytes).expect("write resp");
+            std::thread::sleep(Duration::from_millis(50));
+        });
+
+        let client = RpcClient::connect(server_addr).await.expect("connect");
+        let r = client.call_into_pooled(9, Bytes::from_static(b"req")).await;
+        match r {
+            Err(RpcError::Status { code, message }) => {
+                assert_eq!(code, crate::error::StatusCode::PermissionDenied);
+                assert!(
+                    message.contains("capability token"),
+                    "message preserved: {message}"
+                );
+            }
+            Err(other) => panic!("expected PermissionDenied status, got {other:?}"),
+            Ok(z) => panic!(
+                "expected PermissionDenied status, got Ok(code={}, {} bytes)",
+                z.code,
+                z.buf.len()
+            ),
+        }
+        srv.join().expect("server thread");
+    }
+
+    /// `call_into_pooled` recvs a value-separable response into a
+    /// read_loop-owned `PooledBuf` (TCP small-value path = decode + copy),
+    /// ctrl CRC verified by the decoder, `BulkResp` handed back. Proves the
+    /// cancel-safe primitive's happy path before the UCX + EN/PS wiring.
+    #[compio::test]
+    async fn call_into_pooled_tcp_returns_filled_buffer() {
+        use std::io::{Read, Write};
+        let _ = autumn_transport::current_or_init(); // TCP
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let server_addr = listener.local_addr().expect("local_addr");
+        let value: Vec<u8> = (0..4096u32).map(|i| ((i * 7) & 0xff) as u8).collect();
+        let value_srv = value.clone();
+
+        let srv = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().expect("accept");
+            test_protocol::accept_std(&mut sock, crate::WIRE_VERSION, 1);
+            let mut hdr = [0u8; 10];
+            sock.read_exact(&mut hdr).expect("read req hdr");
+            let req_id = u32::from_le_bytes(hdr[0..4].try_into().unwrap());
+            let plen = u32::from_le_bytes(hdr[6..10].try_into().unwrap()) as usize;
+            let mut req_payload = vec![0u8; plen];
+            sock.read_exact(&mut req_payload).expect("read req payload");
+            // v28 value-separable response: [head(ctrl=[code])][raw value].
+            let head =
+                crate::frame::encode_bulk_response_head(req_id, 15, 0, "", value_srv.len());
+            sock.write_all(&head).expect("write head");
+            sock.write_all(&value_srv).expect("write value");
+            std::thread::sleep(Duration::from_millis(50));
+        });
+
+        let client = RpcClient::connect(server_addr).await.expect("connect");
+        let z = client
+            .call_into_pooled(15, Bytes::from_static(b"req"))
+            .await
+            .expect("call_into_pooled");
+        assert_eq!(z.code, 0);
+        assert!(z.message.is_empty());
+        assert_eq!(
+            z.buf.filled(),
+            &value[..],
+            "value bytes landed in the pool buffer"
+        );
+        srv.join().expect("server thread");
+    }
+
+    /// `call_into_pooled` over TCP with a value ABOVE
+    /// `TCP_RECV_INTO_POOLED_MIN_BYTES` engages the read_loop recv-into-pooled
+    /// branch: prologue verified via `peek_bulk_prologue`, then the value recv'd
+    /// straight into the PooledBuf via a compio owned read, skipping the
+    /// FrameDecoder accumulation. A 256 KiB value forces multiple socket reads
+    /// (64 KiB read_loop scratch), exercising drain-prefix + read-remainder.
+    #[compio::test]
+    async fn call_into_pooled_tcp_large_value_recv_into_pooled() {
+        use std::io::{Read, Write};
+        let _ = autumn_transport::current_or_init(); // TCP
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let server_addr = listener.local_addr().expect("local_addr");
+        let n = 256 * 1024usize; // > 64 KiB threshold; spans many read_loop reads
+        let value: Vec<u8> = (0..n).map(|i| ((i * 31 + 7) & 0xff) as u8).collect();
+        let value_srv = value.clone();
+
+        let srv = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().expect("accept");
+            test_protocol::accept_std(&mut sock, crate::WIRE_VERSION, 1);
+            let mut hdr = [0u8; 10];
+            sock.read_exact(&mut hdr).expect("read req hdr");
+            let req_id = u32::from_le_bytes(hdr[0..4].try_into().unwrap());
+            let plen = u32::from_le_bytes(hdr[6..10].try_into().unwrap()) as usize;
+            let mut req_payload = vec![0u8; plen];
+            sock.read_exact(&mut req_payload).expect("read req payload");
+            let head =
+                crate::frame::encode_bulk_response_head(req_id, 15, 0, "", value_srv.len());
+            sock.write_all(&head).expect("write head");
+            sock.write_all(&value_srv).expect("write value");
+            std::thread::sleep(Duration::from_millis(50));
+        });
+
+        let client = RpcClient::connect(server_addr).await.expect("connect");
+        let z = client
+            .call_into_pooled(15, Bytes::from_static(b"req"))
+            .await
+            .expect("call_into_pooled");
+        assert_eq!(z.code, 0);
+        assert_eq!(z.buf.len(), n, "full value length");
+        assert_eq!(
+            z.buf.filled(),
+            &value[..],
+            "large value bytes landed in the pool buffer"
+        );
+        srv.join().expect("server thread");
+    }
+
+    /// A test server for `call_into_dest`: answers its first request with
+    /// `value`, sending the first `split` value bytes, then the rest after
+    /// `pause`; it starts answering after `delay`.
+    fn dest_server(
+        value: Vec<u8>,
+        delay: Duration,
+        split: usize,
+        pause: Duration,
+    ) -> (std::net::SocketAddr, std::thread::JoinHandle<()>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let srv = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().expect("accept");
+            test_protocol::accept_std(&mut sock, crate::WIRE_VERSION, 1);
+            let mut hdr = [0u8; 10];
+            sock.read_exact(&mut hdr).expect("read req hdr");
+            let req_id = u32::from_le_bytes(hdr[0..4].try_into().unwrap());
+            let plen = u32::from_le_bytes(hdr[6..10].try_into().unwrap()) as usize;
+            let mut req_payload = vec![0u8; plen];
+            sock.read_exact(&mut req_payload).expect("read req payload");
+            std::thread::sleep(delay);
+            let head = crate::frame::encode_bulk_response_head(req_id, 15, 0, "", value.len());
+            // One write, so the client's first read holds the prologue and a
+            // value prefix. The client may have closed the connection by now.
+            let _ = sock.write_all(&[&head[..], &value[..split]].concat());
+            std::thread::sleep(pause);
+            let _ = sock.write_all(&value[split..]);
+            std::thread::sleep(Duration::from_millis(200));
+        });
+        (addr, srv)
+    }
+
+    fn pattern(n: usize) -> Vec<u8> {
+        (0..n).map(|i| ((i * 31 + 7) & 0xff) as u8).collect()
+    }
+
+    /// A large value lands in the lent memory, a value that does not fit comes
+    /// back as the spill, and a small one (decoded with its frame) is copied in.
+    #[compio::test]
+    async fn call_into_dest_receives_into_the_lent_memory() {
+        let _ = autumn_transport::current_or_init(); // TCP
+        for (n, cap) in [(256 * 1024usize, 256 * 1024usize), (300 * 1024, 256 * 1024), (1000, 4096)] {
+            let value = pattern(n);
+            let (addr, srv) = dest_server(value.clone(), Duration::ZERO, n, Duration::ZERO);
+            let client = RpcClient::connect(addr).await.expect("connect");
+            let mut mem = vec![0u8; cap];
+            let (dest, released) = unsafe { autumn_transport::RecvDest::new(mem.as_mut_ptr(), cap) };
+            let r = client
+                .call_into_dest(15, Bytes::from_static(b"req"), dest, released, None)
+                .await
+                .expect("call_into_dest");
+            assert_eq!((r.code, r.value_len), (0, n));
+            match r.spill {
+                None => assert_eq!(&mem[..n], &value[..], "value {n} in the lent memory"),
+                Some(pb) => {
+                    assert!(n > cap, "only a value longer than the memory spills");
+                    assert_eq!(pb.filled(), &value[..]);
+                    assert!(mem.iter().all(|&b| b == 0), "a spilled value leaves the memory alone");
+                }
+            }
+            srv.join().expect("server thread");
+        }
+    }
+
+    /// Once `call_into_dest` returns from a timeout, nothing writes the lent
+    /// memory: not a reply that arrives later, and not the rest of a value
+    /// that was half received. Ablation: return without waiting for the
+    /// `RecvDest` to drop and the late bytes land after the return.
+    #[compio::test]
+    async fn after_a_timeout_nothing_writes_the_lent_memory() {
+        let _ = autumn_transport::current_or_init(); // TCP
+        let n = 1 << 20;
+        // (reply delay, value bytes before the stall): before the value, mid-value.
+        for (delay, split) in [(Duration::from_millis(300), n), (Duration::ZERO, n / 2)] {
+            let (addr, srv) = dest_server(pattern(n), delay, split, Duration::from_millis(300));
+            let client = RpcClient::connect(addr).await.expect("connect");
+            let mut mem = vec![0u8; n];
+            let (dest, released) = unsafe { autumn_transport::RecvDest::new(mem.as_mut_ptr(), n) };
+            let t = Duration::from_millis(100);
+            let call = client.call_into_dest(15, Bytes::from_static(b"req"), dest, released, Some(t));
+            let r = compio::time::timeout(Duration::from_secs(5), call).await.expect("returns promptly");
+            assert!(matches!(r, Err(RpcError::Timeout(_)) | Err(RpcError::ConnectionClosed)), "{r:?}");
+            mem.fill(0xEE);
+            // Block the thread: a receive left running cannot be aborted
+            // meanwhile, and the rest of the value arrives in this window.
+            std::thread::sleep(Duration::from_millis(600));
+            compio::time::sleep(Duration::from_millis(100)).await;
+            assert!(mem.iter().all(|&b| b == 0xEE), "written after the return (split {split})");
+            srv.join().expect("server thread");
+        }
+    }
+
+    /// The value is received in place: while the server stalls halfway, the
+    /// first half is already in the lent memory. A value received into a pool
+    /// buffer and copied would show nothing until it was all in.
+    #[compio::test]
+    async fn the_value_is_received_in_place() {
+        let _ = autumn_transport::current_or_init(); // TCP
+        let n = 1 << 20;
+        let value = pattern(n);
+        let (addr, srv) = dest_server(value.clone(), Duration::ZERO, n / 2, Duration::from_millis(400));
+        let client = RpcClient::connect(addr).await.expect("connect");
+        let mut mem = vec![0u8; n];
+        let ptr = mem.as_ptr() as usize;
+        let (dest, released) = unsafe { autumn_transport::RecvDest::new(mem.as_mut_ptr(), n) };
+        let call = client.call_into_dest(15, Bytes::from_static(b"req"), dest, released, None);
+        let peek = async {
+            compio::time::sleep(Duration::from_millis(200)).await;
+            // The receive owns the memory; read it the way the NIC would see it.
+            (n / 4..n / 2).all(|i| unsafe { std::ptr::read_volatile((ptr + i) as *const u8) } == value[i])
+        };
+        let (r, first_half_in) = futures::join!(call, peek);
+        r.expect("call_into_dest");
+        assert!(first_half_in, "the first half was not in the lent memory during the stall");
+        assert_eq!(mem, value);
+        srv.join().expect("server thread");
+    }
+
+    /// A value received into a pool buffer (longer than the lent memory here;
+    /// every value on UCX) leaves the memory in the slot until it is in, so a
+    /// caller giving up mid-value gets it back at once instead of waiting for
+    /// the rest. Ablation: take the memory out before the receive and the
+    /// call waits for the stalled value.
+    #[compio::test]
+    async fn a_pooled_receive_does_not_hold_the_lent_memory() {
+        let _ = autumn_transport::current_or_init(); // TCP
+        let n = 1 << 20;
+        let (addr, srv) = dest_server(pattern(n), Duration::ZERO, n / 2, Duration::from_secs(2));
+        let client = RpcClient::connect(addr).await.expect("connect");
+        let mut mem = vec![0u8; n / 4];
+        let (dest, released) = unsafe { autumn_transport::RecvDest::new(mem.as_mut_ptr(), mem.len()) };
+        let start = std::time::Instant::now();
+        let r = client
+            .call_into_dest(15, Bytes::from_static(b"req"), dest, released, Some(Duration::from_millis(100)))
+            .await;
+        assert!(matches!(r, Err(RpcError::Timeout(_))), "{r:?}");
+        assert!(start.elapsed() < Duration::from_secs(1), "waited {:?} for the value", start.elapsed());
+        srv.join().expect("server thread");
+    }
+
+    /// v28 — a bulk ERROR response (non-zero code + human message in the CRC'd
+    /// ctrl, empty value) surfaces both fields through `call_into_pooled`.
+    #[compio::test]
+    async fn call_into_pooled_zc_error_message_round_trips() {
+        use std::io::{Read, Write};
+        let _ = autumn_transport::current_or_init(); // TCP
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let server_addr = listener.local_addr().expect("local_addr");
+
+        let srv = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().expect("accept");
+            test_protocol::accept_std(&mut sock, crate::WIRE_VERSION, 1);
+            let mut hdr = [0u8; 10];
+            sock.read_exact(&mut hdr).expect("read req hdr");
+            let req_id = u32::from_le_bytes(hdr[0..4].try_into().unwrap());
+            let plen = u32::from_le_bytes(hdr[6..10].try_into().unwrap()) as usize;
+            let mut req_payload = vec![0u8; plen];
+            sock.read_exact(&mut req_payload).expect("read req payload");
+            let head = crate::frame::encode_bulk_response_head(
+                req_id,
+                15,
+                6, // e.g. CODE_EVERSION_MISMATCH
+                "eversion mismatch: have 3 want 5",
+                0,
+            );
+            sock.write_all(&head).expect("write head");
+            std::thread::sleep(Duration::from_millis(50));
+        });
+
+        let client = RpcClient::connect(server_addr).await.expect("connect");
+        let z = client
+            .call_into_pooled(15, Bytes::from_static(b"req"))
+            .await
+            .expect("call_into_pooled");
+        assert_eq!(z.code, 6);
+        assert_eq!(z.message, "eversion mismatch: have 3 want 5");
+        assert!(z.buf.filled().is_empty());
+        srv.join().expect("server thread");
+    }
+
+    /// An urgent request queued behind normal ones reaches the peer first.
+    /// Everything is queued before this task yields (the sends only
+    /// `try_send`), so the writer task finds all of it at once and the arrival
+    /// order is its choice alone.
+    /// Ablation: submitting `Lane::Urgent` to the normal queue puts it last.
+    #[compio::test]
+    async fn an_urgent_request_overtakes_queued_ones() {
+        let _ = autumn_transport::current_or_init();
+        const NORMAL: usize = 8;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let server_addr = listener.local_addr().expect("local_addr");
+        let peer = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().expect("accept");
+            test_protocol::accept_std(&mut sock, crate::WIRE_VERSION, 1);
+            let mut decoder = FrameDecoder::new();
+            let mut order = Vec::new();
+            let mut buf = vec![0u8; 1 << 20];
+            while order.len() < NORMAL + 1 {
+                let n = std::io::Read::read(&mut sock, &mut buf).expect("read");
+                assert!(n > 0, "client closed early");
+                decoder.feed(&buf[..n]);
+                while let Some(frame) = decoder.try_decode().expect("decode") {
+                    order.push(frame.msg_type);
+                }
+            }
+            order
+        });
+
+        let client = RpcClient::connect(server_addr).await.expect("connect");
+        let big = Bytes::from(vec![7u8; 256 << 10]);
+        let mut replies = Vec::new();
+        for _ in 0..NORMAL {
+            replies.push(client.send_vectored(1, vec![big.clone()]).await.expect("queue"));
+        }
+        let urgent = Frame::request(client.next_req_id(), 2, Bytes::new());
+        replies.push(client.send_frame_on(Lane::Urgent, urgent).await.expect("queue urgent"));
+
+        // Joining blocks this thread; the writer task needs it first.
+        while !peer.is_finished() {
+            compio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let order = peer.join().expect("peer");
+        assert_eq!(order[0], 2, "the urgent request must go out first: {order:?}");
+        assert_eq!(order.iter().filter(|&&m| m == 1).count(), NORMAL);
+        drop(replies);
+    }
+
+    /// With a send window, large requests past it wait in the client while an
+    /// urgent one and the keepalive ping go out. The normal lane stays FIFO: a
+    /// small request queued behind a held large one waits with it.
+    /// Ablation: the ping on the normal lane is held and never written.
+    #[compio::test]
+    async fn the_send_window_holds_large_requests_but_not_urgent_ones() {
+        let _ = autumn_transport::current_or_init();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let server_addr = listener.local_addr().expect("local_addr");
+        // Reads every frame it gets for a while, answers none.
+        let peer = std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().expect("accept");
+            test_protocol::accept_std(&mut sock, crate::WIRE_VERSION, 1);
+            sock.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
+            let mut decoder = FrameDecoder::new();
+            let mut order = Vec::new();
+            let mut buf = vec![0u8; 1 << 20];
+            while let Ok(n) = std::io::Read::read(&mut sock, &mut buf) {
+                if n == 0 {
+                    break;
+                }
+                decoder.feed(&buf[..n]);
+                while let Some(frame) = decoder.try_decode().expect("decode") {
+                    order.push(frame.msg_type);
+                }
+            }
+            order
+        });
+
+        let client = RpcClient::connect(server_addr).await.expect("connect");
+        client.set_send_window(2);
+        let big = Bytes::from(vec![7u8; 256 << 10]);
+        let mut replies = Vec::new();
+        for _ in 0..5 {
+            replies.push(client.send_vectored(1, vec![big.clone()]).await.expect("queue"));
+        }
+        replies.push(client.send_vectored(3, vec![Bytes::from_static(b"small")]).await.expect("small"));
+        let urgent = Frame::request(client.next_req_id(), 2, Bytes::new());
+        replies.push(client.send_frame_on(Lane::Urgent, urgent).await.expect("urgent"));
+        assert!(client.send_ping(), "ping queued");
+        while !peer.is_finished() {
+            compio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let order = peer.join().expect("peer");
+        assert_eq!(order.iter().filter(|&&m| m == 1).count(), 2, "only the window's worth of large frames: {order:?}");
+        assert_eq!(
+            order,
+            vec![2, crate::MSG_TYPE_PING, 1, 1],
+            "urgent and the keepalive ping first, then the window's worth; the small one waits its turn"
+        );
+        drop(replies);
+    }
+}

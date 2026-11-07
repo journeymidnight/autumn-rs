@@ -1,0 +1,8 @@
+[build]
+rustflags = ["-C", "force-frame-pointers=yes"]
+
+# A target's rustflags replace [build]'s, so frame pointers are repeated.
+# SSE4.2 lets crc32c's crc32q inline into its loop; without it each 8 bytes
+# is a call, ~4x slower and sensitive to where the linker places the code.
+[target.'cfg(target_arch = "x86_64")']
+rustflags = ["-C", "force-frame-pointers=yes", "-C", "target-feature=+sse4.2"]

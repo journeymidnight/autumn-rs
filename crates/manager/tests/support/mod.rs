@@ -1,0 +1,1857 @@
+#![allow(dead_code)] // shared test toolbox — not every helper is used by every test binary
+//! Shared test infrastructure for autumn-manager integration tests.
+//!
+//! Provides helper functions for starting components, RPC helpers,
+//! and a ShutdownHandle for controlled node lifecycle management.
+
+use std::net::SocketAddr;
+use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+use autumn_manager::AutumnManager;
+use autumn_partition_server::PartitionServer;
+use autumn_rpc::client::RpcClient;
+use autumn_rpc::manager_rpc::*;
+use autumn_rpc::partition_rpc::{self, TableLocations};
+use autumn_stream::{ExtentNode, ExtentNodeConfig};
+
+// ── ShutdownHandle ────────────────────────────────────────────────────
+
+/// A handle that allows controlled shutdown of a component running on
+/// a separate thread. The component checks `is_shutdown()` periodically
+/// and exits when true. Dropping the handle does NOT signal shutdown.
+#[derive(Clone)]
+pub struct ShutdownFlag(pub Arc<AtomicBool>);
+
+impl ShutdownFlag {
+    pub fn new() -> Self {
+        Self(Arc::new(AtomicBool::new(false)))
+    }
+
+    pub fn shutdown(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    pub fn is_shutdown(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
+// ── Cluster secret ────────────────────────────────────────────────────
+
+/// The cluster secret this test process proves on every Peer/Admin
+/// connection, and the file a spawned server binary reads the same secret
+/// from (`--cluster-secret-file`, which every server binary requires).
+///
+/// Installed process-wide on first use. The address pickers call it, because
+/// every test picks its addresses before it starts anything: an in-process
+/// server that accepted before the install would answer PEER_AUTH "open", and
+/// a client holding the secret refuses an open server.
+pub fn cluster_secret_file() -> &'static std::path::Path {
+    static FILE: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    FILE.get_or_init(|| {
+        const SECRET: &str = "autumn-manager-tests-cluster-secret-0123456789";
+        // One file shared by every test process, so none is left behind per
+        // process: each writes the same bytes beside it and renames them over.
+        let path = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("cluster-secret-manager-tests");
+        let tmp = path.with_extension(std::process::id().to_string());
+        std::fs::write(&tmp, SECRET).expect("write test cluster secret");
+        std::fs::rename(&tmp, &path).expect("install test cluster secret file");
+        autumn_rpc::peer_auth::install(
+            autumn_rpc::peer_auth::ClusterSecret::new(SECRET).expect("test secret"),
+        )
+        .expect("install test cluster secret");
+        path
+    })
+}
+
+// ── Address allocation ────────────────────────────────────────────────
+
+/// Pick a random available port on loopback.
+/// A manager id unique within this test process. Each test owns its etcd,
+/// so ids only have to differ between managers of one test.
+pub fn manager_identity() -> autumn_manager::ManagerIdentity {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    autumn_manager::ManagerIdentity {
+        id,
+        address: format!("test-manager-{id}"),
+    }
+}
+
+/// A loopback address held for this process (`autumn_test_ports`): no other
+/// test process is handed it before the server binds it.
+pub fn pick_addr() -> SocketAddr {
+    cluster_secret_file();
+    autumn_test_ports::addr()
+}
+
+/// A port held for this process (`autumn_test_ports`) with port + 1000 free
+/// too, for an extent node binary's control listener; it stays this
+/// process's across a kill and respawn.
+pub fn pick_stable_port_pair() -> u16 {
+    cluster_secret_file();
+    autumn_test_ports::port_with_control()
+}
+
+// ── Component startup ─────────────────────────────────────────────────
+
+/// Block until `addr` accepts a TCP connection. A server started on a thread
+/// binds after its setup (manager registration, region sync, partition
+/// opens), which a slow runner can stretch well past any fixed sleep.
+pub fn wait_accepting(addr: SocketAddr, what: &str) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_err() {
+        assert!(std::time::Instant::now() < deadline, "{what} never accepted on {addr}");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// `wait_accepting` that yields between probes, for a test whose manager runs
+/// as a task on the test's own runtime: blocking would starve it, and the
+/// server being waited for needs it to come up.
+pub async fn wait_accepting_async(addr: SocketAddr, what: &str) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    while std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_err() {
+        assert!(std::time::Instant::now() < deadline, "{what} never accepted on {addr}");
+        compio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Start a manager (no etcd) on its own thread.
+pub fn start_manager(mgr_addr: SocketAddr) {
+    start_manager_with(mgr_addr, autumn_params::manager::ManagerParams::default());
+}
+
+pub fn start_manager_with(mgr_addr: SocketAddr, params: autumn_params::manager::ManagerParams) {
+    std::thread::spawn(move || {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let manager = AutumnManager::new_with_params(params);
+            if let Err(e) = manager.serve(mgr_addr).await {
+                panic!("manager serve: {e:#}");
+            }
+        });
+    });
+    wait_accepting(mgr_addr, "manager");
+}
+
+/// Start an extent node on its own thread.
+pub fn start_extent_node(addr: SocketAddr, dir: std::path::PathBuf, disk_id: u64) {
+    std::thread::spawn(move || {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let n = ExtentNode::new(ExtentNodeConfig::new(dir, disk_id))
+                .await
+                .expect("extent node");
+            if let Err(e) = n.serve(addr).await {
+                panic!("extent node serve: {e:#}");
+            }
+        });
+    });
+    wait_accepting(addr, "extent node");
+}
+
+/// Like `start_extent_node`, but STOPPABLE: `.shutdown()` + join makes the
+/// EN's compio runtime drop (listener + every live connection torn down) —
+/// a real node death as seen by clients (connection refused / closed), used
+/// by the flush-timeout-leak test to force the writer's seal-and-roll path.
+pub fn start_extent_node_stoppable(
+    addr: SocketAddr,
+    dir: std::path::PathBuf,
+    disk_id: u64,
+) -> (ShutdownFlag, std::thread::JoinHandle<()>) {
+    let flag = ShutdownFlag::new();
+    let flag_thread = flag.clone();
+    let handle = std::thread::spawn(move || {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let n = ExtentNode::new(ExtentNodeConfig::new(dir, disk_id))
+                .await
+                .expect("extent node");
+            compio::runtime::spawn(async move {
+                if let Err(e) = n.serve(addr).await {
+                    panic!("extent node serve: {e:#}");
+                }
+            })
+            .detach();
+            while !flag_thread.is_shutdown() {
+                compio::time::sleep(Duration::from_millis(50)).await;
+            }
+            // block_on returns → Runtime drops → detached serve task +
+            // listener + all conn tasks are cancelled and their sockets
+            // closed. Subsequent connects get ECONNREFUSED.
+        });
+    });
+    wait_accepting(addr, "extent node");
+    (flag, handle)
+}
+
+/// Start a partition server on its own thread.
+///
+/// note: `PartitionServer::connect()` implicitly calls
+/// `sync_regions_once()` during `finish_connect`. That sync opens any
+/// partitions already assigned to this PS via `open_partition`, which
+/// binds a dedicated per-partition listener on `base_port + ord`.
+/// Pre-fix, `base_port` was only set inside `serve()`; tests that
+/// `upsert_partition` BEFORE `connect` would therefore have
+/// `finish_connect`'s implicit sync try to bind port `0 + ord`, failing
+/// with EACCES / EADDRINUSE. We now use `connect_with_advertise_and_port`
+/// which seeds `base_port` + `advertise_host` BEFORE `finish_connect`
+/// runs its implicit sync; the subsequent explicit `sync_regions_once`
+/// is a no-op for already-open partitions and `serve()` reinstates the
+/// same base_port (idempotent). See
+/// `crates/partition-server/src/lib.rs::bind_listen_addr`.
+pub fn spawn_partition_server(ps_id: u64, mgr_addr: SocketAddr, ps_addr: SocketAddr) {
+    std::thread::spawn(move || {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            // Match production (`autumn-ps`): pass the advertise addr so
+            // `bind_listen_addr` can derive the advertise host from it.
+            let advertise = ps_addr.to_string();
+            let ps = PartitionServer::connect_with_advertise_and_port(
+                ps_id,
+                &mgr_addr.to_string(),
+                Some(advertise),
+                ps_addr,
+            )
+            .await
+            .expect("connect partition server");
+            ps.sync_regions_once().await.expect("sync regions");
+            if let Err(e) = ps.serve(ps_addr).await {
+                panic!("partition server serve: {e:#}");
+            }
+        });
+    });
+}
+
+/// `spawn_partition_server`, then wait until it accepts.
+pub fn start_partition_server(ps_id: u64, mgr_addr: SocketAddr, ps_addr: SocketAddr) {
+    spawn_partition_server(ps_id, mgr_addr, ps_addr);
+    wait_accepting(ps_addr, "partition server");
+}
+
+/// Like `start_partition_server`, but returns a `ShutdownFlag`: calling
+/// `.shutdown()` makes the PS drain and STOP its thread (heartbeat loop +
+/// per-partition listeners gone) via `serve_until_shutdown` — a GRACEFUL stop:
+/// the drain flushes every memtable, so nothing is left for WAL replay (a crash
+/// test kills a process instead: `start_partition_server_killable`, `ChildPs`). Plain `start_partition_server` spawns a detached thread that serves
+/// forever; dropping the test's `RpcClient` to it only closes the client, so
+/// the server keeps running + heartbeating. A test that then reuses the same
+/// `ps_id` for a takeover PS gets a same-id split-brain (both servers contest
+/// the per-partition owner_epoch), which wedges the new PS's open/serve. Use
+/// this helper whenever a test must actually take a PS down before another PS
+/// reuses its `ps_id`.
+///
+/// Returns `(ShutdownFlag, JoinHandle)`. After `.shutdown()`, JOIN the handle
+/// before reusing the `ps_id` — `serve_until_shutdown` runs a graceful drain
+/// (up to the per-partition shutdown deadline) before the thread exits, so a
+/// fixed sleep is NOT a reliable "PS is down" signal; the join is deterministic.
+pub fn start_partition_server_stoppable(
+    ps_id: u64,
+    mgr_addr: SocketAddr,
+    ps_addr: SocketAddr,
+) -> (ShutdownFlag, std::thread::JoinHandle<()>) {
+    let flag = ShutdownFlag::new();
+    let flag_thread = flag.clone();
+    let handle = std::thread::spawn(move || {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let advertise = ps_addr.to_string();
+            let ps = PartitionServer::connect_with_advertise_and_port(
+                ps_id,
+                &mgr_addr.to_string(),
+                Some(advertise),
+                ps_addr,
+            )
+            .await
+            .expect("connect partition server");
+            ps.sync_regions_once().await.expect("sync regions");
+            // Bridge the AtomicBool flag to the Future serve_until_shutdown wants.
+            let shutdown = async move {
+                while !flag_thread.is_shutdown() {
+                    compio::time::sleep(Duration::from_millis(50)).await;
+                }
+            };
+            if let Err(e) = ps.serve_until_shutdown(ps_addr, shutdown).await {
+                panic!("partition server serve: {e:#}");
+            }
+        });
+    });
+    wait_accepting(ps_addr, "partition server");
+    (flag, handle)
+}
+
+// ── Manager RPC helpers ───────────────────────────────────────────────
+
+/// Register an extent node with the manager.
+/// Register `names` as namespaces, as an operator enabling those applications
+/// does: nothing is registered by default, and a client's write outside a
+/// registered namespace is refused.
+pub async fn create_namespaces(mgr_addr: SocketAddr, names: &[&str]) {
+    let admin = autumn_client::ClusterClient::connect_admin(&mgr_addr.to_string())
+        .await
+        .expect("connect_admin");
+    for name in names {
+        admin
+            .namespace_create(name, Vec::new())
+            .await
+            .unwrap_or_else(|e| panic!("namespace-create {name}: {e}"));
+    }
+}
+
+pub async fn register_node(mgr: &RpcClient, addr: &str, disk_uuid: &str) -> RegisterNodeResp {
+    register_node_with_uuid(mgr, addr, disk_uuid, "").await
+}
+
+/// What `autumn-op format` does before a real extent node first starts:
+/// register it and return the disk id the manager assigned. The node must run
+/// on that id. Started on any other, it refuses every rebuild the manager pins
+/// to it — the instruction names the target's disks, and the node checks that
+/// the copy it is about to write lands on one of them ("recovery destination
+/// disk is outside the pinned target"). Registering again later with the same
+/// address and disk uuid returns the same ids.
+pub fn format_node(mgr_addr: SocketAddr, addr: SocketAddr, disk_uuid: &str) -> u64 {
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        let mgr = RpcClient::connect(mgr_addr).await.expect("connect mgr");
+        let resp = register_node(&mgr, &addr.to_string(), disk_uuid).await;
+        assert_eq!(resp.code, CODE_OK, "register {addr}: {}", resp.message);
+        resp.disk_uuids
+            .iter()
+            .find(|(uuid, _)| uuid == disk_uuid)
+            .map(|(_, disk_id)| *disk_id)
+            .expect("the manager assigns a disk id to every registered disk uuid")
+    })
+}
+
+/// `register_node` that also gives the node its own stable identity — what a
+/// real EN does at startup with `--advertise`. Needed by anything that asks the
+/// manager a question ABOUT a specific node (the reconcile answers "what should
+/// THIS node hold", so it must be able to resolve the caller).
+pub async fn register_node_with_uuid(
+    mgr: &RpcClient,
+    addr: &str,
+    disk_uuid: &str,
+    node_uuid: &str,
+) -> RegisterNodeResp {
+    let resp = mgr
+        .call(
+            MSG_REGISTER_NODE,
+            rkyv_encode(&RegisterNodeReq {
+                addr: addr.to_string(),
+                disk_uuids: vec![disk_uuid.to_string()],
+                shard_ports: vec![],
+                control_address: String::new(),
+                node_uuid: node_uuid.to_string(),
+            }),
+        )
+        .await
+        .expect("register node");
+    rkyv_decode::<RegisterNodeResp>(&resp).expect("decode RegisterNodeResp")
+}
+
+/// Create a replicated stream.
+pub async fn create_stream(mgr: &RpcClient, replicates: u32) -> u64 {
+    let mgr = RpcClient::connect_as(mgr.peer_addr(), autumn_rpc::version_hello::Role::Admin,
+        Some(autumn_rpc::version_hello::Service::Manager)).await.unwrap();
+    let resp = mgr
+        .call(
+            MSG_CREATE_STREAM,
+            rkyv_encode(&CreateStreamReq {
+                replicates,
+                ec_data_shard: replicates,
+                ec_parity_shard: 0,
+            }),
+        )
+        .await
+        .expect("create stream");
+    let created: CreateStreamResp = rkyv_decode(&resp).expect("decode CreateStreamResp");
+    created
+        .stream
+        .unwrap_or_else(|| {
+            panic!(
+                "create_stream code={} msg={}",
+                created.code, created.message
+            )
+        })
+        .stream_id
+}
+
+/// Create three streams (log, row, meta) for a partition.
+pub async fn create_three_streams(mgr: &RpcClient) -> (u64, u64, u64) {
+    let log = create_stream(mgr, 2).await;
+    let row = create_stream(mgr, 2).await;
+    let meta = create_stream(mgr, 2).await;
+    (log, row, meta)
+}
+
+/// Upsert a partition via manager RPC.
+pub async fn upsert_partition(
+    mgr: &RpcClient,
+    part_id: u64,
+    log_stream: u64,
+    row_stream: u64,
+    meta_stream: u64,
+    start_key: &[u8],
+    end_key: &[u8],
+) {
+    let mgr = RpcClient::connect_as(mgr.peer_addr(), autumn_rpc::version_hello::Role::Admin,
+        Some(autumn_rpc::version_hello::Service::Manager)).await.unwrap();
+    let resp = mgr
+        .call(
+            MSG_UPSERT_PARTITION,
+            rkyv_encode(&UpsertPartitionReq {
+                meta: MgrPartitionMeta {
+                    part_id,
+                    log_stream,
+                    row_stream,
+                    meta_stream,
+                    rg: Some(MgrRange {
+                        start_key: start_key.to_vec(),
+                        end_key: end_key.to_vec(),
+                    }),
+                },
+            }),
+        )
+        .await
+        .expect("upsert partition");
+    let r: UpsertPartitionResp = rkyv_decode(&resp).expect("decode UpsertPartitionResp");
+    assert_eq!(r.code, CODE_OK, "upsert_partition failed: {}", r.message);
+}
+
+/// Get regions from manager.
+pub async fn get_regions(mgr: &RpcClient) -> GetRegionsResp {
+    let resp = mgr
+        .call(MSG_GET_REGIONS, bytes::Bytes::new())
+        .await
+        .expect("get_regions");
+    rkyv_decode::<GetRegionsResp>(&resp).expect("decode GetRegionsResp")
+}
+
+// ── Partition Server RPC helpers ──────────────────────────────────────
+
+/// `MSG_PUT` on a raw connection: the rkyv `PutReq` as ctrl, the value as the
+/// frame's tail, as the SDK sends it.
+pub trait PutCall {
+    async fn call_put(&self, put: partition_rpc::PutReq, value: Vec<u8>) -> Result<bytes::Bytes, autumn_rpc::RpcError>;
+}
+
+impl PutCall for RpcClient {
+    async fn call_put(&self, put: partition_rpc::PutReq, value: Vec<u8>) -> Result<bytes::Bytes, autumn_rpc::RpcError> {
+        self.call_vectored_bulk(partition_rpc::MSG_PUT, vec![partition_rpc::rkyv_encode(&put)], bytes::Bytes::from(value)).await
+    }
+}
+
+/// Put a key-value pair.
+pub async fn ps_put(ps: &RpcClient, part_id: u64, key: &[u8], value: &[u8]) {
+    // Bounded retry on transient errors. The first write on a stream
+    // triggers tail-init `current_commit`, which requires ALL
+    // replicas to answer `commit_length`; a momentary single-replica
+    // non-response (common on a loaded test cluster during a concurrent
+    // split/merge storm, or right after PS startup) surfaces as a
+    // retryable `Internal` error. The commit-length contract is "the caller
+    // retries"; the production SDK (maps Internal → retryable ServerError)
+    // and the concurrent-writer task in `system_merge` both already do.
+    // This helper used to `.expect()` on the first attempt, so a transient
+    // miss panicked the seeding loop. Retry mirrors those callers; the
+    // success path is unchanged.
+    let payload_value: Vec<u8> = value.to_vec();
+    let payload = partition_rpc::PutReq {
+        part_id,
+        key: key.to_vec(),
+        expires_at: 0,
+        region_epoch: 0, // test helper: skip epoch check
+        inode_hint: 0,
+        lease_epoch: 0,
+        evict_rank: 0,
+    };
+    let mut last_err = String::new();
+    for _ in 0..30u32 {
+        match ps.call_put(payload.clone(), payload_value.clone()).await {
+            Ok(resp) => {
+                let _: partition_rpc::PutResp =
+                    partition_rpc::rkyv_decode(&resp).expect("decode PutResp");
+                return;
+            }
+            Err(e) => {
+                last_err = format!("{e:?}");
+                compio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    }
+    panic!("put failed after 30 retries: {last_err}");
+}
+
+/// A point read's outcome: `CODE_*`, the PS's message, and the value bytes.
+#[allow(dead_code)]
+pub struct GetResult {
+    pub code: u8,
+    pub message: String,
+    pub value: Vec<u8>,
+}
+
+/// Get a key's value through `MSG_GET`, the read every client uses.
+pub async fn ps_get(ps: &RpcClient, part_id: u64, key: &[u8]) -> GetResult {
+    try_ps_get(ps, part_id, key).await.expect("get")
+}
+
+/// `ps_get` that returns the transport error instead of panicking — for loops
+/// waiting out a partition reopen, where a reset connection means "not yet".
+pub async fn try_ps_get(
+    ps: &RpcClient,
+    part_id: u64,
+    key: &[u8],
+) -> Result<GetResult, autumn_rpc::RpcError> {
+    let resp = ps
+        .call_into_pooled(
+            partition_rpc::MSG_GET,
+            partition_rpc::rkyv_encode(&partition_rpc::GetReq {
+                part_id,
+                key: key.to_vec(),
+                offset: 0,
+                length: 0,
+                region_epoch: 0, // test helper: skip epoch check,
+                direct: false,
+            }),
+        )
+        .await?;
+    Ok(GetResult {
+        code: resp.code,
+        message: resp.message,
+        value: resp.buf.filled().to_vec(),
+    })
+}
+
+/// Flush a partition's memtable.
+pub async fn ps_flush(ps: &RpcClient, part_id: u64) {
+    let resp = ps
+        .call(
+            partition_rpc::MSG_MAINTENANCE,
+            partition_rpc::rkyv_encode(&partition_rpc::MaintenanceReq {
+                part_id,
+                op: partition_rpc::MAINTENANCE_FLUSH,
+                extent_ids: vec![],
+                gc_ratio: None,
+                gc_max_size: None,
+                gc_stream_debt: None,
+                gc_dead_bytes_high: None,
+                gc_empty_only: false,
+                gc_policy_is_standing: false,
+                op_id: 0,
+            }),
+        )
+        .await
+        .expect("flush");
+    let r: partition_rpc::MaintenanceResp =
+        partition_rpc::rkyv_decode(&resp).expect("decode MaintenanceResp");
+    assert_eq!(
+        r.code,
+        partition_rpc::CODE_OK,
+        "flush failed: {}",
+        r.message
+    );
+}
+
+/// Trigger major compaction.
+/// `ps_put` with a TTL. The plain helper pins `expires_at: 0`, and a test that
+/// needs the periodic EXPIRY-major pass to fire has to age an SST — that pass
+/// keys on `SstReader::min_expires_at`, which only a TTL'd record sets.
+pub async fn ps_put_ttl(ps: &RpcClient, part_id: u64, key: &[u8], value: &[u8], ttl_secs: u64) {
+    let expires_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        .saturating_add(ttl_secs);
+    let payload_value: Vec<u8> = value.to_vec();
+    let payload = partition_rpc::PutReq {
+        part_id,
+        key: key.to_vec(),
+        expires_at,
+        region_epoch: 0,
+        inode_hint: 0,
+        lease_epoch: 0,
+        evict_rank: 0,
+    };
+    let mut last_err = String::new();
+    for _ in 0..30u32 {
+        match ps.call_put(payload.clone(), payload_value.clone()).await {
+            Ok(_) => return,
+            Err(e) => {
+                last_err = format!("{e}");
+                compio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+        }
+    }
+    panic!("ps_put_ttl({part_id}) failed after retries: {last_err}");
+}
+
+/// Queue a major compaction; `Err` carries a refusal (e.g. "compaction busy").
+pub async fn try_ps_compact(ps: &RpcClient, part_id: u64) -> Result<(), String> {
+    let resp = ps
+        .call(
+            partition_rpc::MSG_MAINTENANCE,
+            partition_rpc::rkyv_encode(&partition_rpc::MaintenanceReq {
+                part_id,
+                op: partition_rpc::MAINTENANCE_COMPACT,
+                extent_ids: vec![],
+                gc_ratio: None,
+                gc_max_size: None,
+                gc_stream_debt: None,
+                gc_dead_bytes_high: None,
+                gc_empty_only: false,
+                gc_policy_is_standing: false,
+                op_id: 0,
+            }),
+        )
+        .await
+        .expect("compact");
+    let r: partition_rpc::MaintenanceResp =
+        partition_rpc::rkyv_decode(&resp).expect("decode MaintenanceResp");
+    if r.code == partition_rpc::CODE_OK {
+        Ok(())
+    } else {
+        Err(r.message)
+    }
+}
+
+pub async fn ps_compact(ps: &RpcClient, part_id: u64) {
+    if let Err(e) = try_ps_compact(ps, part_id).await {
+        panic!("compact failed: {e}");
+    }
+}
+
+/// Trigger GC.
+pub async fn ps_gc(ps: &RpcClient, part_id: u64) {
+    let resp = ps
+        .call(
+            partition_rpc::MSG_MAINTENANCE,
+            partition_rpc::rkyv_encode(&partition_rpc::MaintenanceReq {
+                part_id,
+                op: partition_rpc::MAINTENANCE_AUTO_GC,
+                extent_ids: vec![],
+                gc_ratio: None,
+                gc_max_size: None,
+                gc_stream_debt: None,
+                gc_dead_bytes_high: None,
+                gc_empty_only: false,
+                gc_policy_is_standing: false,
+                op_id: 0,
+            }),
+        )
+        .await
+        .expect("gc");
+    let r: partition_rpc::MaintenanceResp =
+        partition_rpc::rkyv_decode(&resp).expect("decode MaintenanceResp");
+    assert_eq!(r.code, partition_rpc::CODE_OK, "gc failed: {}", r.message);
+}
+
+/// Delete a key.
+pub async fn ps_delete(ps: &RpcClient, part_id: u64, key: &[u8]) -> partition_rpc::DeleteResp {
+    let resp = ps
+        .call(
+            partition_rpc::MSG_DELETE,
+            partition_rpc::rkyv_encode(&partition_rpc::DeleteReq {
+                inode_hint: 0,
+                lease_epoch: 0,
+                part_id,
+                key: key.to_vec(),
+                region_epoch: 0,
+            }),
+        )
+        .await
+        .expect("delete");
+    let r: partition_rpc::DeleteResp =
+        partition_rpc::rkyv_decode(&resp).expect("decode DeleteResp");
+    assert_eq!(
+        r.code,
+        partition_rpc::CODE_OK,
+        "delete failed: {}",
+        r.message
+    );
+    r
+}
+
+/// Check if a key exists without fetching the value.
+///
+/// Returns a synthetic `found = false` response when the PS rejects
+/// with "key is out of range" — that error path is the expected
+/// behaviour for cross-partition probes (e.g. post-split tests that
+/// ask each child whether it holds a key). Other RPC errors still
+/// panic via `.expect("head")`.
+pub async fn ps_head(ps: &RpcClient, part_id: u64, key: &[u8]) -> partition_rpc::HeadResp {
+    match ps
+        .call(
+            partition_rpc::MSG_HEAD,
+            partition_rpc::rkyv_encode(&partition_rpc::HeadReq {
+                part_id,
+                key: key.to_vec(),
+                region_epoch: 0,
+            }),
+        )
+        .await
+    {
+        Ok(bytes) => partition_rpc::rkyv_decode(&bytes).expect("decode HeadResp"),
+        Err(e) if e.to_string().contains("key is out of range") => partition_rpc::HeadResp {
+            code: partition_rpc::CODE_OK,
+            message: String::new(),
+            found: false,
+            value_length: 0,
+        },
+        Err(e) => panic!("head: {e}"),
+    }
+}
+
+/// Range scan with prefix, start key, and limit.
+pub async fn ps_range(
+    ps: &RpcClient,
+    part_id: u64,
+    prefix: &[u8],
+    start: &[u8],
+    limit: u32,
+) -> partition_rpc::RangeResp {
+    let resp = ps
+        .call(
+            partition_rpc::MSG_RANGE,
+            partition_rpc::rkyv_encode(&partition_rpc::RangeReq {
+                part_id,
+                prefix: prefix.to_vec(),
+                start: start.to_vec(),
+                limit,
+                region_epoch: 0,
+            }),
+        )
+        .await
+        .expect("range");
+    let r: partition_rpc::RangeResp = partition_rpc::rkyv_decode(&resp).expect("decode RangeResp");
+    assert_eq!(
+        r.code,
+        partition_rpc::CODE_OK,
+        "range failed: {}",
+        r.message
+    );
+    r
+}
+
+// ── per-partition router ───────────────────────────────────────
+//
+// Each partition binds its own TCP listener at
+// `base_port + ord`; cross-partition frames sent to the wrong port are
+// rejected with `NotFound` ("partition X not served by this P-log
+// (owner=Y)"). Tests that touch multiple partitions on one PS (e.g.
+// after a split) therefore need to dial the per-partition address from
+// `GetRegions.part_addrs`, not the first partition's port.
+//
+// `PsRouter` hides this routing: given a manager address and (on
+// construction) the initial partition's RpcClient, it resolves
+// subsequent `part_id`s by querying the manager and caching the
+// resulting RpcClients. Existing helpers (`ps_put`, `ps_get`, ...) are
+// still available for single-partition tests; split tests should use
+// the `psr_*` variants below.
+
+/// Cache of `RpcClient`s keyed by partition id. Resolves unknown
+/// partitions by querying the manager for `part_addrs`.
+pub struct PsRouter {
+    mgr_addr: SocketAddr,
+    /// Fallback address used when `part_addrs` does not yet list the
+    /// requested partition — typically the owning PS's first partition
+    /// port (pre-split it owns everything).
+    fallback_addr: SocketAddr,
+}
+
+impl PsRouter {
+    pub fn new(mgr_addr: SocketAddr, fallback_addr: SocketAddr) -> Self {
+        Self {
+            mgr_addr,
+            fallback_addr,
+        }
+    }
+
+    /// Resolve `part_id` to a fresh RpcClient every call. We do NOT
+    /// cache connections because a PS-side task drop (e.g. a partition
+    /// being evicted and re-opened) would leave the cached client
+    /// pointing at a dead FD. Test-scale cost of a reconnect per call
+    /// is negligible.
+    /// Non-panicking variant — returns `Err(message)` after the retry
+    /// budget is exhausted. Use from chaos tests / verify paths where
+    /// a stuck partition (e.g., merged away mid-flight, or still
+    /// reopening post-split) should propagate as an error rather than
+    /// killing the workload task.
+    pub async fn try_client_for(
+        &self,
+        part_id: u64,
+    ) -> Result<Rc<autumn_rpc::client::RpcClient>, String> {
+        let retries: u32 = std::env::var("AUTUMN_TEST_ROUTER_RETRIES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(50);
+        let mut last_err = String::new();
+        for _ in 0..retries {
+            let mgr = match RpcClient::connect(self.mgr_addr).await {
+                Ok(m) => m,
+                Err(e) => {
+                    last_err = format!("connect mgr: {e}");
+                    compio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+            };
+            let regions = get_regions(&mgr).await;
+            let mut addr: Option<SocketAddr> = None;
+            for (pid, part_addr) in regions.part_addrs {
+                if pid == part_id {
+                    if let Ok(sa) = part_addr.parse::<SocketAddr>() {
+                        addr = Some(sa);
+                    }
+                    break;
+                }
+            }
+            match addr {
+                Some(target) => match RpcClient::connect(target).await {
+                    Ok(c) => return Ok(c),
+                    Err(e) => last_err = format!("connect part {part_id} @ {target}: {e}"),
+                },
+                None => last_err = format!("part {part_id} not in regions yet"),
+            }
+            compio::time::sleep(Duration::from_millis(100)).await;
+        }
+        Err(format!(
+            "connect partition {part_id} after retries: {last_err}"
+        ))
+    }
+
+    pub async fn client_for(&self, part_id: u64) -> Rc<autumn_rpc::client::RpcClient> {
+        // Retry with region re-resolution: a partition can be mid-reopen
+        // (split / merge widen its rg → region_sync drops + reopens it on a
+        // fresh per-partition listener), during which its addr is briefly
+        // unpublished or its listener not yet bound. The production SDK
+        // handles this by refreshing regions + reconnecting
+        // (`call_ps_for_part`, MAX_PS_REFRESHES); this test router mirrors
+        // that instead of panicking on the first transient miss.
+        //
+        // Chaos tests can override the budget via `AUTUMN_TEST_ROUTER_RETRIES`
+        // (each retry = 100 ms) when split + region_sync converge slowly
+        // on a loaded loopback cluster. Default 50 = 5 s.
+        let retries: u32 = std::env::var("AUTUMN_TEST_ROUTER_RETRIES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(50);
+        let mut last_err = String::new();
+        for _ in 0..retries {
+            let mgr = match RpcClient::connect(self.mgr_addr).await {
+                Ok(m) => m,
+                Err(e) => {
+                    last_err = format!("connect mgr: {e}");
+                    compio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+            };
+            let regions = get_regions(&mgr).await;
+            let mut addr: Option<SocketAddr> = None;
+            for (pid, part_addr) in regions.part_addrs {
+                if pid == part_id {
+                    if let Ok(sa) = part_addr.parse::<SocketAddr>() {
+                        addr = Some(sa);
+                    }
+                    break;
+                }
+            }
+            match addr {
+                Some(target) => match RpcClient::connect(target).await {
+                    Ok(c) => return c,
+                    Err(e) => last_err = format!("connect part {part_id} @ {target}: {e}"),
+                },
+                None => last_err = format!("part {part_id} not in regions yet"),
+            }
+            compio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("connect partition {part_id} after retries: {last_err}");
+    }
+}
+
+/// Routed `ps_put` — partition-aware: dials the partition's own listener.
+pub async fn psr_put(router: &PsRouter, part_id: u64, key: &[u8], value: &[u8]) {
+    let c = router.client_for(part_id).await;
+    ps_put(&c, part_id, key, value).await;
+}
+
+/// Routed `ps_get` — partition-aware.
+pub async fn psr_get(router: &PsRouter, part_id: u64, key: &[u8]) -> GetResult {
+    let c = router.client_for(part_id).await;
+    ps_get(&c, part_id, key).await
+}
+
+/// `psr_get` for loops waiting out a reopen: an unroutable partition or a
+/// reset connection is an `Err`, not a panic.
+pub async fn try_psr_get(router: &PsRouter, part_id: u64, key: &[u8]) -> Result<GetResult, String> {
+    let c = router.try_client_for(part_id).await?;
+    try_ps_get(&c, part_id, key).await.map_err(|e| e.to_string())
+}
+
+/// Routed `ps_flush` — partition-aware.
+pub async fn psr_flush(router: &PsRouter, part_id: u64) {
+    let c = router.client_for(part_id).await;
+    ps_flush(&c, part_id).await;
+}
+
+/// Routed `ps_compact` — partition-aware.
+pub async fn psr_compact(router: &PsRouter, part_id: u64) {
+    let c = router.client_for(part_id).await;
+    ps_compact(&c, part_id).await;
+}
+
+/// Routed `ps_gc` — partition-aware.
+pub async fn psr_gc(router: &PsRouter, part_id: u64) {
+    let c = router.client_for(part_id).await;
+    ps_gc(&c, part_id).await;
+}
+
+/// Routed `ps_head` — partition-aware.
+pub async fn psr_head(router: &PsRouter, part_id: u64, key: &[u8]) -> partition_rpc::HeadResp {
+    let c = router.client_for(part_id).await;
+    ps_head(&c, part_id, key).await
+}
+
+/// Routed `ps_range` — partition-aware.
+pub async fn psr_range(
+    router: &PsRouter,
+    part_id: u64,
+    prefix: &[u8],
+    start: &[u8],
+    limit: u32,
+) -> partition_rpc::RangeResp {
+    let c = router.client_for(part_id).await;
+    ps_range(&c, part_id, prefix, start, limit).await
+}
+
+// ── Bulk test utilities ──────────────────────────────────────────────
+
+/// Write `count` keys as `{prefix}-{i:03}` with values `val-{prefix}-{i:03}`.
+pub async fn write_sequential_keys(
+    ps: &RpcClient,
+    part_id: u64,
+    prefix: &str,
+    count: u32,
+) -> Vec<String> {
+    let mut keys = Vec::with_capacity(count as usize);
+    for i in 0..count {
+        let key = format!("{prefix}-{i:03}");
+        let val = format!("val-{prefix}-{i:03}");
+        ps_put(ps, part_id, key.as_bytes(), val.as_bytes()).await;
+        keys.push(key);
+    }
+    keys
+}
+
+// ── Common setup patterns ─────────────────────────────────────────────
+
+/// Standard 2-node infra: manager + 2 extent nodes.
+/// Returns (mgr_addr, n1_addr, n2_addr, n1_dir, n2_dir).
+pub fn setup_two_node_infra(
+    base_port_hint: u16,
+) -> (
+    SocketAddr,
+    SocketAddr,
+    SocketAddr,
+    tempfile::TempDir,
+    tempfile::TempDir,
+) {
+    let mgr_addr = pick_addr();
+    start_manager(mgr_addr);
+
+    let n1_addr = pick_addr();
+    let n2_addr = pick_addr();
+    let n1_dir = tempfile::tempdir().expect("n1 tmpdir");
+    let n2_dir = tempfile::tempdir().expect("n2 tmpdir");
+
+    start_extent_node(n1_addr, n1_dir.path().to_path_buf(), base_port_hint as u64);
+    start_extent_node(
+        n2_addr,
+        n2_dir.path().to_path_buf(),
+        base_port_hint as u64 + 1,
+    );
+
+    (mgr_addr, n1_addr, n2_addr, n1_dir, n2_dir)
+}
+
+/// Register 2 extent nodes with the manager.
+pub async fn register_two_nodes(
+    mgr: &RpcClient,
+    n1_addr: SocketAddr,
+    n2_addr: SocketAddr,
+    base_id: u16,
+) {
+    register_node(mgr, &n1_addr.to_string(), &format!("uuid-{}", base_id)).await;
+    register_node(mgr, &n2_addr.to_string(), &format!("uuid-{}", base_id + 1)).await;
+}
+
+// ── Polling helper ────────────────────────────────────────────────────
+
+/// Poll a condition until it returns true or timeout expires.
+/// Returns true if the condition was met, false on timeout.
+pub async fn poll_until(
+    timeout: Duration,
+    interval: Duration,
+    mut condition: impl FnMut() -> bool,
+) -> bool {
+    let start = std::time::Instant::now();
+    loop {
+        if condition() {
+            return true;
+        }
+        if start.elapsed() >= timeout {
+            return false;
+        }
+        compio::time::sleep(interval).await;
+    }
+}
+
+/// Async version of poll_until for conditions that need async evaluation.
+pub async fn poll_until_async<F, Fut>(timeout: Duration, interval: Duration, mut f: F) -> bool
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let start = std::time::Instant::now();
+    loop {
+        if f().await {
+            return true;
+        }
+        if start.elapsed() >= timeout {
+            return false;
+        }
+        compio::time::sleep(interval).await;
+    }
+}
+
+// ── Embedded etcd ─────────────────────────────────────────────────────
+//
+// Spawns the real `etcd` binary in single-member dev mode against a
+// tempdir. Replaces the pre-this Go helper (`tests/support/embedded_etcd/main.go`)
+// which required a Go toolchain to compile `go.etcd.io/etcd/server/v3/embed`
+// at test time. The binary approach has no build-time dependency and
+// uses whatever etcd version is installed on the system (verified
+// against 3.5.x).
+//
+// All etcd-dependent tests (`leader_fence`, `apply_done_atomicity`,
+// `system_manager_failover`, `etcd_stream_integration`) call
+// `start_etcd()` and drop the returned guard at test exit.
+
+/// RAII guard that kills the spawned etcd child + cleans up its data
+/// dir on drop. Tests bind this to an `_etcd_guard` local with a
+/// leading underscore to signal "kept alive for the test body, not
+/// referenced directly."
+pub struct EtcdGuard {
+    child: Option<std::process::Child>,
+    _data_dir: tempfile::TempDir,
+}
+
+impl Drop for EtcdGuard {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+/// Whether process `pid` holds the socket listening on 127.0.0.1:`port`.
+/// Two processes cannot listen on one port, so this tells the etcd we
+/// spawned from another test's server that took the port after
+/// `pick_addr` released it (tests run in parallel processes).
+pub fn listens_on(pid: u32, port: u16) -> bool {
+    let tcp = std::fs::read_to_string("/proc/net/tcp").unwrap_or_default();
+    let want = format!("0100007F:{port:04X}");
+    let inodes: std::collections::HashSet<String> = tcp
+        .lines()
+        .skip(1)
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split_whitespace().collect();
+            // local address, state 0A = LISTEN, inode
+            (f.len() > 9 && f[1] == want && f[3] == "0A").then(|| format!("socket:[{}]", f[9]))
+        })
+        .collect();
+    std::fs::read_dir(format!("/proc/{pid}/fd")).into_iter().flatten().flatten().any(|fd| {
+        std::fs::read_link(fd.path()).is_ok_and(|t| inodes.contains(t.to_string_lossy().as_ref()))
+    })
+}
+
+/// Spawn a single-member etcd instance for tests. Picks two free ports
+/// (client + peer) on loopback, writes data to a tempdir, and returns
+/// `(guard, "http://127.0.0.1:<client_port>")`. Ready means the child
+/// itself listens on the client port and answers; a child that exits
+/// first lost a port to another process and is started again on fresh ones.
+///
+/// Looks for `etcd` on `$PATH`; override with `AUTUMN_TEST_ETCD_BIN` if
+/// the binary lives somewhere not on `$PATH`.
+pub async fn start_etcd() -> (EtcdGuard, String) {
+    let etcd_bin = std::env::var("AUTUMN_TEST_ETCD_BIN").unwrap_or_else(|_| "etcd".to_string());
+    for _ in 0..5 {
+        let client_addr = pick_addr();
+        let peer_addr = pick_addr();
+        let client_url = format!("http://{}", client_addr);
+        let peer_url = format!("http://{}", peer_addr);
+
+        let data_dir = tempfile::tempdir().expect("etcd tempdir");
+        let data_path = data_dir.path().join("etcd-data");
+
+        let mut cmd = std::process::Command::new(&etcd_bin);
+        cmd.arg("--name")
+            .arg("n1")
+            .arg("--data-dir")
+            .arg(&data_path)
+            .arg("--listen-client-urls")
+            .arg(&client_url)
+            .arg("--advertise-client-urls")
+            .arg(&client_url)
+            .arg("--listen-peer-urls")
+            .arg(&peer_url)
+            .arg("--initial-advertise-peer-urls")
+            .arg(&peer_url)
+            .arg("--initial-cluster")
+            .arg(format!("n1={peer_url}"))
+            .arg("--initial-cluster-state")
+            .arg("new")
+            .arg("--log-level")
+            .arg("error")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+
+        let child = cmd.spawn().unwrap_or_else(|e| {
+            panic!("spawn etcd binary `{etcd_bin}`: {e} — install etcd or set AUTUMN_TEST_ETCD_BIN")
+        });
+        let mut guard = EtcdGuard { child: Some(child), _data_dir: data_dir };
+        let start = std::time::Instant::now();
+        loop {
+            let child = guard.child.as_mut().expect("held");
+            if child.try_wait().expect("etcd child status").is_some() {
+                break; // lost a port: try fresh ones
+            }
+            if listens_on(child.id(), client_addr.port()) {
+                if let Ok(c) = autumn_etcd::EtcdClient::connect(&client_url).await {
+                    if c.get("health-check").await.is_ok() {
+                        return (guard, client_url);
+                    }
+                }
+            }
+            assert!(start.elapsed() < Duration::from_secs(30), "etcd at {client_url} not ready within 30 s");
+            compio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+    panic!("etcd lost its ports to other processes five times");
+}
+
+// ── Embedded toxiproxy ────────────────────────────────────────────────
+//
+// Spawns `toxiproxy-server` (Shopify) for tests that need network-fault
+// injection between manager/PS and EN. The admin HTTP API listens on a
+// random loopback port; tests pass that addr to `toxiproxy-cli --host`
+// to create/toggle/poison proxies. Tests that don't need network faults
+// don't need to call this.
+//
+// Looks for `toxiproxy-server` and `toxiproxy-cli` on `$PATH`; override
+// either via `AUTUMN_TEST_TOXIPROXY_SERVER` / `AUTUMN_TEST_TOXIPROXY_CLI`.
+
+pub struct ToxiproxyGuard {
+    child: Option<std::process::Child>,
+}
+
+impl Drop for ToxiproxyGuard {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+/// Spawn a toxiproxy-server. Returns `(guard, admin_addr)` where
+/// `admin_addr` is `"127.0.0.1:<port>"` suitable for passing to
+/// `toxiproxy-cli --host`.
+pub async fn start_toxiproxy() -> (ToxiproxyGuard, String) {
+    let bin = std::env::var("AUTUMN_TEST_TOXIPROXY_SERVER")
+        .unwrap_or_else(|_| "toxiproxy-server".to_string());
+    let admin = pick_addr();
+    let host = admin.ip().to_string();
+    let port = admin.port().to_string();
+    let mut cmd = std::process::Command::new(&bin);
+    cmd.arg("-host")
+        .arg(&host)
+        .arg("-port")
+        .arg(&port)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let child = cmd.spawn().unwrap_or_else(|e| {
+        panic!(
+            "spawn toxiproxy-server `{bin}`: {e} — install via https://github.com/Shopify/toxiproxy/releases or set AUTUMN_TEST_TOXIPROXY_SERVER"
+        )
+    });
+    // Wait for admin API to bind.
+    let admin_addr = format!("{host}:{port}");
+    let start = std::time::Instant::now();
+    loop {
+        if std::net::TcpStream::connect_timeout(&admin, Duration::from_millis(200)).is_ok() {
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "toxiproxy admin port {admin_addr} never bound"
+        );
+        compio::time::sleep(Duration::from_millis(100)).await;
+    }
+    (ToxiproxyGuard { child: Some(child) }, admin_addr)
+}
+
+/// Read one proxy's enabled state out of piped `toxiproxy-cli list` output.
+///
+/// Piped (not a TTY) the CLI drops its decorated table and prints one
+/// tab-separated row per proxy — name, listen, upstream, `enabled`/`disabled`,
+/// toxic count — with no header. Split out from the shell-out so the field
+/// indexing is pinned by tests instead of by a live server.
+///
+/// Matching is on the WHOLE name field: `en-0` and `en-0-ctl` are different
+/// proxies, and a prefix match would answer for the wrong one.
+fn parse_list_state(txt: &str, name: &str) -> Result<bool, String> {
+    for line in txt.lines() {
+        let mut fields = line.split('\t').map(str::trim);
+        if fields.next() != Some(name) {
+            continue;
+        }
+        // name consumed above; skip listen + upstream, take the state.
+        return match fields.nth(2) {
+            Some("enabled") => Ok(true),
+            Some("disabled") => Ok(false),
+            other => Err(format!(
+                "proxy {name}: cannot read its state from `list` (got {other:?})"
+            )),
+        };
+    }
+    Err(format!("proxy {name}: not present in `list`"))
+}
+
+/// Thin shell-out wrapper around `toxiproxy-cli`. All methods block via
+/// `std::process::Command`; that's fine because they each invoke a
+/// fast (<10ms) admin HTTP call.
+pub struct ToxiproxyCli {
+    bin: String,
+    admin_addr: String,
+}
+
+impl ToxiproxyCli {
+    pub fn new(admin_addr: String) -> Self {
+        let bin = std::env::var("AUTUMN_TEST_TOXIPROXY_CLI")
+            .unwrap_or_else(|_| "toxiproxy-cli".to_string());
+        Self { bin, admin_addr }
+    }
+
+    fn cmd(&self) -> std::process::Command {
+        let mut c = std::process::Command::new(&self.bin);
+        c.arg("--host").arg(&self.admin_addr);
+        c.stdout(std::process::Stdio::null());
+        c.stderr(std::process::Stdio::piped());
+        c
+    }
+
+    /// `toxiproxy-cli create --listen LISTEN --upstream UPSTREAM NAME`
+    pub fn create(&self, name: &str, listen: &str, upstream: &str) -> Result<(), String> {
+        let out = self
+            .cmd()
+            .arg("create")
+            .arg("--listen")
+            .arg(listen)
+            .arg("--upstream")
+            .arg(upstream)
+            .arg(name)
+            .output()
+            .map_err(|e| format!("spawn: {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "create proxy {name}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            ));
+        }
+        Ok(())
+    }
+
+    /// `toxiproxy-cli toggle NAME` — flips enabled state.
+    pub fn toggle(&self, name: &str) -> Result<(), String> {
+        let out = self
+            .cmd()
+            .arg("toggle")
+            .arg(name)
+            .output()
+            .map_err(|e| format!("spawn: {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "toggle proxy {name}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            ));
+        }
+        Ok(())
+    }
+
+    /// Set proxy enabled state explicitly, and CONFIRM it took.
+    ///
+    /// `toggle` flips whatever the current state is, so acting on a misread
+    /// state moves the proxy the wrong way — and a failure-injection helper that
+    /// reports success while the proxy stayed put does not weaken the test, it
+    /// inverts it: the nemesis believes the fault was repaired, `partitioned` is
+    /// cleared so `healthy_count` counts the node again, and everything
+    /// downstream is measured against a cluster that is still broken. So the
+    /// state is re-read after the toggle and a mismatch is an error.
+    pub fn set_enabled(&self, name: &str, want: bool) -> Result<(), String> {
+        if self.is_enabled(name)? == want {
+            return Ok(());
+        }
+        self.toggle(name)?;
+        for _ in 0..50 {
+            if self.is_enabled(name)? == want {
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        Err(format!(
+            "proxy {name}: toggle reported success but the state is still {}",
+            if want { "disabled" } else { "enabled" }
+        ))
+    }
+
+    /// Whether the proxy is passing traffic, from `toxiproxy-cli list`.
+    ///
+    /// NOT from `inspect`: piped, 2.12.0 prints no state line there at all — an
+    /// empty stdout with exit 0 for a proxy with no toxics, and only toxic rows
+    /// when it has some. A parser looking for `Enabled:` therefore never
+    /// matched on ANY proxy in ANY state, and this used to answer "enabled" on
+    /// that miss, which made `set_enabled(name, true)` a silent no-op: a
+    /// `NetworkPartition` cut a node and the repair did nothing.
+    ///
+    /// (What that produced was not "every partition is permanent" — the victim
+    /// is picked deterministically, so the NEXT partition on the same node
+    /// toggled its already-disabled proxy back ON, healing the first cut and
+    /// injecting nothing. A node's reachability was the PARITY of the partition
+    /// events that hit it, which is what made the resulting failures ~50%
+    /// flaky rather than certain.)
+    ///
+    /// An unparseable answer is an ERROR, never a default. Guessing here is
+    /// what turned a broken proxy into a healthy-looking one.
+    pub fn is_enabled(&self, name: &str) -> Result<bool, String> {
+        let out = self
+            .cmd()
+            .stdout(std::process::Stdio::piped())
+            .arg("list")
+            .output()
+            .map_err(|e| format!("spawn: {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "list proxies: {}",
+                String::from_utf8_lossy(&out.stderr)
+            ));
+        }
+        parse_list_state(&String::from_utf8_lossy(&out.stdout), name)
+    }
+
+    /// `toxiproxy-cli toxic add -t TYPE -a key=val ... [-n NAME] PROXY`
+    pub fn add_toxic(
+        &self,
+        proxy: &str,
+        toxic_type: &str,
+        toxic_name: &str,
+        // `false` = downstream (server → client bytes), toxiproxy's default.
+        upstream: bool,
+        attrs: &[(&str, &str)],
+    ) -> Result<(), String> {
+        let mut cmd = self.cmd();
+        cmd.arg("toxic")
+            .arg("add")
+            .arg("-t")
+            .arg(toxic_type)
+            .arg("-n")
+            .arg(toxic_name)
+            .arg(if upstream { "-u" } else { "-d" });
+        for (k, v) in attrs {
+            cmd.arg("-a").arg(format!("{k}={v}"));
+        }
+        cmd.arg(proxy);
+        let out = cmd.output().map_err(|e| format!("spawn: {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "toxic add {toxic_name} on {proxy}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            ));
+        }
+        Ok(())
+    }
+
+    /// `toxiproxy-cli toxic remove -n NAME PROXY`
+    pub fn remove_toxic(&self, proxy: &str, toxic_name: &str) -> Result<(), String> {
+        let out = self
+            .cmd()
+            .arg("toxic")
+            .arg("remove")
+            .arg("-n")
+            .arg(toxic_name)
+            .arg(proxy)
+            .output()
+            .map_err(|e| format!("spawn: {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "toxic remove {toxic_name} on {proxy}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            ));
+        }
+        Ok(())
+    }
+}
+
+// ── TableLocations decoder ────────────────────────────────────────────
+
+/// Decode the last TableLocations record from raw metaStream bytes.
+pub fn decode_last_table_locations(data: &[u8]) -> TableLocations {
+    let mut last: Option<TableLocations> = None;
+    let mut buf = data;
+    while buf.len() >= 4 {
+        let msg_len = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+        let total = 4 + msg_len;
+        if total > buf.len() {
+            break;
+        }
+        match partition_rpc::rkyv_decode::<TableLocations>(&buf[4..4 + msg_len]) {
+            Ok(locs) => {
+                last = Some(locs);
+                buf = &buf[total..];
+            }
+            Err(_) => break,
+        }
+    }
+    last.expect("no valid TableLocations record")
+}
+
+// ── Crash-takeover harness: a PS that can be SIGKILLed ─────────────────
+
+/// A partition server running as a CHILD PROCESS, so a test can SIGKILL it.
+///
+/// This exists because neither in-process helper can express a real crash, and
+/// the difference is not cosmetic — it decides what is durable at takeover:
+///
+/// - `start_partition_server` spawns a DETACHED thread that serves forever.
+///   Dropping the test's client only closes the client; the server keeps
+///   running and heartbeating, so a takeover PS contests the per-partition
+///   `owner_epoch` and its open/serve wedges (its listener never binds, so the
+///   takeover client cannot even connect).
+/// - `start_partition_server_stoppable` exits cleanly, but `shutdown()` is a
+///   GRACEFUL DRAIN: it rotates the active memtable and flushes every imm
+///   before the thread exits. Anything that lived only in the un-flushed
+///   memtable is made durable on the way out — which is precisely the state a
+///   crash test needs to LOSE.
+///
+/// SIGKILL on a child leaves the durable state exactly where a power cut would,
+/// and it is what production actually experiences. The child is spawned from
+/// the same `target/debug/autumn-ps` the cluster scripts use, so a test also
+/// exercises the real binary's startup path rather than a bespoke in-test one.
+///
+/// Build first: `cargo build -p autumn-server --bins`.
+pub struct KillablePs {
+    child: std::process::Child,
+    ps_id: u64,
+    killed: bool,
+}
+
+impl KillablePs {
+    /// SIGKILL the PS and reap it. No drain, no flush — the on-disk state is
+    /// whatever was already durable. Returns once the process is gone, so a
+    /// takeover PS started after this cannot contest the dead one's epoch.
+    pub fn kill(&mut self) {
+        if self.killed {
+            return;
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        self.killed = true;
+    }
+}
+
+impl Drop for KillablePs {
+    fn drop(&mut self) {
+        // A leaked PS child would keep heartbeating into the next test's
+        // manager and contest owner locks.
+        self.kill();
+        let _ = self.ps_id;
+    }
+}
+
+/// Spawn `autumn-ps` as a child process bound to `ps_addr`. Waits until its
+/// listener actually accepts before returning, so callers never race startup.
+pub fn start_partition_server_killable(
+    ps_id: u64,
+    mgr_addr: SocketAddr,
+    ps_addr: SocketAddr,
+) -> KillablePs {
+    let bin = support_binary_path("autumn-ps");
+    let child = std::process::Command::new(bin)
+        .arg("--cluster-secret-file")
+        .arg(cluster_secret_file())
+        .arg("--psid")
+        .arg(ps_id.to_string())
+        .arg("--manager")
+        .arg(mgr_addr.to_string())
+        .arg("--port")
+        .arg(ps_addr.port().to_string())
+        .arg("--listen")
+        .arg(ps_addr.ip().to_string())
+        .arg("--advertise")
+        .arg(ps_addr.to_string())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn autumn-ps");
+
+    let ps = KillablePs {
+        child,
+        ps_id,
+        killed: false,
+    };
+    // The PS binds its listener only after every assigned partition finishes
+    // recovery, so a fixed sleep is not a reliable ready signal.
+    wait_accepting(ps_addr, &format!("autumn-ps {ps_id}"));
+    ps
+}
+
+/// Failpoints a re-executed child PS arms before it connects. See `ChildPs`.
+#[derive(Clone, Copy, Default)]
+pub struct ChildFailpoints {
+    /// The n-th flush commit fails its checkpoint (0 = none).
+    pub flush_checkpoint_nth: u64,
+    /// The first compaction fails its checkpoint (outputs already written).
+    pub compaction_checkpoint: bool,
+    /// Every merged open fails before publishing its merged checkpoint.
+    pub merged_checkpoint: bool,
+    /// Every compaction parks after its first progress sample.
+    pub compaction_hold: bool,
+    /// No minor compaction is requested, so the test's table shape holds.
+    pub minor_paused: bool,
+}
+
+/// Environment of a re-executed child PS:
+/// `<ps_id> <manager> <ps addr> <flush nth> <compaction 0|1> <merged 0|1> <hold 0|1>
+/// <minor paused 0|1>`.
+const CHILD_PS_ENV: &str = "AUTUMN_TEST_CHILD_PS";
+
+/// A partition server running as a re-executed copy of THIS test binary, so a
+/// test can arm in-process failpoints in it and still SIGKILL it
+/// (`KillablePs` runs the real `autumn-ps`, which no test can arm). The test
+/// binary must define `#[test] fn child_ps() { support::child_ps_main() }`;
+/// that test is a no-op in an ordinary run. A child outlives a parent killed
+/// from outside the test (an outer timeout); kill it by hand.
+pub struct ChildPs(std::process::Child);
+
+impl ChildPs {
+    pub fn spawn(
+        ps_id: u64,
+        mgr_addr: SocketAddr,
+        ps_addr: SocketAddr,
+        fp: ChildFailpoints,
+    ) -> Self {
+        let child = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args(["--exact", "child_ps", "--nocapture", "--test-threads=1"])
+            .env(
+                CHILD_PS_ENV,
+                format!(
+                    "{ps_id} {mgr_addr} {ps_addr} {} {} {} {} {}",
+                    fp.flush_checkpoint_nth,
+                    u8::from(fp.compaction_checkpoint),
+                    u8::from(fp.merged_checkpoint),
+                    u8::from(fp.compaction_hold),
+                    u8::from(fp.minor_paused)
+                ),
+            )
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn child PS");
+        let mut ps = ChildPs(child);
+        for _ in 0..600 {
+            if std::net::TcpStream::connect_timeout(&ps_addr, Duration::from_millis(200)).is_ok() {
+                return ps;
+            }
+            if let Some(status) = ps.0.try_wait().expect("poll child PS") {
+                panic!("child PS exited before accepting: {status} (its stderr is above)");
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        panic!("child PS never accepted on {ps_addr}");
+    }
+
+    /// SIGKILL and reap: what is durable is what was durable before it.
+    pub fn kill(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+impl Drop for ChildPs {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
+/// Body of a test binary's `child_ps` test: when re-executed by
+/// `ChildPs::spawn`, arm the failpoints and serve until SIGKILLed; otherwise
+/// return at once.
+pub fn child_ps_main() {
+    let Ok(spec) = std::env::var(CHILD_PS_ENV) else {
+        return;
+    };
+    let f: Vec<&str> = spec.split(' ').collect();
+    let ps_id: u64 = f[0].parse().unwrap();
+    let mgr = f[1].to_string();
+    let ps_addr: SocketAddr = f[2].parse().unwrap();
+    // The cluster secret every server here proves.
+    cluster_secret_file();
+    let nth: u64 = f[3].parse().unwrap();
+    if nth > 0 {
+        autumn_partition_server::fail_nth_flush_checkpoint(nth);
+    }
+    if f[4] == "1" {
+        autumn_partition_server::background::fail_next_compaction_checkpoint();
+    }
+    if f[5] == "1" {
+        autumn_partition_server::fail_merged_checkpoint();
+    }
+    if f[6] == "1" {
+        autumn_partition_server::background::set_compaction_hold(true);
+    }
+    if f[7] == "1" {
+        autumn_partition_server::background::set_minor_compaction_paused(true);
+    }
+    compio::runtime::Runtime::new().unwrap().block_on(async move {
+        let ps = PartitionServer::connect_with_advertise_and_port(
+            ps_id,
+            &mgr,
+            Some(ps_addr.to_string()),
+            ps_addr,
+        )
+        .await
+        .expect("connect partition server");
+        ps.sync_regions_once().await.expect("sync regions");
+        if let Err(e) = ps.serve(ps_addr).await {
+            panic!("partition server serve: {e:#}");
+        }
+    });
+}
+
+/// `target/debug/<name>`, honouring `CARGO_TARGET_DIR`.
+pub fn support_binary_path(name: &str) -> std::path::PathBuf {
+    let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let workspace = manifest
+        .parent()
+        .and_then(|p| p.parent())
+        .expect("workspace root")
+        .to_path_buf();
+    let dir = match std::env::var("CARGO_TARGET_DIR") {
+        Ok(d) => std::path::PathBuf::from(d).join("debug"),
+        Err(_) => workspace.join("target").join("debug"),
+    };
+    let p = dir.join(name);
+    assert!(
+        p.exists(),
+        "binary {name} not found at {} — build it first (`cargo build -p autumn-server --bins`, or `-p autumn-fuse`)",
+        p.display()
+    );
+    p
+}
+
+/// Like `start_extent_node`, but wires the node's MANAGER ENDPOINT.
+///
+/// Required by any test that expects the recovery dispatch loop to act.
+/// `handle_require_recovery` validates the manager endpoint before anything
+/// else and refuses outright when it is unset, so a node started without one is
+/// a valid-looking recovery candidate that rejects every dispatch. The manager
+/// then reports "all recovery candidates rejected" and the loop makes no
+/// progress — while an assertion of the form "membership did not change" passes
+/// vacuously.
+///
+/// Also needed for the EN's own manager round-trips: fetching `ExtentInfo` for
+/// replica addresses, and reporting completion.
+pub fn start_extent_node_with_manager(
+    addr: SocketAddr,
+    dir: std::path::PathBuf,
+    disk_id: u64,
+    mgr_addr: SocketAddr,
+) {
+    let mgr = mgr_addr.to_string();
+    std::thread::spawn(move || {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let cfg = ExtentNodeConfig::new(dir, disk_id).with_manager_endpoint(mgr);
+            let n = ExtentNode::new(cfg).await.expect("extent node");
+            if let Err(e) = n.serve(addr).await {
+                panic!("extent node serve: {e:#}");
+            }
+        });
+    });
+    wait_accepting(addr, "extent node");
+}
+
+/// Controlled manager: real handlers and metadata, no autonomous df consumer.
+pub struct RecoveryManagerControl(
+    std::sync::mpsc::Sender<(
+        RecoveryTask,
+        std::sync::mpsc::Sender<autumn_rpc::extent_rpc::RequireRecoveryReq>,
+    )>,
+);
+impl RecoveryManagerControl {
+    pub async fn instruction(
+        &self,
+        task: RecoveryTask,
+    ) -> autumn_rpc::extent_rpc::RequireRecoveryReq {
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.0.send((task, tx)).unwrap();
+        loop {
+            match rx.try_recv() {
+                Ok(request) => return request,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    compio::time::sleep(Duration::from_millis(5)).await
+                }
+                Err(error) => panic!("manager control closed: {error}"),
+            }
+        }
+    }
+}
+
+pub fn start_recovery_manager(addr: SocketAddr) -> RecoveryManagerControl {
+    let (tx, rx) = std::sync::mpsc::channel::<(
+        RecoveryTask,
+        std::sync::mpsc::Sender<autumn_rpc::extent_rpc::RequireRecoveryReq>,
+    )>();
+    std::thread::spawn(move || {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let manager = AutumnManager::new();
+            manager._test_disable_background_tasks();
+            let rpc = manager.clone();
+            compio::runtime::spawn(async move {
+                rpc.serve(addr).await.unwrap();
+            })
+            .detach();
+            loop {
+                while let Ok((task, reply)) = rx.try_recv() {
+                    reply
+                        .send(manager._test_recovery_instruction(task).await.unwrap())
+                        .unwrap();
+                }
+                compio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+    });
+    wait_accepting(addr, "manager");
+    RecoveryManagerControl(tx)
+}
+
+#[cfg(test)]
+mod toxiproxy_list_tests {
+    use super::parse_list_state;
+
+    /// Verbatim piped output from toxiproxy-cli 2.12.0.
+    const LIST: &str = "en-0\t127.0.0.1:29771\t127.0.0.1:4830\tenabled\t0\n\
+                        en-0-ctl\t127.0.0.1:30771\t127.0.0.1:5830\tdisabled\t0\n\
+                        en-1\t127.0.0.1:29501\t127.0.0.1:8454\tenabled\t1\n";
+
+    #[test]
+    fn reads_each_proxys_own_state() {
+        assert_eq!(parse_list_state(LIST, "en-0"), Ok(true));
+        assert_eq!(parse_list_state(LIST, "en-1"), Ok(true), "a toxic count of 1 is not a state");
+    }
+
+    /// The sibling control proxy's name has the data proxy's name as a prefix.
+    /// Answering for the wrong one silently cuts or restores the wrong plane.
+    #[test]
+    fn a_name_that_prefixes_another_is_not_confused_for_it() {
+        assert_eq!(parse_list_state(LIST, "en-0-ctl"), Ok(false));
+    }
+
+    /// Both failure shapes are errors, never a default — a helper that guesses
+    /// "enabled" here is the whole bug this parser replaced.
+    #[test]
+    fn an_unknown_proxy_or_an_unreadable_row_is_an_error() {
+        assert!(parse_list_state(LIST, "en-9").is_err(), "absent proxy");
+        assert!(parse_list_state("", "en-0").is_err(), "empty output (no proxies)");
+        assert!(
+            parse_list_state("en-0\t127.0.0.1:1\t127.0.0.1:2\n", "en-0").is_err(),
+            "a row too short to carry a state must not read as enabled"
+        );
+        assert!(
+            parse_list_state("Name\tListen\tUpstream\tEnabled\tToxics\n", "en-0").is_err(),
+            "a header-only listing has no proxy in it"
+        );
+    }
+}
+
+use autumn_rpc::manager_rpc::{MgrExtentInfo, MgrStreamInfo};
+
+// ── reading the manager's persisted etcd records from a test ────────────────
+
+/// `[b"AUMG"][record_type][format_version]` — `crates/manager/src/persist`.
+/// Duplicated here because those items are `pub(crate)`: only the manager may
+/// hold a persisted record, and a test binary is outside that wall.
+pub const PERSIST_MAGIC: &[u8; 4] = b"AUMG";
+pub const PERSIST_HEADER_LEN: usize = 6;
+
+pub const RECORD_TYPE_EXTENT: u8 = 4;
+pub const RECORD_TYPE_STREAM: u8 = 5;
+
+/// Check the envelope and hand back the rkyv body.
+///
+/// Concrete rather than generic on purpose: expressing the rkyv bounds would
+/// name `rkyv::` here, and this file is `#[path]`-included by test crates that
+/// do not necessarily depend on rkyv. Two record types are ever read
+/// this way from a test, so two thin wrappers cost less than that coupling.
+fn strip_persist_envelope<'a>(
+    record_type: u8,
+    value: &'a [u8],
+) -> Result<&'a [u8], String> {
+    if value.len() < PERSIST_HEADER_LEN {
+        return Err(format!("{} bytes, too short for an envelope", value.len()));
+    }
+    if &value[0..4] != PERSIST_MAGIC {
+        return Err("no AUMG envelope — did a writer skip it?".to_string());
+    }
+    if value[4] != record_type {
+        return Err(format!("record type {} != {record_type}", value[4]));
+    }
+    Ok(&value[PERSIST_HEADER_LEN..])
+}
+
+/// Decode a persisted `extents/<id>` value read straight out of etcd.
+///
+/// **PANICS on a malformed envelope, deliberately.** A test that reads these
+/// keys and hands the bytes to a bare `rkyv_decode` gets `unaligned pointer`,
+/// because the envelope displaces the archive by six while rkyv locates its
+/// root relative to the buffer end. That failure is deterministic, so it is not
+/// a corruption risk — but it is very easy to SWALLOW, and three of the five
+/// chaos-harness sites this replaced did exactly that (`let Ok(..) = .. else
+/// { continue }`). One of them, `layout_still_serves`, would have downgraded a
+/// real "the file vanished under a layout that still serves it" accusation into
+/// the benign branch. A harness that quietly stops accusing is worse than one
+/// that fails, so there is no Option to ignore here.
+///
+/// The wire type still decodes the body because the persisted record has the
+/// identical field list. The day that stops being true, the call site wants a
+/// different assertion, not a different decoder.
+pub fn decode_persisted_extent(key: &str, value: &[u8]) -> MgrExtentInfo {
+    let body = strip_persist_envelope(RECORD_TYPE_EXTENT, value)
+        .unwrap_or_else(|e| panic!("{key}: {e}"));
+    autumn_rpc::manager_rpc::rkyv_decode(body)
+        .unwrap_or_else(|e| panic!("{key}: persisted extent body does not decode: {e}"))
+}
+
+/// The `streams/<id>` twin. See `decode_persisted_extent`.
+pub fn decode_persisted_stream(key: &str, value: &[u8]) -> MgrStreamInfo {
+    let body = strip_persist_envelope(RECORD_TYPE_STREAM, value)
+        .unwrap_or_else(|e| panic!("{key}: {e}"));
+    autumn_rpc::manager_rpc::rkyv_decode(body)
+        .unwrap_or_else(|e| panic!("{key}: persisted stream body does not decode: {e}"))
+}
+
+/// Fallible twins, for the chaos accounting sweep, which COLLECTS decode
+/// failures into its error list instead of stopping on the first one — a
+/// malformed record there is a finding to report, not a reason to abandon the
+/// round.
+pub fn try_decode_persisted_extent(value: &[u8]) -> Result<MgrExtentInfo, String> {
+    autumn_rpc::manager_rpc::rkyv_decode(strip_persist_envelope(RECORD_TYPE_EXTENT, value)?)
+}
+
+pub fn try_decode_persisted_stream(value: &[u8]) -> Result<MgrStreamInfo, String> {
+    autumn_rpc::manager_rpc::rkyv_decode(strip_persist_envelope(RECORD_TYPE_STREAM, value)?)
+}

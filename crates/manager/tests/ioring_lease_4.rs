@@ -1,0 +1,172 @@
+//! End-to-end close-to-open coherence via the
+//! per-session invalidation map. Drives the full lease layer (real
+//! AutumnManager + real ClusterClient + the daemon-side `lease`
+//! helpers + the pure-fn `apply_invalidation` / `cache_is_stale`)
+//! to assert:
+//!
+//! 1. A reader caches `(ino, lease_epoch=N)`. Writer (different
+//!    daemon) acquires, closes → manager pushes
+//!    `WriterClosed { ino, version=N+1 }`. The reader's
+//!    `session_invalidation_poll_loop` (simulated here by calling
+//!    `lease::poll_invalidations + apply_invalidation` directly)
+//!    bumps `invalidations[ino] = N+1`. `cache_is_stale(ino, N,
+//!    &map) == true` while a fresh cache at `lease_epoch=N+1`
+//!    is fresh again.
+//!
+//! 2. The "subscribe disconnect = invalidate everything" sentinel
+//!    (overflow path) round-trips through the same helpers: an
+//!    overflowed inbox surfaces `MetaChanged { ino=0 }`, which
+//!    `apply_invalidation` returns as `saw_overflow=true` so the
+//!    daemon does the wholesale-clear branch.
+//!
+//! 3. Out-of-order events don't roll back the floor — verified via
+//!    the unit tests in `lease.rs` for the pure-fn, exercised
+//!    end-to-end here by interleaving releases on two inodes.
+
+mod support;
+
+use std::net::SocketAddr;
+
+use autumn_client::ClusterClient;
+use autumn_manager::AutumnManager;
+use autumn_rpc::manager_rpc::{
+    MgrClientId, LEASE_CLIENT_KIND_IORING, LEASE_INVAL_META_CHANGED,
+    LEASE_MODE_READ, LEASE_MODE_WRITE,
+};
+
+use autumn_client::lease::{
+    self, apply_invalidation, DaemonClientId, InvalidationMap,
+};
+
+fn pick_addr() -> SocketAddr {
+    autumn_test_ports::addr()
+}
+
+fn start_manager(addr: SocketAddr) {
+    std::thread::spawn(move || {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let manager = AutumnManager::new();
+            let _ = manager.serve(addr).await;
+        });
+    });
+    support::wait_accepting(addr, "start_manager");
+}
+
+fn cid(byte: u8, host: &str) -> DaemonClientId {
+    DaemonClientId::from_wire(MgrClientId {
+        kind: LEASE_CLIENT_KIND_IORING,
+        uuid: [byte; 16],
+        host: host.to_string(),
+    })
+}
+
+#[test]
+fn overflow_sentinel_triggers_wholesale_clear() {
+    let mgr_addr = pick_addr();
+    start_manager(mgr_addr);
+
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        let cluster_r = ClusterClient::connect_raw(&mgr_addr.to_string()).await.unwrap();
+        let cluster_w = ClusterClient::connect_raw(&mgr_addr.to_string()).await.unwrap();
+        let reader = cid(0xc1, "overflow-reader");
+        let writer = cid(0xd2, "overflow-writer");
+
+        // Force inbox overflow by pushing > MAX_INBOX_EVENTS (1024)
+        // via writer-close cycles on a real reader subscription.
+        // Subscribe (so the inbox exists) and acquire one read
+        // lease so the writer-close pushes target this client.
+        let _ = lease::acquire(&cluster_r, &reader, 50, LEASE_MODE_READ)
+            .await
+            .unwrap();
+        let _ = lease::poll_invalidations(&cluster_r, &reader)
+            .await
+            .unwrap();
+
+        // 1025 acquire+release cycles → 1025 WriterClosed pushes → 1024
+        // queue cap → overflow flag set. This is slow (~1025 manager
+        // round-trips) but precisely exercises the overflow path
+        // end-to-end without reaching into manager internals.
+        for _ in 0..1025 {
+            let _ = lease::acquire(&cluster_w, &writer, 50, LEASE_MODE_WRITE)
+                .await
+                .unwrap();
+            let _ = lease::release(&cluster_w, &writer, 50).await.unwrap();
+        }
+        let events = lease::poll_invalidations(&cluster_r, &reader).await.unwrap();
+        // The drain returns the 1024 surviving events PLUS the
+        // overflow sentinel synthesised by the handler.
+        assert!(events.len() >= 1024, "events.len()={}", events.len());
+        let sentinel = events
+            .iter()
+            .find(|e| e.kind == LEASE_INVAL_META_CHANGED && e.ino == 0)
+            .expect("overflow sentinel must be present");
+        assert_eq!(sentinel.version, 0);
+
+        // The daemon-side helper turns the sentinel into a
+        // wholesale-clear signal.
+        let mut inv = InvalidationMap::new();
+        let overflow = apply_invalidation(&events, &mut inv);
+        assert!(overflow, "apply_invalidation must surface saw_overflow");
+        // The non-sentinel events still apply, but the wholesale
+        // path clears `invalidations` + `held_leases` + `ring_fds`,
+        // so this map is conceptually dropped right after.
+    });
+}
+
+#[test]
+fn out_of_order_events_dont_roll_back_floor() {
+    // Pure-fn replay of the apply_invalidation invariant under a
+    // realistic event order — proven against the wire too here.
+    let mgr_addr = pick_addr();
+    start_manager(mgr_addr);
+
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        let cluster_w = ClusterClient::connect_raw(&mgr_addr.to_string()).await.unwrap();
+        let cluster_r = ClusterClient::connect_raw(&mgr_addr.to_string()).await.unwrap();
+        let writer = cid(0xe1, "writer");
+        let reader = cid(0xf2, "reader");
+
+        // Reader subscribes + acquires read leases on two inodes.
+        let _ = lease::acquire(&cluster_r, &reader, 100, LEASE_MODE_READ)
+            .await
+            .unwrap();
+        let _ = lease::acquire(&cluster_r, &reader, 200, LEASE_MODE_READ)
+            .await
+            .unwrap();
+        let _ = lease::poll_invalidations(&cluster_r, &reader).await.unwrap();
+
+        // Two writer cycles on ino=100, one on ino=200, then poll
+        // — events arrive in queue order; the per-ino floor on 100
+        // takes the MAX across both bumps.
+        let _ = lease::acquire(&cluster_w, &writer, 100, LEASE_MODE_WRITE)
+            .await
+            .unwrap();
+        let v100_a = lease::release(&cluster_w, &writer, 100)
+            .await
+            .unwrap()
+            .unwrap();
+        let _ = lease::acquire(&cluster_w, &writer, 200, LEASE_MODE_WRITE)
+            .await
+            .unwrap();
+        let v200 = lease::release(&cluster_w, &writer, 200)
+            .await
+            .unwrap()
+            .unwrap();
+        let _ = lease::acquire(&cluster_w, &writer, 100, LEASE_MODE_WRITE)
+            .await
+            .unwrap();
+        let v100_b = lease::release(&cluster_w, &writer, 100)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(v100_b > v100_a, "monotonic across same-ino cycles");
+
+        let events = lease::poll_invalidations(&cluster_r, &reader).await.unwrap();
+        assert_eq!(events.len(), 3);
+
+        let mut inv = InvalidationMap::new();
+        apply_invalidation(&events, &mut inv);
+        assert_eq!(inv.get(&100).copied(), Some(v100_b), "max wins");
+        assert_eq!(inv.get(&200).copied(), Some(v200));
+    });
+}

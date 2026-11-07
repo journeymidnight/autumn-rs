@@ -1,0 +1,78 @@
+# crates/server/src/bin/autumn_dashboard as a standalone in-cluster app.
+#
+# The manager NO LONGER serves the dashboard. This small Deployment runs the
+# `autumn-dashboard` binary (same image), which holds no cluster state and drives
+# the cluster ONLY through `autumn-op` — the wire schema stays in one place. It
+# talks to the leader-gated manager Service (`autumn-manager`). Every autumn-op
+# call proves the cluster secret from the `autumn-cluster-secret` Secret.
+#
+# The Service is ClusterIP only. The dashboard has no caller auth and drives
+# mutating admin ops (split, merge, auto-policy switches) with the cluster
+# secret, so reach it with `kubectl port-forward svc/autumn-dashboard 8799:8799`,
+# and put real authentication in front of it before exposing it any wider.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: autumn-dashboard
+  namespace: autumn
+  labels:
+    app.kubernetes.io/name: autumn
+    app.kubernetes.io/component: dashboard
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: autumn
+      app.kubernetes.io/component: dashboard
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: autumn
+        app.kubernetes.io/component: dashboard
+    spec:
+      containers:
+        - name: dashboard
+          image: autumn-rs:latest
+          # Run the binary directly (bypass the entrypoint role dispatcher, like
+          # the bootstrap Job). Flags, not env — this app takes no AUTUMN_* env.
+          command: ["autumn-dashboard"]
+          args:
+            - --manager
+            - autumn-manager:9001
+            - --cluster-secret-file
+            - /etc/autumn/cluster/cluster.secret
+            - --listen
+            - 0.0.0.0
+            - --port
+            - "8799"
+          ports:
+            - { name: dashboard, containerPort: 8799 }
+          resources:
+            requests: { cpu: "50m", memory: "64Mi" }
+          volumeMounts:
+            - name: cluster-secret
+              mountPath: /etc/autumn/cluster
+              readOnly: true
+      volumes:
+        # REQUIRED: autumn-dashboard refuses to start without the cluster secret.
+        # deploy.sh provisions autumn-cluster-secret once before apply.
+        - name: cluster-secret
+          secret:
+            secretName: autumn-cluster-secret
+            defaultMode: 0400
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: autumn-dashboard
+  namespace: autumn
+  labels:
+    app.kubernetes.io/name: autumn
+    app.kubernetes.io/component: dashboard
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: autumn
+    app.kubernetes.io/component: dashboard
+  ports:
+    - { name: dashboard, port: 8799, targetPort: 8799 }

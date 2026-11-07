@@ -1,0 +1,62 @@
+name: Bug report
+description: Something does not work as documented.
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what you got instead.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: How to reproduce
+      description: The smallest set of commands or code that shows it.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Error text and logs
+      description: The exact error, and the relevant lines from the manager, partition server or extent node logs.
+      render: text
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: The release, image tag or commit (`git rev-parse --short HEAD`).
+    validations:
+      required: true
+  - type: dropdown
+    id: deployment
+    attributes:
+      label: Deployment
+      options:
+        - docker compose
+        - Kubernetes (deploy/k8s)
+        - bare metal (autumn-deploy)
+        - cluster.sh (dev)
+        - other
+    validations:
+      required: true
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Which part
+      multiple: true
+      options:
+        - KV (autumn-client / Rust SDK)
+        - Python client
+        - FUSE mount / autumnfs
+        - S3 gateway
+        - KV cache adapters
+        - operations (autumn-op, dashboard, recovery, split/merge)
+        - performance
+  - type: textarea
+    id: env
+    attributes:
+      label: Environment
+      description: Linux kernel (`uname -r`), number of nodes, transport (TCP or UCX), anything unusual.

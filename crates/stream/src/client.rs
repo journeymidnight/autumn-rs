@@ -1,0 +1,8542 @@
+use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, HashSet};
+use std::rc::{Rc, Weak};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+
+use crate::extent_rpc::{
+    AppendHeader, AppendResp, CommitLengthReq, CommitLengthResp, ExtentInfo, FenceExtentReq,
+    FenceExtentResp, PayloadLocation, PayloadRef, ProbeExtentReq, ProbeExtentResp, ReadAmReq, ReadReq, ReadResp, StreamInfo,
+    CODE_ERROR, CODE_EVERSION_MISMATCH, CODE_LOCKED_BY_OTHER, CODE_NOT_FOUND, CODE_OK, MSG_APPEND, MSG_COMMIT_LENGTH,
+    MSG_FENCE_EXTENT, MSG_PROBE_EXTENT, MSG_READ, MSG_READ_AM, READ_EXACT, READ_TO_END, READ_UP_TO,
+    PAYLOAD_LOCATION_IN_DAT,
+};
+use crate::ConnPool;
+use anyhow::{anyhow, Result};
+use autumn_common::metrics::{duration_to_ns, ns_to_ms, unix_time_ms};
+use autumn_rpc::manager_rpc::{self, *};
+
+/// Sentinel error attached to `anyhow::Error` when a `MSG_READ`
+/// reply carries `CODE_EVERSION_MISMATCH`. Top-level
+/// `read_bytes_from_extent` downcasts to this type to drive the
+/// cache-invalidate-and-retry path. Carries no fields — the only
+/// remediation is to refetch `ExtentInfo` from the manager.
+#[derive(Debug)]
+struct EversionStale;
+
+impl std::fmt::Display for EversionStale {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("eversion mismatch (stale extent_info_cache)")
+    }
+}
+
+impl std::error::Error for EversionStale {}
+
+fn is_eversion_stale(err: &anyhow::Error) -> bool {
+    err.chain().any(|e| e.is::<EversionStale>())
+}
+
+/// The EN says it does not hold the payload file this request named.
+///
+/// A typed refusal with a designed meaning: the server's read path
+/// serves the named file or answers `CODE_PAYLOAD_NOT_HERE`, never
+/// the other file, "so the client refreshes the layout instead of retrying the
+/// same wrong file". The client never implemented the other half — the code
+/// fell into the generic `!= CODE_OK` arm and became a string — so the
+/// designed self-heal did not exist and a stale `payload_location` degraded
+/// into reconstruct-forever instead of one refetch.
+#[derive(Debug)]
+struct PayloadNotHere;
+
+impl std::fmt::Display for PayloadNotHere {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("payload not on this node (stale layout)")
+    }
+}
+
+impl std::error::Error for PayloadNotHere {}
+
+fn is_payload_not_here(err: &anyhow::Error) -> bool {
+    err.chain().any(|e| e.is::<PayloadNotHere>())
+}
+
+/// An EC sub-range gather that came up exactly ONE shard short.
+///
+/// Typed so the read loop can retry it, the way it already retries a stale
+/// eversion. Only the one-short case carries this: at two or more short the
+/// extent genuinely lacks K available shards right now, a retry would almost
+/// certainly fail again, and delaying the loud error helps nobody.
+#[derive(Debug)]
+struct EcGatherOneShort;
+
+impl std::fmt::Display for EcGatherOneShort {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ec sub-range gather one shard short")
+    }
+}
+
+impl std::error::Error for EcGatherOneShort {}
+
+fn is_ec_gather_one_short(err: &anyhow::Error) -> bool {
+    err.chain().any(|e| e.is::<EcGatherOneShort>())
+}
+
+/// Why a failed read attempt is worth one more try.
+///
+/// The variants differ in what the caller logs and whether it pauses first, but
+/// they share the rule that matters: refreshing the cached layout is the point,
+/// and it is worth doing exactly once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadRetry {
+    /// The extent's layout moved under us (replica -> EC, most often).
+    EversionStale,
+    /// The EN says the payload is not on the node we named.
+    PayloadNotHere,
+    /// The gather came up exactly one shard short.
+    GatherOneShort,
+    /// Could not reach the address we had for a node.
+    ///
+    /// The only class whose cure is NOT a fresh `ExtentInfo`. A node keeps its
+    /// id across a restart -- identity is the `node_uuid` on its data dir, not
+    /// where it happens to be running -- so a move leaves the layout perfectly
+    /// correct and only `nodes_cache` wrong. Refetching the extent returns the
+    /// same ids, which resolve through the same stale address, forever: the
+    /// pre-fix shape was a PS dialling an EN's previous IP long after every
+    /// slot had been re-registered, with `extent-health` showing all-green.
+    NodeAddrStale,
+}
+
+/// Spacing between a gather's two attempts.
+///
+/// Per-CALL, not per-extent. Hashing the extent id alone gave every reader of
+/// one extent the identical sleep, so the herd this exists to break up stayed in
+/// lockstep — and a read-hot weight file is precisely many readers on one
+/// extent. The extent term still spreads load ACROSS extents; the clock term
+/// spreads it within one.
+fn gather_retry_pause(extent_id: u64) -> std::time::Duration {
+    let spread = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64)
+        .unwrap_or(0);
+    let jitter = 100
+        + (extent_id.wrapping_mul(2654435761) ^ spread.wrapping_mul(6364136223846793005)) % 200;
+    std::time::Duration::from_millis(jitter)
+}
+
+/// Tag a one-short gather so the read loop can recognise it.
+///
+/// Its own function because the tag is a seam: the counting rule and the
+/// classifier are both tested, but nothing bound them together, and swapping
+/// this `EcGatherOneShort` for a plain `anyhow!` left every test in the crate
+/// green while the one-short retry silently stopped happening. Building the
+/// error here lets one test walk the whole chain — verdict, error, classifier.
+fn one_short_error(
+    extent_id: u64,
+    missing_shard_idx: usize,
+    sh_off: u64,
+    sh_len: u64,
+    last_err: anyhow::Error,
+) -> anyhow::Error {
+    anyhow::Error::new(EcGatherOneShort).context(format!(
+        "ec_reconstruct_shard_subrange: one shard short (extent={extent_id}, missing={missing_shard_idx}, sh_off={sh_off}, sh_len={sh_len}): {last_err:#}"
+    ))
+}
+
+/// What a shard gather produced.
+#[derive(Debug)]
+enum GatherOutcome {
+    /// The "missing" shard answered after all. It is a DATA shard (the caller
+    /// enforces `missing_shard_idx < data_shards`), so its bytes are the
+    /// sub-range verbatim and RS must be SKIPPED — not merely avoidable.
+    Verbatim(Vec<u8>),
+    /// K shards in hand; reconstruct from these.
+    Ready(Vec<Option<Vec<u8>>>),
+    /// Exactly one shard short — the retryable case.
+    OneShort { last_err: anyhow::Error },
+    /// Two or more short: the extent really does lack K right now.
+    Short {
+        success: usize,
+        last_err: anyhow::Error,
+    },
+    /// A shard reported a stale layout; that propagates immediately rather than
+    /// being counted as a miss, so the caller can refresh.
+    Stale(anyhow::Error),
+}
+
+/// Drain per-shard results into a verdict.
+///
+/// Split out of `ec_reconstruct_shard_subrange` so the counting rules can be
+/// driven with injected results instead of a cluster — which is the only way to
+/// test them, since the interesting cases (exactly K-1 answers, the missing
+/// shard answering late, a stale-layout shard) do not arise on demand from real
+/// nodes. It takes a stream rather than a collected vector so that the
+/// stop-as-soon-as-K-arrive behaviour, which is what keeps a slow straggler off
+/// the read's critical path, stays inside the function under test.
+async fn ec_gather_collect<S>(
+    rx: &mut S,
+    n: usize,
+    data_shards: usize,
+    missing_shard_idx: usize,
+    mut last_err: anyhow::Error,
+) -> GatherOutcome
+where
+    S: futures::Stream<Item = (usize, Result<Vec<u8>>)> + Unpin,
+{
+    let mut shards: Vec<Option<Vec<u8>>> = vec![None; n];
+    let mut success: usize = 0;
+    while let Some((idx, result)) = futures::StreamExt::next(rx).await {
+        match result {
+            Ok(bytes) => {
+                if idx == missing_shard_idx {
+                    return GatherOutcome::Verbatim(bytes);
+                }
+                shards[idx] = Some(bytes);
+                success += 1;
+                if success >= data_shards {
+                    break;
+                }
+            }
+            Err(e) => {
+                if is_eversion_stale(&e) {
+                    return GatherOutcome::Stale(e);
+                }
+                last_err = e;
+            }
+        }
+    }
+    if success >= data_shards {
+        return GatherOutcome::Ready(shards);
+    }
+    // One short is worth one more look on refreshed state — a peer that blew a
+    // ~3 s deadline, an address that has since rotated, a shard a recovery has
+    // moved. Two or more short is not: the extent really does lack K right now,
+    // and retrying only delays the error.
+    if success + 1 == data_shards {
+        GatherOutcome::OneShort { last_err }
+    } else {
+        GatherOutcome::Short { success, last_err }
+    }
+}
+
+/// Retry policy for `read_bytes_from_extent`: `None` means give the error to the
+/// caller.
+///
+/// Pure, and separate from the loop, because the two rules encoded here are
+/// worth testing without a cluster. Retrying at most once is the load-bearing
+/// half — every EC gather is already a K-way read amplification, so an unbounded
+/// retry multiplies load exactly when the cluster is degraded, which is how the
+/// read-timeout storm was born. The classification is the other half: an error
+/// that is not one of these three is not made better by asking again.
+fn read_retry_action(attempt: usize, err: &anyhow::Error) -> Option<ReadRetry> {
+    if attempt != 0 {
+        return None;
+    }
+    if is_eversion_stale(err) {
+        Some(ReadRetry::EversionStale)
+    } else if is_payload_not_here(err) {
+        Some(ReadRetry::PayloadNotHere)
+    } else if is_ec_gather_one_short(err) {
+        Some(ReadRetry::GatherOneShort)
+    } else if is_connect_failure(err) {
+        Some(ReadRetry::NodeAddrStale)
+    } else {
+        None
+    }
+}
+
+/// Could we not REACH the peer, as opposed to being answered badly by it?
+///
+/// Deliberately narrower than `is_liveness_timeout`, which matches any
+/// "timed out" and would fire on a slow read of a healthy node -- refreshing
+/// the node map on those buys nothing and adds a manager round trip to every
+/// congested read. Only `ConnPool::get_client`'s two failures qualify, and both
+/// name the address they could not reach.
+pub(crate) fn is_connect_failure(err: &anyhow::Error) -> bool {
+    // `{:#}`: by the time this reaches the read loop the connect error is
+    // wrapped in whatever context the read path added.
+    let m = format!("{err:#}");
+    // `ConnPool::get_client` is the only producer of `connect <addr>...` on
+    // this path, in two shapes: a bounded-connect timeout, and the underlying
+    // io error. The tails below are that io error's unreachable-peer forms; a
+    // shape not listed here simply keeps the old behaviour (no retry), which is
+    // the safe direction for a predicate that triggers a manager round trip.
+    m.contains("connect ")
+        && (m.contains(" timed out after ")
+            // The kernel's own ETIMEDOUT, which reads differently from the
+            // bounded-connect one above and only surfaces where `tcp_syn_retries`
+            // is tuned below the 5 s connect bound.
+            || m.contains("Connection timed out")
+            || m.contains("Connection refused")
+            || m.contains("No route to host")
+            || m.contains("Network is unreachable")
+            || m.contains("Host is down"))
+}
+
+/// BUG-MGR-RETRY-CLASS: typed error for a manager RPC that ANSWERED with a
+/// non-OK code. Pre-fix `check_manager_resp` flattened the code into an
+/// anyhow string, so `retry_manager_call` could not tell a transient
+/// failure (worth rotate+retry) from a deterministic verdict — and blindly
+/// burned 20×500ms per call on owner-epoch fences (with a permanently stale
+/// epoch, every autumnfs write paid ~15 s in `alloc_new_extent`). Transport-layer failures (connect/timeout/decode)
+/// stay plain anyhow errors — "has a `ManagerError` in the chain" is
+/// exactly "the manager answered".
+///
+/// Built on error paths only — the OK path never allocates.
+#[derive(Debug)]
+pub struct ManagerError {
+    /// `manager_rpc::CODE_*` from the response.
+    pub code: u8,
+    /// Call-site label, e.g. "stream_alloc_extent" (diagnostics only).
+    ctx: String,
+    /// The manager's message verbatim (e.g. "precondition failed:
+    /// owner_key=partition/<id> owner_epoch mismatch, expected <n>, got
+    /// <m>"). Preserved so existing substring classifiers downstream
+    /// ("precondition failed", "not leader") keep working.
+    pub message: String,
+}
+
+impl ManagerError {
+    pub fn new(code: u8, ctx: &str, message: &str) -> Self {
+        Self {
+            code,
+            ctx: ctx.to_string(),
+            message: message.to_string(),
+        }
+    }
+
+    /// True when the manager rejected us because OUR owner_epoch is stale
+    /// (`ensure_owner_epoch`: a newer acquire bumped the epoch, or the
+    /// owner key is gone). Wire-wise this is just `CODE_PRECONDITION`; the
+    /// message matcher lives NEXT TO the producer in
+    /// `autumn_common::store` (see its doc for why not a new wire code).
+    /// Retrying with the same epoch is mathematically futile — every
+    /// manager consults the same etcd state.
+    pub fn is_owner_fence(&self) -> bool {
+        self.code == manager_rpc::CODE_PRECONDITION
+            && autumn_common::is_owner_epoch_fence_message(&self.message)
+    }
+
+    /// A `CODE_PRECONDITION` that is a TRANSIENT concurrency conflict — the
+    /// manager telling the client to re-pull a fresh snapshot or wait for an
+    /// in-flight op, NOT a deterministic verdict. These clear within a tick
+    /// or two; the owner fence and deterministic business-rule preconditions
+    /// ("stream cannot be empty …") do not, and stay fail-fast.
+    ///
+    /// Coupled by message, like `is_owner_fence` — but the coupling lives in
+    /// `autumn_common::alloc_conflict`, which owns BOTH the manager-side
+    /// message builders and this matcher, with a test running every real
+    /// builder through it. Nothing here or in the manager writes the text.
+    pub fn is_transient_conflict(&self) -> bool {
+        self.code == manager_rpc::CODE_PRECONDITION
+            && autumn_common::alloc_conflict::is_transient_alloc_conflict_message(&self.message)
+    }
+
+    /// Codes worth another attempt on a rotated / later manager:
+    /// - `CODE_NOT_LEADER`: an alive-but-deposed manager answered; the
+    ///   rotate (done by `note_manager_code`) walks to the real leader.
+    /// - `CODE_ERROR` (`AppError::Internal`): transient manager-side
+    ///   failure (etcd mirror hiccup, node-alloc RPC failure, …).
+    /// - `CODE_PRECONDITION` **only when it is a transient concurrency
+    ///   conflict** (`is_transient_conflict`): the sole `retry_manager_call`
+    ///   user is `alloc_new_extent`, whose self-heal IS the client re-pulling
+    ///   a fresh snapshot / waiting out an in-flight EC/recovery op and
+    ///   retrying (20×500ms). Failing fast on THOSE turns a self-healable
+    ///   conflict into an append/roll/recovery/open failure. (An earlier fix
+    ///   over-generalized fail-fast from the fence to ALL Preconditions,
+    ///   killing this retry.)
+    ///
+    /// Fail fast on:
+    /// - the owner-epoch fence Precondition — DETERMINISTIC (every manager
+    ///   consults the same etcd epoch); its Display carries "LockedByOther"
+    ///   so the PS poisons + reopens with a fresh epoch. THIS is the failure
+    ///   the classification exists for (a permanently-stale epoch that burned
+    ///   20×500ms per write forever).
+    /// - deterministic non-fence Preconditions (e.g. "stream cannot be empty
+    ///   after punch holes"), `NOT_FOUND`, `INVALID_ARGUMENT`, future codes —
+    ///   deterministic verdicts from shared etcd state; retrying only adds
+    ///   latency.
+    fn is_retryable(&self) -> bool {
+        match self.code {
+            manager_rpc::CODE_NOT_LEADER | manager_rpc::CODE_ERROR => true,
+            // Overloaded code: only the TRANSIENT concurrency conflicts retry;
+            // the deterministic fence + business-rule preconditions fail fast.
+            manager_rpc::CODE_PRECONDITION => self.is_transient_conflict(),
+            _ => false,
+        }
+    }
+}
+
+impl std::fmt::Display for ManagerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.is_owner_fence() {
+            // The "LockedByOther" token is LOAD-BEARING: the PS's
+            // `is_locked_by_other` classifies on it and poisons the
+            // partition, whose reopen re-acquires a FRESH owner_epoch
+            // — the same self-heal the EN layer's native
+            // CODE_LOCKED_BY_OTHER rejection triggers. This is what turns
+            // a manager-side fence from "20 futile retries, then hope the
+            // upper layer notices" into an immediate fresh-epoch reopen.
+            write!(f, "{} fenced (LockedByOther): {}", self.ctx, self.message)
+        } else {
+            // Same shape as the pre-typed error string, so log greps and
+            // downstream substring matchers are unaffected.
+            write!(f, "{} failed: {}", self.ctx, self.message)
+        }
+    }
+}
+
+impl std::error::Error for ManagerError {}
+
+/// A `MSG_READ` reply frame: its code, its `ReadResp`, and the value, which on
+/// an OK is checked against the reply's block crcs when `with_crcs` asked for
+/// them. The value is the frame's tail, outside the frame CRC.
+pub(crate) fn checked_read_reply(
+    frame: &autumn_rpc::Frame,
+    offset: u64,
+    with_crcs: bool,
+) -> std::result::Result<(u8, ReadResp, Bytes), String> {
+    let code = *frame.payload.first().ok_or("empty read reply")?;
+    let resp: ReadResp = crate::extent_rpc::rkyv_decode(&frame.payload[1..]).map_err(|e| format!("read reply: {e}"))?;
+    let value = frame.value.bytes().clone();
+    if code == CODE_OK && with_crcs {
+        crate::extent_rpc::check_read_block_crcs(offset, &value, &resp.block_crcs)?;
+    }
+    Ok((code, resp, value))
+}
+
+/// A background read: `MSG_READ` of up to `length` bytes from `offset` (to the
+/// replica's end when `length` is 0), with block crcs, checked. Returns the
+/// bytes and the replica's end.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn read_checked(
+    pool: &crate::ConnPool,
+    addr: &str,
+    extent_id: u64,
+    eversion: u64,
+    offset: u64,
+    length: u64,
+    payload: PayloadRef,
+    timeout: Duration,
+    shard: Option<usize>,
+    ctx: &'static str,
+) -> Result<(Bytes, u64)> {
+    let mode = if length == 0 { READ_TO_END } else { READ_UP_TO };
+    let req = rkyv_encode(&ReadReq::new(extent_id, eversion, offset, length, mode, payload).with_crcs());
+    let frame = pool.call_frame_timeout(addr, MSG_READ, req, timeout).await?;
+    let site = || match shard {
+        Some(i) => format!("{ctx} shard {i} from {addr} extent={extent_id}"),
+        None => format!("{ctx} from {addr} extent={extent_id}"),
+    };
+    let (code, resp, value) = checked_read_reply(&frame, offset, true).map_err(|e| anyhow!("{}: {e}", site()))?;
+    if code == CODE_EVERSION_MISMATCH {
+        return Err(anyhow::Error::new(EversionStale).context(site()));
+    }
+    // Typed like the eversion mismatch beside it, and for the same reason:
+    // both mean "your cached layout is wrong", and both are fixed by
+    // refetching rather than by retrying the same request.
+    if code == crate::extent_rpc::CODE_PAYLOAD_NOT_HERE {
+        return Err(anyhow::Error::new(PayloadNotHere).context(site()));
+    }
+    if code != CODE_OK {
+        return Err(anyhow!("{}: code={} ({})", site(), crate::extent_rpc::code_description(code), resp.message));
+    }
+    Ok((value, resp.end))
+}
+
+/// The reason a `MSG_READ` reply gives (its ctrl after the code).
+fn read_message(z: &autumn_rpc::client::BulkResp) -> String {
+    crate::extent_rpc::rkyv_decode::<ReadResp>(&z.ctrl).map(|r| r.message).unwrap_or_default()
+}
+
+/// structured sentinel for "VP points past manager-recorded
+/// `sealed_length`" — historical data corruption from the
+/// former `handle_stream_alloc_extent` race against EC
+/// conversion (see `crates/stream/CLAUDE.md` programming note 6).
+/// Manager writes to `sealed_length` are now monotonic-by-construction
+/// (the `if tail.sealed_length > 0`
+/// guard), so no NEW corruption can arise — but etcd values that were
+/// shrunken before those fixes shipped persist, and the physical EC
+/// shards were truncated during the bug window so the bytes past
+/// `sealed_length` are NOT recoverable.
+///
+/// External operational tooling (a Python audit/repair script per
+/// `feedback_ops_tools_in_python` memory) downcasts to this type via
+/// `anyhow::Error::chain()` to identify "this key is permanently
+/// gone; clean it up" vs transient errors. The Display string is a
+/// **stable wire contract**: the prefix `stale_vp_offset_past_sealed_length:`
+/// and the field order `extent= offset= length= sealed_length=` MUST
+/// NOT change.
+#[derive(Debug, Clone)]
+pub struct StaleVpOffset {
+    pub extent_id: u64,
+    pub requested_offset: u64,
+    pub requested_length: u64,
+    pub sealed_length: u64,
+}
+
+impl std::fmt::Display for StaleVpOffset {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "stale_vp_offset_past_sealed_length: extent={} offset={} length={} sealed_length={}",
+            self.extent_id, self.requested_offset, self.requested_length, self.sealed_length,
+        )
+    }
+}
+
+impl std::error::Error for StaleVpOffset {}
+use bytes::{Bytes, BytesMut};
+use dashmap::DashMap;
+use futures::channel::{mpsc, oneshot};
+use futures::future::join_all;
+
+/// one-shot direct EN read of a value byte range, for clients holding
+/// a value's position (`MSG_GET` `CODE_POSITION`). No StreamClient (no owner
+/// lock, no manager) — the zero-copy wire read the PS itself uses (exact
+/// `MSG_READ` + call_into_pooled: UCX registered recv / TCP owned read, no FrameDecoder
+/// accumulation). Returns a `Bytes` ALIASING the pool buffer (returns to the
+/// pool on drop). Errors (eversion mismatch, extent gone, replica down)
+/// surface for the caller's proxy fallback.
+pub async fn read_extent_value_direct(
+    pool: &crate::ConnPool,
+    addr: &str,
+    extent_id: u64,
+    eversion: u64,
+    offset: u64,
+    length: u64,
+) -> Result<bytes::Bytes> {
+    // `.dat` by construction: for a REPLICATED extent `extent_read_descriptor`
+    // hands out addresses only when the payload is in `.dat`. An EC extent gets
+    // a different descriptor and `read_extent_shard_direct` below, because its
+    // bytes live in per-shard files and the offset means something else.
+    read_extent_direct(
+        pool,
+        addr,
+        extent_id,
+        eversion,
+        offset,
+        length,
+        PayloadRef::in_dat(),
+    )
+    .await
+}
+
+/// How `read_extent_value_landed` ended when it did not fail.
+pub enum Landed {
+    /// The value (this many bytes) is in the memory.
+    In(usize),
+    /// The memory cannot take an active message (unregistered and over
+    /// 256 MiB, or not UCX): read it with `read_extent_value_direct`.
+    NotHere,
+}
+
+/// `read_extent_value_direct` whose value lands at `[ptr, ptr + length)`:
+/// `MSG_READ_AM`, the node sending the value as the active message this
+/// reader tagged — by rendezvous straight into the memory when `region` holds
+/// it, else into a pool buffer copied in. UCX only. Errors read as
+/// `read_extent_value_direct`'s do, so a caller's failover treats them alike.
+///
+/// # Safety
+/// `[ptr, ptr + length)` must be valid for writes and touched by nobody else
+/// until the returned future completes, and the future must run to
+/// completion: dropped early, a receive may still write the memory.
+#[allow(clippy::too_many_arguments)]
+pub async unsafe fn read_extent_value_landed(
+    pool: &crate::ConnPool,
+    addr: &str,
+    extent_id: u64,
+    eversion: u64,
+    offset: u64,
+    length: u64,
+    ptr: *mut u8,
+    region: Option<&std::sync::Arc<autumn_transport::Region>>,
+) -> Result<Landed> {
+    use autumn_transport::am::{self, Arrival};
+    let tag = am::next_tag();
+    // SAFETY: the caller's contract.
+    let (dest, released) = unsafe { autumn_transport::RecvDest::new(ptr, length as usize) };
+    let expected = match am::expect(tag, dest, region) {
+        Ok(e) => e,
+        Err(e) => {
+            released.await;
+            return match e.kind() {
+                std::io::ErrorKind::Unsupported => Ok(Landed::NotHere),
+                _ => Err(e.into()),
+            };
+        }
+    };
+    let req = rkyv_encode(&ReadAmReq {
+        read: ReadReq::new(extent_id, eversion, offset, length, READ_EXACT, PayloadRef::in_dat()),
+        tag,
+        max_len: length,
+    });
+    let deadline = IoDeadline { base: DEFAULT_READ_BASE_TIMEOUT, floor_bytes_per_sec: DEFAULT_READ_FLOOR_BYTES_PER_SEC }
+        .for_len(length);
+    let out = match pool.call_timeout(addr, MSG_READ_AM, req, deadline).await {
+        Ok(ctrl) if ctrl.first() == Some(&CODE_OK) => {
+            // The node replies once the send completed: the value is in.
+            match compio::time::timeout(deadline, expected.arrived()).await {
+                Ok(Ok(Arrival::Received(n))) if n as u64 == length => Ok(Landed::In(n)),
+                Ok(Ok(Arrival::Received(n) | Arrival::TooLong(n))) => {
+                    Err(anyhow!("direct read short from {addr} extent={extent_id}: need {length} got {n}"))
+                }
+                Ok(Err(e)) => Err(anyhow::Error::new(e).context(format!("direct read from {addr} extent={extent_id}"))),
+                Err(_) => Err(anyhow!("direct read from {addr} extent={extent_id}: the value timed out")),
+            }
+        }
+        Ok(ctrl) => {
+            let code = ctrl.first().copied().unwrap_or(CODE_ERROR);
+            let message = ctrl.get(1..).and_then(|c| rkyv_decode::<ReadResp>(c).ok()).map(|r| r.message).unwrap_or_default();
+            Err(anyhow!(
+                "direct read from {addr} extent={extent_id}: code={} ({message})",
+                crate::extent_rpc::code_description(code)
+            ))
+        }
+        Err(e) => Err(e),
+    };
+    expected.finish().await;
+    released.await;
+    out
+}
+
+/// One DATA SHARD's sub-range of an EC extent, straight from the node that
+/// holds it.
+///
+/// `offset` is SHARD-RELATIVE — the caller converts from the extent's logical
+/// offset using the geometry in `ReadDescriptor::Ec`. Getting that wrong reads
+/// real bytes from the wrong place, so the conversion lives in one place on the
+/// caller's side and is unit-tested there.
+pub async fn read_extent_shard_direct(
+    pool: &crate::ConnPool,
+    addr: &str,
+    extent_id: u64,
+    eversion: u64,
+    shard_index: u32,
+    offset: u64,
+    length: u64,
+) -> Result<bytes::Bytes> {
+    read_extent_direct(
+        pool,
+        addr,
+        extent_id,
+        eversion,
+        offset,
+        length,
+        PayloadRef::shard(shard_index),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn read_extent_direct(
+    pool: &crate::ConnPool,
+    addr: &str,
+    extent_id: u64,
+    eversion: u64,
+    offset: u64,
+    length: u64,
+    payload: PayloadRef,
+) -> Result<bytes::Bytes> {
+    let req = rkyv_encode(&ReadReq::new(extent_id, eversion, offset, length, READ_EXACT, payload));
+    let z = pool
+        // BUG-READ-TIMEOUT-STORM: size-scale the deadline (was a fixed 3 s that
+        // stormed on 8 MiB reads). This free fn holds no StreamClientConfig (the
+        // client-SDK EN-direct path), so it uses the shared `DEFAULT_READ_*`
+        // consts — same source of truth as `StreamClientConfig::default`.
+        .call_into_pooled(
+            addr,
+            MSG_READ,
+            req,
+            IoDeadline {
+                base: DEFAULT_READ_BASE_TIMEOUT,
+                floor_bytes_per_sec: DEFAULT_READ_FLOOR_BYTES_PER_SEC,
+            }
+            .for_len(length),
+        )
+        .await?;
+    if z.code != CODE_OK {
+        return Err(anyhow!(
+            "direct read from {addr} extent={extent_id}: code={} ({})",
+            crate::extent_rpc::code_description(z.code),
+            read_message(&z)
+        ));
+    }
+    let mut value = bytes::Bytes::from_owner(z.buf);
+    if value.len() > length as usize {
+        value.truncate(length as usize);
+    }
+    // A short payload under CODE_OK (sealed_length clamp,
+    // stale VP, EN-side truncation) must be a FAILURE — the proxy path's
+    // read_value_from_log enforces the same "got < need" check. Returning
+    // short bytes as Ok would hand the caller silently corrupt data.
+    if value.len() < length as usize {
+        return Err(anyhow!(
+            "direct read short from {addr} extent={extent_id}: need {length} got {}",
+            value.len()
+        ));
+    }
+    Ok(value)
+}
+
+// ── replicated-read spreading + hedging ──────────────────────────
+
+/// (b): hedge delay (ms) for replicated sealed-extent reads. 0
+/// (default) = hedging disabled; start-replica rotation still applies. Set
+/// once at process start from a CLI flag (`autumn-ps --read-hedge-ms`,
+/// translated from `AUTUMN_READ_HEDGE_MS` by cluster.sh) — no env reads
+/// in library code per the config discipline.
+static READ_HEDGE_MS_CELL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+pub fn set_read_hedge_ms(ms: u64) -> bool {
+    READ_HEDGE_MS_CELL.set(ms).is_ok()
+}
+
+pub(crate) fn read_hedge_ms() -> u64 {
+    *READ_HEDGE_MS_CELL.get_or_init(|| 0)
+}
+
+/// (a): deterministic start-replica rotation for sealed-extent reads.
+/// SplitMix64 finalizer over `(extent_id, offset)` — no extra deps, cheap,
+/// and well-mixed so consecutive chunk offsets of one large read stripe
+/// across replicas instead of clustering.
+pub(crate) fn rotated_replica_start(extent_id: u64, offset: u64, n: usize) -> usize {
+    if n <= 1 {
+        return 0;
+    }
+    let mut x = extent_id ^ (offset << 32) ^ 0x9e37_79b9_7f4a_7c15;
+    x ^= x >> 30;
+    x = x.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    x ^= x >> 27;
+    x = x.wrapping_mul(0x94d0_49bb_1331_11eb);
+    x ^= x >> 31;
+    (x % n as u64) as usize
+}
+
+/// WAL self-heal A1 (docs/wal_selfheal_design.md I2): replica slot indices
+/// (into `replicates ++ parity`, = the `read_replicated_with_failover` addr
+/// order) eligible to serve a READ.
+///
+/// For a SEALED, REPLICATED extent, slots whose `avali` bit is 0 are EXCLUDED —
+/// a recovering / isolated-corrupt replica must not serve reads (clearing the
+/// avali bit is how the self-heal isolation removes a bit-rotted replica from
+/// the serving set). OPEN extents are NOT filtered: `avali = 0` is the normal
+/// "not sealed yet" state there, and open-extent read consistency is the
+/// commit-min protocol's job, not avali's. (EC extents never reach this helper —
+/// they go through `ec_subrange_read`, where a missing shard is reconstructed,
+/// not skipped; filtering their addr list would break shard↔addr alignment.)
+///
+/// Defensive: if filtering would leave ZERO eligible slots (a sealed extent
+/// with every avali bit clear — shouldn't happen, since seal sets all_bits),
+/// fall back to ALL slots so reads don't regress; the caller logs the fallback.
+pub(crate) fn eligible_replica_slots(ex: &ExtentInfo) -> Vec<usize> {
+    let n = ex.replicates.len() + ex.parity.len();
+    if !ex.sealed {
+        return (0..n).collect();
+    }
+    let elig: Vec<usize> = (0..n).filter(|&i| (ex.avali & (1u32 << i)) != 0).collect();
+    if elig.is_empty() {
+        (0..n).collect()
+    } else {
+        elig
+    }
+}
+
+/// The extent's PUBLISHED payload location, or a refusal naming the byte.
+///
+/// Every read that names a payload file resolves the location here, ONCE, and
+/// carries the resolved value to each slot. A byte outside the set this build
+/// knows is a refusal rather than `.dat`: `.dat` is a positive claim about
+/// which file holds the value, and on an extent whose bytes have moved it is
+/// the shard-bytes-as-a-value corruption `PayloadRef` exists to rule out.
+fn published_payload(ex: &ExtentInfo) -> Result<PayloadLocation> {
+    ex.payload().ok_or_else(|| {
+        anyhow!(
+            "extent {}: published payload location {} names no file this build knows \
+             (this cluster speaks a layout this binary does not) — refusing the read",
+            ex.extent_id,
+            ex.payload_location
+        )
+    })
+}
+
+/// `replicates ++ parity` node ids in slot order — the SAME order that
+/// `replica_addrs_from_cache` resolves addresses in, so a read slot index maps
+/// back to its `node_id` (needed to consult the Suspected snapshot).
+pub(crate) fn replica_node_ids(ex: &ExtentInfo) -> Vec<u64> {
+    ex.replicates
+        .iter()
+        .chain(ex.parity.iter())
+        .copied()
+        .collect()
+}
+
+/// slot try-order for a REPLICATED read. Starts from the rotated
+/// start, keeps only `avali`-eligible slots, and moves slots whose node the
+/// manager currently believes `Suspected` to the BACK — healthy replicas are
+/// tried first so a flaky node never costs a per-read RPC timeout before
+/// failover. The suspected slots are KEPT (appended, not dropped): a
+/// suspected node is not dead, and every committed byte of a sealed extent is
+/// on every replica, so they remain a correct last-resort. With an empty
+/// `suspected` set (the common case) the result is byte-identical to the
+/// plain rotated order, so the hot path is unchanged.
+pub(crate) fn replicated_read_order(
+    ex: &ExtentInfo,
+    offset: u64,
+    suspected: &HashSet<u64>,
+) -> Vec<usize> {
+    let n = ex.replicates.len() + ex.parity.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    // rotate the start replica for OPEN extents too,
+    // not just sealed ones. This fn is READ-PATH-EXCLUSIVE (the bulk-proxy value
+    // read + the chunked copy read are its only callers), and an open tail's
+    // COMMITTED prefix is on every replica (all-replica-ACK), so a committed VP
+    // read may start from any replica. Pre-fix open tails pinned `start = 0`
+    // (replica[0], the append leader), so every read of a hot open log-tail —
+    // exactly where fresh large values live — piled onto one EN. Appends are
+    // UNAFFECTED (they go through `launch_append`, replica[0]-first, not this
+    // fn). A rotated replica that is momentarily short on an UN-acked tail byte
+    // just fails over to the next slot; it can never be short on committed data.
+    let start = rotated_replica_start(ex.extent_id, offset, n);
+    let eligible = eligible_replica_slots(ex);
+    let filtered = eligible.len() < n;
+    let node_ids = replica_node_ids(ex);
+    let mut healthy: Vec<usize> = Vec::with_capacity(eligible.len());
+    let mut flaky: Vec<usize> = Vec::new();
+    for i in 0..n {
+        let slot = (start + i) % n;
+        if filtered && !eligible.contains(&slot) {
+            continue; // isolated (avali=0) replica — never serve from it
+        }
+        let nid = node_ids.get(slot).copied().unwrap_or(0);
+        if suspected.contains(&nid) {
+            flaky.push(slot);
+        } else {
+            healthy.push(slot);
+        }
+    }
+    healthy.extend(flaky);
+    healthy
+}
+
+/// eligible replica slots with manager-`Suspected` nodes DROPPED — but
+/// only when at least one healthy eligible slot remains (else fall back to ALL
+/// eligible, never strand). Used by the CLIENT-DIRECT descriptor path
+/// (`extent_read_descriptor`), whose external consumer picks its OWN
+/// hash-rotated start over the returned address list — so merely reordering
+/// (as `replicated_read_order` does for the in-order paths) would NOT route
+/// around a flaky node; the suspected address has to be excluded outright.
+/// Soft hint with the same fallback guarantee: an empty Suspected snapshot
+/// returns exactly `eligible_replica_slots`.
+pub(crate) fn healthy_eligible_slots(ex: &ExtentInfo, suspected: &HashSet<u64>) -> Vec<usize> {
+    let eligible = eligible_replica_slots(ex);
+    if suspected.is_empty() {
+        return eligible;
+    }
+    let node_ids = replica_node_ids(ex);
+    let healthy: Vec<usize> = eligible
+        .iter()
+        .copied()
+        .filter(|&s| !suspected.contains(&node_ids.get(s).copied().unwrap_or(0)))
+        .collect();
+    if healthy.is_empty() {
+        eligible
+    } else {
+        healthy
+    }
+}
+
+use futures::stream::FuturesUnordered;
+use futures::{FutureExt, SinkExt, StreamExt};
+
+#[derive(Debug, Clone)]
+pub struct AppendResult {
+    pub extent_id: u64,
+    pub offset: u64,
+    pub end: u64,
+}
+
+#[derive(Debug, Clone)]
+struct StreamTail {
+    extent: ExtentInfo,
+    replica_addrs: Vec<String>,
+    /// parallel to `replica_addrs` — `replicates ++ parity` node ids
+    /// in the same index order used by `replica_addrs_from_cache`. Required
+    /// so `apply_completion` can resolve a failing replica index back to
+    /// its `node_id` for the per-stream `bad_nodes` exclusion list.
+    replica_node_ids: Vec<u64>,
+}
+
+/// Per-stream append state owned exclusively by the stream worker task.
+///
+/// R3 state machine (lease_cursor + pending_acks + in_flight + poisoned)
+/// is preserved; R4 step 4.3 removes the external `Arc<Mutex<_>>` because
+/// the single-owner worker task serialises all state mutations.
+///
+/// - `tail`: cached `StreamTail`. None = needs reload (first use or after
+///           NotFound / alloc_new_extent).
+/// - `commit`: highest acked `end` that forms a contiguous prefix. Matches
+///             Go's `sc.end`. Starts at 0 for a fresh extent.
+/// - `lease_cursor`: next offset to lease. Advances monotonically on lease;
+///                   rewound only via `rewind_or_poison` on the most-recent
+///                   lease fast path.
+/// - `pending_acks`: acked-but-not-yet-prefix batches (offset → end).
+/// - `in_flight`: count of leased-but-not-acked batches.
+/// - `poisoned`: set on mid-sequence failure; forces the next caller to
+///               reset the stream via alloc_new_extent.
+/// A completed-on-all-replicas append waiting for the contiguous prefix
+/// to reach it before the CALLER is acked (ENOSPC-1 P1). `ack` is None in
+/// unit tests that only exercise the cursor arithmetic.
+struct PendingAck {
+    end: u64,
+    ack: Option<(oneshot::Sender<Result<AppendResult>>, AppendResult)>,
+}
+
+struct StreamAppendState {
+    tail: Option<StreamTail>,
+    commit: u64,
+    lease_cursor: u64,
+    pending_acks: std::collections::BTreeMap<u64, PendingAck>,
+    in_flight: u32,
+    poisoned: bool,
+    /// ENOSPC-1 P1: offset of the FIRST failed lease (u64::MAX = none).
+    /// Completions at or above this can never join the contiguous prefix
+    /// — the hole below them is permanent for this extent — so they are
+    /// failed to the caller instead of acked. Reset on a genuine roll.
+    failure_floor: u64,
+    /// Set true by `SealCommit` after it drains + reports `commit`; while true,
+    /// new `Append`s on the about-to-be-sealed tail are REJECTED (soft error →
+    /// caller retries onto the fresh tail). Cleared by `ResetTail`
+    /// (`reset_for_new_extent`). Closes the seal→ResetTail window where a
+    /// concurrent append could write past the new `sealed_length` and have its
+    /// acked data become unreadable.
+    sealing: bool,
+    /// per-stream "recently failed" node ids (`node_id → expires_at`).
+    /// Shared with the public API via `Rc<RefCell<_>>` so
+    /// `alloc_new_extent_once` can snapshot non-expired entries to pass via
+    /// `StreamAllocExtentReq.exclude_node_ids`. Worker writes on
+    /// `apply_completion` Err; public API reads + prunes on snapshot. TTL
+    /// covers a full manager polling cycle without holding excludes long
+    /// enough to block natural disk recovery (default 30 s, env-tunable).
+    bad_nodes: Rc<RefCell<HashMap<u64, Instant>>>,
+    /// cloned sender for the per-StreamClient failure-report
+    /// drainer. `try_send` from `apply_completion` Err; drops the event
+    /// silently when full (best-effort).
+    failure_report_tx: mpsc::Sender<FailureReport>,
+    /// snapshotted bad-nodes TTL — clone-on-spawn from StreamClientConfig
+    /// so the worker doesn't need to re-clone the config Rc per Err.
+    bad_nodes_ttl: Duration,
+    timings: WorkerTimings,
+}
+
+/// Where an append's time goes inside the worker, logged once a second as
+/// "stream worker summary": appends already in flight when it launched, and
+/// launch to the first and to the last replica's reply.
+struct WorkerTimings {
+    started_at: Instant,
+    launches: u64,
+    inflight_sum: u64,
+    first_ns: u64,
+    all_ns: u64,
+}
+
+impl WorkerTimings {
+    fn record(&mut self, extent_id: u64, t: &AppendTiming) {
+        self.launches += 1;
+        self.inflight_sum += t.inflight_at_launch as u64;
+        self.first_ns += t.first_ns;
+        self.all_ns += t.all_ns;
+        let elapsed = self.started_at.elapsed();
+        if elapsed >= Duration::from_secs(1) {
+            let n = self.launches;
+            tracing::info!(
+                extent_id,
+                appends = n,
+                avg_inflight_at_launch = self.inflight_sum as f64 / n as f64,
+                avg_first_replica_ms = ns_to_ms(self.first_ns, n),
+                avg_all_replicas_ms = ns_to_ms(self.all_ns, n),
+                "stream worker summary",
+            );
+            *self = WorkerTimings::new();
+        }
+    }
+
+    fn new() -> Self {
+        WorkerTimings { started_at: Instant::now(), launches: 0, inflight_sum: 0, first_ns: 0, all_ns: 0 }
+    }
+}
+
+/// One append's timing, measured from its launch.
+struct AppendTiming {
+    inflight_at_launch: u32,
+    first_ns: u64,
+    all_ns: u64,
+}
+
+// The bad-nodes TTL helper `bad_nodes_ttl()` was removed. Value now lives on
+// `StreamClientConfig.bad_nodes_ttl` (defined below) — set once at
+// `StreamClient` construction, snapshotted into `StreamAppendState`
+// for the worker. Was previously env `AUTUMN_STREAM_BAD_NODES_TTL_SECS`,
+// now CLI-flag-driven on the PS binary.
+impl StreamAppendState {
+    fn new(
+        bad_nodes: Rc<RefCell<HashMap<u64, Instant>>>,
+        failure_report_tx: mpsc::Sender<FailureReport>,
+        bad_nodes_ttl: Duration,
+    ) -> Self {
+        Self {
+            tail: None,
+            commit: 0,
+            lease_cursor: 0,
+            pending_acks: std::collections::BTreeMap::new(),
+            in_flight: 0,
+            poisoned: false,
+            failure_floor: u64::MAX,
+            sealing: false,
+            bad_nodes,
+            failure_report_tx,
+            bad_nodes_ttl,
+            timings: WorkerTimings::new(),
+        }
+    }
+
+    /// mark a node as recently failed. Called from `apply_completion`
+    /// Err paths with the `node_id` resolved from the cached `ExtentInfo`
+    /// via `StreamTail.replica_node_ids[failing_index]`. Refresh-on-insert
+    /// (overwrites the existing expires_at) so a chain of failures keeps
+    /// the entry hot.
+    fn mark_bad_node(&self, node_id: u64) {
+        let expires_at = Instant::now() + self.bad_nodes_ttl;
+        self.bad_nodes.borrow_mut().insert(node_id, expires_at);
+    }
+
+    /// best-effort fire of a `MSG_REPORT_DISK_FAILURE` event into
+    /// the per-StreamClient drainer. Drops on full channel — the manager
+    /// quorum debounce tolerates loss (per-stream alloc route-around via
+    /// stays as the primary defense).
+    fn try_report_failure(&mut self, node_id: u64, extent_id: u64) {
+        let _ = self
+            .failure_report_tx
+            .try_send(FailureReport { node_id, extent_id });
+    }
+
+    fn reset_for_new_extent(&mut self) {
+        self.commit = 0;
+        self.lease_cursor = 0;
+        self.pending_acks.clear();
+        self.failure_floor = u64::MAX;
+        self.in_flight = 0;
+        self.poisoned = false;
+        // ResetTail moves to a fresh tail → un-freeze: the seal→reset window
+        // (during which appends were rejected) is over.
+        self.sealing = false;
+    }
+
+    /// Apply a `ResetTail`. A DIFFERENT extent is a genuine roll to a fresh,
+    /// empty tail → reset ALL append-progress state (commit=0 etc.). The SAME
+    /// extent is a soft-error tail reload that did NOT change the tail (a
+    /// transient replica failure) → PRESERVE every byte of append-progress
+    /// state (commit / lease_cursor / pending_acks / in_flight / poisoned /
+    /// sealing) and only refresh the cached tail metadata (replica addrs).
+    ///
+    /// BUG#2 (seed=8): zeroing `commit` on a same-extent reload let a later
+    /// `seal_commit_watermark` report commit=0 and `alloc_new_extent(Some(0))`
+    /// seal the live extent at sealed_length=0 — orphaning every acked VP/SST
+    /// byte past 0 (a split child inheriting this CoW tail then can never open:
+    /// `stale_vp_offset_past_sealed_length`). `commit` only ever advances on a
+    /// full all-replica ACK, so it is ground truth for THIS extent. `poisoned`
+    /// is preserved too: under concurrent same-stream appends a non-tail-lease
+    /// failure marks a HOLE (`rewind_or_poison`); kept poisoned, the next
+    /// Append is rejected so the caller escalates to seal-and-roll, sealing at
+    /// the contiguous `commit` (hole + everything after correctly excluded).
+    fn apply_reset_tail(&mut self, tail: StreamTail) {
+        let same_extent =
+            self.tail.as_ref().map(|t| t.extent.extent_id) == Some(tail.extent.extent_id);
+        if !same_extent {
+            self.reset_for_new_extent();
+        }
+        self.tail = Some(tail);
+    }
+
+    fn lease(&mut self, size: u64) -> (u64, u64) {
+        let offset = self.lease_cursor;
+        let end = offset + size;
+        self.lease_cursor = end;
+        self.in_flight += 1;
+        (offset, end)
+    }
+
+    /// Record an all-replica-completed append and fire CALLER acks only
+    /// for the ranges the contiguous prefix now covers (ENOSPC-1 P1).
+    /// Pre-fix, the caller ack fired unconditionally on completion: with
+    /// a lower lease failed (hole) and this range completed above it, the
+    /// caller saw Ok while `commit` (the seal/SealCommit watermark —
+    /// "hole + everything after correctly excluded", see
+    /// `apply_reset_tail`) stayed below — the eventual seal CHOPPED an
+    /// acked range. Now acked ⊆ contiguous-commit, always.
+    fn ack(
+        &mut self,
+        offset: u64,
+        end: u64,
+        ack: Option<(oneshot::Sender<Result<AppendResult>>, AppendResult)>,
+    ) {
+        self.in_flight = self.in_flight.saturating_sub(1);
+        if offset >= self.failure_floor {
+            // A lower lease already failed — this range is beyond the
+            // permanent hole and will be excluded by the roll's seal.
+            // Fail the caller (it retries on the fresh tail; the bytes on
+            // the replicas become benign un-acked duplicates).
+            if let Some((tx, _)) = ack {
+                let _ = tx.send(Err(anyhow!(
+                    "append completed but a lower offset failed (hole below);                      not acked — retry on a fresh extent"
+                )));
+            }
+            return;
+        }
+        self.pending_acks.insert(offset, PendingAck { end, ack });
+        while let Some((&off, slot)) = self.pending_acks.iter().next() {
+            if off == self.commit {
+                self.commit = slot.end;
+                let slot = self.pending_acks.remove(&off).expect("just observed");
+                if let Some((tx, result)) = slot.ack {
+                    let _ = tx.send(Ok(result));
+                }
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn rewind_or_poison(&mut self, offset: u64, size: u64) {
+        self.in_flight = self.in_flight.saturating_sub(1);
+        if offset + size == self.lease_cursor {
+            self.lease_cursor = offset;
+        } else {
+            self.poisoned = true;
+            // ENOSPC-1 P1: everything pending at/above the hole can never
+            // join the contiguous prefix — fail those callers now instead
+            // of acking ranges the roll's seal will discard.
+            self.failure_floor = self.failure_floor.min(offset);
+            let dead = self.pending_acks.split_off(&self.failure_floor);
+            for (_, slot) in dead {
+                if let Some((tx, _)) = slot.ack {
+                    let _ = tx.send(Err(anyhow!(
+                        "append completed but a lower offset failed (hole below);                          not acked — retry on a fresh extent"
+                    )));
+                }
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+struct StreamAppendMetrics {
+    ops: AtomicU64,
+    retries: AtomicU64,
+    lock_wait_ns: AtomicU64,
+    extent_lookup_ns: AtomicU64,
+    fanout_ns: AtomicU64,
+    total_ns: AtomicU64,
+    last_report_ms: AtomicU64,
+}
+
+impl StreamAppendMetrics {
+    fn record(
+        &self,
+        owner_key: &str,
+        lock_wait: Duration,
+        extent_lookup: Duration,
+        fanout: Duration,
+        total: Duration,
+        retries: u64,
+    ) {
+        self.ops.fetch_add(1, Ordering::Relaxed);
+        self.retries.fetch_add(retries, Ordering::Relaxed);
+        self.lock_wait_ns
+            .fetch_add(duration_to_ns(lock_wait), Ordering::Relaxed);
+        self.extent_lookup_ns
+            .fetch_add(duration_to_ns(extent_lookup), Ordering::Relaxed);
+        self.fanout_ns
+            .fetch_add(duration_to_ns(fanout), Ordering::Relaxed);
+        self.total_ns
+            .fetch_add(duration_to_ns(total), Ordering::Relaxed);
+        self.maybe_report(owner_key);
+    }
+
+    fn maybe_report(&self, owner_key: &str) {
+        let now_ms = unix_time_ms();
+        let last = self.last_report_ms.load(Ordering::Relaxed);
+        if now_ms.saturating_sub(last) < 1000 {
+            return;
+        }
+        if self
+            .last_report_ms
+            .compare_exchange(last, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+
+        let ops = self.ops.swap(0, Ordering::Relaxed);
+        if ops == 0 {
+            return;
+        }
+        let retries = self.retries.swap(0, Ordering::Relaxed);
+        let lock_wait_ns = self.lock_wait_ns.swap(0, Ordering::Relaxed);
+        let extent_lookup_ns = self.extent_lookup_ns.swap(0, Ordering::Relaxed);
+        let fanout_ns = self.fanout_ns.swap(0, Ordering::Relaxed);
+        let total_ns = self.total_ns.swap(0, Ordering::Relaxed);
+        tracing::info!(
+            owner_key,
+            ops,
+            retries,
+            avg_lock_wait_ms = ns_to_ms(lock_wait_ns, ops),
+            avg_extent_lookup_ms = ns_to_ms(extent_lookup_ns, ops),
+            avg_fanout_ms = ns_to_ms(fanout_ns, ops),
+            avg_total_ms = ns_to_ms(total_ns, ops),
+            "stream append summary",
+        );
+    }
+}
+
+// ── R4 4.3 — StreamClient per-stream SQ/CQ worker ────────────────────────
+//
+// Each stream_id gets ONE worker compio task (spawned lazily on first
+// append*). The worker owns `StreamAppendState` + a `FuturesUnordered` of
+// in-flight 3-replica joins. NO external Mutex: all state mutations happen
+// inside the worker.
+//
+// Public API → worker via a bounded mpsc. Worker replies via per-op
+// oneshot. The append retry loop lives in the public API (Option A of the
+// spec) — the worker is a stateful single-op executor, not a retry engine.
+//
+// Tail invalidation on alloc_new_extent: the public API explicitly sends
+// `ResetTail` to the worker before resubmission — no hidden staleness, no
+// generation counter, no extra probe from the worker.
+//
+// Construction uses `Rc::new_cyclic` so StreamClient stores a `Weak<Self>`
+// that the worker can use for the removal-guard on exit — without forming
+// an Rc cycle that would prevent shutdown.
+
+/// Bounded capacity of the per-stream submit mpsc. Saturated callers park
+/// on `send().await` — natural upstream back-pressure.
+const STREAM_SUBMIT_CAP: usize = 256;
+
+/// BUG#1 (seed=15): `ensure_tail_initialised` retries the open-tail all-replica
+/// `current_commit` probe this many times (with `OPEN_TAIL_COMMIT_BACKOFF_MS`
+/// between) before giving up and sealing+rolling to a fresh tail. Small —
+/// enough to ride out a brief blip, but the seal-and-roll escape is itself safe
+/// (lenient seal-over-reachable ≥ acked), so a few attempts suffice.
+const OPEN_TAIL_COMMIT_RETRIES: u32 = 3;
+const OPEN_TAIL_COMMIT_BACKOFF_MS: u64 = 300;
+
+
+// env-reading helpers `stream_inflight_cap()`,
+// `append_fanout_timeout()`, `read_chunk_bytes()` removed. Values live
+// on `StreamClientConfig` (defined below) — set once at construction,
+// CLI-flag-driven on the binary. Tests that need overrides build a
+// custom `StreamClientConfig` instead of setting process-global env
+// vars (hostile to parallel test runs).
+
+/// Stream client tunables. Default values match the legacy
+/// env-default behaviour:
+///   - `bad_nodes_ttl`: 30 s
+///   - `inflight_cap`: 32 per-stream FU cap
+///   - `append_fanout_timeout`: 5 s per-replica append BASE deadline
+///     (BUG-FLUSH-TIMEOUT-LEAK made it a base, not the whole deadline)
+///   - `append_floor_bytes_per_sec`: 8 MiB/s assumed worst-case sustained
+///     all-replica append throughput floor (BUG-FLUSH-TIMEOUT-LEAK)
+///   - `read_chunk_bytes`: 256 MiB per replicated read chunk
+#[derive(Clone, Debug)]
+pub struct StreamClientConfig {
+    pub bad_nodes_ttl: Duration,
+    pub inflight_cap: usize,
+    pub append_fanout_timeout: Duration,
+    /// BUG-FLUSH-TIMEOUT-LEAK: the per-append deadline scales with payload
+    /// size — `deadline = append_fanout_timeout + payload_len / this`
+    /// (see `effective_io_timeout`). The earlier fixed 5 s deadline was
+    /// sized for 4 KiB WAL appends; applied verbatim to a 256 MiB SST
+    /// flush it CANNOT be met under load (repeated "append timeout after 5s"
+    /// while every EN had durably written the whole payload), and each
+    /// spurious timeout rolled to a fresh extent, leaking the old one (tens
+    /// of times the logical size in disk usage).
+    ///
+    /// Why 8 MiB/s: measured healthy bulk write throughput is 277–622 MB/s
+    /// (docs/perf_baseline.md — 8 MiB cross-host TCP writes 277 MB/s aggregate
+    /// with p99 ALREADY at 6.1 s > the old 5 s deadline; 8 MB VP writes
+    /// reached 584 MB/s at RF=3 without saturating the EN's NVMe). The floor is ~1.5 orders of magnitude below healthy so it
+    /// tolerates near-full-disk fsync collapse, recovery/GC traffic and
+    /// queueing behind other in-flight bulk appends — the deadline's job is
+    /// to distinguish "dead replica" from "slow but progressing", not to
+    /// estimate typical latency. 4 KiB WAL → +0.5 ms (unchanged); 8 MiB →
+    /// 6 s (matches the measured degraded p99); 256 MiB SST → 37 s; 1 GiB
+    /// compaction output (the PS's `--compact-max-sst-bytes` default) → 133 s.
+    pub append_floor_bytes_per_sec: u64,
+    pub read_chunk_bytes: u64,
+    /// BUG-READ-TIMEOUT-STORM: the READ side of the size-scaled I/O deadline
+    /// (`IoDeadline`), SEPARATE from the append side because a read has no
+    /// RF=3 all-replica-fsync barrier — it is one replica's pread + transfer.
+    /// `read_base_timeout` is the size-independent slack (RTT + queueing),
+    /// `read_floor_bytes_per_sec` the assumed worst-case sustained read
+    /// throughput. Default read deadline = `read_base + len / read_floor`,
+    /// clamped to `IO_TIMEOUT_CAP`. See `DEFAULT_READ_*` for the derivation.
+    /// Replaces the hardcoded fixed 3 s that stormed on 8 MiB reads.
+    pub read_base_timeout: Duration,
+    pub read_floor_bytes_per_sec: u64,
+}
+
+impl Default for StreamClientConfig {
+    fn default() -> Self {
+        Self {
+            bad_nodes_ttl: Duration::from_secs(30),
+            inflight_cap: 32,
+            append_fanout_timeout: Duration::from_secs(5),
+            append_floor_bytes_per_sec: 8 * 1024 * 1024,
+            read_chunk_bytes: 256 * 1024 * 1024,
+            read_base_timeout: DEFAULT_READ_BASE_TIMEOUT,
+            read_floor_bytes_per_sec: DEFAULT_READ_FLOOR_BYTES_PER_SEC,
+        }
+    }
+}
+
+/// BUG-FLUSH-TIMEOUT-LEAK: hard ceiling on the size-scaled I/O deadline (shared
+/// by append AND read). Preserves the dead-replica bound — every append
+/// still resolves (success/error/timeout) within a bounded window, so
+/// `drain_inflight_for_seal` and the failover SealCommit handshake can never
+/// hang. 10 min covers a 4 GiB payload (the frame `payload_len: u32` wire
+/// ceiling) at ~7 MiB/s. For READS the cap is never binding: every read RPC is
+/// chunk-bounded to `read_chunk_bytes` (≤ 256 MiB), so the largest scaled read
+/// deadline is `read_base + 256 MiB / read_floor` ≈ 67 s — do NOT lower this cap
+/// to clip that, it would break the legitimate large-chunk read.
+pub(crate) const IO_TIMEOUT_CAP: Duration = Duration::from_secs(600);
+
+/// BUG-READ-TIMEOUT-STORM: default READ-side `IoDeadline` knobs. Exposed as
+/// `pub` so the config-free `read_extent_value_direct` (the client-SDK EN-direct
+/// path, which holds no `StreamClientConfig`) uses the SAME source of truth as
+/// `StreamClientConfig::default()`. Read base 3 s = the pre-existing fixed read
+/// deadline (every read < ~4 MiB stays byte-identical to today → zero hot-GET
+/// regression). Read floor 4 MiB/s (looser than the 8 MiB/s append floor: a read
+/// is one replica's pread + transfer, no fsync barrier) sits ~1.7 orders below
+/// the worst measured wire-bound read throughput (193–601 MB/s cross-host TCP,
+/// docs/perf_baseline.md) — it distinguishes a dead replica from
+/// slow-but-progressing under congestion, not typical latency. Resulting 8 MiB
+/// read deadline = 3 + 2 = 5 s (was a fixed 3 s that stormed: hundreds of
+/// timeouts when 32 concurrent 8 MiB direct reads queued on a ~200 MB/s wire).
+pub const DEFAULT_READ_BASE_TIMEOUT: Duration = Duration::from_secs(3);
+pub const DEFAULT_READ_FLOOR_BYTES_PER_SEC: u64 = 4 * 1024 * 1024;
+
+/// BUG-READ-TIMEOUT-STORM: is this error a LIVENESS timeout (deadline / connect
+/// timeout — the replica isn't answering) vs a FAST error (NotFound, wrong
+/// shard, eversion-stale, connection refused with a code)? Only a liveness
+/// timeout damps the retry (go to proxy after ≤1 more replica instead of walking
+/// them all at a fresh full deadline); a fast error keeps the full rotation
+/// (cheap, and usually an addressing/GC-churn issue a sibling replica resolves).
+/// Matches the message strings `conn_pool` emits (`"timed out after"`) — the same
+/// contract already relied on at the two damping sites; centralised here.
+pub(crate) fn is_liveness_timeout(err: &anyhow::Error) -> bool {
+    // `{:#}`, like `is_connect_failure`: a connect timeout from `ConnPool` is
+    // `RpcError::Timeout` under a `connect <addr>` context, and plain
+    // `to_string()` prints only that context.
+    let m = format!("{err:#}");
+    m.contains("timed out after") || m.contains("timed out")
+}
+
+/// BUG-FLUSH-TIMEOUT-LEAK FIX #1: derive the per-replica append deadline from
+/// the ACTUAL payload size instead of applying one fixed constant to every
+/// append: `deadline = min(base + payload_len / floor_bytes_per_sec, CAP)`.
+/// `base` covers RTT + queueing + fsync latency (the pre-existing 4 KiB-WAL
+/// deadline); the scaled term covers transfer + write time at an assumed
+/// worst-case throughput floor (see `StreamClientConfig::
+/// append_floor_bytes_per_sec` for the derivation of the default floor).
+pub(crate) fn effective_io_timeout(
+    base: Duration,
+    floor_bytes_per_sec: u64,
+    payload_len: u64,
+) -> Duration {
+    // Defensive: a zero floor (should be unreachable — the builder clamps and
+    // the default is 8 MiB/s) degrades to the pre-fix fixed-base behaviour
+    // rather than dividing by zero.
+    if floor_bytes_per_sec == 0 {
+        return base.min(IO_TIMEOUT_CAP);
+    }
+    let scaled = Duration::from_secs_f64(payload_len as f64 / floor_bytes_per_sec as f64);
+    base.saturating_add(scaled).min(IO_TIMEOUT_CAP)
+}
+
+/// BUG-FLUSH-TIMEOUT-LEAK: per-worker snapshot of the two deadline knobs,
+/// threaded from `StreamClientConfig` into `launch_append` so each append's
+/// timeout is derived from ITS payload size (`for_len`).
+#[derive(Clone, Copy)]
+pub(crate) struct IoDeadline {
+    pub base: Duration,
+    pub floor_bytes_per_sec: u64,
+}
+
+impl IoDeadline {
+    pub(crate) fn for_len(&self, payload_len: u64) -> Duration {
+        effective_io_timeout(self.base, self.floor_bytes_per_sec, payload_len)
+    }
+
+}
+
+impl StreamClientConfig {
+    /// bad-nodes TTL clamp `[1, 600]` seconds.
+    pub fn with_bad_nodes_ttl(mut self, ttl: Duration) -> Self {
+        let secs = ttl.as_secs().clamp(1, 600);
+        self.bad_nodes_ttl = Duration::from_secs(secs);
+        self
+    }
+    /// append fanout clamp `[200 ms, 60 s]`. Post-BUG-FLUSH-TIMEOUT-LEAK
+    /// this is the BASE deadline only (the payload-scaled term is added on
+    /// top per append — see `effective_io_timeout`), so the 60 s ceiling
+    /// stays correct: it bounds the size-independent slack, not the transfer
+    /// time of a large payload.
+    pub fn with_append_fanout_timeout(mut self, t: Duration) -> Self {
+        let ms = t.as_millis().clamp(200, 60_000) as u64;
+        self.append_fanout_timeout = Duration::from_millis(ms);
+        self
+    }
+    /// BUG-FLUSH-TIMEOUT-LEAK: assumed worst-case sustained append throughput
+    /// floor for the payload-scaled deadline term. Clamp `[64 KiB/s, 1 GiB/s]`;
+    /// 0 → default (8 MiB/s).
+    pub fn with_append_floor_bytes_per_sec(mut self, bps: u64) -> Self {
+        self.append_floor_bytes_per_sec = if bps == 0 {
+            8 * 1024 * 1024
+        } else {
+            bps.clamp(64 * 1024, 1024 * 1024 * 1024)
+        };
+        self
+    }
+    /// BUG-READ-TIMEOUT-STORM: read-side base deadline. Clamp `[200 ms, 60 s]`
+    /// (same as the append base — bounds the size-independent slack).
+    pub fn with_read_base_timeout(mut self, t: Duration) -> Self {
+        let ms = t.as_millis().clamp(200, 60_000) as u64;
+        self.read_base_timeout = Duration::from_millis(ms);
+        self
+    }
+    /// BUG-READ-TIMEOUT-STORM: read-side throughput floor. Clamp
+    /// `[64 KiB/s, 1 GiB/s]`; 0 → default (4 MiB/s).
+    pub fn with_read_floor_bytes_per_sec(mut self, bps: u64) -> Self {
+        self.read_floor_bytes_per_sec = if bps == 0 {
+            DEFAULT_READ_FLOOR_BYTES_PER_SEC
+        } else {
+            bps.clamp(64 * 1024, 1024 * 1024 * 1024)
+        };
+        self
+    }
+    /// BUG-READ-TIMEOUT-STORM: the read-side `IoDeadline` (base + len/floor).
+    pub(crate) fn read_deadline(&self) -> IoDeadline {
+        IoDeadline {
+            base: self.read_base_timeout,
+            floor_bytes_per_sec: self.read_floor_bytes_per_sec,
+        }
+    }
+    /// per-stream FU cap. 0 → default 32.
+    pub fn with_inflight_cap(mut self, cap: usize) -> Self {
+        self.inflight_cap = if cap == 0 { 32 } else { cap };
+        self
+    }
+    /// read chunk size. 0 → default 256 MiB.
+    pub fn with_read_chunk_bytes(mut self, bytes: u64) -> Self {
+        self.read_chunk_bytes = if bytes == 0 { 256 * 1024 * 1024 } else { bytes };
+        self
+    }
+}
+
+/// BUG-FLUSH-TIMEOUT-LEAK FIX #1 reproduce-first tests.
+///
+/// The red state: a PS flush appends ONE ~256 MiB SST to row_stream; the
+/// fixed 5 s deadline (sized for 4 KiB WAL appends) fired repeatedly
+/// ("append timeout after 5s") while every EN had durably written all
+/// ~255 MB — the client then rolled to a fresh extent and rewrote the same
+/// SST, leaking 255 MB per iteration (unreclaimable extents tens of times
+/// the logical data size).
+#[cfg(test)]
+mod io_deadline_tests {
+    use super::*;
+
+    // BUG-READ-TIMEOUT-STORM: the READ side of IoDeadline.
+    #[test]
+    fn read_deadline_scales_and_keeps_hot_path() {
+        let cfg = StreamClientConfig::default();
+        let d = cfg.read_deadline();
+        // 4 KiB read stays at ~the 3 s base (adds 4 KiB/4 MiB/s ≈ 1 ms — hot GET
+        // path effectively unchanged).
+        let small = d.for_len(4 * 1024);
+        assert!(small >= DEFAULT_READ_BASE_TIMEOUT);
+        assert!(small < DEFAULT_READ_BASE_TIMEOUT + Duration::from_millis(5));
+        // 8 MiB read: base 3 s + 8 MiB / 4 MiB/s = 5 s (was a FIXED 3 s that
+        // stormed into hundreds of timeouts under concurrent reads).
+        assert_eq!(d.for_len(8 * 1024 * 1024), Duration::from_secs(5));
+        // A 256 MiB chunk (the read_chunk_bytes ceiling) → 3 + 64 = 67 s,
+        // still well under the shared IO cap — do NOT clip the cap below this.
+        let chunk = d.for_len(256 * 1024 * 1024);
+        assert_eq!(chunk, Duration::from_secs(67));
+        assert!(chunk < IO_TIMEOUT_CAP);
+        // Any size is capped.
+        assert_eq!(d.for_len(u64::MAX), IO_TIMEOUT_CAP);
+    }
+
+    // BUG-READ-TIMEOUT-STORM: the retry-damping classifier. A liveness timeout
+    // (deadline / connect timeout) damps the walk; a fast error keeps rotating.
+    #[test]
+    fn is_liveness_timeout_classifies_correctly() {
+        assert!(is_liveness_timeout(&anyhow::anyhow!(
+            "call_into_pooled timed out after 5s"
+        )));
+        assert!(is_liveness_timeout(&anyhow::anyhow!(
+            "connect 1.2.3.4:9101: RPC timed out after 5s"
+        )));
+        assert!(!is_liveness_timeout(&anyhow::anyhow!(
+            "direct read from 1.2.3.4:9101: code=locked"
+        )));
+        assert!(!is_liveness_timeout(&anyhow::anyhow!("NotFound")));
+        assert!(!is_liveness_timeout(&anyhow::anyhow!(
+            "eversion mismatch: cached=1 got=2"
+        )));
+    }
+
+    #[test]
+    fn small_wal_append_keeps_base_deadline() {
+        let cfg = StreamClientConfig::default();
+        let d = effective_io_timeout(
+            cfg.append_fanout_timeout,
+            cfg.append_floor_bytes_per_sec,
+            4 * 1024,
+        );
+        // The 4 KiB WAL hot path must NOT regress: the scaled term for
+        // 4 KiB at the default floor is ~0.5 ms.
+        assert!(
+            d >= cfg.append_fanout_timeout
+                && d < cfg.append_fanout_timeout + Duration::from_millis(100),
+            "4 KiB deadline should stay ≈ base (5 s), got {d:?}"
+        );
+    }
+
+    #[test]
+    fn bulk_sst_append_deadline_scales_with_payload() {
+        let cfg = StreamClientConfig::default();
+        // --flush-mem-bytes = 256 MiB (partition-server lib.rs:53): one SST
+        // upload. 3-replica fanout + fsync of 256 MiB cannot finish in 5 s
+        // under load; the deadline must cover payload / assumed-floor.
+        let d_sst = effective_io_timeout(
+            cfg.append_fanout_timeout,
+            cfg.append_floor_bytes_per_sec,
+            256 << 20,
+        );
+        let want = cfg.append_fanout_timeout
+            + Duration::from_secs_f64(
+                (256u64 << 20) as f64 / cfg.append_floor_bytes_per_sec as f64,
+            );
+        assert!(
+            d_sst >= want,
+            "256 MiB SST deadline must be ≥ base + payload/floor ({want:?}), got {d_sst:?}"
+        );
+
+        // do_compact outputs are bigger than a flush SST (up to the PS's
+        // `--compact-max-sst-bytes`) — the deadline must keep scaling, not
+        // plateau at a hand-picked constant.
+        let d_compact = effective_io_timeout(
+            cfg.append_fanout_timeout,
+            cfg.append_floor_bytes_per_sec,
+            512 << 20,
+        );
+        assert!(
+            d_compact > d_sst,
+            "512 MiB compaction output deadline ({d_compact:?}) must exceed the 256 MiB one ({d_sst:?})"
+        );
+    }
+
+    #[test]
+    fn deadline_stays_bounded_for_any_size() {
+        // dead-replica bound: every append must still resolve within a
+        // bounded window (SealCommit drain depends on it). Even an absurd
+        // payload is capped.
+        let cfg = StreamClientConfig::default();
+        let d = effective_io_timeout(
+            cfg.append_fanout_timeout,
+            cfg.append_floor_bytes_per_sec,
+            u64::MAX,
+        );
+        assert!(d <= IO_TIMEOUT_CAP, "deadline must be capped, got {d:?}");
+        // Zero floor must not divide-by-zero / produce a degenerate deadline.
+        let z = effective_io_timeout(cfg.append_fanout_timeout, 0, 256 << 20);
+        assert!(z >= cfg.append_fanout_timeout && z <= IO_TIMEOUT_CAP);
+    }
+}
+
+/// Pure slicing logic shared by `ec_read_full_and_slice`. Returns the
+/// `[offset, offset+length)` sub-slice of an EC-decoded payload (where
+/// `length == 0` means "to end"), or an `Err` describing the
+/// out-of-bounds condition. Lifted out of the async method so it can
+/// be unit-tested without standing up a manager + extent-node fixture.
+/// takes `full_payload` by value so the full-read path
+/// (offset=0, length=0) can return the decoded Vec directly with
+/// zero copy. This previously took `&[u8]` and unconditionally
+/// `.to_vec()`'d, which on a 256 MiB EC-decoded payload spent
+/// 50-100 ms memcpy'ing INLINE on the caller's compio runtime —
+/// a thread-per-core violation. Sub-range reads still allocate
+/// `read_len` bytes (typically small), but the full-extent EC
+/// read path (the dominant case during recovery / VP fetches)
+/// is now zero-copy after `spawn_blocking(ec_decode)` returns.
+/// `extent_id` + `sealed_length` are pass-through context for the
+/// `StaleVpOffset` sentinel — they're not used by the
+/// in-range slice path. We could derive `sealed_length` from
+/// `full_payload.len()` (they agree in the happy path), but the
+/// caller already has the manager-reported value and we want the
+/// sentinel to surface what the manager THINKS the sealed length
+/// is, not just what the decoded payload happens to be.
+fn ec_slice_decoded(
+    full_payload: Vec<u8>,
+    offset: u64,
+    length: u64,
+    extent_id: u64,
+    sealed_length: u64,
+) -> Result<Vec<u8>> {
+    if offset == 0 && length == 0 {
+        return Ok(full_payload);
+    }
+    let start = offset as usize;
+    if start > full_payload.len() {
+        // structured sentinel so the PS read path can map this
+        // to `StatusCode::FailedPrecondition` and surface a stable
+        // diagnostic to Python operational tooling.
+        return Err(anyhow::Error::new(StaleVpOffset {
+            extent_id,
+            requested_offset: offset,
+            requested_length: length,
+            sealed_length,
+        }));
+    }
+    let read_len = if length == 0 {
+        full_payload.len() - start
+    } else {
+        length as usize
+    };
+    let slice_end = (start + read_len).min(full_payload.len());
+    Ok(full_payload[start..slice_end].to_vec())
+}
+
+/// Message from public API to per-stream worker.
+enum StreamSubmitMsg {
+    /// Append payload segments; worker leases offsets, fans out to 3
+    /// replicas, and acks on completion.
+    ///
+    /// Every append is durable via the extent-node's per-extent
+    /// fsync coalescer.
+    Append {
+        payload_parts: Vec<autumn_transport::RegBytes>,
+        /// crc32c of the parts, when the caller computed it while encoding.
+        payload_crc: Option<u32>,
+        owner_epoch: i64,
+        ack_tx: oneshot::Sender<Result<AppendResult>>,
+    },
+    /// Replace the cached tail (used after alloc_new_extent, on a fresh
+    /// stream's first init, or a soft-error tail reload). When `tail` is a
+    /// DIFFERENT extent than the one the worker is on, this resets all
+    /// append-progress state (lease_cursor/commit/pending/in_flight/poisoned/
+    /// sealing) for the new extent. When it is the SAME extent (a transient-
+    /// failure reload that did not change the tail), it only refreshes the
+    /// cached tail metadata (replica addrs) and PRESERVES the worker's
+    /// append-progress state — see the handler for why (BUG#2 + hole/poison
+    /// safety).
+    ResetTail { tail: StreamTail },
+    /// Seed the lease_cursor/commit to a non-zero starting value.  Sent by
+    /// the public API's tail-init path when the manager-tracked extent
+    /// already has data (`current_commit > 0`); without this the next
+    /// append would try to overwrite pre-existing bytes.
+    SeedCursor { cursor: u64 },
+    /// Failover seal handshake: the worker DRAINS every in-flight append
+    /// (awaits all completions, applying each so `state.commit` reaches its
+    /// final contiguous all-replica-acked prefix), then replies with that
+    /// `state.commit`. The public API uses the returned watermark as the
+    /// authoritative seal length for `alloc_new_extent`. This is the ONLY
+    /// safe source — a public-API-tracked value always lags the worker and
+    /// races concurrent out-of-order appends + rolls. The drain is bounded by
+    /// each append's `append_fanout_timeout`, so it cannot hang.
+    ///
+    /// BUG2-IDEMPOTENT-ROLL: reply is `(commit, tail_extent_id)` — the worker
+    /// is the only place that authoritatively knows WHICH extent the drained
+    /// `commit` belongs to (its cached tail). The caller threads
+    /// `tail_extent_id` into `alloc_new_extent` as `seal_extent_id` so a retried
+    /// roll seals that exact extent (idempotent), never the freshly-rolled one.
+    SealCommit { resp: oneshot::Sender<(u64, u64)> },
+    /// Explicit shutdown.  Dropping the last Sender also exits the worker
+    /// via channel close — this variant is kept for symmetry / tests.
+    #[allow(dead_code)]
+    Shutdown,
+}
+
+/// Result of a single in-flight append — produced by the future the worker
+/// pushes into its FuturesUnordered.
+struct InflightResult {
+    offset: u64,
+    end: u64,
+    extent_id: u64,
+    /// Raw oneshot frames from each replica. `Err` slots are RPC/connection
+    /// failures; `Ok(f)` slots include protocol-level error frames.
+    frames: Vec<Result<autumn_rpc::Frame>>,
+    /// parallel to `frames` — `node_id` of each replica in the same
+    /// index order. Lets `apply_completion` resolve a failing replica back
+    /// to its `node_id` for the per-stream `bad_nodes` exclusion list.
+    replica_node_ids: Vec<u64>,
+    ack_tx: oneshot::Sender<Result<AppendResult>>,
+    timing: AppendTiming,
+}
+
+/// Pinned boxed type for the FuturesUnordered payload.
+type InflightFut = std::pin::Pin<Box<dyn std::future::Future<Output = InflightResult>>>;
+
+/// Guard that, on drop, removes the per-stream worker's sender from the
+/// outer `stream_workers` map. Dropped inside the worker on exit so the
+/// next call to `append_*` spawns a fresh worker instead of finding a
+/// stale Sender whose receiver is gone.
+struct WorkerRemovalGuard {
+    sc: Weak<StreamClient>,
+    stream_id: u64,
+    /// The generation of the worker this guard belongs to.
+    worker_gen: u64,
+}
+
+impl Drop for WorkerRemovalGuard {
+    fn drop(&mut self) {
+        let Some(sc) = self.sc.upgrade() else {
+            return;
+        };
+        // Remove ONLY this worker's own entry. A bare `remove(&stream_id)`
+        // deletes whatever is under the key, which after an
+        // `invalidate_stream` is a LIVE successor: the exiting worker
+        // unregisters its replacement, the next append finds nothing and
+        // spawns a third worker, and that one starts with `tail = None`.
+        {
+            let mut workers = sc.stream_workers.borrow_mut();
+            match workers.get(&self.stream_id) {
+                Some((g, _)) if *g == self.worker_gen => {
+                    workers.remove(&self.stream_id);
+                }
+                _ => return,
+            }
+        }
+        // The "tail initialised" flag belongs to the WORKER that was
+        // initialised, not to the stream id. Left behind, it tells the next
+        // worker that its state is already seeded, so it skips
+        // `load_stream_tail` + `current_commit` + `SeedCursor` entirely and
+        // keeps the `lease_cursor = 0` it was born with. Nothing then zeroes
+        // anything — the zero was never overwritten:
+        //
+        //   1. the first `Append` fails "no tail set";
+        //   2. the public API read that as a soft error, reloaded the tail,
+        //      and sent `ResetTail` (that step is now fail-fast — see the
+        //      `no tail set` arm in `append_payload_segments`);
+        //   3. the retry leased at cursor 0, so `header.commit = 0`;
+        //   4. every replica honoured it by truncating to zero.
+        //
+        // The failure shape: three replicas of one extent each dropped 1.7 GiB on
+        // a single append, and the manager then sealed that extent at 8 MiB
+        // while the nodes held 3.3 GiB. `SeedCursor` is the only thing that
+        // would have set the cursor to the extent's committed length, and it
+        // rides inside the init this flag skipped.
+        sc.stream_init_locks.borrow_mut().remove(&self.stream_id);
+    }
+}
+
+/// drainer task for per-StreamClient failure reports. Holds a
+/// `Weak<StreamClient>` so it exits naturally when the StreamClient is
+/// dropped (mpsc Receiver close also exits the loop, but Weak coverage
+/// makes shutdown deterministic when senders survive in a worker mid-
+/// drop). Each report is sent fire-and-forget against the current
+/// manager address; failures are logged at trace and otherwise
+/// ignored — the per-stream alloc route-around remains the primary
+/// defense.
+async fn failure_report_drain_loop(sc: Weak<StreamClient>, mut rx: mpsc::Receiver<FailureReport>) {
+    use futures::StreamExt;
+    while let Some(report) = rx.next().await {
+        let Some(sc) = sc.upgrade() else {
+            return;
+        };
+        let reporter = sc.reporter_part_id.get();
+        if reporter == 0 {
+            // No reporter id configured — skip rather than poll the
+            // manager with sentinel zeros.
+            continue;
+        }
+        let ts_ms = autumn_common::metrics::unix_time_ms() as i64;
+        let req = manager_rpc::rkyv_encode(&manager_rpc::ReportDiskFailureReq {
+            node_id: report.node_id,
+            extent_id: report.extent_id,
+            error_kind: manager_rpc::REPORT_DISK_FAILURE_KIND_GENERIC,
+            reporter_part_id: reporter,
+            ts_ms,
+        });
+        let addr = sc.manager_addr().to_string();
+        // Fire-and-forget: best-effort. The handler does not return
+        // a meaningful response payload (CODE_OK CodeResp), and a
+        // dropped report is benign — the per-stream alloc route-
+        // around handles the per-call need.
+        // 5 s — fire-and-forget telemetry; bounded so a slow manager
+        // doesn't keep this background task alive past a coarse SLO.
+        if let Err(e) = sc
+            .pool
+            .call_timeout(
+                &addr,
+                manager_rpc::MSG_REPORT_DISK_FAILURE,
+                req,
+                Duration::from_secs(5),
+            )
+            .await
+        {
+            tracing::trace!(
+                manager = %addr,
+                node_id = report.node_id,
+                extent_id = report.extent_id,
+                error = %e,
+                "f192 report_disk_failure send failed"
+            );
+        }
+    }
+}
+
+/// SealCommit drain: await EVERY in-flight append and apply its completion so
+/// `state.commit` reaches its final contiguous all-replica-acked prefix before
+/// the worker reports the seal watermark. Bounded by each append's
+/// size-scaled deadline (`effective_io_timeout`, hard-capped at
+/// `IO_TIMEOUT_CAP` — every `InflightFut` resolves within it:
+/// success, error, or timeout), so it cannot hang even if a replica is dead. After this
+/// returns, `inflight` is empty and `state.commit` is the exact length to seal
+/// the current tail at: every all-replica-acked byte is included, every
+/// un-acked (failed/timed-out) byte is excluded (those callers retry onto the
+/// fresh tail). No phantom, no truncation.
+async fn drain_inflight_for_seal(
+    state: &mut StreamAppendState,
+    inflight: &mut FuturesUnordered<InflightFut>,
+) {
+    while let Some(result) = inflight.next().await {
+        apply_completion(state, result);
+    }
+}
+
+/// Apply one `StreamSubmitMsg` work item inside `stream_worker_loop`. Returns
+/// `ControlFlow::Break(())` for `Shutdown` (the caller drains inflight + exits),
+/// `Continue(())` otherwise. Extracted because the four work arms (ResetTail /
+/// SeedCursor / SealCommit / Append) were byte-identical between the idle branch
+/// and the `select` Left branch; the SQ/CQ arbitration loop is unchanged.
+async fn apply_stream_submit_msg(
+    state: &mut StreamAppendState,
+    pool: &Rc<ConnPool>,
+    inflight: &mut FuturesUnordered<InflightFut>,
+    msg: StreamSubmitMsg,
+    stream_id: u64,
+    append_deadline: IoDeadline,
+) -> std::ops::ControlFlow<()> {
+    match msg {
+        StreamSubmitMsg::Shutdown => return std::ops::ControlFlow::Break(()),
+        StreamSubmitMsg::ResetTail { tail } => {
+            // Same-extent reload preserves the worker's append-progress state;
+            // different-extent roll resets it. See
+            // `StreamAppendState::apply_reset_tail` (BUG#2, seed=8).
+            state.apply_reset_tail(tail);
+        }
+        StreamSubmitMsg::SeedCursor { cursor } => {
+            state.commit = cursor;
+            state.lease_cursor = cursor;
+        }
+        StreamSubmitMsg::SealCommit { resp } => {
+            drain_inflight_for_seal(state, inflight).await;
+            // BUG2 trace (opt-in, target `bug2_trace`): the worker's post-drain
+            // `state.commit` IS the authoritative seal length it reports. A
+            // `reported_commit=0` for a `tail_extent` that physically holds acked
+            // data means THIS worker did not own the writes (reset/fresh worker
+            // after invalidate_stream / ResetTail) — the dual-writer under-seal.
+            tracing::info!(
+                target: "bug2_trace",
+                stream_id,
+                reported_commit = state.commit,
+                tail_extent = ?state.tail.as_ref().map(|t| t.extent.extent_id),
+                in_flight = state.in_flight,
+                "BUG2 SealCommit reply"
+            );
+            // BUG2-IDEMPOTENT-ROLL: report the tail extent id alongside the
+            // commit so the caller can pin the seal to THIS extent.
+            let tail_eid = state.tail.as_ref().map(|t| t.extent.extent_id).unwrap_or(0);
+            let _ = resp.send((state.commit, tail_eid));
+            // Freeze the tail until ResetTail so no append lands past the
+            // just-reported seal point.
+            state.sealing = true;
+        }
+        StreamSubmitMsg::Append {
+            payload_parts,
+            payload_crc,
+            owner_epoch,
+            ack_tx,
+        } => {
+            launch_append(
+                state,
+                pool,
+                inflight,
+                payload_parts,
+                payload_crc,
+                owner_epoch,
+                ack_tx,
+                append_deadline,
+            )
+            .await;
+        }
+    }
+    std::ops::ControlFlow::Continue(())
+}
+
+async fn stream_worker_loop(
+    stream_id: u64,
+    mut submit_rx: mpsc::Receiver<StreamSubmitMsg>,
+    pool: Rc<ConnPool>,
+    bad_nodes: Rc<RefCell<HashMap<u64, Instant>>>,
+    failure_report_tx: mpsc::Sender<FailureReport>,
+    // tunables snapshot — clone-of-Rc<StreamClientConfig> from
+    // the StreamClient, captured at spawn time. No env reads.
+    config: Rc<StreamClientConfig>,
+    removal_guard: WorkerRemovalGuard,
+) {
+    use futures::future::{select, Either};
+
+    let cap = config.inflight_cap;
+    // BUG-FLUSH-TIMEOUT-LEAK FIX #1: the per-append deadline is DERIVED from
+    // each append's payload size (base + len/floor), not one fixed constant.
+    let append_deadline = IoDeadline {
+        base: config.append_fanout_timeout,
+        floor_bytes_per_sec: config.append_floor_bytes_per_sec,
+    };
+    let mut state = StreamAppendState::new(bad_nodes, failure_report_tx, config.bad_nodes_ttl);
+    let mut inflight: FuturesUnordered<InflightFut> = FuturesUnordered::new();
+
+    loop {
+        // (A) Opportunistically drain any already-ready completions.
+        while let Some(Some(result)) = inflight.next().now_or_never() {
+            apply_completion(&mut state, result);
+        }
+
+        let n_inflight = inflight.len();
+        let at_cap = n_inflight >= cap;
+
+        if n_inflight == 0 {
+            // Idle: only SQ can progress. Nothing inflight to drain on exit.
+            let should_break = match submit_rx.next().await {
+                None => true,
+                Some(msg) => apply_stream_submit_msg(
+                    &mut state,
+                    &pool,
+                    &mut inflight,
+                    msg,
+                    stream_id,
+                    append_deadline,
+                )
+                .await
+                .is_break(),
+            };
+            if should_break {
+                break;
+            }
+            continue;
+        }
+
+        if at_cap {
+            // Back-pressure: only CQ can progress. Callers parked on
+            // submit_tx.send() will wake once we pop a completion.
+            if let Some(result) = inflight.next().await {
+                apply_completion(&mut state, result);
+            }
+            continue;
+        }
+
+        // 0 < n_inflight < cap: race SQ vs CQ via futures::future::select.
+        // Neither future preserves state across iterations (SQ is a channel
+        // poll, CQ is FU::next which internally preserves the FU state
+        // regardless of the temporary wrapper), so rebuilding them per
+        // iteration is safe.
+        let submit_fut = submit_rx.next();
+        let cfut = inflight.next();
+        futures::pin_mut!(submit_fut);
+        match select(submit_fut, Box::pin(cfut)).await {
+            Either::Left((maybe_msg, _cfut_dropped)) => {
+                let should_break = match maybe_msg {
+                    None => true,
+                    Some(msg) => apply_stream_submit_msg(
+                        &mut state,
+                        &pool,
+                        &mut inflight,
+                        msg,
+                        stream_id,
+                        append_deadline,
+                    )
+                    .await
+                    .is_break(),
+                };
+                if should_break {
+                    // Drain remaining inflight before exit so callers get a
+                    // final ack (success or connection-closed err).
+                    while let Some(result) = inflight.next().await {
+                        apply_completion(&mut state, result);
+                    }
+                    break;
+                }
+            }
+            Either::Right((maybe_result, _submit_fut_dropped)) => {
+                if let Some(result) = maybe_result {
+                    apply_completion(&mut state, result);
+                }
+            }
+        }
+    }
+
+    // Explicit keep-alive so the compiler doesn't move/drop the guard early.
+    drop(removal_guard);
+    tracing::debug!(stream_id, "stream worker exiting");
+}
+
+fn apply_completion(state: &mut StreamAppendState, result: InflightResult) {
+    let InflightResult {
+        offset,
+        end,
+        extent_id,
+        frames,
+        replica_node_ids,
+        ack_tx,
+        timing,
+    } = result;
+    state.timings.record(extent_id, &timing);
+
+    // Bad-replica attribution below resolves a node by the frame's INDEX, so
+    // these two must stay parallel. Star replication makes that structural —
+    // one frame per `replica_addrs` entry, failures included — and the one
+    // shape that broke it (a chained ack carrying one status for every hop)
+    // is gone. Stated as an assertion because the cost of it silently
+    // drifting again is blaming a healthy node for another's failure.
+    debug_assert_eq!(
+        frames.len(),
+        replica_node_ids.len(),
+        "append completion must carry one frame per replica",
+    );
+
+    // A completion must describe the extent the state is on. This is a real,
+    // reachable backstop — not an unreachable invariant, and not the fix.
+    //
+    // The fix is that every roller now QUIESCES before moving the worker (the
+    // `SealCommit` handshake drains `inflight`), so a roll cannot strand an
+    // append. What cannot be quiesced is the soft-error tail RELOAD: it is
+    // meant to be a same-extent refresh, but it takes its tail from a manager
+    // `StreamInfo` RPC and `apply_reset_tail` decides same-vs-different by
+    // extent id, so a reload whose RPC was served just before a concurrent
+    // roll's alloc landed moves the worker BACKWARDS onto the old extent,
+    // while completions for the new one are still in flight. Quiescing the
+    // rollers made that window wider, not narrower: a cap-hitting roll now
+    // bounces its siblings into exactly this reload path.
+    //
+    // It is loud because the failure it catches is a PERMANENT SILENT HANG,
+    // not a wrong answer. `reset_for_new_extent` sets `commit = 0`, so a
+    // completion for the other extent lands in `pending_acks` at a key the
+    // current one can never reach, holding the caller's oneshot inside a live
+    // map that no timer, retry or later ack ever touches. The partition
+    // server's Phase 2 is an unbounded `ack_rx.await`, so one such entry stops
+    // that partition answering anything: indefinitely, past every downstream
+    // deadline, extent nodes idle, nothing logged.
+    //
+    // Failing the caller is also what the seal says — these bytes are past the
+    // other extent's seal and will be discarded, they were never acked to
+    // anyone, and the caller re-drives onto the current tail, the same contract
+    // as the `failure_floor` arm in `ack`.
+    let tail_extent = state.tail.as_ref().map(|t| t.extent.extent_id);
+    if tail_extent != Some(extent_id) {
+        tracing::warn!(
+            completed_extent = extent_id,
+            tail_extent = ?tail_extent,
+            offset,
+            end,
+            "append completed on an extent the worker has left — a tail reload \
+             raced a roll; failing the caller so it re-drives on the current tail",
+        );
+        let _ = ack_tx.send(Err(anyhow!(
+            "append completed on extent {extent_id} while the worker is on \
+             {tail_extent:?}; those bytes are past that extent's seal — retry on \
+             the current tail"
+        )));
+        return;
+    }
+
+    let size = end - offset;
+
+    let mut success_first: Option<AppendResp> = None;
+    let mut saw_not_found = false;
+    let mut saw_locked_by_other = false;
+    let mut err_msg: Option<String> = None;
+    // index of the first replica that produced a hard error
+    // (rpc/decode/non-OK code/NotFound). LockedByOther is intentionally
+    // NOT recorded — it's a control-plane fence event, not a node-health
+    // signal. Resolved to a `node_id` after the loop via `replica_node_ids`.
+    let mut bad_replica_idx: Option<usize> = None;
+
+    for (i, frame_res) in frames.into_iter().enumerate() {
+        match frame_res {
+            Err(e) => {
+                err_msg = Some(format!("replica {i} rpc error: {e}"));
+                bad_replica_idx = Some(i);
+                break;
+            }
+            Ok(frame) => {
+                // NEVER decode an ERROR frame's payload as AppendResp — error
+                // payloads are [status_code][message], and
+                // StatusCode::Unavailable (5) collides with
+                // CODE_LOCKED_BY_OTHER (5), so a transport error
+                // masquerades as a fencing event and POISONS the partition.
+                // That is not hypothetical: it wedged a PS when the EN behind
+                // a dying replica answered with an error frame. Route error
+                // frames through the soft-error path instead.
+                if frame.is_error() {
+                    err_msg = Some(format!(
+                        "replica {i} error frame: {}",
+                        String::from_utf8_lossy(&frame.payload[1.min(frame.payload.len())..])
+                    ));
+                    bad_replica_idx = Some(i);
+                    break;
+                }
+                let payload = frame.payload;
+                let resp = match AppendResp::decode(payload) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        err_msg = Some(format!("replica {i} decode AppendResp: {e}"));
+                        bad_replica_idx = Some(i);
+                        break;
+                    }
+                };
+                if resp.code == CODE_NOT_FOUND {
+                    saw_not_found = true;
+                    bad_replica_idx = Some(i);
+                    break;
+                }
+                if resp.code == CODE_LOCKED_BY_OTHER {
+                    saw_locked_by_other = true;
+                    break;
+                }
+                if resp.code != CODE_OK {
+                    err_msg = Some(format!(
+                        "replica {i} append failed: code={}",
+                        crate::extent_rpc::code_description(resp.code)
+                    ));
+                    bad_replica_idx = Some(i);
+                    break;
+                }
+                match &success_first {
+                    None => success_first = Some(resp),
+                    Some(first) => {
+                        if resp.offset != first.offset || resp.end != first.end {
+                            err_msg =
+                                Some(format!("replica {i} offset mismatch on extent {extent_id}"));
+                            bad_replica_idx = Some(i);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if saw_locked_by_other {
+        state.rewind_or_poison(offset, size);
+        let _ = ack_tx.send(Err(anyhow!(
+            "LockedByOther: a newer owner holds extent {extent_id}"
+        )));
+        return;
+    }
+
+    if saw_not_found {
+        // the writer's tail cache is stale (the extent has been
+        // moved/sealed/reclaimed on this replica). The replica itself
+        // may still be healthy, but allocating around it for one TTL
+        // window is harmless and routes around persistent inconsistency.
+        if let Some(idx) = bad_replica_idx {
+            if let Some(&nid) = replica_node_ids.get(idx) {
+                state.mark_bad_node(nid);
+                // NotFound is stale-cache, not a node-health
+                // signal — do NOT report it. The manager's quorum
+                // would otherwise misclassify it as a real failure.
+            }
+        }
+        state.rewind_or_poison(offset, size);
+        let _ = ack_tx.send(Err(anyhow!(
+            "extent {extent_id} not found on replica (needs alloc_new_extent)"
+        )));
+        return;
+    }
+
+    if let Some(err) = err_msg {
+        // real per-replica failure (rpc/decode/non-OK code) — mark
+        // the node so the next alloc skips it.
+        // same failure pushes a manager-side report so the
+        // global view catches up to the per-stream truth without
+        // waiting for the next `node_health_loop` df tick (2 s;
+        // was the 10 s `disk_status_update_loop`).
+        if let Some(idx) = bad_replica_idx {
+            if let Some(&nid) = replica_node_ids.get(idx) {
+                state.mark_bad_node(nid);
+                state.try_report_failure(nid, extent_id);
+            }
+        }
+        state.rewind_or_poison(offset, size);
+        let _ = ack_tx.send(Err(anyhow!(err)));
+        return;
+    }
+
+    let appended = success_first.expect("success path implies Some");
+    // ENOSPC-1 P1: the caller ack is DEFERRED until the contiguous prefix
+    // covers this range — `ack` fires it (or fails it past a hole).
+    state.ack(
+        offset,
+        end,
+        Some((
+            ack_tx,
+            AppendResult {
+                extent_id,
+                offset: appended.offset,
+                end: appended.end,
+            },
+        )),
+    );
+}
+
+async fn launch_append(
+    state: &mut StreamAppendState,
+    pool: &Rc<ConnPool>,
+    inflight: &mut FuturesUnordered<InflightFut>,
+    payload_parts: Vec<autumn_transport::RegBytes>,
+    payload_crc: Option<u32>,
+    owner_epoch: i64,
+    ack_tx: oneshot::Sender<Result<AppendResult>>,
+    // + BUG-FLUSH-TIMEOUT-LEAK: per-replica deadline policy. Passed by
+    // the worker loop from its config snapshot; the actual deadline is
+    // derived per append from the payload size (`for_len`) so a 4 KiB
+    // WAL record and a 256 MiB SST upload each get a size-appropriate bound.
+    append_deadline: IoDeadline,
+) {
+    let tail = match &state.tail {
+        Some(t) => t.clone(),
+        None => {
+            let _ = ack_tx.send(Err(anyhow!(
+                "stream worker: no tail set (public API must send ResetTail before first Append)"
+            )));
+            return;
+        }
+    };
+
+    if state.poisoned {
+        let _ = ack_tx.send(Err(anyhow!(
+            "stream poisoned by prior failure; caller should alloc a new extent"
+        )));
+        return;
+    }
+
+    if state.sealing {
+        // A failover SealCommit has captured this tail's final commit and the
+        // manager is sealing it; appending more here would write past the new
+        // sealed_length. Reject as a soft error so the caller retries — by then
+        // ResetTail has switched to the fresh tail (sealing cleared).
+        let _ = ack_tx.send(Err(anyhow!(
+            "stream tail sealing for failover; retry on fresh tail"
+        )));
+        return;
+    }
+
+    let size: u64 = payload_parts.iter().map(|p| p.len() as u64).sum();
+    let inflight_at_launch = state.in_flight;
+    let launched_at = Instant::now();
+    let (offset, end) = state.lease(size);
+    let header_commit = offset; // Option A: lease-time cursor.
+
+    let extent_id = tail.extent.extent_id;
+    // node_ids parallel to replica_addrs, captured here so the
+    // future moves a Vec<u64> rather than borrowing tail across await.
+    let replica_node_ids: Vec<u64> = tail.replica_node_ids.clone();
+    let hdr = AppendHeader {
+        extent_id,
+        eversion: tail.extent.eversion,
+        commit: header_commit,
+        owner_epoch,
+        payload_crc: 0,
+    };
+
+    // Fire send_prepared to each replica IN PARALLEL. Each
+    // RpcClient's writer_task is single-writer (R4 step 4.1), so per-
+    // replica TCP byte order is still determined by the order this
+    // worker's submits land on each replica's submit_tx — and since
+    // this worker is single-task, submits into a given submit_tx
+    // happen in lease order. Firing the 3 submits concurrently only
+    // lets each replica's submit channel progress without waiting on
+    // the others (they are independent); it does NOT interleave bytes
+    // on any one replica's socket, so the commit-truncation invariant
+    // (header.commit = offset must equal that replica's file_len on
+    // arrival) is preserved.
+    //
+    // Preserve the "all 3 slots filled with Result" shape so
+    // apply_completion's error handling (first-err-wins) is unchanged
+    // from the pre-parallel version: use join_all, NOT try_join_all.
+    // Star replication builds ONE payload for every replica: its crc32c is
+    // computed once and rides every replica's ctrl, and the payload segments
+    // are refcount clones, never copied.
+    let prepared = hdr.prepared(payload_parts, payload_crc);
+    let send_futs = tail.replica_addrs.iter().map(|addr| {
+        let addr = addr.clone();
+        let pool = pool.clone();
+        let prepared = &prepared;
+        // The submit no longer parks: `submit()` REFUSES on a full queue
+        // (autumn-rpc), so a peer that stopped reading surfaces here as an
+        // ordinary submit error into `apply_completion`'s soft path instead of
+        // suspending this worker. Note what the old park did NOT do: replies
+        // are consumed by the connection's own spawned `read_loop`, not by this
+        // worker, so a parked worker never stopped the socket being read.
+        //
+        // The submit stays here, synchronously ordered, because per-replica TCP
+        // byte order IS this worker's submit order and the commit-truncation
+        // invariant depends on it (see the comment below).
+        async move {
+            let rx_res = pool.send_prepared(&addr, MSG_APPEND, prepared).await;
+            (addr, rx_res)
+        }
+    });
+    let receivers: Vec<(String, Result<crate::conn_pool::PinnedRecv>)> =
+        join_all(send_futs).await;
+
+    // bound each replica's recv. A half-open socket whose SubmitMsg
+    // landed in the writer_task before RpcClient.closed flipped will
+    // otherwise hang join_all forever (the response can never arrive — peer
+    // is dead). Translating Elapsed into a regular `replica N rpc error:
+    // ... timeout` makes `apply_completion` classify it as a soft error,
+    // which the public-API retry loop already escalates to alloc_new_extent.
+    //
+    // BUG-FLUSH-TIMEOUT-LEAK FIX #1: the bound is SIZE-SCALED
+    // (base + payload/floor, capped) — the old fixed 5 s deadline, sized for
+    // 4 KiB WAL appends, fired repeatedly against 256 MiB SST flush appends
+    // that every replica was durably completing, and each spurious timeout
+    // rolled + leaked a ~255 MB extent (tens-of-times disk amplification,
+    // total write outage). Boundedness (the dead-replica
+    // requirement) is preserved by IO_TIMEOUT_CAP.
+    let timeout = append_deadline.for_len(size);
+    let fut = async move {
+        let wait_futs = receivers.into_iter().map(|(addr, rx_res)| async move {
+            let r = match rx_res {
+                Err(e) => Err(anyhow!("{} submit error: {}", addr, e)),
+                Ok(rx) => {
+                    let recv_fut = rx;
+                    let timer = compio::time::sleep(timeout);
+                    futures::pin_mut!(recv_fut, timer);
+                    match futures::future::select(recv_fut, timer).await {
+                        futures::future::Either::Left((Ok(frame), _)) => Ok(frame),
+                        futures::future::Either::Left((Err(_), _)) => {
+                            Err(anyhow!("{} connection closed", addr))
+                        }
+                        futures::future::Either::Right(_) => {
+                            Err(anyhow!("{} append timeout after {:?}", addr, timeout))
+                        }
+                    }
+                }
+            };
+            (r, launched_at.elapsed())
+        });
+        let replies = join_all(wait_futs).await;
+        let first_ns = replies.iter().map(|(_, d)| d.as_nanos() as u64).min().unwrap_or(0);
+        let all_ns = replies.iter().map(|(_, d)| d.as_nanos() as u64).max().unwrap_or(0);
+        let frames = replies.into_iter().map(|(r, _)| r).collect();
+        InflightResult {
+            offset,
+            end,
+            extent_id,
+            frames,
+            replica_node_ids,
+            ack_tx,
+            timing: AppendTiming { inflight_at_launch, first_ns, all_ns },
+        }
+    };
+    inflight.push(Box::pin(fut));
+}
+
+/// A lock-free StreamClient where operations on different stream_ids
+/// never block each other.  No external Mutex is required.
+///
+/// Construction returns `Rc<Self>` (via `Rc::new_cyclic`) so the internal
+/// per-stream workers can hold a `Weak<Self>` for the removal-guard
+/// without forming an Rc cycle.  Callers that previously wrote
+/// `let sc = StreamClient::connect(...)` get `Rc<StreamClient>`; method
+/// calls `sc.append(...)` still work via `Deref`.
+/// What `StreamClient::read_range_copies` found.
+pub struct RangeCopies {
+    pub copies: Vec<RangeCopy>,
+    /// The layout the copies were read under — what a corrupt report names.
+    pub eversion: u64,
+    pub sealed: bool,
+}
+
+/// One independent copy of a byte range.
+pub struct RangeCopy {
+    pub bytes: Bytes,
+    pub source: CopySource,
+}
+
+/// Where a `RangeCopy` came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CopySource {
+    /// Read from this replica.
+    Replica { node_id: u64 },
+    /// Reconstructed with this data shard left out, its node not asked.
+    EcWithoutShard { shard: usize },
+}
+
+/// Context on an append error raised after the payload was handed to the
+/// stream worker: it may sit on some replicas of a tail that is still open, so
+/// only a later seal decides whether it counts. Without it, nothing was written.
+pub const APPEND_OUTCOME_UNKNOWN: &str = "append outcome unknown";
+
+/// Whether `e` carries `APPEND_OUTCOME_UNKNOWN` anywhere in its chain.
+pub fn is_append_outcome_unknown(e: &anyhow::Error) -> bool {
+    format!("{e:#}").contains(APPEND_OUTCOME_UNKNOWN)
+}
+
+pub struct StreamClient {
+    /// Weak self-reference — used by per-stream workers to clean up on
+    /// exit. Set exactly once by `Rc::new_cyclic`.
+    self_weak: Weak<StreamClient>,
+    /// Manager addresses for round-robin failover on NotLeader.
+    manager_addrs: Vec<String>,
+    /// Current manager index (round-robin on NotLeader).
+    current_mgr: Cell<usize>,
+    owner_key: String,
+    owner_epoch: i64,
+    max_extent_size: u64,
+    /// Shared connection pool — one RpcClient per remote address, with
+    /// heartbeat health checks for extent nodes.
+    pool: Rc<ConnPool>,
+    /// Background reads (`read_checked`: replay, compaction and GC windows,
+    /// checkpoints, EC reads) on connections of their own, so a large reply
+    /// never sits in front of an append or a value read.
+    bg_pool: Rc<ConnPool>,
+    /// Node-id → (address, shard_ports) map (refreshed on miss).
+    /// `shard_ports` routes hot-path RPCs by
+    /// `autumn_rpc::shard_for_extent(extent_id, K)` (the canonical hash; was
+    /// `extent_id % K`). Empty `shard_ports` means legacy single-thread EN.
+    nodes_cache: DashMap<u64, (String, Vec<u16>)>,
+    /// When each node's address was last dropped, so a node that is DOWN
+    /// (rather than moved) cannot buy a `nodes_info` round trip per read.
+    /// See `NODE_ADDR_FORGET_COOLDOWN`.
+    node_addr_forgotten: RefCell<HashMap<u64, std::time::Instant>>,
+    /// Cached ExtentInfo for read path.
+    extent_info_cache: DashMap<u64, ExtentInfo>,
+    /// R4 4.3: per-stream single-owner worker sender.  Spawned lazily on
+    /// first append* to a given stream_id.  Replaces the R3 Mutex-guarded
+    /// `stream_states` DashMap — all per-stream state now lives inside
+    /// the worker task.
+    /// Per-stream worker Sender, tagged with the GENERATION that created it.
+    /// The tag is what makes `WorkerRemovalGuard` safe: a worker that exits
+    /// must remove ITS OWN entry, never whatever happens to be under the key.
+    stream_workers: RefCell<HashMap<u64, (u64, mpsc::Sender<StreamSubmitMsg>)>>,
+    /// Serialises the tail-load + ResetTail for concurrent first-callers
+    /// to the same stream (per-stream init lock).  After the first init,
+    /// subsequent callers observe `*guard == true` and skip.
+    stream_init_locks: RefCell<HashMap<u64, Rc<futures::lock::Mutex<bool>>>>,
+    /// Monotonic tag handed to each spawned per-stream worker.
+    next_worker_gen: Cell<u64>,
+    /// per-stream "recently failed" node ids (`node_id → expires_at`).
+    /// Shared between the per-stream worker (writes on `apply_completion`
+    /// Err) and the public-API `alloc_new_extent_once` (reads + prunes
+    /// before each alloc). Persists across worker respawn — a node that
+    /// just failed should still be excluded if a transient worker exit +
+    /// respawn happens within the TTL window. Pruned lazily on snapshot;
+    /// no background sweeper.
+    stream_bad_nodes: RefCell<HashMap<u64, Rc<RefCell<HashMap<u64, Instant>>>>>,
+    /// fire-and-forget reporter for `MSG_REPORT_DISK_FAILURE`.
+    /// Worker (`apply_completion` Err path) pushes here via `try_send`
+    /// (drop on full — pure best-effort). The drainer task (spawned in
+    /// `construct`) holds the `Receiver`, reads each report, builds a
+    /// `ReportDiskFailureReq` with the current `reporter_part_id`, and
+    /// sends to the manager. The channel is bounded so a misbehaving
+    /// peer can't OOM us; the per-stream alloc route-around remains
+    /// the primary defense, so dropped reports don't hurt correctness.
+    failure_report_tx: mpsc::Sender<FailureReport>,
+    /// When each node was last reported unreachable from a read or the flush
+    /// barrier (`report_unreachable`): at most one report per node per
+    /// `NODE_ADDR_FORGET_COOLDOWN`.
+    node_failure_reported: RefCell<HashMap<u64, Instant>>,
+    /// identifier the manager dedups by inside its quorum
+    /// debounce window. Each `PartitionData` sets this to its own
+    /// `part_id` after `StreamClient::new_with_owner_epoch`. Default 0
+    /// means "no reporter id configured" — drainer skips sending to
+    /// avoid polluting the manager's quorum count with a sentinel.
+    reporter_part_id: Cell<u64>,
+    /// The reporter partition's row stream: where the SSTs it reads live, and
+    /// what a rotted SST block copy is reported against
+    /// (`report_rotted_row_copies`). 0 = not set: such a finding is logged,
+    /// not reported.
+    reporter_row_stream: Cell<u64>,
+    /// stream tunables. Defaults match the legacy env defaults.
+    /// Cloned into per-stream workers at spawn time (`Rc` keeps the
+    /// clone cheap).
+    config: Rc<StreamClientConfig>,
+    append_metrics: StreamAppendMetrics,
+    /// lazily-refreshed snapshot of manager-`Suspected` node ids. The
+    /// READ path consults it to route around a flaky node proactively (no
+    /// per-read RPC timeout) and to reconstruct EC shards from parity instead
+    /// of reading a suspected shard. Soft hint only — see `SuspectedCache`.
+    suspected: Rc<RefCell<SuspectedCache>>,
+}
+
+/// payload of one failure-observation event passed from a
+/// per-stream worker to the per-StreamClient drainer task.
+#[derive(Clone, Copy, Debug)]
+struct FailureReport {
+    node_id: u64,
+    extent_id: u64,
+}
+
+/// client-side snapshot of the manager's `Suspected` node set, consumed
+/// by the READ path. Refreshed lazily + NON-BLOCKING off the read path
+/// (`maybe_refresh_suspected`): the read never waits on a manager RTT, it just
+/// uses the latest snapshot (stale by at most `SUSPECTED_REFRESH_TTL`). This is
+/// a pure soft hint — correctness NEVER depends on it (suspected replicas are
+/// deprioritized, not excluded; EC reads reconstruct from parity). So a stale
+/// or empty snapshot only costs latency on a genuinely-flaky node, never data.
+#[derive(Default)]
+struct SuspectedCache {
+    nodes: HashSet<u64>,
+    last_refresh: Option<Instant>,
+    refreshing: bool,
+}
+
+/// how stale the Suspected snapshot may get before the read path kicks
+/// off a background refresh. 2 s matches the manager's df probe cadence; the
+/// `Suspected` soft-timeout is ~10 s, so a 2 s-stale view is plenty fresh.
+const SUSPECTED_REFRESH_TTL: Duration = Duration::from_secs(2);
+
+/// Why an extent cannot be read directly from an EN. Neither is an error the
+/// caller must handle — both mean "serve this read through the partition
+/// server" — but they are not equally ordinary, and `log` below encodes which
+/// is which so a caller cannot get the severity wrong by accident.
+///
+/// Keeping them out of `Err` is the point. They used to be `anyhow!` strings
+/// alongside genuine faults (a manager lookup that failed, a decode that
+/// broke), so the only way to tell an expected decline from a real problem was
+/// to match on prose — and the caller, having no way to tell, logged all of it
+/// at WARN. On a cluster with EC armed that is one warning per large read
+/// forever, which is how a real fault gets to hide in plain sight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotDirect {
+    /// EC, but not in a shape a client can read directly — its shards are not
+    /// in per-shard files, so there is nothing for a shard-addressed read to
+    /// name. Pre-CoW conversions are like this and are never backfilled.
+    EcNotShardAddressable,
+    /// EC, and a node holding one of the data shards is Suspected. Unlike the
+    /// two below this is TRANSIENT: a shard has no second home, so there is
+    /// nothing to rotate to, and the proxy path can rebuild it from parity
+    /// while this one cannot.
+    EcShardNodeSuspected,
+    /// Holds RS shards, not the payload: a single-EN raw read would hand the
+    /// caller shard bytes as if they were the value.
+    EcConverted,
+    /// The payload is not in `.dat`, and the descriptor names no payload file,
+    /// so a direct reader would read the wrong bytes.
+    PayloadOutsideDat,
+}
+
+impl NotDirect {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            NotDirect::EcNotShardAddressable => {
+                "extent is EC-converted but its shards are not in shard files"
+            }
+            NotDirect::EcShardNodeSuspected => "a data shard's node is Suspected",
+            NotDirect::EcConverted => "extent is EC-converted (holds RS shards)",
+            NotDirect::PayloadOutsideDat => "extent keeps its payload outside .dat",
+        }
+    }
+
+    /// Log a decline at the severity it deserves.
+    ///
+    /// `EcConverted` is routine: on a cluster with EC armed it is true of every
+    /// large read of that extent, forever, so warning about it drowns anything
+    /// worth reading. `PayloadOutsideDat` is the opposite — it can only fire
+    /// when an extent's payload has moved to a shard file while `ec_converted`
+    /// is still false, and the manager publishes those two in ONE etcd
+    /// transaction, so it should be unreachable. Costing nothing in a healthy
+    /// cluster is exactly why it can afford to be loud.
+    pub fn log(self, extent_id: u64, what: &str) {
+        match self {
+            NotDirect::EcConverted
+            | NotDirect::EcNotShardAddressable
+            | NotDirect::EcShardNodeSuspected => {
+                tracing::debug!(extent_id, reason = self.as_str(), "{what}")
+            }
+            NotDirect::PayloadOutsideDat => tracing::warn!(
+                extent_id,
+                reason = self.as_str(),
+                "{what} — payload location and ec_converted disagree, which they \
+                 are published together to prevent"
+            ),
+        }
+    }
+}
+
+/// The answer to "can this extent be read straight from an EN, and where".
+pub enum ReadDescriptor {
+    /// Replicated: every address is a full copy, so read any one of them.
+    Direct {
+        eversion: u64,
+        replica_addrs: Vec<String>,
+    },
+    /// Erasure coded: `shard_addrs[i]` holds DATA SHARD `i` and nothing else.
+    ///
+    /// A reader does not need to decode anything. The payload is laid out as
+    /// `shard0 ‖ … ‖ shard_{k-1}` with `shard_size = ceil(sealed_length / k)`
+    /// (last shard zero-padded, no length trailer — `sealed_length` is
+    /// authoritative), so any byte range covers a CONTIGUOUS run of shards and
+    /// each one is read at its own offset. Reed-Solomon is for RECONSTRUCTING
+    /// a shard whose node will not answer; a reader that cannot do that falls
+    /// back to the partition server, which can.
+    ///
+    /// Every shard's bytes live on exactly one node, so unlike `Direct` there
+    /// is no peer to rotate to — which is why this is refused outright when any
+    /// of those nodes is Suspected (see the call site).
+    Ec {
+        eversion: u64,
+        shard_addrs: Vec<String>,
+        data_shards: u32,
+        sealed_length: u64,
+    },
+    /// Not an error — see [`NotDirect`].
+    NotDirect(NotDirect),
+}
+
+impl StreamClient {
+    /// Current manager address (round-robin index).
+    fn manager_addr(&self) -> &str {
+        &self.manager_addrs[self.current_mgr.get() % self.manager_addrs.len()]
+    }
+
+    /// Rotate to the next manager address (round-robin).
+    fn rotate_manager(&self) {
+        let next = (self.current_mgr.get() + 1) % self.manager_addrs.len();
+        self.current_mgr.set(next);
+    }
+
+    /// one manager RPC with rotate-on-transport-failure. Every
+    /// StreamClient manager call MUST route through this (or through
+    /// `retry_manager_call`, which rotates itself) — a raw
+    /// `pool.call_timeout(self.manager_addr(), ..)` pins every
+    /// CALLER-side retry loop (partition open's 5 s commit_length loop,
+    /// GC cooldown retries, read-path cache refreshes) to a dead manager
+    /// forever. Observed (manager-HA chaos H2): with the old leader
+    /// killed and a healthy standby leading, a PS opening a migrated
+    /// partition hammered the dead address every 5 s for 20+ minutes.
+    async fn manager_call(&self, msg_type: u8, req: Bytes, timeout: Duration) -> Result<Bytes> {
+        match self
+            .pool
+            .call_timeout(self.manager_addr(), msg_type, req, timeout)
+            .await
+        {
+            Ok(b) => Ok(b),
+            Err(e) => {
+                self.rotate_manager();
+                Err(e)
+            }
+        }
+    }
+
+    /// companion: rotate away from a manager that ANSWERED but is
+    /// no longer the leader (alive-but-deposed after an HA failover) —
+    /// the symmetric wedge to the dead-address case above.
+    fn note_manager_code(&self, code: u8) {
+        if code == CODE_NOT_LEADER {
+            self.rotate_manager();
+        }
+    }
+
+    /// Shared tail of the manager-RPC wrappers: note the response `code`
+    /// (rotating to the next manager on NOT_LEADER) and bail with a typed
+    /// `ManagerError` when it isn't OK — `retry_manager_call` and the PS's
+    /// fence classifier downcast/Display it. Non-fence Display keeps the
+    /// pre-typed `"<ctx> failed: <message>"` shape.
+    fn check_manager_resp(&self, code: u8, message: &str, ctx: &str) -> Result<()> {
+        self.note_manager_code(code);
+        if code != CODE_OK {
+            return Err(anyhow::Error::new(ManagerError::new(code, ctx, message)));
+        }
+        Ok(())
+    }
+
+    async fn retry_manager_call<F, Fut, T>(&self, label: &str, max_retries: u32, f: F) -> Result<T>
+    where
+        F: Fn() -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
+        let mut attempt = 0u32;
+        loop {
+            let addr = self.manager_addr().to_string();
+            match f().await {
+                Ok(v) => return Ok(v),
+                Err(e) => {
+                    // BUG-MGR-RETRY-CLASS: classify BEFORE burning a retry.
+                    // A `ManagerError` in the chain means the manager
+                    // ANSWERED. A DETERMINISTIC verdict (NotFound /
+                    // InvalidArgument / the owner-epoch-fence Precondition)
+                    // reflects shared etcd state, so every rotated manager
+                    // returns the SAME answer and rotate+retry is pure
+                    // wasted latency (20×500ms per write on a permanently
+                    // stale epoch). Fail fast — returned
+                    // UNWRAPPED (no `.context()`) so the fence Display's
+                    // "LockedByOther" marker stays outermost for the PS's
+                    // poison-and-reopen classifier. Transport errors (no
+                    // ManagerError), NOT_LEADER / CODE_ERROR, AND the
+                    // TRANSIENT (non-fence) Preconditions — the "retry with
+                    // fresh snapshot" / "defer until it completes"
+                    // concurrency conflicts — keep the retry loop
+                    // (`is_retryable`).
+                    let (retryable, skip_rotate) = match e.downcast_ref::<ManagerError>() {
+                        Some(me) => (
+                            me.is_retryable(),
+                            // Don't rotate the manager for:
+                            //  - NOT_LEADER: already rotated in
+                            //    `note_manager_code` — a second rotate here
+                            //    would skip a live address.
+                            //  - a TRANSIENT concurrency conflict: this is a
+                            //    LEADER-side self-heal ("retry with a fresh
+                            //    snapshot" / "defer … until it completes"), so
+                            //    stay on the SAME leader and wait it out;
+                            //    rotating to a follower would just burn an
+                            //    iteration on the NOT_LEADER it returns (the
+                            //    multi-manager HA regression).
+                            me.code == manager_rpc::CODE_NOT_LEADER || me.is_transient_conflict(),
+                        ),
+                        // Transport error (no ManagerError): rotate to try
+                        // another manager.
+                        None => (true, false),
+                    };
+                    if !retryable {
+                        tracing::warn!(
+                            manager = %addr,
+                            error = %e,
+                            "{} got a deterministic manager error, failing fast",
+                            label,
+                        );
+                        return Err(e);
+                    }
+                    attempt += 1;
+                    if attempt > max_retries {
+                        return Err(
+                            e.context(format!("{label} failed after {max_retries} retries"))
+                        );
+                    }
+                    if !skip_rotate {
+                        self.rotate_manager();
+                    }
+                    tracing::warn!(
+                        attempt,
+                        max_retries,
+                        manager = %addr,
+                        error = %e,
+                        "{} failed, retrying in 500ms (next: {})",
+                        label,
+                        self.manager_addr(),
+                    );
+                    compio::time::sleep(Duration::from_millis(500)).await;
+                }
+            }
+        }
+    }
+
+    /// Connect with the default `StreamClientConfig`. Equivalent to
+    /// `connect_with_config(..., StreamClientConfig::default())`.
+    pub async fn connect(
+        manager_endpoint: &str,
+        owner_key: String,
+        max_extent_size: u64,
+        pool: Rc<ConnPool>,
+    ) -> Result<Rc<Self>> {
+        Self::connect_with_config(
+            manager_endpoint,
+            owner_key,
+            max_extent_size,
+            pool,
+            StreamClientConfig::default(),
+        )
+        .await
+    }
+
+    /// connect with explicit tunables.
+    pub async fn connect_with_config(
+        manager_endpoint: &str,
+        owner_key: String,
+        max_extent_size: u64,
+        pool: Rc<ConnPool>,
+        config: StreamClientConfig,
+    ) -> Result<Rc<Self>> {
+        let mgr_addrs: Vec<String> = manager_endpoint
+            .split(',')
+            .map(|s| crate::conn_pool::normalize_endpoint(s.trim()))
+            .collect();
+        let req = manager_rpc::rkyv_encode(&AcquireOwnerLockReq {
+            owner_key: owner_key.clone(),
+        });
+        let mut last_err = None;
+        let mut connected_idx = 0usize;
+        let mut owner_epoch = 0i64;
+        let mut ok = false;
+        for (idx, addr) in mgr_addrs.iter().enumerate() {
+            // 10 s — owner-lock acquisition is one etcd CAS on the
+            // manager side. Bounded so a deposed/hanging manager
+            // doesn't trap a fresh PS startup; the loop walks to the
+            // next manager address on timeout.
+            match pool
+                .call_timeout(
+                    addr,
+                    MSG_ACQUIRE_OWNER_LOCK,
+                    req.clone(),
+                    Duration::from_secs(10),
+                )
+                .await
+            {
+                Ok(resp_data) => {
+                    let resp: AcquireOwnerLockResp =
+                        manager_rpc::rkyv_decode(&resp_data).map_err(|e| anyhow!("{e}"))?;
+                    if resp.code == CODE_OK {
+                        connected_idx = idx;
+                        owner_epoch = resp.owner_epoch;
+                        ok = true;
+                        break;
+                    } else if resp.code == CODE_NOT_LEADER {
+                        last_err = Some(anyhow!("NotLeader from {}", addr));
+                        continue;
+                    } else {
+                        return Err(anyhow!("acquire_owner_lock failed: {}", resp.message));
+                    }
+                }
+                Err(e) => {
+                    last_err = Some(e);
+                    continue;
+                }
+            }
+        }
+        if !ok {
+            return Err(last_err.unwrap_or_else(|| anyhow!("no manager available")));
+        }
+        Ok(Self::construct(
+            mgr_addrs,
+            connected_idx,
+            owner_key,
+            owner_epoch,
+            max_extent_size,
+            pool,
+            config,
+        ))
+    }
+
+    /// Create a StreamClient that reuses an existing owner-lock owner_epoch
+    /// without calling `acquire_owner_lock` again. Accepts comma-separated
+    /// manager endpoints. Uses `StreamClientConfig::default()`.
+    pub async fn new_with_owner_epoch(
+        manager_endpoint: &str,
+        owner_key: String,
+        owner_epoch: i64,
+        max_extent_size: u64,
+        pool: Rc<ConnPool>,
+    ) -> Result<Rc<Self>> {
+        Self::new_with_owner_epoch_and_config(
+            manager_endpoint,
+            owner_key,
+            owner_epoch,
+            max_extent_size,
+            pool,
+            StreamClientConfig::default(),
+        )
+        .await
+    }
+
+    /// as `new_with_owner_epoch` but with explicit tunables.
+    pub async fn new_with_owner_epoch_and_config(
+        manager_endpoint: &str,
+        owner_key: String,
+        owner_epoch: i64,
+        max_extent_size: u64,
+        pool: Rc<ConnPool>,
+        config: StreamClientConfig,
+    ) -> Result<Rc<Self>> {
+        let mgr_addrs: Vec<String> = manager_endpoint
+            .split(',')
+            .map(|s| crate::conn_pool::normalize_endpoint(s.trim()))
+            .collect();
+        Ok(Self::construct(
+            mgr_addrs,
+            0,
+            owner_key,
+            owner_epoch,
+            max_extent_size,
+            pool,
+            config,
+        ))
+    }
+
+    /// Private ctor: `Rc::new_cyclic` captures a weak self-ref for the
+    /// per-stream workers' removal guard and for the failure-report
+    /// drainer task. `config` carries the (env-default-
+    /// equivalent) tunables; pass `StreamClientConfig::default()` to
+    /// keep historical behavior.
+    fn construct(
+        manager_addrs: Vec<String>,
+        current_mgr: usize,
+        owner_key: String,
+        owner_epoch: i64,
+        max_extent_size: u64,
+        pool: Rc<ConnPool>,
+        config: StreamClientConfig,
+    ) -> Rc<Self> {
+        let config = Rc::new(config);
+        // bounded channel — drop reports on overflow rather than
+        // OOMing the writer. The per-stream alloc route-around is
+        // the primary defense; reports are pure advisory.
+        let (failure_report_tx, failure_report_rx) = mpsc::channel::<FailureReport>(1024);
+        let rc = Rc::new_cyclic(|weak| Self {
+            self_weak: weak.clone(),
+            manager_addrs,
+            current_mgr: Cell::new(current_mgr),
+            owner_key,
+            owner_epoch,
+            max_extent_size,
+            bg_pool: Rc::new(pool.separate()),
+            pool,
+            nodes_cache: DashMap::new(),
+            node_addr_forgotten: RefCell::new(HashMap::new()),
+            extent_info_cache: DashMap::new(),
+            stream_workers: RefCell::new(HashMap::new()),
+            next_worker_gen: Cell::new(0),
+            stream_init_locks: RefCell::new(HashMap::new()),
+            stream_bad_nodes: RefCell::new(HashMap::new()),
+            failure_report_tx,
+            node_failure_reported: RefCell::new(HashMap::new()),
+            reporter_part_id: Cell::new(0),
+            reporter_row_stream: Cell::new(0),
+            config,
+            append_metrics: StreamAppendMetrics::default(),
+            suspected: Rc::new(RefCell::new(SuspectedCache::default())),
+        });
+        // spawn the drainer task on the current compio runtime.
+        // The Weak<Self> exits the loop when StreamClient is dropped.
+        let weak = Rc::downgrade(&rc);
+        compio::runtime::spawn(failure_report_drain_loop(weak, failure_report_rx)).detach();
+        rc
+    }
+
+    /// set the partition id that the manager-side quorum debounce
+    /// dedups by. Each `PartitionData` calls this once after
+    /// `new_with_owner_epoch`. Leaving it at 0 disables the failure-report
+    /// send path (the drainer skips events with reporter=0) — safe for tests and
+    /// for the rare server-level `StreamClient` that doesn't belong to
+    /// a partition.
+    pub fn set_reporter_part_id(&self, part_id: u64) {
+        self.reporter_part_id.set(part_id);
+    }
+
+    /// Set the reporter partition's row stream (`reporter_row_stream`).
+    pub fn set_reporter_row_stream(&self, row_stream_id: u64) {
+        self.reporter_row_stream.set(row_stream_id);
+    }
+
+    pub fn owner_epoch(&self) -> i64 {
+        self.owner_epoch
+    }
+    pub fn owner_key(&self) -> &str {
+        &self.owner_key
+    }
+
+    // ── internal helpers ─────────────────────────────────────────────────────
+
+    /// Returns `true` if the heartbeat monitor has seen a recent echo from the
+    /// extent node at `addr` (within the last 8 s).
+    pub fn is_extent_healthy(&self, addr: &str) -> bool {
+        self.pool.is_healthy(addr)
+    }
+
+    async fn refresh_nodes_map(&self) -> Result<()> {
+        // 5 s — read-only manager call, all in-memory state.
+        let resp_data = self
+            .pool
+            .call_timeout(
+                self.manager_addr(),
+                MSG_NODES_INFO,
+                Bytes::new(),
+                Duration::from_secs(5),
+            )
+            .await?;
+        let resp: NodesInfoResp =
+            manager_rpc::rkyv_decode(&resp_data).map_err(|e| anyhow!("{e}"))?;
+        self.check_manager_resp(resp.code, &resp.message, "nodes_info")?;
+        for (id, node) in resp.nodes {
+            self.nodes_cache
+                .insert(id, (node.address, node.shard_ports));
+        }
+        Ok(())
+    }
+
+    /// cheap, synchronous "does the manager currently believe this node
+    /// Suspected?" read off the cached snapshot. Same-thread `RefCell` borrow,
+    /// no await, no alloc.
+    fn is_node_suspected(&self, node_id: u64) -> bool {
+        self.suspected.borrow().nodes.contains(&node_id)
+    }
+
+    /// kick a NON-BLOCKING refresh of the Suspected snapshot if it's
+    /// older than `SUSPECTED_REFRESH_TTL` and none is already in flight. The
+    /// caller (read path) does NOT await this — it spawns a detached task that
+    /// polls `MSG_LIST_NODE_STATES` and swaps the snapshot in. The current read
+    /// proceeds on the existing (slightly stale) snapshot. Idle StreamClients
+    /// never poll: the refresh only fires while reads are actually happening.
+    ///
+    /// CONSEQUENCE (by design): the avoidance is STEADY-STATE / self-healing,
+    /// not a per-read guarantee. The FIRST read after a node flips to Suspected
+    /// (e.g. on a previously-idle client whose snapshot is still empty) only
+    /// *kicks* this refresh — it uses the old snapshot and can still pay one
+    /// timeout if it lands on the flaky node. Every read after the ~2 s refresh
+    /// routes around it. We accept this over a synchronous first-refresh (which
+    /// would put a manager RTT on the read's critical path) or idle background
+    /// polling (the per-partition manager traffic we deliberately avoid). It
+    /// never regresses the reactive failover.
+    fn maybe_refresh_suspected(&self) {
+        {
+            let c = self.suspected.borrow();
+            if c.refreshing {
+                return;
+            }
+            if let Some(t) = c.last_refresh {
+                if t.elapsed() < SUSPECTED_REFRESH_TTL {
+                    return;
+                }
+            }
+        }
+        let Some(sc) = self.self_weak.upgrade() else {
+            return;
+        };
+        sc.suspected.borrow_mut().refreshing = true;
+        compio::runtime::spawn(async move {
+            let res = sc.fetch_suspected_nodes().await;
+            let mut c = sc.suspected.borrow_mut();
+            c.refreshing = false;
+            c.last_refresh = Some(Instant::now());
+            // On error keep the previous snapshot — a failed poll must never
+            // widen the avoidance set (that could strand reads); stale is fine.
+            if let Ok(set) = res {
+                c.nodes = set;
+            }
+        })
+        .detach();
+    }
+
+    /// one `MSG_LIST_NODE_STATES` poll → the set of node ids the manager
+    /// currently marks `Suspected`. Rotates managers on transport / NotLeader
+    /// failure like every other StreamClient manager call.
+    async fn fetch_suspected_nodes(&self) -> Result<HashSet<u64>> {
+        // 5 s — read-only manager call over in-memory state (matches
+        // refresh_nodes_map). The handler ignores the request payload.
+        let resp_data = self
+            .manager_call(MSG_LIST_NODE_STATES, Bytes::new(), Duration::from_secs(5))
+            .await?;
+        let resp: ListNodeStatesResp =
+            manager_rpc::rkyv_decode(&resp_data).map_err(|e| anyhow!("{e}"))?;
+        self.check_manager_resp(resp.code, &resp.message, "list_node_states")?;
+        Ok(resp
+            .nodes
+            .iter()
+            .filter(|n| n.auto_state == NODE_AUTO_STATE_SUSPECTED)
+            .map(|n| n.node_id)
+            .collect())
+    }
+
+    fn replica_addrs_from_cache(&self, ex: &ExtentInfo) -> Result<Vec<String>> {
+        let mut addrs = Vec::with_capacity(ex.replicates.len() + ex.parity.len());
+        for node_id in ex.replicates.iter().chain(ex.parity.iter()) {
+            let entry = self
+                .nodes_cache
+                .get(node_id)
+                .ok_or_else(|| anyhow!("node {} missing", node_id))?;
+            let (addr, shard_ports) = entry.value();
+            // route this extent to the owning shard port.
+            addrs.push(crate::conn_pool::shard_addr_for_extent(
+                addr,
+                shard_ports,
+                ex.extent_id,
+            ));
+        }
+        if addrs.is_empty() {
+            return Err(anyhow!("extent {} has no replicas", ex.extent_id));
+        }
+        Ok(addrs)
+    }
+
+    async fn replica_addrs_for_extent(&self, ex: &ExtentInfo) -> Result<Vec<String>> {
+        if self.nodes_cache.is_empty() {
+            self.refresh_nodes_map().await?;
+        }
+        if let Ok(addrs) = self.replica_addrs_from_cache(ex) {
+            return Ok(addrs);
+        }
+        self.refresh_nodes_map().await?;
+        self.replica_addrs_from_cache(ex)
+    }
+
+    /// Per-stream init lock.  Used to serialise tail-load + ResetTail when
+    /// multiple public-API callers race to first-initialise the same stream.
+    fn stream_init_lock(&self, stream_id: u64) -> Rc<futures::lock::Mutex<bool>> {
+        if let Some(l) = self.stream_init_locks.borrow().get(&stream_id) {
+            return l.clone();
+        }
+        let l = Rc::new(futures::lock::Mutex::new(false));
+        self.stream_init_locks
+            .borrow_mut()
+            .insert(stream_id, l.clone());
+        l
+    }
+
+    /// Lookup-only: the per-stream worker's Sender IF one is live.
+    /// Never spawns. Used by `seal_and_roll_tail` to decide between the
+    /// live-writer roll (quiesce the worker first) and the probe roll
+    /// (no writer exists, a manager-side probe seal is race-free).
+    fn existing_stream_worker(&self, stream_id: u64) -> Option<mpsc::Sender<StreamSubmitMsg>> {
+        self.stream_workers
+            .borrow()
+            .get(&stream_id)
+            .map(|(_, tx)| tx.clone())
+    }
+
+    /// Get or spawn the per-stream worker, returning a cloned Sender.
+    fn stream_worker_sender(&self, stream_id: u64) -> mpsc::Sender<StreamSubmitMsg> {
+        if let Some((_, tx)) = self.stream_workers.borrow().get(&stream_id) {
+            return tx.clone();
+        }
+        let (tx, rx) = mpsc::channel::<StreamSubmitMsg>(STREAM_SUBMIT_CAP);
+        // `worker_gen`, not `gen`: the latter is a reserved keyword from
+        // edition 2024 and this workspace will migrate one day.
+        let worker_gen = self.next_worker_gen.get().wrapping_add(1);
+        self.next_worker_gen.set(worker_gen);
+        self.stream_workers
+            .borrow_mut()
+            .insert(stream_id, (worker_gen, tx.clone()));
+        let pool = self.pool.clone();
+        let bad_nodes = self.stream_bad_nodes_handle(stream_id);
+        // clone the failure-report sender into the worker so
+        // `apply_completion` Err can fire reports without an extra
+        // hop through the StreamClient.
+        let failure_report_tx = self.failure_report_tx.clone();
+        // hand the worker its tunables. `Rc<StreamClientConfig>`
+        // clone is O(1) ref-count bump.
+        let config = self.config.clone();
+        let guard = WorkerRemovalGuard {
+            sc: self.self_weak.clone(),
+            stream_id,
+            worker_gen,
+        };
+        compio::runtime::spawn(async move {
+            stream_worker_loop(
+                stream_id,
+                rx,
+                pool,
+                bad_nodes,
+                failure_report_tx,
+                config,
+                guard,
+            )
+            .await;
+        })
+        .detach();
+        tx
+    }
+
+    /// get or create the per-stream `bad_nodes` Rc handle.
+    /// Persisted across worker respawn so a node that just failed stays
+    /// excluded for one TTL window even if the worker briefly exits.
+    fn stream_bad_nodes_handle(&self, stream_id: u64) -> Rc<RefCell<HashMap<u64, Instant>>> {
+        if let Some(rc) = self.stream_bad_nodes.borrow().get(&stream_id) {
+            return rc.clone();
+        }
+        let rc = Rc::new(RefCell::new(HashMap::new()));
+        self.stream_bad_nodes
+            .borrow_mut()
+            .insert(stream_id, rc.clone());
+        rc
+    }
+
+    /// snapshot of currently-active (non-expired) bad-node ids for
+    /// `stream_id`. Lazily prunes expired entries during the read so the
+    /// map can never grow without bound. Returns empty Vec if no entry
+    /// exists (which is also the legacy / cold-start behaviour).
+    fn snapshot_bad_nodes(&self, stream_id: u64) -> Vec<u64> {
+        let map = self.stream_bad_nodes.borrow();
+        let Some(rc) = map.get(&stream_id) else {
+            return Vec::new();
+        };
+        let now = Instant::now();
+        let mut entries = rc.borrow_mut();
+        entries.retain(|_, expires_at| *expires_at > now);
+        entries.keys().copied().collect()
+    }
+
+    /// Discard the cached worker and init-lock for `stream_id` so the next
+    /// append spawns a fresh worker that re-loads the tail from the manager.
+    /// Used after partition split: the manager sealed the old tail, but the
+    /// existing worker still targets it.  Without invalidation the worker
+    /// keeps appending beyond `sealed_length`, and recovery (which reads up
+    /// to `sealed_length`) silently loses that data.
+    pub fn invalidate_stream(&self, stream_id: u64) {
+        self.stream_workers.borrow_mut().remove(&stream_id);
+        self.stream_init_locks.borrow_mut().remove(&stream_id);
+    }
+
+    async fn load_stream_tail(&self, stream_id: u64) -> Result<StreamTail> {
+        let req = manager_rpc::rkyv_encode(&StreamInfoReq {
+            stream_ids: vec![stream_id],
+        });
+        // 5 s — read-only manager call, in-memory state.
+        let resp_data = self
+            .manager_call(MSG_STREAM_INFO, req, Duration::from_secs(5))
+            .await?;
+        let resp: StreamInfoResp =
+            manager_rpc::rkyv_decode(&resp_data).map_err(|e| anyhow!("{e}"))?;
+        self.check_manager_resp(resp.code, &resp.message, "stream_info")?;
+        let (_, mgr_stream) = resp
+            .streams
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("stream {} not found", stream_id))?;
+        let tail_eid = *mgr_stream
+            .extent_ids
+            .last()
+            .ok_or_else(|| anyhow!("stream {} has no extents", stream_id))?;
+
+        let mgr_extent = resp
+            .extents
+            .into_iter()
+            .find(|(id, _)| *id == tail_eid)
+            .map(|(_, e)| e)
+            .ok_or_else(|| anyhow!("tail extent {} not in response", tail_eid))?;
+
+        let extent = Self::mgr_to_extent_info(&mgr_extent, PAYLOAD_LOCATION_IN_DAT);
+        self.extent_info_cache
+            .insert(extent.extent_id, extent.clone());
+
+        self.refresh_nodes_map().await?;
+        let addrs = self.replica_addrs_from_cache(&extent)?;
+        let node_ids = Self::replica_node_ids_for(&extent);
+
+        Ok(StreamTail {
+            extent,
+            replica_addrs: addrs,
+            replica_node_ids: node_ids,
+        })
+    }
+
+    /// Build a worker `StreamTail` for a freshly-allocated / rolled extent:
+    /// resolve the replica addresses (may lazily refresh the nodes cache) and
+    /// capture the matching replica node ids. Every roll/reset site must
+    /// construct the tail through here so the addr ↔ node-id pairing stays
+    /// consistent with the extent it was built from.
+    async fn build_stream_tail(&self, extent: ExtentInfo) -> Result<StreamTail> {
+        let replica_addrs = self.replica_addrs_for_extent(&extent).await?;
+        let replica_node_ids = Self::replica_node_ids_for(&extent);
+        Ok(StreamTail {
+            extent,
+            replica_addrs,
+            replica_node_ids,
+        })
+    }
+
+    /// chained `replicates ++ parity` node ids — same index order as
+    /// `replica_addrs_from_cache`. Used to populate `StreamTail.replica_node_ids`.
+    fn replica_node_ids_for(ex: &ExtentInfo) -> Vec<u64> {
+        ex.replicates
+            .iter()
+            .chain(ex.parity.iter())
+            .copied()
+            .collect()
+    }
+
+    async fn check_commit(&self, stream_id: u64) -> Result<(StreamInfo, ExtentInfo, u64)> {
+        let req = manager_rpc::rkyv_encode(&CheckCommitLengthReq {
+            stream_id,
+            owner_key: self.owner_key.clone(),
+            owner_epoch: self.owner_epoch,
+        });
+        // 15 s — manager fans out commit_length probes to every
+        // replica of the tail extent before responding; each replica
+        // call is itself bounded but the aggregate can take a few s.
+        let resp_data = self
+            .manager_call(MSG_CHECK_COMMIT_LENGTH, req, Duration::from_secs(15))
+            .await?;
+        let resp: CheckCommitLengthResp =
+            manager_rpc::rkyv_decode(&resp_data).map_err(|e| anyhow!("{e}"))?;
+        self.check_manager_resp(resp.code, &resp.message, "check_commit_length")?;
+        let stream = resp
+            .stream_info
+            .map(|s| Self::mgr_to_stream_info(&s))
+            .ok_or_else(|| anyhow!("check_commit: missing stream_info"))?;
+        let extent = resp
+            .last_ex_info
+            .map(|e| Self::mgr_to_extent_info(&e, PAYLOAD_LOCATION_IN_DAT))
+            .ok_or_else(|| anyhow!("check_commit: missing last_ex_info"))?;
+        Ok((stream, extent, resp.end))
+    }
+
+    async fn alloc_new_extent_once(
+        &self,
+        stream_id: u64,
+        seal_commit: Option<u64>,
+        seal_extent_id: u64,
+    ) -> Result<(StreamInfo, ExtentInfo)> {
+        // snapshot the per-stream `bad_nodes` set (lazily prunes
+        // expired entries). The manager filters its candidate pool by
+        // this set and only blocks allocation if doing so would empty
+        // the pool — see `select_nodes` + `handle_stream_alloc_extent`.
+        let exclude_node_ids = self.snapshot_bad_nodes(stream_id);
+        let req = manager_rpc::rkyv_encode(&StreamAllocExtentReq {
+            stream_id,
+            owner_key: self.owner_key.clone(),
+            owner_epoch: self.owner_epoch,
+            seal_commit,
+            exclude_node_ids,
+            // BUG2-IDEMPOTENT-ROLL: pin the seal to the extent the commit was
+            // captured for (0 = no specific target / probe). Reused verbatim
+            // across retries, so a retried roll seals THAT extent (idempotent),
+            // never the freshly-rolled new tail.
+            seal_extent_id,
+        });
+        // 30 s — manager seals current tail (3-replica commit_length
+        // probe + etcd mirror) and allocs a fresh extent on each new
+        // replica node (alloc_extent_on_node bounded at 10 s each).
+        let resp_data = self
+            .pool
+            .call_timeout(
+                self.manager_addr(),
+                MSG_STREAM_ALLOC_EXTENT,
+                req,
+                Duration::from_secs(30),
+            )
+            .await?;
+        let resp: StreamAllocExtentResp =
+            manager_rpc::rkyv_decode(&resp_data).map_err(|e| anyhow!("{e}"))?;
+        // BUG-MGR-RETRY-CLASS: routed through `check_manager_resp` so the
+        // failure keeps its wire code (typed `ManagerError`) for the retry
+        // classifier — this is THE call a stale epoch used to burn 20×500ms
+        // on — and so NOT_LEADER now rotates here too (this site
+        // predates `note_manager_code` and never rotated on a deposed
+        // leader; the outer retry loop's blind rotate masked it).
+        self.check_manager_resp(resp.code, &resp.message, "stream_alloc_extent")?;
+        let stream = resp
+            .stream_info
+            .map(|s| Self::mgr_to_stream_info(&s))
+            .ok_or_else(|| anyhow!("alloc_new_extent: missing stream_info"))?;
+        let extent = resp
+            .last_ex_info
+            .map(|e| Self::mgr_to_extent_info(&e, PAYLOAD_LOCATION_IN_DAT))
+            .ok_or_else(|| anyhow!("alloc_new_extent: missing last_ex_info"))?;
+        self.extent_info_cache
+            .insert(extent.extent_id, extent.clone());
+        // GC-RECLAIM: refresh the OLD tail's cache entry to its post-seal state.
+        // `alloc_new_extent` caches only the NEW tail; pre-this the OLD tail
+        // lingered as its pre-seal OPEN snapshot (`sealed=false, sealed_length=0`)
+        // and GC's authoritative-sealed gate (background.rs
+        // `authoritative_sealed`) SKIPS anything not-sealed — so the rolled
+        // extent was never reclaimed until its cache happened to refresh (a read /
+        // EC-invalidate / restart): a GC-reclamation leak.
+        //
+        // We INVALIDATE the old tail's cache rather than SYNTHESIZE its sealed
+        // length (data-loss): we must NOT write `sealed_length = seal_
+        // commit` locally, because the manager does NOT guarantee it sealed this
+        // extent at exactly `seal_commit` — its `already_sealed` branch IGNORES
+        // `req.seal_commit` and preserves the EXISTING `sealed_length L` (a prior
+        // probe/split/merge seal; `L ≥ acked ≥ seal_commit`). Caching a too-small
+        // `seal_commit < L` would make GC relocate only the first `seal_commit`
+        // bytes yet punch the whole extent → lose committed `[seal_commit, L)`.
+        // Invalidating forces GC's next `get_extent_info` to fetch the
+        // AUTHORITATIVE sealed length from the manager. The extra cache-miss RPC
+        // is safe now: the seed=603 wedge a GC-side refetch would once have
+        // exposed is itself fixed (BUG2-IDEMPOTENT-ROLL), so the timing shift no
+        // longer wedges anything; and it is one-shot (re-cached on the fetch).
+        if seal_commit.is_some() && seal_extent_id != 0 {
+            self.extent_info_cache.remove(&seal_extent_id);
+        } else if seal_extent_id == 0 {
+            // An unpinned roll names no target: the manager sealed whatever
+            // was the tail, now the new extent's predecessor.
+            if let [.., old_tail, _] = stream.extent_ids[..] {
+                self.extent_info_cache.remove(&old_tail);
+            }
+        }
+        Ok((stream, extent))
+    }
+
+    async fn alloc_new_extent(
+        &self,
+        stream_id: u64,
+        seal_commit: Option<u64>,
+        seal_extent_id: u64,
+    ) -> Result<(StreamInfo, ExtentInfo)> {
+        // BUG2-IDEMPOTENT-ROLL: `seal_extent_id` is captured ONCE (with
+        // `seal_commit`) and reused across every retry inside
+        // `retry_manager_call`, so a retried roll seals the original tail
+        // (idempotent), never the freshly-rolled new tail.
+        let out = self
+            .retry_manager_call("alloc_new_extent", 20, || {
+                self.alloc_new_extent_once(stream_id, seal_commit, seal_extent_id)
+            })
+            .await?;
+        // BUG-FLUSH-TIMEOUT-LEAK FIX #2: a failure-roll that sealed its old
+        // tail at commit=0 abandoned an extent on which NOT ONE byte was ever
+        // all-replica-acked (caller-ack ⊆ contiguous commit, so no VP / SST /
+        // checkpoint can reference it) — yet the extent may physically hold
+        // hundreds of MB of un-acked replica bytes (e.g. 256 MiB
+        // SST appends that timed out AFTER every EN durably wrote them). Left
+        // in place it is PERMANENTLY unreclaimable: sealed_length=0 keeps it
+        // out of all logical accounting, log-GC punches only extents it holds
+        // discards for, and row-stream `truncate` only advances past extents
+        // holding live tables. Reclaim it NOW (best-effort punch → refs-- →
+        // physical delete at refs=0). Guarded three ways: only the
+        // authoritative empty seal (`Some(0)`) qualifies, only a pinned tail
+        // (`seal_extent_id != 0`), and never the extent the manager just
+        // handed back as the current tail (the BUG2 idempotent-no-op branch).
+        if seal_commit == Some(0) && seal_extent_id != 0 && out.1.extent_id != seal_extent_id {
+            self.reclaim_abandoned_empty_tail(stream_id, seal_extent_id)
+                .await;
+        }
+        Ok(out)
+    }
+
+    /// BUG-FLUSH-TIMEOUT-LEAK FIX #2 — reclaim a rolled-away tail that was
+    /// sealed EMPTY (sealed_length == 0). Best-effort: any failure only delays
+    /// reclamation (WARN), never the roll itself.
+    ///
+    /// Safety argument (data-loss review — this path deletes an extent):
+    /// - We act only on the manager's AUTHORITATIVE post-seal state: the cache
+    ///   entry is invalidated and re-fetched, and we require `sealed == true`
+    ///   AND `sealed_length == 0` (the same immutable-`sealed` gate GC's
+    ///   `authoritative_sealed` trusts). If the manager's
+    ///   `already_sealed` branch preserved a PRIOR non-zero seal (the extent
+    ///   holds acked data), `sealed_length != 0` and we do nothing.
+    /// - `sealed_length == 0` under the seal invariants (SealCommit handshake
+    ///   ≥ acked; probe = min over committed members ≥ acked; note 20/22)
+    ///   means NO byte on this extent was ever acked to any caller, so no
+    ///   ValuePointer, SST TableLocation, or checkpoint can reference it —
+    ///   reads of it are impossible by construction. Punching removes only
+    ///   physically-present but logically-nonexistent bytes.
+    /// - CoW safety: `punch_holes` removes the extent from THIS stream and
+    ///   decrements `refs`; a split-shared extent (refs ≥ 2) merely drops our
+    ///   membership — the sibling keeps its reference. Physical delete happens
+    ///   only at refs == 0 via the manager's guarded delete queue.
+    /// - The worker cannot race us: the SealCommit handshake set
+    ///   `sealing = true` (appends rejected) and `ResetTail` to the fresh
+    ///   tail is sent only after `alloc_new_extent` (and this reclaim)
+    ///   returns; the manager rejects any stale-epoch writer via
+    ///   `ensure_owner_epoch`, and an in-flight ledger op (Recovery/EC) makes
+    ///   `punch_holes` refuse with Precondition (→ WARN, not retried here: the
+    ///   manager's sealed-empty sweep reclaims the extent once the op is done).
+    async fn reclaim_abandoned_empty_tail(&self, stream_id: u64, extent_id: u64) {
+        self.invalidate_extent_cache(extent_id);
+        let info = match self.get_extent_info(extent_id).await {
+            Ok(i) => i,
+            Err(e) => {
+                tracing::warn!(
+                    stream_id,
+                    extent_id,
+                    error = %e,
+                    "abandoned-tail reclaim: extent_info fetch failed; the manager's sealed-empty sweep reclaims it"
+                );
+                return;
+            }
+        };
+        if !info.sealed || info.sealed_length != 0 {
+            // Not authoritatively sealed-empty — someone acked/sealed real
+            // data here (or the seal didn't land). Never punch it.
+            return;
+        }
+        match self.punch_holes(stream_id, vec![extent_id]).await {
+            Ok(_) => {
+                // Drop the just-cached sealed-empty entry so later readers
+                // see the extent as gone, not as a stale cached record.
+                self.invalidate_extent_cache(extent_id);
+                tracing::info!(
+                    stream_id,
+                    extent_id,
+                    "reclaimed abandoned empty rolled-away tail extent (BUG-FLUSH-TIMEOUT-LEAK)"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    stream_id,
+                    extent_id,
+                    error = %e,
+                    "abandoned-tail reclaim: punch_holes failed; the manager's sealed-empty sweep reclaims it"
+                );
+            }
+        }
+    }
+
+    /// Seal-and-roll the current OPEN tail of `stream_id`, safely for BOTH
+    /// caller shapes:
+    ///
+    /// **Live writer (a per-stream worker exists — the fence-drain
+    /// `MSG_ROLL_TAILS` path):** the roll MUST go through the worker. A bare
+    /// manager probe-seal behind a live worker's back freezes the manager's
+    /// `sealed_length` while the worker — whose cached tail and the ENs' local
+    /// state know nothing of the seal (seal state propagates to ENs lazily,
+    /// and the writer's cached eversion still matches the ENs') — keeps
+    /// appending to the SAME extent and keeps getting client ACKs. Every byte
+    /// acked after the seal sits above `sealed_length`: recovery's
+    /// committed-clamped replay stops at the seal (silent loss of acked
+    /// writes), and any checkpoint/SST that lands in or references the ghost
+    /// region wedges a CoW split child with
+    /// `stale_vp_offset_past_sealed_length` (the chaos acked-write-loss family, reproduced by
+    /// `system_roll_tails_live_writer`). So: SealCommit handshake (quiesce →
+    /// the worker's exact all-replica-acked commit; freezes the doomed tail
+    /// against new appends), authoritative seal+alloc PINNED to that tail
+    /// (note 20/32a idempotent-roll rules), then `ResetTail` so the writer
+    /// resumes on the fresh extent — the same mechanics as the append-failure
+    /// roll.
+    ///
+    /// **No live writer (WAL self-heal A4 during recovery, pre-worker):**
+    /// manager probe (seal-over-reachable) + fresh tail. Race-free because
+    /// there is no writer to race: `min`-over-reachable ≥ acked under
+    /// all-replica-ACK, and the fresh tail is picked up by
+    /// `ensure_tail_initialised` when the worker later spawns (the old tail
+    /// now reports sealed → alloc fresh, the standard path).
+    pub async fn seal_and_roll_tail(&self, stream_id: u64) -> Result<()> {
+        if let Some(tx) = self.existing_stream_worker(stream_id) {
+            let (seal_commit, seal_eid) = self.seal_commit_watermark(stream_id, &tx).await?;
+            if seal_eid != 0 {
+                // If alloc fails here the worker is left `sealing = true`;
+                // that is self-healing: the next append soft-errors and the
+                // public-API retry path escalates to its own
+                // SealCommit+alloc+ResetTail roll (and the fence-drain sweep
+                // retries on its cooldown).
+                let (_, new_ext) = self
+                    .alloc_new_extent(stream_id, Some(seal_commit), seal_eid)
+                    .await?;
+                let new_tail = self.build_stream_tail(new_ext).await?;
+                let mut tx_clone = tx.clone();
+                tx_clone
+                    .send(StreamSubmitMsg::ResetTail { tail: new_tail })
+                    .await
+                    .map_err(|_| anyhow!("stream {stream_id} worker gone mid-roll"))?;
+                return Ok(());
+            }
+            // Worker exists but never initialised a tail (seal_eid == 0):
+            // nothing acked through it — fall through to the probe roll.
+            // (SealCommit left it `sealing = true`; the first append's
+            // ResetTail onto the fresh tail clears the flag.)
+        }
+        // None seal_commit (probe) → seal_extent_id=0 (no specific target).
+        self.alloc_new_extent(stream_id, None, 0).await?;
+        Ok(())
+    }
+
+    /// SealCommit handshake — ask the per-stream worker for its TRUE
+    /// all-replica-acked commit on the current tail, captured at a QUIESCED
+    /// point (the worker drains every in-flight append first). This is the
+    /// ONLY safe source for the failover seal length: a value tracked in the
+    /// public API always lags the worker's `state.commit` and races concurrent
+    /// out-of-order appends + tail rolls (→ phantom seal or acked-data
+    /// truncation). The drain is bounded by each append's size-scaled
+    /// deadline (capped), so it cannot hang. Returns the commit (may be
+    /// 0 for a tail where nothing was ever all-acked); the caller passes it to
+    /// `alloc_new_extent(.., Some(commit))` so the manager seals
+    /// at EXACTLY this value without probing.
+    /// Returns `(commit, tail_extent_id)` — `tail_extent_id` is the extent the
+    /// drained `commit` belongs to (BUG2-IDEMPOTENT-ROLL). Pass it on to
+    /// `alloc_new_extent` as `seal_extent_id` so a retried roll seals THAT
+    /// extent (idempotent), not the freshly-rolled tail.
+    async fn seal_commit_watermark(
+        &self,
+        stream_id: u64,
+        tx: &mpsc::Sender<StreamSubmitMsg>,
+    ) -> Result<(u64, u64)> {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        let mut tx_clone = tx.clone();
+        tx_clone
+            .send(StreamSubmitMsg::SealCommit { resp: resp_tx })
+            .await
+            .map_err(|_| anyhow!("stream {stream_id} worker gone before SealCommit"))?;
+        resp_rx
+            .await
+            .map_err(|_| anyhow!("stream {stream_id} worker dropped SealCommit resp"))
+    }
+
+    /// Core append implementation.  Thin wrapper that wraps a single Bytes
+    /// payload into the segments vec expected by the worker path.
+    async fn append_payload(&self, stream_id: u64, payload: Bytes) -> Result<AppendResult> {
+        self.append_payload_segments(stream_id, vec![payload.into()], None).await
+    }
+
+    /// R4 4.3 public-API retry loop.  The worker is a stateful single-op
+    /// executor: it leases offsets, fires 3 replicas, and acks/rewinds on
+    /// completion.  Retries (NotFound, soft errors, extent-full) live here.
+    ///
+    /// Steps per loop iteration:
+    ///   1. Send Append msg to worker (parks on bounded channel under overload).
+    ///   2. Await ack_rx.
+    ///   3a. Ok  → if result.end >= max_extent_size, alloc + ResetTail;
+    ///             return the AppendResult.
+    ///   3b. Err "not found on replica" → alloc + ResetTail; retry.
+    ///   3c. Err "LockedByOther" → return immediately (PS should self-evict).
+    ///   3d. Err soft (retry ≤ 2) → sleep 100ms, reload tail, ResetTail; retry.
+    ///   3e. Err hard → alloc + ResetTail; retry.
+    ///
+    /// Invariant: a `ResetTail` that moves the worker to a DIFFERENT extent
+    /// must follow a `SealCommit` drain, so no append is in flight across it.
+    /// The soft-error reload is the exception and is backstopped in
+    /// `apply_completion`; see stream CLAUDE.md note 36.
+    /// the new extent.
+    ///
+    /// An error after the payload was handed to the worker carries
+    /// `APPEND_OUTCOME_UNKNOWN`.
+    async fn append_payload_segments(
+        &self,
+        stream_id: u64,
+        segments: Vec<autumn_transport::RegBytes>,
+        crc: Option<u32>,
+    ) -> Result<AppendResult> {
+        let sent = std::cell::Cell::new(false);
+        self.append_payload_attempts(stream_id, segments, crc, &sent)
+            .await
+            .map_err(|e| {
+                if !sent.get() {
+                    return e;
+                }
+                // The original message stays first: callers match on it.
+                let outer = e.to_string();
+                e.context(format!("{outer} ({APPEND_OUTCOME_UNKNOWN})"))
+            })
+    }
+
+    async fn append_payload_attempts(
+        &self,
+        stream_id: u64,
+        segments: Vec<autumn_transport::RegBytes>,
+        crc: Option<u32>,
+        sent: &std::cell::Cell<bool>,
+    ) -> Result<AppendResult> {
+        let payload_len_u32: u32 = segments.iter().map(|s| s.len() as u32).sum();
+        let payload_len: usize = payload_len_u32 as usize;
+        let append_started_at = Instant::now();
+
+        let tx = self.stream_worker_sender(stream_id);
+
+        // First-use tail init (serialised per stream).
+        self.ensure_tail_initialised(stream_id, &tx).await?;
+
+        let mut retry = 0usize;
+        let mut alloc_count = 0u32;
+        const MAX_ALLOC_PER_APPEND: u32 = 3;
+        let mut fanout_elapsed = Duration::default();
+        let lock_wait_total = Duration::default();
+        let extent_lookup_elapsed = Duration::default();
+
+        loop {
+            let (ack_tx, ack_rx) = oneshot::channel();
+            let msg = StreamSubmitMsg::Append {
+                payload_parts: segments.clone(),
+                payload_crc: crc,
+                owner_epoch: self.owner_epoch,
+                ack_tx,
+            };
+
+            let fanout_started_at = Instant::now();
+            {
+                let mut tx_clone = tx.clone();
+                tx_clone
+                    .send(msg)
+                    .await
+                    .map_err(|_| anyhow!("stream {stream_id} worker gone"))?;
+                sent.set(true);
+            }
+            let ack = ack_rx
+                .await
+                .map_err(|_| anyhow!("stream {stream_id} worker dropped ack"))?;
+            fanout_elapsed += fanout_started_at.elapsed();
+
+            match ack {
+                Ok(result) => {
+                    let total_elapsed = append_started_at.elapsed();
+                    tracing::debug!(
+                        stream_id,
+                        payload_len,
+                        fanout_ms = fanout_elapsed.as_secs_f64() * 1000.0,
+                        total_ms = total_elapsed.as_secs_f64() * 1000.0,
+                        retry,
+                        "append_payload"
+                    );
+                    self.append_metrics.record(
+                        &self.owner_key,
+                        lock_wait_total,
+                        extent_lookup_elapsed,
+                        fanout_elapsed,
+                        total_elapsed,
+                        retry as u64,
+                    );
+
+                    if result.end >= self.max_extent_size {
+                        alloc_count += 1;
+                        if alloc_count <= MAX_ALLOC_PER_APPEND {
+                            // Preemptive roll on a SUCCESSFUL cap-hitting append.
+                            //
+                            // QUIESCE FIRST, like every other roller. This used
+                            // to seal at `result.end` — this append's acked end —
+                            // on the theory that later-leased appends are beyond
+                            // it and get re-driven onto the new tail. Neither
+                            // half held, because the partition server pipelines
+                            // up to eight Phase-2 appends on one stream:
+                            //
+                            //   * an append leased behind this one can COMPLETE
+                            //     before the `ResetTail` lands. `ack` has no cap
+                            //     awareness, so it advances the contiguous prefix
+                            //     and acks that caller Ok — at an offset past the
+                            //     seal this roll is about to take. Those bytes
+                            //     are acked and then discarded: WAL replay clamps
+                            //     to `sealed_length`, so they are invisible on
+                            //     recovery. Silent loss of acked data, which is
+                            //     the one thing notes 20/22/25a exist to prevent.
+                            //   * an append still IN FLIGHT at the reset is not
+                            //     re-driven by anything. It completes afterwards
+                            //     against the fresh extent's state, where
+                            //     `commit` is 0, and parks its caller forever
+                            //     (see `apply_completion`'s stale-extent arm).
+                            //
+                            // The SealCommit handshake closes both: it drains
+                            // `inflight`, so the commit it reports covers every
+                            // completed append and none is stranded, and it sets
+                            // `sealing` so appends arriving during the roll are
+                            // bounced onto the fresh tail instead of landing past
+                            // the seal. Cost is one pipeline drain per 16 GiB per
+                            // stream.
+                            // A failure after the handshake leaves the worker
+                            // frozen (`sealing = true`) with no tail to move to.
+                            // It self-heals — the next append soft-errors twice
+                            // and the hard path runs its own seal-and-roll — but
+                            // silently, so say it happened.
+                            match self.seal_commit_watermark(stream_id, &tx).await {
+                                Ok((seal_commit, seal_eid)) => {
+                                    match self
+                                        .alloc_new_extent(stream_id, Some(seal_commit), seal_eid)
+                                        .await
+                                    {
+                                        Ok((_, new_ext)) => {
+                                            match self.build_stream_tail(new_ext).await {
+                                                Ok(new_tail) => {
+                                                    let mut tx_clone = tx.clone();
+                                                    let _ = tx_clone
+                                                        .send(StreamSubmitMsg::ResetTail {
+                                                            tail: new_tail,
+                                                        })
+                                                        .await;
+                                                }
+                                                Err(e) => tracing::warn!(
+                                                    stream_id, error = %e,
+                                                    "preemptive roll: sealed but could not build \
+                                                     the new tail; the next append re-rolls",
+                                                ),
+                                            }
+                                        }
+                                        Err(e) => tracing::warn!(
+                                            stream_id, error = %e,
+                                            "preemptive roll: sealed but could not allocate a new \
+                                             extent; the next append re-rolls",
+                                        ),
+                                    }
+                                }
+                                Err(e) => tracing::warn!(
+                                    stream_id, error = %e,
+                                    "preemptive roll: could not quiesce the worker; the tail stays \
+                                     past its cap until the next append rolls it",
+                                ),
+                            }
+                        }
+                    }
+
+                    return Ok(AppendResult {
+                        extent_id: result.extent_id,
+                        offset: result.offset,
+                        end: result.end,
+                    });
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    let is_not_found = msg.contains("not found on replica");
+                    let is_locked = msg.contains("LockedByOther");
+
+                    if is_locked {
+                        return Err(e);
+                    }
+
+                    // "no tail set" means this worker never ran its init, so it
+                    // still holds the `lease_cursor = 0` it was born with. The
+                    // soft path below would reload the tail and retry, and the
+                    // retry would lease at zero — `header.commit = 0` against a
+                    // live extent, which every replica honours by truncating.
+                    // That is how three replicas each dropped 1.7 GiB.
+                    //
+                    // It is also unreachable by design: every append path calls
+                    // `ensure_tail_initialised` first. So fail LOUDLY instead of
+                    // papering over it — the caller re-enters and re-initialises
+                    // (a partition server reopens the partition: the error comes
+                    // back marked `APPEND_OUTCOME_UNKNOWN`), and a future lifecycle
+                    // bug surfaces as an error instead of as silent data loss.
+                    if msg.contains("no tail set") {
+                        // Clear the init flag on the way out, or this is not a
+                        // fail-fast — it is a permanent one. Re-entry reaches the
+                        // SAME worker, and `ensure_tail_initialised` would see the
+                        // flag still set and return without sending `ResetTail`,
+                        // so every later append on this stream fails too, until a
+                        // split or a restart. Dropping the flag makes the next
+                        // call re-run the init that was skipped.
+                        self.stream_init_locks.borrow_mut().remove(&stream_id);
+                        return Err(e.context(
+                            "worker had no tail: refusing to retry, because the \
+                             retry would lease from offset 0 and truncate the tail",
+                        ));
+                    }
+
+                    retry += 1;
+                    if is_not_found {
+                        alloc_count += 1;
+                        if alloc_count > MAX_ALLOC_PER_APPEND {
+                            return Err(anyhow!(
+                                "too many extent allocations ({alloc_count}) for single append, giving up"
+                            ));
+                        }
+                        // SealCommit handshake: seal the failed tail at the
+                        // worker's TRUE drained commit (no probe → no phantom).
+                        // BUG2-IDEMPOTENT-ROLL: pin the seal to the tail the
+                        // commit was captured for, so a retried roll is idempotent.
+                        let (seal_commit, seal_eid) =
+                            self.seal_commit_watermark(stream_id, &tx).await?;
+                        let (_, new_ext) = self
+                            .alloc_new_extent(stream_id, Some(seal_commit), seal_eid)
+                            .await?;
+                        let new_tail = self.build_stream_tail(new_ext).await?;
+                        let mut tx_clone = tx.clone();
+                        tx_clone
+                            .send(StreamSubmitMsg::ResetTail { tail: new_tail })
+                            .await
+                            .map_err(|_| anyhow!("worker gone mid-retry"))?;
+                        continue;
+                    }
+
+                    if retry <= 2 {
+                        tracing::warn!(stream_id, retry, error = %e, "append soft-error, retrying");
+                        compio::time::sleep(Duration::from_millis(100)).await;
+                        let fresh = self.load_stream_tail(stream_id).await?;
+                        if fresh.extent.sealed {
+                            alloc_count += 1;
+                            if alloc_count > MAX_ALLOC_PER_APPEND {
+                                return Err(anyhow!(
+                                    "too many extent allocations ({alloc_count}) for single append, giving up"
+                                ));
+                            }
+                            // BUG2-IDEMPOTENT-ROLL: pin seal to the captured tail.
+                            let (seal_commit, seal_eid) =
+                                self.seal_commit_watermark(stream_id, &tx).await?;
+                            let (_, new_ext) = self
+                                .alloc_new_extent(stream_id, Some(seal_commit), seal_eid)
+                                .await?;
+                            let new_tail = self.build_stream_tail(new_ext).await?;
+                            let mut tx_clone = tx.clone();
+                            tx_clone
+                                .send(StreamSubmitMsg::ResetTail { tail: new_tail })
+                                .await
+                                .map_err(|_| anyhow!("worker gone mid-retry"))?;
+                        } else {
+                            // Open tail reload. Hand the freshly-loaded tail to
+                            // the worker; the worker's `ResetTail` handler
+                            // decides whether to ZERO `state.commit`:
+                            //   - SAME extent (the common soft-error case — a
+                            //     transient replica failure that did NOT change
+                            //     the tail) → PRESERVE the worker's commit (the
+                            //     authoritative all-replica-acked prefix), only
+                            //     refresh replica addrs. BUG#2 (seed=8): zeroing
+                            //     it here let a later `seal_commit_watermark`
+                            //     report commit=0 and seal the live tail at
+                            //     sealed_length=0, orphaning acked VP/SST data
+                            //     (split child then can't open:
+                            //     stale_vp_offset_past_sealed_length).
+                            //   - DIFFERENT extent (a genuine roll to a fresh,
+                            //     empty open extent) → reset to 0 (correct).
+                            // Putting the same-vs-different decision in the
+                            // worker is load-bearing: only the worker knows its
+                            // current cached tail extent_id (the public API does
+                            // not), so it is the one place that can tell a
+                            // transient failure on the same tail apart from a
+                            // real tail change.
+                            let mut tx_clone = tx.clone();
+                            tx_clone
+                                .send(StreamSubmitMsg::ResetTail { tail: fresh })
+                                .await
+                                .map_err(|_| anyhow!("worker gone mid-retry"))?;
+                        }
+                        continue;
+                    }
+
+                    alloc_count += 1;
+                    if alloc_count > MAX_ALLOC_PER_APPEND {
+                        return Err(anyhow!(
+                            "too many extent allocations ({alloc_count}) for single append, giving up: {e}"
+                        ));
+                    }
+                    // BUG2-IDEMPOTENT-ROLL: pin seal to the captured tail.
+                    let (seal_commit, seal_eid) =
+                        self.seal_commit_watermark(stream_id, &tx).await?;
+                    let (_, new_ext) = self
+                        .alloc_new_extent(stream_id, Some(seal_commit), seal_eid)
+                        .await
+                        .map_err(|alloc_err| {
+                            alloc_err
+                                .context(format!("alloc_new_extent failed after append error: {e}"))
+                        })?;
+                    let new_tail = self.build_stream_tail(new_ext).await?;
+                    let mut tx_clone = tx.clone();
+                    tx_clone
+                        .send(StreamSubmitMsg::ResetTail { tail: new_tail })
+                        .await
+                        .map_err(|_| anyhow!("worker gone mid-retry"))?;
+                    retry = 0;
+                    continue;
+                }
+            }
+        }
+    }
+
+    /// First-use tail initialisation for a stream.  Serialised by a per-
+    /// stream mutex so concurrent first-callers don't each RPC the
+    /// manager.  The first caller loads the tail + queries commit_length
+    /// and sends `ResetTail` + `SeedCursor` to the worker; subsequent
+    /// callers observe `*guard == true` and skip.
+    async fn ensure_tail_initialised(
+        &self,
+        stream_id: u64,
+        tx: &mpsc::Sender<StreamSubmitMsg>,
+    ) -> Result<()> {
+        let lock = self.stream_init_lock(stream_id);
+        let mut guard = lock.lock().await;
+        if *guard {
+            return Ok(());
+        }
+        let tail = self.load_stream_tail(stream_id).await?;
+        let (tail, commit_val) = if tail.extent.sealed {
+            // First-use / new-owner init: the inherited tail is already sealed,
+            // so this is NOT a failover seal — we just roll past it. The
+            // manager's `already_sealed` short-circuit preserves the existing
+            // seal; `seal_commit = None` (no worker commit to claim → probe).
+            let (_, new_ext) = self.alloc_new_extent(stream_id, None, 0).await?;
+            (self.build_stream_tail(new_ext).await?, 0)
+        } else {
+            // Open tail. Determine its committed length to seed the worker
+            // cursor. A failure here must NEVER seed 0 — the earlier
+            // `unwrap_or(0)` turned "can't determine the committed length (a
+            // replica down)" into cursor=0, and the next append's
+            // `header.commit=0` truncated EVERY replica to 0, destroying all
+            // acked data. So we retry the all-replica probe a few times first.
+            //
+            // BUG#1 (seed=15) — open-tail write-wedge: but a PERSISTENT failure
+            // (a replica on the OPEN active tail permanently unreachable/short)
+            // would otherwise wedge flush + writes FOREVER. Recovery only
+            // reconfigures SEALED extents, so the open tail's bad replica never
+            // heals, and `current_commit(&tail).await?` just propagated the
+            // error on every retry → the flush's first-use init looped forever.
+            // Escape: SEAL-AND-ROLL to a fresh tail on healthy nodes via
+            // `alloc_new_extent(stream_id, None)`. This is SAFE under
+            // all-replica-ACK: the manager's None path runs the LENIENT
+            // seal-over-reachable probe (`compute_commit_seal`), sealing the old
+            // tail at `min` over the reachable COMMITTED members, which is ≥ the
+            // acked length (every acked record is on every replica) — no acked
+            // data is dropped; only un-acked speculation past the seal is. MUST
+            // pass `None` (let the manager probe), NEVER `Some(0)` (that asserts
+            // commit=0 — the exact silent truncation the propagate above guards
+            // against; we have no trusted worker commit here).
+            let mut commit_result = self.current_commit(&tail).await;
+            for _ in 0..OPEN_TAIL_COMMIT_RETRIES {
+                if commit_result.is_ok() {
+                    break;
+                }
+                compio::time::sleep(Duration::from_millis(OPEN_TAIL_COMMIT_BACKOFF_MS)).await;
+                commit_result = self.current_commit(&tail).await;
+            }
+            match commit_result {
+                Ok(commit_val) => (tail, commit_val),
+                Err(e) => {
+                    tracing::warn!(
+                        stream_id,
+                        extent_id = tail.extent.extent_id,
+                        error = %e,
+                        "BUG#1: open-tail current_commit persistently failed — sealing + rolling to a fresh tail (seal-over-reachable)"
+                    );
+                    let (_, new_ext) = self.alloc_new_extent(stream_id, None, 0).await?;
+                    (self.build_stream_tail(new_ext).await?, 0)
+                }
+            }
+        };
+        let mut tx_clone = tx.clone();
+        tx_clone
+            .send(StreamSubmitMsg::ResetTail { tail })
+            .await
+            .map_err(|_| anyhow!("worker gone before init"))?;
+        if commit_val > 0 {
+            tx_clone
+                .send(StreamSubmitMsg::SeedCursor { cursor: commit_val })
+                .await
+                .map_err(|_| anyhow!("worker gone before init"))?;
+        }
+        *guard = true;
+        Ok(())
+    }
+
+    /// Query commit length from all replicas (min). Called on first append
+    /// to an existing extent (commit==0) to avoid truncating pre-existing data.
+    ///
+    /// NO quorum. This is a WAS stream layer — the append path is
+    /// all-replica-ACK (`apply_completion` acks only when every replica
+    /// wrote the record), so the committed length must be derived from ALL
+    /// replicas. A subset `min` (the former majority-quorum) can sit
+    /// BELOW the acked length when it includes a short / catching-up
+    /// replica (→ next append's `header.commit` truncates acked data on
+    /// the up-to-date replicas → silent loss), or ABOVE it when it
+    /// excludes a member (→ keeps un-acked data). We require every replica
+    /// to respond and take the min over all of them; on any miss we return
+    /// `Err` so the caller refuses to seed a cursor (NEVER seed a subset
+    /// min — see `ensure_tail_initialised`). A permanently-dead replica is
+    /// reconfigured out of the set by the manager seal + operator
+    /// fence/recovery lifecycle, after which all remaining members respond.
+    async fn current_commit(&self, tail: &StreamTail) -> Result<u64> {
+        let mut min_len: Option<u64> = None;
+        let mut success: usize = 0;
+        let mut locked: usize = 0;
+        let total = tail.replica_addrs.len();
+        let owner_epoch = self.owner_epoch;
+        for addr in &tail.replica_addrs {
+            let req = CommitLengthReq {
+                extent_id: tail.extent.extent_id,
+                owner_epoch,
+            };
+            // 5 s — commit_length is a tiny in-memory probe on EN.
+            // Per-replica timeout: a paged-out replica counts as a
+            // miss for the quorum tally rather than wedging the
+            // whole call.
+            let result = self
+                .pool
+                .call_timeout(
+                    addr,
+                    MSG_COMMIT_LENGTH,
+                    req.encode(),
+                    Duration::from_secs(5),
+                )
+                .await;
+            let Ok(resp_bytes) = result else {
+                continue;
+            };
+            let Ok(resp) = CommitLengthResp::decode(resp_bytes) else {
+                continue;
+            };
+            if resp.code != CODE_OK {
+                // a CODE_LOCKED_BY_OTHER rejection means OUR epoch is
+                // stale (admin fence-bump / new owner), NOT that the replica
+                // is unreachable. This was previously folded into the generic
+                // "only N/M responded" error, so the caller could never tell
+                // a fenced probe from a dead replica — and a fence-bumped
+                // writer retried the same stale epoch forever (the seed=13/15
+                // open-tail write wedge's compounding layer).
+                if resp.code == CODE_LOCKED_BY_OTHER {
+                    locked += 1;
+                }
+                continue;
+            }
+            success += 1;
+            min_len = Some(min_len.map_or(resp.length, |cur| cur.min(resp.length)));
+        }
+        // require ALL replicas to respond — no quorum (see fn doc).
+        if success < total {
+            if locked > 0 {
+                // The "LockedByOther" substring is load-bearing: the PS's
+                // `is_locked_by_other` classifies on it and poisons the
+                // partition, whose region_sync reopen re-acquires a FRESH
+                // per-partition epoch — the self-heal for fence bumps.
+                return Err(anyhow!(
+                    "commit_length on extent {}: only {}/{} replicas responded \
+                     ({} rejected LockedByOther — stale owner epoch)",
+                    tail.extent.extent_id,
+                    success,
+                    total,
+                    locked
+                ));
+            }
+            return Err(anyhow!(
+                "commit_length on extent {}: only {}/{} replicas responded (need all)",
+                tail.extent.extent_id,
+                success,
+                total
+            ));
+        }
+        min_len.ok_or_else(|| anyhow!("no available replica for commit_length"))
+    }
+
+    // ── public append API ────────────────────────────────────────────────────
+
+    pub async fn append_batch_repeated(
+        &self,
+        stream_id: u64,
+        block: &[u8],
+        count: usize,
+    ) -> Result<AppendResult> {
+        if count == 0 {
+            return Err(anyhow!("append_batch_repeated requires count > 0"));
+        }
+        let total = block
+            .len()
+            .checked_mul(count)
+            .ok_or_else(|| anyhow!("append payload too large"))?;
+        let mut payload = BytesMut::with_capacity(total);
+        for _ in 0..count {
+            payload.extend_from_slice(block);
+        }
+        self.append_payload(stream_id, payload.freeze()).await
+    }
+
+    pub async fn append_batch(&self, stream_id: u64, blocks: &[&[u8]]) -> Result<AppendResult> {
+        if blocks.is_empty() {
+            return Err(anyhow!("append_batch requires at least one block"));
+        }
+        let total = blocks.iter().try_fold(0usize, |acc, b| {
+            acc.checked_add(b.len())
+                .ok_or_else(|| anyhow!("append payload too large"))
+        })?;
+        let mut payload = BytesMut::with_capacity(total);
+        for b in blocks {
+            payload.extend_from_slice(b);
+        }
+        self.append_payload(stream_id, payload.freeze()).await
+    }
+
+    /// Append a pre-built Bytes payload directly (avoids an extra copy).
+    pub async fn append_bytes(&self, stream_id: u64, payload: Bytes) -> Result<AppendResult> {
+        self.append_payload(stream_id, payload).await
+    }
+
+    /// Append multiple Bytes segments without copying them into a single buffer.
+    /// A segment received into a pool buffer goes to the extent nodes with
+    /// that buffer's registration.
+    pub async fn append_segments(
+        &self,
+        stream_id: u64,
+        segments: Vec<autumn_transport::RegBytes>,
+    ) -> Result<AppendResult> {
+        self.append_payload_segments(stream_id, segments, None).await
+    }
+
+    /// `append_segments` with the segments' crc32c, computed by the caller
+    /// while it encoded them (the PS's WAL batches and SSTs), so no later pass
+    /// rescans them.
+    pub async fn append_segments_with_crc(
+        &self,
+        stream_id: u64,
+        segments: Vec<autumn_transport::RegBytes>,
+        crc: u32,
+    ) -> Result<AppendResult> {
+        self.append_payload_segments(stream_id, segments, Some(crc)).await
+    }
+
+    pub async fn append(&self, stream_id: u64, payload: &[u8]) -> Result<AppendResult> {
+        self.append_payload(stream_id, Bytes::copy_from_slice(payload))
+            .await
+    }
+
+    pub async fn commit_length(&self, stream_id: u64) -> Result<u64> {
+        let (_stream, _extent, end) = self.check_commit(stream_id).await?;
+        Ok(end)
+    }
+
+    /// Seal the stream's open tail where the replicas that answer agree (the
+    /// manager's probe seal), without allocating a new tail; a sealed tail is
+    /// left as it is. Returns the sealed length. A partition calls this on open,
+    /// after its takeover fence and before replay (docs/seal_length_design.md §2).
+    pub async fn seal_tail(&self, stream_id: u64) -> Result<u64> {
+        let req = manager_rpc::rkyv_encode(&CheckCommitLengthReq {
+            stream_id,
+            owner_key: self.owner_key.clone(),
+            owner_epoch: self.owner_epoch,
+        });
+        // 15 s, as `check_commit`: the manager probes every replica first.
+        let resp_data = self
+            .manager_call(MSG_SEAL_TAIL, req, Duration::from_secs(15))
+            .await?;
+        let resp: CheckCommitLengthResp =
+            manager_rpc::rkyv_decode(&resp_data).map_err(|e| anyhow!("{e}"))?;
+        self.check_manager_resp(resp.code, &resp.message, "seal_tail")?;
+        // A cached copy from before the seal still reads as open.
+        if let Some(ex) = &resp.last_ex_info {
+            self.invalidate_extent_cache(ex.extent_id);
+        }
+        Ok(resp.end)
+    }
+
+    /// Like `commit_length`, but ALSO returns the id of the tail extent the
+    /// value was measured on. Split captures use this so the manager can
+    /// verify at commit time that each tail is still the one the length was
+    /// captured for (a concurrent roll otherwise gets the captured length
+    /// stamped onto its fresh empty tail).
+    pub async fn commit_length_with_tail(&self, stream_id: u64) -> Result<(u64, u64)> {
+        let (_stream, extent, end) = self.check_commit(stream_id).await?;
+        Ok((end, extent.extent_id))
+    }
+
+    /// Committed length of the stream's tail extent, but ONLY when that tail
+    /// is still OPEN (`!sealed`). A SEALED tail's length is already counted in
+    /// the manager's `sealed_length` sum, so returning it here would
+    /// double-count in the overview / cluster-df logical footprint (a
+    /// freshly-reopened CoW split child, or a just-sealed-not-yet-rolled tail,
+    /// has an all-sealed stream and would otherwise be added twice). Returns
+    /// `Ok(0)` for a sealed tail. Used by the PS open-tail size probe.
+    pub async fn open_tail_committed_len(&self, stream_id: u64) -> Result<u64> {
+        let (_stream, extent, end) = self.check_commit(stream_id).await?;
+        Ok(if extent.sealed { 0 } else { end })
+    }
+
+    pub async fn punch_holes(&self, stream_id: u64, extent_ids: Vec<u64>) -> Result<StreamInfo> {
+        let req = manager_rpc::rkyv_encode(&PunchHolesReq {
+            stream_id,
+            owner_key: self.owner_key.clone(),
+            owner_epoch: self.owner_epoch,
+            extent_ids,
+        });
+        // 30 s — manager updates extent refs + may schedule
+        // pending_extent_deletes; etcd mirror inside.
+        let resp_data = self
+            .manager_call(MSG_STREAM_PUNCH_HOLES, req, Duration::from_secs(30))
+            .await?;
+        let resp: PunchHolesResp =
+            manager_rpc::rkyv_decode(&resp_data).map_err(|e| anyhow!("{e}"))?;
+        self.check_manager_resp(resp.code, &resp.message, "punch_holes")?;
+        resp.stream
+            .map(|s| Self::mgr_to_stream_info(&s))
+            .ok_or_else(|| anyhow!("punch_holes: missing stream"))
+    }
+
+    /// Which of `extent_ids` have an op in flight on the manager (a punch of
+    /// one is refused until it ends).
+    pub async fn extents_in_flight(&self, extent_ids: &[u64]) -> Result<Vec<u64>> {
+        let req = manager_rpc::rkyv_encode(&manager_rpc::ExtentsInFlightReq {
+            extent_ids: extent_ids.to_vec(),
+        });
+        // 5 s — read-only manager call.
+        let resp_data = self
+            .manager_call(manager_rpc::MSG_EXTENTS_IN_FLIGHT, req, Duration::from_secs(5))
+            .await?;
+        let resp: manager_rpc::ExtentsInFlightResp =
+            manager_rpc::rkyv_decode(&resp_data).map_err(|e| anyhow!("{e}"))?;
+        self.check_manager_resp(resp.code, &resp.message, "extents_in_flight")?;
+        Ok(resp.in_flight)
+    }
+
+    pub async fn truncate(&self, stream_id: u64, extent_id: u64) -> Result<StreamInfo> {
+        let req = manager_rpc::rkyv_encode(&TruncateReq {
+            stream_id,
+            owner_key: self.owner_key.clone(),
+            owner_epoch: self.owner_epoch,
+            extent_id,
+        });
+        // 30 s — same shape as punch_holes; ref updates + etcd mirror.
+        let resp_data = self
+            .manager_call(MSG_TRUNCATE, req, Duration::from_secs(30))
+            .await?;
+        let resp: TruncateResp =
+            manager_rpc::rkyv_decode(&resp_data).map_err(|e| anyhow!("{e}"))?;
+        self.check_manager_resp(resp.code, &resp.message, "truncate")?;
+        resp.updated_stream_info
+            .map(|s| Self::mgr_to_stream_info(&s))
+            .ok_or_else(|| anyhow!("truncate: missing stream"))
+    }
+
+    pub async fn get_stream_info(&self, stream_id: u64) -> Result<StreamInfo> {
+        let req = manager_rpc::rkyv_encode(&StreamInfoReq {
+            stream_ids: vec![stream_id],
+        });
+        // 5 s — read-only manager call.
+        let resp_data = self
+            .manager_call(MSG_STREAM_INFO, req, Duration::from_secs(5))
+            .await?;
+        let resp: StreamInfoResp =
+            manager_rpc::rkyv_decode(&resp_data).map_err(|e| anyhow!("{e}"))?;
+        self.check_manager_resp(resp.code, &resp.message, "stream_info")?;
+        resp.streams
+            .into_iter()
+            .next()
+            .map(|(_, s)| Self::mgr_to_stream_info(&s))
+            .ok_or_else(|| anyhow!("stream {} not found", stream_id))
+    }
+
+    /// Return the ExtentInfo for a given extent (includes sealed_length). Cached.
+    pub async fn get_extent_info(&self, extent_id: u64) -> Result<ExtentInfo> {
+        self.fetch_extent_info(extent_id).await
+    }
+
+    async fn fetch_extent_info(&self, extent_id: u64) -> Result<ExtentInfo> {
+        if let Some(ex) = self.extent_info_cache.get(&extent_id) {
+            return Ok(ex.clone());
+        }
+        let req = manager_rpc::rkyv_encode(&ExtentInfoReq { extent_id });
+        // 5 s — read-only manager call. Hot in the EC stale-cache
+        // refetch path; bounded so that path doesn't wedge.
+        let resp_data = self
+            .manager_call(MSG_EXTENT_INFO, req, Duration::from_secs(5))
+            .await?;
+        let resp: ExtentInfoResp =
+            manager_rpc::rkyv_decode(&resp_data).map_err(|e| anyhow!("{e}"))?;
+        self.check_manager_resp(resp.code, &resp.message, "extent_info")?;
+        let ex = resp
+            .extent
+            .map(|e| Self::mgr_to_extent_info(&e, resp.payload_location))
+            .ok_or_else(|| anyhow!("extent {} not found", extent_id))?;
+        self.extent_info_cache.insert(extent_id, ex.clone());
+        Ok(ex)
+    }
+
+    /// Evict cached ExtentInfo so next read fetches fresh metadata.
+    /// Needed after EC conversion changes the extent's topology.
+    pub fn invalidate_extent_cache(&self, extent_id: u64) {
+        self.extent_info_cache.remove(&extent_id);
+    }
+
+    pub fn has_cached_extent_info(&self, extent_id: u64) -> bool {
+        self.extent_info_cache.contains_key(&extent_id)
+    }
+
+    /// Forget the cached ADDRESS of a node we could not reach.
+    ///
+    /// Orthogonal to the extent cache and to the retry classes on purpose. A
+    /// node keeps its id across a restart (identity is the `node_uuid` on its
+    /// data dir), so a moved EN leaves every layout naming it CORRECT and only
+    /// this map wrong — refetching `ExtentInfo` returns the same ids, which
+    /// resolve through the same dead host, forever.
+    ///
+    /// Per node, never the whole map: the map is shared by every stream on this
+    /// client, so clearing it makes unrelated reads of healthy extents refetch
+    /// too, and concurrent failures each buy their own `nodes_info` round trip.
+    /// `replica_addrs_from_cache` fails on a MISSING id, and that failure is
+    /// what already drives `refresh_nodes_map` — so removing one entry is the
+    /// whole cure, with no new refresh path to keep correct.
+    /// How long one node may be forgotten again.
+    ///
+    /// A node that MOVED heals on the first refresh; a node that is DOWN does
+    /// not — the manager lists a crashed-but-registered EN with its old address,
+    /// so forgetting it makes the next resolve refetch the SAME address and the
+    /// cycle repeats. Unbounded, that is a `nodes_info` RPC and a warn line per
+    /// READ, and a `Connection refused` fails instantly, so a partition serving
+    /// thousands of GETs a second would aim thousands of manager calls a second
+    /// at the leader for as long as the node stays down. The pre-rework note 34
+    /// already carried this as an invariant and the first rewrite dropped it.
+    const NODE_ADDR_FORGET_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// Forget the cached ADDRESS of a node we could not reach.
+    ///
+    /// Orthogonal to the extent cache and to the retry classes on purpose. A
+    /// node keeps its id across a restart (identity is the `node_uuid` on its
+    /// data dir), so a moved EN leaves every layout naming it CORRECT and only
+    /// this map wrong — refetching `ExtentInfo` returns the same ids, which
+    /// resolve through the same dead host, forever.
+    ///
+    /// Per node, never the whole map: the map is shared by every stream on this
+    /// client, so clearing it makes unrelated reads of healthy extents refetch
+    /// too. `replica_addrs_from_cache` fails on a MISSING id, and that failure
+    /// is what already drives `refresh_nodes_map` — so removing one entry is the
+    /// whole cure, with no new refresh path to keep correct.
+    pub(crate) fn forget_node_addr(&self, node_id: u64) {
+        let now = std::time::Instant::now();
+        {
+            let mut last = self.node_addr_forgotten.borrow_mut();
+            if let Some(&t) = last.get(&node_id) {
+                if now.duration_since(t) < Self::NODE_ADDR_FORGET_COOLDOWN {
+                    // Already forgotten recently and the address came back the
+                    // same: the node is down, not moved. Re-asking the manager
+                    // cannot change that answer.
+                    return;
+                }
+            }
+            last.insert(node_id, now);
+        }
+        if self.nodes_cache.remove(&node_id).is_some() {
+            tracing::warn!(node_id, "could not reach this node's cached address — forgetting it");
+        }
+    }
+
+    /// Node `node_id` (a replica of `extent_id`) could not be reached: forget
+    /// its cached address and tell the manager. For the sites that know WHICH
+    /// node failed — a read failing over or reconstructing past it, the flush
+    /// barrier giving up on it. Appends report through their worker
+    /// (`StreamAppendState::try_report_failure`).
+    pub(crate) fn note_unreachable(&self, node_id: u64, extent_id: u64) {
+        self.forget_node_addr(node_id);
+        self.report_unreachable(node_id, extent_id);
+    }
+
+    /// `MSG_REPORT_DISK_FAILURE` for `node_id`, at most once per node per
+    /// `NODE_ADDR_FORGET_COOLDOWN`: a read path can hit a dead node thousands
+    /// of times a second, and one report per reporter per window is all the
+    /// manager's quorum counts. The cooldown is what bounds the volume (a
+    /// cloned sender always has a slot); `try_send` fails only once the
+    /// drainer is gone.
+    fn report_unreachable(&self, node_id: u64, extent_id: u64) {
+        let now = Instant::now();
+        {
+            let mut last = self.node_failure_reported.borrow_mut();
+            if last
+                .get(&node_id)
+                .is_some_and(|t| now.duration_since(*t) < Self::NODE_ADDR_FORGET_COOLDOWN)
+            {
+                return;
+            }
+            last.insert(node_id, now);
+        }
+        if let Err(e) = self
+            .failure_report_tx
+            .clone()
+            .try_send(FailureReport { node_id, extent_id })
+        {
+            tracing::debug!(node_id, extent_id, error = %e, "unreachable-node report not sent");
+        }
+    }
+
+    /// `forget_node_addr` for every replica of `ex`, when the error says we
+    /// could not reach one of them but not WHICH.
+    ///
+    /// Used at the sites that SWALLOW a per-replica failure — EC degrading to
+    /// reconstruct, replicated failover moving to the next slot — where the
+    /// read still succeeds and nothing ever reaches `read_retry_action`. Those
+    /// are the routine shape: a rolling update moves one node at a time, the
+    /// other replicas cover for it, and without this every later read to that
+    /// slot re-dials the dead address and waits out the full connect timeout,
+    /// silently, for the life of the process.
+    pub(crate) fn forget_unreachable_replicas(&self, ex: &ExtentInfo, err: &anyhow::Error) {
+        if !is_connect_failure(err) {
+            return;
+        }
+        for node_id in replica_node_ids(ex) {
+            self.forget_node_addr(node_id);
+        }
+    }
+
+    /// Everything a retryable read failure must forget before the next attempt.
+    ///
+    /// ONE function because there are two retry loops — the plain read and the
+    /// committed read — and they had drifted: the first draft of the
+    /// address-staleness fix taught only the plain one to drop a dead address,
+    /// so the WAL replay path kept the pre-fix behaviour. Both loops now call
+    /// this, so the pair cannot disagree again; a test could only have caught
+    /// that drift by driving a real read down each loop.
+    fn forget_for_retry(&self, extent_id: u64, ex: &ExtentInfo, err: &anyhow::Error) {
+        // Address first: the extent cache is refetched from the manager, and if
+        // the node map still held a dead address the refetched layout would
+        // resolve straight back to it.
+        self.forget_unreachable_replicas(ex, err);
+        self.invalidate_extent_cache(extent_id);
+    }
+
+    /// EAGERLY raise the EN `owner_epoch` fence floor on the stream's CURRENT
+    /// tail extent to `owner_epoch`, on every REACHABLE replica, WITHOUT
+    /// appending (`MSG_FENCE_EXTENT`).
+    ///
+    /// Called on partition TAKEOVER (`open_partition`) so a paused-then-resumed
+    /// previous owner (a "zombie writer") whose in-flight append still carries
+    /// the OLD epoch is rejected at the EN (`append_burst_frames`: `req.owner_epoch <
+    /// stored`). It closes the idle-takeover window where the EN floor stayed at
+    /// `E_old` until the new owner's FIRST append lazily raised it — the window
+    /// in which the zombie's `E_old` append (equal to the stale floor) passed
+    /// the fence, landed in the log extent, and was silently ACKed.
+    ///
+    /// LENIENT + best-effort (mirrors the seal-over-reachable rule): append is
+    /// all-replica-ACK, so fencing even ONE reachable replica already blocks the
+    /// zombie — its append needs EVERY replica to accept. Returns `Ok` when at
+    /// least one replica was fenced (`CODE_OK`) or already carries a HIGHER
+    /// epoch (`CODE_LOCKED_BY_OTHER` — someone newer already owns it); a replica
+    /// that is unreachable, undecodable, or fail-closed (`CODE_PRECONDITION`) is
+    /// logged and skipped. `Err` only when NO replica could be fenced. An empty
+    /// stream (no tail extent) is `Ok` — nothing to fence.
+    ///
+    /// CALLER CONTRACT (Layer-C guard): `owner_epoch` MUST be the partition's own
+    /// freshly-acquired `partition/{part_id}` owner-lock revision (E_new from
+    /// `acquire_partition_owner_epoch`). NEVER pass a `ps-<id>` server_revision, an
+    /// `admin-merge:` epoch, or any other lock's revision — feeding a foreign
+    /// revision into a floor-RAISING op is exactly the hazard the check-only
+    /// `handle_commit_length` postmortem ("CHECK ONLY, NEVER handover") records:
+    /// a stray higher revision would poison the LIVE owner's own fence floor.
+    pub async fn fence_tail(&self, stream_id: u64, owner_epoch: i64) -> Result<()> {
+        let stream = self.get_stream_info(stream_id).await?;
+        let Some(&tail_id) = stream.extent_ids.last() else {
+            // Empty stream — no tail extent exists yet. Nothing to fence; the
+            // first-appended extent starts at owner_epoch 0 and the new owner's
+            // own first append raises it.
+            return Ok(());
+        };
+        let ex = self.get_extent_info(tail_id).await?;
+        let addrs = self.replica_addrs_for_extent(&ex).await?;
+        let total = addrs.len();
+        let mut fenced = 0usize;
+        for addr in &addrs {
+            let req = FenceExtentReq {
+                extent_id: tail_id,
+                owner_epoch,
+            };
+            // 5 s — the fence is a tiny in-memory `fetch_max` + a durable
+            // `.meta` persist on the EN; a paged-out / slow replica counts as a
+            // miss (best-effort) rather than wedging the takeover.
+            let result = self
+                .pool
+                .call_timeout(addr, MSG_FENCE_EXTENT, req.encode(), Duration::from_secs(5))
+                .await;
+            let Ok(resp_bytes) = result else {
+                // Transport error OR a handler-level error frame (wrong-shard /
+                // invalid-arg surface as `Err`, never a mis-decodable OK body).
+                tracing::warn!(
+                    stream_id,
+                    extent_id = tail_id,
+                    addr = %addr,
+                    "fence_tail: replica unreachable / errored — skipped (best-effort)"
+                );
+                continue;
+            };
+            let Ok(resp) = FenceExtentResp::decode(resp_bytes) else {
+                tracing::warn!(
+                    stream_id,
+                    extent_id = tail_id,
+                    addr = %addr,
+                    "fence_tail: undecodable response — skipped"
+                );
+                continue;
+            };
+            match resp.code {
+                // Floor raised to (or already at/above) `owner_epoch`, durable.
+                CODE_OK => fenced += 1,
+                // A HIGHER owner already fenced this extent — also fine: the
+                // zombie (lower epoch) is rejected by that higher floor too.
+                CODE_LOCKED_BY_OTHER => fenced += 1,
+                other => {
+                    // CODE_PRECONDITION (fail-closed persist error / quarantine)
+                    // or anything unexpected: this replica is NOT fenced. Other
+                    // reachable replicas may still cover the all-replica-ACK
+                    // guarantee, so keep going.
+                    tracing::warn!(
+                        stream_id,
+                        extent_id = tail_id,
+                        addr = %addr,
+                        code = other,
+                        message = %resp.message,
+                        "fence_tail: replica refused fence — not fenced there"
+                    );
+                }
+            }
+        }
+        if fenced == 0 {
+            return Err(anyhow!(
+                "fence_tail extent {tail_id} (stream {stream_id}): no replica accepted the fence (0/{total})"
+            ));
+        }
+        Ok(())
+    }
+
+    /// Read-error policy shared by the replicated failover + hedge paths.
+    /// An `EversionStale` error means the cached `ExtentInfo` is a stale
+    /// GENERATION — the caller must FAIL FAST (returns `true`) so the
+    /// top-level 2-attempt retry refetches it; the cache is left intact
+    /// because every replica reports the same mismatch. Any OTHER error
+    /// means this REPLICA failed; the cached replica layout may be wrong,
+    /// so evict the entry and let the caller try the next replica (returns
+    /// `false`).
+    fn read_err_fail_fast(&self, e: &anyhow::Error, extent_id: u64) -> bool {
+        if is_eversion_stale(e) {
+            return true;
+        }
+        self.extent_info_cache.remove(&extent_id);
+        false
+    }
+
+    /// The committed byte bound a reader may trust for `ex` — shared by
+    /// `read_committed_bytes_from_extent` and `read_committed_from_replica`
+    /// so their committed-end semantics can never drift. Sealed →
+    /// `sealed_length`, first guarding a stale VP whose offset lies past the
+    /// seal (the `stale_vp_offset_past_sealed_length` wire-contract
+    /// sentinel); open tail → one min-replica `commit_length` probe per call
+    /// (replay-only cadence, one probe per chunk — not a hot path).
+    async fn committed_end_for_read(
+        &self,
+        ex: &ExtentInfo,
+        offset: u64,
+        length: u64,
+    ) -> Result<u64> {
+        if ex.sealed {
+            if offset > ex.sealed_length {
+                return Err(anyhow::Error::new(StaleVpOffset {
+                    extent_id: ex.extent_id,
+                    requested_offset: offset,
+                    requested_length: length,
+                    sealed_length: ex.sealed_length,
+                }));
+            }
+            Ok(ex.sealed_length)
+        } else {
+            self.commit_length_for_extent(ex).await
+        }
+    }
+
+    /// Read bytes from a specific extent.
+    /// Pass `length=0` to read from offset to the end of the extent.
+    ///
+    /// For replicated extents, reads larger than `read_chunk_bytes()`
+    /// (default 256 MiB, the PS's `--stream-read-chunk-bytes`) are split
+    /// transparently into multiple chunks. This is required on macOS
+    /// (pread caps at INT_MAX) and matches Linux's per-syscall ceiling
+    /// (`0x7ffff000`); without chunking, GC and recovery fail with
+    /// EINVAL on extents > 2 GiB. EC reads keep their existing per-shard
+    /// path — shards are at most `sealed_length / data_shards` and have
+    /// their own size logic.
+    ///
+    /// Wrapped in a 2-attempt loop so that a stale `extent_info_cache`
+    /// (e.g. after the manager flips an extent from replica to EC via
+    /// `ec_conversion_dispatch_loop`) self-heals on the first miss:
+    /// the inner read returns `EversionStale`, we evict the cache, and
+    /// the second attempt fetches the fresh `ExtentInfo` and routes
+    /// down the correct (EC) path. Without this, the first GET pays
+    /// up to `3 × call_timeout` (~9 s) per stale replica before any
+    /// future call sees the new layout.
+    pub async fn read_bytes_from_extent(
+        &self,
+        extent_id: u64,
+        offset: u64,
+        length: u64,
+    ) -> Result<(Bytes, u64)> {
+        for attempt in 0..2 {
+            let ex = self.fetch_extent_info(extent_id).await?;
+            match self.read_with_layout(extent_id, offset, length, &ex).await {
+                Ok(r) => return Ok(r),
+                Err(e) => match read_retry_action(attempt, &e) {
+                    None => return Err(e),
+                    Some(kind) => {
+                        match kind {
+                            // The layout moved under us. Refetching is the whole
+                            // point; without it the first GET after a
+                            // replica -> EC flip pays up to 3 x call_timeout
+                            // against stale replicas before anything sees the
+                            // new layout.
+                            ReadRetry::EversionStale => {}
+                            // The EN told us our layout is stale. Refetching is
+                            // the designed response and the server's contract
+                            // says so; without this class the refusal was
+                            // indistinguishable from any other failure and the
+                            // read degraded to reconstruct on every attempt,
+                            // forever.
+                            ReadRetry::PayloadNotHere => tracing::warn!(
+                                extent_id,
+                                error = %format_args!("{e:#}"),
+                                "ec: payload not on the named node — refreshing extent layout"
+                            ),
+                            ReadRetry::GatherOneShort => tracing::warn!(
+                                extent_id,
+                                error = %format_args!("{e:#}"),
+                                "ec: gather one shard short — refreshing extent info and retrying once"
+                            ),
+                            // The one class the extent cache cannot cure: the
+                            // layout is right and the ADDRESS is not. The cure
+                            // is applied below, unconditionally — see there.
+                            ReadRetry::NodeAddrStale => tracing::warn!(
+                                extent_id,
+                                error = %format_args!("{e:#}"),
+                                "could not reach a node's cached address — \
+                                 refreshing the node map and retrying once"
+                            ),
+                        }
+                        // NOT tied to the class. `ec_gather_collect` keeps only
+                        // the LAST error, so a gather that hit both a dead
+                        // address and a typed refusal is classified by whichever
+                        // landed last — and a connect timeout arrives seconds
+                        // after a refusal arrives in milliseconds. Dropping the
+                        // address whenever the error says we could not reach the
+                        // peer, whatever class won, is what makes the cure
+                        // independent of that race.
+                        self.forget_for_retry(extent_id, &ex, &e);
+                        // Only the gather pauses. The useful part of every retry
+                        // here is re-planning from FRESH ExtentInfo, but a gather
+                        // is a K-way read amplification, so spacing the attempts
+                        // keeps a degraded cluster from being hit by the whole
+                        // herd at once.
+                        if kind == ReadRetry::GatherOneShort {
+                            compio::time::sleep(gather_retry_pause(extent_id)).await;
+                        }
+                        continue;
+                    }
+                },
+            }
+        }
+        unreachable!("read_bytes_from_extent: 2-attempt loop must terminate")
+    }
+
+    /// replay-oriented chunked read — like `read_bytes_from_extent`,
+    /// but the requested window is CLAMPED to the extent's COMMITTED end
+    /// before the read is issued: `sealed_length` for sealed extents, the
+    /// min-replica commit probe for the open tail. An EN's data file can
+    /// legitimately hold speculative bytes PAST the committed end (a replica
+    /// that was ahead at seal time is never truncated back — commit-protocol
+    /// truncation only happens on the next append, which never comes once
+    /// sealed; open-tail replicas diverge the same way until the next
+    /// append's `header.commit`). A plain explicit-length read is clamped
+    /// only by the SERVING replica's local file length, so a chunked scanner
+    /// stopping on `got < want` walks straight through the committed end and
+    /// ingests un-committed — possibly replica-divergent, possibly
+    /// about-to-be-truncated — bytes as if they were WAL content.
+    ///
+    /// Returns `(data, end)`; `data` is empty once `offset` reaches the
+    /// committed end (clean end-of-scan). A SEALED extent with
+    /// `offset > sealed_length` still surfaces the `StaleVpOffset` sentinel:
+    /// a checkpoint pointing past the seal is corruption and must fail the
+    /// partition open loudly, never be masked as a clean end-of-replay.
+    pub async fn read_committed_bytes_from_extent(
+        &self,
+        extent_id: u64,
+        offset: u64,
+        length: u64,
+    ) -> Result<(Bytes, u64)> {
+        for attempt in 0..2 {
+            let ex = self.fetch_extent_info(extent_id).await?;
+            let committed_end = self.committed_end_for_read(&ex, offset, length).await?;
+            let want = length.min(committed_end.saturating_sub(offset));
+            if want == 0 {
+                return Ok((Bytes::new(), committed_end));
+            }
+            match self.read_with_layout(extent_id, offset, want, &ex).await {
+                // MERGE-EC-REPLAY: return OUR authoritative `committed_end`
+                // (the extent's sealed_length for a sealed extent), NOT
+                // read_with_layout's second element. For an EC-converted extent
+                // `ec_subrange_read` returns a SHARD-relative end
+                // (≈ sealed_length / K); propagating it as the extent's
+                // committed_end made the PS WAL replay — which uses this value
+                // as its stop bound — read only ONE shard's worth of bytes and
+                // trip WAL-FAILSTOP at the shard boundary, permanently wedging
+                // any partition whose VP-head replay window reaches an EC log
+                // extent (e.g. a merge survivor replaying the victim's spliced
+                // extents, which the victim itself never replayed). The read
+                // already clamped `want` to `committed_end - offset`, so the
+                // returned bytes are correct; only the reported end was wrong.
+                Ok((bytes, _read_end)) => return Ok((bytes, committed_end)),
+                // Same policy as the plain read, and it has to be: this is the
+                // path a partition's WAL replay takes, 64 MiB at a time, and a
+                // log stream's sealed extents are EC-encoded by default, so the
+                // EC failure classes reach this loop as readily as the other
+                // one. This loop used to recover from `EversionStale` alone —
+                // and that is the class the node does NOT send for a stale
+                // layout, because `read_plan` tests `holds_payload` before
+                // eversion and answers PAYLOAD_NOT_HERE instead.
+                //
+                // What that cost, precisely, because the two halves differ:
+                //   - Replicated path: `read_err_fail_fast` already evicts the
+                //     layout cache for any non-eversion error, so the caller's
+                //     next attempt healed. One warn and one 2 s stall per stale
+                //     extent — recovered, not wedged.
+                //   - EC path: `ec_subrange_read` never calls that, so nothing
+                //     evicted anything, and the failure repeated across every
+                //     one of `recover_partition`'s ten attempts. That open
+                //     really did fail.
+                // Handling the classes here heals both inside the single call.
+                //
+                // `attempt` is this loop's own, so the budget stays one retry
+                // here regardless of what the plain read already spent. It does
+                // stack with the caller's ten, which is bounded and fine.
+                Err(e) => match read_retry_action(attempt, &e) {
+                    None => return Err(e),
+                    Some(kind) => {
+                        if kind != ReadRetry::EversionStale {
+                            tracing::warn!(
+                                extent_id,
+                                offset,
+                                error = %format_args!("{e:#}"),
+                                "committed read: refreshing extent layout (and any unreachable address) and retrying once"
+                            );
+                        }
+                        // The same cure as the plain read. This loop is the WAL
+                        // replay path, which runs on a per-partition client that
+                        // lives as long as the partition is open — the longest
+                        // any cached address gets to go stale.
+                        self.forget_for_retry(extent_id, &ex, &e);
+                        if kind == ReadRetry::GatherOneShort {
+                            // Spaced for the reason the plain read spaces it: a
+                            // gather is a K-way read amplification and replay
+                            // runs them back to back.
+                            compio::time::sleep(gather_retry_pause(extent_id)).await;
+                        }
+                        continue;
+                    }
+                },
+            }
+        }
+        unreachable!("read_committed_bytes_from_extent: 2-attempt loop must terminate")
+    }
+
+    /// WAL self-heal A2 (docs/wal_selfheal_design.md): read the committed
+    /// `[offset, offset+length)` range of a REPLICATED extent from ONE specific
+    /// replica (`replica_idx` into `replicates ++ parity`), with NO failover —
+    /// so the replay self-heal (A3) can read the SAME committed range from each
+    /// replica in turn and CRC-check it, isolating the bit-rotted one.
+    ///
+    /// The committed clamp is identical to `read_committed_bytes_from_extent`
+    /// (the open-time `check commit length` already aligned the committed
+    /// length across replicas, so all replicas agree on the range — only the
+    /// CONTENT can differ). Returns `(bytes, committed_end, node_id)`.
+    ///
+    /// EC-converted extents return `Err` (the replicated self-heal does not
+    /// apply — EC shard corruption is reconstructed via `ec_subrange_read`, a
+    /// separate path). `replica_idx` out of range → `Err`.
+    pub async fn read_committed_from_replica(
+        &self,
+        extent_id: u64,
+        replica_idx: usize,
+        offset: u64,
+        length: u64,
+    ) -> Result<(Bytes, u64, u64)> {
+        let ex = self.fetch_extent_info(extent_id).await?;
+        if ex.ec_converted {
+            return Err(anyhow!(
+                "extent {extent_id} is EC-converted; per-replica read not applicable"
+            ));
+        }
+        let node_ids: Vec<u64> = ex
+            .replicates
+            .iter()
+            .chain(ex.parity.iter())
+            .copied()
+            .collect();
+        if replica_idx >= node_ids.len() {
+            return Err(anyhow!(
+                "replica_idx {replica_idx} out of range (extent {extent_id} has {} replicas)",
+                node_ids.len()
+            ));
+        }
+        let committed_end = self.committed_end_for_read(&ex, offset, length).await?;
+        let node_id = node_ids[replica_idx];
+        let want = length.min(committed_end.saturating_sub(offset));
+        if want == 0 {
+            return Ok((Bytes::new(), committed_end, node_id));
+        }
+        let addrs = self.replica_addrs_for_extent(&ex).await?;
+        let addr = &addrs[replica_idx];
+        let (bytes, _end) = self
+            .read_shard_from_addr(
+                addr,
+                extent_id,
+                ex.eversion,
+                offset,
+                want,
+                PayloadRef::for_extent(published_payload(&ex)?, replica_idx as u32),
+            )
+            .await?;
+        Ok((bytes, committed_end, node_id))
+    }
+
+    /// WAL self-heal A2: replica count of a REPLICATED extent (= the valid
+    /// `replica_idx` range for `read_committed_from_replica`). EC extent → 0.
+    pub async fn replicated_replica_count(&self, extent_id: u64) -> Result<usize> {
+        let ex = self.fetch_extent_info(extent_id).await?;
+        if ex.ec_converted {
+            return Ok(0);
+        }
+        Ok(ex.replicates.len() + ex.parity.len())
+    }
+
+    /// Every independent copy of `[offset, offset + length)` this extent can
+    /// produce, for a caller whose own content check (an SST block CRC) failed
+    /// on what `read_bytes_from_extent` returned — that read names no source,
+    /// so the caller cannot tell which copy was wrong, or whether another is
+    /// right.
+    ///
+    /// A replicated extent gives one copy per replica (avali-dark slots of a
+    /// sealed extent are left out, as on every read). An EC extent has one copy
+    /// of each byte, so the alternatives are reconstructions: one per data
+    /// shard the range covers, that shard rebuilt from the other shards with
+    /// its own node not asked. Whichever copy passes the caller's check names
+    /// the culprit by its `source`. A copy that could not be read is left out —
+    /// it says nothing about content.
+    ///
+    /// Reads run in parallel; this costs one read per replica (or K shard
+    /// sub-range reads per covering shard) and is for the failure path only.
+    pub async fn read_range_copies(
+        &self,
+        extent_id: u64,
+        offset: u64,
+        length: u64,
+    ) -> Result<RangeCopies> {
+        // The layout is fetched fresh: the one cached for the failed read may
+        // predate a seal or an isolation, and what the copies are read under
+        // is what a corrupt report names.
+        self.invalidate_extent_cache(extent_id);
+        let ex = self.fetch_extent_info(extent_id).await?;
+        let mut copies = Vec::new();
+        if ex.ec_converted {
+            let data_shards = ex.replicates.len();
+            let shard_size =
+                crate::erasure::shard_size(ex.sealed_length as usize, data_shards.max(1)) as u64;
+            if data_shards > 0 && shard_size > 0 && length > 0 {
+                let first = (offset / shard_size) as usize;
+                let last = ((offset + length - 1) / shard_size) as usize;
+                if last < data_shards {
+                    let reads = (first..=last).map(|shard| {
+                        let ex = &ex;
+                        async move {
+                            (
+                                shard,
+                                self.ec_subrange_read(extent_id, offset, length, ex, Some(shard))
+                                    .await,
+                            )
+                        }
+                    });
+                    for (shard, r) in futures::future::join_all(reads).await {
+                        match r {
+                            Ok((bytes, _)) if bytes.len() as u64 == length => {
+                                copies.push(RangeCopy {
+                                    bytes,
+                                    source: CopySource::EcWithoutShard { shard },
+                                })
+                            }
+                            Ok((bytes, _)) => tracing::warn!(
+                                extent_id,
+                                shard,
+                                got = bytes.len(),
+                                length,
+                                "range copy: reconstruction came back short"
+                            ),
+                            Err(e) => tracing::warn!(
+                                extent_id,
+                                shard,
+                                error = %format_args!("{e:#}"),
+                                "range copy: could not reconstruct without this shard"
+                            ),
+                        }
+                    }
+                }
+            }
+        } else {
+            let node_ids = replica_node_ids(&ex);
+            let reads = eligible_replica_slots(&ex).into_iter().map(|idx| async move {
+                (idx, self.read_committed_from_replica(extent_id, idx, offset, length).await)
+            });
+            for (idx, r) in futures::future::join_all(reads).await {
+                match r {
+                    Ok((bytes, _, node_id)) if bytes.len() as u64 == length => {
+                        copies.push(RangeCopy {
+                            bytes,
+                            source: CopySource::Replica { node_id },
+                        })
+                    }
+                    Ok((bytes, _, node_id)) => tracing::warn!(
+                        extent_id,
+                        node_id,
+                        got = bytes.len(),
+                        length,
+                        "range copy: replica answered short"
+                    ),
+                    Err(e) => tracing::warn!(
+                        extent_id,
+                        node_id = node_ids.get(idx).copied().unwrap_or(0),
+                        error = %format_args!("{e:#}"),
+                        "range copy: replica could not be read"
+                    ),
+                }
+            }
+        }
+        Ok(RangeCopies {
+            copies,
+            eversion: ex.eversion,
+            sealed: ex.sealed,
+        })
+    }
+
+    /// Report bit-rotted replica(s) of a SEALED extent in the partition's log
+    /// stream (WAL self-heal A5) or row stream (an SST block read) to the
+    /// manager so it ISOLATES them (clears each corrupt slot's
+    /// `avali` bit + bumps eversion, etcd-first) — the A1 read-path filter then
+    /// stops serving from those slots, and the eversion bump forces every PS to
+    /// refetch the cleared ExtentInfo on its next read. Fenced: carries the
+    /// partition `owner_epoch` (self) + the extent `eversion` the PS saw; the
+    /// manager CAS-validates both. Returns Err on any non-OK code so the caller
+    /// can keep the partition fail-loud (isolation MUST succeed before serving,
+    /// design invariant I1). After a successful report the caller should
+    /// `invalidate_extent_cache(extent_id)` so its own subsequent reads refetch
+    /// the cleared-avali / bumped-eversion ExtentInfo.
+    pub async fn report_corrupt_replica(
+        &self,
+        partition_id: u64,
+        stream_id: u64,
+        extent_id: u64,
+        eversion: u64,
+        corrupt_node_ids: Vec<u64>,
+    ) -> Result<()> {
+        let req = manager_rpc::rkyv_encode(&ReportCorruptReplicaReq {
+            partition_id,
+            owner_epoch: self.owner_epoch,
+            stream_id,
+            extent_id,
+            eversion,
+            corrupt_node_ids,
+        });
+        let resp_data = self
+            .manager_call(MSG_REPORT_CORRUPT_REPLICA, req, Duration::from_secs(10))
+            .await?;
+        let resp: ReportCorruptReplicaResp =
+            manager_rpc::rkyv_decode(&resp_data).map_err(|e| anyhow!("{e}"))?;
+        self.note_manager_code(resp.code);
+        if resp.code != CODE_OK {
+            return Err(anyhow!("report_corrupt_replica refused: {}", resp.message));
+        }
+        Ok(())
+    }
+
+    /// Report the replicas whose copy of an SST block failed its CRC while
+    /// another replica's copy passed (`read_range_copies`), so the manager
+    /// isolates them — the row-stream twin of the WAL replay's report, under
+    /// the same fencing and the same evidence. Then drops the cached layout,
+    /// so this client's next read of the extent sees the darkened slot.
+    /// `Err` when this client has no reporter partition and row stream set.
+    pub async fn report_rotted_row_copies(
+        &self,
+        extent_id: u64,
+        eversion: u64,
+        corrupt_node_ids: Vec<u64>,
+    ) -> Result<()> {
+        let (part_id, row_stream) = (self.reporter_part_id.get(), self.reporter_row_stream.get());
+        if part_id == 0 || row_stream == 0 {
+            return Err(anyhow!(
+                "no reporter partition / row stream set on this client; not reporting"
+            ));
+        }
+        let r = self
+            .report_corrupt_replica(part_id, row_stream, extent_id, eversion, corrupt_node_ids)
+            .await;
+        self.invalidate_extent_cache(extent_id);
+        r
+    }
+
+    /// The EC half of `read_value_into_pooled`: a range inside one data shard,
+    /// whose node is not Suspected, is one bulk read of that shard at the offset
+    /// inside it (the layout `ec_subrange_read` plans with). A range across
+    /// shards, past the data shards, or on a Suspected node, and a read the node
+    /// refused (a non-OK code or an error frame), is `Ok(None)`: the copy path
+    /// splits it, reconstructs it or refreshes the layout. A read that failed in
+    /// transport (connection, timeout) is rebuilt here from the other shards: the
+    /// copy path would read the same node again first and pay its timeout twice.
+    async fn ec_shard_into_pooled(
+        &self,
+        extent_id: u64,
+        offset: u64,
+        length: u64,
+        ex: &ExtentInfo,
+    ) -> Result<Option<(autumn_rpc::PooledBuf, usize)>> {
+        let data_shards = ex.replicates.len();
+        let shard_size = crate::erasure::shard_size(ex.sealed_length as usize, data_shards.max(1)) as u64;
+        if data_shards == 0 || shard_size == 0 {
+            return Ok(None);
+        }
+        let shard = offset / shard_size;
+        if shard != (offset + length - 1) / shard_size || shard as usize >= data_shards {
+            return Ok(None);
+        }
+        let shard = shard as usize;
+        let node_id = ex.replicates[shard];
+        if self.is_node_suspected(node_id) {
+            return Ok(None);
+        }
+        let addrs = self.replica_addrs_for_extent(ex).await?;
+        let req = rkyv_encode(&ReadReq::new(
+            extent_id,
+            ex.eversion,
+            offset % shard_size,
+            length,
+            READ_EXACT,
+            PayloadRef::for_extent(published_payload(ex)?, shard as u32),
+        ));
+        match self
+            .pool
+            .call_into_pooled(&addrs[shard], MSG_READ, req, self.config.read_deadline().for_len(length))
+            .await
+        {
+            // READ_EXACT: CODE_OK means the buffer holds exactly `length` bytes.
+            Ok(z) if z.code == CODE_OK => Ok(Some((z.buf, length as usize))),
+            Ok(z) => {
+                tracing::debug!(extent_id, shard, code = z.code, message = %read_message(&z), "EC bulk read non-OK; using the copy path");
+                self.extent_info_cache.remove(&extent_id);
+                Ok(None)
+            }
+            // No reply buffer, here or at the node: the layout is fine, so the
+            // copy path reads it as it stands.
+            Err(e)
+                if e.chain().any(|c| {
+                    matches!(
+                        c.downcast_ref::<autumn_rpc::RpcError>(),
+                        Some(autumn_rpc::RpcError::Status { code: autumn_rpc::StatusCode::Unavailable, .. })
+                    )
+                }) =>
+            {
+                tracing::debug!(extent_id, shard, error = %format_args!("{e:#}"), "EC bulk read refused for want of a buffer; using the copy path");
+                Ok(None)
+            }
+            // An error frame from the node is a refusal: the copy path refreshes
+            // the layout or reconstructs, as for a non-OK code.
+            Err(e)
+                if e.chain()
+                    .any(|c| matches!(c.downcast_ref::<autumn_rpc::RpcError>(), Some(autumn_rpc::RpcError::Status { .. }))) =>
+            {
+                tracing::debug!(extent_id, shard, error = %format_args!("{e:#}"), "EC bulk read refused; using the copy path");
+                self.extent_info_cache.remove(&extent_id);
+                Ok(None)
+            }
+            Err(e) => {
+                tracing::warn!(extent_id, shard, error = %format_args!("{e:#}"), "EC bulk read failed; reconstructing without that shard");
+                self.extent_info_cache.remove(&extent_id);
+                // After the rebuild: forgetting the address first would send it
+                // to the manager for a node map it does not need.
+                let rebuilt = self.ec_subrange_read(extent_id, offset, length, ex, Some(shard)).await;
+                if is_connect_failure(&e) {
+                    self.note_unreachable(node_id, extent_id);
+                }
+                let (data, _) = rebuilt?;
+                if data.len() as u64 != length {
+                    return Ok(None);
+                }
+                let mut pb = autumn_rpc::regpool_acquire(data.len());
+                pb.dest_and_reg().0.copy_from_slice(&data);
+                Ok(Some((pb, data.len())))
+            }
+        }
+    }
+
+    /// UCX / TCP recv-side copy-elimination fast path: recv the
+    /// value straight into a read_loop-owned `PooledBuf` (`MSG_READ` exact +
+    /// call_into_pooled). UCX → one Stream unpack into the pooled slab; TCP →
+    /// compio owned read (one kernel copy). No app-level copy of the value. Returns `Some((pb, len))`
+    /// on a clean OK; returns `Ok(None)` for ANYTHING it can't handle (an EC range
+    /// that is not inside one healthy data shard, length==0/unknown,
+    /// multi-chunk, eversion-stale, non-OK code, all replicas failed) so the
+    /// caller falls back to the copy path
+    /// (`read_bytes_from_extent`, which owns eversion-retry / EC / chunking /
+    /// failover). Cancel-safe: call_into_pooled keeps the buffer with the
+    /// read_loop, so a timeout reclaims it (no leak).
+    pub async fn read_value_into_pooled(
+        &self,
+        extent_id: u64,
+        offset: u64,
+        length: u64,
+    ) -> Result<Option<(autumn_rpc::PooledBuf, usize)>> {
+        // both transports use this fast path now. The value is received into a
+        // pooled buffer by the rpc read_loop — UCX Stream unpacks into it, TCP
+        // reads into it — so its only copy is the receive itself (no
+        // FrameDecoder accumulation copy).
+        // The EN `MSG_READ` response is value-separable + pooled on both
+        // transports, so the EN send side also drops its per-op alloc/zeroing +
+        // encode copy.
+        if length == 0 {
+            return Ok(None);
+        }
+        // this bulk value fast path is a READ path too — refresh the
+        // Suspected snapshot (TTL-gated, non-blocking) so it routes around a
+        // flaky node like the copy path, not just the avali-isolated ones
+        // (without this the hot GET still hit slot 0 first and paid
+        // the 3 s timeout on a Suspected EN — the VP-read-paths-fragmented trap).
+        self.maybe_refresh_suspected();
+        let ex = self.fetch_extent_info(extent_id).await?;
+        // Chunked / stale-VP-offset → let the copy path handle it.
+        if length > self.config.read_chunk_bytes || (ex.sealed && offset > ex.sealed_length) {
+            return Ok(None);
+        }
+        if ex.ec_converted {
+            return self.ec_shard_into_pooled(extent_id, offset, length, &ex).await;
+        }
+        let addrs = self.replica_addrs_for_extent(&ex).await?;
+        // WAL self-heal A1: serve only avali-eligible slots, healthy
+        // (non-Suspected) replicas FIRST, rotated start — exactly the copy
+        // path's `replicated_read_order`. avali isolation: a bit-rotted-but-
+        // isolated replica returns CODE_OK with corrupt bytes (no per-VP CRC on
+        // this path), so it must never be read (I2 invariant).
+        // Suspected-to-back: a flaky node is tried last so the common case
+        // doesn't pay its timeout. With an empty snapshot this is the prior
+        // eligible-slot order (plus start-replica rotation, matching the copy path).
+        let order = {
+            let c = self.suspected.borrow();
+            replicated_read_order(&ex, offset, &c.nodes)
+        };
+        // BUG-READ-TIMEOUT-STORM: damp on liveness timeouts (see below).
+        let mut timeouts = 0usize;
+        let loc = published_payload(&ex)?;
+        for &slot in &order {
+            let addr = &addrs[slot];
+            let req = rkyv_encode(&ReadReq::new(
+                extent_id,
+                ex.eversion,
+                offset,
+                length,
+                READ_EXACT,
+                PayloadRef::for_extent(loc, slot as u32),
+            ));
+            match self
+                .pool
+                // BUG-READ-TIMEOUT-STORM: size-scale (was fixed 3 s). `length`
+                // is chunk-bounded ≤ read_chunk_bytes by the caller.
+                .call_into_pooled(addr, MSG_READ, req, self.config.read_deadline().for_len(length))
+                .await
+            {
+                // READ_EXACT (extent_node `build_read_future`): a read that
+                // cannot serve the FULL requested range returns a non-OK code,
+                // never CODE_OK + a short payload — so CODE_OK here implies the
+                // buffer holds exactly `length` bytes.
+                Ok(z) if z.code == CODE_OK => return Ok(Some((z.buf, length as usize))),
+                Ok(z) => {
+                    // eversion mismatch / EN-side error → bail to the copy path
+                    // (it refetches ExtentInfo + re-routes EC). buf drops → pool.
+                    tracing::debug!(
+                        extent_id,
+                        code = z.code,
+                        message = %read_message(&z),
+                        "bulk proxy read non-OK; falling back to copy path"
+                    );
+                    self.extent_info_cache.remove(&extent_id);
+                    return Ok(None);
+                }
+                // Refused for want of a reply buffer — here (this process's
+                // `Reply` budget, which another replica would meet too) or at
+                // the node (its own budget) — or a send queue full: the copy
+                // path reads unbudgeted, through its own replica loop.
+                Err(e)
+                    if e.chain().any(|c| {
+                        matches!(
+                            c.downcast_ref::<autumn_rpc::RpcError>(),
+                            Some(autumn_rpc::RpcError::Status { code: autumn_rpc::StatusCode::Unavailable, .. })
+                        )
+                    }) =>
+                {
+                    tracing::debug!(extent_id, error = %format_args!("{e:#}"), "bulk proxy read refused; using the copy path");
+                    return Ok(None);
+                }
+                Err(e) => {
+                    // transport/timeout error → evict + try next replica.
+                    // Classify like the client-side direct read: a
+                    // TIMEOUT means the op silently ate the full 3s deadline
+                    // (e.g. a UCX dead-endpoint stall) — warn; fast transport
+                    // errors (connect refused mid-failover) stay debug.
+                    let msg = format!("{e:#}");
+                    self.extent_info_cache.remove(&extent_id);
+                    // The GET hot path swallows this the same way the failover
+                    // arm does — the next slot answers and the caller sees
+                    // `Ok(Some)`, so no retry loop ever classifies it. And
+                    // `replicated_read_order` rotates the start by
+                    // `(extent_id, offset)`, so a single moved node is on the
+                    // front of roughly one GET in K+M: without forgetting it
+                    // here, that fraction of every partition's reads pays a full
+                    // connect timeout for the life of the process.
+                    if is_connect_failure(&e) {
+                        if let Some(&node_id) = replica_node_ids(&ex).get(slot) {
+                            self.note_unreachable(node_id, extent_id);
+                        }
+                    }
+                    if is_liveness_timeout(&e) {
+                        timeouts += 1;
+                        tracing::warn!(
+                            extent_id,
+                            addr = %addr,
+                            error = %msg,
+                            "bulk proxy read TIMED OUT; evicting cache, trying next replica"
+                        );
+                        // Damp: after 2 liveness timeouts bail to the chunked
+                        // copy path (it refetches ExtentInfo + re-routes) rather
+                        // than walking every remaining slot at a full deadline.
+                        if timeouts >= 2 {
+                            return Ok(None);
+                        }
+                    } else {
+                        tracing::debug!(
+                            extent_id,
+                            addr = %addr,
+                            error = %msg,
+                            "bulk proxy read failed; evicting cache, trying next replica"
+                        );
+                    }
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Branch on the (cached) extent layout: EC sub-range read for
+    /// EC extents, replicated read with chunked failover for replica
+    /// extents. The `read_bytes_from_extent` retry loop handles
+    /// stale-cache (`EversionStale`) propagation.
+    ///
+    /// EC dispatch keys on `ec_converted` (set only by the manager's
+    /// `apply_ec_conversion_done` after RS-encoding a sealed extent),
+    /// NOT on `parity.is_empty()`. The manager pre-fills `parity` for
+    /// every extent allocated via `stream_alloc_extent` on an EC
+    /// stream, but those extents stay full-replicated on every K+M
+    /// node until EC conversion runs (only triggered after seal).
+    /// Routing an open / pre-conversion extent through `ec_subrange_read`
+    /// would compute `shard_size` from `sealed_length=0` and panic with
+    /// `range start index … out of range for slice of length …` on the
+    /// per-shard slice — and the underlying data isn't EC-shaped yet
+    /// anyway. `read_replicated_with_failover` already iterates the
+    /// full `replicates ++ parity` address list via
+    /// `replica_addrs_for_extent`, so it correctly hits all K+M nodes
+    /// holding the replicated payload.
+    async fn read_with_layout(
+        &self,
+        extent_id: u64,
+        offset: u64,
+        length: u64,
+        ex: &ExtentInfo,
+    ) -> Result<(Bytes, u64)> {
+        // refresh the Suspected snapshot in the background (TTL-gated,
+        // non-blocking) so the replica-routing + EC-reconstruct decisions
+        // below see a ~2 s-fresh view of which nodes are flaky.
+        self.maybe_refresh_suspected();
+        // mirror the `StaleVpOffset` sentinel for the
+        // replicated path. Previously only `ec_slice_decoded` produced
+        // it; a VP read on a sealed replicated extent whose offset was
+        // past `sealed_length` was silently short-circuited by the
+        // server (an up-to read answers `code=OK` with no bytes when
+        // `read_offset > total_len`). Operations
+        // grepping the wire contract `stale_vp_offset_past_sealed_length:`
+        // never saw the replicated case. Detecting upfront here covers
+        // BOTH layouts and skips the wasted server round-trip / EC
+        // decode on a known-stale VP. Matches `ec_slice_decoded`'s
+        // `if start > full_payload.len()` semantics — only fires when
+        // the extent has a recorded `sealed_length`, since pre-seal
+        // there's no authoritative bound to check against.
+        if ex.sealed && offset > ex.sealed_length {
+            return Err(anyhow::Error::new(StaleVpOffset {
+                extent_id,
+                requested_offset: offset,
+                requested_length: length,
+                sealed_length: ex.sealed_length,
+            }));
+        }
+        if ex.ec_converted {
+            return self.ec_subrange_read(extent_id, offset, length, ex, None).await;
+        }
+
+        // Resolve effective length so we know when to stop chunking.
+        // length=0 ("to end") needs an explicit size: sealed_length for
+        // sealed extents, commit_length min-replica for open extents.
+        let resolved = if length == 0 {
+            // A SEALED extent has an authoritative bound = sealed_length (even
+            // 0 — a sealed-empty extent reads to-end as empty, no probe). Only
+            // an OPEN extent needs the min-replica commit_length probe.
+            let total_end = if ex.sealed {
+                ex.sealed_length
+            } else {
+                self.commit_length_for_extent(ex).await?
+            };
+            total_end.saturating_sub(offset)
+        } else {
+            length
+        };
+
+        let chunk = self.config.read_chunk_bytes;
+        if resolved <= chunk {
+            return self.read_replicated_with_failover(ex, offset, length).await;
+        }
+
+        let mut data = BytesMut::with_capacity(resolved as usize);
+        let stop = offset
+            .checked_add(resolved)
+            .ok_or_else(|| anyhow!("read_bytes_from_extent: offset+length overflows u32"))?;
+        let mut cur = offset;
+        let mut last_end: u64 = 0;
+        while cur < stop {
+            let want = (stop - cur).min(chunk);
+            let (piece, end) = self.read_replicated_with_failover(ex, cur, want).await?;
+            if piece.is_empty() {
+                break;
+            }
+            let piece_len = piece.len() as u64;
+            data.extend_from_slice(&piece);
+            cur = cur.saturating_add(piece_len);
+            last_end = end;
+            if piece_len < want {
+                // server-side has less data than requested (open extent
+                // grew slower than expected); stop early
+                break;
+            }
+        }
+        Ok((data.freeze(), last_end))
+    }
+
+    /// descriptor for a CLIENT-side direct extent read — the cached
+    /// `(eversion, replica addresses)` for an extent, fetched/refreshed via
+    /// the manager on cache miss. The PS puts these in a `ValuePosition` so
+    /// the client can read value bytes straight from an EN
+    /// without a manager round-trip of its own.
+    pub async fn extent_read_descriptor(&self, extent_id: u64) -> Result<ReadDescriptor> {
+        // the external client picks its OWN hash-rotated start over the
+        // returned addrs (crates/client/src/lib.rs), so reordering can't route
+        // around a flaky node — a Suspected address must be EXCLUDED outright
+        // Refresh the snapshot here too (this is a read path).
+        self.maybe_refresh_suspected();
+        let ex = self.fetch_extent_info(extent_id).await?;
+        // An EC-converted extent holds RS shards, not the payload, so the
+        // REPLICATED descriptor above would be data corruption: its contract is
+        // "read any address for the whole range", and each of these nodes holds
+        // one slice. It gets its own descriptor instead, carrying the geometry
+        // that lets a reader address the right shard at the right offset.
+        //
+        // Refused outright if ANY data-shard node is Suspected. There is no
+        // peer to rotate to for a given byte, so a direct read of a shard on a
+        // dead node buys a full RPC timeout before the proxy fallback even
+        // starts — the shape of the read-timeout storm this codebase already
+        // paid for once. The proxy path can reconstruct that shard from parity;
+        // this one cannot, so it declines while it still costs nothing.
+        if ex.ec_converted {
+            let data_shards = ex.replicates.len();
+            if data_shards == 0 {
+                return Ok(ReadDescriptor::NotDirect(NotDirect::EcNotShardAddressable));
+            }
+            // A shard-addressed read names `PayloadRef::shard(i)`, and an EN
+            // refuses a payload file it does not hold. Conversions predating the
+            // CoW layout left their shard bytes in `.dat` and are never
+            // backfilled, so handing out a descriptor for one would buy a round
+            // of EN refusals before the proxy fallback every single time — the
+            // old blanket refusal was free by comparison.
+            if ex.payload() != Some(PayloadLocation::InShardFile) {
+                return Ok(ReadDescriptor::NotDirect(NotDirect::EcNotShardAddressable));
+            }
+            let node_ids = replica_node_ids(&ex);
+            let any_suspected = (0..data_shards)
+                .any(|i| self.is_node_suspected(node_ids.get(i).copied().unwrap_or(0)));
+            if any_suspected {
+                return Ok(ReadDescriptor::NotDirect(NotDirect::EcShardNodeSuspected));
+            }
+            // Positional by shard index, exactly as `ec_subrange_read` indexes
+            // them — NOT filtered, since dropping an entry would silently shift
+            // every shard after it onto the wrong node.
+            let shard_addrs = self.replica_addrs_for_extent(&ex).await?;
+            return Ok(ReadDescriptor::Ec {
+                eversion: ex.eversion,
+                shard_addrs,
+                data_shards: data_shards as u32,
+                sealed_length: ex.sealed_length,
+            });
+        }
+        // The descriptor names no payload file, so the SDK's direct read always
+        // asks for `.dat` (`read_extent_value_direct`). That is sound only
+        // while a shard-file extent is unreachable here — which the refusal
+        // above enforces, since `InShardFile` is published exclusively by the
+        // EC layout flip, which also sets `ec_converted`. Check it anyway: if
+        // that ever stops holding, the SDK must fall back to the proxy rather
+        // than read `.dat` bytes that are no longer the value.
+        if ex.payload() != Some(PayloadLocation::InDat) {
+            return Ok(ReadDescriptor::NotDirect(NotDirect::PayloadOutsideDat));
+        }
+        let addrs = self.replica_addrs_for_extent(&ex).await?;
+        // WAL self-heal A1: hand the client only avali-ELIGIBLE replicas
+        // (an isolated bit-rotted slot must not be a client-direct read target
+        // — same I2 invariant as the bulk + copy paths, no per-VP CRC here) AND
+        // drop manager-Suspected replicas (the client hash-rotates, so excluding
+        // is the only effective route-around). `healthy_eligible_slots` keeps
+        // ALL eligible when every one is Suspected — never strand the read.
+        let slots = {
+            let c = self.suspected.borrow();
+            healthy_eligible_slots(&ex, &c.nodes)
+        };
+        let filtered: Vec<String> = slots.into_iter().map(|s| addrs[s].clone()).collect();
+        Ok(ReadDescriptor::Direct {
+            eversion: ex.eversion,
+            replica_addrs: filtered,
+        })
+    }
+
+    /// Replicated-mode read with per-replica failover. Used both for the
+    /// single-shot small path and as the per-chunk worker for the chunked
+    /// large-extent path.
+    ///
+    /// On `EversionStale` we **fail fast** — every replica in `ex` is
+    /// guaranteed to report the same mismatch (manager bumps eversion
+    /// once for the whole extent during EC conversion), so iterating
+    /// the remaining addresses just burns 3s timeouts each. Top-level
+    /// `read_bytes_from_extent` catches this and refetches.
+    ///
+    /// (a) — rotated start replica. Previously every read walked
+    /// `addrs` from index 0, so ALL replicated read IO landed on
+    /// replica[0] while the other two replicas' disks + NICs idled.
+    /// The start index is rotated by `(extent_id, offset)` hash — so
+    /// consecutive chunks of the chunked large-read path naturally
+    /// stripe across replicas. This applies to SEALED extents (immutable;
+    /// all-replica-ACK ⇒ every committed byte is on every replica) AND —
+    /// to OPEN tails (their committed prefix is
+    /// likewise on every replica, so a committed VP read starts anywhere;
+    /// was replica[0]-first, which piled hot-tail reads on the append
+    /// leader). Appends are unaffected (they go through `launch_append`).
+    ///
+    /// (b) — optional hedged read (off by default;
+    /// `set_read_hedge_ms`). When enabled and the rotated-first replica
+    /// hasn't answered within the hedge window, the SECOND replica is
+    /// raced concurrently and the first Ok wins — classic "Tail at
+    /// Scale" tail-latency repair. Both-fail falls back to the
+    /// remaining replicas in rotated order (same failover semantics).
+    async fn read_replicated_with_failover(
+        &self,
+        ex: &ExtentInfo,
+        offset: u64,
+        length: u64,
+    ) -> Result<(Bytes, u64)> {
+        let addrs = self.replica_addrs_for_extent(ex).await?;
+        let n = addrs.len();
+        let mut last_err = anyhow!("no replicas for extent {}", ex.extent_id);
+
+        // A1 (self-heal I2): avali-isolated slots are dropped from the read set
+        // on a sealed replicated extent. Among the eligible slots, the
+        // ones whose node the manager believes Suspected are moved to the BACK
+        // so a flaky replica never costs a per-read RPC timeout before failover
+        // — soft hint, they remain a last-resort fallback (suspected != dead,
+        // and every committed byte is on every replica). `replicated_read_order`
+        // folds all three: rotated start, avali eligibility, suspected-to-back.
+        // With an empty Suspected snapshot the order is the plain rotated
+        // walk, so the hot path is unchanged.
+        let eligible = eligible_replica_slots(ex);
+        let filtered = eligible.len() < n;
+        if filtered {
+            tracing::warn!(
+                extent_id = ex.extent_id,
+                avali = ex.avali,
+                eligible = ?eligible,
+                "read: serving from avali-eligible replicas only (some slot isolated)"
+            );
+        }
+        let order = {
+            let c = self.suspected.borrow();
+            replicated_read_order(ex, offset, &c.nodes)
+        };
+        if order.is_empty() {
+            return Err(last_err);
+        }
+
+        let mut from = 0usize;
+        // Hedge the two LEADING (healthy-first) slots. Disabled when a slot is
+        // avali-isolated (filtered), same as the unfiltered path.
+        if !filtered && read_hedge_ms() > 0 && ex.sealed && order.len() > 1 {
+            match self
+                .read_hedged_pair(&addrs, order[0], order[1], ex, offset, length)
+                .await
+            {
+                Ok(r) => return Ok(r),
+                Err(e) => {
+                    if self.read_err_fail_fast(&e, ex.extent_id) {
+                        return Err(e);
+                    }
+                    last_err = e;
+                }
+            }
+            from = 2; // hedge already consumed order[0] and order[1]
+        }
+
+        let loc = published_payload(ex)?;
+        for &slot in &order[from..] {
+            let addr = &addrs[slot];
+            match self
+                .read_shard_from_addr(
+                    addr,
+                    ex.extent_id,
+                    ex.eversion,
+                    offset,
+                    length,
+                    PayloadRef::for_extent(loc, slot as u32),
+                )
+                .await
+            {
+                Ok(result) => return Ok(result),
+                Err(e) => {
+                    if self.read_err_fail_fast(&e, ex.extent_id) {
+                        return Err(e);
+                    }
+                    // Failing over HIDES an unreachable address: the next slot
+                    // answers, this call returns Ok, and nothing reaches the
+                    // retry classifier — so the dead address stays cached and
+                    // every later read pays its connect timeout again. Drop it
+                    // here, where the slot names exactly which node it was.
+                    if is_connect_failure(&e) {
+                        if let Some(&node_id) = replica_node_ids(ex).get(slot) {
+                            self.note_unreachable(node_id, ex.extent_id);
+                        }
+                    }
+                    last_err = e;
+                }
+            }
+        }
+        Err(last_err)
+    }
+
+    /// (b): hedged read over the first two rotated replicas. Fires the
+    /// read to `addrs[start]`; if no answer within `read_hedge_ms()`, races
+    /// a second read to `addrs[start+1]` and returns whichever succeeds
+    /// first.
+    ///
+    /// Both reads run as DETACHED tasks that always run to completion:
+    /// dropping an in-flight `call_timeout` future
+    /// would strand its req_id in `RpcClient.pending` — there is no
+    /// drop-guard removal, and the bare drop also skips the timeout-evict
+    /// path — so a connected-but-unresponsive EN would accumulate pending
+    /// entries forever. Detached tasks let the LOSER finish on its own
+    /// (bounded by its rpc timeout, which evicts on expiry); results come
+    /// back over oneshots, and a dropped oneshot receiver is harmless.
+    /// Eversion-stale fails fast on every arm (same rationale as failover).
+    async fn read_hedged_pair(
+        &self,
+        addrs: &[String],
+        s0: usize,
+        s1: usize,
+        ex: &ExtentInfo,
+        offset: u64,
+        length: u64,
+    ) -> Result<(Bytes, u64)> {
+        use futures::future::{select, Either};
+        let n = addrs.len();
+        // `s0`/`s1` are the two LEADING slots of the suspected-aware read
+        // order (healthy-first), not necessarily `start`/`start+1`.
+        let a0 = addrs[s0 % n].clone();
+        let a1 = addrs[s1 % n].clone();
+        // Each arm asks its OWN slot for its own payload file — the two hedged
+        // reads are different slots, so a single hoisted ref would ask one node
+        // for the other's shard.
+        let loc = published_payload(ex)?;
+        let p0 = PayloadRef::for_extent(loc, (s0 % n) as u32);
+        let p1 = PayloadRef::for_extent(loc, (s1 % n) as u32);
+        let Some(sc) = self.self_weak.upgrade() else {
+            // Client is shutting down — plain single read, no hedge.
+            return self
+                .read_shard_from_addr(&a0, ex.extent_id, ex.eversion, offset, length, p0)
+                .await;
+        };
+        let (eid, ev) = (ex.extent_id, ex.eversion);
+        let spawn_read = |sc: Rc<StreamClient>, addr: String, payload: PayloadRef| {
+            let (tx, rx) = futures::channel::oneshot::channel();
+            compio::runtime::spawn(async move {
+                let _ = tx.send(
+                    sc.read_shard_from_addr(&addr, eid, ev, offset, length, payload)
+                        .await,
+                );
+            })
+            .detach();
+            rx
+        };
+
+        let rx0 = spawn_read(sc.clone(), a0, p0);
+        futures::pin_mut!(rx0);
+        let timer = compio::time::sleep(Duration::from_millis(read_hedge_ms()));
+        futures::pin_mut!(timer);
+
+        let rx0 = match select(rx0, timer).await {
+            Either::Left((res, _timer)) => {
+                return match flatten_hedge(res) {
+                    Ok(r) => Ok(r),
+                    Err(e) => {
+                        if self.read_err_fail_fast(&e, ex.extent_id) {
+                            return Err(e);
+                        }
+                        // First failed before the hedge window: sequential
+                        // second read (no point hedging a known failure).
+                        flatten_hedge(spawn_read(sc, a1, p1).await)
+                    }
+                };
+            }
+            Either::Right(((), rx0)) => rx0,
+        };
+
+        // Hedge window elapsed: race first vs second, first Ok wins. The
+        // loser keeps running detached and cleans up via its own timeout.
+        let rx1 = spawn_read(sc, a1, p1);
+        futures::pin_mut!(rx1);
+        match select(rx0, rx1).await {
+            Either::Left((res0, rx1_pending)) => match flatten_hedge(res0) {
+                Ok(r) => Ok(r),
+                Err(e) => {
+                    if self.read_err_fail_fast(&e, ex.extent_id) {
+                        return Err(e);
+                    }
+                    flatten_hedge(rx1_pending.await)
+                }
+            },
+            Either::Right((res1, rx0_pending)) => match flatten_hedge(res1) {
+                Ok(r) => Ok(r),
+                Err(e) => {
+                    if self.read_err_fail_fast(&e, ex.extent_id) {
+                        return Err(e);
+                    }
+                    flatten_hedge(rx0_pending.await)
+                }
+            },
+        }
+    }
+
+    /// Query commit_length on each replica, return the minimum (the
+    /// safe contiguous-prefix end). For open extents only — sealed
+    /// extents should read `ExtentInfo.sealed_length` directly.
+    ///
+    /// requires majority quorum to respond — see `current_commit`
+    /// for the rationale. Without a quorum check, the protocol could
+    /// commit at a position only the lone surviving responder held,
+    /// permanently losing data if that responder later died before
+    /// re-replicating to the unreachable peers.
+    ///
+    /// **Fence-free**: uses `MSG_PROBE_EXTENT` rather than
+    /// `MSG_COMMIT_LENGTH`. Pre-fix this called `MSG_COMMIT_LENGTH`
+    /// with the StreamClient's owner owner_epoch, which causes the EN to
+    /// run fence handover (bumps `owner_epoch` if our owner_epoch is
+    /// higher). Two harmful side-effects:
+    ///   1. A reader StreamClient created with a NEW owner_key
+    ///      (higher owner_epoch) silently fences the original writer's
+    ///      next append → CODE_LOCKED_BY_OTHER. Reproducible via the
+    ///      integration test: PS appends meta_stream 3× with
+    ///      owner_epoch=1; test creates external StreamClient
+    ///      (owner_epoch=2) for read-only `read_last_extent_data`; that
+    ///      call falls through to this helper which bumps EN's
+    ///      owner_epoch to 2; PS's 4th append (compact's checkpoint)
+    ///      fails with LockedByOther.
+    ///   2. The same shape can hit production whenever an external
+    ///      reader (e.g. autumn-stream-cli read, or any consumer that
+    ///      opens its own StreamClient against the same stream) does
+    ///      a `read_bytes_from_extent(_, _, 0)` against an active
+    ///      writer's stream.
+    /// `MSG_PROBE_EXTENT` returns the same `(code, length)` shape but
+    /// skips the fence interaction entirely — exactly what a read path
+    /// needs.
+    async fn commit_length_for_extent(&self, ex: &ExtentInfo) -> Result<u64> {
+        let addrs = self.replica_addrs_for_extent(ex).await?;
+        let mut min_len: Option<u64> = None;
+        let mut success: usize = 0;
+        let total = addrs.len();
+        for addr in &addrs {
+            let req = ProbeExtentReq {
+                extent_id: ex.extent_id,
+            };
+            // 5 s — same per-replica budget as the historical
+            // commit_length path. Per-replica miss is tolerated by
+            // the quorum tally below.
+            let Ok(resp_bytes) = self
+                .pool
+                .call_timeout(addr, MSG_PROBE_EXTENT, req.encode(), Duration::from_secs(5))
+                .await
+            else {
+                continue;
+            };
+            let Ok(resp) = ProbeExtentResp::decode(resp_bytes) else {
+                continue;
+            };
+            if resp.code != CODE_OK {
+                continue;
+            }
+            success += 1;
+            min_len = Some(min_len.map_or(resp.length, |cur| cur.min(resp.length)));
+        }
+        let quorum = total / 2 + 1;
+        if success < quorum {
+            return Err(anyhow!(
+                "insufficient quorum for probe_extent on extent {}: got {} of {} (need {})",
+                ex.extent_id,
+                success,
+                total,
+                quorum
+            ));
+        }
+        min_len.ok_or_else(|| {
+            anyhow!(
+                "no replica responded to probe_extent for extent {}",
+                ex.extent_id
+            )
+        })
+    }
+
+    /// Read raw shard bytes from a single replica address via autumn-rpc.
+    ///
+    /// `eversion` is the caller's view of the extent's eversion (from
+    /// the cached `ExtentInfo`). Server-side `build_read_future` rejects stale (lower) eversions with
+    /// `CODE_EVERSION_MISMATCH`, surfaced here as `EversionStale` so
+    /// the top-level `read_bytes_from_extent` can refetch and retry.
+    ///
+    /// there is no longer a "pass 0 to skip" sentinel — the
+    /// extent_node defaults `entry.eversion` to 1 on alloc (matches
+    /// the manager's `MgrExtentInfo { eversion: 1 }` default), so any
+    /// `eversion=0` is by definition stale (or never-cached). Always
+    /// pass the cached `ex.eversion`; the only legitimate `0` is from
+    /// raw bench/test code talking to a hand-rolled `entry.eversion=0`
+    /// fixture.
+    async fn read_shard_from_addr(
+        &self,
+        addr: &str,
+        extent_id: u64,
+        eversion: u64,
+        offset: u64,
+        length: u64,
+        payload: PayloadRef,
+    ) -> Result<(Bytes, u64)> {
+        // u64-offset widening: a single MSG_READ response is framed with
+        // `payload_len: u32` (frame.rs), so a per-RPC read MUST stay under
+        // 4 GiB. With max_extent_size raised to 16 GiB an EC shard is
+        // ~sealed_length/K (≈ 5.33 GiB at 16 GiB / K=3), so a full-shard read
+        // here would overflow the frame length field. EC reads route straight
+        // to ec_subrange_read → here WITHOUT the replicated path's chunking
+        // (read_with_layout only chunks the replicated branch), so this is the
+        // single EC choke point that must bound the per-RPC size. Chunk at
+        // `read_chunk_bytes` (default 256 MiB), exactly like the replicated
+        // path; short read stops early (a shard is shorter than requested).
+        let chunk = self.config.read_chunk_bytes;
+        if length <= chunk {
+            return self
+                .read_shard_chunk_from_addr(addr, extent_id, eversion, offset, length, payload)
+                .await;
+        }
+        let mut data = BytesMut::with_capacity(length as usize);
+        let stop = offset
+            .checked_add(length)
+            .ok_or_else(|| anyhow!("read_shard_from_addr: offset+length overflows u64"))?;
+        let mut cur = offset;
+        let mut last_end: u64 = 0;
+        while cur < stop {
+            let want = (stop - cur).min(chunk);
+            let (piece, end) = self
+                .read_shard_chunk_from_addr(addr, extent_id, eversion, cur, want, payload)
+                .await?;
+            if piece.is_empty() {
+                break;
+            }
+            let piece_len = piece.len() as u64;
+            data.extend_from_slice(&piece);
+            cur = cur.saturating_add(piece_len);
+            last_end = end;
+            if piece_len < want {
+                break;
+            }
+        }
+        Ok((data.freeze(), last_end))
+    }
+
+    /// Single-RPC shard read (one `MSG_READ` with block crcs). Callers must keep
+    /// `length <= read_chunk_bytes` so the `payload_len: u32` frame field
+    /// never overflows — `read_shard_from_addr` enforces that by chunking.
+    async fn read_shard_chunk_from_addr(
+        &self,
+        addr: &str,
+        extent_id: u64,
+        eversion: u64,
+        offset: u64,
+        length: u64,
+        payload: PayloadRef,
+    ) -> Result<(Bytes, u64)> {
+        // BUG-READ-TIMEOUT-STORM: size-scaled. The one choke point for both
+        // replicated failover and EC per-shard reads; `length` is
+        // chunk-bounded ≤ read_chunk_bytes.
+        let deadline = self.config.read_deadline().for_len(length);
+        read_checked(&self.bg_pool, addr, extent_id, eversion, offset, length, payload, deadline, None, "read").await
+    }
+
+    /// EC sub-range read.
+    ///
+    /// Generalised N-shard parallel scatter: for a `[offset, offset+length)`
+    /// sub-range that spans `start_shard..=end_shard` of the data shards,
+    /// fire one parallel `read_shard_from_addr` per touched shard and
+    /// concatenate the results in shard order. Each shard's slice is:
+    ///
+    /// - **first shard** (`start_shard`): `[start % shard_size, shard_size)`
+    /// - **last shard** (`end_shard`): `[0, end - end_shard*shard_size)`
+    /// - **middle shards** (when `end_shard - start_shard >= 2`):
+    ///   the entire shard `[0, shard_size)`
+    /// - **single-shard read** (`start_shard == end_shard`): just
+    ///   `[start % shard_size, start % shard_size + length)`
+    ///
+    /// On any per-shard error (non-eversion), short read, or a request
+    /// that lands past the data shards (e.g. a stale VP whose offset
+    /// straddles into the parity region), we fall back to
+    /// `ec_read_full_and_slice` — slow (full extent decode + RS) but
+    /// always correct.
+    ///
+    /// **Bug history**: pre-fix the two-shard branch only checked
+    /// `end_shard < data_shards` and entered for any 3+ shard span
+    /// (e.g. K=3 EC extent + 64 MiB GC chunk). It read shard 0 +
+    /// shard 2 only — silently skipping shard 1's bytes. The server
+    /// returned a SHORT-OK for shard 2 (length exceeded that shard's
+    /// actual file size), the join produced a contiguous buffer of
+    /// the right total length but with the middle ~15 MiB replaced
+    /// by shard 2's prefix, and the GC log-record decoder panicked
+    /// with `trailing bytes did not form a complete record`. The
+    /// generalised scatter below handles spans of any width safely.
+    ///
+    /// `distrust`: a data shard whose bytes are not to be believed — it is
+    /// reconstructed from the others, and its node is asked for nothing during
+    /// this read, not for its own shard nor as a peer of another shard being
+    /// reconstructed (`read_range_copies`, after a content check failed).
+    /// `None` = every shard read directly unless it fails.
+    async fn ec_subrange_read(
+        &self,
+        extent_id: u64,
+        offset: u64,
+        length: u64,
+        ex: &ExtentInfo,
+        distrust: Option<usize>,
+    ) -> Result<(Bytes, u64)> {
+        let data_shards = ex.replicates.len();
+        if data_shards == 0 {
+            return Err(anyhow!("EC extent {extent_id} has no data shards"));
+        }
+
+        let sealed_length = ex.sealed_length;
+        let shard_size = crate::erasure::shard_size(sealed_length as usize, data_shards) as u64;
+        // Saturating sub guards against a stale / corrupt VP whose
+        // offset has drifted past sealed_length: instead of unsigned-
+        // wrapping `read_len`, we fall through to ec_read_full_and_slice
+        // which returns an explicit Err.
+        let read_len = if length == 0 {
+            sealed_length.saturating_sub(offset)
+        } else {
+            length
+        };
+
+        if read_len == 0 {
+            return Ok((Bytes::new(), 0));
+        }
+
+        let start = offset;
+        let end = start + read_len;
+
+        let start_shard = (start / shard_size) as usize;
+        let end_shard = ((end - 1) / shard_size) as usize;
+
+        // If the read lands past the data-shard region (start_shard or
+        // end_shard >= data_shards) we cannot service it from data
+        // shards alone — surface via the bounds-checked full-decode
+        // path which returns Err with extent_id + sealed_length context.
+        if start_shard >= data_shards || end_shard >= data_shards {
+            return self
+                .ec_read_full_and_slice(extent_id, offset, length, ex)
+                .await;
+        }
+
+        let addrs = self.replica_addrs_for_extent(ex).await?;
+
+        // Build the per-shard (offset, length) plan.
+        let span = end_shard - start_shard + 1;
+        let mut shard_plan: Vec<(usize, u64, u64)> = Vec::with_capacity(span);
+        for shard_idx in start_shard..=end_shard {
+            let (sh_off, sh_len) = if start_shard == end_shard {
+                (start % shard_size, read_len)
+            } else if shard_idx == start_shard {
+                let off = start % shard_size;
+                let len = shard_size - start % shard_size;
+                (off, len)
+            } else if shard_idx == end_shard {
+                let len = end - shard_idx as u64 * shard_size;
+                (0u64, len)
+            } else {
+                (0u64, shard_size)
+            };
+            shard_plan.push((shard_idx, sh_off, sh_len));
+        }
+
+        // a data shard whose node the manager believes Suspected is
+        // reconstructed from parity IMMEDIATELY — its direct shard read is NOT
+        // issued, so the `join_all` below never blocks on a flaky node's full
+        // RPC timeout before reconstruction starts (on EC, reconstruct
+        // immediately rather than waiting for the request to time out). Soft
+        // hint: if reconstruction can't gather K
+        // healthy shards it still launches to every peer
+        // (`ec_reconstruct_shard_subrange` races first-K-wins), so a mistaken
+        // Suspected mark only costs a little extra parity traffic, never
+        // correctness. With an empty snapshot every shard is read directly =
+        // the unfiltered behavior.
+        let node_ids = replica_node_ids(ex);
+        let mut plan_results: Vec<Option<Bytes>> = vec![None; shard_plan.len()];
+        let mut needs_reconstruct: Vec<usize> = Vec::new();
+        let mut to_read: Vec<usize> = Vec::with_capacity(shard_plan.len());
+        for (i, &(shard_idx, _, _)) in shard_plan.iter().enumerate() {
+            let nid = node_ids.get(shard_idx).copied().unwrap_or(0);
+            if distrust == Some(shard_idx) {
+                needs_reconstruct.push(i);
+            } else if self.is_node_suspected(nid) {
+                // The THIRD way into a reconstruct, and the one that lasts: a
+                // short read and a read error each get a warning, but a node the
+                // manager has marked Suspected is diverted here before anything
+                // is even attempted — so a node that stays Suspected turns every
+                // read of its shards into a parity reconstruct, indefinitely,
+                // and used to say nothing at all while doing it. At 4+1 that is
+                // one hiccup away from unavailable, which is exactly the state
+                // worth hearing about.
+                tracing::warn!(
+                    extent_id,
+                    shard = shard_idx,
+                    node_id = nid,
+                    "EC read: shard's node is Suspected — reconstructing from parity \
+                     instead of reading it (redundancy is spent while this lasts)"
+                );
+                needs_reconstruct.push(i);
+            } else {
+                to_read.push(i);
+            }
+        }
+
+        // Parallel scatter over the non-suspected shards only.
+        // `read_shard_from_addr` borrows `&self`, which is fine because all
+        // futures share the same self borrow that outlives this `await`.
+        let loc = published_payload(ex)?;
+        let read_futs: Vec<_> = to_read
+            .iter()
+            .map(|&i| {
+                let (shard_idx, sh_off, sh_len) = shard_plan[i];
+                let addr = &addrs[shard_idx];
+                self.read_shard_from_addr(
+                    addr,
+                    extent_id,
+                    ex.eversion,
+                    sh_off,
+                    sh_len,
+                    PayloadRef::for_extent(loc, shard_idx as u32),
+                )
+            })
+            .collect();
+        let results = futures::future::join_all(read_futs).await;
+
+        // failed (or suspected-skipped) entries get reconstructed
+        // via sub-range RS in the pass below — DO NOT fall back to
+        // `ec_read_full_and_slice` (which would read 4 × full-shard payloads to
+        // decode the whole extent just to slice out the requested sub-range).
+        // The amplification caused df-probe timeouts under heavy GC fanout,
+        // flapping disks offline.
+        let mut last_end: u64 = 0;
+        for (k, r) in results.into_iter().enumerate() {
+            let i = to_read[k];
+            match r {
+                Ok((bytes, end_val)) => {
+                    let want = shard_plan[i].2 as usize;
+                    if bytes.len() != want {
+                        // short read — treat same as failure; reconstruct.
+                        // R4: SAY SO. A shard that has been reconstruct-only
+                        // for weeks is invisible today, and with M=1 that means
+                        // sitting one hiccup away from data-unavailable with no
+                        // signal at all.
+                        tracing::warn!(
+                            extent_id,
+                            shard = shard_plan[i].0,
+                            got = bytes.len(),
+                            want,
+                            "ec: short shard read — degrading to reconstruct"
+                        );
+                        needs_reconstruct.push(i);
+                        continue;
+                    }
+                    plan_results[i] = Some(bytes);
+                    last_end = end_val;
+                }
+                Err(e) => {
+                    if is_eversion_stale(&e) {
+                        return Err(anyhow::Error::new(EversionStale));
+                    }
+                    // R4: same reasoning as the short-read arm — this was the
+                    // silent one. `{e:#}` so the chain survives; the outermost
+                    // Display alone is what made this class unreadable.
+                    tracing::warn!(
+                        extent_id,
+                        shard = shard_plan[i].0,
+                        error = %format_args!("{e:#}"),
+                        "ec: shard read failed — degrading to reconstruct"
+                    );
+                    // Reconstruct HIDES this failure: the read succeeds from the
+                    // other K and nothing reaches `read_retry_action`, so a
+                    // moved node would keep costing a full connect timeout on
+                    // every read of this extent, forever, in silence. This is
+                    // the routine shape — a rolling update moves one node at a
+                    // time and the others cover for it.
+                    if is_connect_failure(&e) {
+                        if let Some(&node_id) = node_ids.get(shard_plan[i].0) {
+                            self.note_unreachable(node_id, extent_id);
+                        }
+                    }
+                    needs_reconstruct.push(i);
+                }
+            }
+        }
+
+        if !needs_reconstruct.is_empty() {
+            // Sub-range RS reconstruction. For each failed plan entry,
+            // read the same [sh_off, sh_len] window from K healthy
+            // shards (the other data shards + parity) and call
+            // `ec_reconstruct_shard` on K-aligned sub-shards. Bytes-on-
+            // the-wire ≈ K × sh_len per failure, vs 4 × full-shard
+            // for the old fall-back path.
+            for &plan_idx in &needs_reconstruct {
+                let (failing_shard_idx, sh_off, sh_len) = shard_plan[plan_idx];
+                let recon = self
+                    .ec_reconstruct_shard_subrange(
+                        extent_id,
+                        ex,
+                        &addrs,
+                        failing_shard_idx,
+                        sh_off,
+                        sh_len,
+                        distrust,
+                    )
+                    .await?;
+                plan_results[plan_idx] = Some(Bytes::from(recon));
+            }
+            // No `last_end` from reconstruction (the sub-range reads
+            // didn't surface server-side `end` watermarks). Fall back
+            // to the sealed_length as the safe overall end signal —
+            // matches what `read_replicated_with_failover` would
+            // return for a sealed extent.
+            if last_end == 0 {
+                last_end = ex.sealed_length;
+            }
+        }
+
+        // One shard: its reply as received.
+        if let [Some(only)] = plan_results.as_mut_slice() {
+            return Ok((std::mem::take(only), last_end));
+        }
+        let mut data = BytesMut::with_capacity(read_len as usize);
+        for (i, slot) in plan_results.into_iter().enumerate() {
+            let bytes = slot.ok_or_else(|| {
+                anyhow!(
+                    "ec_subrange_read: plan entry {} unfilled after reconstruction (shard_idx={}, sh_off={}, sh_len={})",
+                    i,
+                    shard_plan[i].0,
+                    shard_plan[i].1,
+                    shard_plan[i].2,
+                )
+            })?;
+            data.extend_from_slice(&bytes);
+        }
+        Ok((data.freeze(), last_end))
+    }
+
+    /// reconstruct one data shard's sub-range `[sh_off, sh_off + sh_len)`
+    /// from K healthy peers (the other data shards + a parity shard).
+    /// Replaces the old `ec_read_full_and_slice` fall-back for the case where
+    /// a single per-shard sub-range read fails inside `ec_subrange_read`.
+    ///
+    /// Why sub-range reconstruction works: RS encodes byte-by-byte across
+    /// the K data shards (galois_8). Decoding any single missing shard at
+    /// row position `i` needs `data_shards` (K) byte values at the SAME row
+    /// position from healthy peers. So a sub-range `[sh_off, sh_off + sh_len)`
+    /// on the missing shard can be reconstructed from `[sh_off, sh_off + sh_len)`
+    /// on K healthy shards — no full-extent decode needed.
+    ///
+    /// Bytes-on-the-wire: `K × sh_len` (e.g., 3 × 64 MiB = 192 MiB for the
+    /// user's GC chunk read of a 3+1 extent), vs the earlier fall-back
+    /// of `(K + M) × shard_size(sealed_length, K)` (e.g., 4 × 933 MiB ≈
+    /// 3.7 GiB for the same chunk on a 2.8 GiB extent). 20× reduction.
+    ///
+    /// Concurrency: launches reads to ALL `(K + M) - 1` non-missing
+    /// peers in parallel and stops as soon as `K` succeed. Any single
+    /// stale-eversion response short-circuits the whole call so the
+    /// top-level `read_bytes_from_extent` 2-attempt loop can refetch
+    /// `ExtentInfo` and retry against the fresh EC layout.
+    async fn ec_reconstruct_shard_subrange(
+        &self,
+        extent_id: u64,
+        ex: &ExtentInfo,
+        addrs: &[String],
+        missing_shard_idx: usize,
+        sh_off: u64,
+        sh_len: u64,
+        distrust: Option<usize>,
+    ) -> Result<Vec<u8>> {
+        let data_shards = ex.replicates.len();
+        let parity_shards = ex.parity.len();
+        let n = data_shards + parity_shards;
+
+        if sh_len == 0 {
+            return Ok(Vec::new());
+        }
+        if missing_shard_idx >= data_shards {
+            return Err(anyhow!(
+                "ec_reconstruct_shard_subrange: missing_shard_idx {missing_shard_idx} is in parity region (data_shards={data_shards}); refusing"
+            ));
+        }
+
+        let (tx, mut rx) = futures::channel::mpsc::channel::<(usize, Result<Vec<u8>>)>(n);
+        let cached_eversion = ex.eversion;
+        let cached_location = published_payload(ex)?;
+        // BUG-READ-TIMEOUT-STORM: capture the read IoDeadline (Copy) here where
+        // `self.config` is reachable — the per-shard read runs inside a spawned
+        // task that only captures a cloned `pool`, not `self`.
+        let read_dl = self.config.read_deadline();
+        // R1: ASK THE MISSING SHARD'S NODE TOO.
+        //
+        // Skipping it made 4+1 behave like "all four survivors must answer",
+        // which is one unit of slack tighter than the data actually has. And
+        // the skip is often unearned: a shard lands here whenever its direct
+        // read failed OR its node merely appeared in the Suspected snapshot —
+        // in the latter case nobody asked it anything. Suspected is not dead,
+        // and a mistaken mark then costs availability rather than the "little
+        // extra parity traffic" the comment above the skip promises.
+        //
+        // Including it restores 4-of-5. It runs in the same parallel race, so
+        // it costs no wall-clock, just one more sh_len RPC. And if it answers,
+        // its bytes ARE the answer — `missing_shard_idx < data_shards` is
+        // enforced above, so this is a data shard, never parity — which lets
+        // the receive loop return them directly and skip RS entirely.
+        //
+        // Except a distrusted shard (`ec_subrange_read`'s `distrust`): a
+        // content check failed and that shard is the one being ruled out, so
+        // its bytes must neither come back verbatim nor feed the RS of any
+        // other shard this read reconstructs.
+        for (i, addr) in addrs.iter().enumerate() {
+            if distrust == Some(i) {
+                continue;
+            }
+            let mut tx_clone = tx.clone();
+            let addr_clone = addr.clone();
+            let pool = self.bg_pool.clone();
+            compio::runtime::spawn(async move {
+                // Shard `i` from the node that holds shard `i`.
+                // BUG-READ-TIMEOUT-STORM: size-scaled. Sub-range is `sh_len`
+                // (≤ read_chunk_bytes, typically 64 MiB GC chunks).
+                let payload = PayloadRef::for_extent(cached_location, i as u32);
+                let result: Result<Vec<u8>> = read_checked(
+                    &pool,
+                    &addr_clone,
+                    extent_id,
+                    cached_eversion,
+                    sh_off,
+                    sh_len,
+                    payload,
+                    read_dl.for_len(sh_len),
+                    Some(i),
+                    "ec_reconstruct",
+                )
+                .await
+                .and_then(|(data, _)| {
+                    if data.len() as u64 != sh_len {
+                        Err(anyhow!("ec_reconstruct: short read from {addr_clone}: got {} want {sh_len}", data.len()))
+                    } else {
+                        // RS reconstruct works on owned buffers.
+                        Ok(data.to_vec())
+                    }
+                });
+                let _ = futures::SinkExt::send(&mut tx_clone, (i, result)).await;
+            })
+            .detach();
+        }
+        drop(tx);
+
+        let no_responses =
+            anyhow!("ec_reconstruct_shard_subrange: no shard responses for extent {extent_id}");
+        let shards = match ec_gather_collect(
+            &mut rx,
+            n,
+            data_shards,
+            missing_shard_idx,
+            no_responses,
+        )
+        .await
+        {
+            GatherOutcome::Verbatim(bytes) => {
+                tracing::debug!(
+                    extent_id,
+                    shard = missing_shard_idx,
+                    "ec_reconstruct: missing shard answered on retry — no RS needed"
+                );
+                return Ok(bytes);
+            }
+            GatherOutcome::Ready(shards) => shards,
+            GatherOutcome::Stale(e) => return Err(e),
+            GatherOutcome::OneShort { last_err } => {
+                return Err(one_short_error(
+                    extent_id,
+                    missing_shard_idx,
+                    sh_off,
+                    sh_len,
+                    last_err,
+                ));
+            }
+            GatherOutcome::Short { success, last_err } => {
+                return Err(last_err.context(format!(
+                    "ec_reconstruct_shard_subrange: only {success}/{data_shards} shards available for sub-range reconstruct (extent={extent_id}, missing={missing_shard_idx}, sh_off={sh_off}, sh_len={sh_len})"
+                )));
+            }
+        };
+
+        // RS reconstruction is CPU-bound; offload to blocking pool.
+        let result = compio::runtime::spawn_blocking(move || {
+            crate::erasure::ec_reconstruct_shard(
+                shards,
+                data_shards,
+                parity_shards,
+                missing_shard_idx,
+            )
+        })
+        .await
+        .map_err(|_| anyhow!("ec_reconstruct_shard task panicked"))??;
+
+        Ok(result)
+    }
+
+    /// Decode the entire EC extent and slice `[offset, offset+length)`.
+    ///
+    /// Returns `Err` (instead of panicking) when `offset` is past the
+    /// decoded payload length. The caller is responsible for surfacing
+    /// the resulting short/missing read upstream.
+    ///
+    /// **Bug history**: pre-fix this used `full_payload[start..slice_end]`
+    /// directly, which panics with `range start index N out of range
+    /// for slice of length L` when `start > L`. That happened when
+    /// log_stream extents were (incorrectly) EC-converted
+    /// and a VP referenced an offset past the manager's recorded
+    /// `sealed_length` — the panic took down the entire PS process.
+    /// The error is now structured so `read_value_from_log` reports a
+    /// "logStream value short" / out-of-bounds error to the caller and
+    /// the partition keeps serving other requests.
+    async fn ec_read_full_and_slice(
+        &self,
+        extent_id: u64,
+        offset: u64,
+        length: u64,
+        ex: &ExtentInfo,
+    ) -> Result<(Bytes, u64)> {
+        let (full_payload, end) = self.ec_read_full(extent_id, ex).await?;
+        // pass extent_id + sealed_length so `ec_slice_decoded`
+        // can build a structured `StaleVpOffset` sentinel on
+        // out-of-bounds. Previously we wrapped a stringy
+        // `anyhow!("ec_read_full_and_slice: ...")` here — that erased
+        // the downcast surface the PS layer relies on. Now the
+        // sentinel surfaces unmodified; the PS `map_storage_error`
+        // helper recognises it and returns `FailedPrecondition`
+        // instead of `Internal`.
+        let bytes = ec_slice_decoded(full_payload, offset, length, extent_id, ex.sealed_length)?;
+        Ok((Bytes::from(bytes), end))
+    }
+
+    async fn ec_read_full(&self, extent_id: u64, ex: &ExtentInfo) -> Result<(Vec<u8>, u64)> {
+        let data_shards = ex.replicates.len();
+        let parity_shards = ex.parity.len();
+        let n = data_shards + parity_shards;
+
+        let addrs = self.replica_addrs_for_extent(ex).await?;
+        debug_assert_eq!(addrs.len(), n);
+
+        let (tx, mut rx) = futures::channel::mpsc::channel::<(usize, Result<(Vec<u8>, u64)>)>(n);
+
+        let cached_eversion = ex.eversion;
+        // BUG-READ-TIMEOUT-STORM: size-scale the per-shard read (was a fixed 5 s
+        // — the worst mismatch in the file: this reads a FULL EC shard,
+        // `sealed_length / K`, hundreds of MiB today). Captured here (Copy)
+        // because the read runs inside a spawned task that captures only `pool`.
+        // NOTE: `ec_read_full`'s per-shard MSG_READ is NOT chunked (unlike
+        // `read_shard_from_addr`), so a shard > 4 GiB would also overflow the
+        // frame `payload_len: u32` — a pre-existing hazard, out of scope here.
+        let read_dl = self.config.read_deadline();
+        let cached_location = published_payload(ex)?;
+        let shard_len = crate::erasure::shard_size(ex.sealed_length as usize, data_shards) as u64;
+        for (i, addr) in addrs.into_iter().enumerate() {
+            let mut tx = tx.clone();
+            let pool = self.bg_pool.clone();
+            let delay = if i >= data_shards {
+                Duration::from_millis(20)
+            } else {
+                Duration::ZERO
+            };
+            compio::runtime::spawn(async move {
+                if !delay.is_zero() {
+                    compio::time::sleep(delay).await;
+                }
+                // Size-scaled per-shard deadline (BUG-READ-TIMEOUT-STORM) —
+                // without a bound, a paged-out / dead EN can keep its spawned
+                // task alive forever, and since the outer `while rx.next().await`
+                // only exits when either `success >= data_shards` OR all senders
+                // drop, two slow shards in a K=3 EC layout would wedge
+                // `ec_read_full` indefinitely: minutes of VP-resolve latency on
+                // a single Get when one EN stalled. NOTE: a genuinely-stuck
+                // loser now lingers up to
+                // `read_dl.for_len(shard_len)` (≤ 600 s cap) rather than the old
+                // fixed 5 s; acceptable because EC is off by default and a healthy
+                // large-shard read legitimately needs the scaled budget (a 5 s cap
+                // was the read-side of the storm bug). If EC concurrency ever makes
+                // loser accumulation a problem, give losers a separate shorter
+                // deadline.
+                let payload = PayloadRef::for_extent(cached_location, i as u32);
+                let result: Result<(Vec<u8>, u64)> = read_checked(
+                    &pool,
+                    &addr,
+                    extent_id,
+                    cached_eversion,
+                    0,
+                    0,
+                    payload,
+                    read_dl.for_len(shard_len),
+                    Some(i),
+                    "ec_read_full",
+                )
+                .await
+                // RS decode works on owned buffers.
+                .map(|(data, end)| (data.to_vec(), end));
+                let _ = futures::SinkExt::send(&mut tx, (i, result)).await;
+            })
+            .detach();
+        }
+        drop(tx);
+
+        let mut shard_data: Vec<Option<Vec<u8>>> = vec![None; n];
+        let mut end_val: Option<u64> = None;
+        let mut success = 0usize;
+        let mut last_err = anyhow!("no shard responses for extent {}", extent_id);
+
+        while let Some((idx, result)) = futures::StreamExt::next(&mut rx).await {
+            match result {
+                Ok((data, end)) => {
+                    shard_data[idx] = Some(data);
+                    end_val = Some(end);
+                    success += 1;
+                    if success >= data_shards {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    // Any single shard reporting stale eversion means
+                    // the cached EC layout is wrong; bail out so the
+                    // top-level retry can refetch ExtentInfo.
+                    if is_eversion_stale(&e) {
+                        return Err(e);
+                    }
+                    last_err = e;
+                }
+            }
+        }
+
+        if success < data_shards {
+            return Err(last_err.context(format!(
+                "only {success}/{data_shards} shards available for EC decode"
+            )));
+        }
+
+        // RS decode of a full extent (up to 128 MiB) is CPU-bound;
+        // run it on the blocking pool so the caller's compio thread (P-log
+        // / P-sst / extent-node read fanout) stays responsive while the
+        // GF(256) math runs. `sealed_length` is the authoritative payload
+        // length (no in-shard trailer); decode truncates the data shards to it.
+        let original_size = ex.sealed_length as usize;
+        let decoded = compio::runtime::spawn_blocking(move || {
+            crate::erasure::ec_decode(shard_data, data_shards, parity_shards, original_size)
+        })
+        .await
+        .map_err(|_| anyhow!("ec_decode task panicked"))??;
+        Ok((decoded, end_val.unwrap()))
+    }
+
+    /// Read all bytes from the last non-empty extent of the given stream.
+    /// Returns None if the stream has no data.
+    pub async fn read_last_extent_data(&self, stream_id: u64) -> Result<Option<Bytes>> {
+        let info = self.get_stream_info(stream_id).await?;
+        for &eid in info.extent_ids.iter().rev() {
+            let (payload, _end) = self.read_bytes_from_extent(eid, 0, 0).await?;
+            if !payload.is_empty() {
+                return Ok(Some(payload));
+            }
+        }
+        Ok(None)
+    }
+
+    pub async fn multi_modify_split(
+        &self,
+        mid_key: Vec<u8>,
+        part_id: u64,
+        op_id: u64,
+        sealed_lengths: [u64; 3],
+        tail_extent_ids: [u64; 3],
+        timeout: Duration,
+    ) -> Result<()> {
+        let req = manager_rpc::rkyv_encode(&MultiModifySplitReq {
+            part_id,
+            owner_key: self.owner_key.clone(),
+            owner_epoch: self.owner_epoch,
+            mid_key,
+            log_stream_sealed_length: sealed_lengths[0],
+            row_stream_sealed_length: sealed_lengths[1],
+            meta_stream_sealed_length: sealed_lengths[2],
+            log_tail_extent_id: tail_extent_ids[0],
+            row_tail_extent_id: tail_extent_ids[1],
+            meta_tail_extent_id: tail_extent_ids[2],
+            op_id,
+        });
+        // Per-call timeout is caller-chosen (#6): the PS split path bounds it
+        // SHORT so the whole freeze critical section stays under FREEZE_TTL —
+        // a split that committed AFTER the freeze lapsed would seal the
+        // log_stream at a stale commit_length and lose the writes that resumed
+        // post-unfreeze. The manager runs the split's atomic etcd txn (alloc 4
+        // ids + duplicate 3 streams + create partition + update regions +
+        // last_op_at sidecar).
+        let resp_data = self
+            .manager_call(MSG_MULTI_MODIFY_SPLIT, req, timeout)
+            .await?;
+        let resp: CodeResp = manager_rpc::rkyv_decode(&resp_data).map_err(|e| anyhow!("{e}"))?;
+        self.check_manager_resp(resp.code, &resp.message, "multi_modify_split")?;
+        Ok(())
+    }
+
+    // ── Mgr→local type conversion helpers ───────────────────────────────
+
+    fn mgr_to_stream_info(s: &MgrStreamInfo) -> StreamInfo {
+        StreamInfo {
+            stream_id: s.stream_id,
+            extent_ids: s.extent_ids.clone(),
+            ec_data_shard: s.ec_data_shard,
+            ec_parity_shard: s.ec_parity_shard,
+        }
+    }
+
+    /// `payload_location` is not part of `MgrExtentInfo` (that struct is the
+    /// persisted etcd value); it arrives beside it. Callers that hold no
+    /// published location pass `PAYLOAD_LOCATION_IN_DAT` — sound because only a
+    /// SEALED extent can live outside `.dat`, and those callers are handling a
+    /// freshly allocated or just-committed tail.
+    fn mgr_to_extent_info(e: &MgrExtentInfo, payload_location: u8) -> ExtentInfo {
+        ExtentInfo {
+            extent_id: e.extent_id,
+            replicates: e.replicates.clone(),
+            parity: e.parity.clone(),
+            eversion: e.eversion,
+            refs: e.refs,
+            sealed_length: e.sealed_length,
+            sealed: e.sealed,
+            avali: e.avali,
+            replicate_disks: e.replicate_disks.clone(),
+            parity_disks: e.parity_disks.clone(),
+            ec_converted: e.ec_converted,
+            payload_location,
+        }
+    }
+}
+
+#[cfg(test)]
+mod pipeline_tests {
+    use super::*;
+
+    #[test]
+    fn ack_advances_commit_on_prefix() {
+        let mut state = StreamAppendState::new(
+            Rc::new(RefCell::new(HashMap::new())),
+            mpsc::channel::<FailureReport>(1).0,
+            Duration::from_secs(30),
+        );
+        let (o0, e0) = state.lease(100); // 0..100
+        let (o1, e1) = state.lease(100); // 100..200
+        let (o2, e2) = state.lease(100); // 200..300
+
+        state.ack(o1, e1, None);
+        assert_eq!(state.commit, 0);
+        assert_eq!(state.in_flight, 2);
+        assert!(state.pending_acks.contains_key(&100));
+
+        state.ack(o2, e2, None);
+        assert_eq!(state.commit, 0);
+        assert_eq!(state.in_flight, 1);
+
+        state.ack(o0, e0, None);
+        assert_eq!(state.commit, 300);
+        assert_eq!(state.in_flight, 0);
+        assert!(state.pending_acks.is_empty());
+    }
+
+    /// An append that completes AFTER the tail rolled beneath it must fail its
+    /// caller, not be filed against the new extent's prefix.
+    ///
+    /// This is the live wedge. The preemptive roll fires from a successful ack
+    /// without quiescing the worker, so appends already in flight on the old
+    /// extent complete afterwards. `reset_for_new_extent` has set `commit = 0`,
+    /// so such a completion's 16 GiB-scale offset can never join the new
+    /// extent's contiguous prefix: it sits in `pending_acks` holding its
+    /// caller's oneshot, nothing ever removes it, and the partition server's
+    /// Phase 2 — an unbounded `ack_rx.await` — never returns. The partition
+    /// then stops answering anything, indefinitely, past every downstream
+    /// deadline, with the extent nodes idle.
+    ///
+    /// Ablation: drop the stale-extent arm at the top of `apply_completion`
+    /// (or call `state.ack` directly here) and the receiver below stays empty
+    /// forever while `pending_acks` holds one entry.
+    #[test]
+    fn a_completion_from_a_rolled_away_extent_fails_its_caller() {
+        let tail = |eid: u64| StreamTail {
+            extent: ExtentInfo {
+                extent_id: eid,
+                ..Default::default()
+            },
+            replica_addrs: vec!["a".to_string()],
+            replica_node_ids: vec![1],
+        };
+        let ok_frame = |offset: u64, end: u64| {
+            autumn_rpc::Frame::response(
+                0,
+                MSG_APPEND,
+                AppendResp {
+                    code: CODE_OK,
+                    offset,
+                    end,
+                }
+                .encode(),
+            )
+        };
+
+        let mut state = test_state();
+        state.apply_reset_tail(tail(7));
+
+        // Two appends in flight on extent 7, the second beyond the cap.
+        let (o_a, e_a) = state.lease(300);
+        let (o_b, e_b) = state.lease(300);
+        assert_eq!(state.in_flight, 2);
+
+        // A completes and acks; the cap-hitting roll then moves the tail to a
+        // FRESH extent without draining B.
+        state.ack(o_a, e_a, None);
+        state.apply_reset_tail(tail(8));
+        assert_eq!(state.commit, 0, "a fresh extent starts at zero");
+        assert_eq!(state.in_flight, 0, "the reset forgot the in-flight lease");
+
+        // B now completes — on extent 7, which is no longer the tail.
+        let (tx_b, mut rx_b) = oneshot::channel::<Result<AppendResult>>();
+        apply_completion(
+            &mut state,
+            InflightResult {
+                offset: o_b,
+                end: e_b,
+                extent_id: 7,
+                frames: vec![Ok(ok_frame(o_b, e_b))],
+                replica_node_ids: vec![1],
+                ack_tx: tx_b,
+                timing: AppendTiming { inflight_at_launch: 0, first_ns: 0, all_ns: 0 },
+            },
+        );
+
+        let got = rx_b
+            .try_recv()
+            .expect("the caller's sender must not be held")
+            .expect("the caller must be answered, not parked");
+        assert!(
+            got.is_err(),
+            "bytes past the old extent's seal must not ack as success"
+        );
+        assert!(
+            state.pending_acks.is_empty(),
+            "a stale completion must not be filed against the new extent's \
+             prefix — that entry is what holds the caller forever"
+        );
+        assert_eq!(state.commit, 0, "and it must not move the new prefix");
+        // ...and it must not have gone through the failure path, which also
+        // sends Err and leaves `pending_acks` empty — that one would poison the
+        // FRESH extent for the old one's completion.
+        assert!(!state.poisoned, "a stale completion must not poison the new tail");
+        assert_eq!(
+            state.failure_floor,
+            u64::MAX,
+            "a stale completion must not lower the new extent's failure floor"
+        );
+    }
+
+    fn test_state() -> StreamAppendState {
+        StreamAppendState::new(
+            Rc::new(RefCell::new(HashMap::new())),
+            mpsc::channel::<FailureReport>(1).0,
+            Duration::from_secs(30),
+        )
+    }
+
+    fn ack_payload(
+        offset: u64,
+        end: u64,
+    ) -> (
+        oneshot::Receiver<Result<AppendResult>>,
+        Option<(oneshot::Sender<Result<AppendResult>>, AppendResult)>,
+    ) {
+        let (tx, rx) = oneshot::channel();
+        (
+            rx,
+            Some((
+                tx,
+                AppendResult {
+                    extent_id: 1,
+                    offset,
+                    end,
+                },
+            )),
+        )
+    }
+
+    /// ENOSPC-1 P1: caller acks fire only when the contiguous prefix
+    /// covers the range — an out-of-order completion is HELD, not acked.
+    #[test]
+    fn caller_ack_deferred_until_contiguous() {
+        let mut state = test_state();
+        let (o0, e0) = state.lease(100); // 0..100
+        let (o1, e1) = state.lease(100); // 100..200
+
+        let (mut rx1, p1) = ack_payload(o1, e1);
+        state.ack(o1, e1, p1);
+        assert_eq!(state.commit, 0);
+        assert!(
+            rx1.try_recv().expect("sender alive").is_none(),
+            "ack for 100..200 fired before 0..100 completed"
+        );
+
+        let (mut rx0, p0) = ack_payload(o0, e0);
+        state.ack(o0, e0, p0);
+        assert_eq!(state.commit, 200);
+        assert!(rx0.try_recv().unwrap().unwrap().is_ok());
+        assert!(rx1.try_recv().unwrap().unwrap().is_ok());
+    }
+
+    /// ENOSPC-1 P1 (the seal-chop bug): a completion ABOVE a failed lease
+    /// must be FAILED to the caller — pre-fix it acked Ok while `commit`
+    /// (the seal watermark) stayed below it, so the roll's seal discarded
+    /// an acked range. Covers both orders: completion-then-failure
+    /// (pending drained) and failure-then-completion (floor check).
+    #[test]
+    fn completion_above_failed_lease_is_failed_not_acked() {
+        // Order 1: B completes first, then A fails -> B's pending ack
+        // must drain as Err.
+        let mut state = test_state();
+        let (a_off, a_end) = state.lease(100); // 0..100   (A)
+        let (b_off, b_end) = state.lease(100); // 100..200 (B)
+        let _ = state.lease(50); // 200..250 keeps A's rewind path off
+        let (mut rx_b, p_b) = ack_payload(b_off, b_end);
+        state.ack(b_off, b_end, p_b);
+        assert!(rx_b.try_recv().unwrap().is_none(), "B acked early");
+        state.rewind_or_poison(a_off, a_end - a_off); // A fails (hole)
+        assert!(state.poisoned);
+        let b = rx_b.try_recv().unwrap().expect("B must be resolved");
+        assert!(
+            b.is_err(),
+            "B acked Ok above a hole (would be seal-chopped)"
+        );
+        assert_eq!(state.commit, 0, "commit must not cover the hole");
+
+        // Order 2: A fails first, then B completes -> floor check fails B.
+        let mut state = test_state();
+        let (a_off, a_end) = state.lease(100);
+        let (b_off, b_end) = state.lease(100);
+        let _ = state.lease(50);
+        state.rewind_or_poison(a_off, a_end - a_off);
+        let (mut rx_b, p_b) = ack_payload(b_off, b_end);
+        state.ack(b_off, b_end, p_b);
+        let b = rx_b.try_recv().unwrap().expect("B must be resolved");
+        assert!(b.is_err(), "late completion above the hole acked Ok");
+
+        // Ranges BELOW the hole still ack normally.
+        let mut state = test_state();
+        let (a_off, a_end) = state.lease(100); // 0..100
+        let (b_off, b_end) = state.lease(100); // 100..200 - will fail
+        let (c_off, c_end) = state.lease(100); // 200..300
+        state.rewind_or_poison(b_off, b_end - b_off); // poison via gap
+        let (mut rx_c, p_c) = ack_payload(c_off, c_end);
+        state.ack(c_off, c_end, p_c);
+        assert!(rx_c.try_recv().unwrap().unwrap().is_err(), "C above hole");
+        let (mut rx_a, p_a) = ack_payload(a_off, a_end);
+        state.ack(a_off, a_end, p_a);
+        assert!(
+            rx_a.try_recv().unwrap().unwrap().is_ok(),
+            "A below the hole must still ack"
+        );
+        assert_eq!(state.commit, 100, "commit advances up to the hole only");
+    }
+
+    #[test]
+    fn rewind_on_error_most_recent() {
+        let mut state = StreamAppendState::new(
+            Rc::new(RefCell::new(HashMap::new())),
+            mpsc::channel::<FailureReport>(1).0,
+            Duration::from_secs(30),
+        );
+        let (o0, _e0) = state.lease(100);
+        let (o1, _e1) = state.lease(200);
+        assert_eq!(state.lease_cursor, 300);
+        assert_eq!(state.in_flight, 2);
+
+        state.rewind_or_poison(o1, 200);
+        assert_eq!(state.lease_cursor, 100);
+        assert_eq!(state.in_flight, 1);
+        assert!(!state.poisoned);
+
+        let (o2, e2) = state.lease(50);
+        assert_eq!(o2, 100);
+        assert_eq!(e2, 150);
+
+        let _ = o0;
+    }
+
+    #[test]
+    fn poison_on_error_mid_sequence() {
+        let mut state = StreamAppendState::new(
+            Rc::new(RefCell::new(HashMap::new())),
+            mpsc::channel::<FailureReport>(1).0,
+            Duration::from_secs(30),
+        );
+        let (o0, _) = state.lease(100);
+        let (_, _) = state.lease(200);
+        assert_eq!(state.in_flight, 2);
+
+        state.rewind_or_poison(o0, 100);
+        assert!(state.poisoned);
+        assert_eq!(state.lease_cursor, 300);
+        assert_eq!(state.in_flight, 1);
+    }
+
+    /// BUG#2 (seed=8) regression: a soft-error tail reload onto the SAME open
+    /// extent must preserve the worker's append-progress state; only a roll to
+    /// a DIFFERENT extent resets it. Zeroing `commit` on a same-extent reload
+    /// let a later `seal_commit_watermark` report commit=0 and seal the live
+    /// tail at sealed_length=0, orphaning acked VP/SST data (split child then
+    /// un-openable: stale_vp_offset_past_sealed_length).
+    #[test]
+    fn reset_tail_same_extent_preserves_commit_and_poison() {
+        let mut state = StreamAppendState::new(
+            Rc::new(RefCell::new(HashMap::new())),
+            mpsc::channel::<FailureReport>(1).0,
+            Duration::from_secs(30),
+        );
+        let tail = |eid: u64| StreamTail {
+            extent: ExtentInfo {
+                extent_id: eid,
+                ..Default::default()
+            },
+            replica_addrs: vec!["a".to_string()],
+            replica_node_ids: vec![1],
+        };
+
+        // Worker on extent 18 with acked data + a marked hole + sealing freeze.
+        state.apply_reset_tail(tail(18));
+        state.commit = 8_657_884;
+        state.lease_cursor = 8_657_884;
+        state.poisoned = true;
+        state.sealing = true;
+
+        // Same-extent reload (transient replica failure) → preserve everything.
+        state.apply_reset_tail(tail(18));
+        assert_eq!(
+            state.commit, 8_657_884,
+            "same-extent reload must preserve commit (the all-replica-acked prefix)"
+        );
+        assert_eq!(state.lease_cursor, 8_657_884);
+        assert!(
+            state.poisoned,
+            "same-extent reload must preserve the hole marker"
+        );
+        assert!(
+            state.sealing,
+            "same-extent reload must preserve the sealing freeze"
+        );
+        assert_eq!(state.tail.as_ref().unwrap().extent.extent_id, 18);
+
+        // Genuine roll to a DIFFERENT (fresh, empty) extent → full reset.
+        state.apply_reset_tail(tail(30));
+        assert_eq!(state.commit, 0, "new extent must reset commit to 0");
+        assert_eq!(state.lease_cursor, 0);
+        assert!(!state.poisoned);
+        assert!(!state.sealing);
+        assert_eq!(state.tail.as_ref().unwrap().extent.extent_id, 30);
+    }
+}
+
+#[cfg(test)]
+mod selfheal_avali_filter_tests {
+    //! WAL self-heal A1: `eligible_replica_slots` isolates avali=0 slots on a
+    //! SEALED replicated extent (the read-path isolation that makes "clear the
+    //! avali bit" actually remove a bit-rotted replica from the serving set),
+    //! while leaving OPEN extents and the all-clear defensive case unfiltered.
+    use super::eligible_replica_slots;
+    use crate::extent_rpc::ExtentInfo;
+
+    fn ext(sealed: bool, n_repl: usize, avali: u32) -> ExtentInfo {
+        ExtentInfo {
+            extent_id: 7,
+            replicates: (0..n_repl as u64).collect(),
+            parity: Vec::new(),
+            sealed,
+            avali,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn sealed_excludes_avali_zero_slot() {
+        // 3 replicas, slot 0's avali bit cleared (isolated corrupt) → only 1,2.
+        let e = ext(true, 3, 0b110);
+        assert_eq!(eligible_replica_slots(&e), vec![1, 2]);
+        // slot 1 cleared → 0,2.
+        assert_eq!(eligible_replica_slots(&ext(true, 3, 0b101)), vec![0, 2]);
+        // all healthy → all.
+        assert_eq!(eligible_replica_slots(&ext(true, 3, 0b111)), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn open_extent_is_never_filtered() {
+        // avali=0 on an OPEN extent is the normal "not sealed" state, not
+        // "all replicas bad" — must read all of them.
+        assert_eq!(eligible_replica_slots(&ext(false, 3, 0)), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn sealed_all_clear_falls_back_to_all() {
+        // Defensive: a sealed extent with EVERY avali bit clear shouldn't
+        // happen (seal sets all_bits); never refuse all reads — fall back.
+        assert_eq!(eligible_replica_slots(&ext(true, 3, 0)), vec![0, 1, 2]);
+    }
+}
+
+#[cfg(test)]
+mod suspected_read_tests {
+    //! the READ path routes around manager-`Suspected` nodes. Replicated
+    //! reads deprioritize suspected slots to the BACK (healthy-first, never
+    //! dropped); EC reads reconstruct a suspected data shard from parity
+    //! instead of issuing a doomed direct read. These cover the pure decision
+    //! fn `replicated_read_order` + the `replicas ++ parity` slot→node mapping.
+    use super::{
+        healthy_eligible_slots, replica_node_ids, replicated_read_order, rotated_replica_start,
+    };
+    use crate::extent_rpc::ExtentInfo;
+    use std::collections::HashSet;
+
+    fn ext(replicates: Vec<u64>, parity: Vec<u64>, sealed: bool, avali: u32) -> ExtentInfo {
+        ExtentInfo {
+            extent_id: 42,
+            replicates,
+            parity,
+            sealed,
+            avali,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn replica_node_ids_is_replicates_then_parity() {
+        let ex = ext(vec![10, 20, 30], vec![40], false, 0);
+        assert_eq!(replica_node_ids(&ex), vec![10, 20, 30, 40]);
+    }
+
+    #[test]
+    fn empty_suspected_preserves_rotated_order() {
+        // Common case: an empty Suspected snapshot must reproduce the pure
+        // rotated order (no Suspected reshuffle). OPEN
+        // extents now rotate too, so the order is the contiguous rotation from
+        // `rotated_replica_start`, NOT a hardcoded [0,1,2].
+        let ex = ext(vec![10, 20, 30], vec![], false, 0);
+        let empty = HashSet::new();
+        let start = rotated_replica_start(ex.extent_id, 0, 3);
+        let expected: Vec<usize> = (0..3).map(|i| (start + i) % 3).collect();
+        assert_eq!(replicated_read_order(&ex, 0, &empty), expected);
+    }
+
+    #[test]
+    fn suspected_slot_moves_to_back_preserving_order() {
+        // node 20 (slot 1) suspected → tried last; the healthy slots keep their
+        // rotated order (open extent rotates, so derive
+        // the expectation from `rotated_replica_start` rather than assuming 0).
+        let ex = ext(vec![10, 20, 30], vec![], false, 0);
+        let s: HashSet<u64> = [20].into_iter().collect();
+        let start = rotated_replica_start(ex.extent_id, 0, 3);
+        let mut expected: Vec<usize> = (0..3)
+            .map(|i| (start + i) % 3)
+            .filter(|&s| s != 1)
+            .collect();
+        expected.push(1); // suspected slot 1 appended at the back
+        assert_eq!(replicated_read_order(&ex, 0, &s), expected);
+    }
+
+    #[test]
+    fn all_suspected_still_returns_every_slot() {
+        // Soft hint: never strand a read. Every node suspected → the full set
+        // is still returned (all in the flaky tail), so a stale/over-broad
+        // snapshot degrades latency, never availability.
+        let ex = ext(vec![10, 20, 30], vec![], false, 0);
+        let s: HashSet<u64> = [10, 20, 30].into_iter().collect();
+        let order = replicated_read_order(&ex, 0, &s);
+        assert_eq!(order.len(), 3);
+        let set: HashSet<usize> = order.into_iter().collect();
+        assert_eq!(set, [0, 1, 2].into_iter().collect::<HashSet<usize>>());
+    }
+
+    #[test]
+    fn open_tail_read_rotates_across_replicas() {
+        // an OPEN extent's reads must spread the start
+        // replica across offsets (was pinned to replica[0], concentrating all
+        // hot-tail reads on the append leader). Vary the offset and assert every
+        // replica gets picked as the start at least once.
+        let ex = ext(vec![10, 20, 30], vec![], false, 0);
+        let empty = HashSet::new();
+        let mut seen_starts = HashSet::new();
+        for off in 0u64..300 {
+            let order = replicated_read_order(&ex, off * (8 << 20), &empty);
+            seen_starts.insert(order[0]);
+        }
+        assert_eq!(
+            seen_starts,
+            [0usize, 1, 2].into_iter().collect::<HashSet<usize>>(),
+            "open-tail reads must rotate across all replicas"
+        );
+    }
+
+    #[test]
+    fn avali_isolated_slot_dropped_then_suspected_ordered() {
+        // Sealed extent, slot 1 avali bit clear → excluded entirely (self-heal
+        // I2), independent of Suspected. Remaining eligible slots {0,2}.
+        let ex = ext(vec![10, 20, 30], vec![], true, 0b101);
+        let empty = HashSet::new();
+        let order = replicated_read_order(&ex, 0, &empty);
+        let set: HashSet<usize> = order.iter().copied().collect();
+        assert_eq!(set, [0, 2].into_iter().collect::<HashSet<usize>>());
+        assert!(
+            !order.contains(&1),
+            "avali-isolated slot must never be read"
+        );
+    }
+
+    #[test]
+    fn healthy_eligible_drops_suspected_with_fallback() {
+        // Client-direct path: a Suspected node is EXCLUDED (the client rotates,
+        // so ordering wouldn't route around it).
+        let ex = ext(vec![10, 20, 30], vec![], false, 0);
+        let s: HashSet<u64> = [20].into_iter().collect();
+        assert_eq!(healthy_eligible_slots(&ex, &s), vec![0, 2]);
+        // Empty snapshot → exactly eligible_replica_slots (no behavior change).
+        assert_eq!(healthy_eligible_slots(&ex, &HashSet::new()), vec![0, 1, 2]);
+        // ALL eligible Suspected → fall back to all (never strand the read).
+        let all: HashSet<u64> = [10, 20, 30].into_iter().collect();
+        assert_eq!(healthy_eligible_slots(&ex, &all), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn healthy_eligible_respects_avali_isolation() {
+        // Sealed, slot 1 avali bit clear → excluded by avali; node 10 (slot 0)
+        // Suspected → excluded; only slot 2 left.
+        let ex = ext(vec![10, 20, 30], vec![], true, 0b101);
+        let s: HashSet<u64> = [10].into_iter().collect();
+        assert_eq!(healthy_eligible_slots(&ex, &s), vec![2]);
+    }
+
+    #[test]
+    fn suspected_rotated_first_slot_tried_last_on_sealed() {
+        // Sealed extent, all avali set: whichever slot the rotation would
+        // start on, if its node is Suspected it must end up LAST.
+        let ex = ext(vec![10, 20, 30], vec![40], true, 0b1111);
+        let start = rotated_replica_start(ex.extent_id, 0, 4);
+        let node_ids = replica_node_ids(&ex);
+        let s: HashSet<u64> = [node_ids[start]].into_iter().collect();
+        let order = replicated_read_order(&ex, 0, &s);
+        assert_eq!(order.len(), 4);
+        assert_eq!(
+            *order.last().unwrap(),
+            start,
+            "suspected rotated-first slot must be tried last"
+        );
+    }
+}
+
+#[cfg(test)]
+mod ec_slice_tests {
+    //! Regression tests for the slice-bounds bug that crashed the
+    //! partition server when a VP referenced an offset past the
+    //! EC-decoded payload length. Pre-fix the slicing was
+    //! `full_payload[start..slice_end]` with `start > full_payload.len()`,
+    //! which panics with `range start index N out of range for slice of
+    //! length L` and unwound the entire partition thread.
+    use super::{ec_slice_decoded, StaleVpOffset};
+
+    /// Test fixture: arbitrary extent_id + sealed_length context that
+    /// ec_slice_decoded threads through into the StaleVpOffset sentinel on
+    /// out-of-bounds. The happy-path tests pass arbitrary values
+    /// because the data flow doesn't use them when offset is in range.
+    const TEST_EXTENT: u64 = 42;
+
+    #[test]
+    fn slice_in_range_returns_subslice() {
+        let payload: Vec<u8> = (0u8..=199).collect();
+        let expected = payload[50..80].to_vec();
+        let out = ec_slice_decoded(payload, 50, 30, TEST_EXTENT, 200).expect("in-range slice");
+        assert_eq!(out.len(), 30);
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn slice_zero_length_means_to_end() {
+        let payload: Vec<u8> = (0u8..=199).collect();
+        let expected = payload[50..].to_vec();
+        let out = ec_slice_decoded(payload, 50, 0, TEST_EXTENT, 200).expect("to-end slice");
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn slice_offset_past_end_returns_err_not_panic() {
+        // Reproduces the crash shape: VP offset 49541652 on a
+        // payload of length 45479123. Pre-fix this slicing path
+        // panicked; post-fix it must surface a clean Err so the
+        // caller can convert it into a "value short" RPC response and
+        // the partition keeps serving other requests.
+        let payload = vec![0u8; 45_479_123];
+        let err = ec_slice_decoded(payload, 49_541_652, 14_456_954, 7, 45_479_123)
+            .expect_err("offset past end must be rejected");
+        // must be the structured sentinel, not just a stringy error.
+        let stale = err
+            .chain()
+            .find_map(|c| c.downcast_ref::<StaleVpOffset>())
+            .expect("error chain must contain StaleVpOffset");
+        assert_eq!(stale.extent_id, 7);
+        assert_eq!(stale.requested_offset, 49_541_652);
+        assert_eq!(stale.requested_length, 14_456_954);
+        assert_eq!(stale.sealed_length, 45_479_123);
+        // Display contract for Python regex consumers (memory:
+        // feedback-ops-tools-in-python).
+        let msg = stale.to_string();
+        assert!(
+            msg.starts_with("stale_vp_offset_past_sealed_length:"),
+            "unexpected prefix: {msg}"
+        );
+        assert!(msg.contains("extent=7"));
+        assert!(msg.contains("offset=49541652"));
+        assert!(msg.contains("length=14456954"));
+        assert!(msg.contains("sealed_length=45479123"));
+    }
+
+    #[test]
+    fn slice_offset_at_end_returns_empty() {
+        // offset == len is the boundary: no bytes to read, but not an
+        // error. Required for callers that pass `offset = sealed_length`
+        // and `length = 0` to mean "nothing left".
+        let payload = vec![0u8; 100];
+        let out = ec_slice_decoded(payload, 100, 0, TEST_EXTENT, 100).expect("offset==len is OK");
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn slice_length_overshoots_clamps_to_end() {
+        let payload: Vec<u8> = (0u8..=99).collect();
+        let expected = payload[80..].to_vec();
+        // Asking for 999 bytes from offset 80 should return 20.
+        let out = ec_slice_decoded(payload, 80, 999, TEST_EXTENT, 100).expect("clamped slice");
+        assert_eq!(out.len(), 20);
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn slice_full_read_is_zero_copy() {
+        // invariant: offset=0,length=0 returns the input Vec
+        // by ownership transfer (no allocation). This test verifies
+        // that the returned Vec's capacity matches the input — if a
+        // memcpy slipped in, the new Vec would have shrunken capacity.
+        let mut payload = Vec::with_capacity(1024);
+        payload.extend_from_slice(&(0u8..=199).collect::<Vec<u8>>());
+        let in_ptr = payload.as_ptr();
+        let in_cap = payload.capacity();
+        let out = ec_slice_decoded(payload, 0, 0, TEST_EXTENT, 200).expect("full read");
+        assert_eq!(out.as_ptr(), in_ptr, "full-read must NOT memcpy");
+        assert_eq!(out.capacity(), in_cap, "capacity preserved → no realloc");
+    }
+}
+
+#[cfg(test)]
+mod rotation_tests {
+    use super::rotated_replica_start;
+
+    #[test]
+    fn deterministic_and_in_range() {
+        for eid in [1u64, 42, 7_000_000] {
+            for off in [0u64, 4096, 64 << 20] {
+                for n in [1usize, 2, 3, 5] {
+                    let a = rotated_replica_start(eid, off, n);
+                    let b = rotated_replica_start(eid, off, n);
+                    assert_eq!(a, b, "deterministic");
+                    assert!(a < n, "in range: {a} < {n}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn spreads_across_replicas() {
+        // Consecutive 64 MiB chunk offsets of one large extent must not all
+        // land on the same start replica, and across many extents the
+        // distribution must cover every replica.
+        let n = 3usize;
+        let mut seen = [0usize; 3];
+        for eid in 0..32u64 {
+            for chunk in 0..8u64 {
+                seen[rotated_replica_start(eid, chunk * (64 << 20), n)] += 1;
+            }
+        }
+        let total: usize = seen.iter().sum();
+        assert_eq!(total, 32 * 8);
+        for (i, &c) in seen.iter().enumerate() {
+            assert!(
+                c > total / 6,
+                "replica {i} underused: {c}/{total} (want roughly even spread)"
+            );
+        }
+    }
+}
+
+/// unwrap a hedged-read oneshot result. `Canceled` means the spawned
+/// read task was dropped before sending (runtime teardown) — surfaced as a
+/// plain error so the failover loop continues.
+fn flatten_hedge(
+    res: std::result::Result<Result<(Bytes, u64)>, futures::channel::oneshot::Canceled>,
+) -> Result<(Bytes, u64)> {
+    match res {
+        Ok(r) => r,
+        Err(_) => Err(anyhow!("hedged read task canceled before completion")),
+    }
+}
+
+/// MERGE-EC-REPLAY regression.
+///
+/// `read_committed_bytes_from_extent` must report the extent's OWN
+/// authoritative `committed_end` (`sealed_length` for a sealed extent),
+/// NOT the second element of `read_with_layout`'s return tuple. For an
+/// EC-converted extent `ec_subrange_read` surfaces a SHARD-relative end
+/// (≈ `sealed_length / K`); the pre-fix `Ok(r) => return Ok(r)` propagated
+/// it verbatim, so the PS WAL replay — which uses this value as its stop
+/// bound — read only ONE shard's worth of bytes and tripped WAL-FAILSTOP
+/// at the shard boundary, permanently wedging recovery of any partition
+/// whose VP-head replay window reached an EC log extent.
+///
+/// This exercises the real read path end-to-end against in-process extent
+/// nodes holding RS shards: it asserts the reported end equals the logical
+/// `sealed_length` (not the per-shard length) AND that the bytes decode to
+/// the original payload (the bug was the END only — bytes were already
+/// clamped correctly).
+#[cfg(test)]
+mod merge_ec_replay_tests {
+    use super::*;
+    use crate::extent_rpc::{
+        rkyv_decode, AllocExtentReq, AllocExtentResp, WriteShardReq, WriteShardResp,
+        MSG_ALLOC_EXTENT, MSG_WRITE_SHARD, PAYLOAD_LOCATION_IN_SHARD_FILE,
+    };
+
+    fn pick_addr() -> std::net::SocketAddr {
+        autumn_test_ports::addr()
+    }
+
+    async fn start_node(dir: &std::path::Path, addr: std::net::SocketAddr) {
+        let config = crate::ExtentNodeConfig::new(dir.to_path_buf(), 1);
+        let node = crate::ExtentNode::new(config)
+            .await
+            .expect("create ExtentNode");
+        compio::runtime::spawn(async move {
+            let _ = node.serve(addr).await;
+        })
+        .detach();
+        compio::time::sleep(Duration::from_millis(120)).await;
+    }
+
+    #[compio::test]
+    async fn ec_committed_end_is_sealed_length_not_shard_length() {
+        const K: usize = 3; // data shards
+        const M: usize = 1; // parity shards
+        const N: usize = K + M;
+        // Logical payload length. `shard_size` = ceil(L/K), strictly smaller
+        // than the logical length — that gap is exactly what the bug confused
+        // for the end. (6144/3 = 2048 exactly.)
+        const L: usize = 6144;
+        const EVERSION: u64 = 5; // post-EC target eversion
+        let extent_id: u64 = 70_001;
+        let node_ids: [u64; N] = [1, 2, 3, 4];
+
+        // Bring up N in-process extent nodes.
+        let dirs: Vec<_> = (0..N)
+            .map(|_| tempfile::tempdir().expect("tempdir"))
+            .collect();
+        let addrs: Vec<std::net::SocketAddr> = (0..N).map(|_| pick_addr()).collect();
+        for i in 0..N {
+            start_node(dirs[i].path(), addrs[i]).await;
+        }
+
+        // RS-encode a deterministic payload into K data + M parity shards.
+        let payload: Vec<u8> = (0..L).map(|i| (i % 251) as u8).collect();
+        let shards = crate::erasure::ec_encode(&payload, K, M).expect("ec_encode");
+        assert_eq!(shards.len(), N);
+        let shard_size = crate::erasure::shard_size(L, K);
+        assert!(
+            shard_size < L,
+            "shard ({shard_size}) must be strictly smaller than logical ({L})"
+        );
+
+        // Distribute one EC shard per node: alloc → write_shard, which stages
+        // into `extent-{id}.shard{i}`. There is no per-node commit — the
+        // manager's layout flip is the commit point, and this test stands in
+        // for it by publishing `InShardFile` in the cached ExtentInfo below.
+        let pool = Rc::new(ConnPool::new());
+        for i in 0..N {
+            let addr = addrs[i].to_string();
+
+            let alloc = pool
+                .call(
+                    &addr,
+                    MSG_ALLOC_EXTENT,
+                    crate::extent_rpc::rkyv_encode(&AllocExtentReq { extent_id }),
+                )
+                .await
+                .expect("alloc_extent RPC");
+            assert_eq!(
+                rkyv_decode::<AllocExtentResp>(&alloc).expect("decode").code,
+                CODE_OK
+            );
+
+            let ws = WriteShardReq {
+                extent_id,
+                shard_index: i as u32,
+                sealed_length: L as u64,
+                shard_len: shards[i].len() as u64,
+                eversion: EVERSION,
+                owner_epoch: 0,
+                shard_offset: 0,
+                attempt_nonce: 0,
+                payload: Bytes::from(shards[i].clone()),
+            };
+            let ws_resp = pool
+                .call_prepared(&addr, MSG_WRITE_SHARD, &ws.prepared())
+                .await
+                .expect("write_shard RPC");
+            assert_eq!(
+                WriteShardResp::decode(ws_resp).expect("decode").code,
+                CODE_OK
+            );
+
+        }
+
+        // Build a StreamClient WITHOUT touching a manager: `construct` skips
+        // `acquire_owner_lock`, and we pre-seed both caches so the read path
+        // never issues a manager RPC.
+        let sc = StreamClient::construct(
+            vec!["127.0.0.1:1".to_string()], // never contacted
+            0,
+            "merge-ec-replay-test".to_string(),
+            0,
+            1 << 30,
+            pool.clone(),
+            StreamClientConfig::default(),
+        );
+        for i in 0..N {
+            sc.nodes_cache
+                .insert(node_ids[i], (addrs[i].to_string(), Vec::<u16>::new()));
+        }
+        sc.extent_info_cache.insert(
+            extent_id,
+            ExtentInfo {
+                extent_id,
+                replicates: node_ids[..K].to_vec(),
+                parity: node_ids[K..].to_vec(),
+                eversion: EVERSION,
+                refs: 1,
+                sealed_length: L as u64,
+                sealed: true,
+                avali: (1u32 << N) - 1, // all slots available
+                replicate_disks: vec![],
+                parity_disks: vec![],
+                ec_converted: true,
+                // What the layout flip publishes: each member serves its shard
+                // from its own file.
+                payload_location: PAYLOAD_LOCATION_IN_SHARD_FILE,
+            },
+        );
+
+        // The function under test: a full-extent committed read.
+        let (bytes, committed_end) = sc
+            .read_committed_bytes_from_extent(extent_id, 0, L as u64)
+            .await
+            .expect("read_committed_bytes_from_extent");
+
+        // THE REGRESSION GUARD: the reported committed end must be the
+        // LOGICAL sealed_length, not a shard-relative end. Pre-fix this was
+        // `last_end` from `ec_subrange_read` (≈ shard_size = L/K = 2048).
+        assert_eq!(
+            committed_end, L as u64,
+            "committed_end must equal sealed_length ({L}), not the shard-relative end (~{shard_size}); \
+             a shard-relative end here is the MERGE-EC-REPLAY WAL-FAILSTOP bug"
+        );
+        // And the bytes themselves decode to the original payload — the bug
+        // was the reported END only; `want` was already clamped correctly.
+        assert_eq!(bytes.len(), L, "full logical payload must be returned");
+        assert_eq!(bytes, payload, "decoded EC bytes must match original");
+    }
+}
+
+/// BUG-MGR-RETRY-CLASS regression tests — manager-call retry policy must be
+/// code-classified, not retry-everything.
+///
+/// Failure pinned here: a PS partition held a permanently stale owner_epoch
+/// (the manager expected a newer one — an etcd-backed verdict identical on
+/// EVERY manager), yet `retry_manager_call` treated the
+/// CODE_PRECONDITION rejection as transient: 20 × (rotate + 500ms sleep) =
+/// 10 s of mathematically-futile retries per `alloc_new_extent`, ≈15 s per
+/// autumnfs write (45 s for a 3-key put). The fix: deterministic codes fail
+/// fast, and an owner-epoch fence carries the "LockedByOther" marker so the
+/// PS's poison-and-reopen self-heal re-acquires a fresh epoch.
+#[cfg(test)]
+mod worker_lifecycle_tests {
+    use super::*;
+
+    fn client() -> Rc<StreamClient> {
+        StreamClient::construct(
+            vec!["127.0.0.1:1".to_string()],
+            0,
+            "partition/40".to_string(),
+            1,
+            1 << 30,
+            Rc::new(ConnPool::new()),
+            StreamClientConfig::default(),
+        )
+    }
+
+    /// An exiting worker must unregister ITSELF, never its successor.
+    ///
+    /// The order below is the live one: a split calls `invalidate_stream`,
+    /// the next append spawns a replacement, and only then does the old
+    /// worker finish draining and drop its guard. Removing by key alone
+    /// deletes the replacement, so the append after that finds no worker and
+    /// spawns a THIRD one — which starts with `tail = None`.
+    ///
+    /// Ablation: drop the generation check in `WorkerRemovalGuard::drop` and
+    /// the successor is gone here.
+    #[compio::test]
+    async fn an_exiting_worker_does_not_unregister_its_successor() {
+        let sc = client();
+        let stream_id = 37;
+
+        let (tx_old, _rx_old) = mpsc::channel::<StreamSubmitMsg>(4);
+        let gen_old = 1;
+        sc.stream_workers
+            .borrow_mut()
+            .insert(stream_id, (gen_old, tx_old));
+        let old_guard = WorkerRemovalGuard {
+            sc: Rc::downgrade(&sc),
+            stream_id,
+            worker_gen: gen_old,
+        };
+
+        // split
+        sc.invalidate_stream(stream_id);
+        // the next append spawns the replacement
+        let (tx_new, _rx_new) = mpsc::channel::<StreamSubmitMsg>(4);
+        let gen_new = 2;
+        sc.stream_workers
+            .borrow_mut()
+            .insert(stream_id, (gen_new, tx_new));
+        // ...and it completes its own init
+        {
+            let lock = sc.stream_init_lock(stream_id);
+            let mut g = lock.try_lock().expect("uncontended");
+            *g = true;
+        }
+
+        // the old worker finally drains and exits
+        drop(old_guard);
+
+        let still_there = sc
+            .stream_workers
+            .borrow()
+            .get(&stream_id)
+            .map(|(g, _)| *g);
+        assert_eq!(
+            still_there,
+            Some(gen_new),
+            "the exiting worker removed its live replacement; the next append \
+             will spawn a third worker with no tail and no seeded commit"
+        );
+        // And the flag clear must stay BEHIND the generation check. Clearing
+        // it unconditionally passes every other assertion here while making
+        // the LIVE successor re-initialise underneath itself — two workers
+        // leasing the same extent from independent cursors, which is worse
+        // than the bug being fixed.
+        let successor_still_seeded = {
+            let lock = sc.stream_init_lock(stream_id);
+            let g = lock.try_lock().expect("uncontended");
+            *g
+        };
+        assert!(
+            successor_still_seeded,
+            "a stale worker's guard cleared the LIVE successor's init flag"
+        );
+    }
+
+    /// The "tail is initialised" flag must not outlive the worker it
+    /// initialised.
+    ///
+    /// `ensure_tail_initialised` is what loads the tail and seeds the cursor
+    /// from `current_commit`. A flag left set makes the next worker skip all
+    /// of it and keep `tail = None` — and a worker with no tail reads the
+    /// first `ResetTail` onto the CURRENT tail as a roll to a fresh extent,
+    /// zeroing `commit` on an extent that holds real data.
+    ///
+    /// Ablation: stop clearing `stream_init_locks` in the guard and the flag
+    /// below stays `true`.
+    #[compio::test]
+    async fn a_worker_that_exits_clears_the_tail_initialised_flag() {
+        let sc = client();
+        let stream_id = 37;
+
+        let (tx, _rx) = mpsc::channel::<StreamSubmitMsg>(4);
+        sc.stream_workers.borrow_mut().insert(stream_id, (7, tx));
+        let guard = WorkerRemovalGuard {
+            sc: Rc::downgrade(&sc),
+            stream_id,
+            worker_gen: 7,
+        };
+        // this worker completed its init
+        {
+            let lock = sc.stream_init_lock(stream_id);
+            let mut g = lock.try_lock().expect("uncontended");
+            *g = true;
+        }
+
+        drop(guard);
+
+        let seeded = {
+            let lock = sc.stream_init_lock(stream_id);
+            let g = lock.try_lock().expect("uncontended");
+            *g
+        };
+        assert!(
+            !seeded,
+            "the next worker would skip load_stream_tail + current_commit + \
+             SeedCursor and run with tail=None, which turns the first ResetTail \
+             into a roll and sets commit=0 on a non-empty extent"
+        );
+        assert!(
+            sc.stream_workers.borrow().get(&stream_id).is_none(),
+            "the entry must go too — a dead Sender left in the map makes every \
+             later append fail 'worker gone' instead of spawning a replacement"
+        );
+    }
+
+    /// A worker that reports "no tail set" must fail the append AND forget the
+    /// stream's init flag.
+    ///
+    /// Without the second half the fail-fast is a permanent-fail: re-entry
+    /// reaches the SAME worker and `ensure_tail_initialised` returns early on
+    /// the still-set flag, so every later append on the stream fails too,
+    /// until a split or a restart.
+    ///
+    /// The fixture is a FAKE worker — a registered Sender whose receiver this
+    /// test drains — so the append path runs for real up to the point where
+    /// the worker answers.
+    ///
+    /// Ablation: drop the `stream_init_locks.remove` in the `no tail set` arm
+    /// and the flag below stays `true`.
+    #[compio::test]
+    async fn a_no_tail_worker_fails_the_append_and_forgets_its_init() {
+        let sc = client();
+        let stream_id = 43;
+
+        let (tx, mut rx) = mpsc::channel::<StreamSubmitMsg>(4);
+        sc.stream_workers.borrow_mut().insert(stream_id, (9, tx));
+        // pretend this worker already initialised, which is exactly the state
+        // the lifecycle bug leaves behind
+        {
+            let lock = sc.stream_init_lock(stream_id);
+            let mut g = lock.try_lock().expect("uncontended");
+            *g = true;
+        }
+
+        // the fake worker: answer the first Append the way a tail-less one does
+        compio::runtime::spawn(async move {
+            while let Some(msg) = rx.next().await {
+                if let StreamSubmitMsg::Append { ack_tx, .. } = msg {
+                    let _ = ack_tx.send(Err(anyhow!(
+                        "stream worker: no tail set (public API must send ResetTail before first Append)"
+                    )));
+                }
+            }
+        })
+        .detach();
+
+        let err = sc
+            .append_payload(stream_id, Bytes::from_static(b"x"))
+            .await
+            .expect_err("an append to a tail-less worker must fail, not retry");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("refusing to retry"),
+            "the append must fail fast rather than reload and lease from zero; got {msg}"
+        );
+
+        let still_seeded = {
+            let lock = sc.stream_init_lock(stream_id);
+            let g = lock.try_lock().expect("uncontended");
+            *g
+        };
+        assert!(
+            !still_seeded,
+            "the flag survived, so re-entry would skip init again and every \
+             later append on this stream would fail the same way forever"
+        );
+    }
+
+    /// The WIRING, through the real spawn path.
+    ///
+    /// The tests above hand-build guards, so they cannot see whether
+    /// `stream_worker_sender` actually tags each worker and hands its guard
+    /// the matching tag. Pin it end to end: spawn, split, spawn again, then
+    /// let the first worker's channel close so its guard really runs.
+    ///
+    /// Ablation: remove the tagging entirely — one constant in BOTH the map
+    /// insert and the guard — and the stale guard matches the successor's
+    /// entry and deletes it here. (Tagging only the guard with a constant is
+    /// NOT the ablation: a tag that matches nothing makes the guard remove
+    /// nothing, which no assertion can see.)
+    #[compio::test]
+    async fn the_spawn_path_tags_each_worker_and_its_guard_alike() {
+        let sc = client();
+        let stream_id = 41;
+
+        let tx_first = sc.stream_worker_sender(stream_id);
+        let gen_first = sc.stream_workers.borrow().get(&stream_id).map(|(g, _)| *g);
+        assert!(gen_first.is_some(), "spawn must register the worker");
+
+        // a split drops the registration; the flag goes with it
+        sc.invalidate_stream(stream_id);
+
+        // the next append spawns the successor, which registers a NEW tag
+        let _tx_second = sc.stream_worker_sender(stream_id);
+        let gen_second = sc.stream_workers.borrow().get(&stream_id).map(|(g, _)| *g);
+        assert_ne!(
+            gen_first, gen_second,
+            "each spawned worker must get its own generation"
+        );
+
+        // the first worker's last Sender goes away, so its loop ends and its
+        // guard runs — against a map entry that now belongs to the successor
+        drop(tx_first);
+        compio::time::sleep(Duration::from_millis(50)).await;
+
+        let survivor = sc.stream_workers.borrow().get(&stream_id).map(|(g, _)| *g);
+        assert_eq!(
+            survivor, gen_second,
+            "the first worker's guard unregistered the LIVE successor; the next \
+             append would spawn a third worker that never runs its init"
+        );
+        // And the first worker's OWN registration must be gone — a guard that
+        // matches nothing would also leave the successor alone, so presence of
+        // the successor is not on its own evidence that the gate works.
+        let gen_third = {
+            let before = sc.next_worker_gen.get();
+            let _tx = sc.stream_worker_sender(stream_id);
+            assert_eq!(
+                sc.next_worker_gen.get(),
+                before,
+                "the successor is still registered, so no new worker should spawn"
+            );
+            sc.stream_workers.borrow().get(&stream_id).map(|(g, _)| *g)
+        };
+        assert_eq!(gen_third, gen_second, "callers must reach the successor");
+    }
+
+    /// What an UNSEEDED worker sends as `header.commit`, pinned on the state
+    /// machine itself.
+    ///
+    /// Note what does NOT happen: nothing zeroes a commit. A fresh worker is
+    /// born at zero, and `SeedCursor` — which rides inside the init a stale
+    /// flag makes it skip — is the only thing that would raise the cursor to
+    /// the extent's committed length. So the hazard is an unseeded worker
+    /// being handed a LIVE tail and leasing from zero — which is what the
+    /// soft-error reload path did after "no tail set", before that arm was
+    /// made fail-fast.
+    ///
+    /// The first half also pins note 22: a same-extent reload must preserve
+    /// append progress, or a seeded worker would regress the same way.
+    #[test]
+    fn an_unseeded_worker_leases_a_live_extent_from_zero() {
+        let new_state = || {
+            let (tx, _rx) = mpsc::channel::<FailureReport>(4);
+            StreamAppendState::new(
+                Rc::new(RefCell::new(HashMap::new())),
+                tx,
+                Duration::from_secs(1),
+            )
+        };
+        let mut state = new_state();
+        let tail = StreamTail {
+            extent: ExtentInfo {
+                extent_id: 269,
+                ..Default::default()
+            },
+            replica_addrs: vec!["127.0.0.1:1".to_string()],
+            replica_node_ids: vec![1],
+        };
+
+        // a seeded worker keeps its progress across a same-extent reload
+        state.apply_reset_tail(tail.clone());
+        state.commit = 1_811_951_208;
+        state.apply_reset_tail(tail.clone());
+        assert_eq!(
+            state.commit, 1_811_951_208,
+            "a same-extent reload must preserve append progress"
+        );
+
+        // A worker that skipped its init: never seeded, handed the live tail
+        // by the soft-error reload. Its lease cursor is still zero, so the
+        // first append it sends carries `header.commit = 0` — against an
+        // extent holding 1.81 GB.
+        let mut unseeded = new_state();
+        unseeded.apply_reset_tail(tail);
+        let (offset, _end) = unseeded.lease(8 * 1024 * 1024);
+        assert_eq!(
+            offset, 0,
+            "an unseeded worker leases from zero, and `header.commit = offset` \
+             is what every replica truncates to"
+        );
+        assert_eq!(
+            unseeded.commit, 0,
+            "and it has no commit of its own to contradict that"
+        );
+    }
+}
+
+#[cfg(test)]
+mod manager_retry_tests {
+    use super::*;
+
+    /// Client with fake manager addrs — `construct` skips
+    /// `acquire_owner_lock` and the closures under test never do real IO,
+    /// so no manager is contacted (same pattern as merge_ec_replay_tests).
+    pub(super) fn test_client(n_mgrs: usize) -> Rc<StreamClient> {
+        let addrs = (0..n_mgrs)
+            .map(|i| format!("127.0.0.1:{}", i + 1))
+            .collect();
+        StreamClient::construct(
+            addrs,
+            0,
+            "partition/17".to_string(),
+            14364,
+            1 << 30,
+            Rc::new(ConnPool::new()),
+            StreamClientConfig::default(),
+        )
+    }
+
+    fn fence_message() -> String {
+        // The wire shape of a real fence rejection: AppError Display
+        // ("precondition failed: ...") wrapping the store.rs message.
+        "precondition failed: owner_key=partition/17 owner_epoch mismatch, \
+         expected 14396, got 14364"
+            .to_string()
+    }
+
+    #[test]
+    fn fence_display_carries_locked_by_other_marker() {
+        let e = ManagerError::new(
+            manager_rpc::CODE_PRECONDITION,
+            "stream_alloc_extent",
+            &fence_message(),
+        );
+        assert!(e.is_owner_fence());
+        let shown = e.to_string();
+        // Load-bearing token: the PS `is_locked_by_other` → poison →
+        // fresh-epoch reopen self-heal keys off this substring.
+        assert!(shown.contains("LockedByOther"), "got: {shown}");
+        // The manager's message must survive verbatim for diagnostics and
+        // downstream "precondition failed" matchers.
+        assert!(
+            shown.contains("owner_epoch mismatch, expected 14396, got 14364"),
+            "got: {shown}"
+        );
+        assert!(shown.contains("precondition failed"), "got: {shown}");
+    }
+
+    #[test]
+    fn non_fence_errors_keep_legacy_display_shape() {
+        // Ordinary precondition: NOT a fence, must NOT poison partitions.
+        let e = ManagerError::new(
+            manager_rpc::CODE_PRECONDITION,
+            "punch_holes",
+            "precondition failed: stream cannot be empty after punch holes",
+        );
+        assert!(!e.is_owner_fence());
+        assert_eq!(
+            e.to_string(),
+            "punch_holes failed: precondition failed: stream cannot be empty after punch holes"
+        );
+
+        let nf = ManagerError::new(
+            manager_rpc::CODE_NOT_FOUND,
+            "stream_info",
+            "not found: stream 7",
+        );
+        assert!(!nf.is_owner_fence());
+        assert!(!nf.to_string().contains("LockedByOther"));
+    }
+
+    #[test]
+    fn retryable_classification_per_code() {
+        let m = |code| ManagerError::new(code, "ctx", "msg");
+        assert!(m(manager_rpc::CODE_NOT_LEADER).is_retryable());
+        assert!(m(manager_rpc::CODE_ERROR).is_retryable());
+        assert!(!m(manager_rpc::CODE_NOT_FOUND).is_retryable());
+        assert!(!m(manager_rpc::CODE_INVALID_ARGUMENT).is_retryable());
+        assert!(!m(manager_rpc::CODE_PRECONDITION).is_retryable());
+        assert!(!m(manager_rpc::CODE_REVOKE_PENDING).is_retryable());
+    }
+
+    /// THE regression: a stale-epoch fence must fail after exactly ONE
+    /// attempt — no rotate-and-sleep loop (pre-fix: 20 × 500ms = 10 s).
+    #[compio::test]
+    async fn stale_epoch_fence_fails_fast_without_retries() {
+        let sc = test_client(1);
+        let attempts = Rc::new(Cell::new(0u32));
+        let started = Instant::now();
+
+        let a = attempts.clone();
+        let sc2 = sc.clone();
+        let res: Result<()> = sc
+            .retry_manager_call("alloc_new_extent", 20, move || {
+                let a = a.clone();
+                let sc2 = sc2.clone();
+                async move {
+                    a.set(a.get() + 1);
+                    // Produce the error through the REAL path so the test
+                    // pins check_manager_resp → ManagerError wiring.
+                    sc2.check_manager_resp(
+                        manager_rpc::CODE_PRECONDITION,
+                        &fence_message(),
+                        "stream_alloc_extent",
+                    )?;
+                    Ok(())
+                }
+            })
+            .await;
+
+        let err = res.expect_err("fence must fail");
+        assert_eq!(attempts.get(), 1, "no retries for a deterministic fence");
+        assert!(
+            started.elapsed() < Duration::from_millis(400),
+            "fail-fast path must not sleep (pre-fix: 10 s)"
+        );
+        // Typed code preserved for callers…
+        let me = err
+            .downcast_ref::<ManagerError>()
+            .expect("ManagerError must survive the retry wrapper");
+        assert_eq!(me.code, manager_rpc::CODE_PRECONDITION);
+        assert!(me.is_owner_fence());
+        // …and the fence marker is OUTERMOST (unwrapped), so even the plain
+        // `{e}` Display reaches the PS poison classifier.
+        assert!(format!("{err}").contains("LockedByOther"), "got: {err}");
+    }
+
+    /// Deterministic non-fence codes also fail fast (no 20×500ms).
+    #[compio::test]
+    async fn deterministic_codes_fail_fast() {
+        for (code, msg) in [
+            (manager_rpc::CODE_NOT_FOUND, "not found: stream 7"),
+            (
+                manager_rpc::CODE_INVALID_ARGUMENT,
+                "invalid argument: bad req",
+            ),
+            (
+                manager_rpc::CODE_PRECONDITION,
+                "precondition failed: stream cannot be empty after punch holes",
+            ),
+        ] {
+            let sc = test_client(1);
+            let attempts = Rc::new(Cell::new(0u32));
+            let a = attempts.clone();
+            let sc2 = sc.clone();
+            let res: Result<()> = sc
+                .retry_manager_call("test_call", 20, move || {
+                    let a = a.clone();
+                    let sc2 = sc2.clone();
+                    async move {
+                        a.set(a.get() + 1);
+                        sc2.check_manager_resp(code, msg, "test_call")?;
+                        Ok(())
+                    }
+                })
+                .await;
+            let err = res.expect_err("must fail");
+            assert_eq!(attempts.get(), 1, "code {code} must not retry");
+            assert!(
+                !format!("{err:#}").contains("LockedByOther"),
+                "non-fence code {code} must NOT poison partitions: {err:#}"
+            );
+        }
+    }
+
+    /// BUG-MGR-RETRY-CLASS regression: the TRANSIENT `alloc_extent`
+    /// preconditions — the inflight "defer … until it completes" and the
+    /// verify-at-apply / etcd-CAS "retry with [a] fresh snapshot" — MUST be
+    /// classified retryable, or a self-healable concurrency conflict (a
+    /// concurrent split/recovery/EC) becomes a hard append/roll failure.
+    #[test]
+    fn transient_conflict_preconditions_are_retryable() {
+        let mk =
+            |msg: &str| ManagerError::new(manager_rpc::CODE_PRECONDITION, "alloc_new_extent", msg);
+        // The four real manager producers (verbatim marker phrases).
+        for msg in [
+            "extent 42 has in-flight ConvertToEc; defer alloc_extent until it completes",
+            "stream 7 membership changed during alloc_extent; retry with fresh snapshot",
+            "extent 9 eversion changed during alloc_extent (3 -> 4); retry with fresh snapshot",
+            "stream changed concurrently (CAS conflict); retry with a fresh snapshot",
+        ] {
+            let e = mk(msg);
+            assert!(e.is_transient_conflict(), "must be transient: {msg}");
+            assert!(e.is_retryable(), "must retry: {msg}");
+            assert!(
+                !e.is_owner_fence(),
+                "transient conflict is not a fence: {msg}"
+            );
+        }
+        // The fence + a deterministic business rule are NOT transient → fail fast.
+        let fence = ManagerError::new(
+            manager_rpc::CODE_PRECONDITION,
+            "stream_alloc_extent",
+            &fence_message(),
+        );
+        assert!(!fence.is_transient_conflict());
+        assert!(!fence.is_retryable());
+        let biz = ManagerError::new(
+            manager_rpc::CODE_PRECONDITION,
+            "punch_holes",
+            "precondition failed: stream cannot be empty after punch holes",
+        );
+        assert!(!biz.is_transient_conflict());
+        assert!(!biz.is_retryable());
+    }
+
+    /// The retry LOOP (not just the classifier) re-attempts a transient
+    /// precondition and completes once it clears — the in-flight EC/recovery
+    /// op finishing, or the CAS succeeding on a fresh snapshot.
+    #[compio::test]
+    async fn transient_precondition_retries_until_it_clears() {
+        let sc = test_client(1);
+        let attempts = Rc::new(Cell::new(0u32));
+        let a = attempts.clone();
+        let sc2 = sc.clone();
+        let res: Result<()> = sc
+            .retry_manager_call("alloc_new_extent", 20, move || {
+                let a = a.clone();
+                let sc2 = sc2.clone();
+                async move {
+                    a.set(a.get() + 1);
+                    // Transient for the first 2 attempts, then clears.
+                    if a.get() < 3 {
+                        sc2.check_manager_resp(
+                            manager_rpc::CODE_PRECONDITION,
+                            "stream 7 membership changed during alloc_extent; \
+                             retry with fresh snapshot",
+                            "alloc_new_extent",
+                        )?;
+                    }
+                    Ok(())
+                }
+            })
+            .await;
+        res.expect("transient precondition must eventually succeed after retries");
+        assert_eq!(
+            attempts.get(),
+            3,
+            "must have retried the transient conflict"
+        );
+    }
+
+    /// Multi-manager HA: a TRANSIENT precondition retry must NOT rotate
+    /// the manager — it's a LEADER-side self-heal, so stay on the leader and wait
+    /// it out. Rotating to a follower would just burn an iteration on the
+    /// NOT_LEADER it returns, reducing effective retries against the real leader.
+    #[compio::test]
+    async fn transient_precondition_does_not_rotate_manager() {
+        let sc = test_client(3);
+        let attempts = Rc::new(Cell::new(0u32));
+        let a = attempts.clone();
+        let sc2 = sc.clone();
+        let res: Result<()> = sc
+            .retry_manager_call("alloc_new_extent", 20, move || {
+                let a = a.clone();
+                let sc2 = sc2.clone();
+                async move {
+                    a.set(a.get() + 1);
+                    if a.get() < 3 {
+                        sc2.check_manager_resp(
+                            manager_rpc::CODE_PRECONDITION,
+                            "stream 7 membership changed during alloc_extent; \
+                             retry with fresh snapshot",
+                            "alloc_new_extent",
+                        )?;
+                    }
+                    Ok(())
+                }
+            })
+            .await;
+        res.expect("transient precondition retries + succeeds");
+        assert_eq!(attempts.get(), 3, "retried the transient conflict twice");
+        assert_eq!(
+            sc.current_mgr.get(),
+            0,
+            "transient precondition stays on the SAME leader — no rotation"
+        );
+    }
+
+    /// Transport-layer failures (no ManagerError in the chain) keep the
+    /// rotate-and-retry behavior — the dead-manager escape.
+    #[compio::test]
+    async fn transport_errors_still_rotate_and_retry() {
+        let sc = test_client(3);
+        let attempts = Rc::new(Cell::new(0u32));
+        let a = attempts.clone();
+        let res: Result<u32> = sc
+            .retry_manager_call("test_call", 5, move || {
+                let a = a.clone();
+                async move {
+                    a.set(a.get() + 1);
+                    if a.get() < 3 {
+                        Err(anyhow!("connection refused"))
+                    } else {
+                        Ok(42)
+                    }
+                }
+            })
+            .await;
+        assert_eq!(res.expect("third attempt succeeds"), 42);
+        assert_eq!(attempts.get(), 3);
+        // Two failures → two rotations (3 managers: 0 → 1 → 2).
+        assert_eq!(sc.current_mgr.get(), 2, "each transport failure rotates");
+    }
+
+    /// NOT_LEADER (rotated by note_manager_code, NOT double-rotated by the
+    /// loop) and CODE_ERROR (rotated by the loop) both retry.
+    #[compio::test]
+    async fn not_leader_and_internal_retry_with_single_rotation() {
+        let sc = test_client(3);
+        let attempts = Rc::new(Cell::new(0u32));
+        let a = attempts.clone();
+        let sc2 = sc.clone();
+        let res: Result<u32> = sc
+            .retry_manager_call("test_call", 5, move || {
+                let a = a.clone();
+                let sc2 = sc2.clone();
+                async move {
+                    a.set(a.get() + 1);
+                    match a.get() {
+                        // note_manager_code rotates 0 → 1; the loop must not
+                        // rotate again (would skip an address).
+                        1 => {
+                            sc2.check_manager_resp(
+                                manager_rpc::CODE_NOT_LEADER,
+                                "not leader",
+                                "test_call",
+                            )?;
+                            unreachable!()
+                        }
+                        // internal error: the LOOP rotates 1 → 2.
+                        2 => {
+                            sc2.check_manager_resp(
+                                manager_rpc::CODE_ERROR,
+                                "internal error: etcd mirror failed",
+                                "test_call",
+                            )?;
+                            unreachable!()
+                        }
+                        _ => Ok(7),
+                    }
+                }
+            })
+            .await;
+        assert_eq!(res.expect("third attempt succeeds"), 7);
+        assert_eq!(attempts.get(), 3);
+        assert_eq!(
+            sc.current_mgr.get(),
+            2,
+            "exactly one rotation per failure (NOT_LEADER must not double-rotate)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod unreachable_report_tests {
+    use super::*;
+
+    /// A manager that records every `MSG_REPORT_DISK_FAILURE` it receives as
+    /// `(node_id, extent_id, reporter_part_id)`.
+    async fn recording_manager() -> (String, Rc<RefCell<Vec<(u64, u64, u64)>>>) {
+        use compio::io::{AsyncRead, AsyncWriteExt};
+        let listener = compio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let reports = Rc::new(RefCell::new(Vec::new()));
+        let seen = reports.clone();
+        compio::runtime::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                let seen = seen.clone();
+                compio::runtime::spawn(async move {
+                    let (mut rd, mut wr) = autumn_transport::Conn::Tcp(socket).into_split();
+                    let Ok(n) = autumn_rpc::version_hello::accept(
+                        &mut rd,
+                        &mut wr,
+                        autumn_rpc::version_hello::Service::Manager,
+                        "test",
+                    )
+                    .await
+                    else {
+                        return;
+                    };
+                    if autumn_rpc::peer_auth::accept(&mut rd, &mut wr, &n, None, "test")
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    let mut decoder = autumn_rpc::FrameDecoder::new();
+                    loop {
+                        let compio::BufResult(r, buf) = rd.read(vec![0; 4096]).await;
+                        let Ok(len) = r else { return };
+                        if len == 0 {
+                            return;
+                        }
+                        decoder.feed(&buf[..len]);
+                        while let Ok(Some(frame)) = decoder.try_decode() {
+                            if frame.msg_type == manager_rpc::MSG_REPORT_DISK_FAILURE {
+                                let req: manager_rpc::ReportDiskFailureReq =
+                                    manager_rpc::rkyv_decode(&frame.payload).unwrap();
+                                seen.borrow_mut().push((
+                                    req.node_id,
+                                    req.extent_id,
+                                    req.reporter_part_id,
+                                ));
+                            }
+                            let reply =
+                                autumn_rpc::Frame::response(frame.req_id, frame.msg_type, Bytes::new());
+                            if wr.write_all(reply.encode()).await.0.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                })
+                .detach();
+            }
+        })
+        .detach();
+        (addr, reports)
+    }
+
+    /// A node a read could not reach is reported to the manager, once per node
+    /// per cooldown however many reads meet it.
+    #[compio::test]
+    async fn an_unreachable_node_is_reported_once() {
+        let (mgr, reports) = recording_manager().await;
+        let sc = StreamClient::construct(
+            vec![mgr],
+            0,
+            "partition/9".to_string(),
+            1,
+            1 << 30,
+            Rc::new(ConnPool::new()),
+            StreamClientConfig::default(),
+        );
+        sc.set_reporter_part_id(9);
+        for _ in 0..3 {
+            sc.note_unreachable(1, 7);
+        }
+        // The report travels on the client's background drainer.
+        let start = Instant::now();
+        while reports.borrow().is_empty() && start.elapsed() < Duration::from_secs(5) {
+            compio::time::sleep(Duration::from_millis(20)).await;
+        }
+        compio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(*reports.borrow(), vec![(1, 7, 9)]);
+    }
+}
+
+#[cfg(test)]
+mod ec_gather_retry_tests {
+    use super::*;
+
+    // The tests below drive the real decision functions with injected per-shard
+    // results. The sentinel-classification tests further down do NOT: they build
+    // an error by hand and assert the classifier's verdict on it, which stays
+    // green however production tags its own errors. Keep them for the plumbing,
+    // but these are the ones that hold the rules.
+
+    fn ok(idx: usize, b: &[u8]) -> (usize, Result<Vec<u8>>) {
+        (idx, Ok(b.to_vec()))
+    }
+    fn fail(idx: usize) -> (usize, Result<Vec<u8>>) {
+        (idx, Err(anyhow!("shard {idx}: read failed")))
+    }
+    fn gather(
+        items: Vec<(usize, Result<Vec<u8>>)>,
+        n: usize,
+        k: usize,
+        missing: usize,
+    ) -> GatherOutcome {
+        let mut rx = futures::stream::iter(items);
+        compio::runtime::Runtime::new().unwrap().block_on(async move {
+            ec_gather_collect(&mut rx, n, k, missing, anyhow!("no shard responses")).await
+        })
+    }
+
+    /// K-1 answers is the retryable verdict; K-2 is not. This is the rule the
+    /// whole one-short retry rests on, and the ablation named in the ledger
+    /// (`success + 1` -> `success + 2`) flips both halves of it.
+    #[test]
+    fn one_short_is_retryable_and_two_short_is_not() {
+        // 4+1 with shard 0 missing: K=4, so one short is three usable answers.
+        let one_short = gather(
+            vec![ok(1, b"b"), ok(2, b"c"), ok(3, b"d"), fail(4)],
+            5,
+            4,
+            0,
+        );
+        assert!(
+            matches!(one_short, GatherOutcome::OneShort { .. }),
+            "3 of 4 shards must be the retryable one-short verdict, got {one_short:?}"
+        );
+
+        let two_short = gather(vec![ok(1, b"b"), ok(2, b"c"), fail(3), fail(4)], 5, 4, 0);
+        assert!(
+            matches!(two_short, GatherOutcome::Short { success: 2, .. }),
+            "2 of 4 shards must be terminal, not retryable, got {two_short:?}"
+        );
+    }
+
+    /// When the shard we were told is missing answers, its bytes ARE the answer:
+    /// returned verbatim, with RS skipped rather than merely made unnecessary.
+    #[test]
+    fn the_missing_shard_answering_returns_its_bytes_verbatim() {
+        let payload = b"the missing shard's own bytes".to_vec();
+        let out = gather(
+            vec![ok(1, b"parity-ish"), (0, Ok(payload.clone())), ok(2, b"x")],
+            5,
+            4,
+            0,
+        );
+        match out {
+            GatherOutcome::Verbatim(got) => assert_eq!(got, payload),
+            other => panic!("missing shard answered but the gather did not return it: {other:?}"),
+        }
+    }
+
+    /// K answers ends the gather; a straggler behind them is never awaited. That
+    /// is what keeps one slow peer off the read's critical path.
+    #[test]
+    fn the_gather_stops_as_soon_as_k_shards_arrive() {
+        let mut rx = futures::stream::iter(vec![
+            ok(1, b"a"),
+            ok(2, b"b"),
+            ok(3, b"c"),
+            ok(4, b"d"),
+            fail(9), // a straggler that must never be consumed
+        ]);
+        let out = compio::runtime::Runtime::new().unwrap().block_on(async {
+            let out = ec_gather_collect(&mut rx, 5, 4, 0, anyhow!("none")).await;
+            // The straggler is still queued — the gather returned without it.
+            let leftover = futures::StreamExt::next(&mut rx).await;
+            assert!(
+                matches!(leftover, Some((9, Err(_)))),
+                "the gather consumed the straggler instead of returning at K"
+            );
+            out
+        });
+        assert!(matches!(out, GatherOutcome::Ready(_)), "got {out:?}");
+    }
+
+    /// A stale-layout shard aborts the gather instead of counting as one more
+    /// miss — the caller has to refresh, and calling it a miss would send it down
+    /// the one-short path with a wrong reason.
+    #[test]
+    fn a_stale_layout_shard_aborts_the_gather() {
+        let stale = (1usize, Err(anyhow::Error::new(EversionStale)));
+        let out = gather(vec![stale, ok(2, b"b"), ok(3, b"c")], 5, 4, 0);
+        assert!(matches!(out, GatherOutcome::Stale(_)), "got {out:?}");
+    }
+
+    /// The chain, end to end: a one-short gather must produce an error the read
+    /// loop actually recognises as retryable. Without this, the counting rule
+    /// and the classifier are each tested and the glue between them is not —
+    /// replacing the sentinel with a plain `anyhow!` used to leave every test in
+    /// the crate green while the retry quietly stopped happening.
+    #[test]
+    fn a_one_short_verdict_produces_an_error_the_read_loop_retries() {
+        let out = gather(
+            vec![ok(1, b"b"), ok(2, b"c"), ok(3, b"d"), fail(4)],
+            5,
+            4,
+            0,
+        );
+        let GatherOutcome::OneShort { last_err } = out else {
+            panic!("expected OneShort, got {out:?}");
+        };
+        let tagged = one_short_error(7, 0, 0, 4096, last_err);
+        assert_eq!(
+            read_retry_action(0, &tagged),
+            Some(ReadRetry::GatherOneShort),
+            "the one-short verdict must survive error construction as a retryable class"
+        );
+    }
+
+    /// A node that moved is not a node that is gone.
+    ///
+    /// Identity is the `node_uuid` on the data dir, so a restarted EN keeps its
+    /// id and re-registers a new address. Every cached layout naming it stays
+    /// CORRECT — only `nodes_cache` is wrong — so refetching `ExtentInfo`
+    /// resolves the same ids through the same dead host, forever. The failure
+    /// shape: a PS dialling an EN's previous IP for hours, degrading every
+    /// read to reconstruct, with `extent-health` reporting all slots healthy.
+    #[test]
+    fn an_unreachable_cached_address_is_its_own_retry_class() {
+        for m in [
+            // ConnPool's bounded-connect timeout — the shape actually observed.
+            "connect 10.0.0.9:9111: RPC timed out after 5s",
+            // ...and its underlying-io-error sibling, which is what a reused
+            // address answers with once something else holds the port.
+            "connect 10.0.0.9:9111: Connection refused (os error 111)",
+        ] {
+            let err = anyhow::anyhow!("{m}").context("read_bytes_from_extent");
+            assert!(is_connect_failure(&err), "should be a connect failure: {m}");
+            assert_eq!(
+                read_retry_action(0, &err),
+                Some(ReadRetry::NodeAddrStale),
+                "an unreachable address must refresh the node map, not the extent alone: {m}"
+            );
+        }
+    }
+
+    /// The predicate has to stay narrower than `is_liveness_timeout`, which
+    /// matches any "timed out": a slow read of a healthy node must NOT drag a
+    /// `nodes_info` round trip onto the retry, and an answer we did not like is
+    /// not an address problem at all.
+    #[test]
+    fn a_slow_or_unhappy_peer_is_not_an_address_problem() {
+        for m in [
+            "call_into_pooled timed out after 5s",
+            "direct read from 1.2.3.4:9101: code=locked",
+            "eversion mismatch: cached=1 got=2",
+        ] {
+            let err = anyhow::anyhow!("{m}");
+            assert!(!is_connect_failure(&err), "must not be a connect failure: {m}");
+        }
+    }
+
+    /// Retrying at most once is the load-bearing half of the whole classifier
+    /// (see `read_retry_action`), and a new class must not opt out of it — a
+    /// refresh per attempt would put a manager round trip in front of every
+    /// read to a genuinely dead node.
+    #[test]
+    fn the_address_class_still_retries_only_once() {
+        let err = anyhow::anyhow!("connect 10.0.0.9:9111: RPC timed out after 5s");
+        assert_eq!(read_retry_action(1, &err), None);
+    }
+
+    /// The strings above are hand-built; this one comes from the real pool. A
+    /// peer that never completes the connect (here: TCP accepted by the kernel
+    /// backlog, VERSION_HELLO never answered) must fail as a connect even when
+    /// the read's own deadline is shorter than the connect bound — otherwise
+    /// the read deadline fires first and the stale address is never refreshed.
+    #[compio::test]
+    async fn a_connect_that_never_completes_is_classified_through_the_real_pool() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let pool = ConnPool::new();
+        let err = pool
+            .call_into_pooled(&addr, 1, Bytes::new(), Duration::from_secs(1))
+            .await
+            .expect_err("the peer never answers");
+        assert!(is_connect_failure(&err), "got: {err:#}");
+        assert!(is_liveness_timeout(&err), "got: {err:#}");
+        assert_eq!(read_retry_action(0, &err), Some(ReadRetry::NodeAddrStale));
+        let err = pool
+            .call_timeout(&addr, 1, Bytes::new(), Duration::from_secs(1))
+            .await
+            .expect_err("the peer never answers");
+        assert!(is_connect_failure(&err), "got: {err:#}");
+        assert!(is_liveness_timeout(&err), "got: {err:#}");
+        drop(listener);
+    }
+
+    fn ex_with_replicas(extent_id: u64, replicates: Vec<u64>) -> ExtentInfo {
+        ExtentInfo {
+            extent_id,
+            replicates,
+            ..Default::default()
+        }
+    }
+
+    /// Both retry loops must apply the cure, and a helper test cannot see the
+    /// difference — the first draft of this fix taught only the plain read and
+    /// left the committed read (WAL replay, on the longest-lived client there
+    /// is) with the pre-fix behaviour, and every test still passed.
+    ///
+    /// No extent nodes needed: nothing listens on port 1, so every dial refuses
+    /// instantly. The PARITY id is the probe. The EC direct pass only forgets
+    /// DATA shards it actually dialled and the reconstruct's per-peer errors
+    /// forget nothing, so a parity entry can disappear only through the loop's
+    /// own `forget_for_retry`.
+    async fn assert_loop_forgets_parity(
+        read: impl std::future::Future<Output = Result<(Bytes, u64)>>,
+        sc: &Rc<StreamClient>,
+    ) {
+        let _ = read.await; // the fake manager makes this fail; only cache state matters
+        assert!(
+            sc.nodes_cache.get(&99).is_none(),
+            "the retry loop must drop the unreachable parity node's address; \
+             a loop that only invalidates the extent cache re-resolves to the same dead host"
+        );
+    }
+
+    fn ec_client_with_dead_addrs() -> Rc<StreamClient> {
+        let sc = super::manager_retry_tests::test_client(1);
+        for id in [7u64, 8, 99] {
+            // Port 1: refused immediately, so the test does not wait out a
+            // connect timeout.
+            sc.nodes_cache.insert(id, ("127.0.0.1:1".into(), vec![1]));
+        }
+        let mut ex = ex_with_replicas(4242, vec![7, 8]);
+        ex.parity = vec![99];
+        ex.sealed = true;
+        ex.sealed_length = 8192;
+        ex.ec_converted = true;
+        sc.extent_info_cache.insert(4242, ex);
+        sc
+    }
+
+    /// A node that MOVED heals on the first refresh. One that is DOWN does not:
+    /// the manager lists a crashed-but-registered EN with its old address, so
+    /// the refresh re-inserts exactly what was dropped. Without a cooldown that
+    /// is a `nodes_info` round trip per READ — and a refused connect fails
+    /// instantly, so a partition serving thousands of GETs a second would aim
+    /// thousands of manager calls a second at the leader for as long as the node
+    /// stays down.
+    #[compio::test]
+    async fn a_node_that_is_down_is_not_forgotten_once_per_read() {
+        let sc = super::manager_retry_tests::test_client(1);
+        let addr = || ("10.0.0.7:9111".to_string(), vec![9111u16]);
+
+        sc.nodes_cache.insert(7, addr());
+        sc.forget_node_addr(7);
+        assert!(sc.nodes_cache.get(&7).is_none(), "the first failure drops it");
+
+        // The manager answers with the same address, because the node is
+        // registered and merely dead.
+        sc.nodes_cache.insert(7, addr());
+        sc.forget_node_addr(7);
+        assert!(
+            sc.nodes_cache.get(&7).is_some(),
+            "a second failure inside the cooldown must NOT re-ask the manager: \
+             re-forgetting cannot change an answer that is already correct"
+        );
+    }
+
+    #[compio::test]
+    async fn the_plain_read_loop_forgets_an_unreachable_address() {
+        let sc = ec_client_with_dead_addrs();
+        assert_loop_forgets_parity(sc.read_bytes_from_extent(4242, 0, 4096), &sc).await;
+    }
+
+    #[compio::test]
+    async fn the_committed_read_loop_forgets_an_unreachable_address() {
+        let sc = ec_client_with_dead_addrs();
+        assert_loop_forgets_parity(sc.read_committed_bytes_from_extent(4242, 0, 4096), &sc).await;
+    }
+
+    /// The CURE, not the classification.
+    ///
+    /// The first version of this fix classified the error correctly and then
+    /// dropped the address in ONE of the two retry loops. Every test passed:
+    /// they all stopped at `read_retry_action`. Assert the cache actually loses
+    /// the entry, or the next hole hides in the same blind spot.
+    #[compio::test]
+    async fn an_unreachable_replica_loses_its_cached_address() {
+        let sc = super::manager_retry_tests::test_client(1);
+        for id in [7u64, 8, 9] {
+            sc.nodes_cache.insert(id, ("10.0.0.9:9111".into(), vec![9111]));
+        }
+        let ex = ex_with_replicas(42, vec![7, 8, 9]);
+
+        sc.forget_unreachable_replicas(
+            &ex,
+            &anyhow::anyhow!("connect 10.0.0.9:9111: RPC timed out after 5s"),
+        );
+        assert!(sc.nodes_cache.is_empty(), "the replicas' addresses must be dropped");
+    }
+
+    /// Only an address problem may cost an address. An answer we did not like
+    /// says nothing about where the node is, and dropping the entry there buys
+    /// a `nodes_info` round trip on every unhappy read.
+    #[compio::test]
+    async fn a_non_address_failure_leaves_the_map_alone() {
+        let sc = super::manager_retry_tests::test_client(1);
+        sc.nodes_cache.insert(7, ("10.0.0.1:9111".into(), vec![9111]));
+        let ex = ex_with_replicas(42, vec![7]);
+
+        sc.forget_unreachable_replicas(&ex, &anyhow::anyhow!("eversion mismatch: cached=1 got=2"));
+        assert_eq!(sc.nodes_cache.len(), 1);
+    }
+
+    /// A rolling update moves ONE node at a time, so the other replicas cover
+    /// for it and the read SUCCEEDS — the failure never reaches a retry loop.
+    /// The entry still has to go, or every later read of this extent re-dials
+    /// the dead address and waits out the connect timeout, silently, for the
+    /// life of the process.
+    #[compio::test]
+    async fn forgetting_is_per_node_so_a_healthy_peer_keeps_its_address() {
+        let sc = super::manager_retry_tests::test_client(1);
+        sc.nodes_cache.insert(7, ("10.0.0.7:9111".into(), vec![9111]));
+        sc.nodes_cache.insert(8, ("10.0.0.8:9111".into(), vec![9111]));
+
+        sc.forget_node_addr(7);
+
+        assert!(sc.nodes_cache.get(&7).is_none(), "the moved node is forgotten");
+        assert!(
+            sc.nodes_cache.get(&8).is_some(),
+            "a healthy peer must keep its address — clearing the whole map makes \
+             unrelated reads refetch and lets concurrent failures each buy a round trip"
+        );
+    }
+
+    /// Exactly one retry, and only for the three classes that a refreshed layout
+    /// can actually fix. The ledger's second ablation (dropping `attempt == 0`)
+    /// flips the second half of each pair.
+    #[test]
+    fn a_read_retries_at_most_once_and_only_for_recoverable_classes() {
+        let stale = anyhow::Error::new(EversionStale);
+        let not_here = anyhow::Error::new(PayloadNotHere);
+        let one_short = anyhow::Error::new(EcGatherOneShort);
+        let other = anyhow!("connection reset by peer");
+
+        assert_eq!(read_retry_action(0, &stale), Some(ReadRetry::EversionStale));
+        assert_eq!(
+            read_retry_action(0, &not_here),
+            Some(ReadRetry::PayloadNotHere)
+        );
+        assert_eq!(
+            read_retry_action(0, &one_short),
+            Some(ReadRetry::GatherOneShort)
+        );
+        assert_eq!(read_retry_action(0, &other), None, "an unrecoverable error must not be retried");
+
+        // Second attempt: no class is retried again.
+        assert_eq!(read_retry_action(1, &stale), None);
+        assert_eq!(read_retry_action(1, &not_here), None);
+        assert_eq!(
+            read_retry_action(1, &one_short),
+            None,
+            "a second retry multiplies K-way read amplification on a degraded cluster"
+        );
+    }
+
+    /// The layout-stale refusal is typed and distinct from the other two —
+    /// it must refresh WITHOUT the gather arm's pause, since nothing is
+    /// contended, only misaddressed.
+    #[test]
+    fn payload_not_here_is_its_own_class() {
+        let e = anyhow::Error::new(PayloadNotHere).context("read_shard shard 2 from 10.0.0.1");
+        assert!(is_payload_not_here(&e));
+        assert!(!is_eversion_stale(&e) && !is_ec_gather_one_short(&e));
+        // And a generic failure must not be mistaken for it.
+        let g = anyhow!("read_shard shard 2 from 10.0.0.1: code=error");
+        assert!(!is_payload_not_here(&g));
+    }
+
+    /// The two retryable classes stay distinct: each arm invalidates and
+    /// re-plans, but only the gather arm pauses, and conflating them would
+    /// make an eversion refresh sleep for no reason.
+    #[test]
+    fn eversion_and_gather_sentinels_do_not_alias() {
+        let ev = anyhow::Error::new(EversionStale);
+        let gs = anyhow::Error::new(EcGatherOneShort);
+        assert!(is_eversion_stale(&ev) && !is_ec_gather_one_short(&ev));
+        assert!(is_ec_gather_one_short(&gs) && !is_eversion_stale(&gs));
+    }
+}

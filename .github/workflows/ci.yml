@@ -1,0 +1,61 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: false
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          # autumn-manager/fuse-tests pulls in autumn-fuse and fuser.
+          # fuse3 provides fusermount3 for fuse_umount_exit's real mount.
+          sudo apt-get install -y etcd-server protobuf-compiler libfuse3-dev fuse3
+          # autumn-fuse mounts with auto_unmount, which implies allow_other; the
+          # runner is not root, so fusermount3 refuses it without this.
+          echo user_allow_other | sudo tee -a /etc/fuse.conf >/dev/null
+          # Network-fault tests (etcd_resend_after_timeout, update_stream_ec_cas, ...)
+          # spawn toxiproxy-server and drive it with toxiproxy-cli.
+          v=2.12.0
+          base=https://github.com/Shopify/toxiproxy/releases/download/v$v
+          curl -fsSL -o /tmp/toxiproxy-server "$base/toxiproxy-server-linux-amd64"
+          curl -fsSL -o /tmp/toxiproxy-cli "$base/toxiproxy-cli-linux-amd64"
+          sha256sum -c - <<'SUMS'
+          556d891134a3c582dc1e1a3f7335fd55142e5965769855a00b944e13e48302fc  /tmp/toxiproxy-server
+          26c747024a3758a243c4449ff4f65634983fe98a0ab411d242cc9ff4561312b4  /tmp/toxiproxy-cli
+          SUMS
+          sudo install -m 0755 /tmp/toxiproxy-server /tmp/toxiproxy-cli /usr/local/bin/
+          toxiproxy-server --version
+      - name: Build
+        run: cargo build --workspace --exclude ucx-sys-mini
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Dashboard contracts
+        run: |
+          node crates/server/src/bin/autumn_dashboard/tests/render_check.js
+          node crates/server/src/bin/autumn_dashboard/tests/tabs_smoke.js
+          node crates/server/src/bin/autumn_dashboard/tests/policy_controls.js
+          bash crates/server/src/bin/autumn_dashboard/tests/api_contract.sh
+      - uses: taiki-e/install-action@nextest
+      - name: Tests
+        # cargo-nextest: every test in its own process (`.config/nextest.toml`,
+        # profile `ci`). Each process has its own io_uring rings, freed at its
+        # exit; RLIMIT_MEMLOCK is still raised for tests that create many.
+        # `ulimit -l unlimited` is refused on the runner; sudo prlimit on this
+        # shell's PID is not, and cargo inherits it.
+        run: |
+          sudo prlimit --pid $$ --memlock=unlimited:unlimited || true
+          sudo prlimit --pid $$ --nofile=65536:65536 || true
+          cat /proc/$$/limits | grep -E 'locked|files'
+          cargo nextest run --profile ci --workspace --exclude ucx-sys-mini --features autumn-manager/fuse-tests
+      - name: Doc tests
+        run: cargo test --workspace --doc --exclude ucx-sys-mini

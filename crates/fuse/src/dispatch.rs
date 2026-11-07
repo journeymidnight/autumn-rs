@@ -1,0 +1,1849 @@
+//! Compio-thread dispatch loop: receives FsRequests from the bridge and
+//! executes them using the filesystem state.
+
+use anyhow::{anyhow, Result};
+
+use autumn_client::lease;
+use autumn_rpc::manager_rpc::{LEASE_MODE_READ, LEASE_MODE_WRITE};
+
+use crate::attr::inode_to_attr;
+use crate::bridge::*;
+use autumn_fs::dir;
+use autumn_fs::meta::*;
+use autumn_fs::read;
+use crate::prefetch;
+use crate::read_pool::{PrefetchJob, ReadJob, ReadPool};
+use autumn_fs::schema::InodeState;
+use autumn_fs::state::{FsState, FuseLease};
+use autumn_fs::write;
+
+/// Directory entries fetched per kernel READDIR call.
+const READDIR_BATCH: usize = 256;
+
+/// Derive the lease mode from POSIX open flags. The
+/// fuse `open` callback supplies `flags` directly (`O_RDONLY` /
+/// `O_WRONLY` / `O_RDWR`). Treat any non-read-only opener as a
+/// writer — that's the safe upper bound; a read-leased fd would
+/// reject a write at lease-check time.
+fn lease_mode_for_open(flags: i32) -> u8 {
+    // O_RDONLY (0) → READ; everything else (O_WRONLY=1, O_RDWR=2 +
+    // any flag combinations) → WRITE.
+    if flags & libc::O_ACCMODE == libc::O_RDONLY {
+        LEASE_MODE_READ
+    } else {
+        LEASE_MODE_WRITE
+    }
+}
+
+/// Per-event MARK of held leases on
+/// `LEASE_INVAL_LEASE_REVOKED`. Previously the fuse mount's
+/// invalidation poll loop just logged the event; `held_leases[ino]`
+/// stayed populated until the next `session_heartbeat_loop` tick
+/// returned `NotHeld` (up to 5 s later). Inside that window a Write
+/// request via `FsRequest::Write` continued to flow through because
+/// the dispatcher doesn't consult held_leases on the write path.
+///
+/// **Marker, not remove.** Removing the entry instead would
+/// BREAK Release's flush-decision (no entry ⇒
+/// `release_now_pred` is false ⇒ dirty buffer dropped on a kernel
+/// `flush=false` close) AND Write's lease check (no entry ⇒ "no
+/// lease held" which is indistinguishable from a Write before
+/// Open). Instead the entry is kept and gets the
+/// `revoked: bool` sticky flag, so:
+///   - Write checks the flag and fails with EIO.
+///   - Release sees the flag and flushes before evicting.
+///   - Open's re-acquire path observes the flag, drops the entry,
+///     and treats the inode as fresh (gets a new lease epoch).
+/// Returns the inos newly-transitioned to revoked so the caller can
+/// do a best-effort `lease::release` (idempotent on the manager
+/// side).
+///
+/// `WriterClosed` / `WillRevokeIn` / overflow sentinel do NOT
+/// mark.
+/// Pure-fn lease check used by the Write
+/// arm of `FsRequest`. Three states:
+///
+/// - `Ok(())`: this mount holds a write fd on the inode, not revoked.
+/// - `Err("revoked")`: held entry but server-side revoked (the
+///   data-leak window — the stale writer's bytes must NOT land).
+/// - `Err("wrong mode")`: held, but only read fds are open (`writer_refs == 0`
+///   — a read-only opener, or a mount that downgraded when its last write fd
+///   closed). Keyed on the ROLE COUNT rather than `mode` because `mode` also
+///   reads WRITE for the window in which a write fd is open alongside readers.
+/// - `Err("no lease")`: no entry at all — caller dropped through
+///   Open without acquiring, or a wholesale invalidate dropped the
+///   map. Either way, refuse the write.
+///
+/// Returning `&'static str` keeps the helper allocation-free in the
+/// hot path; the dispatcher wraps it in an `anyhow!` for the
+/// `FsRequest::Write` reply.
+pub fn check_write_allowed(
+    held_leases: &std::collections::HashMap<u64, autumn_fs::state::FuseLease>,
+    ino: u64,
+) -> Result<(), &'static str> {
+    match held_leases.get(&ino) {
+        None => Err("no lease"),
+        Some(slot) if slot.revoked => Err("revoked"),
+        Some(slot) if slot.writer_refs == 0 => Err("wrong mode"),
+        Some(_) => Ok(()),
+    }
+}
+
+/// Pure-fn decision helper for the Release path. Invariant: a
+/// server-side revoked lease MUST flush before dropping the
+/// in-memory entry, even when the kernel passed `flush=false` and
+/// `refcount > 1`. Returns:
+///
+/// `role` is the lease mode of the fd being closed, derived from the open
+/// flags the kernel echoes back on RELEASE. It decides WHICH refcount falls,
+/// and therefore whether this close ends the mount's write lease.
+///
+/// - `must_flush`: the dispatcher's `write::flush_inode` must run.
+///   True iff: kernel `flush=true`, OR this is the last fd of any kind, OR
+///   `slot.revoked` is set, OR it is the last WRITE fd (dirty data must reach
+///   the cluster while this mount still holds the write lease — after the
+///   downgrade below its writes would be refused).
+/// - `must_drop_entry`: the held_leases entry should be removed
+///   after the flush attempt. True iff: no fd of either role is left,
+///   OR `slot.revoked` is set (revoked entries are not
+///   recoverable — the manager already gave the lease to someone
+///   else; keeping the entry around just confuses the next Open).
+/// - `downgrade_to_read`: the last WRITE fd closed but read fds remain. The
+///   dispatcher releases the write lease and re-acquires a READ one, so a
+///   lingering reader (`tail -f`) stops occupying the single writer slot and
+///   blocking every other mount's writer. Never set together with
+///   `must_drop_entry`.
+/// - `propagate_flush_err`: the dispatcher should answer the RELEASE
+///   with EIO rather than swallowing it. True iff NOT revoked (a
+///   revoked flush is best-effort; the bytes will fence at the PS
+///   anyway via lease write fencing — surfacing
+///   it would mask the legitimate next Open + retry path).
+///   It does NOT mean the application learns of the error: fuser's
+///   release contract is that "error values are not returned to
+///   close() or munmap()", so the kernel drops the reply either way.
+///   It therefore must NEVER be used to decide whether the sticky
+///   `flush_error` may be consumed — RELEASE always passes
+///   `FlushReport::BestEffort`.
+pub fn compute_release_action(
+    held_leases: &std::collections::HashMap<u64, autumn_fs::state::FuseLease>,
+    ino: u64,
+    kernel_flush: bool,
+    role: u8,
+) -> ReleaseAction {
+    match held_leases.get(&ino) {
+        None => ReleaseAction {
+            must_flush: kernel_flush,
+            must_drop_entry: false,
+            downgrade_to_read: false,
+            propagate_flush_err: true,
+        },
+        Some(slot) => {
+            let last = slot.total_refs() <= 1;
+            // `== 1`, not `<= 1`: a WRITE-role release against a slot with no
+            // writer counted is a drift, and answering it with a downgrade
+            // spends two round trips releasing and re-taking a read lease that
+            // already describes the state.
+            let last_writer =
+                role == autumn_rpc::manager_rpc::LEASE_MODE_WRITE && slot.writer_refs == 1;
+            ReleaseAction {
+                must_flush: kernel_flush || last || slot.revoked || last_writer,
+                must_drop_entry: last || slot.revoked,
+                // A revoked entry is dropped whole, so there is nothing to
+                // downgrade: the next Open re-acquires from scratch.
+                downgrade_to_read: last_writer && !last && !slot.revoked,
+                propagate_flush_err: !slot.revoked,
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReleaseAction {
+    pub must_flush: bool,
+    pub must_drop_entry: bool,
+    pub downgrade_to_read: bool,
+    pub propagate_flush_err: bool,
+}
+
+/// Pure-fn predicate used by the
+/// Open arm to decide whether the cached `InodeState.meta` /
+/// `extents` are stale relative to a freshly-acquired lease
+/// version.
+///
+/// `acquired_version`: the version returned by the just-completed
+///   AcquireLease (or read back from `held_leases[ino].version` on
+///   a same-mount Open that didn't re-acquire). `0` is the
+///   "couldn't observe a fresh version this Open" sentinel — the
+///   helper returns `false` so the existing cached entry stays
+///   untouched (matches pre-fix behavior; never makes things
+///   WORSE than pre-fix).
+/// `cached_version`: the version stored on the per-mount
+///   `InodeState.cached_version` at the time it was rebuilt.
+/// Returns `true` iff `cached < acquired && acquired > 0`. The
+/// strict `<` matters: an equal-version Open is the common case
+/// (refcount+1) and must NOT trigger a reload.
+pub fn inode_cache_needs_reload(cached_version: u64, acquired_version: u64) -> bool {
+    acquired_version > 0 && cached_version < acquired_version
+}
+
+/// Plan the blocks ahead of a sequential reader of `ino` and hand them to the
+/// read workers (`prefetch.rs`). A block the budget cannot take is skipped —
+/// its READs go to the cluster as they would without prefetch.
+async fn prefetch_ahead(state: &mut FsState, pool: &ReadPool, ino: u64, offset: u64, len: u64) {
+    let Some(pf) = pool.prefetch() else {
+        return;
+    };
+    let Some(is) = state.inodes.get(&ino) else {
+        return;
+    };
+    // A file this mount is writing changes generation with every write; its
+    // blocks would be dropped before anybody read them.
+    if is.dirty || is.write_buf.as_ref().is_some_and(|wb| wb.len > 0) {
+        return;
+    }
+    let (generation, size) = (is.meta.generation, is.meta.size);
+    let fetches = pf.detector.borrow_mut().on_read(ino, generation, offset, len, size);
+    let mut fetches = fetches.into_iter();
+    while let Some(prefetch::Fetch { block, already_read }) = fetches.next() {
+        let want = prefetch::block_bytes().min(size - block);
+        let plan = match read::prepare(state, ino, block as i64, want as u32).await {
+            Ok(plan) => plan,
+            Err(e) => {
+                // Not fetched: let later READs ask for this block and the rest.
+                tracing::debug!(ino, block, error = %e, "prefetch: planning failed");
+                let mut detector = pf.detector.borrow_mut();
+                detector.unissue(ino, block);
+                for rest in fetches {
+                    detector.unissue(ino, rest.block);
+                }
+                return;
+            }
+        };
+        // Inline data, holes and EOF cost no round trip: nothing to fetch ahead.
+        if plan.inline_result.is_some() || plan.chunks.is_empty() {
+            continue;
+        }
+        let Some(slot) = pf.cache.reserve(ino, generation, block, plan.actual_size as u64, already_read)
+        else {
+            // Refused (budget) or already there; a refused block may fit later.
+            pf.detector.borrow_mut().unissue(ino, block);
+            continue;
+        };
+        pool.submit_prefetch(PrefetchJob {
+            slot,
+            chunks: plan.chunks,
+            actual_size: plan.actual_size,
+            direct_read: plan.direct_read,
+        });
+    }
+}
+
+/// Open reply flag: the kernel keeps the inode's page cache across this open
+/// instead of dropping it (`fuse_finish_open`).
+pub const FOPEN_KEEP_CACHE: u32 = 1 << 1;
+
+/// Whether an Open may keep the kernel's cached pages of the inode.
+///
+/// - While this mount held a lease before the Open, every other client's
+///   write reached it as an invalidation, so the pages are as current as
+///   the mount's open fds see them.
+/// - Without one, pages from before the last close may predate writes this
+///   mount never heard of: keep them only if the generation read fresh at
+///   this Open (`fresh`) is the one recorded when they were last vouched for
+///   (`recorded`). `None` for `fresh` means it could not be read.
+/// - A failed kernel invalidation (`sticky_inval_failed`) means the pages may
+///   be stale whatever the lease says.
+pub fn open_keeps_page_cache(
+    sticky_inval_failed: bool,
+    lease_was_held: bool,
+    recorded: Option<u64>,
+    fresh: Option<u64>,
+) -> bool {
+    if sticky_inval_failed {
+        return false;
+    }
+    lease_was_held || (fresh.is_some() && recorded == fresh)
+}
+
+/// Pure-fn predicate used by the
+/// Open / Read arms to detect that the per-mount kernel
+/// `notify_inval_inode` call FAILED for this ino during the most
+/// recent invalidation event. When this is `true`, the caller MUST:
+///
+///   1. Drop any cached InodeState (force a fresh `get_inode`).
+///   2. Queue `notify_inval_inode(ino, 0, 0)` again; its outcome
+///      clears the sticky entry on success (`inval.rs`).
+///
+/// Without this, a transient EINVAL/ENOENT/EAGAIN on the kernel
+/// notify path leaves the kernel page cache serving stale bytes
+/// to userspace AND the mount's own InodeState pointing at stale
+/// extents — close-to-open coherence silently broken from the
+/// reader app's perspective even though the user-space lease
+/// state is correct.
+///
+/// Why not just retry on a timer: the kernel page cache serves
+/// most reads WITHOUT round-tripping to our dispatcher. The only
+/// reliable hook is the next syscall that DOES reach us — Open
+/// is the cheapest one to instrument because every long-lived
+/// read fd starts with one.
+pub fn notify_inval_inode_failed_for(
+    failed: &std::collections::HashSet<u64>,
+    ino: u64,
+) -> bool {
+    failed.contains(&ino)
+}
+
+// M4: the per-session lease background tasks (heartbeat +
+// invalidation poll) moved to the fuser-free `autumn_fs::lease_tasks` so the PyO3
+// `autumn.Fs` binding shares them. Re-exported here so `main.rs` +
+// this module's unit tests reference them unchanged.
+pub use autumn_fs::lease_tasks::{
+    evict_revoked_held_leases, invalidate_kernel_cache_for_events, spawn_lease_background_tasks,
+    InodeInvalidator,
+};
+
+/// Initialize the root inode if it doesn't exist yet.
+pub async fn init_root(state: &mut FsState) -> Result<()> {
+    // Root creation is the shared core primitive (`meta::ensure_root`, used by
+    // the PyO3 `autumn.Fs` binding too — M2); the fuse mount adds
+    // its legacy pre-manager batch seed on a fresh filesystem only.
+    if !ensure_root(state).await? {
+        tracing::info!("root inode already exists");
+        return Ok(());
+    }
+    tracing::info!("created root inode");
+    // SD-3 (review P1-2): do NOT seed a local inode batch here. The
+    // pre-SD-3 mount seeded `[ROOT_INO+1, ROOT_INO+1+inode_alloc_batch)` locally
+    // on a fresh FS — but with per-volume filesystems each volume's fresh mount
+    // would seed the SAME low range, and the lease/fence plane keys by BARE ino,
+    // so those low inodes would COLLIDE across volumes (cross-volume write-lease
+    // conflict). Leaving `next_inode == inode_batch_end` (the FsState::new
+    // default) makes the first `alloc_inode` fetch from the manager's GLOBAL
+    // counter, so every file inode is cluster-unique. The PyO3 `autumn.Fs`
+    // front-end already skips the local seed (it calls `ensure_root`, not
+    // `init_root`), so both front-ends now allocate uniformly through the manager.
+    Ok(())
+}
+
+/// Process a single FsRequest. Returns false if the loop should exit (Destroy).
+/// `pool`, when present, is where a prepared read goes instead of this thread's
+/// runtime — see `read_pool`. `None` keeps every read on the dispatcher, which
+/// is what the lease tests and any non-mount driver want.
+pub async fn handle_request(
+    state: &mut FsState,
+    req: FsRequest,
+    pool: Option<&ReadPool>,
+) -> bool {
+    // One place for the MOUNT, so no handler here can forget. A pipelined
+    // append flush leaves the inode's extent map missing its extents and its
+    // bytes not yet durable, and only a contiguous write to that same inode may
+    // proceed on that view (`write::write` plans purely from the buffer's own
+    // offset and drains itself for every other shape). Everything else — reads,
+    // stat, rename, unlink, fsync, readdir — waits here for a complete picture.
+    //
+    // This funnel is why `FsState::pipelined_writes` is set by the mount and
+    // nothing else: the PyO3 `autumn.Fs` worker calls the core ops directly and
+    // never passes through here, so a pipelined flush would be invisible to its
+    // reads.
+    //
+    // Logging the error here is NOT how it gets reported — this drain runs
+    // ahead of the fsync handler and would otherwise consume the only copy.
+    // `drain_pending` sticks the failure to the inode. Until it is retired,
+    // every `flush_inode` fails on it; only one marked `ToApplication` — FLUSH
+    // (which the kernel sends on every `close()`) or FSYNC — retires it, while
+    // the `BestEffort` callers, truncate among them, fail and leave it standing.
+    // RELEASE is deliberately `BestEffort`: fuser drops a release error before
+    // it reaches `close()`, so it may report but never consume.
+    if !matches!(req, FsRequest::Write { .. }) {
+        if let Err(e) = write::drain_all_pending(state).await {
+            tracing::warn!(error = %e, "pending append flush failed (fsync will report it)");
+        }
+    }
+    match req {
+        FsRequest::Init { reply } => {
+            let result = init_root(state).await;
+            // UNLINK-1: replay any unlink interrupted by a crash —
+            // tombstoned inodes are unreachable by invariant, so the
+            // sweep can delete their data unconditionally. Best-effort:
+            // a failed sweep retries at the next mount.
+            match autumn_fs::extent::sweep_unlink_tombstones(state).await {
+                Ok(0) => {}
+                Ok(n) => tracing::info!(reaped = n, "unlink tombstone sweep"),
+                Err(e) => tracing::warn!("unlink tombstone sweep failed: {e}"),
+            }
+            let _ = reply.send(result);
+        }
+        FsRequest::Destroy => {
+            // Flush all dirty inodes before shutting down
+            let dirty: Vec<u64> = state.dirty_inodes.iter().copied().collect();
+            for ino in dirty {
+                // Best-effort: this only logs, so it must not consume the
+                // sticky record (`FlushReport`).
+                if let Err(e) =
+                    write::flush_inode(state, ino, write::FlushReport::BestEffort).await
+                {
+                    tracing::warn!(ino, error = %e, "destroy: flush failed");
+                }
+            }
+            return false;
+        }
+        FsRequest::Lookup {
+            parent,
+            name,
+            reply,
+        } => {
+            // M1: core returns (ino, meta); convert to the
+            // fuser reply shape at this boundary.
+            let result = dir::lookup(state, parent, &name)
+                .await
+                .map(|(ino, meta)| (inode_to_attr(ino, &meta), ino));
+            let _ = reply.send(result);
+        }
+        FsRequest::Forget { ino, nlookup } => {
+            if let Some(count) = state.lookup_count.get_mut(&ino) {
+                *count = count.saturating_sub(nlookup);
+                if *count == 0 {
+                    state.lookup_count.remove(&ino);
+                    // The kernel inode, and its pages, are gone.
+                    state.page_cache_generation.remove(&ino);
+                    state.meta_invalidated.borrow_mut().remove(&ino);
+                    if let Some(pool) = pool {
+                        pool.forget(ino);
+                    }
+                    // Evict from cache if not open
+                    if let Some(is) = state.inodes.get(&ino) {
+                        if is.open_count == 0 && !is.dirty {
+                            state.inodes.remove(&ino);
+                        }
+                    }
+                }
+            }
+        }
+        FsRequest::GetAttr { ino, reply } => {
+            let result = async {
+                let meta = get_inode(state, ino).await?;
+                Ok(inode_to_attr(ino, &meta))
+            }
+            .await;
+            let _ = reply.send(result);
+        }
+        FsRequest::SetAttr {
+            ino,
+            mode,
+            uid,
+            gid,
+            size,
+            atime,
+            mtime,
+            reply,
+        } => {
+            // A size change of a segmented file this mount holds nothing on
+            // (`open(O_TRUNC)` arrives as this SETATTR before the OPEN, and
+            // `truncate(2)` never opens) runs under a WRITE lease taken for
+            // the whole request, so the trailing inode put below is fenced
+            // too, not only the truncate's own.
+            let transient = match size {
+                Some(_) => autumn_fs::segment::needs_transient_write(state, ino).await,
+                None => Ok(false),
+            };
+            let transient = match transient {
+                Ok(t) => t,
+                Err(e) => {
+                    let _ = reply.send(Err(e));
+                    return true;
+                }
+            };
+            if transient {
+                if let Err(e) = autumn_fs::segment::hold_transient_write(state, ino).await {
+                    let _ = reply.send(Err(e));
+                    return true;
+                }
+            }
+            let result = async {
+                // Size first: the truncate writes its own meta, and the edits
+                // below apply to the result rather than being overwritten by it.
+                if let Some(s) = size {
+                    write::truncate(state, ino, s).await?;
+                }
+                let mut meta = get_inode(state, ino).await?;
+                if let Some(m) = mode {
+                    meta.mode = (meta.mode & S_IFMT) | (m & 0o7777);
+                }
+                if let Some(u) = uid {
+                    meta.uid = u;
+                }
+                if let Some(g) = gid {
+                    meta.gid = g;
+                }
+                // Resolve a SetAttr time (explicit timestamp or "now") into
+                // the meta's secs/nsecs pair — identical for atime and mtime.
+                fn apply_time(t: fuser::TimeOrNow, secs: &mut i64, nsecs: &mut u32) {
+                    match t {
+                        fuser::TimeOrNow::SpecificTime(st) => {
+                            let d = st.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+                            *secs = d.as_secs() as i64;
+                            *nsecs = d.subsec_nanos();
+                        }
+                        fuser::TimeOrNow::Now => {
+                            let (s, ns) = now_ts();
+                            *secs = s;
+                            *nsecs = ns;
+                        }
+                    }
+                }
+                if let Some(t) = atime {
+                    apply_time(t, &mut meta.atime_secs, &mut meta.atime_nsecs);
+                }
+                if let Some(t) = mtime {
+                    apply_time(t, &mut meta.mtime_secs, &mut meta.mtime_nsecs);
+                }
+                let (s, ns) = now_ts();
+                meta.ctime_secs = s;
+                meta.ctime_nsecs = ns;
+                let meta = put_inode(state, ino, &meta).await?;
+                Ok(inode_to_attr(ino, &meta))
+            }
+            .await;
+            if transient {
+                if result.is_err() {
+                    // The cached map may name pages no put published, which
+                    // the reclaim in the release is about to delete.
+                    state.inodes.remove(&ino);
+                    state.dirty_inodes.remove(&ino);
+                }
+                autumn_fs::segment::drop_transient_write(state, ino).await;
+            }
+            let _ = reply.send(result);
+        }
+        FsRequest::Mkdir {
+            parent,
+            name,
+            mode,
+            reply,
+        } => {
+            let result = dir::mkdir(state, parent, &name, mode)
+                .await
+                .map(|(ino, meta)| inode_to_attr(ino, &meta));
+            let _ = reply.send(result);
+        }
+        FsRequest::Rmdir {
+            parent,
+            name,
+            reply,
+        } => {
+            let result = dir::rmdir(state, parent, &name).await;
+            let _ = reply.send(result);
+        }
+        FsRequest::Readdir { ino, offset, reply } => {
+            // One kernel reply buffer holds roughly a hundred entries; the
+            // kernel asks again from the last offset for the rest.
+            let result = dir::readdir_bounded(state, ino, offset, READDIR_BATCH).await;
+            let _ = reply.send(result);
+        }
+        FsRequest::Rename {
+            old_parent,
+            old_name,
+            new_parent,
+            new_name,
+            reply,
+        } => {
+            let result = dir::rename(state, old_parent, &old_name, new_parent, &new_name).await;
+            let _ = reply.send(result);
+        }
+        FsRequest::Create {
+            parent,
+            name,
+            mode,
+            flags,
+            reply,
+        } => {
+            let result = async {
+                // M2: the file-create KV steps live in the shared
+                // core (`dir::create`) so the fuse mount and the PyO3
+                // `autumn.Fs` binding never drift. Open semantics — lease
+                // acquire + the runtime `InodeState` cache + the `FileAttr`
+                // reply — stay here at the FUSE reply boundary.
+                let (ino, meta) = dir::create(state, parent, &name, mode).await?;
+                // Create produces a
+                // writable fd just like Open. AcquireLease BEFORE
+                // publishing the inode cache so a concurrent Open
+                // from another mount can't get a writer-lease on
+                // the same inode. Brand-new inode → no contention
+                // is possible at the manager (new ino), but the
+                // bookkeeping keeps held_leases consistent so the
+                // matching Release fires ReleaseLease and other
+                // mounts can then take over.
+                let req_mode = lease_mode_for_open(flags);
+                use lease::AcquireResult;
+                let cluster = state.client.clone();
+                let id = state.client_id.clone();
+                let acquired_version = match lease::acquire(&cluster, &id, ino, req_mode).await {
+                    Ok(AcquireResult::Granted(info)) => {
+                        let mut slot = FuseLease {
+                            writer_refs: 0,
+                            reader_refs: 0,
+                            mode: req_mode,
+                            lease_epoch: info.version,
+                            revoked: false,
+                        };
+                        slot.add_ref(req_mode);
+                        state.held_leases.borrow_mut().insert(ino, slot);
+                        info.version
+                    }
+                    Ok(AcquireResult::Conflict { manager_message }) => {
+                        // Should not happen for a freshly-allocated
+                        // ino, but if it does (UUID collision in
+                        // another mount's last_version shadow, say)
+                        // surface as EBUSY rather than silently
+                        // owning a leaseless fd.
+                        return Err(anyhow!(
+                            "EBUSY: lease conflict on fresh ino {}: {}",
+                            ino, manager_message
+                        ));
+                    }
+                    Ok(AcquireResult::RevokePending { .. }) => {
+                        // Unreachable: this call uses `acquire`
+                        // (force=false). Defensive return so a
+                        // future refactor that flips it to
+                        // `acquire_force` fails loudly instead
+                        // of silently dropping the grace window.
+                        return Err(anyhow!(
+                            "BUG: Create with non-force acquire returned RevokePending"
+                        ));
+                    }
+                    Err(e) => return Err(anyhow!("AcquireLease ino {}: {}", ino, e)),
+                };
+                // Cache the inode. Seed `cached_version`
+                // with the just-acquired lease version so the next
+                // Open(ino) on this mount's restart can detect a
+                // cross-mount version bump.
+                state.inodes.insert(
+                    ino,
+                    InodeState {
+                        meta: meta.clone(),
+                        write_epoch: 0,
+                        write_buf: None,
+                        pending_flushes: std::collections::VecDeque::new(),
+                        flush_error: None,
+                        dirty: false,
+                        open_count: 1,
+                        extents: None,
+                        cached_version: acquired_version,
+                    },
+                );
+                // NOTE: `dir::create` already bumped `lookup_count[ino]`.
+                let attr = inode_to_attr(ino, &meta);
+                Ok((attr, ino)) // fh = ino for simplicity
+            }
+            .await;
+            let _ = reply.send(result);
+        }
+        FsRequest::Link { ino, parent, name, reply } => {
+            let result = dir::link(state, ino, parent, &name).await
+                .map(|meta| inode_to_attr(ino, &meta));
+            let _ = reply.send(result);
+        }
+        FsRequest::Unlink {
+            parent,
+            name,
+            reply,
+        } => {
+            // M2: shared core owns the file-unlink KV steps
+            // (dirent delete + nlink decrement + tombstoned data reap).
+            let result = dir::unlink(state, parent, &name).await;
+            let _ = reply.send(result);
+        }
+        FsRequest::Open { ino, flags, reply } => {
+            let result = async {
+                // Fail-closed on
+                // stale `notify_inval_inode`. If the most recent
+                // kernel notify for this ino FAILED (sticky set
+                // populated from the invalidation thread's outcomes),
+                // drop any cached InodeState BEFORE the get_inode
+                // reload so this Open's bookkeeping is built on fresh
+                // attrs, and queue the kernel notify again. Its
+                // outcome clears or keeps the sticky entry later; the
+                // Open does not wait for it — waiting would hold this
+                // loop while the notify waits on a read only this loop
+                // can answer (`inval.rs`). Without this a transient
+                // kernel EINVAL/EAGAIN strands the kernel page cache
+                // on stale bytes despite our user-space lease state
+                // being correct.
+                let sticky_failed = {
+                    let s = state.notify_inval_failed.borrow();
+                    notify_inval_inode_failed_for(&s, ino)
+                };
+                if sticky_failed {
+                    state.inodes.remove(&ino);
+                    let invalidator = state.kernel_invalidator.borrow().clone();
+                    if let Some(invalidator) = invalidator {
+                        invalidator(ino);
+                    }
+                }
+                // Ensure inode exists.
+                let _ = get_inode(state, ino).await?;
+
+                // AcquireLease BEFORE bumping the
+                // local open_count so a conflicting writer surfaces
+                // as `EBUSY` (mapped to ErrorKind::Other in
+                // `err_to_errno`). Refcount the lease per-mount.
+                let req_mode = lease_mode_for_open(flags);
+                // What this Open must ask the manager for, if anything:
+                //   - nothing, when this mount already holds a lease at least
+                //     as strong as `req_mode` — including a READ open while
+                //     this mount holds the WRITE lease. That pair is the
+                //     ffmpeg-faststart shape (write fd held, same file reopened
+                //     O_RDONLY to move the moov atom) and it used to be
+                //     refused with EBUSY. Nothing needs saying: the manager
+                //     lets readers coexist with a writer, and within one mount
+                //     the write path keeps its own cache coherent.
+                //   - an UPGRADE to WRITE, when read fds are open and the first
+                //     write fd arrives. Same-client `acquire(WRITE)` is
+                //     idempotent at the manager, so this is one round trip that
+                //     either grants (bumping our epoch) or reports another
+                //     client's writer as a conflict, exactly as a fresh open would.
+                let mut needs_acquire = false;
+                let lease_was_held;
+                {
+                    let mut m = state.held_leases.borrow_mut();
+                    lease_was_held = m.get(&ino).is_some_and(|slot| !slot.revoked);
+                    match m.get_mut(&ino) {
+                        Some(slot) if slot.revoked => {
+                            // The prior lease was revoked
+                            // server-side; drop the stale entry and
+                            // re-acquire. The client picks up a
+                            // fresh `version` (and a fresh server-
+                            // side epoch once lease_epoch is
+                            // exposed to the SDK).
+                            m.remove(&ino);
+                            needs_acquire = true;
+                        }
+                        Some(slot) if req_mode == LEASE_MODE_WRITE && slot.writer_refs == 0 => {
+                            // Upgrade: readers are open, this is the first
+                            // writer. Count the fd only once the manager has
+                            // granted, below.
+                            needs_acquire = true;
+                        }
+                        Some(slot) => {
+                            slot.add_ref(req_mode);
+                        }
+                        None => {
+                            needs_acquire = true;
+                        }
+                    }
+                }
+                // Capture the post-acquire lease
+                // version so the per-inode-cache branch below can
+                // compare it against `InodeState.cached_version` and
+                // force a reload on mismatch. `0` is the "no fresh
+                // acquire happened this Open" sentinel — we keep the
+                // cached InodeState untouched in that case (matching
+                // pre-fix behavior; the version-mismatch check needs
+                // a known-current version, which only the acquire
+                // round-trip can produce).
+                let acquired_version: u64 = if needs_acquire {
+                    use lease::AcquireResult;
+                    let cluster = state.client.clone();
+                    let id = state.client_id.clone();
+                    match lease::acquire(&cluster, &id, ino, req_mode).await {
+                        Ok(AcquireResult::Granted(info)) => {
+                            // `entry`, not `insert`: on the upgrade path the
+                            // slot already carries this mount's open read fds,
+                            // and overwriting it would forget them — their
+                            // RELEASEs would then underflow to zero and drop
+                            // the lease while fds are still open.
+                            let mut held = state.held_leases.borrow_mut();
+                            let slot = held.entry(ino).or_insert(FuseLease {
+                                writer_refs: 0,
+                                reader_refs: 0,
+                                mode: req_mode,
+                                lease_epoch: info.version,
+                                revoked: false,
+                            });
+                            slot.mode = req_mode;
+                            slot.lease_epoch = info.version;
+                            slot.revoked = false;
+                            slot.add_ref(req_mode);
+                            info.version
+                        }
+                        Ok(AcquireResult::Conflict { manager_message }) => {
+                            return Err(anyhow!(
+                                "EBUSY: writer lease conflict on ino {}: {}",
+                                ino, manager_message
+                            ));
+                        }
+                        Ok(AcquireResult::RevokePending { .. }) => {
+                            // Unreachable for non-force acquire.
+                            return Err(anyhow!(
+                                "BUG: Open with non-force acquire returned RevokePending"
+                            ));
+                        }
+                        Err(e) => return Err(anyhow!("AcquireLease ino {}: {}", ino, e)),
+                    }
+                } else {
+                    // Same mount, same fd-family reopen: we kept the
+                    // refcount and the lease version is still in
+                    // `held_leases[ino]`. Read it back so the
+                    // cached-version check below works on EVERY
+                    // Open, not just the AcquireLease path. Stale
+                    // entries are revoked-checked above, so this
+                    // version reflects the current grant.
+                    state
+                        .held_leases
+                        .borrow()
+                        .get(&ino)
+                        .map(|s| s.lease_epoch)
+                        .unwrap_or(0)
+                };
+
+                // Read after the acquire: a writer that closes later
+                // invalidates this mount; one that closed earlier has
+                // already published its generation. A failed read only
+                // costs the cached pages.
+                let fresh_meta = if lease_was_held {
+                    None
+                } else {
+                    match fetch_inode(state, ino).await {
+                        Ok(m) => Some(m),
+                        Err(e) => {
+                            tracing::warn!(ino, error = %e, "open: generation unreadable; dropping the page cache");
+                            None
+                        }
+                    }
+                };
+                let fresh_generation = fresh_meta.as_ref().map(|m| m.generation);
+                let keep_cache = open_keeps_page_cache(
+                    sticky_failed,
+                    lease_was_held,
+                    state.page_cache_generation.get(&ino).copied(),
+                    fresh_generation,
+                );
+                match fresh_generation {
+                    Some(g) => {
+                        state.page_cache_generation.insert(ino, g);
+                    }
+                    None if !lease_was_held => {
+                        state.page_cache_generation.remove(&ino);
+                    }
+                    None => {}
+                }
+
+                // Now publish to the per-inode cache.
+                // If a cached entry exists AND its `cached_version`
+                // is older than the freshly-acquired lease version,
+                // a different writer (likely a different mount) has
+                // closed since this mount last cached the inode —
+                // the cached `meta` / `extents` are stale; rebuild
+                // them. `acquired_version == 0` means no fresh
+                // acquire was issued this call (refcount > 1, no
+                // revoke); keep the cached entry as-is in that
+                // case (matches pre-fix behavior).
+                let needs_reload = state
+                    .inodes
+                    .get(&ino)
+                    .map(|is| inode_cache_needs_reload(is.cached_version, acquired_version))
+                    .unwrap_or(false);
+                if needs_reload {
+                    tracing::info!(
+                        ino,
+                        cached = state.inodes.get(&ino).map(|is| is.cached_version).unwrap_or(0),
+                        acquired = acquired_version,
+                        "BUG-LEASE-7: stale cached InodeState; reloading"
+                    );
+                    state.inodes.remove(&ino);
+                }
+                if let Some(is) = state.inodes.get_mut(&ino) {
+                    is.open_count += 1;
+                    // Bump cached_version forward — if we entered
+                    // this branch with `is.cached_version <
+                    // acquired_version`, `needs_reload` would have
+                    // dropped the entry. The remaining case is
+                    // `cached_version >= acquired_version` (same
+                    // mount, same generation, or transient acquire-
+                    // skip path). Either way, take the max so a
+                    // future Open's cached version is at least the
+                    // version we've now committed to.
+                    if acquired_version > is.cached_version {
+                        is.cached_version = acquired_version;
+                    }
+                    // `fresh_meta` is the inode as the cluster has it now. A
+                    // clean cached copy yields to it: the version rule above
+                    // cannot see a change made under a manager that restarted
+                    // (its versions start over), and this mount held no lease,
+                    // so no writer close was pushed to it either.
+                    if let (Some(m), false) = (fresh_meta, is.dirty) {
+                        is.meta = m;
+                        is.extents = None;
+                    }
+                } else {
+                    let meta = match fresh_meta {
+                        Some(m) => m,
+                        None => get_inode(state, ino).await?,
+                    };
+                    state.inodes.insert(
+                        ino,
+                        InodeState {
+                            meta,
+                            write_epoch: 0,
+                            write_buf: None,
+                            pending_flushes: std::collections::VecDeque::new(),
+                            flush_error: None,
+                            dirty: false,
+                            open_count: 1,
+                            extents: None,
+                            cached_version: acquired_version,
+                        },
+                    );
+                }
+                // ino is the file handle.
+                Ok((ino, if keep_cache { FOPEN_KEEP_CACHE } else { 0 }))
+            }
+            .await;
+            let _ = reply.send(result);
+        }
+        FsRequest::Read {
+            ino,
+            offset,
+            size,
+            fuse_reply,
+        } => {
+            // Two-phase, async-reply read:
+            // - `prepare` under the dispatcher's `&mut state` (cheap routing
+            //   lookups + inode cache hit, no real I/O);
+            // - the plan goes to a read-pool worker thread when one exists, or
+            //   to this runtime when none does;
+            // - whoever executes it replies to fuser DIRECTLY via the shipped
+            //   `ReplyData`, bypassing the std::mpsc reply hop.
+            // The fuser kernel-channel reader thread is then free to read the
+            // next /dev/fuse request immediately, so concurrent FUSE reads can
+            // actually overlap.
+            match read::prepare(state, ino, offset, size).await {
+                Ok(plan) => {
+                    // Inline data / EOF is already the answer. Handing it to a
+                    // worker would buy a thread hop for a memcpy.
+                    if let Some(inline) = plan.inline_result {
+                        fuse_reply.data(&inline);
+                        return true;
+                    }
+                    let actual_size = plan.actual_size;
+                    // `prepare` just read the meta through `get_inode`, so this
+                    // is the generation the prefetched blocks must match.
+                    let generation = state.inodes.get(&ino).map(|is| is.meta.generation);
+                    let prefetch_key = match (pool.and_then(|p| p.prefetch()), generation) {
+                        (Some(_), Some(generation)) => Some((ino, generation, offset as u64)),
+                        _ => None,
+                    };
+                    let job = ReadJob {
+                        chunks: plan.chunks,
+                        actual_size,
+                        direct_read: plan.direct_read,
+                        reply: fuse_reply,
+                        prefetch_key,
+                    };
+                    // Back on this runtime when there is no pool, or when every
+                    // worker's channel is closed (a dead thread). The job is
+                    // handed back rather than dropped, so no read is answered
+                    // EIO just because the pool would not take it.
+                    let job = match pool {
+                        Some(p) => p.submit(job).err(),
+                        None => Some(job),
+                    };
+                    if let Some(job) = job {
+                        let plan = read::ReadPlan {
+                            inline_result: None,
+                            actual_size: job.actual_size,
+                            client: state.client.clone(),
+                            chunks: job.chunks,
+                            direct_read: job.direct_read,
+                        };
+                        let fuse_reply = job.reply;
+                        compio::runtime::spawn(async move {
+                            // BOUNDED. This is the one FUSE op that answers the
+                            // kernel off the dispatcher, so it is also the one
+                            // that can leave the kernel waiting forever: every
+                            // other op goes through `call_sync`, whose
+                            // `--reply-timeout-secs` ends in `reply.error(EIO)` no matter
+                            // what the cluster does.
+                            //
+                            // FUSE has no timeout of its own. A read that never
+                            // answers parks its caller in uninterruptible sleep
+                            // permanently — unkillable, holding whatever locks it
+                            // held — and if that caller is a container runtime
+                            // thread stat-ing a path, the whole node stops being
+                            // able to start containers. An unreachable manager or
+                            // a stalled extent read must degrade to EIO, not to a
+                            // wedged node.
+                            match compio::time::timeout(reply_timeout(), read::execute(plan)).await {
+                                Ok(Ok(data)) => fuse_reply.data(&data),
+                                Ok(Err(e)) => {
+                                    tracing::warn!(error = %e, "fuse read execute failed");
+                                    fuse_reply.error(libc::EIO);
+                                }
+                                Err(_) => {
+                                    tracing::warn!(
+                                        timeout_secs = reply_timeout().as_secs(),
+                                        "fuse read timed out — replying EIO"
+                                    );
+                                    fuse_reply.error(libc::EIO);
+                                }
+                            }
+                        })
+                        .detach();
+                    }
+                    // After the READ is on its way, so planning never delays it.
+                    if let Some(pool) = pool {
+                        prefetch_ahead(state, pool, ino, offset as u64, actual_size as u64).await;
+                    }
+                }
+                Err(e) => {
+                    let errno = if e.to_string().contains("not found") {
+                        libc::ENOENT
+                    } else {
+                        libc::EIO
+                    };
+                    fuse_reply.error(errno);
+                }
+            }
+        }
+        FsRequest::Write {
+            ino,
+            offset,
+            data,
+            reply,
+        } => {
+            // Refuse writes whose lease the
+            // manager has already revoked (sticky `revoked` flag on
+            // `FuseLease`, set by the per-mount invalidation poll
+            // loop at the moment the LeaseRevoked event was
+            // observed — see `evict_revoked_held_leases`). Without
+            // it the Write arm drops through unconditionally, so the
+            // stale fd's bytes race past the manager's revoke and
+            // co-mingle with the new writer's view. Lease write
+            // fencing (PUT_ZC + fuse epoch-stamping) is what
+            // makes the same guard hold on the PS side; this is
+            // the client-side fail-fast.
+            let lease_check = {
+                let held = state.held_leases.borrow();
+                check_write_allowed(&held, ino)
+            };
+            let result = match lease_check {
+                Ok(()) => write::write(state, ino, offset, &data).await,
+                Err(reason) => Err(anyhow!(
+                    "EIO: write refused on ino {}: lease {}",
+                    ino,
+                    reason
+                )),
+            };
+            let _ = reply.send(result);
+        }
+        FsRequest::Flush { ino, reply } => {
+            let result = write::flush_inode(state, ino, write::FlushReport::ToApplication).await;
+            let _ = reply.send(result);
+        }
+        FsRequest::Release {
+            ino,
+            flags,
+            flush,
+            reply,
+        } => {
+            let result = async {
+                // Writer-release MUST happen AFTER dirty data is
+                // flushed. The kernel's `flush: bool` argument is
+                // unreliable — close-with-error paths and some
+                // app patterns pass false even when buffers are
+                // dirty.
+                //
+                // When the lease was
+                // server-side revoked (sticky `revoked` flag),
+                // we ALSO must flush even with kernel `flush=false`
+                // AND refcount > 1, because the entry is going
+                // away regardless (we drop revoked entries
+                // unconditionally so a subsequent Open re-acquires
+                // a fresh lease). Dropping the entry without
+                // flushing silently loses the dirty buffer.
+                // `compute_release_action` is the pure-fn that
+                // captures all three signals (kernel_flush /
+                // refcount-1 / revoked) into one decision tuple;
+                // see its doc for the `propagate_flush_err` nuance.
+                // The kernel echoes the fd's open flags on RELEASE, which is
+                // what says whether this close ends a writer or a reader.
+                let role = lease_mode_for_open(flags);
+                let action = {
+                    let held = state.held_leases.borrow();
+                    compute_release_action(&held, ino, flush, role)
+                };
+                // A flush error bound for the kernel is DEFERRED to the end of
+                // this block, not returned from the middle of it. An early
+                // return skips the `open_count` decrement, the cache eviction,
+                // the `held_leases` refcount and `lease::release` below — and
+                // fuser sends exactly ONE release per open, so nothing ever
+                // comes back to finish the job: the write lease keeps being
+                // heartbeated and every other writer gets `WriteConflict` for
+                // the life of the mount.
+                //
+                // The skip predates this change, and it was never self-healing:
+                // `compute_release_action` derives `must_drop_entry` from
+                // `slot.refcount <= 1` taken BEFORE the decrement, and the
+                // decrement is itself inside the skipped teardown. So one
+                // skipped release offsets the refcount by one permanently —
+                // the next Open takes it to 2, that release to 1, and
+                // `must_drop_entry` is never true again, so `lease::release`
+                // is never called for the life of the mount. What this change
+                // alters is only how often the skip is reached: RELEASE used to
+                // CONSUME the record, so a later release found nothing and took
+                // the normal path; now the record stands by design.
+                let mut deferred_flush_err: Option<anyhow::Error> = None;
+                // Revoked or not: a failed flush leaves a cached map no put
+                // published, which matters below once the lease is gone.
+                let mut flush_failed = false;
+                if action.must_flush {
+                    // ALWAYS BestEffort — including when `propagate_flush_err`
+                    // is set. RELEASE does reply with an error, but fuser's
+                    // contract is explicit that "error values are not returned
+                    // to close() or munmap() which triggered the release": the
+                    // kernel drops it, nobody is told, so this site has no
+                    // right to consume the sticky record.
+                    //
+                    // FUSE_FLUSH is the caller that can deliver it (it runs on
+                    // every close(), and per fuser one reason it exists is "if
+                    // the filesystem wants to return write errors"). But that
+                    // is not a guarantee to lean on — the same doc warns
+                    // filesystems "shouldn't assume that flush will always be
+                    // called after some writes, or that it will be called at
+                    // all". Consuming here on the strength of that assumption
+                    // is precisely the hole this record exists to close.
+                    if let Err(e) =
+                        write::flush_inode(state, ino, write::FlushReport::BestEffort).await
+                    {
+                        flush_failed = true;
+                        if action.propagate_flush_err {
+                            deferred_flush_err = Some(e);
+                        } else {
+                            // Revoked-flush is best-effort: log and
+                            // continue so we still drop the held_lease
+                            // entry. The bytes fence at the PS via
+                            // lease epoch stamping; surfacing EIO here would
+                            // confuse a legit next-Open + retry.
+                            tracing::warn!(
+                                ino,
+                                error = %e,
+                                "R2-P0 #2: revoked-flush failed; continuing to drop entry"
+                            );
+                        }
+                    }
+                }
+                // A write fd closing after a clean flush: the kernel's pages
+                // hold what this mount wrote under its write lease, and the
+                // generation it just published names that content — so the
+                // next lease-less Open can keep them.
+                if role == LEASE_MODE_WRITE && !flush_failed {
+                    if let Some(is) = state.inodes.get(&ino).filter(|is| !is.dirty) {
+                        state.page_cache_generation.insert(ino, is.meta.generation);
+                    }
+                }
+                if let Some(is) = state.inodes.get_mut(&ino) {
+                    is.open_count = is.open_count.saturating_sub(1);
+                    // Nobody reads through this mount any more (an mmap holds
+                    // its file, so RELEASE comes after the munmap).
+                    if is.open_count == 0 {
+                        if let Some(pool) = pool {
+                            pool.forget(ino);
+                        }
+                    }
+                    // Evict from cache if no longer open and not dirty
+                    if is.open_count == 0
+                        && !is.dirty
+                        && state.lookup_count.get(&ino).copied().unwrap_or(0) == 0
+                    {
+                        state.inodes.remove(&ino);
+                    }
+                }
+                // Refcount the lease; only the 1→0 transition
+                // OR a revoked entry fires ReleaseLease.
+                // Best-effort — a failed release is recovered by
+                // the manager's TTL revoke loop (≤ 30s window).
+                let release_now = {
+                    let mut m = state.held_leases.borrow_mut();
+                    match m.get_mut(&ino) {
+                        Some(slot) => {
+                            slot.drop_ref(role);
+                            // Drop the entry on 1→0 OR if revoked
+                            // (revoked entries are not recoverable
+                            // — the manager already gave the lease
+                            // to someone else).
+                            if action.must_drop_entry {
+                                m.remove(&ino);
+                                true
+                            } else {
+                                false
+                            }
+                        }
+                        None => false,
+                    }
+                };
+                // Last write fd closed, read fds still open: hand the writer
+                // slot back and re-register as a reader. The manager keeps ONE
+                // writer per inode, so holding it for a `tail -f` that outlives
+                // the writing process would block every other mount's writer
+                // until that reader closed.
+                //
+                // ONLY when the flush above actually succeeded. The write lease
+                // is what makes this mount's leftover state safe to retry, and
+                // a failed flush leaves plenty: `flush_inode` zeroes the write
+                // buffer's length BEFORE `write_region`, so the bytes are gone
+                // while `dirty` stays set and `meta.size` still covers them —
+                // and every later flush (periodic sync, the reader fd's own
+                // FLUSH and RELEASE) will put that size again. Hand the slot
+                // back with that pending, and another mount can take the
+                // writer, append, and then have this mount's stale size land on
+                // top of its work — after which the next grow's
+                // `clean_beyond_eof` deletes the extents past it. So a failed
+                // flush KEEPS the write lease (pre-change behaviour): the slot
+                // goes back when the last read fd closes, whose RELEASE flushes
+                // again, and until then `mode` stays WRITE so the retry is
+                // fence-stamped instead of ANON.
+                if action.downgrade_to_read && !release_now && deferred_flush_err.is_none() {
+                    let cluster = state.client.clone();
+                    let id = state.client_id.clone();
+                    match lease::release(&cluster, &id, ino).await {
+                        Ok(_) => {
+                            // The manager has taken the writer slot back, so
+                            // this mount must stop claiming it IMMEDIATELY —
+                            // `write_lease_for` reads `mode`, and a stale WRITE
+                            // here would stamp a fencing epoch the mount no
+                            // longer owns. Done before the re-acquire so the
+                            // re-acquire failing cannot leave the claim behind.
+                            if let Some(slot) = state.held_leases.borrow_mut().get_mut(&ino) {
+                                slot.mode = LEASE_MODE_READ;
+                            }
+                        }
+                        Err(e) => tracing::warn!(
+                            ino,
+                            error = %e,
+                            "lease downgrade: release failed; this mount keeps the writer slot \
+                             until its last read fd closes"
+                        ),
+                    }
+                    match lease::acquire(&cluster, &id, ino, LEASE_MODE_READ).await {
+                        Ok(lease::AcquireResult::Granted(info)) => {
+                            if let Some(slot) = state.held_leases.borrow_mut().get_mut(&ino) {
+                                slot.mode = LEASE_MODE_READ;
+                                slot.lease_epoch = info.version;
+                            }
+                            tracing::info!(
+                                ino,
+                                lease_epoch = info.version,
+                                "lease downgrade: writer slot released, read lease kept"
+                            );
+                        }
+                        // The read lease is a coherence courtesy, not a
+                        // correctness gate: reads are served fresh and the
+                        // writer slot — the part that matters — is already
+                        // handed back. Leave the entry's refcounts alone so
+                        // the remaining fds still release cleanly.
+                        Ok(other) => tracing::warn!(
+                            ino,
+                            ?other,
+                            "lease downgrade: re-acquire as reader not granted"
+                        ),
+                        Err(e) => tracing::warn!(
+                            ino,
+                            error = %e,
+                            "lease downgrade: re-acquire as reader failed"
+                        ),
+                    }
+                }
+                if release_now {
+                    let cluster = state.client.clone();
+                    let id = state.client_id.clone();
+                    if let Err(e) = lease::release(&cluster, &id, ino).await {
+                        tracing::warn!(
+                            ino,
+                            error = %e,
+                            "ReleaseLease failed; TTL revoke is the backstop"
+                        );
+                    }
+                    // A segmented change is published only under the WRITE
+                    // lease that covered its new objects, and that lease is
+                    // gone now. A cached map the failed flush never published
+                    // names objects the reclaim below deletes: drop it, so the
+                    // next open reads the map from KV.
+                    if flush_failed
+                        && state.inodes.get(&ino).is_some_and(|is| is.meta.segments.is_some())
+                    {
+                        state.inodes.remove(&ino);
+                        state.dirty_inodes.remove(&ino);
+                    }
+                    // The last close of a file unlinked while open: its data
+                    // can go now, unless another client still holds it — then
+                    // the tombstone stays for the periodic sweep.
+                    if state.unlinked_open.remove(&ino) {
+                        if let Err(e) = autumn_fs::extent::reclaim_unreachable(state, ino).await {
+                            tracing::warn!(ino, error = %e, "reclaim at last close failed; the sweep retries");
+                        }
+                    } else if state.segment_garbage.contains(&ino) {
+                        if let Err(e) = autumn_fs::segment::reclaim_live(state, ino).await {
+                            tracing::warn!(ino, error = %e, "segment reclaim at last close failed; the sweep retries");
+                        }
+                    }
+                }
+                // Now that every teardown step above has run, hand the kernel
+                // the flush error if there was one.
+                match deferred_flush_err {
+                    Some(e) => Err(e),
+                    None => Ok(()),
+                }
+            }
+            .await;
+            let _ = reply.send(result);
+        }
+        FsRequest::Fsync {
+            ino,
+            datasync: _,
+            reply,
+        } => {
+            let result = write::flush_inode(state, ino, write::FlushReport::ToApplication).await;
+            let _ = reply.send(result);
+        }
+        FsRequest::Statfs { reply } => {
+            // cluster-df: report REAL backend capacity (was hardcoded 1 TiB).
+            // statfs is rare (a `df` invocation), so an inline manager call is
+            // fine — but BOUND it so a slow/down manager can't hang the
+            // syscall; on timeout/error fall back to a benign large default.
+            //
+            // Mapping is CONSERVATIVE (÷3 = assume 3-replica). Usable LOGICAL
+            // capacity is a RANGE under EC (cold data is 1.25-1.33×, hot data
+            // 3×); statfs is a single scalar, so — CephFS-style — we collapse
+            // the range to the WORST factor: never over-report free, so `df`
+            // can't lull a writer into an optimistic ENOSPC. Already-EC'd cold
+            // data means real free is higher; under-reporting is the safe side.
+            const BSIZE: u64 = 4096;
+            let fallback = StatfsData {
+                blocks: 1 << 30,
+                bfree: 1 << 29,
+                bavail: 1 << 29,
+                files: 1 << 20,
+                ffree: 1 << 19,
+                bsize: BSIZE as u32,
+                namelen: 255,
+            };
+            let data = match compio::time::timeout(
+                std::time::Duration::from_secs(2),
+                state.client.cluster_df(),
+            )
+            .await
+            {
+                Ok(Ok(r)) if r.raw_total > 0 => {
+                    let blocks = (r.raw_total / 3) / BSIZE;
+                    let avail = (r.raw_free / 3) / BSIZE;
+                    StatfsData {
+                        blocks: blocks.max(1),
+                        bfree: avail,
+                        bavail: avail,
+                        files: 1 << 20,
+                        ffree: 1 << 19,
+                        bsize: BSIZE as u32,
+                        namelen: 255,
+                    }
+                }
+                _ => fallback,
+            };
+            let _ = reply.send(Ok(data));
+        }
+    }
+    true // continue processing
+}
+
+#[cfg(test)]
+mod page_cache_tests {
+    use super::open_keeps_page_cache;
+
+    /// The decision table without a cluster; `fuse_page_cache.rs` drives it
+    /// end to end.
+    #[test]
+    fn keep_only_what_a_lease_or_a_matching_generation_vouches_for() {
+        // (sticky, held, recorded, fresh) -> keep
+        let table = [
+            (false, true, None, None, true),
+            (true, true, Some(3), None, false),
+            (false, false, Some(3), Some(3), true),
+            (false, false, Some(3), Some(4), false),
+            (false, false, None, Some(3), false),
+            (false, false, Some(3), None, false), // generation unreadable
+            (true, false, Some(3), Some(3), false),
+        ];
+        for (sticky, held, recorded, fresh, want) in table {
+            assert_eq!(
+                open_keeps_page_cache(sticky, held, recorded, fresh),
+                want,
+                "sticky={sticky} held={held} recorded={recorded:?} fresh={fresh:?}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod fuse_lease_2_unit_tests {
+    //! The per-event ⇒ invalidator-call contract without a cluster;
+    //! `fuse_lease_2.rs` drives it end to end.
+
+    use super::invalidate_kernel_cache_for_events;
+    use autumn_rpc::manager_rpc::{
+        MgrInvalidation, LEASE_INVAL_LEASE_REVOKED, LEASE_INVAL_META_CHANGED,
+        LEASE_INVAL_WRITER_CLOSED,
+    };
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    fn ev(ino: u64, version: u64, kind: u8) -> MgrInvalidation {
+        MgrInvalidation { ino, version, kind }
+    }
+
+    fn counting_inv() -> (super::InodeInvalidator, Rc<RefCell<Vec<u64>>>) {
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let log_c = log.clone();
+        let inv: super::InodeInvalidator = Rc::new(move |ino: u64| {
+            log_c.borrow_mut().push(ino);
+        });
+        (inv, log)
+    }
+
+    #[test]
+    fn ino_zero_overflow_sentinel_is_filtered() {
+        // Manager's overflow signalling sends MetaChanged{ino=0};
+        // the per-ino invalidator path MUST skip it (wholesale
+        // branch in spawn_lease_background_tasks handles overflow).
+        let (inv, log) = counting_inv();
+        invalidate_kernel_cache_for_events(
+            &[
+                ev(0, 0, LEASE_INVAL_META_CHANGED),
+                ev(42, 3, LEASE_INVAL_WRITER_CLOSED),
+            ],
+            &inv,
+        );
+        assert_eq!(*log.borrow(), vec![42], "ino=0 sentinel must NOT reach invalidator");
+    }
+
+    #[test]
+    fn multi_ino_batch_invalidates_each() {
+        // The production case: a poll batch carries events for
+        // several distinct inos. Every non-zero ino must trigger
+        // the kernel-cache evict.
+        let (inv, log) = counting_inv();
+        invalidate_kernel_cache_for_events(
+            &[
+                ev(100, 1, LEASE_INVAL_WRITER_CLOSED),
+                ev(200, 2, LEASE_INVAL_LEASE_REVOKED),
+                ev(300, 3, LEASE_INVAL_WRITER_CLOSED),
+            ],
+            &inv,
+        );
+        assert_eq!(*log.borrow(), vec![100, 200, 300]);
+    }
+}
+
+#[cfg(test)]
+mod bug_lease_3_fuse_tests {
+    //! Fuse-side unit tests
+    //! for the per-event eviction contract.
+
+    use super::evict_revoked_held_leases;
+    use autumn_fs::state::FuseLease;
+    use autumn_rpc::manager_rpc::{
+        MgrInvalidation, LEASE_INVAL_LEASE_REVOKED, LEASE_INVAL_WRITER_CLOSED, LEASE_MODE_READ, LEASE_MODE_WRITE,
+    };
+    use std::collections::HashMap;
+
+    fn ev(ino: u64, version: u64, kind: u8) -> MgrInvalidation {
+        MgrInvalidation { ino, version, kind }
+    }
+
+    fn lease(mode: u8) -> FuseLease {
+        let mut l = FuseLease {
+            writer_refs: 0,
+            reader_refs: 0,
+            mode,
+            lease_epoch: 1,
+            revoked: false,
+        };
+        l.add_ref(mode);
+        l
+    }
+
+    #[test]
+    fn lease_revoked_marks_held_lease() {
+        // Evict does not remove — it sets the
+        // sticky `revoked: bool` so Write/Release can act on it.
+        let mut held = HashMap::new();
+        held.insert(42, lease(LEASE_MODE_WRITE));
+        held.insert(99, lease(LEASE_MODE_READ));
+        let newly_revoked = evict_revoked_held_leases(
+            &[ev(42, 6, LEASE_INVAL_LEASE_REVOKED)],
+            &mut held,
+        );
+        assert_eq!(newly_revoked, vec![42]);
+        assert!(held.contains_key(&42), "entry must stay in map for Write/Release to see");
+        assert!(held.get(&42).unwrap().revoked, "entry must be marked revoked");
+        assert!(held.contains_key(&99));
+        assert!(!held.get(&99).unwrap().revoked, "untouched entry must stay unrevoked");
+    }
+
+    #[test]
+    fn double_revoke_is_idempotent_after_r2() {
+        // Second LeaseRevoked for the same ino must NOT re-emit
+        // a newly_revoked entry — otherwise the dispatch caller's
+        // best-effort `lease::release` runs twice for one event.
+        let mut held = HashMap::new();
+        held.insert(42, lease(LEASE_MODE_WRITE));
+        let _ = evict_revoked_held_leases(
+            &[ev(42, 6, LEASE_INVAL_LEASE_REVOKED)],
+            &mut held,
+        );
+        let newly = evict_revoked_held_leases(
+            &[ev(42, 7, LEASE_INVAL_LEASE_REVOKED)],
+            &mut held,
+        );
+        assert!(newly.is_empty(), "second revoke must not re-emit; got {:?}", newly);
+        assert!(held.get(&42).unwrap().revoked);
+    }
+
+    #[test]
+    fn writer_closed_does_not_mark() {
+        let mut held = HashMap::new();
+        held.insert(42, lease(LEASE_MODE_READ));
+        let newly = evict_revoked_held_leases(
+            &[ev(42, 6, LEASE_INVAL_WRITER_CLOSED)],
+            &mut held,
+        );
+        assert!(newly.is_empty());
+        assert!(!held.get(&42).unwrap().revoked);
+    }
+}
+
+#[cfg(test)]
+mod r2_p0_2_3_lease_check_tests {
+    //! Pure-fn reproductions for the
+    //! Write/Release lease-revoke checks.
+
+    use super::{check_write_allowed, compute_release_action, ReleaseAction};
+    use autumn_fs::state::FuseLease;
+    use autumn_rpc::manager_rpc::{LEASE_MODE_READ, LEASE_MODE_WRITE};
+    use std::collections::HashMap;
+
+    /// `refcount` fds, all in `mode`'s role — the single-role shape the
+    /// pre-split tests described. Mixed-role cases build the struct directly.
+    fn lease(mode: u8, refcount: u32, revoked: bool) -> FuseLease {
+        let writer = mode == LEASE_MODE_WRITE;
+        FuseLease {
+            writer_refs: if writer { refcount } else { 0 },
+            reader_refs: if writer { 0 } else { refcount },
+            mode,
+            lease_epoch: 1,
+            revoked,
+        }
+    }
+
+    // ── check_write_allowed ────────────────────────────────────
+
+    #[test]
+    fn write_with_active_writer_lease_is_allowed() {
+        let mut held = HashMap::new();
+        held.insert(7, lease(LEASE_MODE_WRITE, 1, false));
+        assert_eq!(check_write_allowed(&held, 7), Ok(()));
+    }
+
+    #[test]
+    fn write_with_revoked_lease_is_refused() {
+        // KEY ASSERTION: a held entry whose lease was
+        // revoked server-side must NOT let writes through.
+        let mut held = HashMap::new();
+        held.insert(7, lease(LEASE_MODE_WRITE, 1, true));
+        assert_eq!(check_write_allowed(&held, 7), Err("revoked"));
+    }
+
+    #[test]
+    fn write_with_read_only_lease_is_refused() {
+        let mut held = HashMap::new();
+        held.insert(7, lease(LEASE_MODE_READ, 1, false));
+        assert_eq!(check_write_allowed(&held, 7), Err("wrong mode"));
+    }
+
+    #[test]
+    fn write_without_any_lease_is_refused() {
+        let held = HashMap::new();
+        assert_eq!(check_write_allowed(&held, 7), Err("no lease"));
+    }
+
+    // ── dual-open (writer + reader on the same inode) ──────────
+
+    /// One process holding a write fd and a read fd on the same file is
+    /// ffmpeg's MP4 faststart, and it must be a permitted state, not EBUSY.
+    /// A read fd opened alongside the writer does not touch `writer_refs`, so
+    /// writes keep flowing on the write fd.
+    #[test]
+    fn a_reader_opened_alongside_a_writer_does_not_disturb_the_write_path() {
+        let mut held = HashMap::new();
+        let mut slot = lease(LEASE_MODE_WRITE, 1, false);
+        slot.add_ref(LEASE_MODE_READ); // the faststart reopen
+        assert_eq!((slot.writer_refs, slot.reader_refs), (1, 1));
+        held.insert(7, slot);
+        assert_eq!(check_write_allowed(&held, 7), Ok(()));
+    }
+
+    /// Closing the read fd of a writer+reader pair is an ordinary release:
+    /// the writer is untouched, nothing is flushed on its behalf, and the
+    /// lease stays exactly as it was.
+    #[test]
+    fn closing_the_reader_of_a_dual_open_leaves_the_writer_alone() {
+        let mut held = HashMap::new();
+        let mut slot = lease(LEASE_MODE_WRITE, 1, false);
+        slot.add_ref(LEASE_MODE_READ);
+        held.insert(7, slot);
+        let action = compute_release_action(&held, 7, false, LEASE_MODE_READ);
+        assert_eq!(
+            action,
+            ReleaseAction {
+                must_flush: false,
+                must_drop_entry: false,
+                downgrade_to_read: false,
+                propagate_flush_err: true,
+            }
+        );
+    }
+
+    /// Closing the WRITE fd while a read fd remains must flush first and then
+    /// downgrade. Flush, because after the downgrade this mount may no longer
+    /// write; downgrade, because the manager keeps ONE writer per inode and a
+    /// surviving reader (`tail -f`) would otherwise hold that slot against
+    /// every other mount's writer.
+    #[test]
+    fn closing_the_writer_of_a_dual_open_flushes_then_downgrades() {
+        let mut held = HashMap::new();
+        let mut slot = lease(LEASE_MODE_WRITE, 1, false);
+        slot.add_ref(LEASE_MODE_READ);
+        held.insert(7, slot);
+        let action = compute_release_action(&held, 7, false, LEASE_MODE_WRITE);
+        assert_eq!(
+            action,
+            ReleaseAction {
+                must_flush: true,
+                must_drop_entry: false,
+                downgrade_to_read: true,
+                propagate_flush_err: true,
+            }
+        );
+    }
+
+    /// A revoked lease is dropped whole, never downgraded: the manager has
+    /// already handed the inode to someone else, so re-acquiring a read lease
+    /// here would resurrect state that no longer exists.
+    #[test]
+    fn a_revoked_dual_open_drops_instead_of_downgrading() {
+        let mut held = HashMap::new();
+        let mut slot = lease(LEASE_MODE_WRITE, 1, true);
+        slot.add_ref(LEASE_MODE_READ);
+        held.insert(7, slot);
+        let action = compute_release_action(&held, 7, false, LEASE_MODE_WRITE);
+        assert!(action.must_flush);
+        assert!(action.must_drop_entry);
+        assert!(!action.downgrade_to_read);
+    }
+
+    /// After the downgrade the mount holds only read fds, so a stray write on
+    /// the closed fd must be refused rather than ride the read lease.
+    #[test]
+    fn after_a_downgrade_writes_are_refused() {
+        let mut held = HashMap::new();
+        let mut slot = lease(LEASE_MODE_WRITE, 1, false);
+        slot.add_ref(LEASE_MODE_READ);
+        slot.drop_ref(LEASE_MODE_WRITE);
+        slot.mode = LEASE_MODE_READ;
+        held.insert(7, slot);
+        assert_eq!(check_write_allowed(&held, 7), Err("wrong mode"));
+    }
+
+    /// The full faststart sequence: open(W), open(R), close(R), close(W).
+    /// Every step's decision is pinned, because the bug was that step two was
+    /// refused outright.
+    #[test]
+    fn the_faststart_open_close_sequence_holds_its_refcounts() {
+        let mut slot = FuseLease {
+            writer_refs: 0,
+            reader_refs: 0,
+            mode: LEASE_MODE_WRITE,
+            lease_epoch: 1,
+            revoked: false,
+        };
+        slot.add_ref(LEASE_MODE_WRITE); // open(W)
+        slot.add_ref(LEASE_MODE_READ); // open(R) — used to be EBUSY
+        assert_eq!((slot.writer_refs, slot.reader_refs, slot.total_refs()), (1, 1, 2));
+
+        let mut held = HashMap::new();
+        held.insert(7, slot);
+        // close(R): ordinary, nothing to tell the manager.
+        let a = compute_release_action(&held, 7, false, LEASE_MODE_READ);
+        assert!(!a.must_drop_entry && !a.downgrade_to_read);
+        held.get_mut(&7).unwrap().drop_ref(LEASE_MODE_READ);
+
+        // close(W): last fd of any kind — flush and release the lease.
+        let b = compute_release_action(&held, 7, false, LEASE_MODE_WRITE);
+        assert_eq!(
+            b,
+            ReleaseAction {
+                must_flush: true,
+                must_drop_entry: true,
+                downgrade_to_read: false,
+                propagate_flush_err: true,
+            }
+        );
+        held.get_mut(&7).unwrap().drop_ref(LEASE_MODE_WRITE);
+        assert_eq!(held.get(&7).unwrap().total_refs(), 0);
+    }
+
+    // ── compute_release_action ─────────────────────────────────
+
+    #[test]
+    fn release_normal_last_refcount_flushes_and_drops() {
+        let mut held = HashMap::new();
+        held.insert(7, lease(LEASE_MODE_WRITE, 1, false));
+        let action = compute_release_action(&held, 7, false, LEASE_MODE_WRITE);
+        assert_eq!(action, ReleaseAction {
+            must_flush: true,
+            must_drop_entry: true,
+            // Nothing is left to downgrade to — the entry goes away whole.
+            downgrade_to_read: false,
+            propagate_flush_err: true,
+        });
+    }
+
+    #[test]
+    fn release_normal_non_last_refcount_no_flush() {
+        let mut held = HashMap::new();
+        held.insert(7, lease(LEASE_MODE_WRITE, 3, false));
+        let action = compute_release_action(&held, 7, false, LEASE_MODE_WRITE);
+        assert_eq!(action, ReleaseAction {
+            must_flush: false,
+            must_drop_entry: false,
+            downgrade_to_read: false,
+            propagate_flush_err: true,
+        });
+    }
+
+    #[test]
+    fn release_kernel_flush_true_always_flushes() {
+        let mut held = HashMap::new();
+        held.insert(7, lease(LEASE_MODE_WRITE, 3, false));
+        let action = compute_release_action(&held, 7, true, LEASE_MODE_WRITE);
+        assert!(action.must_flush);
+        assert!(!action.must_drop_entry, "kernel-flush alone doesn't drop the entry");
+    }
+
+    #[test]
+    fn release_revoked_entry_flushes_and_drops_even_at_high_refcount() {
+        // KEY ASSERTION: a revoked entry MUST flush
+        // before drop even when refcount > 1 and kernel flush=false.
+        // Pre-fix the original "release_now_pred = refcount==1"
+        // would skip the flush and the dirty buffer would be lost
+        // on the eventual drop.
+        let mut held = HashMap::new();
+        held.insert(7, lease(LEASE_MODE_WRITE, 3, true));
+        let action = compute_release_action(&held, 7, false, LEASE_MODE_WRITE);
+        assert_eq!(action, ReleaseAction {
+            must_flush: true,
+            must_drop_entry: true,
+            // A revoked entry is dropped whole; re-acquiring a read lease for
+            // it would resurrect state the manager has already reassigned.
+            downgrade_to_read: false,
+            propagate_flush_err: false,
+        });
+    }
+
+    #[test]
+    fn release_revoked_flush_err_does_not_propagate() {
+        // A revoked entry's flush is best-effort: the bytes will
+        // fence at the PS via lease epoch stamping. Surfacing the err to the kernel would mask
+        // the legit next-Open-after-revoke retry path.
+        let mut held = HashMap::new();
+        held.insert(7, lease(LEASE_MODE_WRITE, 1, true));
+        let action = compute_release_action(&held, 7, false, LEASE_MODE_WRITE);
+        assert!(!action.propagate_flush_err);
+    }
+
+    #[test]
+    fn release_no_entry_honors_kernel_flush_only() {
+        // Pre-Open Release (rare but possible on some kernel
+        // close-with-error paths) — no entry to drop, no lease
+        // bookkeeping; just honor kernel flush as before.
+        let held = HashMap::new();
+        let action = compute_release_action(&held, 7, true, LEASE_MODE_WRITE);
+        assert_eq!(action, ReleaseAction {
+            must_flush: true,
+            must_drop_entry: false,
+            downgrade_to_read: false,
+            propagate_flush_err: true,
+        });
+        let action2 = compute_release_action(&held, 7, false, LEASE_MODE_WRITE);
+        assert!(!action2.must_flush);
+    }
+}
+
+#[cfg(test)]
+mod bug_lease_6_notify_fail_closed_tests {
+    //! The sticky-set predicate
+    //! the Open arm checks. How notify outcomes mark and clear the
+    //! set is tested in `inval.rs`.
+
+    
+    
+
+}
+
+#[cfg(test)]
+mod bug_lease_7_open_cache_version_tests {
+    //! Pure-fn / driving tests
+    //! for `inode_cache_needs_reload`. The Open arm wires this
+    //! against (cached_version, acquired_version) on every Open;
+    //! a `true` return drops the cached InodeState and forces
+    //! `get_inode` to repopulate. Mirror of ioring's
+    //! lease-version staleness check.
+
+    use super::inode_cache_needs_reload;
+
+    #[test]
+    fn equal_version_does_not_reload() {
+        // Common Open path: same mount, same fd-family reopen,
+        // version unchanged → keep the cached state.
+        assert!(!inode_cache_needs_reload(7, 7));
+    }
+
+    #[test]
+    fn higher_cache_does_not_reload() {
+        // Shouldn't happen in practice (acquired is monotonic),
+        // but be defensive: a cached version GREATER than the
+        // acquired version is NOT stale (no version regression
+        // implied — could be a stale read of held_leases on a
+        // multi-step race). The strict `<` rule keeps the
+        // helper from spuriously reloading.
+        assert!(!inode_cache_needs_reload(10, 7));
+    }
+
+    #[test]
+    fn lower_cache_with_nonzero_acquired_reloads() {
+        // KEY ASSERTION: another mount wrote + closed, manager
+        // bumped version 7 → 8, this mount's Open acquires
+        // version 8 but its cached InodeState was last refetched
+        // when version was 7. MUST reload.
+        assert!(inode_cache_needs_reload(7, 8));
+    }
+
+    #[test]
+    fn zero_acquired_does_not_reload() {
+        // The Open arm's "I didn't observe a fresh version this
+        // call" sentinel — same-mount Open without re-acquire
+        // AND `held_leases[ino]` was absent. The helper returns
+        // `false` so the existing cached entry stays untouched
+        // (matches pre-fix behavior; never makes things worse).
+        assert!(!inode_cache_needs_reload(5, 0));
+        assert!(!inode_cache_needs_reload(0, 0));
+    }
+}

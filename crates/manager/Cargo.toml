@@ -1,0 +1,86 @@
+[package]
+name = "autumn-manager"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+fuse-tests = ["dep:autumn-fuse"]
+
+[dependencies]
+anyhow.workspace = true
+autumn-common = { path = "../common" }
+autumn-params = { path = "../params" }
+autumn-etcd = { path = "../etcd" }
+autumn-rpc = { path = "../rpc" }
+autumn-transport = { path = "../transport" }
+bytes.workspace = true
+compio = { workspace = true, features = ["net", "time", "macros"] }
+# manager-as-KDC — Ed25519 signing (holds the private key) + SHA-256
+# credential hashing for the principal account DB.
+ed25519-dalek = "2"
+futures = "0.3"
+rand = "0.8"
+sha2 = "0.10"
+rkyv = { version = "0.8.15", features = ["alloc"] }
+serde_json = "1"
+tracing.workspace = true
+uuid.workspace = true
+autumn-fuse = { path = "../fuse", optional = true }
+
+[dev-dependencies]
+autumn-test-ports = { path = "../test-ports" }
+# The `fs/` tree, for the filesystem, publish and multipart system tests. It
+# needs no libfuse, so those tests build everywhere; only the three that drive
+# the mount's dispatch loop need `fuse-tests`.
+autumn-fs = { path = "../fs" }
+autumn-stream = { path = "../stream" }
+autumn-partition-server = { path = "../partition-server" }
+autumn-client = { path = "../client" }
+autumn-rpc = { path = "../rpc" }
+autumn-etcd = { path = "../etcd" }
+compio = { workspace = true, features = ["net", "time", "macros"] }
+tempfile = "3"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+crc32c = "0.6"
+
+[[test]]
+name = "fuse_lease_2"
+required-features = ["fuse-tests"]
+
+[[test]]
+name = "fuse_lease_1"
+required-features = ["fuse-tests"]
+
+[[test]]
+name = "system_fuse_release_best_effort"
+required-features = ["fuse-tests"]
+
+[[test]]
+name = "fuse_page_cache"
+required-features = ["fuse-tests"]
+
+[[test]]
+name = "fuse_umount_exit"
+required-features = ["fuse-tests"]
+
+[[test]]
+name = "fuse_lease_loss"
+required-features = ["fuse-tests"]
+
+[[test]]
+name = "fuse_lease_restart"
+required-features = ["fuse-tests"]
+
+[[test]]
+name = "fuse_lease_drain"
+required-features = ["fuse-tests"]
+
+[[test]]
+name = "fuse_lease_deposed_writer"
+required-features = ["fuse-tests"]
+
+[lints]
+workspace = true

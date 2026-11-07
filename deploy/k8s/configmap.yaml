@@ -1,0 +1,40 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: autumn-config
+  namespace: autumn
+  labels:
+    app.kubernetes.io/name: autumn
+data:
+  # Shared env consumed by deploy/k8s/docker/entrypoint.sh (env→flag translation
+  # lives in the entrypoint; the Rust binaries take only CLI flags).
+  AUTUMN_TRANSPORT: "tcp"
+  # Service names (resolved to ClusterIPs by the entrypoint — the binaries do
+  # not resolve DNS themselves).
+  AUTUMN_ETCD_ENDPOINTS: "autumn-etcd:2379"
+  AUTUMN_MANAGER: "autumn-manager:9001"
+  # Bootstrap waits for this many extent nodes Online before creating streams.
+  # MUST equal the extent-node StatefulSet replica count.
+  AUTUMN_EXPECT_NODES: "3"
+  # The cluster secret: the manager, PS and EN refuse to start without it, and
+  # it authorizes autumn-op (bootstrap, readiness probe, admin ops). It comes
+  # from the REQUIRED `autumn-cluster-secret` Secret (key `cluster.secret`;
+  # generate it once with `autumn-op gen-cluster-secret` —
+  # deploy/k8s/deploy.sh does this), mounted read-only at
+  # /etc/autumn/cluster into every server pod and the bootstrap Job.
+  AUTUMN_CLUSTER_SECRET_FILE: "/etc/autumn/cluster/cluster.secret"
+  # Data-plane authz is ON by DEFAULT for k8s deploys. The
+  # signing key comes from the `autumn-authz` Secret (generate it
+  # once with `autumn-op gen-signing-key` — deploy/k8s/deploy.sh does
+  # this), mounted into the manager at /etc/autumn/authz. Authz engages ONLY when
+  # that Secret is actually mounted (entrypoint `-s` gate), so a cluster deployed
+  # WITHOUT the Secret — or with AUTUMN_AUTH_DISABLE="1" — runs authz-OFF.
+  # Clients pass the minted credential via --credential-file (see "Deployment" in docs/ops.md).
+  # PROTECT-EVERYTHING: the signing key alone arms enforcement of EVERY keyed
+  # op; there is no protected-prefix list to set.
+  AUTUMN_AUTH_SIGNING_KEY_FILE: "/etc/autumn/authz/signing.key"
+  # Escape hatch (dev/test): AUTUMN_AUTH_DISABLE: "1"
+  # EC + replication defaults follow cluster.sh (auto by node count). To force:
+  # AUTUMN_REPLICATION: "3+0"
+  # AUTUMN_EC_LOG: "off"
+  # AUTUMN_EC_ROW: "off"

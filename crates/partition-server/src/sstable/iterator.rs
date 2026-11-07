@@ -1,0 +1,734 @@
+use std::rc::Rc;
+use std::sync::Arc;
+
+use anyhow::Result;
+use autumn_stream::StreamClient;
+use bytes::Bytes;
+
+use super::block_cache::BlockCache;
+use super::format::DecodedBlock;
+use super::reader::SstReader;
+
+// ---------------------------------------------------------------------------
+// Item: one entry returned by an iterator
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub struct IterItem {
+    pub key: Vec<u8>, // internal key (user_key ++ 8-byte inverted-seq suffix)
+    pub op: u8,
+    pub value: Vec<u8>,
+    pub expires_at: u64,
+}
+
+// ---------------------------------------------------------------------------
+// BlockIterator: iterates entries within a single decoded block
+// ---------------------------------------------------------------------------
+
+pub struct BlockIterator {
+    block: Arc<DecodedBlock>,
+    idx: usize,
+    current: Option<IterItem>,
+}
+
+impl BlockIterator {
+    pub fn new(block: Arc<DecodedBlock>) -> Self {
+        BlockIterator {
+            block,
+            idx: 0,
+            current: None,
+        }
+    }
+
+    pub fn valid(&self) -> bool {
+        self.current.is_some()
+    }
+
+    pub fn item(&self) -> Option<&IterItem> {
+        self.current.as_ref()
+    }
+
+    pub fn next(&mut self) {
+        self.idx += 1;
+        self.load_current();
+    }
+
+    /// Seek to the first entry with key >= `target`.
+    pub fn seek(&mut self, target: &[u8]) {
+        // Binary search over entry_offsets using decoded keys.
+        // We use a linear scan from the binary-search starting point for simplicity.
+        // For large blocks we could improve this, but 64KB / ~20B avg entry ≈ 3000 entries.
+        let n = self.block.num_entries();
+        if n == 0 {
+            self.current = None;
+            return;
+        }
+
+        // Binary search: find first entry whose key >= target.
+        let mut lo = 0usize;
+        let mut hi = n;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            match self.block.get_entry(mid) {
+                Ok((key, _, _, _)) => {
+                    if crate::cmp_internal_keys(&key, target).is_lt() {
+                        lo = mid + 1;
+                    } else {
+                        hi = mid;
+                    }
+                }
+                Err(_) => {
+                    hi = mid;
+                }
+            }
+        }
+        self.idx = lo;
+        self.load_current();
+    }
+
+    /// Position at the first entry (rewind).
+    pub fn rewind(&mut self) {
+        self.idx = 0;
+        self.load_current();
+    }
+
+    fn load_current(&mut self) {
+        if self.idx >= self.block.num_entries() {
+            self.current = None;
+            return;
+        }
+        match self.block.get_entry(self.idx) {
+            Ok((key, op, value, expires_at)) => {
+                self.current = Some(IterItem {
+                    key,
+                    op,
+                    value: value.to_vec(),
+                    expires_at,
+                });
+            }
+            Err(_) => {
+                self.current = None;
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TableIterator: iterates all entries in an SSTable across blocks
+// ---------------------------------------------------------------------------
+
+/// TEST-ONLY sync iterator over a Resident SST — production iteration uses
+/// `AsyncTableIterator` (works on Resident AND Paged sources).
+#[cfg(test)]
+pub struct TableIterator {
+    reader: Arc<SstReader>,
+    block_idx: usize,
+    block_iter: Option<BlockIterator>,
+    err: Option<anyhow::Error>,
+}
+
+#[cfg(test)]
+impl TableIterator {
+    pub fn new(reader: Arc<SstReader>) -> Self {
+        TableIterator {
+            reader,
+            block_idx: 0,
+            block_iter: None,
+            err: None,
+        }
+    }
+
+    pub fn valid(&self) -> bool {
+        self.err.is_none() && self.block_iter.as_ref().is_some_and(|bi| bi.valid())
+    }
+
+    pub fn item(&self) -> Option<&IterItem> {
+        self.block_iter.as_ref()?.item()
+    }
+
+    pub fn next(&mut self) {
+        if let Some(bi) = self.block_iter.as_mut() {
+            bi.next();
+            if bi.valid() {
+                return;
+            }
+        }
+        // Move to next block
+        self.block_idx += 1;
+        self.load_block_at_start();
+    }
+
+    /// Seek to the first entry with key >= `target`.
+    pub fn seek(&mut self, target: &[u8]) {
+        let start_block = self.reader.find_block_for_key(target);
+        self.block_idx = start_block;
+        match self.load_block(start_block) {
+            Ok(bi_opt) => {
+                if let Some(mut bi) = bi_opt {
+                    bi.seek(target);
+                    if bi.valid() {
+                        self.block_iter = Some(bi);
+                        return;
+                    }
+                    // Key is past this block; try next blocks.
+                    self.block_idx += 1;
+                    self.load_block_at_start();
+                } else {
+                    self.block_iter = None;
+                }
+            }
+            Err(e) => {
+                self.err = Some(e);
+                self.block_iter = None;
+            }
+        }
+    }
+
+    /// Position at the very first entry.
+    pub fn rewind(&mut self) {
+        self.block_idx = 0;
+        self.load_block_at_start();
+    }
+
+    fn load_block_at_start(&mut self) {
+        loop {
+            if self.block_idx >= self.reader.block_count() {
+                self.block_iter = None;
+                return;
+            }
+            match self.load_block(self.block_idx) {
+                Ok(Some(mut bi)) => {
+                    bi.rewind();
+                    if bi.valid() {
+                        self.block_iter = Some(bi);
+                        return;
+                    }
+                    self.block_idx += 1;
+                }
+                Ok(None) => {
+                    self.block_iter = None;
+                    return;
+                }
+                Err(e) => {
+                    self.err = Some(e);
+                    self.block_iter = None;
+                    return;
+                }
+            }
+        }
+    }
+
+    fn load_block(&self, idx: usize) -> Result<Option<BlockIterator>> {
+        if idx >= self.reader.block_count() {
+            return Ok(None);
+        }
+        let block = self.reader.read_block(idx)?;
+        Ok(Some(BlockIterator::new(block)))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AsyncTableIterator: block-on-demand iteration over a (paged) SST
+// ---------------------------------------------------------------------------
+
+/// How an `AsyncTableIterator` fetches blocks it doesn't have.
+#[derive(Clone, Copy, Debug)]
+pub enum FetchMode {
+    /// Per-block through the global `BlockCache` (point-ish scans: RANGE).
+    /// Cache-friendly — repeated list calls over the same prefix hit warm
+    /// blocks; cost is one cache probe (+ one 64 KiB RPC on miss) per block.
+    Cached,
+    /// Sequential bulk windows of up to N bytes, BYPASSING the cache
+    /// (full-SST sweeps: compaction, split key-scan). One RPC per window
+    /// instead of per block, and scan-resistant — the sweep cannot evict
+    /// the hot point-lookup working set (RocksDB `fill_cache=false`
+    /// analogue). Peak memory per iterator = one window.
+    Window(u32),
+}
+
+/// async counterpart of `TableIterator` — works on BOTH Resident and
+/// Paged readers, fetching blocks on demand per `FetchMode`. Replaces the
+/// Stage-1 `materialized_for_iteration` whole-SST transient residency.
+///
+/// API contract differences vs the sync `TableIterator`:
+/// - `seek`/`next`/`rewind` are async and return `Result` — a block-read
+///   failure PROPAGATES instead of silently ending the iteration. (The sync
+///   iterator stashes errors in a field nobody reads; with network-backed
+///   blocks that silence would truncate a compaction's merge output.)
+/// - Holds `Rc<StreamClient>` + `Arc<SstReader>` snapshots only — callers
+///   must NOT hold a `RefCell` borrow across the awaits (note 15).
+pub struct AsyncTableIterator {
+    reader: Arc<SstReader>,
+    sc: Rc<StreamClient>,
+    cache: Arc<BlockCache>,
+    mode: FetchMode,
+    block_idx: usize,
+    block_iter: Option<BlockIterator>,
+    /// Window-mode prefetch buffer: (bytes, first_block, end_block_excl,
+    /// win_start_rel).
+    win: Option<(Bytes, usize, usize, u32)>,
+}
+
+impl AsyncTableIterator {
+    pub fn new(
+        reader: Arc<SstReader>,
+        sc: Rc<StreamClient>,
+        cache: Arc<BlockCache>,
+        mode: FetchMode,
+    ) -> Self {
+        AsyncTableIterator {
+            reader,
+            sc,
+            cache,
+            mode,
+            block_idx: 0,
+            block_iter: None,
+            win: None,
+        }
+    }
+
+    /// How far this iterator has walked, and how far it has to go, in SST
+    /// data blocks — the unit a merge actually advances in, and one the reader
+    /// already knows without touching the stream.
+    pub fn block_progress(&self) -> (u64, u64) {
+        (self.block_idx as u64, self.reader.block_count() as u64)
+    }
+
+    pub fn valid(&self) -> bool {
+        self.block_iter.as_ref().is_some_and(|bi| bi.valid())
+    }
+
+    pub fn item(&self) -> Option<&IterItem> {
+        self.block_iter.as_ref()?.item()
+    }
+
+    pub async fn rewind(&mut self) -> Result<()> {
+        self.block_idx = 0;
+        self.load_from_block_start().await
+    }
+
+    /// Position at the first entry with key >= `target`.
+    pub async fn seek(&mut self, target: &[u8]) -> Result<()> {
+        self.block_idx = self.reader.find_block_for_key(target);
+        match self.load_block(self.block_idx).await? {
+            Some(mut bi) => {
+                bi.seek(target);
+                if bi.valid() {
+                    self.block_iter = Some(bi);
+                    return Ok(());
+                }
+                // Key is past this block (block-boundary case, note 14
+                // analogue): continue from the next block's first entry.
+                self.block_idx += 1;
+                self.load_from_block_start().await
+            }
+            None => {
+                self.block_iter = None;
+                Ok(())
+            }
+        }
+    }
+
+    pub async fn next(&mut self) -> Result<()> {
+        if let Some(bi) = self.block_iter.as_mut() {
+            bi.next();
+            if bi.valid() {
+                return Ok(());
+            }
+        }
+        self.block_idx += 1;
+        self.load_from_block_start().await
+    }
+
+    async fn load_from_block_start(&mut self) -> Result<()> {
+        loop {
+            match self.load_block(self.block_idx).await? {
+                Some(mut bi) => {
+                    bi.rewind();
+                    if bi.valid() {
+                        self.block_iter = Some(bi);
+                        return Ok(());
+                    }
+                    self.block_idx += 1;
+                }
+                None => {
+                    self.block_iter = None;
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    async fn load_block(&mut self, idx: usize) -> Result<Option<BlockIterator>> {
+        if idx >= self.reader.block_count() {
+            return Ok(None);
+        }
+        let block = match self.mode {
+            FetchMode::Cached => {
+                self.reader
+                    .read_block_via(idx, &self.sc, &self.cache)
+                    .await?
+            }
+            FetchMode::Window(max_bytes) => {
+                let covered = self
+                    .win
+                    .as_ref()
+                    .is_some_and(|(_, s, e, _)| idx >= *s && idx < *e);
+                if !covered {
+                    let (bytes, end_idx, start_rel) = self
+                        .reader
+                        .read_blocks_window(idx, max_bytes, &self.sc)
+                        .await?;
+                    self.win = Some((bytes, idx, end_idx, start_rel));
+                }
+                let (bytes, _, _, start_rel) = self.win.as_ref().unwrap();
+                // A window is one read of one copy; a block in it that does
+                // not decode is fetched again on its own, from the others.
+                match self.reader.decode_block_from_window(bytes, *start_rel, idx) {
+                    Ok(b) => b,
+                    Err(why) => self.reader.reread_block(idx, &self.sc, why).await?,
+                }
+            }
+        };
+        Ok(Some(BlockIterator::new(block)))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AsyncMergeIterator: N-way merge over AsyncTableIterators
+// ---------------------------------------------------------------------------
+//
+// Iterators are passed newest-first. For the same user key the item with
+// the higher seq (smaller internal-key suffix) wins, so the minimum internal
+// key across iterators is the newest version of the smallest user key; on an
+// exact internal-key tie the lower-index (newer) iterator wins. Errors from
+// child iterators propagate.
+
+pub struct AsyncMergeIterator {
+    iters: Vec<AsyncTableIterator>,
+}
+
+impl AsyncMergeIterator {
+    pub fn new(iters: Vec<AsyncTableIterator>) -> Self {
+        AsyncMergeIterator { iters }
+    }
+
+    pub fn valid(&self) -> bool {
+        self.iters.iter().any(|it| it.valid())
+    }
+
+    /// Merge progress as `(blocks consumed, blocks total)` summed over the
+    /// inputs. Exact and free: every term is already in memory.
+    pub fn block_progress(&self) -> (u64, u64) {
+        self.iters
+            .iter()
+            .map(|it| it.block_progress())
+            .fold((0, 0), |(d, t), (id, it_total)| (d + id, t + it_total))
+    }
+
+    /// Return the current minimum key across all valid iterators.
+    pub fn item(&self) -> Option<&IterItem> {
+        let mut best: Option<&IterItem> = None;
+        let mut best_iter_idx: Option<usize> = None;
+        for (i, it) in self.iters.iter().enumerate() {
+            if let Some(item) = it.item() {
+                if best.is_none()
+                    || crate::cmp_internal_keys(&item.key, &best.unwrap().key).is_lt()
+                    || (item.key == best.unwrap().key && i < best_iter_idx.unwrap())
+                {
+                    best = Some(item);
+                    best_iter_idx = Some(i);
+                }
+            }
+        }
+        best
+    }
+
+    /// Advance all iterators currently positioned on the minimum key.
+    pub async fn next(&mut self) -> Result<()> {
+        let min_key = match self.item().map(|i| i.key.clone()) {
+            Some(k) => k,
+            None => return Ok(()),
+        };
+        for it in self.iters.iter_mut() {
+            if it.item().is_some_and(|i| i.key == min_key.as_slice()) {
+                it.next().await?;
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn rewind(&mut self) -> Result<()> {
+        for it in self.iters.iter_mut() {
+            it.rewind().await?;
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MemtableIterator: wraps a sorted snapshot of memtable entries
+// ---------------------------------------------------------------------------
+
+/// A snapshot of a memtable's entries for iteration (sorted by internal key).
+pub struct MemtableIterator {
+    entries: Vec<IterItem>,
+    idx: usize,
+}
+
+impl MemtableIterator {
+    pub fn new(mut entries: Vec<IterItem>) -> Self {
+        entries.sort_by(|a, b| crate::cmp_internal_keys(&a.key, &b.key));
+        MemtableIterator { entries, idx: 0 }
+    }
+
+    pub fn valid(&self) -> bool {
+        self.idx < self.entries.len()
+    }
+
+    pub fn item(&self) -> Option<&IterItem> {
+        self.entries.get(self.idx)
+    }
+
+    pub fn next(&mut self) {
+        self.idx += 1;
+    }
+
+    pub fn seek(&mut self, target: &[u8]) {
+        self.idx = self
+            .entries
+            .partition_point(|e| crate::cmp_internal_keys(&e.key, target).is_lt());
+    }
+
+    #[allow(dead_code)]
+    pub fn rewind(&mut self) {
+        self.idx = 0;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sstable::builder::SstBuilder;
+
+    fn ikey(user_key: &[u8], seq: u64) -> Vec<u8> {
+        crate::key_with_ts(user_key, seq)
+    }
+
+    fn build_sst(entries: &[(&[u8], u64, &[u8])]) -> Arc<SstReader> {
+        let mut b = SstBuilder::new(0, 0, 1024);
+        for (uk, seq, val) in entries {
+            b.add(&ikey(uk, *seq), 1, val, 0);
+        }
+        let data = b.finish().to_bytes().to_vec();
+        Arc::new(SstReader::from_bytes(bytes::Bytes::from(data)).expect("reader"))
+    }
+
+    // ── Tests ported from Go table/table_test.go ─────────────────────────────
+
+    #[test]
+    fn table_iterator_seek_various() {
+        let entries: Vec<(Vec<u8>, u64, Vec<u8>)> = (0..10000)
+            .map(|i| {
+                let uk = format!("key{i:06}");
+                (uk.into_bytes(), i as u64, format!("{i}").into_bytes())
+            })
+            .collect();
+        let refs: Vec<(&[u8], u64, &[u8])> = entries
+            .iter()
+            .map(|(k, s, v)| (k.as_slice(), *s, v.as_slice()))
+            .collect();
+        let reader = build_sst(&refs);
+
+        // Seek before first key
+        let mut it = TableIterator::new(reader.clone());
+        it.seek(&ikey(b"key", u64::MAX));
+        assert!(it.valid(), "seek before first: should be valid");
+        assert!(
+            it.item().unwrap().key.starts_with(b"key000000"),
+            "seek before first: should land on first key"
+        );
+
+        // Seek exact match
+        let mut it = TableIterator::new(reader.clone());
+        it.seek(&ikey(b"key005000", u64::MAX));
+        assert!(it.valid());
+        assert!(it.item().unwrap().key.starts_with(b"key005000"));
+
+        // Seek beyond last key
+        let mut it = TableIterator::new(reader.clone());
+        it.seek(&ikey(b"key999999", u64::MAX));
+        assert!(!it.valid(), "seek beyond last: should be invalid");
+
+        // Seek between keys — should land on next key
+        let mut it = TableIterator::new(reader.clone());
+        it.seek(&ikey(b"key001000", u64::MAX));
+        assert!(it.valid());
+        assert!(it.item().unwrap().key.starts_with(b"key001000"));
+    }
+
+    #[test]
+    fn table_iterator_big_values() {
+        let big_val = vec![0xAB; 1024 * 1024]; // 1MB
+        let entries: Vec<(Vec<u8>, u64, Vec<u8>)> = (0..20)
+            .map(|i| {
+                let uk = format!("bigkey{i:04}");
+                (uk.into_bytes(), i as u64, big_val.clone())
+            })
+            .collect();
+        let refs: Vec<(&[u8], u64, &[u8])> = entries
+            .iter()
+            .map(|(k, s, v)| (k.as_slice(), *s, v.as_slice()))
+            .collect();
+        let reader = build_sst(&refs);
+
+        let mut it = TableIterator::new(reader.clone());
+        it.rewind();
+        let mut count = 0;
+        while it.valid() {
+            assert_eq!(
+                it.item().unwrap().value.len(),
+                1024 * 1024,
+                "entry {count}: value should be 1MB"
+            );
+            count += 1;
+            it.next();
+        }
+        assert_eq!(count, 20);
+        assert!(
+            reader.block_count() > 1,
+            "big values should span multiple blocks"
+        );
+    }
+
+    // ── AsyncMergeIterator tests ─────────────────────────────────────────────
+
+    /// Resident readers never touch the stream client, so it points nowhere.
+    async fn async_iter(reader: Arc<SstReader>) -> AsyncTableIterator {
+        let sc = StreamClient::new_with_owner_epoch(
+            "127.0.0.1:1",
+            "merge-test".into(),
+            1,
+            1024 * 1024,
+            Rc::new(autumn_stream::ConnPool::new()),
+        )
+        .await
+        .unwrap();
+        AsyncTableIterator::new(reader, sc, Arc::new(BlockCache::new(1 << 20)), FetchMode::Cached)
+    }
+
+    async fn drain(m: &mut AsyncMergeIterator) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let mut out = Vec::new();
+        while m.valid() {
+            let it = m.item().unwrap();
+            out.push((it.key.clone(), it.value.clone()));
+            m.next().await.unwrap();
+        }
+        out
+    }
+
+    #[test]
+    fn merge_orders_by_internal_key_and_the_first_table_wins_a_tie() {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let t0 = build_sst(&[(b"a", 5, b"t0a5"), (b"c", 3, b"t0c3"), (b"d", 9, b"t0d9")]);
+            let t1 = build_sst(&[(b"a", 7, b"t1a7"), (b"b", 2, b"t1b2"), (b"d", 9, b"t1d9")]);
+            let mut m = AsyncMergeIterator::new(vec![async_iter(t0).await, async_iter(t1).await]);
+            m.rewind().await.unwrap();
+            let want: Vec<(Vec<u8>, Vec<u8>)> = [
+                (&b"a"[..], 7, &b"t1a7"[..]),
+                (b"a", 5, b"t0a5"),
+                (b"b", 2, b"t1b2"),
+                (b"c", 3, b"t0c3"),
+                // One entry for an identical internal key: the earlier table's.
+                (b"d", 9, b"t0d9"),
+            ]
+            .iter()
+            .map(|(k, ts, v)| (ikey(k, *ts), v.to_vec()))
+            .collect();
+            assert_eq!(drain(&mut m).await, want);
+
+            m.rewind().await.unwrap();
+            assert_eq!(drain(&mut m).await, want, "rewind starts the merge over");
+        });
+    }
+
+    #[test]
+    fn merge_of_no_tables_or_empty_tables_is_empty() {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let mut m = AsyncMergeIterator::new(vec![]);
+            m.rewind().await.unwrap();
+            assert!(!m.valid());
+            let mut m = AsyncMergeIterator::new(vec![async_iter(build_sst(&[])).await]);
+            m.rewind().await.unwrap();
+            assert!(!m.valid() && m.item().is_none());
+        });
+    }
+
+    // ── MemtableIterator tests ───────────────────────────────────────────────
+
+    #[test]
+    fn memtable_iterator_basic() {
+        let entries = vec![
+            IterItem {
+                key: ikey(b"cherry", 1),
+                op: 1,
+                value: b"v3".to_vec(),
+                expires_at: 0,
+            },
+            IterItem {
+                key: ikey(b"apple", 2),
+                op: 1,
+                value: b"v1".to_vec(),
+                expires_at: 0,
+            },
+            IterItem {
+                key: ikey(b"banana", 3),
+                op: 1,
+                value: b"v2".to_vec(),
+                expires_at: 0,
+            },
+        ];
+        let mut it = MemtableIterator::new(entries);
+        // Should be sorted: apple, banana, cherry
+        assert!(it.valid());
+        assert!(it.item().unwrap().key.starts_with(b"apple"));
+        it.next();
+        assert!(it.item().unwrap().key.starts_with(b"banana"));
+        it.next();
+        assert!(it.item().unwrap().key.starts_with(b"cherry"));
+        it.next();
+        assert!(!it.valid());
+    }
+
+    #[test]
+    fn memtable_iterator_seek() {
+        let entries = vec![
+            IterItem {
+                key: ikey(b"a", 1),
+                op: 1,
+                value: b"v1".to_vec(),
+                expires_at: 0,
+            },
+            IterItem {
+                key: ikey(b"c", 2),
+                op: 1,
+                value: b"v2".to_vec(),
+                expires_at: 0,
+            },
+            IterItem {
+                key: ikey(b"e", 3),
+                op: 1,
+                value: b"v3".to_vec(),
+                expires_at: 0,
+            },
+        ];
+        let mut it = MemtableIterator::new(entries);
+        // Seek to "c" — should land on "c"
+        it.seek(&ikey(b"c", u64::MAX));
+        assert!(it.valid());
+        assert!(it.item().unwrap().key.starts_with(b"c"));
+        // Seek beyond all
+        it.seek(&ikey(b"z", u64::MAX));
+        assert!(!it.valid());
+    }
+}

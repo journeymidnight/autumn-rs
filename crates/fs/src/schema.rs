@@ -1,0 +1,660 @@
+//! Core data types for the FUSE filesystem layer.
+
+use std::collections::VecDeque;
+
+use rkyv::{Archive, Deserialize, Serialize};
+
+/// Decode InodeMeta from rkyv bytes.
+pub fn decode_inode_meta(bytes: &[u8]) -> Result<InodeMeta, String> {
+    if bytes.is_empty() {
+        return Err("empty InodeMeta bytes".to_string());
+    }
+    autumn_rpc::partition_rpc::rkyv_decode(bytes).map_err(|e| format!("{:?}", e))
+}
+
+/// Encode InodeMeta to rkyv bytes.
+pub fn encode_inode_meta(meta: &InodeMeta) -> Vec<u8> {
+    autumn_rpc::partition_rpc::rkyv_encode(meta).to_vec()
+}
+
+/// lane count used when an fs has declared no geometry.
+///
+/// **Lanes are a LOGICAL property of the key layout; whether the partitions were
+/// actually cut at lane boundaries is a separate PLACEMENT decision.** Striping
+/// unconditionally is what makes placement changeable after the fact: a file
+/// written on a 1-partition fs already has its extents sorted by lane, so a
+/// later split at a lane boundary hands it parallelism RETROACTIVELY, with no
+/// data rewrite and no re-stamping. The old behaviour — no presplit ⇒ legacy
+/// `[0x03][ino][off]` keys — was an irreversible loss: those files sit entirely
+/// in lane 0 forever, and growing the cluster to 24 partitions does nothing
+/// for them.
+///
+/// 24 is over-provisioned on purpose (the Kafka-partition / Ceph-PG / Cassandra-
+/// vnode move): a partition owns a contiguous RUN of lanes, so any partition
+/// count that DIVIDES 24 — 1, 2, 3, 4, 6, 8, 12, 24 — distributes every file
+/// evenly. The lane count is therefore a permanent layout constant rather than a
+/// function of cluster shape, which is what removes the "a file's stripe width
+/// is frozen at create time and can never widen" problem: it never needs to
+/// widen. 24 has more divisors than 32 or 16, so it fits more cluster sizes.
+///
+/// A declared `lanes` of 1 turns striping off for an fs (the write path stripes
+/// only at `lanes >= 2`).
+pub const DEFAULT_STRIPE_LANES: u8 = 24;
+
+/// decode the declared fs-wide stripe geometry
+/// (`[0x04]stripe_geom`). Validated through `checked()` so a corrupt/truncated
+/// value fails loud here rather than dividing by zero deep in the key builder.
+pub fn decode_stripe_geom(bytes: &[u8]) -> Result<StripeLayout, String> {
+    if bytes.is_empty() {
+        return Err("empty stripe_geom bytes".to_string());
+    }
+    let layout: StripeLayout =
+        autumn_rpc::partition_rpc::rkyv_decode(bytes).map_err(|e| format!("{:?}", e))?;
+    layout.checked()?;
+    Ok(layout)
+}
+
+/// Encode the declared fs-wide stripe geometry.
+pub fn encode_stripe_geom(layout: &StripeLayout) -> Vec<u8> {
+    autumn_rpc::partition_rpc::rkyv_encode(layout).to_vec()
+}
+
+/// Decode DirentValue from rkyv bytes.
+pub fn decode_dirent(bytes: &[u8]) -> Result<DirentValue, String> {
+    if bytes.is_empty() {
+        return Err("empty DirentValue bytes".to_string());
+    }
+    autumn_rpc::partition_rpc::rkyv_decode(bytes).map_err(|e| format!("{:?}", e))
+}
+
+/// Encode DirentValue to rkyv bytes.
+pub fn encode_dirent(dirent: &DirentValue) -> Vec<u8> {
+    autumn_rpc::partition_rpc::rkyv_encode(dirent).to_vec()
+}
+
+/// Inode metadata stored in KV at key `[0x01][ino: u64 BE]`.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct InodeMeta {
+    /// File type + permissions (e.g. S_IFREG | 0o644).
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
+    /// Logical file size in bytes.
+    pub size: u64,
+    /// Hard link count.
+    pub nlink: u32,
+    pub atime_secs: i64,
+    pub atime_nsecs: u32,
+    pub mtime_secs: i64,
+    pub mtime_nsecs: u32,
+    pub ctime_secs: i64,
+    pub ctime_nsecs: u32,
+    /// Inline data for small files (≤4KB). None for directories or large files.
+    pub inline_data: Option<Vec<u8>>,
+    /// Symlink target path. None for non-symlinks.
+    pub symlink_target: Option<Vec<u8>>,
+    /// `Some` iff this file's data extents are STRIPED across
+    /// `lanes` partitions. `None` = the legacy single-partition layout
+    /// (`[0x03][ino][off]`, all extents in one partition/log_stream). A large
+    /// file (> threshold) is stamped striped at create so its extents round-robin
+    /// across lane partitions (`[0x03][lane][ino][off]`) → parallel write/read
+    /// beyond the single-stream ceiling. Immutable once set; the reader branches
+    /// on this to pick the key layout, so old files stay correct with no migration.
+    pub stripe: Option<StripeLayout>,
+    /// Content generation: raised by every change to the file's bytes (a
+    /// flushed write, a truncate, a replaced segment map). Together with the
+    /// inode number it identifies one version of the content, which is what
+    /// the S3 gateway's ETag is — so a same-size rewrite within one second
+    /// still changes it. v4.
+    pub generation: u64,
+    /// `Some`: the file's bytes are defined by this map of logical ranges onto
+    /// data objects, and the file owns no `[0x03]` extents of its own
+    /// (`inline_data` and `stripe` are `None`). A multipart upload completes
+    /// into this form without touching the parts' bytes. v4.
+    pub segments: Option<SegmentMap>,
+}
+
+/// One logical range of a segmented file: `[off, off+len)` of the file is
+/// `[data_off, data_off+len)` of data object `data_ino`.
+///
+/// A data object is written once, densely, in `unit`-sized extents at
+/// `[0x03][lane][data_ino][o]` for `o` = 0, unit, 2·unit, … with
+/// `lane = (o/unit + data_ino) % lanes` (`key::data_extent_key`). Dense means a
+/// reader knows every key a covered range needs, so a MISSING key is an error
+/// rather than a sparse hole. The lane rotates with `data_ino` because objects
+/// are usually smaller than one unit: without it every 5 MiB multipart part
+/// would put its only extent on lane 0.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct Segment {
+    pub off: u64,
+    pub len: u64,
+    pub data_ino: u64,
+    pub data_off: u64,
+    pub lanes: u8,
+    pub unit: u32,
+}
+
+impl Segment {
+    pub fn end(&self) -> u64 {
+        self.off + self.len
+    }
+
+    /// Validate a segment read from storage before its geometry divides or
+    /// its offsets add: a corrupt zero or an overflow must be an error, not
+    /// a panic that takes the mount down (as `StripeLayout::checked`).
+    pub fn checked(&self) -> Result<(), String> {
+        if self.lanes == 0 || self.unit == 0 || self.len == 0 {
+            return Err(format!("corrupt segment {self:?}"));
+        }
+        if self.off.checked_add(self.len).is_none() || self.data_off.checked_add(self.len).is_none() {
+            return Err(format!("segment overflows: {self:?}"));
+        }
+        Ok(())
+    }
+}
+
+/// A segmented file's map, sorted by `off`, non-overlapping; gaps are holes
+/// and read as zeros.
+///
+/// Small maps live `inline` in the inode (a single-PUT object has one
+/// segment, a Lance data file a dozen), so reading them costs nothing extra.
+/// Larger maps are paged: page `i` is `[0x05][map_id][i]`, immutable, holding
+/// at most `SEGMENT_PAGE` segments; `page_starts[i]` is its first segment's
+/// `off`, so a read loads only the pages its range touches.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default)]
+pub struct SegmentMap {
+    pub inline: Vec<Segment>,
+    /// 0 for an inline map.
+    pub map_id: u64,
+    pub page_starts: Vec<u64>,
+    /// Total segments, inline or paged.
+    pub count: u64,
+}
+
+/// What a reclaim record (`key::segc_key`) names, with what it takes to
+/// delete it without consulting any map.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub enum SegcRecord {
+    Object { len: u64, lanes: u8, unit: u32 },
+    Pages { count: u32 },
+}
+
+pub fn encode_segc(r: &SegcRecord) -> Vec<u8> {
+    autumn_rpc::partition_rpc::rkyv_encode(r).to_vec()
+}
+
+pub fn decode_segc(bytes: &[u8]) -> Result<SegcRecord, String> {
+    autumn_rpc::partition_rpc::rkyv_decode(bytes).map_err(|e| format!("{:?}", e))
+}
+
+/// A session's operation in progress (`key::pending_key`).
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub enum PendingOp {
+    /// Publishing new inode `new_ino` as `parent`/`name`. Finished iff the
+    /// dirent names `new_ino`; otherwise `new_ino` and its data are undone.
+    Publish {
+        parent: u64,
+        name: Vec<u8>,
+        new_ino: u64,
+    },
+    /// Taking `parent`/`name` away from inode `ino`, handing it to
+    /// `successor` (a replace) or to nobody (a delete). Once the dirent holds
+    /// exactly that, the name is dropped from `ino`. Anything else (the old
+    /// name still, or another session's file) says this swap did not land,
+    /// and whoever moved the name retired `ino` themselves.
+    Retire {
+        parent: u64,
+        name: Vec<u8>,
+        ino: u64,
+        successor: Option<u64>,
+    },
+    /// Writing data object `data_ino` as part `part` of `upload`. Kept iff
+    /// the upload owns it: open with the part record naming it, or frozen
+    /// into the file a Complete is publishing or has published.
+    Part {
+        upload: u64,
+        part: u32,
+        data_ino: u64,
+    },
+    /// Completing `upload` into the inode this record is keyed by. Finished
+    /// iff the dirent names that inode; otherwise undone and the upload
+    /// reopened.
+    Complete { upload: u64 },
+}
+
+pub fn encode_pending(p: &PendingOp) -> Vec<u8> {
+    autumn_rpc::partition_rpc::rkyv_encode(p).to_vec()
+}
+
+pub fn decode_pending(bytes: &[u8]) -> Result<PendingOp, String> {
+    autumn_rpc::partition_rpc::rkyv_decode(bytes).map_err(|e| format!("{:?}", e))
+}
+
+/// Where a multipart upload is. Every transition is a `compare_put` on the
+/// upload record, so a Complete and an Abort race to exactly one winner.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub enum UploadState {
+    Open,
+    /// Being published as inode `new_ino` by `session`, from exactly the data
+    /// objects in `frozen` (list order).
+    Completing {
+        new_ino: u64,
+        session: u64,
+        frozen: Vec<u64>,
+    },
+    /// Published as `new_ino`, which owns the objects in `frozen`. The record
+    /// is deleted once the upload's leftovers are.
+    Completed {
+        new_ino: u64,
+        frozen: Vec<u64>,
+    },
+    Aborted,
+}
+
+/// `key::upload_key`.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct UploadRecord {
+    /// Where Complete publishes the file.
+    pub parent: u64,
+    pub name: Vec<u8>,
+    /// The S3 key, for listings.
+    pub key: Vec<u8>,
+    pub state: UploadState,
+}
+
+/// `key::completed_upload_key`: what a finished Complete answered, so a retry
+/// whose first reply was lost gets the same answer after the upload record
+/// is gone.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct CompletedUpload {
+    /// The S3 key the upload was for.
+    pub key: Vec<u8>,
+    /// The file the Complete published.
+    pub new_ino: u64,
+}
+
+pub fn encode_completed(r: &CompletedUpload) -> Vec<u8> {
+    autumn_rpc::partition_rpc::rkyv_encode(r).to_vec()
+}
+
+pub fn decode_completed(bytes: &[u8]) -> Result<CompletedUpload, String> {
+    autumn_rpc::partition_rpc::rkyv_decode(bytes).map_err(|e| format!("{:?}", e))
+}
+
+/// `key::upload_part_key`: the part's current data object.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct PartRecord {
+    pub data_ino: u64,
+    pub size: u64,
+    pub crc32c: u32,
+    pub lanes: u8,
+    pub unit: u32,
+}
+
+pub fn encode_upload(r: &UploadRecord) -> Vec<u8> {
+    autumn_rpc::partition_rpc::rkyv_encode(r).to_vec()
+}
+
+pub fn decode_upload(bytes: &[u8]) -> Result<UploadRecord, String> {
+    autumn_rpc::partition_rpc::rkyv_decode(bytes).map_err(|e| format!("{:?}", e))
+}
+
+pub fn encode_part(r: &PartRecord) -> Vec<u8> {
+    autumn_rpc::partition_rpc::rkyv_encode(r).to_vec()
+}
+
+pub fn decode_part(bytes: &[u8]) -> Result<PartRecord, String> {
+    autumn_rpc::partition_rpc::rkyv_decode(bytes).map_err(|e| format!("{:?}", e))
+}
+
+/// Segments kept inline in the inode before a map is paged.
+pub const INLINE_SEGMENTS: usize = 64;
+
+/// Segments per map page.
+pub const SEGMENT_PAGE: usize = 1024;
+
+/// Decode one segment-map page.
+pub fn decode_segment_page(bytes: &[u8]) -> Result<Vec<Segment>, String> {
+    if bytes.is_empty() {
+        return Err("empty segment page".to_string());
+    }
+    autumn_rpc::partition_rpc::rkyv_decode(bytes).map_err(|e| format!("{:?}", e))
+}
+
+/// Encode one segment-map page.
+pub fn encode_segment_page(segments: &Vec<Segment>) -> Vec<u8> {
+    autumn_rpc::partition_rpc::rkyv_encode(segments).to_vec()
+}
+
+/// per-file stripe geometry. An extent at logical offset `off` lives
+/// on lane `(off / unit_bytes) % lanes`, whose wire key is `[0x03][lane][ino][off]`.
+/// Lane partitions are pre-split at `[0x03][lane]` (static, ino-independent) and
+/// placed on distinct PSs, so consecutive extents hit different PSs in parallel.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct StripeLayout {
+    /// Number of stripe lanes = number of pre-split lane partitions. 1..=255.
+    pub lanes: u8,
+    /// Stripe unit in bytes. v1 uses `MAX_EXTENT` (each extent its own lane).
+    pub unit_bytes: u32,
+}
+
+impl StripeLayout {
+    /// Validate the PERSISTED geometry before it feeds `stripe_lane`'s
+    /// `off / unit_bytes` + `% lanes` — a corrupt/hand-written inode with
+    /// `lanes == 0` or `unit_bytes == 0` would otherwise div-by-zero panic the
+    /// reader/rm. Returns `(lanes, unit_bytes)` or a diagnostic error. Every path
+    /// that reads `meta.stripe` from KV MUST route through this, not the raw fields.
+    pub fn checked(&self) -> Result<(u8, u32), String> {
+        if self.lanes < 1 || self.unit_bytes < 1 {
+            return Err(format!(
+                "invalid stripe layout (corrupt inode?): lanes={} unit_bytes={}",
+                self.lanes, self.unit_bytes
+            ));
+        }
+        Ok((self.lanes, self.unit_bytes))
+    }
+}
+
+/// The `unit_bytes`-aligned logical offsets (0, u, 2u, …)
+/// of a striped file of `size` bytes — the enumeration the reader / rm / delete
+/// paths use to COMPUTE lane keys.
+///
+/// **`unit` MUST come from the file's PERSISTED `StripeLayout.unit_bytes`, never
+/// from the `MAX_EXTENT` constant.** This used to step by the compile-time
+/// constant, which silently assumed "the extent cap today == the extent cap when
+/// this file was written". `MAX_EXTENT` is explicitly slated for retuning on
+/// full-resource hardware, and the day it shrinks (8 MiB → 4 MiB) every existing
+/// striped file would enumerate offsets (0, 4M, 8M…) that do not match its
+/// written keys (0, 8M, 16M…) — and because a missing extent READS AS ZEROS
+/// (sparse-file semantics, `read::execute`), half of every striped file would
+/// come back zero-filled with no error. That is the same silent-misread class the
+/// stripe stamp exists to prevent, so the stride is now part of the file's
+/// self-describing geometry. Decoupling `unit_bytes` from the extent cap later
+/// (multi-extent stripe units) needs a new persisted field + a schema bump.
+///
+/// Guards a corrupt huge `size`: a bare `while off < size { off += unit }` would
+/// wrap `off` (infinite loop) or push billions of entries (OOM) if
+/// `size ≈ u64::MAX`. Errors when the extent count exceeds a sane ceiling.
+/// `unit == 0` errors rather than dividing by zero (`StripeLayout::checked()`
+/// is the normal gate, but this is a pub fn taking a bare u32).
+pub fn striped_extent_offsets(size: u64, unit: u32) -> Result<Vec<u64>, String> {
+    let count = striped_extent_count(size, unit)?;
+    let unit = unit as u64;
+    Ok((0..count).map(|i| i.saturating_mul(unit)).collect())
+}
+
+/// Validate the geometry/size without allocating the full file's extent map.
+pub(crate) fn striped_extent_count(size: u64, unit: u32) -> Result<u64, String> {
+    const MAX_EXTENTS: u64 = 16 * 1024 * 1024; // 16M × 8 MiB = 128 TiB
+    if unit == 0 {
+        return Err("striped file has unit_bytes=0 (corrupt inode?)".to_string());
+    }
+    let unit = unit as u64;
+    let count = size.div_ceil(unit);
+    if count > MAX_EXTENTS {
+        return Err(format!(
+            "striped file size {size} too large ({count} extents > {MAX_EXTENTS} cap — corrupt inode?)"
+        ));
+    }
+    Ok(count)
+}
+
+/// Directory entry stored in KV at key `[0x02][parent_ino: u64 BE][name]`.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct DirentValue {
+    pub child_inode: u64,
+    /// File type constant: DT_REG=8, DT_DIR=4, DT_LNK=10.
+    pub file_type: u8,
+}
+
+/// Maximum extent (variable-length data block) size: 8 MiB.
+///
+/// Files are stored as **variable-length extents** keyed by their logical byte
+/// offset (`[0x03][ino][logical_off BE]`), NOT fixed 256 KiB chunks. A
+/// sequential (write-once) stream coalesces into extents capped at `MAX_EXTENT`;
+/// the last/partial extent is shorter → "variable like Linux extents". 8 MiB
+/// matches the project's large-value bench size and the UCX large-read sweet
+/// spot, so the ≥64 KiB bulk path (and the future RDMA path) is engaged for
+/// whole-extent reads. The write buffer also flushes at this granularity.
+pub const MAX_EXTENT: usize = 8 * 1024 * 1024;
+
+/// Small file inline threshold: 4KB (matches VALUE_THROTTLE).
+pub const INLINE_THRESHOLD: usize = 4096;
+
+/// Inode allocation batch size (`--inode-alloc-batch`).
+pub fn inode_alloc_batch() -> u64 {
+    crate::params().inode_alloc_batch.get()
+}
+
+/// Per-inode write buffer capacity in extents. Buffer = `--write-buf-extents` *
+/// [`MAX_EXTENT`] bytes (8 × 8 MiB = 64 MiB). The buffer fills with sequential
+/// fuse `write` syscalls and flushes one whole buffer's worth at a time via
+/// `extent::write_region`. With `--write-buf-extents` == 1 the flush is a single
+/// `put` and the cp throughput ceiling is `MAX_EXTENT / RPC_RTT` (~270 MB/s
+/// on local NVMe + TCP loopback + 3 replicas). With > 1, write_region splits
+/// into multiple extents and `put_many` groups them BY WIRE KEY, fanning the
+/// groups out concurrently (`--batch-put-concurrency`). A flush's extent
+/// keys are all distinct, so every extent in it goes out in parallel and the
+/// ceiling scales to `write_buf_extents * MAX_EXTENT / RPC_RTT` until the
+/// EN-side disk + replica fanout saturates. (There is no `APPEND_PIPELINE_
+/// DEPTH` — that constant was removed when `put_many` stopped taking a
+/// `concurrency` argument; see `extent.rs`.)
+///
+/// Cost: up to `write_buf_extents * MAX_EXTENT` (64 MiB) of pre-flush RAM per
+/// actively-writing inode. For sglang-style model checkpoint cp (a handful
+/// of concurrent multi-GB files) this is negligible; for a workload with
+/// thousands of concurrently-open dirty inodes a smaller value may be
+/// appropriate.
+pub fn write_buf_extents() -> usize {
+    crate::params().write_buf_extents.get()
+}
+
+/// Per-inode write buffer capacity in bytes. See [`write_buf_extents`].
+pub fn write_buf_cap() -> usize {
+    write_buf_extents() * MAX_EXTENT
+}
+
+/// How many append flushes one inode may have in flight at once.
+///
+/// `2` means one batch on the wire while the next fills. Before it, the writer
+/// drained the previous flush BEFORE it could even plan the next, so exactly
+/// one 64 MiB batch — 8 concurrent extent puts — was ever on the wire.
+///
+/// MEASURED (loopback 3-EN RF3 cluster pinned to one core per EN,
+/// 4 GiB `dd bs=8M conv=fsync` into the mount, six A/B pairs, three in each
+/// order): depth 2 beat depth 1 in every pair, 284.7 vs 266.3 MiB/s over all
+/// six (+6.9%), and matched `autumnfs put` of the same file on the same runs
+/// (283.5 mean). Small, as expected — but real, so it stays at 2. That rig is
+/// slower than the one the figures below come from (338 / 345); on it one slot
+/// reached ~94% of the CLI, and the inter-batch bubble is the missing ~6%.
+///
+/// Where it comes from: the mount is NOT stuck at the
+/// 208 MiB/s recorded earlier: that number predates the single-slot
+/// pipeline, and the single-slot pipeline then took writes 249 -> 338 MiB/s,
+/// which is 98% of the `autumnfs` CLI's 345 on the same rig. One slot already
+/// puts 8 extents in flight, the same count as the CLI's non-striped `depth`
+/// (`autumnfs.rs`, `None => 8`); the two landing so close is consistent with
+/// that, though the causal link is INFERRED, not measured.
+///
+/// What depth 2 changes is narrower than "8 -> 16 in flight". The CLI's 8 is a
+/// CONTINUOUS window refilled on each completion; one fuse slot is a batch of 8
+/// behind a barrier, and the next batch cannot start until the buffer refills
+/// AND the previous batch lands. Depth 2 removes that inter-batch bubble. The
+/// prize is still small, and the CLI is a comparator rather than a proven
+/// ceiling for the mount: a non-striped fuse file is ONE partition, so the wall
+/// it meets first is the single-log_stream ceiling (~350 MB/s by this project's
+/// own measurements) — which is exactly where 338 and 345 both sit.
+/// (The earlier RF3-all-replica-fsync wall was measured on the striped 4-lane
+/// aggregate: a different path, same conclusion that the client is not it.)
+///
+/// Deeper is NOT free and wants its own measurement: `plan_append_only` COPIES
+/// the buffer into the plan (`Bytes::copy_from_slice`), so each slot pins a
+/// live `write_buf_cap()`. At 2 that is 128 MiB in flight per actively-writing
+/// inode, on top of the 64 MiB buffer itself — and depth 2 already matches the
+/// CLI's continuous window, the comparator, on that rig.
+///
+/// `1` is an EXACT revert (at 1, `make_room` waits whenever the queue holds
+/// anything at all, which is precisely what the unconditional drain it
+/// replaced did), and it is what the A/B above ran as the baseline.
+pub fn append_inflight_depth() -> usize {
+    crate::params().append_inflight_depth.get()
+}
+
+/// Root inode number (FUSE_ROOT_ID).
+pub const ROOT_INO: u64 = 1;
+
+/// the on-disk layout version stamped in the superblock
+/// (`[0x04]schema_version`, so it lands at `fs/[0x04]schema_version`).
+///
+/// - **v1** = the pre-namespace layout (raw `0x01`–`0x04` keys under a Raw client
+///   binding). Never actually stamped — v1 filesystems carry NO schema_version
+///   key.
+/// - **v2** = the namespaced layout: keys are RELATIVE to `fs/` (the client
+///   prepends it), with a cluster-unique GLOBAL inode counter.
+///
+/// `meta::ensure_schema_version` stamps a fresh filesystem with this value and
+/// FAILS LOUD if an existing stamp differs — a future incompatible layout (v3+)
+/// then refuses to mount rather than silently corrupting data.
+/// - **v3** = lane striping: `InodeMeta` gains the `stripe: Option<StripeLayout>`
+///   field (rkyv layout change — v2 inode bytes can't decode), and large files
+///   store data extents under the lane-striped key `[0x03][lane][ino][off]`.
+///   Stop-world reset from v2 (no in-place migration; old files would decode
+///   wrong). Small / legacy files keep `stripe=None` + the `[0x03][ino][off]` key.
+///
+/// - **v4** = segmented files and content generations: `InodeMeta` gains
+///   `generation` and `segments` (rkyv layout change). Converted in place by
+///   a one-shot converter against a stopped filesystem (tool since removed) — every
+///   inode keeps its number, links and bytes, and gains `generation = 1` and
+///   `segments = None` — rather than by a reset.
+///
+/// BUMP this whenever the key layout / value encoding changes incompatibly.
+pub const SCHEMA_VERSION: u64 = 4;
+
+// File type constants (from libc)
+pub const DT_REG: u8 = 8;
+pub const DT_DIR: u8 = 4;
+pub const DT_LNK: u8 = 10;
+
+/// A single readdir entry. Lives in the fuser-free core
+/// (`kind` is a `DT_*` byte, not `fuser::FileType`); the FUSE reply
+/// boundary (`ops.rs`) converts via `attr::dt_to_filetype`.
+pub struct ReaddirEntry {
+    pub ino: u64,
+    pub offset: i64,
+    /// `DT_REG` / `DT_DIR` / `DT_LNK`.
+    pub kind: u8,
+    pub name: std::ffi::OsString,
+}
+
+/// Runtime write buffer state for a single inode (compio thread-local).
+/// A spawned append flush plus the extent-map updates to apply when it lands.
+pub struct PendingFlush {
+    pub task: compio::runtime::JoinHandle<anyhow::Result<()>>,
+    pub upserts: Vec<(u64, u32)>,
+}
+
+pub struct WriteBuffer {
+    /// Buffer storage, capacity = [`write_buf_cap()`].
+    pub buf: Vec<u8>,
+    /// Starting file offset of buffered data.
+    pub offset: i64,
+    /// Bytes currently in buffer.
+    pub len: usize,
+}
+
+impl Default for WriteBuffer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl WriteBuffer {
+    pub fn new() -> Self {
+        Self {
+            buf: Vec::with_capacity(write_buf_cap()),
+            offset: 0,
+            len: 0,
+        }
+    }
+}
+
+/// Per-inode runtime state (compio thread-local, not persisted).
+pub struct InodeState {
+    pub meta: InodeMeta,
+    /// The WRITE lease epoch the unpublished state (`write_buf`, `dirty`) was
+    /// made under; 0 when it was made under no lease. A flush stamps this when
+    /// the lease entry is gone, so it is refused by the fence instead of going
+    /// out anonymous over whoever holds the lease now. Cleared by a successful
+    /// flush.
+    pub write_epoch: u64,
+    pub write_buf: Option<WriteBuffer>,
+    /// Append flushes whose puts are still in flight, OLDEST FIRST, each with
+    /// the extent-map updates it will imply once it lands. This is what lets
+    /// the mount overlap the network with the kernel: the dispatcher goes back
+    /// to filling the next buffer instead of waiting here.
+    ///
+    /// A QUEUE, not one slot. With a single slot the writer had to drain the
+    /// previous flush before it could even PLAN the next, so exactly one
+    /// 64 MiB batch was ever on the wire. Up to [`--append-inflight-depth`] ride
+    /// at once now — but that single slot was itself the win that mattered
+    /// (249 -> 338 MiB/s); see [`--append-inflight-depth`] for how
+    /// little is left after it.
+    ///
+    /// While this is NON-EMPTY the extent map is INCOMPLETE and the inode's
+    /// on-disk size must not be published. Only ever filled when
+    /// `FsState::pipelined_writes` is on, which is the fuse MOUNT alone: its
+    /// dispatcher drains ahead of every non-write request, and no other
+    /// front-end has that funnel.
+    ///
+    /// Completion ORDER does not matter: `extent::upsert` is a sorted
+    /// insert-or-replace keyed by start offset, and consecutive batches cover
+    /// disjoint ranges, so applying them as they land is equivalent to
+    /// applying them in issue order.
+    pub pending_flushes: VecDeque<PendingFlush>,
+    /// A failed flush, held until someone reports it.
+    ///
+    /// The failure cannot be delivered to the `write` that started it — that
+    /// call returned before the puts ran — so it is kept here until one of
+    /// Linux's writeback-error RETIREMENT points consumes it: a
+    /// `write::flush_inode` marked `FlushReport::ToApplication`, which is
+    /// exactly FUSE_FLUSH (sent on every `close()`), FSYNC, and the PyO3
+    /// binding's explicit flush. Without this the dispatcher's drain, which
+    /// runs ahead of the fsync handler and only logs, would consume the error
+    /// first and fsync would then acknowledge success over a hole.
+    ///
+    /// EVERY other caller passes `BestEffort` and leaves it standing — and the
+    /// test is NOT "does this caller return an error to somebody". `RELEASE`
+    /// replies with an error the kernel drops (fuser: "error values are not
+    /// returned to close() or munmap() which triggered the release");
+    /// `periodic_sync` and `Destroy` only log; and the read-after-write
+    /// barrier, the write path's own gap flush, and `truncate` all DO hand
+    /// their caller an EIO, but none of them is a point at which a writeback
+    /// error retires. Each of those three was classified wrong at some point in
+    /// this file's history for exactly that reason.
+    pub flush_error: Option<String>,
+    pub dirty: bool,
+    pub open_count: u32,
+    /// runtime extent map: sorted `(logical_start, value_len)` of this
+    /// file's data extents. `None` = not yet loaded (rebuild via range-scan of
+    /// the `[0x03][ino]` prefix + neighbor/file-size length inference). This is a
+    /// *runtime cache only* — the persistent source of truth is the extent KV
+    /// keys themselves (the implicit-key design: no extent list in InodeMeta).
+    /// Invalidated (set `None`) on truncate; maintained incrementally on write.
+    pub extents: Option<Vec<(u64, u32)>>,
+    /// The manager-side lease
+    /// version that was current when `meta` / `extents` were
+    /// LAST refetched from KV. On Open the dispatcher compares
+    /// this against the version returned by AcquireLease; on
+    /// mismatch the cached InodeState is dropped and rebuilt
+    /// from `get_inode` (and a fresh extent rescan on next
+    /// `ensure_extents_loaded`). Without this a second mount
+    /// that re-Opens the inode after the first mount wrote +
+    /// closed would happily serve from its stale cached `meta`
+    /// (correct user-space lease state notwithstanding) — the
+    /// close-to-open bytes invariant breaks at the FUSE layer
+    /// even when the manager + kernel-cache layers are correct.
+    ///
+    /// `0` means "no lease seen yet" — only seeded by Open and
+    /// preserved across `forget` for as long as the entry lives.
+    pub cached_version: u64,
+}

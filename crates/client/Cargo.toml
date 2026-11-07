@@ -1,0 +1,33 @@
+[package]
+name = "autumn-client"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+# Propagate the UCX transport down through autumn-rpc → autumn-transport.
+ucx = ["autumn-rpc/ucx"]
+
+[dependencies]
+autumn-rpc = { path = "../rpc" }
+autumn-params = { path = "../params" }
+autumn-stream = { path = "../stream" }
+anyhow.workspace = true
+bytes.workspace = true
+compio = { workspace = true, features = ["net", "time"] }
+crc32c.workspace = true
+futures = "0.3"
+thiserror.workspace = true
+tracing.workspace = true
+# F-fuse-lease-1: inode-lease helpers (DaemonClientId UUID, typed
+# acquire/release/heartbeat/poll_invalidations) used by autumn-fuse.
+# Pulled into the SDK so the consumer depends only on
+# autumn-client + autumn-rpc, no cross-feature wiring.
+uuid = { workspace = true }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+autumn-transport = { path = "../transport" }

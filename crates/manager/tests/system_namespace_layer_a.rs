@@ -1,0 +1,288 @@
+//! D7 (SD-2) — wire-level integration tests for the two subtle
+//! correctness points the unit tests only cover in isolation:
+//!
+//! 1. **Layer-A over the wire** (`layer_a_rejects_unregistered_namespace_put`):
+//!    with a namespace registered, a put under it is admitted, a put under an
+//!    UNregistered prefix is rejected with `NamespaceUnknown` (anonymous
+//!    connection checked too), and a `delete` under an unregistered prefix is
+//!    NOT Layer-A gated.
+//! 2. **put-stream chunk-in-scope-range** (`putstream_chunks_land_in_scope_range`):
+//!    a Prepend-bound client's striped chunk keys land INSIDE
+//!    `[{scope}/, {scope}0)`, not in a global `\xff\xfe…` space.
+//!
+//! Both run on an in-process cluster (ENs + a real PS), like
+//! `system_putstream.rs`.
+
+mod support;
+
+use std::net::SocketAddr;
+use std::time::Duration;
+
+use autumn_client::{AutumnError, ClusterClient};
+use autumn_rpc::client::RpcClient;
+use autumn_rpc::manager_rpc::{
+    rkyv_decode, rkyv_encode, NamespaceCreateReq, NamespaceCreateResp, CODE_OK,
+    MSG_NAMESPACE_CREATE,
+};
+
+use support::*;
+
+
+/// A memory-mode manager (namespace-create is Admin-only: see `ns_create`'s
+/// connection).
+fn start_memory_manager(mgr_addr: SocketAddr) {
+    std::thread::spawn(move || {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let manager = autumn_manager::AutumnManager::new();
+            let _ = manager.serve(mgr_addr).await;
+        });
+    });
+    support::wait_accepting(mgr_addr, "start_memory_manager");
+}
+
+async fn ns_create(mgr: &RpcClient, name: &str) {
+    let payload = rkyv_encode(&NamespaceCreateReq {
+        name: name.to_string(),
+        presplit: Vec::new(),
+    });
+    let resp = mgr
+        .call(MSG_NAMESPACE_CREATE, payload)
+        .await
+        .expect("namespace-create rpc");
+    let r: NamespaceCreateResp = rkyv_decode(&resp).expect("decode");
+    assert_eq!(r.code, CODE_OK, "namespace-create failed: {}", r.message);
+}
+
+#[test]
+fn layer_a_rejects_unregistered_namespace_put() {
+    let mgr_addr = pick_addr();
+    start_memory_manager(mgr_addr);
+    let n1_dir = tempfile::tempdir().expect("n1");
+    let n2_dir = tempfile::tempdir().expect("n2");
+    let n1_addr = pick_addr();
+    let n2_addr = pick_addr();
+    start_extent_node(n1_addr, n1_dir.path().to_path_buf(), 130);
+    start_extent_node(n2_addr, n2_dir.path().to_path_buf(), 131);
+
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::version_hello::Role::Admin, None).await.unwrap();
+        register_two_nodes(&mgr, n1_addr, n2_addr, 130).await;
+        let (log, row, meta) = create_three_streams(&mgr).await;
+        upsert_partition(&mgr, 13001, log, row, meta, b"", b"\xff\xff\xff\xff").await;
+
+        // Register `bench` BEFORE the PS starts so its initial authz-config fetch
+        // sees a non-empty registry → Layer-A enabled (independent of any signing
+        // key). Then bring up the PS.
+        ns_create(&mgr, "bench").await;
+
+        let ps_addr = pick_addr();
+        start_partition_server(130, mgr_addr, ps_addr);
+        compio::time::sleep(Duration::from_millis(1800)).await;
+
+        // scoped client `"bench/perf"` prepends `bench/perf/`.
+        // A put of `k1` → wire `bench/perf/k1` → 1st segment `bench/` registered →
+        // ADMITTED.
+        let scoped = ClusterClient::connect(&mgr_addr.to_string(), "bench/perf")
+            .await
+            .expect("scoped connect");
+        scoped.set_rpc_timeout(Duration::from_secs(15));
+        scoped.put(b"k1", b"v1", autumn_client::WriteOptions::default()).await.expect("put in registered ns");
+        assert_eq!(scoped.get(b"k1").await.unwrap().as_deref(), Some(&b"v1"[..]));
+
+        // RAW (anonymous, no client clamp) put of an ABSOLUTE key whose 1st
+        // segment is an UNregistered namespace → Layer-A rejects with
+        // NamespaceUnknown. Anonymous connection is checked too (token-free).
+        let raw = ClusterClient::connect_raw(&mgr_addr.to_string())
+            .await
+            .expect("raw connect");
+        raw.set_rpc_timeout(Duration::from_secs(15));
+        let err = raw.put(b"unreg/x", b"nope", autumn_client::WriteOptions::default()).await.unwrap_err();
+        assert!(
+            matches!(err, AutumnError::NamespaceUnknown(_)),
+            "put to unregistered namespace must be NamespaceUnknown, got {err:?}"
+        );
+
+        // A put whose 1st segment IS registered (`bench/…`) via the raw
+        // client is admitted.
+        raw.put(b"bench/raw-ok", b"ok", autumn_client::WriteOptions::default())
+            .await
+            .expect("raw put under registered ns");
+
+        // DELETE is NOT Layer-A gated (Layer-A is put-class only) → succeeds
+        // (delete of an absent key is OK).
+        raw.delete(b"unreg/x", autumn_client::WriteOptions::default())
+            .await
+            .expect("delete under unregistered ns is not Layer-A gated");
+    });
+}
+
+/// A namespace created after the PS last fetched its registry is writable at
+/// once: the PS answers its first write `Unavailable`, fetches the registry
+/// early, and the client's retry is admitted — no waiting out
+/// `--config-poll-secs` (an hour here). A namespace that really does not exist
+/// still ends in `NamespaceUnknown`.
+#[test]
+fn a_namespace_created_after_the_ps_started_is_writable_at_once() {
+    // Process-wide: the other tests of this binary create no namespace after
+    // their PS started, so the long poll does not touch them.
+    autumn_partition_server::params().config_poll_secs.set(3600);
+    let mgr_addr = pick_addr();
+    start_memory_manager(mgr_addr);
+    let n1_dir = tempfile::tempdir().expect("n1");
+    let n2_dir = tempfile::tempdir().expect("n2");
+    let n1_addr = pick_addr();
+    let n2_addr = pick_addr();
+    start_extent_node(n1_addr, n1_dir.path().to_path_buf(), 150);
+    start_extent_node(n2_addr, n2_dir.path().to_path_buf(), 151);
+
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::version_hello::Role::Admin, None).await.unwrap();
+        register_two_nodes(&mgr, n1_addr, n2_addr, 150).await;
+        let (log, row, meta) = create_three_streams(&mgr).await;
+        upsert_partition(&mgr, 15001, log, row, meta, b"", b"\xff\xff\xff\xff").await;
+        // A non-empty registry at the PS's first fetch, so Layer-A is on.
+        ns_create(&mgr, "bench").await;
+        let ps_addr = pick_addr();
+        start_partition_server(150, mgr_addr, ps_addr);
+        compio::time::sleep(Duration::from_millis(1800)).await;
+
+        ns_create(&mgr, "fresh").await;
+        let scoped = ClusterClient::connect(&mgr_addr.to_string(), "fresh")
+            .await
+            .expect("scoped connect");
+        scoped.set_rpc_timeout(Duration::from_secs(15));
+        let t0 = std::time::Instant::now();
+        scoped.put(b"k", b"v", autumn_client::WriteOptions::default()).await.expect("put in a just-created namespace");
+        assert!(t0.elapsed() < Duration::from_secs(10), "took {:?}", t0.elapsed());
+        assert_eq!(scoped.get(b"k").await.unwrap().as_deref(), Some(&b"v"[..]));
+
+        let raw = ClusterClient::connect_raw(&mgr_addr.to_string())
+            .await
+            .expect("raw connect");
+        raw.set_rpc_timeout(Duration::from_secs(15));
+        let err = raw.put(b"nosuch/x", b"nope", autumn_client::WriteOptions::default()).await.unwrap_err();
+        assert!(
+            matches!(err, AutumnError::NamespaceUnknown(_)),
+            "put to an unregistered namespace must still be NamespaceUnknown, got {err:?}"
+        );
+    });
+}
+
+/// Nothing is registered by default, and an empty registry admits no client
+/// write; an admin connection is not held to namespaces.
+#[test]
+fn an_empty_registry_admits_no_client_write() {
+    let mgr_addr = pick_addr();
+    start_manager(mgr_addr);
+    let n1_dir = tempfile::tempdir().expect("n1");
+    let n2_dir = tempfile::tempdir().expect("n2");
+    let n1_addr = pick_addr();
+    let n2_addr = pick_addr();
+    start_extent_node(n1_addr, n1_dir.path().to_path_buf(), 150);
+    start_extent_node(n2_addr, n2_dir.path().to_path_buf(), 151);
+
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::version_hello::Role::Admin, None).await.unwrap();
+        register_two_nodes(&mgr, n1_addr, n2_addr, 150).await;
+        let (log, row, meta) = create_three_streams(&mgr).await;
+        upsert_partition(&mgr, 15001, log, row, meta, b"", b"\xff\xff\xff\xff").await;
+        let ps_addr = pick_addr();
+        start_partition_server(150, mgr_addr, ps_addr);
+        compio::time::sleep(Duration::from_millis(1800)).await;
+
+        for scope in ["fs", "kvc"] {
+            let c = ClusterClient::connect(&mgr_addr.to_string(), scope).await.expect("scoped connect");
+            c.set_rpc_timeout(Duration::from_secs(15));
+            let err = c.put(b"k", b"v", autumn_client::WriteOptions::default()).await.unwrap_err();
+            assert!(matches!(err, AutumnError::NamespaceUnknown(_)), "{scope}: {err:?}");
+            // The batched path gives up at once with the same error, rather
+            // than refreshing routing as if the partition had moved.
+            let items = [(&b"a"[..], bytes::Bytes::from_static(b"v")), (&b"b"[..], bytes::Bytes::from_static(b"v"))];
+            let t0 = std::time::Instant::now();
+            for r in c.put_many(&items, autumn_client::WriteOptions::default()).await {
+                assert!(matches!(r, Err(AutumnError::NamespaceUnknown(_))), "{scope} put_many: {r:?}");
+            }
+            assert!(t0.elapsed() < Duration::from_secs(5), "{scope} put_many took {:?}", t0.elapsed());
+        }
+        let admin = ClusterClient::connect_admin(&mgr_addr.to_string()).await.expect("admin connect");
+        admin.put(b"anything", b"v", autumn_client::WriteOptions::default()).await.expect("admin put");
+    });
+}
+
+#[test]
+fn putstream_chunks_land_in_scope_range() {
+    let mgr_addr = pick_addr();
+    start_manager(mgr_addr);
+    let n1_dir = tempfile::tempdir().expect("n1");
+    let n2_dir = tempfile::tempdir().expect("n2");
+    let n1_addr = pick_addr();
+    let n2_addr = pick_addr();
+    start_extent_node(n1_addr, n1_dir.path().to_path_buf(), 140);
+    start_extent_node(n2_addr, n2_dir.path().to_path_buf(), 141);
+
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::version_hello::Role::Admin, None).await.unwrap();
+        register_two_nodes(&mgr, n1_addr, n2_addr, 140).await;
+        let (log, row, meta) = create_three_streams(&mgr).await;
+        upsert_partition(&mgr, 14001, log, row, meta, b"", b"\xff\xff\xff\xff").await;
+        let ps_addr = pick_addr();
+        start_partition_server(140, mgr_addr, ps_addr);
+        compio::time::sleep(Duration::from_millis(1800)).await;
+        create_namespaces(mgr_addr, &["bench"]).await;
+
+        // Prepend-bound client on `bench/perf/`.
+        let scoped = ClusterClient::connect(&mgr_addr.to_string(), "bench/perf")
+            .await
+            .expect("scoped connect");
+        scoped.set_rpc_timeout(Duration::from_secs(20));
+
+        // Stripe-put a large value → chunks go through the leaf `put`, so each
+        // chunk key `\xff\xfe…++bigfile` is prefixed ONCE with `bench/perf/`.
+        let value = vec![7u8; 3 * 1024 * 1024]; // 3 MiB → multiple chunks
+        let mut h = scoped.put_stream_begin(b"bigfile", 0).with_chunk_size(1024 * 1024);
+        h.send(&value).await.expect("send");
+        h.commit().await.expect("commit");
+
+        // A scoped range scan (empty prefix → the whole `bench/perf/`)
+        // sees BOTH the meta key and the striped chunk keys — proving the chunks
+        // landed inside the scope range. The binding strips `bench/perf/`, so
+        // the chunk keys come back starting with the `\xff\xfe` chunk prefix.
+        let scan = scoped.range(b"", b"", 10_000).await.expect("scoped range");
+        let has_meta = scan.entries.iter().any(|e| e.key == b"bigfile");
+        let has_chunk = scan
+            .entries
+            .iter()
+            .any(|e| e.key.starts_with(b"\xff\xfe"));
+        assert!(has_meta, "meta key `bigfile` must be in the scope range");
+        assert!(
+            has_chunk,
+            "striped chunk keys (\\xff\\xfe…) must be in the scope range"
+        );
+
+        // On the WIRE the chunk keys are `bench/perf/\xff\xfe…` — verify via a raw
+        // client that scanning the GLOBAL `\xff\xfe` space finds NOTHING (the
+        // chunks are NOT in a global stripe namespace), while scanning the
+        // `bench/perf/` prefix DOES find them.
+        let raw = ClusterClient::connect_raw(&mgr_addr.to_string())
+            .await
+            .expect("raw connect");
+        raw.set_rpc_timeout(Duration::from_secs(20));
+        let global = raw.range(b"\xff\xfe", b"\xff\xfe", 100).await.expect("raw global range");
+        assert!(
+            global.entries.is_empty(),
+            "no chunk key may live in the GLOBAL \\xff\\xfe space (found {})",
+            global.entries.len()
+        );
+        let in_scope = raw
+            .range(b"bench/perf/", b"bench/perf/", 10_000)
+            .await
+            .expect("raw scope range");
+        assert!(
+            in_scope
+                .entries
+                .iter()
+                .any(|e| e.key.starts_with(b"bench/perf/\xff\xfe")),
+            "chunk keys must be under `bench/perf/\\xff\\xfe…` on the wire"
+        );
+    });
+}

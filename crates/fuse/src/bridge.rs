@@ -1,0 +1,204 @@
+//! FUSE thread ↔ compio thread bridge.
+//!
+//! `fuser` callbacks run on fuser's own threads. `ClusterClient` uses `Rc<RpcClient>`
+//! which is `!Send`. We bridge via `futures::channel::mpsc::unbounded`: fuser threads
+//! call `unbounded_send` (non-blocking, Send-safe) and block on a std oneshot for
+//! the reply. The compio thread awaits `rx.next()` so the dispatcher never busy-polls.
+
+use std::ffi::OsString;
+use std::time::Duration;
+
+use anyhow::Result;
+
+/// One-shot reply channel (std mpsc works fine for single reply).
+pub type Reply<T> = std::sync::mpsc::Sender<Result<T>>;
+
+/// Create a reply pair: (sender for compio thread, receiver for fuser thread).
+pub fn reply_channel<T>() -> (Reply<T>, std::sync::mpsc::Receiver<Result<T>>) {
+    std::sync::mpsc::channel()
+}
+
+/// All filesystem requests dispatched from fuser threads to the compio thread.
+pub enum FsRequest {
+    // ── Metadata ────────────────────────────────────────────
+    Init {
+        reply: Reply<()>,
+    },
+    Destroy,
+
+    Lookup {
+        parent: u64,
+        name: OsString,
+        reply: Reply<(fuser::FileAttr, u64)>,
+    },
+    Forget {
+        ino: u64,
+        nlookup: u64,
+    },
+    GetAttr {
+        ino: u64,
+        reply: Reply<fuser::FileAttr>,
+    },
+    SetAttr {
+        ino: u64,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        size: Option<u64>,
+        atime: Option<fuser::TimeOrNow>,
+        mtime: Option<fuser::TimeOrNow>,
+        reply: Reply<fuser::FileAttr>,
+    },
+
+    // ── Directory operations ────────────────────────────────
+    Mkdir {
+        parent: u64,
+        name: OsString,
+        mode: u32,
+        reply: Reply<fuser::FileAttr>,
+    },
+    Rmdir {
+        parent: u64,
+        name: OsString,
+        reply: Reply<()>,
+    },
+    Readdir {
+        ino: u64,
+        offset: i64,
+        reply: Reply<Vec<ReaddirEntry>>,
+    },
+    Rename {
+        old_parent: u64,
+        old_name: OsString,
+        new_parent: u64,
+        new_name: OsString,
+        reply: Reply<()>,
+    },
+
+    // ── File operations ─────────────────────────────────────
+    Create {
+        parent: u64,
+        name: OsString,
+        mode: u32,
+        flags: i32,
+        reply: Reply<(fuser::FileAttr, u64)>, // (attr, fh)
+    },
+    Unlink {
+        parent: u64,
+        name: OsString,
+        reply: Reply<()>,
+    },
+    Link {
+        ino: u64,
+        parent: u64,
+        name: OsString,
+        reply: Reply<fuser::FileAttr>,
+    },
+    Open {
+        ino: u64,
+        flags: i32,
+        reply: Reply<(u64, u32)>, // (fh, FOPEN_* flags)
+    },
+    /// **Async-reply Read** — does NOT use the std::mpsc reply channel.
+    /// Instead, the fuser-side `ReplyData` is shipped across the bridge
+    /// to the compio thread, which calls `reply.data(...)` directly when
+    /// the parallel chunk fetch completes. This unblocks fuser's
+    /// single-threaded dispatch loop (see fuser-0.15 `Session::run` doc:
+    /// "read-dispatch-loop is non-concurrent"). Without this, every
+    /// FUSE read serialized at the kernel-channel layer regardless of
+    /// our compio-side concurrency.
+    Read {
+        ino: u64,
+        offset: i64,
+        size: u32,
+        fuse_reply: fuser::ReplyData,
+    },
+    Write {
+        ino: u64,
+        offset: i64,
+        data: Vec<u8>,
+        reply: Reply<u32>, // bytes written
+    },
+    Flush {
+        ino: u64,
+        reply: Reply<()>,
+    },
+    Release {
+        ino: u64,
+        /// The fd's open flags, echoed back by the kernel. They name the role
+        /// (`O_RDONLY` reader vs writer) whose refcount this close drops —
+        /// a file can be open in both roles at once.
+        flags: i32,
+        flush: bool,
+        reply: Reply<()>,
+    },
+    Fsync {
+        ino: u64,
+        datasync: bool,
+        reply: Reply<()>,
+    },
+    Statfs {
+        reply: Reply<StatfsData>,
+    },
+}
+
+// FsRequest is Send because all its fields are Send
+unsafe impl Send for FsRequest {}
+
+/// A single readdir entry. The struct lives in the
+/// fuser-free core (`schema::ReaddirEntry`, `kind` = `DT_*` byte);
+/// re-exported here so `bridge::ReaddirEntry` callers keep compiling.
+pub use autumn_fs::schema::ReaddirEntry;
+
+/// Simplified statfs data.
+pub struct StatfsData {
+    pub blocks: u64,
+    pub bfree: u64,
+    pub bavail: u64,
+    pub files: u64,
+    pub ffree: u64,
+    pub bsize: u32,
+    pub namelen: u32,
+}
+
+/// The bridge uses `futures::channel::mpsc` so the compio thread can await
+/// incoming requests instead of busy-polling `try_recv`. Senders are on
+/// fuser's own OS threads (Send-safe), receiver is driven by the compio
+/// event loop.
+pub struct FuseBridge {
+    pub tx: futures::channel::mpsc::UnboundedSender<FsRequest>,
+    pub rx: futures::channel::mpsc::UnboundedReceiver<FsRequest>,
+}
+
+impl Default for FuseBridge {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FuseBridge {
+    pub fn new() -> Self {
+        let (tx, rx) = futures::channel::mpsc::unbounded();
+        Self { tx, rx }
+    }
+}
+
+/// Helper: send a request and block waiting for the reply.
+/// Used by `ops.rs` fuser callbacks.
+pub fn call_sync<T>(
+    tx: &futures::channel::mpsc::UnboundedSender<FsRequest>,
+    req: FsRequest,
+    reply_rx: std::sync::mpsc::Receiver<Result<T>>,
+) -> Result<T> {
+    tx.unbounded_send(req)
+        .map_err(|_| anyhow::anyhow!("fs bridge channel closed"))?;
+    reply_rx
+        .recv_timeout(reply_timeout())
+        .map_err(|_| anyhow::anyhow!("fs reply timeout"))?
+}
+
+/// Timeout for blocking on reply (prevent deadlock on shutdown;
+/// `--reply-timeout-secs`).
+pub fn reply_timeout() -> Duration {
+    Duration::from_secs(crate::params().reply_timeout_secs.get())
+}

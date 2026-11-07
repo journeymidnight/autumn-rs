@@ -1,0 +1,1518 @@
+//! Wire protocol framing for autumn-rpc.
+//!
+//! ONE frame shape (wire v28) — no flag-dependent variants:
+//!
+//! ```text
+//! ┌───────────┬──────────┬───────┬──────────────┐
+//! │ req_id    │ msg_type │ flags │ payload_len  │   header, 10 B
+//! │ u32 LE    │ u8       │ u8    │ u32 LE       │
+//! └───────────┴──────────┴───────┴──────────────┘
+//! payload = [ctrl_len: u32 LE][ctrl …][crc32c: u32 LE][value …]
+//! ```
+//!
+//! The CRC32C covers `header ++ ctrl_len ++ ctrl` — control bytes are ALWAYS
+//! protected (there is no CRC flag bit; protection is structural). The `value`
+//! tail is raw: bulk value integrity is the transport's job (UCX NIC ICRC /
+//! TCP kernel checksum) plus the storage-layer checksums (WAL record CRC, SST
+//! block CRC). `value_len = payload_len − 4 − ctrl_len − 4` and may be 0.
+//!
+//! Per-msg_type ctrl/value split:
+//! - normal rkyv / binary RPCs and error envelopes: ctrl = whole body, no value.
+//! - `MSG_GET` / `MSG_BATCH_GET` / `MSG_READ` responses: ctrl = `[code:1][…]`,
+//!   value = the raw value bytes (recv'd straight into a `PooledBuf`).
+//! - `MSG_PUT` requests: ctrl = `[put meta][key]`, value = raw value —
+//!   the sender never CRC-scans the value.
+//! - `MSG_APPEND` requests: ctrl = `[header][crc32c(payload)]`, value = the
+//!   payload; the extent node checks the crc, the payload's in-transit check.
+//!
+//! `FLAG_AM_VALUE` (UCX, peers at `WIRE_VERSION_WITH_AM_VALUES`): pieces of the
+//! value travel as UCX active messages beside the frame, by rendezvous, so the
+//! receiving CPU does not copy them. The ctrl region then ends with the piece
+//! list — `[(len: u32 LE, tag: u64 LE) × n][n: u16 LE]`, CRC-covered — and only
+//! the tag-0 pieces follow on the stream, in order (`am_frame`).
+//!
+//! Header-inclusive CRC closes two pre-v28 holes: a flipped `req_id` delivering
+//! a valid-CRC response to the wrong caller, and a flipped CRC flag bit
+//! silently disabling verification (the bit no longer exists).
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  ⚠️  WIRE SCHEMA. Edit an `Archive` type here — add, remove, reorder or
+//  retype a field, or change what one MEANS — and you MUST bump
+//  `WIRE_VERSION` in `crates/rpc/src/lib.rs` — and raise
+//  `MIN_CLIENT_WIRE_VERSION` too if the change breaks the CLIENT surface.
+//
+//  NOTHING CHECKS THIS FOR YOU. The schema fingerprint that used to catch a
+//  forgotten bump was removed; the version integer is the only guard left,
+//  and it is maintained by hand. Forget it and two binaries claiming the same
+//  version will handshake, then decode each other's bytes as garbage — no
+//  error, no log, just wrong data. That has happened here before.
+// ═══════════════════════════════════════════════════════════════════════════
+
+use autumn_transport::RegBytes;
+use bytes::{Buf, BufMut, Bytes, BytesMut};
+
+/// Frame header size in bytes.
+pub const HEADER_LEN: usize = 10;
+
+/// Size of the `ctrl_len` field that starts every payload.
+pub const CTRL_PREFIX_LEN: usize = 4;
+
+/// Size of the CRC32C field between ctrl and value.
+pub const CRC_LEN: usize = 4;
+
+/// Fixed per-frame payload overhead: `ctrl_len` field + CRC.
+pub const CTRL_OVERHEAD: usize = CTRL_PREFIX_LEN + CRC_LEN;
+
+/// Maximum payload size: 4 GB - 1 (u32::MAX).
+/// Individual services should enforce their own practical limits.
+pub const MAX_PAYLOAD_LEN: u32 = u32::MAX;
+
+/// The largest payload a client connection may send where all it may send is
+/// a small control message: to the manager, to an extent node, and to a
+/// partition server before CLIENT_AUTH while authz is on
+/// (`FrameDecoder::set_max_payload`). A header declaring more is refused
+/// before anything is reserved for it.
+pub const CLIENT_CONTROL_MAX_PAYLOAD: u32 = 1 << 20;
+
+// Flag bits. Bit 3 (0x08) is RESERVED — it was FLAG_CRC before wire v28, when
+// CRC presence was optional; protection is now structural, so the bit is gone.
+pub const FLAG_RESPONSE: u8 = 0x01;
+pub const FLAG_ERROR: u8 = 0x02;
+pub const FLAG_STREAM_END: u8 = 0x04;
+/// The value's pieces are listed at the end of the ctrl region; those with a
+/// tag come as UCX active messages (see the module doc).
+pub const FLAG_AM_VALUE: u8 = 0x10;
+
+/// One piece of the value of a `FLAG_AM_VALUE` frame: `(len, tag)`. Tag 0 is
+/// the next `len` bytes of the stream tail; any other tag is an active message
+/// on the same connection.
+pub type AmPiece = (usize, u64);
+
+const AM_PIECE_LEN: usize = 12;
+const AM_COUNT_LEN: usize = 2;
+
+/// A single RPC frame on the wire.
+#[derive(Debug, Clone)]
+pub struct Frame {
+    pub req_id: u32,
+    pub msg_type: u8,
+    pub flags: u8,
+    /// Control bytes — the CRC-protected part (rkyv body / error envelope /
+    /// bulk meta+key). For non-value-separable frames this is the whole logical
+    /// payload, so existing handlers keep reading `frame.payload` unchanged.
+    pub payload: Bytes,
+    /// Raw value tail — NOT covered by the frame CRC (transport + storage
+    /// integrity). Empty for non-value-separable frames. For a frame with
+    /// `am_pieces`, only the pieces that came on the stream. A value received
+    /// into a pool buffer keeps its registration, so sending it on (a PS's
+    /// append to the extent nodes) hands UCX the buffer's memh.
+    pub value: RegBytes,
+    /// The value's pieces when some come as active messages
+    /// (`FLAG_AM_VALUE`); the receiver assembles it (`am_frame::receive_value`).
+    pub am_pieces: Option<Vec<AmPiece>>,
+    /// The whole value in parts, in order, when it came as active messages
+    /// too large for one pool buffer (`am_frame::start`); `value` is then
+    /// empty. Empty otherwise.
+    pub value_parts: Vec<RegBytes>,
+}
+
+impl Frame {
+    /// Create a new request frame (ctrl-only, no raw value tail).
+    pub fn request(req_id: u32, msg_type: u8, payload: Bytes) -> Self {
+        Self {
+            req_id,
+            msg_type,
+            flags: 0,
+            payload,
+            value: RegBytes::default(),
+            am_pieces: None,
+            value_parts: Vec::new(),
+        }
+    }
+
+    /// Create a response frame (ctrl-only, no raw value tail).
+    pub fn response(req_id: u32, msg_type: u8, payload: Bytes) -> Self {
+        Self {
+            req_id,
+            msg_type,
+            flags: FLAG_RESPONSE,
+            payload,
+            value: RegBytes::default(),
+            am_pieces: None,
+            value_parts: Vec::new(),
+        }
+    }
+
+    /// Create an error response frame. `payload` is the status envelope
+    /// (`RpcError::encode_status`), carried in ctrl (CRC-protected).
+    pub fn error(req_id: u32, msg_type: u8, payload: Bytes) -> Self {
+        Self {
+            req_id,
+            msg_type,
+            flags: FLAG_RESPONSE | FLAG_ERROR,
+            payload,
+            value: RegBytes::default(),
+            am_pieces: None,
+            value_parts: Vec::new(),
+        }
+    }
+
+    /// Create a value-separable request frame: `payload` = ctrl (CRC'd),
+    /// `value` = raw tail (transport integrity). `MSG_PUT`'s shape.
+    pub fn request_zc(req_id: u32, msg_type: u8, ctrl: Bytes, value: Bytes) -> Self {
+        Self {
+            req_id,
+            msg_type,
+            flags: 0,
+            payload: ctrl,
+            value: value.into(),
+            am_pieces: None,
+            value_parts: Vec::new(),
+        }
+    }
+
+    /// Create a value-separable response frame: `payload` = ctrl (CRC'd,
+    /// `[code:1][message…]` for the bulk read responses), `value` = raw tail.
+    pub fn response_zc(req_id: u32, msg_type: u8, ctrl: Bytes, value: Bytes) -> Self {
+        Self {
+            req_id,
+            msg_type,
+            flags: FLAG_RESPONSE,
+            payload: ctrl,
+            value: value.into(),
+            am_pieces: None,
+            value_parts: Vec::new(),
+        }
+    }
+
+    pub fn is_response(&self) -> bool {
+        self.flags & FLAG_RESPONSE != 0
+    }
+
+    pub fn is_error(&self) -> bool {
+        self.flags & FLAG_ERROR != 0
+    }
+
+    pub fn is_stream_end(&self) -> bool {
+        self.flags & FLAG_STREAM_END != 0
+    }
+
+    /// Encode this frame into one buffer:
+    /// `[header][ctrl_len][ctrl][crc32c][value]`, CRC over
+    /// `header ++ ctrl_len ++ ctrl`.
+    pub fn encode(&self) -> Bytes {
+        let ctrl_len = self.payload.len();
+        let (wire_len, ctrl_len_u32) = header_lens(ctrl_len, self.value.len());
+        let mut buf = BytesMut::with_capacity(HEADER_LEN + wire_len as usize);
+        buf.put_u32_le(self.req_id);
+        buf.put_u8(self.msg_type);
+        buf.put_u8(self.flags);
+        buf.put_u32_le(wire_len);
+        buf.put_u32_le(ctrl_len_u32);
+        buf.extend_from_slice(&self.payload);
+        let crc = crc32c::crc32c(&buf[..HEADER_LEN + CTRL_PREFIX_LEN + ctrl_len]);
+        buf.put_u32_le(crc);
+        buf.extend_from_slice(&self.value);
+        buf.freeze()
+    }
+
+    /// Build + encode a (ctrl-only) response frame in ONE allocation, writing
+    /// the ctrl bytes straight into the frame buffer via `write_payload`
+    /// (which must append exactly `payload_len` bytes), then appending the
+    /// CRC32C. Byte-for-byte identical to
+    /// `Frame::response(req_id, msg_type, payload).encode()` without the
+    /// intermediate payload `Bytes` (saves one alloc + one payload memcpy on
+    /// the read hot path).
+    pub fn encode_response_with<F: FnOnce(&mut BytesMut)>(
+        req_id: u32,
+        msg_type: u8,
+        payload_len: usize,
+        write_payload: F,
+    ) -> Bytes {
+        // Before `write_payload` runs: a caller that is over the ceiling should
+        // learn it without first being asked to produce the bytes.
+        let (wire_len, ctrl_len_u32) = header_lens(payload_len, 0);
+        let mut buf = BytesMut::with_capacity(HEADER_LEN + wire_len as usize);
+        buf.put_u32_le(req_id);
+        buf.put_u8(msg_type);
+        buf.put_u8(FLAG_RESPONSE);
+        buf.put_u32_le(wire_len);
+        buf.put_u32_le(ctrl_len_u32);
+        let payload_start = buf.len();
+        write_payload(&mut buf);
+        // Release-enforced (not debug-only): a `write_payload` that appends a
+        // different count than `payload_len` would emit a frame whose header
+        // `payload_len`, actual ctrl, and CRC position disagree — a malformed
+        // frame that desyncs the peer's `FrameDecoder`. Fail loud rather than
+        // ship a silently-bad frame.
+        assert_eq!(
+            buf.len() - payload_start,
+            payload_len,
+            "encode_response_with: write_payload appended {} bytes, expected {payload_len}",
+            buf.len() - payload_start,
+        );
+        let crc = crc32c::crc32c(&buf[..]);
+        buf.put_u32_le(crc);
+        buf.freeze()
+    }
+}
+
+/// The two length fields every encoder writes into the header, narrowed to the
+/// `u32` the wire format gives them, with the payload bound checked.
+///
+/// `as u32` on its own is a silent wrap: a payload at or past 4 GiB writes a
+/// header that disagrees with the bytes that follow it, the peer's
+/// `FrameDecoder` fails its CRC, and the symptom an operator sees is "corrupt
+/// frame", not "this response was too large". That has already cost one
+/// misdiagnosis — an EC rebuild reading a `u32::MAX + 29,421` byte shard was
+/// read as a 30 s timeout until the log timestamps (10.75 s between attempts,
+/// not 4x30 s) disproved it.
+///
+/// **Debug-only, deliberately.** An `assert!` here would be release-enforced,
+/// and release is `panic = "abort"` — so a frame this size would kill the
+/// process rather than unwind, and every producer below is reachable from a
+/// REMOTE request. Trading a corrupt frame for a dead node is not an
+/// improvement, so the bound that actually protects production lives at each
+/// producer, where it can REFUSE and keep serving:
+///
+/// - extent-node reads — `READ_REPLY_MAX_VALUE_BYTES` / `ReadRefusal::TooLargeForOneFrame`
+/// - PS batch get — `batch_get_budget_exceeded`
+/// - PS group-commit append — `MAX_WRITE_BATCH_BYTES`
+///
+/// What is left for the debug assert is the developer loop: a new path that
+/// forgot to chunk trips it in `cargo test` and in any debug build, which is
+/// where it is cheap to find. In release the length still narrows, so a
+/// producer nobody bounded still emits a wrapped header — that is the failure
+/// this file cannot fix on its own, and the reason the bound belongs upstream.
+///
+/// Bounded by `MAX_PAYLOAD_LEN`, the decoder's default bound
+/// (`FrameError::PayloadTooLarge`), not by a second copy of `u32::MAX`.
+///
+/// It COMPUTES `wire_payload_len` rather than taking it, which is what makes
+/// one check enough: the payload always contains the ctrl, so a ctrl too large
+/// to narrow makes the payload too large first and a second assert on
+/// `ctrl_len` would be unreachable. Taking both as independent arguments made
+/// that a property of today's callers instead — a future encoder that derived
+/// the payload length some other way would get a silently wrapped `ctrl_len`,
+/// which is this very bug one level up.
+#[inline]
+fn header_lens(ctrl_len: usize, value_len: usize) -> (u32, u32) {
+    let wire_payload_len = CTRL_OVERHEAD + ctrl_len + value_len;
+    debug_assert!(
+        wire_payload_len <= MAX_PAYLOAD_LEN as usize,
+        "frame payload is {wire_payload_len} bytes, over the wire format's {MAX_PAYLOAD_LEN} \
+         byte ceiling — the caller must chunk it",
+    );
+    (wire_payload_len as u32, ctrl_len as u32)
+}
+
+/// Header + `ctrl_len` prefix for a vectored write (14 bytes). The caller
+/// follows these bytes with the ctrl parts, the 4-byte CRC trailer
+/// (`compute_ctrl_crc` over this head + the same ctrl parts), then the raw
+/// value parts (if any). `ctrl_len`/`value_len` are the parts' total sizes.
+pub fn encode_vectored_head(
+    req_id: u32,
+    msg_type: u8,
+    flags: u8,
+    ctrl_len: usize,
+    value_len: usize,
+) -> [u8; HEADER_LEN + CTRL_PREFIX_LEN] {
+    let mut h = [0u8; HEADER_LEN + CTRL_PREFIX_LEN];
+    h[0..4].copy_from_slice(&req_id.to_le_bytes());
+    h[4] = msg_type;
+    h[5] = flags;
+    let (wire_len, ctrl_len_u32) = header_lens(ctrl_len, value_len);
+    h[6..10].copy_from_slice(&wire_len.to_le_bytes());
+    h[10..14].copy_from_slice(&ctrl_len_u32.to_le_bytes());
+    h
+}
+
+/// Compute the frame CRC32C for a vectored write: over the 14-byte
+/// `encode_vectored_head` bytes ++ the ctrl parts (NEVER the value parts).
+/// Returns the 4-byte little-endian CRC field.
+pub fn compute_ctrl_crc(head: &[u8], ctrl_parts: &[Bytes]) -> [u8; 4] {
+    let mut crc = crc32c::crc32c(head);
+    for p in ctrl_parts {
+        crc = crc32c::crc32c_append(crc, p);
+    }
+    crc.to_le_bytes()
+}
+
+/// Split a `FLAG_AM_VALUE` ctrl region into the ctrl length and the piece
+/// list at its end. `stream_len`: value bytes that follow on the stream, which
+/// the tag-0 pieces must add up to.
+fn split_am_pieces(region: &[u8], stream_len: usize) -> Result<(usize, Vec<AmPiece>), FrameError> {
+    let bad = |why| Err(FrameError::Malformed(why));
+    let Some(count_at) = region.len().checked_sub(AM_COUNT_LEN) else {
+        return bad("value piece list missing");
+    };
+    let n = u16::from_le_bytes(region[count_at..].try_into().unwrap()) as usize;
+    let Some(ctrl_len) = count_at.checked_sub(n * AM_PIECE_LEN) else {
+        return bad("value piece list longer than the ctrl");
+    };
+    let mut pieces = Vec::with_capacity(n);
+    let mut inline = 0usize;
+    for p in region[ctrl_len..count_at].chunks_exact(AM_PIECE_LEN) {
+        let len = u32::from_le_bytes(p[..4].try_into().unwrap()) as usize;
+        let tag = u64::from_le_bytes(p[4..].try_into().unwrap());
+        if tag == 0 {
+            inline += len;
+        }
+        pieces.push((len, tag));
+    }
+    if inline != stream_len || !pieces.iter().any(|p| p.1 != 0) {
+        return bad("value pieces disagree with the frame");
+    }
+    let mut tags: Vec<u64> = pieces.iter().filter(|p| p.1 != 0).map(|p| p.1).collect();
+    tags.sort_unstable();
+    if pieces.iter().any(|p| p.0 == 0) || tags.windows(2).any(|w| w[0] == w[1]) {
+        // An empty or repeated tagged piece would wait for a value that never comes.
+        return bad("value pieces: an empty or repeated piece");
+    }
+    Ok((ctrl_len, pieces))
+}
+
+/// A `FLAG_AM_VALUE` frame: the buffers to write on the stream, and the
+/// `(tag, value part)` active messages to send beside them. Each value part of
+/// at least `BULK_MIN_BYTES` becomes its own message (rendezvous moves only
+/// contiguous memory without a copy), except that one with no memh larger than
+/// `STAGED_PIECE_BYTES` is cut into equal pieces of at most that (no copy; each
+/// is staged on its own, a few at a time, and none is under `BULK_MIN_BYTES`,
+/// as every frame value must go by rendezvous); smaller parts stay on the
+/// stream, one piece per run of them. `next_tag` gives tags unique on the
+/// connection.
+pub fn encode_am_frame<V: Into<RegBytes>>(
+    req_id: u32,
+    msg_type: u8,
+    flags: u8,
+    ctrl_parts: Vec<Bytes>,
+    value_parts: Vec<V>,
+    mut next_tag: impl FnMut() -> u64,
+) -> (Vec<Bytes>, Vec<(u64, RegBytes)>) {
+    let mut pieces: Vec<AmPiece> = Vec::new();
+    let mut inline = Vec::new();
+    let mut am = Vec::new();
+    for part in value_parts {
+        let part = part.into();
+        if part.len() >= autumn_transport::BULK_MIN_BYTES {
+            let max = autumn_transport::am::STAGED_PIECE_BYTES;
+            let n = if part.is_registered() { 1 } else { part.len().div_ceil(max) };
+            let (each, mut at) = (part.len().div_ceil(n), 0);
+            while at < part.len() {
+                let piece = part.slice(at..(at + each).min(part.len()));
+                at += piece.len();
+                let tag = next_tag();
+                pieces.push((piece.len(), tag));
+                am.push((tag, piece));
+            }
+        } else if !part.is_empty() {
+            match pieces.last_mut() {
+                Some((len, 0)) => *len += part.len(),
+                _ => pieces.push((part.len(), 0)),
+            }
+            inline.push(part.into_bytes());
+        }
+    }
+    let mut list = BytesMut::with_capacity(pieces.len() * AM_PIECE_LEN + AM_COUNT_LEN);
+    for &(len, tag) in &pieces {
+        debug_assert!(len <= u32::MAX as usize);
+        list.put_u32_le(len as u32);
+        list.put_u64_le(tag);
+    }
+    assert!(pieces.len() <= u16::MAX as usize, "{} value pieces in one frame", pieces.len());
+    list.put_u16_le(pieces.len() as u16);
+    let list = list.freeze();
+    let ctrl_len = ctrl_parts.iter().map(Bytes::len).sum::<usize>() + list.len();
+    let inline_len = inline.iter().map(Bytes::len).sum();
+    let head = encode_vectored_head(req_id, msg_type, flags | FLAG_AM_VALUE, ctrl_len, inline_len);
+    let mut crc = crc32c::crc32c(&head);
+    for p in ctrl_parts.iter().chain(std::iter::once(&list)) {
+        crc = crc32c::crc32c_append(crc, p);
+    }
+    let mut bufs = Vec::with_capacity(3 + ctrl_parts.len() + inline.len());
+    bufs.push(Bytes::copy_from_slice(&head));
+    bufs.extend(ctrl_parts);
+    bufs.push(list);
+    bufs.push(Bytes::copy_from_slice(&crc.to_le_bytes()));
+    bufs.extend(inline);
+    (bufs, am)
+}
+
+/// The stream form of a value-separable request: `[head][ctrl…][crc][values…]`,
+/// the crc over the head and ctrl only, the values a raw tail.
+pub fn value_separable_bufs(req_id: u32, msg_type: u8, ctrl_parts: Vec<Bytes>, values: Vec<Bytes>) -> Vec<Bytes> {
+    let ctrl_len: usize = ctrl_parts.iter().map(|p| p.len()).sum();
+    let value_len: usize = values.iter().map(|v| v.len()).sum();
+    let head = encode_vectored_head(req_id, msg_type, 0, ctrl_len, value_len);
+    let crc = compute_ctrl_crc(&head, &ctrl_parts);
+    let mut bufs = Vec::with_capacity(3 + ctrl_parts.len() + values.len());
+    bufs.push(Bytes::copy_from_slice(&head));
+    bufs.extend(ctrl_parts);
+    bufs.push(Bytes::copy_from_slice(&crc));
+    bufs.extend(values);
+    bufs
+}
+
+/// An append's body and its checksum, reusable across replica connections:
+/// the ctrl is built from crc32c(body) (an `AppendHeader`), the body the frame's value — as
+/// frame values over UCX when a part warrants it, else the raw tail. The
+/// frame CRC covers only the head and ctrl on every replica; the body is
+/// scanned once, by the first frame, whatever the replica count — or not at
+/// all here when its encoder already knew the crc (`with_crc`, checked against
+/// a scan in debug builds; a wrong one is refused by the extent node).
+pub struct PreparedPayload {
+    /// Builds the ctrl from the body's crc32c (an append's `AppendHeader`).
+    make_ctrl: Box<dyn Fn(u32) -> Bytes>,
+    /// Each part keeps the registration it came with: a value received into a
+    /// pool buffer goes out with that buffer's memh.
+    body: Vec<RegBytes>,
+    /// The ctrl, built once by the first frame.
+    ctrl: std::cell::OnceCell<Bytes>,
+}
+
+impl PreparedPayload {
+    pub fn new<B: Into<RegBytes>>(make_ctrl: impl Fn(u32) -> Bytes + 'static, body: Vec<B>) -> Self {
+        Self {
+            make_ctrl: Box::new(make_ctrl),
+            body: body.into_iter().map(Into::into).collect(),
+            ctrl: std::cell::OnceCell::new(),
+        }
+    }
+
+    /// With the body's crc32c already known, computed by whoever encoded the
+    /// body while its bytes were in cache.
+    pub fn with_crc<B: Into<RegBytes>>(
+        make_ctrl: impl Fn(u32) -> Bytes + 'static,
+        body: Vec<B>,
+        crc: u32,
+    ) -> Self {
+        let body: Vec<RegBytes> = body.into_iter().map(Into::into).collect();
+        debug_assert_eq!(crc, body.iter().fold(0, |c, p| crc32c::crc32c_append(c, p)), "precomputed body crc");
+        let ctrl = std::cell::OnceCell::from(make_ctrl(crc));
+        Self { make_ctrl: Box::new(make_ctrl), body, ctrl }
+    }
+
+    pub fn body(&self) -> &[RegBytes] {
+        &self.body
+    }
+
+    fn ctrl(&self) -> &Bytes {
+        self.ctrl.get_or_init(|| {
+            let crc = self.body.iter().fold(0, |crc, p| crc32c::crc32c_append(crc, p));
+            (self.make_ctrl)(crc)
+        })
+    }
+
+    /// The ctrl parts and the body.
+    pub fn ctrl_and_body(&self) -> (Vec<Bytes>, Vec<RegBytes>) {
+        (vec![self.ctrl().clone()], self.body.clone())
+    }
+
+    /// The stream form of one frame of it, as `value_separable_bufs` builds
+    /// it, straight into one Vec (one per replica, on the append path).
+    pub fn stream_parts(&self, req_id: u32, msg_type: u8) -> Vec<Bytes> {
+        let ctrl = self.ctrl();
+        let value_len: usize = self.body.iter().map(|p| p.len()).sum();
+        let head = encode_vectored_head(req_id, msg_type, 0, ctrl.len(), value_len);
+        let frame_crc = crc32c::crc32c_append(crc32c::crc32c(&head), ctrl).to_le_bytes();
+        let mut bufs = Vec::with_capacity(3 + self.body.len());
+        bufs.push(Bytes::copy_from_slice(&head));
+        bufs.push(ctrl.clone());
+        bufs.push(Bytes::copy_from_slice(&frame_crc));
+        bufs.extend(self.body.iter().map(|p| p.bytes().clone()));
+        bufs
+    }
+}
+
+/// Build the complete head of a value-separable RESPONSE as ONE buffer:
+/// `[header][ctrl_len][code:1][message][crc]`. The caller emits the raw value
+/// as the following iovec(s); `value_len` only feeds the header's
+/// `payload_len`. This is the read response (`MSG_GET`): status code +
+/// human-readable message ride in the
+/// CRC-protected ctrl, the value is a raw tail the receiver lands in a
+/// `PooledBuf`.
+pub fn encode_bulk_response_head(
+    req_id: u32,
+    msg_type: u8,
+    code: u8,
+    message: &str,
+    value_len: usize,
+) -> Bytes {
+    encode_bulk_response_head_bytes(req_id, msg_type, code, message.as_bytes(), value_len)
+}
+
+/// `encode_bulk_response_head` for a ctrl tail that is NOT text. The layout is
+/// unchanged — `[code:1][tail…]`, CRC'd, with the raw values following — so
+/// `parse_bulk_ctrl` reads it the same way; only the interpretation of the tail
+/// differs. A batched bulk read puts its per-key statuses and value lengths
+/// here, which is what lets one reply carry N values and still be splittable.
+pub fn encode_bulk_response_head_bytes(
+    req_id: u32,
+    msg_type: u8,
+    code: u8,
+    ctrl_tail: &[u8],
+    value_len: usize,
+) -> Bytes {
+    let message = ctrl_tail;
+    let ctrl_len = 1 + message.len();
+    let (wire_len, ctrl_len_u32) = header_lens(ctrl_len, value_len);
+    let mut buf = BytesMut::with_capacity(HEADER_LEN + CTRL_PREFIX_LEN + ctrl_len + CRC_LEN);
+    buf.put_u32_le(req_id);
+    buf.put_u8(msg_type);
+    buf.put_u8(FLAG_RESPONSE);
+    buf.put_u32_le(wire_len);
+    buf.put_u32_le(ctrl_len_u32);
+    buf.put_u8(code);
+    buf.extend_from_slice(message);
+    let crc = crc32c::crc32c(&buf[..]);
+    buf.put_u32_le(crc);
+    buf.freeze()
+}
+
+/// Parse a bulk read-response ctrl: `[code:1][message…]`. `None` on empty ctrl.
+pub fn parse_bulk_ctrl(ctrl: &[u8]) -> Option<(u8, &[u8])> {
+    ctrl.split_first().map(|(c, m)| (*c, m))
+}
+
+/// Verified prologue of the frame at the front of a `FrameDecoder` — the
+/// bulk fast paths use it to learn the value boundary and validate the control
+/// bytes BEFORE recv'ing the value straight into its destination.
+#[derive(Debug, Clone, Copy)]
+pub struct BulkPrologue {
+    pub req_id: u32,
+    pub msg_type: u8,
+    pub flags: u8,
+    pub ctrl_len: usize,
+    pub value_len: usize,
+}
+
+/// Spare capacity of a [`FrameDecoder`]'s own buffer, lent to one socket read.
+///
+/// A read into it lands the received bytes where the decoder will split frames
+/// from, so a frame's payload is the same memory the transport wrote: TCP's
+/// kernel copy or UCX Stream's unpack is the only copy on receive. Hand it back
+/// with [`FrameDecoder::finish_read`] before the decoder is used again; a loop
+/// that abandons the connection may drop it together with the decoder.
+pub type ReadWindow = compio::buf::Slice<BytesMut>;
+
+/// Decode state machine for reading frames from a byte stream.
+pub struct FrameDecoder {
+    buf: BytesMut,
+    /// Largest payload accepted. A frame's whole length is reserved from its
+    /// header alone (so a large frame is received in place), so an untrusted
+    /// connection's limit bounds what one header can make this reserve.
+    max_payload: u32,
+    /// Whether `FLAG_AM_VALUE` frames are accepted: not on a connection that
+    /// may only send control messages, nor by a loop that never assembles
+    /// values (its receiver would wait on values nobody bounds).
+    am_values: bool,
+}
+
+impl FrameDecoder {
+    pub fn new() -> Self {
+        Self {
+            buf: BytesMut::with_capacity(64 * 1024),
+            max_payload: MAX_PAYLOAD_LEN,
+            am_values: true,
+        }
+    }
+
+    /// Refuse frames whose payload exceeds `max` (`FrameError::PayloadTooLarge`).
+    pub fn set_max_payload(&mut self, max: u32) {
+        self.max_payload = max;
+    }
+
+    pub fn max_payload(&self) -> u32 {
+        self.max_payload
+    }
+
+    /// Refuse (`Malformed`) or accept `FLAG_AM_VALUE` frames.
+    pub fn set_am_values(&mut self, accept: bool) {
+        self.am_values = accept;
+    }
+
+    /// Feed new data into the decoder buffer. Copies `data`; a receive loop
+    /// reads through [`read_window`](Self::read_window) instead.
+    pub fn feed(&mut self, data: &[u8]) {
+        self.buf.extend_from_slice(data);
+    }
+
+    /// Lend up to `max_len` bytes of spare buffer capacity to a read.
+    ///
+    /// A partially buffered frame whose rest fits in the spare capacity keeps
+    /// filling this allocation, since moving it would copy it. Otherwise the
+    /// spare capacity is reused while it holds a quarter of `max_len`, so small
+    /// reads fill one allocation instead of each reserving a fresh one while
+    /// earlier frames still share it. An incomplete frame already reserved its
+    /// remaining length in [`try_decode`](Self::try_decode), so a `max_len` of
+    /// at least [`front_frame_remaining`](Self::front_frame_remaining)
+    /// receives the rest of that frame in place.
+    pub fn read_window(&mut self, max_len: usize) -> ReadWindow {
+        let needed = match self.front_frame_remaining() {
+            Some(rest) => rest.min(max_len),
+            None if self.buf.is_empty() => max_len / 4,
+            None => HEADER_LEN - self.buf.len(),
+        };
+        self.window(max_len, needed)
+    }
+
+    /// Lend `len` bytes of spare capacity, first reserving `len` when fewer
+    /// than `needed` are spare.
+    fn window(&mut self, len: usize, needed: usize) -> ReadWindow {
+        use compio::buf::IoBuf;
+        let filled = self.buf.len();
+        if self.buf.capacity() - filled < needed.max(1) {
+            self.buf.reserve(len);
+        }
+        let window = (self.buf.capacity() - filled).min(len);
+        std::mem::take(&mut self.buf).slice(filled..filled + window)
+    }
+
+    /// Take back the buffer lent by [`read_window`](Self::read_window); bytes
+    /// the read stored are appended to the decoder.
+    pub fn finish_read(&mut self, window: ReadWindow) {
+        use compio::buf::IntoInner;
+        debug_assert!(self.buf.is_empty(), "read window lent twice");
+        self.buf = window.into_inner();
+    }
+
+    /// Bytes still missing from the front frame once its header is buffered.
+    pub fn front_frame_remaining(&self) -> Option<usize> {
+        let (_, _, _, payload_len) = self.peek_header()?;
+        if payload_len > self.max_payload {
+            // Refused by `try_decode`; nothing to receive in place.
+            return Some(0);
+        }
+        Some((HEADER_LEN + payload_len as usize).saturating_sub(self.buf.len()))
+    }
+
+    /// Try to decode the next complete frame from the buffer.
+    /// Returns `None` if not enough data is available yet.
+    ///
+    /// Verifies the frame CRC32C over `header ++ ctrl_len ++ ctrl` before
+    /// exposing anything; the raw value tail passes through unverified
+    /// (transport integrity). The returned `Frame` carries ctrl in `payload`
+    /// and the raw tail in `value`.
+    pub fn try_decode(&mut self) -> Result<Option<Frame>, FrameError> {
+        if self.buf.len() < HEADER_LEN {
+            return Ok(None);
+        }
+
+        let payload_len = u32::from_le_bytes(self.buf[6..10].try_into().unwrap());
+
+        // Before the reserve below: the header is all that has arrived.
+        if payload_len > self.max_payload {
+            return Err(FrameError::PayloadTooLarge(payload_len));
+        }
+        let payload_len = payload_len as usize;
+
+        let total = HEADER_LEN + payload_len;
+        if self.buf.len() < total {
+            // Reserve capacity for the rest of the frame to reduce reallocations.
+            self.buf.reserve(total - self.buf.len());
+            return Ok(None);
+        }
+
+        if payload_len < CTRL_OVERHEAD {
+            return Err(FrameError::Malformed("payload shorter than ctrl_len+crc"));
+        }
+        let ctrl_len =
+            u32::from_le_bytes(self.buf[10..14].try_into().unwrap()) as usize;
+        if CTRL_OVERHEAD + ctrl_len > payload_len {
+            return Err(FrameError::Malformed("ctrl_len exceeds payload"));
+        }
+
+        let crc_off = HEADER_LEN + CTRL_PREFIX_LEN + ctrl_len;
+        let computed = crc32c::crc32c(&self.buf[..crc_off]);
+        let stored = u32::from_le_bytes(self.buf[crc_off..crc_off + 4].try_into().unwrap());
+        if stored != computed {
+            return Err(FrameError::CrcMismatch { stored, computed });
+        }
+
+        let req_id = u32::from_le_bytes(self.buf[0..4].try_into().unwrap());
+        let msg_type = self.buf[4];
+        let flags = self.buf[5];
+        let value_len = payload_len - CTRL_OVERHEAD - ctrl_len;
+        let ctrl_start = HEADER_LEN + CTRL_PREFIX_LEN;
+        let (ctrl_len, am_pieces) = if flags & FLAG_AM_VALUE != 0 {
+            if !self.am_values {
+                return Err(FrameError::Malformed("frame values are not accepted on this connection"));
+            }
+            let (len, pieces) = split_am_pieces(&self.buf[ctrl_start..ctrl_start + ctrl_len], value_len)?;
+            // The connection's limit covers the whole value, not just the stream part.
+            let whole = pieces.iter().map(|p| p.0).sum::<usize>().saturating_add(payload_len - value_len);
+            if whole > self.max_payload as usize {
+                return Err(FrameError::PayloadTooLarge(whole.min(u32::MAX as usize) as u32));
+            }
+            (len, Some(pieces))
+        } else {
+            (ctrl_len, None)
+        };
+
+        self.buf.advance(ctrl_start);
+        let payload = self.buf.split_to(ctrl_len).freeze();
+        self.buf.advance(crc_off + CRC_LEN - ctrl_start - ctrl_len);
+        let value = self.buf.split_to(value_len).freeze();
+
+        Ok(Some(Frame {
+            req_id,
+            msg_type,
+            flags,
+            payload,
+            value: value.into(),
+            am_pieces,
+            value_parts: Vec::new(),
+        }))
+    }
+
+    /// Bytes currently buffered (not yet decoded).
+    pub fn buffered_len(&self) -> usize {
+        self.buf.len()
+    }
+
+    /// Peek the next frame's header without consuming it. Returns
+    /// `(req_id, msg_type, flags, payload_len)` once `HEADER_LEN` bytes are
+    /// buffered. Lets the bulk fast paths decide whether to recv a raw value
+    /// tail straight into its destination before `try_decode` would buffer
+    /// the whole payload.
+    pub fn peek_header(&self) -> Option<(u32, u8, u8, u32)> {
+        if self.buf.len() < HEADER_LEN {
+            return None;
+        }
+        Some((
+            u32::from_le_bytes(self.buf[0..4].try_into().unwrap()),
+            self.buf[4],
+            self.buf[5],
+            u32::from_le_bytes(self.buf[6..10].try_into().unwrap()),
+        ))
+    }
+
+    /// Peek the front frame's `ctrl_len` field (needs `HEADER_LEN + 4` bytes
+    /// buffered).
+    pub fn peek_ctrl_len(&self) -> Option<usize> {
+        if self.buf.len() < HEADER_LEN + CTRL_PREFIX_LEN {
+            return None;
+        }
+        Some(u32::from_le_bytes(self.buf[10..14].try_into().unwrap()) as usize)
+    }
+
+    /// Peek the first `n` ctrl bytes of the front frame without consuming,
+    /// once they are buffered. Lets a server read loop inspect a
+    /// value-separable request's meta/key prefix (e.g. `MSG_PUT`'s
+    /// `[meta][key]`) to gate the recv-into fast path BEFORE committing.
+    pub fn peek_ctrl(&self, n: usize) -> Option<&[u8]> {
+        let start = HEADER_LEN + CTRL_PREFIX_LEN;
+        if self.buf.len() < start + n {
+            return None;
+        }
+        Some(&self.buf[start..start + n])
+    }
+
+    /// bulk fast path: once the front frame's FULL prologue
+    /// (`[header][ctrl_len][ctrl][crc]`) is buffered, verify the CRC and
+    /// return the parsed prologue WITHOUT consuming anything.
+    /// `Ok(None)` = need more bytes. A CRC mismatch or malformed ctrl_len is
+    /// a hard frame error (same as `try_decode` would raise).
+    pub fn peek_bulk_prologue(&self) -> Result<Option<BulkPrologue>, FrameError> {
+        let Some((req_id, msg_type, flags, payload_len)) = self.peek_header() else {
+            return Ok(None);
+        };
+        if flags & FLAG_AM_VALUE != 0 {
+            // Its value is not the stream tail; `try_decode` assembles the pieces.
+            return Err(FrameError::Malformed("bulk prologue of a frame whose value comes as active messages"));
+        }
+        if payload_len > self.max_payload {
+            return Err(FrameError::PayloadTooLarge(payload_len));
+        }
+        let payload_len = payload_len as usize;
+        if payload_len < CTRL_OVERHEAD {
+            return Err(FrameError::Malformed("payload shorter than ctrl_len+crc"));
+        }
+        let Some(ctrl_len) = self.peek_ctrl_len() else {
+            return Ok(None);
+        };
+        if CTRL_OVERHEAD + ctrl_len > payload_len {
+            return Err(FrameError::Malformed("ctrl_len exceeds payload"));
+        }
+        let crc_off = HEADER_LEN + CTRL_PREFIX_LEN + ctrl_len;
+        if self.buf.len() < crc_off + CRC_LEN {
+            return Ok(None);
+        }
+        let computed = crc32c::crc32c(&self.buf[..crc_off]);
+        let stored = u32::from_le_bytes(self.buf[crc_off..crc_off + 4].try_into().unwrap());
+        if stored != computed {
+            return Err(FrameError::CrcMismatch { stored, computed });
+        }
+        Ok(Some(BulkPrologue {
+            req_id,
+            msg_type,
+            flags,
+            ctrl_len,
+            value_len: payload_len - CTRL_OVERHEAD - ctrl_len,
+        }))
+    }
+
+    /// Consume a prologue previously verified by `peek_bulk_prologue`, leaving
+    /// the frame's raw value bytes (or the next frame) at the front.
+    pub fn consume_bulk_prologue(&mut self, ctrl_len: usize) {
+        self.buf
+            .advance(HEADER_LEN + CTRL_PREFIX_LEN + ctrl_len + CRC_LEN);
+    }
+
+    /// Advance past `n` already-buffered bytes.
+    pub fn consume(&mut self, n: usize) {
+        self.buf.advance(n);
+    }
+
+    /// Copy up to `dest.len()` buffered bytes into `dest`, advancing the
+    /// decoder by the amount moved. Returns the count. Used to drain a
+    /// value's already-buffered prefix into a recv-into target before
+    /// recv'ing the remainder straight off the wire.
+    pub fn drain_into(&mut self, dest: &mut [u8]) -> usize {
+        let n = dest.len().min(self.buf.len());
+        dest[..n].copy_from_slice(&self.buf[..n]);
+        self.buf.advance(n);
+        n
+    }
+}
+
+impl Default for FrameDecoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum FrameError {
+    #[error("payload too large: {0} bytes for this connection")]
+    PayloadTooLarge(u32),
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+    /// The frame's structural fields are inconsistent (payload shorter than
+    /// the mandatory ctrl_len+crc, or ctrl_len pointing past the payload).
+    #[error("malformed frame: {0}")]
+    Malformed(&'static str),
+    /// The frame CRC32C over `header ++ ctrl_len ++ ctrl` does not match.
+    #[error("frame CRC mismatch: stored={stored:#010x} computed={computed:#010x}")]
+    CrcMismatch { stored: u32, computed: u32 },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// crc32c's hardware path inlines only when the whole build has SSE4.2
+    /// (`.cargo/config.toml`); otherwise every 8 bytes is a call.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn crc32c_is_built_with_sse42() {
+        assert!(cfg!(target_feature = "sse4.2"), "build without +sse4.2: crc32c runs ~4x slower");
+    }
+
+    /// A header declaring more than the decoder's limit is refused from the
+    /// header alone: nothing is reserved for the body it announces.
+    #[test]
+    fn a_header_over_the_limit_reserves_nothing() {
+        use compio::buf::IntoInner;
+        let announce = |decoder: &mut FrameDecoder| {
+            let mut head = [0u8; HEADER_LEN];
+            head[0] = 1;
+            head[6..10].copy_from_slice(&(64u32 << 20).to_le_bytes());
+            decoder.feed(&head);
+        };
+        let mut open = FrameDecoder::new();
+        announce(&mut open);
+        assert!(open.try_decode().unwrap().is_none());
+        assert!(open.read_window(1).into_inner().capacity() >= 64 << 20, "the default reserves the frame");
+
+        let mut limited = FrameDecoder::new();
+        limited.set_max_payload(CLIENT_CONTROL_MAX_PAYLOAD);
+        announce(&mut limited);
+        assert_eq!(limited.front_frame_remaining(), Some(0));
+        assert!(matches!(limited.try_decode(), Err(FrameError::PayloadTooLarge(n)) if n == 64 << 20));
+        assert!(matches!(limited.peek_bulk_prologue(), Err(FrameError::PayloadTooLarge(_))));
+        let window = limited.read_window(64 * 1024);
+        assert!(window.into_inner().capacity() < 1 << 20, "a refused header reserved its body");
+
+        let mut ok = FrameDecoder::new();
+        ok.set_max_payload(CLIENT_CONTROL_MAX_PAYLOAD);
+        ok.feed(&Frame::request(7, 1, Bytes::from(vec![9u8; 4096])).encode());
+        assert_eq!(ok.try_decode().unwrap().unwrap().payload.len(), 4096);
+    }
+
+    /// Stand-in for a transport read: store `data` at the window start.
+    fn receive(window: &mut ReadWindow, data: &[u8]) -> *const u8 {
+        use compio::buf::{IoBufMut, SetLen};
+        let dst = window.as_uninit();
+        assert!(data.len() <= dst.len());
+        for (slot, byte) in dst.iter_mut().zip(data) {
+            slot.write(*byte);
+        }
+        let start = dst.as_ptr() as *const u8;
+        unsafe { window.set_len(data.len()) };
+        start
+    }
+
+    #[test]
+    fn read_window_receives_the_rest_of_a_frame_in_place() {
+        let payload: Vec<u8> = (0..1_048_576).map(|i| (i % 251) as u8).collect();
+        let wire = Frame::request(9, 1, Bytes::copy_from_slice(&payload)).encode();
+        let first = 64 * 1024;
+        let mut decoder = FrameDecoder::new();
+
+        let mut window = decoder.read_window(first);
+        receive(&mut window, &wire[..first]);
+        decoder.finish_read(window);
+        assert!(decoder.try_decode().unwrap().is_none());
+        let remaining = decoder.front_frame_remaining().unwrap();
+        assert_eq!(remaining, wire.len() - first);
+
+        let mut window = decoder.read_window(remaining);
+        let rest_at = receive(&mut window, &wire[first..]);
+        decoder.finish_read(window);
+        let frame = decoder.try_decode().unwrap().unwrap();
+
+        assert_eq!(frame.payload.as_ref(), payload.as_slice());
+        // The received tail is the payload's own memory, not a copy of it.
+        let offset = first - HEADER_LEN - CTRL_PREFIX_LEN;
+        assert_eq!(frame.payload[offset..].as_ptr(), rest_at);
+        assert_eq!(decoder.buffered_len(), 0);
+    }
+
+    #[test]
+    fn a_partial_frame_whose_rest_fits_is_not_moved() {
+        let small = Frame::request(1, 1, Bytes::from_static(&[1; 4096])).encode();
+        let mut decoder = FrameDecoder::new();
+        let mut window = decoder.read_window(64 * 1024);
+        receive(&mut window, &small);
+        decoder.finish_read(window);
+        let held = decoder.try_decode().unwrap().unwrap(); // shares the allocation
+
+        // A frame that ends 1 KiB before the allocation does, first received
+        // 2 KiB short: its rest fits, but the spare is under a quarter window.
+        let spare = decoder.buf.capacity();
+        let big_len = spare - 1024 - HEADER_LEN - CTRL_OVERHEAD;
+        let big = Frame::request(2, 1, Bytes::from(vec![9u8; big_len])).encode();
+        let split = big.len() - 2048;
+        let mut window = decoder.read_window(64 * 1024);
+        let first_at = receive(&mut window, &big[..split]);
+        decoder.finish_read(window);
+        assert!(decoder.try_decode().unwrap().is_none());
+        assert!(decoder.buf.capacity() - decoder.buf.len() < 16 * 1024);
+
+        let mut window = decoder.read_window(64 * 1024);
+        receive(&mut window, &big[split..]);
+        decoder.finish_read(window);
+        let frame = decoder.try_decode().unwrap().unwrap();
+        assert_eq!(
+            frame.payload.as_ptr() as usize - first_at as usize,
+            HEADER_LEN + CTRL_PREFIX_LEN
+        );
+        assert_eq!(frame.payload.len(), big_len);
+        assert_eq!(held.payload.as_ref(), &[1; 4096][..]);
+    }
+
+    #[test]
+    fn read_window_reuses_spare_capacity_while_frames_share_the_buffer() {
+        let wire = Frame::request(3, 1, Bytes::from_static(&[7; 4096])).encode();
+        let mut decoder = FrameDecoder::new();
+        let mut frames = Vec::new();
+        let mut starts = Vec::new();
+        for _ in 0..4 {
+            let mut window = decoder.read_window(64 * 1024);
+            starts.push(receive(&mut window, &wire));
+            decoder.finish_read(window);
+            frames.push(decoder.try_decode().unwrap().unwrap());
+        }
+        // Each read continued the same allocation right after the frame
+        // still referenced from the previous read.
+        for pair in starts.windows(2) {
+            assert_eq!(pair[1] as usize - pair[0] as usize, wire.len());
+        }
+        assert!(frames.iter().all(|f| f.payload.as_ref() == &[7; 4096][..]));
+
+        // Too little spare capacity left: a fresh window, earlier frames intact.
+        let before = decoder.buf.capacity();
+        let window = decoder.read_window(4 * before + 64);
+        assert!(compio::buf::IntoInner::into_inner(window).capacity() >= 4 * before + 64);
+        assert!(frames.iter().all(|f| f.payload.as_ref() == &[7; 4096][..]));
+    }
+
+    /// A frame value frame: the large parts become active messages, each run
+    /// of small ones one stream piece; the piece list sits at the end of the
+    /// CRC-covered ctrl and the decoder hands back the ctrl alone.
+    #[test]
+    fn an_am_frame_lists_its_pieces_and_carries_only_the_small_ones() {
+        let big = autumn_transport::BULK_MIN_BYTES;
+        let parts: Vec<Bytes> = [100, big, 50, 30, 1 << 20].iter().map(|&n| Bytes::from(vec![n as u8; n])).collect();
+        let mut tags = 41..;
+        let (bufs, am) = encode_am_frame(9, 0x51, 0, vec![Bytes::from_static(b"meta")], parts.clone(), || tags.next().unwrap());
+        let am: Vec<(u64, Bytes)> = am.into_iter().map(|(t, v)| (t, v.into_bytes())).collect();
+        assert_eq!(am, vec![(41, parts[1].clone()), (42, parts[4].clone())]);
+        let wire = bufs.concat();
+        let mut list = Vec::new();
+        for (len, tag) in [(100u32, 0u64), (big as u32, 41), (80, 0), (1 << 20, 42)] {
+            list.extend_from_slice(&len.to_le_bytes());
+            list.extend_from_slice(&tag.to_le_bytes());
+        }
+        list.extend_from_slice(&4u16.to_le_bytes());
+        let ctrl_at = HEADER_LEN + CTRL_PREFIX_LEN;
+        assert_eq!(wire[5], FLAG_AM_VALUE);
+        assert_eq!(&wire[ctrl_at..ctrl_at + 4], b"meta");
+        assert_eq!(&wire[ctrl_at + 4..ctrl_at + 4 + list.len()], list.as_slice());
+        let mut decoder = FrameDecoder::new();
+        decoder.feed(&wire);
+        let frame = decoder.try_decode().unwrap().unwrap();
+        assert_eq!(frame.payload.as_ref(), b"meta");
+        assert_eq!(*frame.value, [parts[0].clone(), parts[2].clone(), parts[3].clone()].concat());
+        assert_eq!(frame.am_pieces, Some(vec![(100, 0), (big, 41), (80, 0), (1 << 20, 42)]));
+        assert_eq!(decoder.buffered_len(), 0);
+
+        // The piece list is CRC-covered.
+        let mut bad = wire.clone();
+        bad[ctrl_at + 4 + 4] ^= 1;
+        let mut decoder = FrameDecoder::new();
+        decoder.feed(&bad);
+        assert!(matches!(decoder.try_decode(), Err(FrameError::CrcMismatch { .. })));
+
+        // Its value is not the stream tail: no bulk prologue for it.
+        let mut decoder = FrameDecoder::new();
+        decoder.feed(&wire);
+        assert!(matches!(decoder.peek_bulk_prologue(), Err(FrameError::Malformed(_))));
+    }
+
+    /// A piece list naming an empty or a repeated tagged piece is refused: its
+    /// receiver would wait for a value that never comes.
+    /// A value part with no memh larger than `STAGED_PIECE_BYTES` goes in
+    /// equal pieces of at most that, none under `BULK_MIN_BYTES`, in order;
+    /// a registered part goes whole whatever its size.
+    #[test]
+    fn an_unregistered_value_goes_in_staged_pieces() {
+        let max = autumn_transport::am::STAGED_PIECE_BYTES;
+        let big: Vec<u8> = (0..(3 * max + 100)).map(|i| (i % 251) as u8).collect();
+        let small = vec![9u8; 100];
+        let mut next = 0u64;
+        let (_bufs, values) = encode_am_frame(1, 2, 0, vec![Bytes::from_static(b"c")], vec![Bytes::from(big.clone()), Bytes::from(small)], || {
+            next += 1;
+            next
+        });
+        assert_eq!(values.len(), 4, "3 x STAGED_PIECE_BYTES + 100 in four pieces");
+        let lens: Vec<usize> = values.iter().map(|(_, v)| v.len()).collect();
+        assert!(lens.iter().all(|&l| l <= max && l >= autumn_transport::BULK_MIN_BYTES), "{lens:?}");
+        let joined: Vec<u8> = values.iter().flat_map(|(_, v)| v.iter().copied()).collect();
+        assert_eq!(joined, big, "the pieces are the value, in order");
+        let tags: Vec<u64> = values.iter().map(|(t, _)| *t).collect();
+        assert_eq!(tags, vec![1, 2, 3, 4]);
+
+        let mut pb = autumn_transport::regpool_acquire(2 * max);
+        pb.dest_mut().fill(3);
+        let registered = pb.freeze();
+        let (_bufs, values) = encode_am_frame(1, 2, 0, vec![], vec![registered.clone()], || 7);
+        if registered.is_registered() {
+            assert_eq!(values.len(), 1, "a registered part is not cut");
+        }
+    }
+
+    #[test]
+    fn an_am_frame_with_an_empty_or_repeated_piece_is_refused() {
+        let frame_with = |pieces: &[(u32, u64)]| {
+            let mut ctrl = b"k".to_vec();
+            for &(len, tag) in pieces {
+                ctrl.extend_from_slice(&len.to_le_bytes());
+                ctrl.extend_from_slice(&tag.to_le_bytes());
+            }
+            ctrl.extend_from_slice(&(pieces.len() as u16).to_le_bytes());
+            let head = encode_vectored_head(1, 0x51, FLAG_AM_VALUE, ctrl.len(), 0);
+            let ctrl = Bytes::from(ctrl);
+            let crc = compute_ctrl_crc(&head, std::slice::from_ref(&ctrl));
+            let mut decoder = FrameDecoder::new();
+            decoder.feed(&[&head[..], &ctrl, &crc].concat());
+            decoder.try_decode()
+        };
+        assert!(frame_with(&[(1 << 20, 5), (1 << 20, 6)]).unwrap().is_some());
+        assert!(matches!(frame_with(&[(1 << 20, 5), (1 << 20, 5)]), Err(FrameError::Malformed(_))));
+        assert!(matches!(frame_with(&[(0, 5), (1 << 20, 6)]), Err(FrameError::Malformed(_))));
+    }
+
+    /// A connection's payload limit covers the whole value, wherever it comes from.
+    #[test]
+    fn an_am_frame_is_held_to_the_connection_s_limit() {
+        let parts = vec![Bytes::from(vec![1u8; 2 << 20])];
+        let (bufs, _) = encode_am_frame(1, 0x51, 0, vec![Bytes::from_static(b"k")], parts, || 7);
+        let mut limited = FrameDecoder::new();
+        limited.set_max_payload(CLIENT_CONTROL_MAX_PAYLOAD);
+        limited.feed(&bufs.concat());
+        assert!(matches!(limited.try_decode(), Err(FrameError::PayloadTooLarge(_))));
+
+        // A connection that takes no frame values refuses even a small one.
+        let (bufs, _) = encode_am_frame(1, 0x51, 0, vec![Bytes::from_static(b"k")], vec![Bytes::from(vec![1u8; 64 << 10])], || 7);
+        let mut control_only = FrameDecoder::new();
+        control_only.set_am_values(false);
+        control_only.feed(&bufs.concat());
+        assert!(matches!(control_only.try_decode(), Err(FrameError::Malformed(_))));
+    }
+
+    /// A crc the encoder already computed gives the frame the scan would.
+    #[test]
+    fn a_known_body_crc_builds_the_same_frame() {
+        let ctrl_of = |crc: u32| Bytes::from(crc.to_le_bytes().to_vec());
+        let body = vec![Bytes::from(vec![5u8; 70_000]), Bytes::from(vec![6u8; 9])];
+        let crc = crc32c::crc32c(&body.concat());
+        let known = PreparedPayload::with_crc(ctrl_of, body.clone(), crc);
+        let computed = PreparedPayload::new(ctrl_of, body);
+        assert_eq!(known.stream_parts(7, 1).concat(), computed.stream_parts(7, 1).concat());
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "precomputed body crc")]
+    fn a_wrong_known_crc_is_caught_in_debug_builds() {
+        PreparedPayload::with_crc(|crc: u32| Bytes::from(crc.to_le_bytes().to_vec()), vec![Bytes::from_static(b"x")], 1);
+    }
+
+    /// A prepared payload: the ctrl is built from the body's crc32c, once
+    /// whichever replica asks first; on the stream the body is the raw tail,
+    /// outside the frame CRC, so its own crc is what checks it.
+    #[test]
+    fn a_prepared_payload_carries_its_body_crc_in_ctrl() {
+        let ctrl_of = |crc: u32| Bytes::from([[3u8; 32].as_slice(), &crc.to_le_bytes()].concat());
+        let body = vec![Bytes::from(vec![5u8; 70_000]), Bytes::new(), Bytes::from(vec![6u8; 9])];
+        let built = std::rc::Rc::new(std::cell::Cell::new(0));
+        let counted = built.clone();
+        let prepared = PreparedPayload::new(
+            move |crc| {
+                counted.set(counted.get() + 1);
+                ctrl_of(crc)
+            },
+            body.clone(),
+        );
+        let (ctrl, value) = prepared.ctrl_and_body();
+        let crc = crc32c::crc32c(&body.concat());
+        assert_eq!(ctrl, vec![ctrl_of(crc)]);
+        assert_eq!(value.iter().map(|v| v.bytes().clone()).collect::<Vec<_>>(), body);
+        assert_eq!(prepared.ctrl_and_body().0, ctrl);
+        assert_eq!(built.get(), 1, "the ctrl is built once");
+        // An empty payload: crc 0, an empty tail.
+        let empty = PreparedPayload::new::<Bytes>(ctrl_of, vec![]);
+        let mut decoder = FrameDecoder::new();
+        decoder.feed(&empty.stream_parts(5, 1).concat());
+        let frame = decoder.try_decode().unwrap().unwrap();
+        assert_eq!(frame.payload, ctrl_of(0));
+        assert!(frame.value.is_empty());
+        for id in [1, u32::MAX] {
+            let wire = prepared.stream_parts(id, 1).concat();
+            let mut decoder = FrameDecoder::new();
+            decoder.feed(&wire);
+            let frame = decoder.try_decode().unwrap().unwrap();
+            assert_eq!(frame.req_id, id);
+            assert_eq!(frame.payload, ctrl.concat());
+            assert_eq!(frame.value.as_ref(), body.concat().as_slice());
+            // The frame CRC covers the ctrl, not the body.
+            let mut bad = wire.clone();
+            bad[HEADER_LEN + CTRL_PREFIX_LEN + 1] ^= 1;
+            let mut decoder = FrameDecoder::new();
+            decoder.feed(&bad);
+            assert!(matches!(decoder.try_decode(), Err(FrameError::CrcMismatch { .. })));
+        }
+    }
+
+    #[test]
+    fn encode_decode_round_trip() {
+        let frame = Frame::request(42, 7, Bytes::from_static(b"hello world"));
+        let encoded = frame.encode();
+        // wire = header + ctrl_len + ctrl + crc (no value).
+        assert_eq!(encoded.len(), HEADER_LEN + CTRL_OVERHEAD + 11);
+
+        let mut decoder = FrameDecoder::new();
+        decoder.feed(&encoded);
+        let decoded = decoder.try_decode().unwrap().unwrap();
+
+        assert_eq!(decoded.req_id, 42);
+        assert_eq!(decoded.msg_type, 7);
+        assert_eq!(decoded.payload, Bytes::from_static(b"hello world"));
+        assert!(decoded.value.is_empty());
+    }
+
+    #[test]
+    fn encode_response_with_matches_response_encode() {
+        // Byte-for-byte identical to the two-step `response(...).encode()`,
+        // for an empty payload, a tiny payload, and a large one.
+        for payload in [
+            Bytes::new(),
+            Bytes::from_static(b"\x00abcdefgh"),
+            Bytes::from(vec![0xCD; 4096]),
+        ] {
+            let want = Frame::response(7, 2, payload.clone()).encode();
+            let got = Frame::encode_response_with(7, 2, payload.len(), |b| {
+                b.extend_from_slice(&payload);
+            });
+            assert_eq!(got, want, "payload len {}", payload.len());
+
+            // And it still decodes (CRC verified) back to the payload.
+            let mut decoder = FrameDecoder::new();
+            decoder.feed(&got);
+            let decoded = decoder.try_decode().unwrap().unwrap();
+            assert!(decoded.is_response());
+            assert_eq!(decoded.payload, payload);
+        }
+    }
+
+    #[test]
+    fn decode_partial_header() {
+        let frame = Frame::request(1, 2, Bytes::from_static(b"x"));
+        let encoded = frame.encode();
+
+        let mut decoder = FrameDecoder::new();
+        decoder.feed(&encoded[..5]); // partial header
+        assert!(decoder.try_decode().unwrap().is_none());
+
+        decoder.feed(&encoded[5..]); // rest
+        let decoded = decoder.try_decode().unwrap().unwrap();
+        assert_eq!(decoded.req_id, 1);
+        assert_eq!(decoded.payload, Bytes::from_static(b"x"));
+    }
+
+    #[test]
+    fn decode_partial_payload() {
+        let payload = Bytes::from(vec![0xAB; 100]);
+        let frame = Frame::request(10, 3, payload.clone());
+        let encoded = frame.encode();
+
+        let mut decoder = FrameDecoder::new();
+        decoder.feed(&encoded[..HEADER_LEN + 50]); // header + partial payload
+        assert!(decoder.try_decode().unwrap().is_none());
+
+        decoder.feed(&encoded[HEADER_LEN + 50..]); // rest
+        let decoded = decoder.try_decode().unwrap().unwrap();
+        assert_eq!(decoded.payload, payload);
+    }
+
+    /// Value-separable round trip: ctrl carries `[code][message]`, value is a
+    /// raw tail; decoder splits them and verifies the ctrl CRC.
+    #[test]
+    fn bulk_frame_round_trip_splits_ctrl_and_value() {
+        let value = Bytes::from(vec![0x5A; 4096]);
+        let head = encode_bulk_response_head(9, 0x50, 0, "", value.len());
+        let mut wire = BytesMut::new();
+        wire.extend_from_slice(&head);
+        wire.extend_from_slice(&value);
+
+        let mut decoder = FrameDecoder::new();
+        decoder.feed(&wire);
+        let decoded = decoder.try_decode().unwrap().unwrap();
+        assert!(decoded.is_response());
+        let (code, msg) = parse_bulk_ctrl(&decoded.payload).unwrap();
+        assert_eq!(code, 0);
+        assert!(msg.is_empty());
+        assert_eq!(*decoded.value, value);
+    }
+
+    /// bulk error responses carry a readable message in the CRC'd ctrl.
+    #[test]
+    fn bulk_head_carries_error_message() {
+        let head = encode_bulk_response_head(3, 0x50, 6, "eversion mismatch", 0);
+        let mut decoder = FrameDecoder::new();
+        decoder.feed(&head);
+        let decoded = decoder.try_decode().unwrap().unwrap();
+        let (code, msg) = parse_bulk_ctrl(&decoded.payload).unwrap();
+        assert_eq!(code, 6);
+        assert_eq!(msg, b"eversion mismatch");
+        assert!(decoded.value.is_empty());
+    }
+
+    /// The vectored head + compute_ctrl_crc produce bytes the decoder accepts,
+    /// and the value parts are NOT covered by the CRC.
+    #[test]
+    fn vectored_zc_request_round_trip() {
+        let meta = Bytes::from_static(b"meta-and-key-bytes");
+        let value = Bytes::from(vec![0xEE; 1024]);
+        let head = encode_vectored_head(77, 0x51, 0, meta.len(), value.len());
+        let crc = compute_ctrl_crc(&head, std::slice::from_ref(&meta));
+
+        let mut wire = BytesMut::new();
+        wire.extend_from_slice(&head);
+        wire.extend_from_slice(&meta);
+        wire.extend_from_slice(&crc);
+        wire.extend_from_slice(&value);
+
+        let mut decoder = FrameDecoder::new();
+        decoder.feed(&wire);
+        let decoded = decoder.try_decode().unwrap().unwrap();
+        assert_eq!(decoded.req_id, 77);
+        assert_eq!(decoded.msg_type, 0x51);
+        assert_eq!(decoded.payload, meta);
+        assert_eq!(*decoded.value, value);
+
+        // Corrupt a VALUE byte → still decodes fine (value is raw; its
+        // integrity is the transport's + the storage layer's).
+        let mut wire2 = wire.clone();
+        let vstart = wire2.len() - 1024;
+        wire2[vstart + 10] ^= 0xFF;
+        let mut d2 = FrameDecoder::new();
+        d2.feed(&wire2);
+        assert!(d2.try_decode().unwrap().is_some());
+    }
+
+    /// Any flipped bit in the HEADER trips CRC verification — the pre-v28
+    /// holes (req_id delivering to the wrong caller with a valid payload CRC;
+    /// a flipped CRC flag bit disabling verification) are structurally closed.
+    #[test]
+    fn decoder_rejects_corrupted_header_and_ctrl() {
+        let frame = Frame::request(1, 1, Bytes::from(vec![0u8; 256]));
+        let encoded = frame.encode();
+
+        // Flip one bit in every header byte position + a ctrl byte; each must
+        // fail loud (CrcMismatch), never decode silently.
+        for pos in [0usize, 4, 5, 11, HEADER_LEN + CTRL_PREFIX_LEN + 50] {
+            let mut wire = encoded.to_vec();
+            wire[pos] ^= 0x01;
+            let mut decoder = FrameDecoder::new();
+            decoder.feed(&wire);
+            match decoder.try_decode() {
+                Err(_) => {}
+                Ok(v) => panic!("corrupted byte {pos} decoded silently: {:?}", v.is_some()),
+            }
+        }
+    }
+
+    /// peek_bulk_prologue: verifies the ctrl CRC without consuming; a partial
+    /// buffer reports "need more"; consume_bulk_prologue leaves the value.
+    #[test]
+    fn bulk_prologue_peek_verify_consume() {
+        let value = Bytes::from(vec![0x11; 512]);
+        let head = encode_bulk_response_head(5, 0x50, 0, "", value.len());
+
+        let mut decoder = FrameDecoder::new();
+        decoder.feed(&head[..8]);
+        assert!(decoder.peek_bulk_prologue().unwrap().is_none(), "partial header");
+        decoder.feed(&head[8..]);
+        let p = decoder.peek_bulk_prologue().unwrap().expect("full prologue");
+        assert_eq!(p.req_id, 5);
+        assert_eq!(p.ctrl_len, 1);
+        assert_eq!(p.value_len, 512);
+
+        decoder.feed(&value[..100]); // value arrives in pieces
+        decoder.consume_bulk_prologue(p.ctrl_len);
+        assert_eq!(decoder.buffered_len(), 100, "value prefix left at front");
+    }
+
+    #[test]
+    fn decode_multiple_frames() {
+        let f1 = Frame::request(1, 1, Bytes::from_static(b"aaa"));
+        let f2 = Frame::response(2, 2, Bytes::from_static(b"bbb"));
+
+        let mut all = BytesMut::new();
+        all.extend_from_slice(&f1.encode());
+        all.extend_from_slice(&f2.encode());
+
+        let mut decoder = FrameDecoder::new();
+        decoder.feed(&all);
+
+        let d1 = decoder.try_decode().unwrap().unwrap();
+        assert_eq!(d1.req_id, 1);
+        assert!(!d1.is_response());
+
+        let d2 = decoder.try_decode().unwrap().unwrap();
+        assert_eq!(d2.req_id, 2);
+        assert!(d2.is_response());
+
+        assert!(decoder.try_decode().unwrap().is_none());
+    }
+
+    #[test]
+    fn empty_payload() {
+        let frame = Frame::request(0, 0, Bytes::new());
+        let encoded = frame.encode();
+        // Every frame carries ctrl_len + CRC — even an empty ctrl.
+        assert_eq!(encoded.len(), HEADER_LEN + CTRL_OVERHEAD);
+
+        let mut decoder = FrameDecoder::new();
+        decoder.feed(&encoded);
+        let decoded = decoder.try_decode().unwrap().unwrap();
+        assert_eq!(decoded.payload.len(), 0);
+        assert_eq!(decoded.value.len(), 0);
+    }
+
+    /// encode_vectored_head + compute_ctrl_crc match Frame::encode byte-for-
+    /// byte for a ctrl-only frame (the send_vectored path must be
+    /// indistinguishable on the wire from the single-buffer path).
+    #[test]
+    fn vectored_head_matches_encode() {
+        let p1 = Bytes::from_static(b"hello");
+        let p2 = Bytes::from(vec![0xab; 64]);
+        let parts = vec![p1.clone(), p2.clone()];
+        let ctrl_len: usize = parts.iter().map(|p| p.len()).sum();
+
+        let head = encode_vectored_head(123, 45, 0, ctrl_len, 0);
+        let crc = compute_ctrl_crc(&head, &parts);
+        let mut wire = BytesMut::new();
+        wire.extend_from_slice(&head);
+        for p in &parts {
+            wire.extend_from_slice(p);
+        }
+        wire.extend_from_slice(&crc);
+
+        let mut whole = Vec::new();
+        whole.extend_from_slice(&p1);
+        whole.extend_from_slice(&p2);
+        let want = Frame::request(123, 45, Bytes::from(whole)).encode();
+        assert_eq!(&wire[..], &want[..]);
+    }
+}
+
+#[cfg(test)]
+mod frame_length_ceiling_tests {
+    use super::*;
+
+    // The three `should_panic` cases below assert on a `debug_assert!`, so they
+    // are debug-only by construction — `cargo test --release` would otherwise
+    // report them as failures for behaviour that is deliberately absent there.
+
+    /// The wire format gives the payload length 32 bits. Going over it used to
+    /// be a silent `as u32` wrap: the header said one thing, the bytes said
+    /// another, and the peer reported a CRC failure — a corrupt frame where the
+    /// truth was "too large to send". These two entry points take LENGTHS
+    /// rather than buffers, so the ceiling is reachable in a test without
+    /// allocating 4 GiB.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "over the wire format's")]
+    fn a_vectored_head_over_the_ceiling_refuses_instead_of_wrapping() {
+        encode_vectored_head(1, 2, 0, 0, MAX_PAYLOAD_LEN as usize + 1);
+    }
+
+    /// And it refuses BEFORE asking the caller to produce the bytes.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "over the wire format's")]
+    fn a_response_over_the_ceiling_refuses_before_writing_the_payload() {
+        Frame::encode_response_with(1, 2, MAX_PAYLOAD_LEN as usize + 1, |_| {
+            unreachable!("write_payload must not run for a payload that cannot be framed")
+        });
+    }
+
+    /// The largest frame that still fits must encode with a header that agrees
+    /// with itself — the boundary is where an off-by-one in the check would
+    /// hide.
+    #[test]
+    fn the_largest_encodable_frame_is_still_encoded() {
+        let value_len = MAX_PAYLOAD_LEN as usize - CTRL_OVERHEAD;
+        let head = encode_vectored_head(7, 9, 0, 0, value_len);
+        assert_eq!(
+            u32::from_le_bytes(head[6..10].try_into().unwrap()),
+            MAX_PAYLOAD_LEN,
+            "the ceiling itself is legal, not one byte below it"
+        );
+    }
+
+    /// The ctrl field is narrowed by the same `as u32` and had no check of its
+    /// own either. It needs none: ctrl is part of the payload length, so an
+    /// un-framable ctrl is refused by the payload bound — pinned here because
+    /// the alternative is a second assert that can never fire.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "frame payload is")]
+    fn an_oversized_ctrl_is_refused_by_the_payload_bound() {
+        encode_vectored_head(1, 2, 0, MAX_PAYLOAD_LEN as usize + 1, 0);
+    }
+}

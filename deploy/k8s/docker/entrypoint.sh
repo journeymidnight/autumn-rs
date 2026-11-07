@@ -1,0 +1,509 @@
+#!/usr/bin/env bash
+# entrypoint.sh — role dispatcher for the autumn-rs container image.
+#
+#   entrypoint.sh manager | extent-node | ps | bootstrap
+#   entrypoint.sh <anything else>   → exec'd verbatim (client tooling, debug)
+#
+# Everything k8s-specific lives here, not in the Rust binaries (which stay
+# env-free and take only CLI flags):
+#   - DNS→IP resolution: the server binaries parse their address flags with
+#     SocketAddr::parse (IP literals only; client tools resolve names
+#     themselves). Service names from env are resolved to ClusterIPs here,
+#     then passed as flags.
+#   - env→flag translation, mirroring cluster.sh's AUTUMN_* conventions.
+#   - bring-up ordering guards (wait-for-leader, idempotent format,
+#     streams-guarded bootstrap) — the same protocol as cluster.sh.
+#
+# Addressing model (see "Deployment" in docs/ops.md):
+#   extent-node  advertises its per-pod Service ClusterIP (Service name ==
+#                pod name). The manager keys EN
+#                identity on a stable node_uuid (persisted on the PVC), NOT
+#                the address, and the EN self-registers its live address +
+#                shard ports at EVERY startup — so a naked pod IP would now
+#                also work correctness-wise. The per-pod ClusterIP is kept
+#                anyway: it avoids routing churn (a df-echo drift heal) on
+#                every pod restart and gives operators a stable target.
+#                `format` is identity-only (no address) — see cmd below.
+#   ps           advertises its POD IP. Safe because every partition open
+#                re-registers its address with the manager, so a rescheduled
+#                PS heals its routing automatically. Per-partition listener
+#                ports are dynamic (base+ord, monotonic) — flat pod-to-pod
+#                networking carries them without Service port enumeration.
+
+set -euo pipefail
+
+log() { echo "[autumn-entrypoint] $*" >&2; }
+die() { log "ERROR: $*"; exit 1; }
+
+TRANSPORT="${AUTUMN_TRANSPORT:-tcp}"
+
+# The cluster secret (AUTUMN_CLUSTER_SECRET_FILE → --cluster-secret-file). The
+# manager, PS and EN refuse to start without it, and autumn-op needs it for
+# every call (it connects as an operator), so every server role and the
+# bootstrap Job require it. Client roles (fuse, s3) never hold it.
+CLUSTER_SECRET_FILE="${AUTUMN_CLUSTER_SECRET_FILE:-}"
+require_cluster_secret() {
+    [[ -s "$CLUSTER_SECRET_FILE" ]] \
+        || die "AUTUMN_CLUSTER_SECRET_FILE='$CLUSTER_SECRET_FILE' is not a non-empty file (generate one with: autumn-op gen-cluster-secret)"
+}
+
+# ---------------------------------------------------------------------------
+# address helpers
+# ---------------------------------------------------------------------------
+
+# first_allowed_cpus N — the first N cores this container may run on, as a
+# comma list. The EN pins each shard with sched_setaffinity and REFUSES to start
+# on a core outside its cgroup cpuset (so does the PS for its AUTUMN_PS_CPUSET),
+# so the default cannot be host cores 0..N-1:
+# under the kubelet's static CPU manager a pod's cores are whatever it was
+# granted (e.g. 12-15). Without the static policy every host core is allowed and
+# this yields 0..N-1, as before.
+first_allowed_cpus() {
+    local n="$1" list seg lo hi c
+    local -a cores=()
+    list="$(awk '/^Cpus_allowed_list:/ {print $2}' /proc/self/status)"
+    for seg in ${list//,/ }; do
+        lo="${seg%-*}"; hi="${seg#*-}"
+        for (( c = lo; c <= hi; c++ )); do cores+=("$c"); done
+    done
+    (( ${#cores[@]} >= n )) \
+        || die "AUTUMN_EXTENT_SHARDS=$n but this container may only run on ${#cores[@]} cores ($list)"
+    local IFS=,
+    echo "${cores[*]:0:n}"
+}
+
+# Wrap bare IPv6 literals in brackets so "host:port" strings survive
+# SocketAddr::parse on the Rust side.
+bracket_host() {
+    local ip="$1"
+    if [[ "$ip" == *:* && "$ip" != \[* ]]; then
+        echo "[$ip]"
+    else
+        echo "$ip"
+    fi
+}
+
+# Resolve a DNS name (or pass through an IP literal) to one IP, retrying
+# until kube-dns catches up. Prints the bracketed-if-IPv6 IP.
+resolve_ip() {
+    local name="$1" tries="${2:-60}"
+    name="${name#[}"; name="${name%]}"
+    local i ip
+    for (( i = 0; i < tries; i++ )); do
+        ip="$(getent hosts "$name" 2>/dev/null | awk 'NR==1 {print $1}')" || true
+        if [[ -n "${ip:-}" ]]; then
+            bracket_host "$ip"
+            return 0
+        fi
+        (( i == 0 )) && log "waiting for DNS: $name"
+        sleep 2
+    done
+    die "cannot resolve '$name' after $tries attempts"
+}
+
+# Resolve every "name:port" in a comma-separated list to "IP:port".
+resolve_hostport_list() {
+    local list="$1" out="" item name port
+    for item in ${list//,/ }; do
+        # split on the LAST ':' so bracketed IPv6 names survive
+        port="${item##*:}"
+        name="${item%:*}"
+        [[ "$port" =~ ^[0-9]+$ ]] || die "expected host:port, got '$item'"
+        out+="${out:+,}$(resolve_ip "$name"):$port"
+    done
+    echo "$out"
+}
+
+# Leader-gated readiness: `autumn-op info` only succeeds against the elected
+# leader, so this doubles as "control plane actually up", not just TCP-open.
+# Needs the cluster secret (autumn-op connects as an operator).
+wait_for_manager() {
+    local mgr="$1" tries="${2:-150}"
+    local i
+    for (( i = 0; i < tries; i++ )); do
+        if autumn-op --cluster-secret-file "$CLUSTER_SECRET_FILE" \
+            --manager "$mgr" --transport "$TRANSPORT" info >/dev/null 2>&1; then
+            return 0
+        fi
+        (( i == 0 )) && log "waiting for manager leader at $mgr"
+        sleep 2
+    done
+    die "manager at $mgr not answering leader-gated info after $tries attempts"
+}
+
+# Client roles (fuse, s3) do not hold the cluster secret, so they cannot run
+# `autumn-op info`; they wait for the first manager address to accept TCP.
+wait_for_manager_port() {
+    local mgr="${1%%,*}" tries="${2:-150}"
+    local host="${mgr%:*}" port="${mgr##*:}"
+    host="${host#[}"; host="${host%]}"
+    local i
+    for (( i = 0; i < tries; i++ )); do
+        if (exec 3<>"/dev/tcp/$host/$port") 2>/dev/null; then
+            return 0
+        fi
+        (( i == 0 )) && log "waiting for manager at $mgr"
+        sleep 2
+    done
+    die "manager at $mgr not accepting connections after $tries attempts"
+}
+
+# ---------------------------------------------------------------------------
+# roles
+# ---------------------------------------------------------------------------
+
+run_manager() {
+    local port="${AUTUMN_MANAGER_PORT:-9001}"
+    local etcd
+    etcd="$(resolve_hostport_list "${AUTUMN_ETCD_ENDPOINTS:-etcd:2379}")"
+    require_cluster_secret
+    # manager id must be unique and non-zero: StatefulSet ordinal + 1.
+    local mid="${AUTUMN_MANAGER_ID:-}"
+    if [[ -z "$mid" ]]; then
+        local ord="${HOSTNAME##*-}"
+        [[ "$ord" =~ ^[0-9]+$ ]] \
+            || die "cannot derive the manager id from HOSTNAME='$HOSTNAME'; set AUTUMN_MANAGER_ID"
+        mid=$(( ord + 1 ))
+    fi
+    local -a args=(
+        --cluster-secret-file "$CLUSTER_SECRET_FILE"
+        --port "$port" --manager-id "$mid" --etcd "$etcd" --listen 0.0.0.0 --transport "$TRANSPORT"
+    )
+    [[ "${AUTUMN_POLICY_FAST_MODE:-0}" == "1" ]] && args+=(--policy-fast-mode)
+    # Leader-fenced auto-policy controller. Production deploy defaults to ARMED
+    # steady-state maintenance — the `balanced` policy (gc + compaction + EC +
+    # rebalance) is seeded Armed on a fresh cluster and actuates on its own (no
+    # separate arming flag). (cluster.sh / chaos / perf never set this env, so
+    # they stay Off — dev/test unaffected.) Override:
+    # AUTUMN_AUTO_POLICY_DEFAULT=<preset|off> to change/disable the seeded policy.
+    # The web dashboard is a separate app (crates/server/src/bin/autumn_dashboard → the autumn-
+    # dashboard binary), not started here; deploy it on its own (deploy/k8s/dashboard.yaml).
+    _auto_policy="${AUTUMN_AUTO_POLICY_DEFAULT:-balanced}"
+    [[ "$_auto_policy" != "off" && "$_auto_policy" != "0" ]] \
+        && args+=(--auto-policy-default "$_auto_policy")
+    [[ -n "${AUTUMN_MGR_MIN_ALLOC_FREE_BYTES:-}" ]] \
+        && args+=(--min-alloc-free-bytes "$AUTUMN_MGR_MIN_ALLOC_FREE_BYTES")
+    # authz engages iff NOT explicitly disabled AND the signing
+    # key file is actually present + non-empty. The k8s ConfigMap sets
+    # AUTUMN_AUTH_SIGNING_KEY_FILE to the mounted-Secret path unconditionally, so
+    # the `-s` test (not just `-n`) is what keeps a deploy WITHOUT the
+    # `autumn-authz` Secret (optional mount → file absent) — or an explicit
+    # AUTUMN_AUTH_DISABLE=1 — running authz-OFF instead of crash-looping on a
+    # missing key. (cluster.sh stays OFF because it never sets the env at all.)
+    if [[ "${AUTUMN_AUTH_DISABLE:-0}" != "1" && -s "${AUTUMN_AUTH_SIGNING_KEY_FILE:-/nonexistent}" ]]; then
+        args+=(--auth-signing-key-file "$AUTUMN_AUTH_SIGNING_KEY_FILE")
+        [[ -n "${AUTUMN_AUTH_TOKEN_TTL_SECS:-}" ]] \
+            && args+=(--auth-token-ttl-secs "$AUTUMN_AUTH_TOKEN_TTL_SECS")
+    fi
+    log "exec autumn-manager-server ${args[*]}"
+    exec autumn-manager-server "${args[@]}"
+}
+
+run_extent_node() {
+    local port="${AUTUMN_EXTENT_PORT:-9101}"
+    local data="${AUTUMN_EXTENT_DATA:-/data/autumn}"
+    local mgr
+    mgr="$(resolve_hostport_list "${AUTUMN_MANAGER:-autumn-manager:9001}")"
+    [[ "$mgr" == *,* ]] && die "extent-node takes a single manager address, got '$mgr'"
+    require_cluster_secret
+
+    # Advertise this pod's OWN IP (Downward-API status.podIP,
+    # passed as AUTUMN_ADVERTISE_IP). The EN self-registers its location under a
+    # stable node_uuid at every startup, so a fresh pod IP on reschedule just
+    # updates the same identity — no per-pod ClusterIP Service, no FQDN, no
+    # phantom-node trap. The pod IP is already an IP literal (no DNS), so we
+    # only bracket it for IPv6. Legacy fallback: a per-pod-Service FQDN via
+    # AUTUMN_ADVERTISE_NAME (resolved to its ClusterIP) still works if set.
+    local adv
+    if [[ -n "${AUTUMN_ADVERTISE_IP:-}" ]]; then
+        adv="$(bracket_host "${AUTUMN_ADVERTISE_IP}")"
+    else
+        adv="$(resolve_ip "${AUTUMN_ADVERTISE_NAME:-$HOSTNAME}")"
+    fi
+
+    # Sharding (AUTUMN_EXTENT_SHARDS, default 1). Shard i binds its data
+    # listener at `port + i*stride` and its control listener at
+    # `port+1000 + i*stride` (EN default stride 10 — keep it in sync here).
+    # The manager routes an extent to shard `extent_id % shards` and dials
+    # `advertise_host:shard_port`. The EN binary
+    # itself self-registers every shard's data port at startup (via its own
+    # `--advertise`) and the manager/PS dial the pod IP directly — no
+    # `--shard-ports` flag and no per-pod Service enumerating shard ports
+    # anywhere anymore. shards=1 keeps the original single-shard behaviour.
+    local shards="${AUTUMN_EXTENT_SHARDS:-1}"
+    [[ "$shards" =~ ^[0-9]+$ && "$shards" -ge 1 ]] \
+        || die "AUTUMN_EXTENT_SHARDS must be a positive integer"
+    local cpuset="${AUTUMN_EXTENT_CPUSET:-}"
+    [[ -n "$cpuset" ]] || cpuset="$(first_allowed_cpus "$shards")"
+
+    wait_for_manager "$mgr"
+
+    # format is IDENTITY-ONLY (no --listen/--advertise) —
+    # idempotent: re-running on a formatted dir reuses the stamped
+    # disk_uuid and re-registers the same node identity. The EN process
+    # below self-registers the live location (--advertise) at every startup.
+    local -a dirs=()
+    local d
+    for d in ${data//,/ }; do
+        mkdir -p "$d"
+        dirs+=("$d")
+    done
+    local i
+    for (( i = 0; i < 30; i++ )); do
+        if autumn-op --cluster-secret-file "$CLUSTER_SECRET_FILE" \
+            --manager "$mgr" --transport "$TRANSPORT" format "${dirs[@]}"; then
+            break
+        fi
+        (( i == 29 )) && die "autumn-op format failed after 30 attempts"
+        log "format attempt $((i + 1)) failed; retrying"
+        sleep 2
+    done
+
+    local -a args=(
+        --cluster-secret-file "$CLUSTER_SECRET_FILE"
+        --port "$port" --data "$data" --manager "$mgr"
+        --listen 0.0.0.0 --transport "$TRANSPORT"
+        # Self-register the live location + shard ports at
+        # every startup — required now that `format` no longer stamps one.
+        --advertise "${adv}:${port}"
+        # Shard count == cpuset length (EN). Default: the container's first
+        # AUTUMN_EXTENT_SHARDS allowed cores (first_allowed_cpus). See the
+        # sharding block above and docs/ops.md "Multi-shard extent nodes".
+        --cpuset "$cpuset"
+    )
+    # bound resident sealed-extent fds (default 4096 in the
+    # binary). env→flag in the shell layer, never read in Rust.
+    [[ -n "${AUTUMN_EXTENT_FD_CACHE_CAP:-}" ]] && args+=(--fd-cache-cap "$AUTUMN_EXTENT_FD_CACHE_CAP")
+    # O_DIRECT for append bursts >= 1 MiB is the binary's default; the data
+    # volume must accept it. AUTUMN_EXTENT_DIRECT_IO=0 turns it off.
+    case "${AUTUMN_EXTENT_DIRECT_IO:-1}" in
+        1) ;;
+        0) args+=(--no-direct-io) ;;
+        *) die "AUTUMN_EXTENT_DIRECT_IO must be 0 or 1, got '$AUTUMN_EXTENT_DIRECT_IO'" ;;
+    esac
+    log "exec autumn-extent-node ${args[*]}"
+    exec autumn-extent-node "${args[@]}"
+}
+
+# cluster.sh AUTUMN_* env → autumn-ps flag table (subset that makes sense
+# off-host; UCX knobs excluded until a ucx-enabled image exists).
+PS_TUNABLES=(
+    "AUTUMN_GROUP_COMMIT_CAP:--group-commit-cap"
+    "AUTUMN_PS_INFLIGHT_CAP:--ps-inflight-cap"
+    "AUTUMN_PS_FLUSH_INFLIGHT_CAP:--flush-inflight-cap"
+    "AUTUMN_PS_SST_INFLIGHT_CAP:--ps-bulk-inflight-cap"
+    "AUTUMN_PS_MAX_IMM_DEPTH:--max-imm-depth"
+    "AUTUMN_PS_MAX_WAL_GAP:--max-wal-gap"
+    "AUTUMN_PS_SHUTDOWN_TIMEOUT_MS:--shutdown-timeout-ms"
+    "AUTUMN_PS_MAJOR_COMPACT_PARALLELISM:--major-compact-parallelism"
+    "AUTUMN_PS_GC_PARALLELISM:--gc-parallelism"
+    "AUTUMN_PS_CONN_INFLIGHT_CAP:--conn-inflight-cap"
+    "AUTUMN_PS_MEM_TIER_BYTES:--mem-tier-bytes"
+    "AUTUMN_PS_MEM_TIER_PREFIX:--mem-tier-prefix"
+    "AUTUMN_PS_FG_RATE_BYTES_PER_SEC:--fg-rate-bytes-per-sec"
+    "AUTUMN_PS_FG_IOPS_PER_SEC:--fg-iops-per-sec"
+    "AUTUMN_PS_ADMISSION_COMPACT_RATE_BYTES_PER_SEC:--admission-compact-rate-bytes-per-sec"
+    "AUTUMN_PS_ADMISSION_GC_RATE_BYTES_PER_SEC:--admission-gc-rate-bytes-per-sec"
+    "AUTUMN_PS_FG_SATURATED_THRESHOLD:--fg-saturated-threshold"
+    "AUTUMN_READ_HEDGE_MS:--read-hedge-ms"
+    "AUTUMN_SST_BLOCK_CACHE_BYTES:--sst-block-cache-bytes"
+    "AUTUMN_PS_GC_READ_CHUNK_BYTES:--gc-read-chunk-bytes"
+    "AUTUMN_PS_GC_BATCH_RECORDS:--gc-batch-records"
+    "AUTUMN_PS_GC_BATCH_BYTES:--gc-batch-bytes"
+    "AUTUMN_PS_GC_RATE_BYTES_PER_SEC:--gc-rate-bytes-per-sec"
+)
+
+run_ps() {
+    local port="${AUTUMN_PS_PORT:-9301}"
+    local mgr
+    mgr="$(resolve_hostport_list "${AUTUMN_MANAGER:-autumn-manager:9001}")"
+
+    # psid must be unique and non-zero: StatefulSet ordinal + 1.
+    local psid="${AUTUMN_PSID:-}"
+    if [[ -z "$psid" ]]; then
+        local ord="${HOSTNAME##*-}"
+        [[ "$ord" =~ ^[0-9]+$ ]] \
+            || die "cannot derive psid from HOSTNAME='$HOSTNAME'; set AUTUMN_PSID"
+        psid=$(( ord + 1 ))
+    fi
+
+    [[ -n "${POD_IP:-}" ]] || die "POD_IP not set (downward API status.podIP required)"
+    local adv
+    adv="$(bracket_host "$POD_IP")"
+
+    require_cluster_secret
+    wait_for_manager "$mgr"
+
+    local -a args=(
+        --cluster-secret-file "$CLUSTER_SECRET_FILE"
+        --psid "$psid" --port "$port" --manager "$mgr"
+        --listen 0.0.0.0 --advertise "${adv}:${port}" --transport "$TRANSPORT"
+    )
+    [[ -n "${AUTUMN_PS_CPUSET:-}" ]] && args+=(--cpuset "$AUTUMN_PS_CPUSET")
+    local pair env_name flag
+    for pair in "${PS_TUNABLES[@]}"; do
+        env_name="${pair%%:*}"; flag="${pair#*:}"
+        [[ -n "${!env_name:-}" ]] && args+=("$flag" "${!env_name}")
+    done
+    log "exec autumn-ps ${args[*]}"
+    exec autumn-ps "${args[@]}"
+}
+
+run_bootstrap() {
+    local expect="${AUTUMN_EXPECT_NODES:-3}"
+    [[ "$expect" =~ ^[0-9]+$ && "$expect" -ge 1 ]] \
+        || die "AUTUMN_EXPECT_NODES must be a positive integer"
+    local mgr
+    mgr="$(resolve_hostport_list "${AUTUMN_MANAGER:-autumn-manager:9001}")"
+    require_cluster_secret
+    wait_for_manager "$mgr"
+
+    # Guard: `bootstrap` is NOT idempotent (a second run creates duplicate
+    # streams/partitions). Mirror cluster.sh's etcd streams/ check via the
+    # leader-gated info snapshot: any stream ⇒ already bootstrapped. Only
+    # `info --full` emits the streams array ("stream_id") + partitions ("part_id").
+    local info
+    info="$(autumn-op --cluster-secret-file "$CLUSTER_SECRET_FILE" \
+        --manager "$mgr" --transport "$TRANSPORT" --json info --full 2>/dev/null || true)"
+    if grep -q '"stream_id"' <<<"$info"; then
+        if grep -q '"part_id"' <<<"$info"; then
+            log "cluster already bootstrapped (streams + partition) — nothing to do"
+        else
+            # Streams but no partition = a bootstrap that died mid-way. Do NOT
+            # re-run (would duplicate streams); surface it loudly. The Job
+            # completes so it stops retrying; an operator must inspect/repair.
+            log "WARN: streams exist but NO partition — cluster looks HALF-bootstrapped; not re-running (would duplicate streams). Inspect 'autumn-op info --full'."
+        fi
+        exit 0
+    fi
+
+    log "waiting for $expect extent node(s) Online"
+    local i n
+    for (( i = 0; i < 60; i++ )); do
+        n="$(autumn-op --cluster-secret-file "$CLUSTER_SECRET_FILE" \
+            --manager "$mgr" --transport "$TRANSPORT" list-nodes 2>/dev/null \
+            | grep -c Online || true)"
+        (( n >= expect )) && break
+        sleep 5
+    done
+    (( n >= expect )) || die "only $n/$expect extent node(s) Online"
+
+    # EC + replication defaults follow cluster.sh: replication min(3,N);
+    # N==4 → 3+1, N>=5 → 4+1, N<=3 → no EC. AUTUMN_EC_LOG/ROW: "off" or "K+M".
+    local meta_repl=$(( expect >= 3 ? 3 : expect ))
+    local ec_default=""
+    (( expect == 4 )) && ec_default="3+1"
+    (( expect >= 5 )) && ec_default="4+1"
+    local log_ec row_ec
+    case "${AUTUMN_EC_LOG:-}" in off) log_ec="" ;; ?*) log_ec="$AUTUMN_EC_LOG" ;; *) log_ec="$ec_default" ;; esac
+    case "${AUTUMN_EC_ROW:-}" in off) row_ec="" ;; ?*) row_ec="$AUTUMN_EC_ROW" ;; *) row_ec="$ec_default" ;; esac
+
+    local -a args=(--replication "${AUTUMN_REPLICATION:-${meta_repl}+0}")
+    [[ -n "$log_ec" ]] && args+=(--log-ec "$log_ec")
+    [[ -n "$row_ec" ]] && args+=(--row-ec "$row_ec")
+    # AUTUMN_BOOTSTRAP_PRESPLIT is RETIRED. It fed `bootstrap --presplit`, which
+    # cut the RAW keyspace at hex points; those are namespace-blind, so under the
+    # `{ns}/` key layout every cut point sorts below every real key and the split
+    # silently did nothing. `autumn-op bootstrap` now rejects the flag outright.
+    # Refuse here too rather than dropping it quietly — an operator who sets this
+    # wants their keyspace split, and silence would leave them on one partition.
+    if [[ -n "${AUTUMN_BOOTSTRAP_PRESPLIT:-}" ]]; then
+        die "AUTUMN_BOOTSTRAP_PRESPLIT is retired (raw-keyspace presplit is namespace-blind).
+Create and cut each namespace AFTER bootstrap instead (docs/ops.md):
+  autumn-op --cluster-secret-file F namespace-create --name fs  --parts 6
+  autumn-op --cluster-secret-file F namespace-create --name kvc --parts 16"
+    fi
+    # Bootstrap sends CREATE_STREAM / UPSERT_PARTITION, admin RPCs the manager
+    # authorizes by the cluster secret autumn-op proves on connect.
+    log "autumn-op bootstrap ${args[*]}"
+    autumn-op --cluster-secret-file "$CLUSTER_SECRET_FILE" \
+        --manager "$mgr" --transport "$TRANSPORT" bootstrap "${args[@]}"
+    log "bootstrap complete"
+}
+
+run_fuse() {
+    local mgr
+    mgr="$(resolve_hostport_list "${AUTUMN_MANAGER:-autumn-manager:9001}")"
+    local mp="${AUTUMN_FUSE_MOUNTPOINT:-/mnt/autumn}"
+
+    # A crashed daemon leaves the mount entry behind; the next mount on the same
+    # path then fails with EBUSY / "Transport endpoint is not connected". Clear
+    # it best-effort before mounting (no-op on a clean start).
+    #
+    # NEVER test this with `mountpoint -q`. That stats the path, and a stale
+    # FUSE mount whose server is gone blocks stat() in uninterruptible sleep
+    # forever — so the check meant to recover from a crashed predecessor is
+    # itself what hangs the replacement, silently, before it logs anything.
+    # /proc/mounts is pure VFS metadata and never blocks. The unmount is lazy
+    # for the same reason: plain `fusermount3 -u` can block on the dead
+    # connection, while `-uz` detaches the subtree immediately so nothing that
+    # follows (mkdir, the new mount) can trip over the corpse.
+    if grep -qs " ${mp} fuse" /proc/mounts; then
+        log "stale mount at $mp — lazy unmounting"
+        fusermount3 -uz "$mp" 2>/dev/null \
+            || umount -l "$mp" 2>/dev/null \
+            || log "lazy unmount failed (continuing)"
+    fi
+    mkdir -p "$mp"
+
+    wait_for_manager_port "$mgr"
+
+    local -a args=(
+        --manager "$mgr" --mountpoint "$mp" --transport "$TRANSPORT"
+    )
+    # The mount covers the WHOLE fs/ namespace; the credential names its own
+    # principal. Required when the cluster protects fs/, omitted on authz-off.
+    [[ -n "${AUTUMN_CREDENTIAL_FILE:-}" ]] \
+        && args+=(--credential-file "$AUTUMN_CREDENTIAL_FILE")
+    # Both default ON in the binary; only pass a flag when overriding to false.
+    [[ -n "${AUTUMN_FUSE_DIRECT_READ:-}" ]] \
+        && args+=(--direct-read "$AUTUMN_FUSE_DIRECT_READ")
+    [[ "${AUTUMN_FUSE_ALLOW_OTHER:-0}" == "1" ]] && args+=(--allow-other)
+    # Read I/O threads (binary default 4). Each carries its own client and its own
+    # registered-buffer pool, so a memory- or connection-constrained pod wants a
+    # way down to 0 (every read back on the dispatcher) without a new image.
+    [[ -n "${AUTUMN_FUSE_READ_IO_THREADS:-}" ]] \
+        && args+=(--read-io-threads "$AUTUMN_FUSE_READ_IO_THREADS")
+
+    log "exec autumn-fuse ${args[*]}"
+    exec autumn-fuse "${args[@]}"
+}
+
+run_s3() {
+    local mgr
+    mgr="$(resolve_hostport_list "${AUTUMN_MANAGER:-autumn-manager:9001}")"
+    wait_for_manager_port "$mgr"
+
+    local -a args=(
+        --manager "$mgr"
+        --listen "${AUTUMN_S3_LISTEN:-0.0.0.0}"
+        --port "${AUTUMN_S3_PORT:-9100}"
+    )
+    # Same fs/ credential the fuse role uses — the gateway reads the same tree,
+    # and authz gates READS too, so this is required once fs/ is protected.
+    [[ -n "${AUTUMN_CREDENTIAL_FILE:-}" ]] \
+        && args+=(--credential-file "$AUTUMN_CREDENTIAL_FILE")
+    [[ -n "${AUTUMN_S3_DIRECT_READ:-}" ]] \
+        && args+=(--direct-read "$AUTUMN_S3_DIRECT_READ")
+    # Distinct daemon identity per pod so the manager's lease registry can tell
+    # gateways apart (HOSTNAME is set by the orchestrator).
+    [[ -n "${HOSTNAME:-}" ]] && args+=(--host "s3-$HOSTNAME")
+
+    log "exec autumn-s3 ${args[*]}"
+    exec autumn-s3 "${args[@]}"
+}
+
+# ---------------------------------------------------------------------------
+# dispatch
+# ---------------------------------------------------------------------------
+
+case "${1:-}" in
+    manager)      run_manager ;;
+    extent-node)  run_extent_node ;;
+    ps)           run_ps ;;
+    bootstrap)    run_bootstrap ;;
+    fuse)         run_fuse ;;
+    s3)           run_s3 ;;
+    "")           die "usage: entrypoint.sh manager|extent-node|ps|bootstrap|fuse|s3|<command...>" ;;
+    *)            exec "$@" ;;
+esac

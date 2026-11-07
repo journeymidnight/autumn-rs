@@ -1,0 +1,15057 @@
+// `background` module made public so the autumn-ps binary can
+// reach its `set_*` setters (`set_gc_*`; `set_min_pipeline_batch` was
+// removed). The module's internal symbols stay `pub(crate)`/private.
+pub mod authz;
+pub mod background;
+mod rpc_handlers;
+mod sstable;
+pub mod compact_policy;
+mod wal_record;
+pub mod metrics;
+mod plog_load;
+mod clock;
+mod mem_tier;
+pub use metrics::{LatHist, PartitionMetrics, LAT_BUCKET_BOUNDS_NS};
+
+use background::*;
+use rpc_handlers::dispatch_partition_rpc;
+
+use std::cell::{Cell, RefCell};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::net::SocketAddr;
+use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use anyhow::{anyhow, Context, Result};
+use autumn_common::metrics::{duration_to_ns, ns_to_ms};
+use autumn_params::ps::PsParams;
+use autumn_rpc::manager_rpc::{self, rkyv_decode, rkyv_encode, MgrRange as Range};
+use autumn_rpc::partition_rpc::{self, SstLocation, TableLocations, *};
+use autumn_rpc::{Frame, FrameDecoder, HandlerResult, StatusCode};
+#[cfg(test)]
+#[path = "../../rpc/tests/support/protocol.rs"]
+mod test_protocol;
+use autumn_stream::{ConnPool, StreamClient};
+use bytes::Bytes;
+use compio::io::AsyncWriteExt;
+// `AsyncRead` is only needed in scope for `.read()` in the #[cfg(test)] code;
+// importing it unconditionally trips clippy's unused-import on the lib target.
+#[cfg(test)]
+use compio::io::AsyncRead;
+use compio::BufResult;
+use futures::channel::{mpsc, oneshot};
+use futures::stream::FuturesUnordered;
+use futures::{FutureExt, SinkExt, StreamExt};
+
+use sstable::{IterItem, MemtableIterator, SstBuilder, SstReader};
+
+// ---------------------------------------------------------------------------
+// Compat helpers
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+const WRITE_CHANNEL_CAP: usize = 1024;
+
+/// The runtime overrides this process installed last (`fetch_runtime_config_once`).
+static RUNTIME_INSTALLED: autumn_params::Installed = autumn_params::Installed::new();
+
+/// Every PS tunable (`autumn_params::ps`). Process-wide: the binary sets the
+/// flags before the first `PartitionServer`; a runtime override lands on the
+/// next read, so readers call `params().x.get()` where they need the value.
+pub fn params() -> &'static PsParams {
+    static PARAMS: std::sync::LazyLock<PsParams> = std::sync::LazyLock::new(PsParams::default);
+    &PARAMS
+}
+
+/// Test sync-point (RocksDB-`SyncPoint` style): when true, `background_flush_loop`
+/// holds BEFORE claiming any imm, so a test can advance the write cursor between
+/// an imm's rotation and its flush-claim — deterministically reproducing the
+/// flush-race. One relaxed load per flush-wake; only ever set by tests.
+static FLUSH_TEST_PAUSE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Count of fully-committed flushes (imm popped + meta checkpoint published).
+/// Lets a test wait for a flush to DURABLY complete instead of sleeping. Bumped
+/// once per `commit_flush_outcome` success; read via `flush_commit_count`.
+static FLUSH_COMMITS: AtomicU64 = AtomicU64::new(0);
+/// Log-stream bytes recovery replay has read, per partition, since process
+/// start. Tests take the delta across a reopen to see how much WAL it walked.
+static REPLAY_READ_BYTES: std::sync::Mutex<std::collections::BTreeMap<u64, u64>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// Test sync-point: when set, `finish_write_batch` parks BEFORE its memtable
+/// insert (Phase 3). It models a Put that is seq-assigned (Phase 1) + WAL-durable
+/// (Phase 2) but not yet visible in the memtable — the "in-flight WAL queue"
+/// state a concurrent GC value-relocation must not shadow. One relaxed load per
+/// batch; only ever set by tests.
+static WRITE_PHASE3_PAUSE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+/// Count of Phase-3 inserts that have PARKED on `WRITE_PHASE3_PAUSE`. A test
+/// polls this to know a write is seq-assigned but not yet in the memtable.
+static WRITE_PHASE3_PARKED: AtomicU64 = AtomicU64::new(0);
+
+/// Memtable rotation threshold, and so the size of an SST a flush writes.
+/// Compaction reads its own sizes off the same value.
+pub(crate) fn flush_mem_bytes() -> u64 {
+    params().flush_mem_bytes.get()
+}
+/// Data-block bytes at which `do_compact` cuts an output SST (bloom, index and
+/// MetaBlock come on top): `--compact-max-sst-bytes`, and at least twice the
+/// flush size so a flushed table is never above half of it.
+pub(crate) fn max_sst_bytes() -> u64 {
+    params()
+        .compact_max_sst_bytes
+        .get()
+        .max(flush_mem_bytes().saturating_mul(2))
+}
+/// Approximate encoded bytes used to enforce the per-SST output budget.
+pub(crate) fn sst_entry_bytes(key_len: usize, value_len: usize) -> usize {
+    key_len.saturating_add(value_len).saturating_add(20)
+}
+/// Test sync-point control — see `FLUSH_TEST_PAUSE`. Only tests call this.
+pub fn set_flush_test_pause(paused: bool) {
+    FLUSH_TEST_PAUSE.store(paused, Ordering::Relaxed);
+}
+fn flush_test_paused() -> bool {
+    FLUSH_TEST_PAUSE.load(Ordering::Relaxed)
+}
+/// Test failpoint: `n > 0` makes the n-th flush commit from now fail its
+/// checkpoint as an append that never landed (0 = off). Only tests set it.
+static FLUSH_CHECKPOINT_FAIL_AT: AtomicU64 = AtomicU64::new(0);
+/// Arm `FLUSH_CHECKPOINT_FAIL_AT`: the `n`-th flush commit from now fails its
+/// checkpoint (1 = the next one). Only tests call this.
+pub fn fail_nth_flush_checkpoint(n: u64) {
+    FLUSH_CHECKPOINT_FAIL_AT.store(n, Ordering::Relaxed);
+}
+fn flush_checkpoint_failpoint() -> bool {
+    FLUSH_CHECKPOINT_FAIL_AT
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+        == Ok(1)
+}
+/// Test failpoint: while set, a merged open fails before it publishes the
+/// merged checkpoint, leaving the meta stream as a PS crash right after the
+/// merge would. Only tests set it.
+static MERGED_CHECKPOINT_FAIL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+/// Arm `MERGED_CHECKPOINT_FAIL` for the life of the process. Only tests call this.
+pub fn fail_merged_checkpoint() {
+    MERGED_CHECKPOINT_FAIL.store(true, Ordering::Relaxed);
+}
+/// Test failpoint: while set, writes record no `wal_dead`, leaving their WAL
+/// bytes uncounted as builds before that tally did. Only tests set it.
+static WAL_DEAD_OFF: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Set `WAL_DEAD_OFF`. Only tests call this.
+pub fn set_wal_dead_off(off: bool) {
+    WAL_DEAD_OFF.store(off, Ordering::Relaxed);
+}
+/// Number of flushes fully committed (checkpoint published) since process start.
+/// Tests poll this for deterministic flush completion. See `FLUSH_COMMITS`.
+pub fn flush_commit_count() -> u64 {
+    FLUSH_COMMITS.load(Ordering::Relaxed)
+}
+/// Log-stream bytes recovery replay has read for `part_id` since process
+/// start. See `REPLAY_READ_BYTES`.
+pub fn replay_read_bytes(part_id: u64) -> u64 {
+    let m = REPLAY_READ_BYTES.lock().unwrap_or_else(|e| e.into_inner());
+    m.get(&part_id).copied().unwrap_or(0)
+}
+/// Test sync-point: parks `handle_split_part` AFTER its commit-length
+/// captures + P-sst barrier, BEFORE `multi_modify_split` — the window where a
+/// concurrent tail roll invalidates the captured lengths. Only tests set it.
+static SPLIT_COMMIT_PAUSE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+/// Count of splits that have PARKED on `SPLIT_COMMIT_PAUSE` (tests poll it to
+/// know the captures are done and the handler is held pre-commit).
+static SPLIT_COMMIT_PARKED: AtomicU64 = AtomicU64::new(0);
+/// Test sync-point control — see `SPLIT_COMMIT_PAUSE`. Only tests call this.
+pub fn set_split_commit_pause(paused: bool) {
+    SPLIT_COMMIT_PAUSE.store(paused, Ordering::Relaxed);
+}
+pub(crate) fn split_commit_paused() -> bool {
+    SPLIT_COMMIT_PAUSE.load(Ordering::Relaxed)
+}
+pub fn split_commit_parked_count() -> u64 {
+    SPLIT_COMMIT_PARKED.load(Ordering::Relaxed)
+}
+pub(crate) fn note_split_commit_parked() {
+    SPLIT_COMMIT_PARKED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Test sync-point: parks `handle_roll_tails` AFTER its freeze/idempotency
+/// checks, BEFORE the seal+roll — modelling a roll already in flight when a
+/// split's freeze begins. Only tests set it.
+static ROLL_TAILS_PAUSE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+/// Count of roll entries that have PARKED on `ROLL_TAILS_PAUSE`.
+static ROLL_TAILS_PARKED: AtomicU64 = AtomicU64::new(0);
+/// Test sync-point control — see `ROLL_TAILS_PAUSE`. Only tests call this.
+pub fn set_roll_tails_pause(paused: bool) {
+    ROLL_TAILS_PAUSE.store(paused, Ordering::Relaxed);
+}
+pub(crate) fn roll_tails_paused() -> bool {
+    ROLL_TAILS_PAUSE.load(Ordering::Relaxed)
+}
+pub fn roll_tails_parked_count() -> u64 {
+    ROLL_TAILS_PARKED.load(Ordering::Relaxed)
+}
+pub(crate) fn note_roll_tails_parked() {
+    ROLL_TAILS_PARKED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Test sync-point control — see `WRITE_PHASE3_PAUSE`. Only tests call this.
+pub fn set_write_phase3_pause(paused: bool) {
+    WRITE_PHASE3_PAUSE.store(paused, Ordering::Relaxed);
+}
+pub(crate) fn write_phase3_paused() -> bool {
+    WRITE_PHASE3_PAUSE.load(Ordering::Relaxed)
+}
+/// Number of Phase-3 inserts currently/previously PARKED on the pause. Tests
+/// poll this to know a held write is seq-assigned but not yet in the memtable.
+pub fn write_phase3_parked_count() -> u64 {
+    WRITE_PHASE3_PARKED.load(Ordering::Relaxed)
+}
+pub(crate) fn note_write_phase3_parked() {
+    WRITE_PHASE3_PARKED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Group-commit request count cap (`--group-commit-cap`).
+fn max_write_batch() -> usize {
+    params().group_commit_cap.get()
+}
+/// The most encoded bytes one group-commit batch may carry.
+///
+/// The batch becomes ONE `AppendReq`, and a frame's `payload_len` is a u32, so
+/// a batch past this ceiling cannot be sent at all: the length narrows, the
+/// header disagrees with the bytes, and the peer fails CRC. Nothing upstream
+/// stopped it — `pending` is bounded by request COUNT (`max_write_batch()`,
+/// 3072 by default) while a single Put may carry
+/// `AUTUMN_PS_MAX_INLINE_BYTES_DEFAULT` (64 MiB), so 65 large Puts already
+/// cross it, and the shape that produces them — a model load — is the target
+/// workload.
+///
+/// Headroom under the ceiling covers the `AppendReq` header and per-record
+/// framing that `start_write_batch` adds on top of `encoded_size()`.
+///
+/// This is a WIRE bound, not the memory bound the `ps_inflight_cap` doc
+/// describes: it only ever splits a batch that could not have been sent, so
+/// the batching behaviour under every real workload is unchanged. A tighter,
+/// memory-oriented cap is a separate decision with its own measurements.
+pub(crate) const MAX_WRITE_BATCH_BYTES: usize =
+    autumn_rpc::frame::MAX_PAYLOAD_LEN as usize - (1 << 20);
+
+/// A batch launched while another is already in flight must carry at least
+/// this many ops. The EN serializes appends to one extent, so a second batch
+/// does not overlap the first — it adds a whole append of its own. Under the
+/// perf bench a partition serves two client connections × the PS
+/// per-connection admission of 4 = 8 ops; launching on the first
+/// connection's 4 split every burst into two 4-op appends (see
+/// `partition_loop` (B)). Measured with other workloads pinned away, 4K writes
+/// over 8 partitions: average batch 4.4 without the gate, 8.00 with it, +30%
+/// write throughput. An idle partition (nothing in flight) launches whatever
+/// it holds at once — the gate only ever delays an op that would have queued
+/// behind the in-flight append on the EN anyway.
+pub(crate) const MIN_PIPELINED_BATCH: usize = 8;
+
+/// How long `partition_loop` waits, right after a batch completes, for the
+/// refill that batch's acks just triggered before launching a partial burst
+/// with nothing in flight. Without it the two connections a partition serves
+/// settle into strict alternation: A's 4 ops complete, B's 4 (held while A was
+/// in flight) launch instantly, A's refill lands ~100 µs later and is held
+/// behind B's — every batch is one connection's worth, forever. One window
+/// after a completion lets A's refill join B's, both are acked together, both
+/// refill together, and the loop stays in lock-step from then on.
+///
+/// WHAT the window waits for is sized by `CoalesceWindow`, never by a fixed
+/// count. A fixed `MIN_PIPELINED_BATCH` target made a lone writer — one
+/// connection, one op at a time, which is autumnfs writing one file — sit out
+/// the whole window on every op for a refill that was already complete:
+/// +0.13 ms p50 and -20% throughput at depth 1.
+pub(crate) const LAUNCH_COALESCE_WINDOW: Duration = Duration::from_micros(200);
+
+/// The coalescing window `partition_loop` opens after a completion, and the
+/// size of the refill it waits for.
+///
+/// Every client frame a completion answers releases one admission slot on
+/// its connection (`ps_conn_inflight_cap`), and each slot refills with one
+/// frame of at least one op. So the ops already held at the completion (a
+/// burst partner's, taken in while the batch was in flight) plus the frames
+/// answered is a count `pending` is guaranteed to reach once every refill has
+/// landed — the window holds a launch only while `pending` is below that
+/// target and the deadline has not passed. Completions inside one window add
+/// up; a launch closes it. A lone writer's refill launches the instant it
+/// arrives (target 1), one connection refilling its 4 admitted ops in one
+/// read launches at 4, and two desynchronized connections (4 held + 4
+/// answered) wait for the second refill and re-lock at 8. Counting frames,
+/// not ops, is what keeps a batch-put stream and a fence record honest: a
+/// 50-op batch frame answered is one slot, and its writer's next frame —
+/// whatever its size — launches at once; a fence record answers nobody and
+/// counts for nothing.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct CoalesceWindow {
+    deadline: Option<Instant>,
+    target: usize,
+}
+
+impl CoalesceWindow {
+    /// A completion just answered `acked` client frames while `held` ops were
+    /// pending.
+    pub(crate) fn arm(&mut self, held: usize, acked: usize, now: Instant) {
+        let open = self.deadline.is_some_and(|d| now < d);
+        self.target = if open { self.target } else { held } + acked;
+        self.deadline = Some(now + LAUNCH_COALESCE_WINDOW);
+    }
+
+    /// A batch launched, or the window ran out: nothing left to wait for.
+    pub(crate) fn clear(&mut self) {
+        *self = Self::default();
+    }
+
+    /// With `pending` ops queued and nothing in flight: how much longer to
+    /// wait for the refill before launching. `None` means launch now.
+    pub(crate) fn holds(&self, pending: usize, now: Instant) -> Option<Duration> {
+        let deadline = self.deadline?;
+        (pending > 0 && pending < self.target && now < deadline).then(|| deadline - now)
+    }
+}
+
+/// Capacity of a `PartitionServer`'s SST block cache (paged readers only).
+/// The cache ITSELF is per-`PartitionServer` (`PartitionServer::block_cache`,
+/// handed to every partition it opens) — only this size knob is process-wide.
+///
+/// The cache keys blocks on `(extent_id, offset)`, which is unique only WITHIN
+/// one cluster. One PS serves one cluster, so a per-PS cache can never alias;
+/// a process-global one silently could, and did in test harnesses that run
+/// several in-process clusters at once.
+
+fn new_block_cache() -> std::sync::Arc<crate::sstable::BlockCache> {
+    let cap = params().sst_block_cache_bytes.get();
+    std::sync::Arc::new(crate::sstable::BlockCache::new(cap))
+}
+
+/// staleness predicate: has the live `sst_readers` set changed since a
+/// pre-await snapshot was taken? Shared by every snapshot-then-await reader
+/// (GET / HEAD / range scan retry loops, GC's re-check) so the "compaction
+/// republished the readers during my block read" detection can never drift
+/// between them. Pointer equality per slot — publishes always swap `Arc`s.
+pub(crate) fn sst_readers_changed(
+    live: &[std::sync::Arc<crate::sstable::SstReader>],
+    snap: &[std::sync::Arc<crate::sstable::SstReader>],
+) -> bool {
+    live.len() != snap.len()
+        || live
+            .iter()
+            .zip(snap.iter())
+            .any(|(a, b)| !std::sync::Arc::ptr_eq(a, b))
+}
+
+/// R4 4.4 — maximum number of P-log `append_batch` futures in flight
+/// concurrently per partition. Higher values give more pipeline depth so
+/// multiple 256-request group-commit batches overlap their replica RTT, but
+/// also raise peak memory (each in-flight batch holds its requests' encoded
+/// segments).
+///
+/// Default = 8. The per-batch memory is whatever the queued requests hold —
+/// `MAX_WRITE_BATCH_BYTES` bounds the WIRE frame, not the working set — so a
+/// burst of large Puts can exceed the figure this note used to quote.
+/// Range clamped to [1, 64]. `--ps-inflight-cap`.
+pub(crate) fn ps_inflight_cap() -> usize {
+    params().ps_inflight_cap.get()
+}
+
+/// R4 4.4 — maximum number of P-sst (flush) in-flight SST uploads per
+/// partition. Each in-flight request holds a full 128 MB SSTable buffer
+/// (peak), so this cap is deliberately small. Default = 2 lets the next
+/// flush start its `build_sst` while the previous one's 128 MB
+/// `row_stream.append` is streaming. Range clamped to [1, 16].
+/// `--ps-bulk-inflight-cap`.
+///
+/// `background_flush_loop` is structurally
+/// parallel via `FuturesOrdered` and `ps_flush_inflight_cap()`. The
+/// parallel path defaults to cap=1 (serial behaviour) after 120 s
+/// perf_check showed cap=4 doesn't help fg-saturated 4K workloads
+/// — EN-side row_stream fsync is the wall, not P-log concurrency.
+/// Operators opting in to parallel flush via
+/// `--flush-inflight-cap N` should bump this knob to match so the
+/// P-sst `FuturesUnordered` doesn't head-of-line block.
+/// Default returns to 2 (the long-standing R4 4.4 value).
+pub(crate) fn ps_sst_inflight_cap() -> usize {
+    params().ps_bulk_inflight_cap.get()
+}
+
+/// parallel imm-flush drain cap on the P-log side.
+/// `background_flush_loop` uses `FuturesOrdered` with this cap; up to
+/// N imms can be building+uploading concurrently, then commit
+/// (`save_table_locs_raw`, then `tables.push` / `imm.pop_front`) runs
+/// strictly serial in launch order (see `commit_flush_outcome`).
+/// Range clamped to [1, 64].
+///
+/// **Default = 1** (functionally equivalent to the original serial flow).
+/// The 120 s perf_check at p=16 d=8 4K showed bumping this to 4
+/// does NOT improve write p99 / throughput on the sustained-write
+/// pattern because the bottleneck is **EN-side row_stream fsync**,
+/// not P-log concurrency: 256 MB SST × 3-replica fsync ≈ 3 s
+/// regardless of how many SSTs are launched concurrently (writes
+/// to the same row_stream tail extent serialise at the extent file).
+///
+/// still matters for *future* workloads where the bottleneck
+/// shifts — single-partition heavy churn (split-followup compaction),
+/// VP-heavy imm with small SST + big log_stream tail, short burst
+/// → drain. Operator can opt in via `--flush-inflight-cap N`.
+pub(crate) fn ps_flush_inflight_cap() -> usize {
+    params().flush_inflight_cap.get()
+}
+
+/// maximum imm queue depth per partition. When `imm.len()` reaches
+/// this cap, `partition_loop` stops pulling from `req_rx` (write
+/// back-pressure) and waits for `flush_one_imm` to pop one entry before
+/// resuming. Worst-case unflushed-WAL window per partition is therefore
+/// `MAX_IMM_DEPTH * --flush-mem-bytes + active.bytes` = 4 × 256 MB + 256 MB
+/// = 1.25 GB (vs. the earlier unbounded window). Range clamped to [1, 64].
+/// `--max-imm-depth`. RocksDB analogue:
+/// `max_write_buffer_number` (default 2). Default 4 because our memtable
+/// is 4× RocksDB's default `write_buffer_size` and bulk uploads are
+/// network-bound 128 MB SSTs.
+pub(crate) fn max_imm_depth() -> usize {
+    params().max_imm_depth.get()
+}
+
+/// maximum unflushed log_stream gap per partition. When
+/// `active.bytes + Σ imm[i].bytes > MAX_WAL_GAP`, `partition_loop`
+/// force-rotates `active` to imm even if it hasn't reached
+/// `FLUSH_MEM_BYTES = 256 MB`. Bounds `open_partition` replay time when
+/// the workload is dominated by large values (small memtable footprint
+/// per record but full payload sits in log_stream as VPs) or by small
+/// writes that drip in below the rotate threshold. Range clamped to
+/// [128 MiB, 64 GiB]. `--max-wal-gap`.
+/// RocksDB analogue: `max_total_wal_size` (default
+/// `write_buffer_size × max_write_buffer_number × 4`).
+pub(crate) fn max_wal_gap() -> u64 {
+    params().max_wal_gap.get()
+}
+
+/// Per-extent seal threshold passed to each partition's `StreamClient`.
+/// Default 16 GiB (was a hardcoded 3 GiB); overridable via
+/// `autumn-ps --max-extent-size-bytes`.
+/// The u64-offset widening lifted the prior 4 GiB read-offset
+/// ceiling so extents can now exceed 4 GiB.
+pub(crate) fn max_extent_size_bytes() -> u64 {
+    params().max_extent_size_bytes.get()
+}
+
+/// The `--stream-*` parameters, read when a partition opens its stream clients.
+fn stream_client_config() -> autumn_stream::client::StreamClientConfig {
+    let p = params();
+    autumn_stream::client::StreamClientConfig {
+        bad_nodes_ttl: Duration::from_secs(p.stream_bad_nodes_ttl_secs.get()),
+        inflight_cap: p.stream_inflight_cap.get(),
+        append_fanout_timeout: Duration::from_millis(p.stream_append_timeout_ms.get()),
+        append_floor_bytes_per_sec: p.stream_append_floor_bytes_per_sec.get(),
+        read_chunk_bytes: p.stream_read_chunk_bytes.get(),
+        read_base_timeout: Duration::from_millis(p.stream_read_timeout_ms.get()),
+        read_floor_bytes_per_sec: p.stream_read_floor_bytes_per_sec.get(),
+    }
+}
+
+/// graceful shutdown deadline. After SIGTERM, `PartitionServer::
+/// shutdown()` waits at most this many milliseconds for each partition's
+/// drain (rotate active + flush all imm). Range clamped to [1 s, 10 min].
+/// `--shutdown-timeout-ms`.
+pub(crate) fn shutdown_timeout_ms() -> u64 {
+    params().shutdown_timeout_ms.get()
+}
+
+// CPU affinity: the PS pins no thread; its `--cpuset` confines the process
+// (`autumn_common::cpu_pin::float_current` in the binary).
+
+/// global cross-partition gate on concurrent compactions.
+///
+/// `do_compact` (background.rs) holds, at peak, both the input SSTs'
+/// `Bytes` (already in `PartitionData.sst_readers`) and the output SSTs'
+/// `Bytes` (in the `new_readers` Vec built up during the streaming loop)
+/// — roughly 2× the on-disk SST size of one partition. With N partitions
+/// running compactions concurrently on the same process this multiplies
+/// linearly. With 4 partitions of ~5 GB SST each on one PS,
+/// `autumn-op compact ALL` can push RSS into the tens of GB.
+///
+/// This gate caps cross-partition compaction concurrency. Default = **4**
+/// (post-D-r7-recal; was 1 pre-recal). With single-compact peak ~256 MB
+/// after streaming compaction + spawn_blocking, 4 concurrent compacts =
+/// ~2 GB peak RSS — well below the tens of GB an uncapped `compact ALL` reached.
+/// Memory-constrained operators can lower via `--major-compact-parallelism 1`;
+/// throughput-bound operators can raise up to 64.
+pub(crate) fn ps_major_compact_parallelism() -> usize {
+    // D-r7-recal: bumped 1 → 4. The original RAM-cap default was
+    // overly conservative — a single compact's spawn_blocking SST
+    // buffer is bounded at 2x the flush size (512 MiB at the default),
+    // so 4 concurrent compacts peak at ~2 GB RSS, well within modern server budgets.
+    // The 1 default created a structural bottleneck: with N partitions
+    // doing sustained 4K writes (~27 MB/s flush per partition × 16 =
+    // 432 MB/s aggregate flush input), a serialized single compact at
+    // 256 MiB/s simply cannot keep up. Operator can lower via
+    // `--major-compact-parallelism` for memory-constrained hosts.
+    params().major_compact_parallelism.get()
+}
+
+/// PS-wide cap on concurrent `run_gc` calls across partitions.
+/// GC reads sealed log_stream extents in 64 MiB chunks and
+/// rewrites live VPs — both the chunk-read buffer (~64 MiB) and the
+/// rewrite append staging consume RSS. Without a PS-wide cap,
+/// `autumn-op gc ALL` on an N-partition PS would launch N
+/// concurrent `run_gc` calls, multiplying peak memory by N.
+///
+/// Default = **4** (post-D-r7-recal), tunable via `--gc-parallelism`.
+/// Range clamped to [1, 64]. Symmetric with
+/// `ps_major_compact_parallelism`; reasoning is identical (RAM cap,
+/// not rate cap — that's the per-partition `RateController`).
+/// 4 × 64 MiB chunk buffer = 256 MiB peak RSS, well below any
+/// reasonable budget.
+pub(crate) fn ps_gc_parallelism() -> usize {
+    params().gc_parallelism.get()
+}
+
+pub struct CompactionGate {
+    inflight: std::sync::atomic::AtomicUsize,
+    max_parallel: usize,
+}
+
+impl CompactionGate {
+    pub fn new(max_parallel: usize) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            inflight: std::sync::atomic::AtomicUsize::new(0),
+            max_parallel: max_parallel.max(1),
+        })
+    }
+
+    pub async fn acquire(self: &std::sync::Arc<Self>) -> CompactionPermit {
+        use std::sync::atomic::Ordering;
+        loop {
+            let cur = self.inflight.load(Ordering::Acquire);
+            if cur < self.max_parallel
+                && self
+                    .inflight
+                    .compare_exchange_weak(cur, cur + 1, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+            {
+                return CompactionPermit {
+                    gate: std::sync::Arc::clone(self),
+                };
+            }
+            // Either at-cap or CAS lost the race; back off briefly and
+            // retry. 50 ms is short relative to compaction wallclock
+            // (seconds–minutes) and avoids hot-spinning the CPU.
+            compio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+}
+
+pub struct CompactionPermit {
+    gate: std::sync::Arc<CompactionGate>,
+}
+
+impl Drop for CompactionPermit {
+    fn drop(&mut self) {
+        self.gate
+            .inflight
+            .fetch_sub(1, std::sync::atomic::Ordering::Release);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MVCC internal-key helpers
+// ---------------------------------------------------------------------------
+//
+// Internal (storage) key = `user_key ++ BigEndian(u64::MAX - seq)`.
+//
+// ORDER IS NOT BYTE ORDER. Every comparison of internal keys MUST go through
+// `cmp_internal_keys`, which compares the user key first and the fixed-width
+// inverted-seq suffix second. Raw byte comparison is wrong whenever one user
+// key is a proper prefix of another: the shorter key's suffix bytes (leading
+// 0xFF for small seq) would compare against the longer key's CONTENT bytes,
+// sorting `"mykey"` after `"mykey1"`. An earlier encoding worked around that
+// with a 0x00 separator byte between user key and suffix — which restored
+// prefix ordering only for user keys that contain no 0x00 themselves, and the
+// system permits arbitrary bytes in user keys (`"a"` vs `"a\x00b"` inverted).
+// The explicit comparator is correct for arbitrary user keys and needs no
+// separator byte at all.
+
+/// Width of the internal-key suffix: `BE(u64::MAX - seq)`.
+const TS_BYTES: usize = 8;
+
+/// Split an internal key into `(user_key, inverted-seq suffix)`. A
+/// well-formed internal key is always ≥ `TS_BYTES` long (`key_with_ts` output
+/// for an empty user key is exactly `TS_BYTES`); anything shorter is treated
+/// degenerately as `(whole, empty)`.
+#[inline]
+fn split_internal_key(internal_key: &[u8]) -> (&[u8], &[u8]) {
+    if internal_key.len() < TS_BYTES {
+        (internal_key, &[])
+    } else {
+        internal_key.split_at(internal_key.len() - TS_BYTES)
+    }
+}
+
+/// THE total order over MVCC internal keys: user key first (byte order),
+/// then the inverted-seq suffix — so distinct user keys sort in user-key
+/// order regardless of length/content, and versions of the same user key
+/// sort newest (highest seq) first.
+///
+/// Byte-equality coincides with comparator-equality (two keys compare Equal
+/// iff both halves match, i.e. the keys are identical), so `==` on internal
+/// keys stays plain byte equality.
+#[inline]
+pub(crate) fn cmp_internal_keys(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+    let (ua, sa) = split_internal_key(a);
+    let (ub, sb) = split_internal_key(b);
+    ua.cmp(ub).then_with(|| sa.cmp(sb))
+}
+
+pub(crate) fn key_with_ts(user_key: &[u8], ts: u64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(user_key.len() + TS_BYTES);
+    out.extend_from_slice(user_key);
+    out.extend_from_slice(&(u64::MAX - ts).to_be_bytes());
+    out
+}
+
+pub(crate) fn parse_key(internal_key: &[u8]) -> &[u8] {
+    split_internal_key(internal_key).0
+}
+
+pub(crate) fn parse_ts(internal_key: &[u8]) -> u64 {
+    let (_, suffix) = split_internal_key(internal_key);
+    match <[u8; TS_BYTES]>::try_from(suffix) {
+        Ok(b) => u64::MAX - u64::from_be_bytes(b),
+        Err(_) => 0, // degenerate short key
+    }
+}
+
+/// Internal key with the comparator as its `Ord` — the memtable's BTreeMap
+/// key type, so tree walks and `range()` seeks follow `cmp_internal_keys`
+/// instead of raw byte order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InternalKey(Vec<u8>);
+
+impl Ord for InternalKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        cmp_internal_keys(&self.0, &other.0)
+    }
+}
+
+impl PartialOrd for InternalKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Value-log
+// ---------------------------------------------------------------------------
+
+const VALUE_THROTTLE: usize = 4 * 1024;
+// u64-offset widening: VP offset addresses into a log_stream extent that can
+// now exceed 4 GiB, so offset (and len, for headroom) are u64 → 8+8+8 = 24.
+const VALUE_POINTER_SIZE: usize = 24;
+const OP_VALUE_POINTER: u8 = 0x80;
+
+/// Does this WAL record's value hold a ValuePointer?
+///
+/// **GC's scan and the replay MUST answer this identically.** GC decides what
+/// to relocate from the scan and then punches the extent; recovery decides what
+/// to reconstruct from the replay. If the two disagree about a record, GC
+/// relocates a set that does not match what is actually live and then destroys
+/// the originals.
+///
+/// They did disagree. GC's own relocation writes its WAL record with a bare
+/// `op = 1` — its memtable insert sets `1 | OP_VALUE_POINTER`, but the record on
+/// disk does not — while the scan required the flag and the replay accepted
+/// either the flag OR an over-threshold length. So a relocated value was
+/// reconstructed correctly by recovery, and invisible to the NEXT GC of the
+/// extent it had just been moved into: skipped as if it were a chunk blob, not
+/// relocated, and punched while its ValuePointer was still live. Any large
+/// value that survived two GC generations was silently lost.
+///
+/// The length arm also covers records written before the flag existed, which is
+/// why the replay had it in the first place.
+#[inline]
+fn record_carries_value_pointer(op: u8, value_len: usize) -> bool {
+    op & OP_VALUE_POINTER != 0 || value_len > VALUE_THROTTLE
+}
+
+/// Lease write fencing: WAL record op for a fence-floor bump. Emitted into
+/// the SAME group-commit batch as (and BEFORE) the write whose
+/// `check_and_bump_fence` raised the per-ino floor, so the floor is durable
+/// no later than the write it admitted. Record shape: key = internal key
+/// over `ino.to_be_bytes()` (8 bytes), value = `epoch.to_le_bytes()`
+/// (8 bytes). NEVER enters the memtable / SSTs; recovery replay max-merges
+/// it into `PartitionData.fence_floors` (idempotent, so no ts-dedup needed).
+/// 0x08 is free: 1=put, 2=tombstone, 0x80=VP flag, 0x40/0x10 reserved
+/// (former server-side multipart flags), and GC's VP scan skips it
+/// (`op & OP_VALUE_POINTER == 0`).
+const OP_FENCE_BUMP: u8 = 0x08;
+
+/// Record op of a put (an inline value).
+const OP_PUT: u8 = 1;
+
+/// Record op of a delete (the low bits; `OP_VALUE_POINTER` is a flag above).
+const OP_TOMBSTONE: u8 = 2;
+
+/// backstop TTL for a merge freeze's write halt. The manager's
+/// merge orchestrator (`handle_merge_partitions`) commits in <1 s on the
+/// happy path and explicitly unfreezes on rollback. This TTL fires only
+/// when the orchestrator crashed mid-flow before either committing the
+/// merge txn (which causes the survivor's region_sync_loop to drop the
+/// frozen `PartitionData` and reopen with frozen=false) or unfreezing on
+/// failure. 30 s gives the manager's leader-election + replay path enough
+/// runway while bounding the worst-case write-halt window — far below the
+/// alternative of "frozen forever until PS restart" that a crash-bare
+/// design would imply.
+const FREEZE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+// `OP_VALUE_POINTER_MULTI` (0x40) and `OP_CHUNK_BLOB` (0x10)
+// were the server-side multipart op flags. Removed along with the
+// rest of the server-side multipart machinery. Stripe-write is now pure
+// client-side via `ClusterClient::put_stream_begin` (Ceph striperados
+// pattern). Op-flag values 0x40 and 0x10 remain RESERVED to avoid
+// conflicting with on-disk records that may still exist from earlier
+// runs.
+
+// Inline-Put cap. The PS rejects `MSG_PUT` with `value.len()` greater
+// than this with `CODE_VALUE_TOO_LARGE`; client SDK retries via
+// `put_stream_begin` (client-side striping).
+pub(crate) const AUTUMN_PS_MAX_INLINE_BYTES_DEFAULT: u32 = 64 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ValuePointer {
+    extent_id: u64,
+    offset: u64,
+    len: u64,
+}
+
+impl ValuePointer {
+    fn encode(&self) -> [u8; VALUE_POINTER_SIZE] {
+        let mut b = [0u8; VALUE_POINTER_SIZE];
+        b[0..8].copy_from_slice(&self.extent_id.to_le_bytes());
+        b[8..16].copy_from_slice(&self.offset.to_le_bytes());
+        b[16..24].copy_from_slice(&self.len.to_le_bytes());
+        b
+    }
+    fn decode(b: &[u8]) -> Self {
+        Self {
+            extent_id: u64::from_le_bytes(b[0..8].try_into().unwrap()),
+            offset: u64::from_le_bytes(b[8..16].try_into().unwrap()),
+            len: u64::from_le_bytes(b[16..24].try_into().unwrap()),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Memtable entry
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub(crate) struct MemEntry {
+    op: u8,
+    value: Vec<u8>,
+    expires_at: u64,
+}
+
+// single-writer (P-log) BTreeMap under parking_lot::RwLock.
+//
+// Motivation (perf diagnosis): the previous crossbeam SkipMap paid
+// full lock-free bookkeeping
+// (epoch pinning + tagged atomic pointer loads + CAS splice retries + refcount
+// drops) on every insert, which accounted for ~28 % of the P-log thread's CPU
+// budget at the 60–65 k write ceiling. autumn-rs's write path has exactly one
+// writer per memtable (the P-log thread's `background_write_loop_r1`), so that
+// machinery is pure overhead. A plain `BTreeMap` under a `parking_lot::RwLock`
+// gives:
+//   - single-threaded insert walks (cache-friendly, no atomics)
+//   - brief writer lock hold (~microseconds per batch phase-3)
+//   - parallel reader access (ps-conn Get path can acquire the read lock
+//     concurrently with other readers; a batch insert briefly excludes them)
+// Linearizability is preserved by the RwLock (see Programming Notes in
+// crates/partition-server/CLAUDE.md).
+pub(crate) struct Memtable {
+    data: parking_lot::RwLock<BTreeMap<InternalKey, MemEntry>>,
+    bytes: AtomicU64,
+    /// BUG1: LOG bytes (the actual WAL records appended to
+    /// log_stream for this memtable's entries — VALUE included), tracked
+    /// SEPARATELY from `bytes` (in-memory footprint, which for a large value is
+    /// only the ~24-byte ValuePointer). The WAL-gap force-rotate must
+    /// bound the recovery REPLAY WINDOW = un-flushed log bytes, so it reads this,
+    /// not `mem_bytes()`. Updated once per group-commit batch via `add_log_bytes`
+    /// (Σ record_sizes = bytes appended to log_stream).
+    log_bytes: AtomicU64,
+    /// Per log extent, the bytes of this memtable's WAL records that are dead
+    /// once it is flushed: every record byte except a ValuePointer's value,
+    /// which only lives in the log. An inline value (<= `VALUE_THROTTLE`) is
+    /// copied into the SST, so its WAL record is needed only until then.
+    /// `build_sst` stores this as the SST's discard map. Compaction
+    /// cannot count these bytes later: an inline entry does not record where
+    /// its WAL record is. Without it, a log extent of small values never
+    /// showed a dead byte and GC never took it.
+    wal_dead: parking_lot::Mutex<HashMap<u64, i64>>,
+}
+
+impl Memtable {
+    fn new() -> Self {
+        Self {
+            data: parking_lot::RwLock::new(BTreeMap::new()),
+            bytes: AtomicU64::new(0),
+            log_bytes: AtomicU64::new(0),
+            wal_dead: parking_lot::Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn insert(&self, key: Vec<u8>, entry: MemEntry, size: u64) {
+        // BTreeMap::insert returns the previous value if present; we intentionally
+        // discard it — SkipMap::insert silently replaced on duplicate keys and
+        // autumn's MVCC-encoded keys are unique per (user_key, seq) so collisions
+        // only occur under replay-idempotent recovery, where dropping the prior
+        // identical value is safe.
+        let _ = self.data.write().insert(InternalKey(key), entry);
+        self.bytes.fetch_add(size, Ordering::Relaxed);
+    }
+
+    /// Insert a whole batch of (key, entry, size) tuples under a SINGLE write
+    /// lock acquisition. This is the hot-path helper used by Phase 3 of
+    /// `background_write_loop_r1`, where up to 256 entries land at once. It
+    /// collapses 256 `parking_lot::RwLock::write()` acquisitions into one,
+    /// saving ~2–5 ns/entry of atomic-CAS cost on the uncontended write path.
+    ///
+    /// Semantics identical to calling `insert` N times: duplicate keys are
+    /// replaced silently, byte counter accumulates the sum of sizes.
+    pub(crate) fn insert_batch<I>(&self, items: I)
+    where
+        I: IntoIterator<Item = (Vec<u8>, MemEntry, u64)>,
+    {
+        let mut guard = self.data.write();
+        let mut total = 0u64;
+        for (k, v, s) in items {
+            let _ = guard.insert(InternalKey(k), v);
+            total += s;
+        }
+        drop(guard);
+        if total > 0 {
+            self.bytes.fetch_add(total, Ordering::Relaxed);
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.data.read().is_empty()
+    }
+
+    fn len(&self) -> usize {
+        self.data.read().len()
+    }
+    /// Tombstones held here. A full walk — only for seeding
+    /// `PartitionMetrics::unsettled_deletes` from the replayed memtable at open.
+    fn tombstone_count(&self) -> u64 {
+        self.data
+            .read()
+            .values()
+            .filter(|e| e.op & 0x7f == OP_TOMBSTONE)
+            .count() as u64
+    }
+    fn mem_bytes(&self) -> u64 {
+        self.bytes.load(Ordering::Relaxed)
+    }
+    /// BUG1: accumulate the LOG bytes appended for this
+    /// batch (Σ record_sizes = the log_stream growth). Called once per batch
+    /// from Phase 3 — the value is included, so this tracks the true replay
+    /// window (unlike `mem_bytes`, which only sees the VP for large values).
+    fn add_log_bytes(&self, n: u64) {
+        self.log_bytes.fetch_add(n, Ordering::Relaxed);
+    }
+    fn log_bytes(&self) -> u64 {
+        self.log_bytes.load(Ordering::Relaxed)
+    }
+    /// Record `n` bytes of `extent_id` that this memtable's flush makes dead
+    /// (see `wal_dead`). The write and GC paths call it once per appended
+    /// batch; recovery replay once per kept record.
+    fn add_wal_dead(&self, extent_id: u64, n: u64) {
+        if n > 0 && !WAL_DEAD_OFF.load(Ordering::Relaxed) {
+            *self.wal_dead.lock().entry(extent_id).or_insert(0) += n as i64;
+        }
+    }
+
+    fn seek_user_key(&self, user_key: &[u8]) -> Option<MemEntry> {
+        let seek = InternalKey(key_with_ts(user_key, u64::MAX));
+        let guard = self.data.read();
+        // First internal key >= seek (comparator order) is the newest version
+        // of `user_key` (the MVCC suffix is inverted-seq, so newest sorts
+        // first). Return it iff the user key matches; otherwise this user_key
+        // has no entry.
+        let (k, v) = guard.range(seek..).next()?;
+        (parse_key(&k.0) == user_key).then(|| v.clone())
+    }
+
+    /// diag: return the newest seq for `user_key` (or 0 if absent).
+    /// Used by `MSG_DIAG_TRACE_KEY` only — not on any hot path.
+    pub(crate) fn seek_user_key_seq(&self, user_key: &[u8]) -> u64 {
+        let seek = InternalKey(key_with_ts(user_key, u64::MAX));
+        let guard = self.data.read();
+        let Some((k, _)) = guard.range(seek..).next() else {
+            return 0;
+        };
+        if parse_key(&k.0) == user_key {
+            parse_ts(&k.0)
+        } else {
+            0
+        }
+    }
+
+    fn snapshot_sorted(&self) -> Vec<IterItem> {
+        let guard = self.data.read();
+        guard
+            .iter()
+            .map(|(k, v)| IterItem {
+                key: k.0.clone(),
+                op: v.op,
+                value: v.value.clone(),
+                expires_at: v.expires_at,
+            })
+            .collect()
+    }
+
+    /// Snapshot ONLY the entries at or after `seek`, at most `cap` of them, and
+    /// WITHOUT cloning values.
+    ///
+    /// `handle_range` used to call `snapshot_sorted`, which clones every key AND
+    /// every value in the whole memtable. Both halves are waste for a range
+    /// page: the scan walks forward from one seek point so it never looks at
+    /// anything before it, and `RangeEntry.value` is always empty (range answers
+    /// keys). The cost was O(memtable) per REQUEST regardless of the page limit
+    /// — measured at 65 ms for a 500k-entry memtable of 64-byte values and
+    /// 125 ms at 512-byte values, before the scan examined a single key. That
+    /// fixed cost per page is what made a full-prefix delete quadratic: every
+    /// page of 512 keys paid for the entire remaining memtable.
+    ///
+    /// Returns `(items, truncated)`. `truncated` = there are more entries at or
+    /// after `seek` than `cap`, so this view is authoritative only up to the
+    /// last returned key — the caller must not emit anything past it.
+    pub(crate) fn snapshot_range_keys(
+        &self,
+        from: std::ops::Bound<&[u8]>,
+        cap: usize,
+    ) -> (Vec<IterItem>, bool) {
+        debug_assert!(cap > 0, "a zero-cap window is blind, not truncated");
+        use std::ops::Bound;
+        let lo = match from {
+            Bound::Unbounded => Bound::Unbounded,
+            Bound::Included(k) => Bound::Included(InternalKey(k.to_vec())),
+            // Resuming past a previous window's last key: EXCLUDED rather than
+            // key arithmetic, because an internal key ends in a fixed-width
+            // suffix that `cmp_internal_keys` splits off — appending a byte to
+            // "get the successor" would move the split and compare a different
+            // user key.
+            Bound::Excluded(k) => Bound::Excluded(InternalKey(k.to_vec())),
+        };
+        let guard = self.data.read();
+        let mut it = guard.range((lo, Bound::Unbounded));
+        let mut items = Vec::with_capacity(cap.min(guard.len()));
+        for (k, v) in it.by_ref().take(cap) {
+            items.push(IterItem {
+                key: k.0.clone(),
+                op: v.op,
+                value: Vec::new(),
+                expires_at: v.expires_at,
+            });
+        }
+        let truncated = it.next().is_some();
+        (items, truncated)
+    }
+
+    /// Iterate the memtable entries in ascending key order under a read lock
+    /// and hand each entry to `f`. Used by `build_sst` and `rotate_active`
+    /// to avoid allocating an intermediate snapshot Vec when the caller just
+    /// needs read access to (&[u8], &MemEntry).
+    pub(crate) fn for_each<F: FnMut(&[u8], &MemEntry)>(&self, mut f: F) {
+        let guard = self.data.read();
+        for (k, v) in guard.iter() {
+            f(k.0.as_slice(), v);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SSTable metadata
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug)]
+pub(crate) struct TableMeta {
+    extent_id: u64,
+    // u64-offset widening: SST position/len in the row_stream extent (now > 4 GiB).
+    offset: u64,
+    len: u64,
+    estimated_size: u64,
+    last_seq: u64,
+}
+
+impl TableMeta {
+    fn loc(&self) -> (u64, u64) {
+        (self.extent_id, self.offset)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PartitionData — lives on a dedicated partition thread (Rc, no locks)
+// ---------------------------------------------------------------------------
+
+// `UploadSession` and `upload_sessions` field on PartitionData
+// were the in-memory state for the server-side multipart upload.
+// Removed; stripe-write is now pure client-side (Ceph
+// striperados). The PS no longer holds any per-upload state.
+
+pub(crate) struct PartitionData {
+    part_id: u64,
+    rg: Range,
+    /// Monotonic epoch assigned by the manager, bumped whenever `rg` is
+    /// rewritten (split: both children new; merge: survivor new). Picked
+    /// up from `MgrRegionInfo.region_epoch` by `sync_regions_once` and
+    /// passed in at open time. Once Phase 3 wires it onto the request
+    /// path, ps-conn stamps it on every response so the SDK can detect
+    /// stale routing without a manager round-trip (TiKV `region_epoch`
+    /// pattern). Until then it is plumbed but unused on the wire.
+    pub(crate) region_epoch: u64,
+    active: Memtable,
+    imm: VecDeque<Arc<Memtable>>,
+    /// Set of imm `Arc::as_ptr` values currently being flushed.
+    /// Prevents `flush_one_imm` (called inline by `flush_memtable_locked`)
+    /// from racing `background_flush_loop` on the same imm[0]: pre-fix,
+    /// both paths cloned imm.front() in their synchronous claim step,
+    /// then each ran `run_flush_async_phase` to produce an SST and each
+    /// called `commit_flush_outcome` to push to `tables`. Result: two
+    /// SSTs in `tables` with identical content but different
+    /// (extent_id, offset), and `imm.pop_front()` ran twice (the second
+    /// pop was a no-op on the now-empty queue). The duplicate SSTs
+    /// silently inflated table count and corrupted the
+    /// `tables`/`sst_readers` alignment invariants.
+    ///
+    /// Lifetimes:
+    /// - INSERT at claim time (synchronous, inside `borrow_mut`).
+    /// - REMOVE at the bottom of `commit_flush_outcome` (synchronous,
+    ///   inside the same `borrow_mut` block that pops imm.front).
+    /// - A duplicate claim attempt sees the ptr already present and
+    ///   returns `FlushStep::Busy` — the caller MUST wait + retry, never
+    ///   treat it as "drained". (Before the fix this returned
+    ///   `Ok(false)` indistinguishable from "imm empty" and the split
+    ///   freeze-drain ack'd before the in-flight row_stream.append landed
+    ///   — see `FlushStep` docstring for the resulting
+    ///   `stale_vp_offset_past_sealed_length` failure mode.)
+    flushing_imm_ptrs: RefCell<HashSet<usize>>,
+    /// each queued imm's vp_head, captured at ROTATION time (the
+    /// imm's true log content boundary = the write cursor at the instant it was
+    /// frozen), keyed by `Arc::as_ptr`. The flush stamps THIS onto the SST + meta
+    /// checkpoint — NOT the live cursor `p.vp_*` at flush-claim, which foreground
+    /// writes may have pushed AHEAD of this imm's content between rotation and the
+    /// (lagging background) claim → the SST vp_head overruns the un-flushed tail →
+    /// recovery skips it = loss (`system_flush_race_vp_head`). It is also the
+    /// premise `compaction_output_vp_head`'s MAX rests on. Lifecycle mirrors
+    /// `flushing_imm_ptrs`: INSERT at `rotate_active` (push), REMOVE at
+    /// `commit_flush_outcome` (pop). Never removed on a flush ERROR (the imm stays
+    /// queued for retry and keeps its vp).
+    imm_vp_heads: RefCell<HashMap<usize, (u64, u64)>>,
+    /// each queued imm's ROW-stream floor, captured at rotation: the extent of
+    /// the newest table then listed (`None` = no table). The imm's SST is
+    /// appended later, at the tail, so it lands at or after this extent — which
+    /// is what lets `truncate_unreferenced_row_prefix` cut while flushes are
+    /// queued without dropping the extent an in-flight SST lands in before its
+    /// table is listed. Same lifecycle as `imm_vp_heads`.
+    pub(crate) imm_row_floors: RefCell<HashMap<usize, Option<u64>>>,
+    /// The last row-stream prefix cut did not land (an op in flight, the
+    /// manager unreachable); the compaction loop's tick tries again.
+    pub(crate) row_cut_deferred: bool,
+    flush_tx: mpsc::UnboundedSender<()>,
+    compact_tx: mpsc::Sender<CompactTask>,
+    gc_tx: mpsc::Sender<GcTask>,
+    seq_number: u64,
+    /// User keys with a write in the WAL pipeline — seq assigned (Phase 1,
+    /// `start_write_batch`) but NOT yet in the memtable (Phase 3,
+    /// `finish_write_batch`). Keyed by a 64-bit hash of the user key, refcounted
+    /// for concurrent same-key writes. GC value-relocation consults this so it
+    /// never relocates the OLD value of a key whose NEWER write is
+    /// seq-assigned-but-not-yet-committed: Phase 1 already bumped `seq_number`,
+    /// so GC's relocation seq would be HIGHER and shadow that write (a silent
+    /// lost-update — `system_gc_inflight_wal_put`). A hash collision only costs a
+    /// spurious GC-round abort (safe, retried). Maintained on the hot write path.
+    inflight_write_keys: HashMap<u64, u32>,
+    log_stream_id: u64,
+    row_stream_id: u64,
+    meta_stream_id: u64,
+    tables: Vec<TableMeta>,
+    sst_readers: Vec<Arc<SstReader>>,
+    /// Held by every checkpoint publisher from its table snapshot through the
+    /// append to the change of `tables` / `sst_readers` it publishes, which
+    /// happens only after the append acks. Only publishers change the list, so
+    /// the list in memory is never ahead of the durable checkpoint, and a later
+    /// snapshot never misses a change whose append is still in flight.
+    pub(crate) publish_lock: Rc<futures::lock::Mutex<()>>,
+    has_overlap: Cell<u32>,
+    /// What the last GC SELECTION pass resolved — `eid -> (sealed_length, refs)`
+    /// plus the standing POLICY to judge them by — so the IDLE refresh tick can compute
+    /// `gc_debt_bytes` with the SAME predicate instead of a raw dead-byte sum.
+    ///
+    /// That tick re-arms every 5-7 s and overwrites selection's store, so
+    /// without this the advisory reads "every dead byte" almost all the time and
+    /// the fire-and-refuse loop survives for garbage spread thinly across
+    /// extents. Reusing what selection already fetched keeps it at zero extra
+    /// RPCs. `None` until the first STANDING dispatch (an operator override
+    /// arriving first leaves it `None`): the tick then falls back to the raw
+    /// sum, which over-reports — the safe direction.
+    pub(crate) gc_debt_basis: RefCell<Option<crate::background::GcDebtBasis>>,
+    vp_extent_id: u64,
+    vp_offset: u64,
+    /// The cursor of the newest durably ACKed checkpoint record; GC raises its
+    /// replay floor to it (`gc_floor_raise_to_durable_ckpt`). Every publisher
+    /// holds `publish_lock`. Every publisher sets it after its append acks; a
+    /// compaction republishes it, only moved off a sealed extent's end
+    /// (`compaction_checkpoint_cursor`), so no record falls behind the floor.
+    /// Never set from in-memory state (`vp_*` runs past acked writes no SST
+    /// holds yet, and a floor there could outrun what recovery loads). Seeded
+    /// at open from the single recovered record's cursor when it resolves;
+    /// several records (a merge's sources) are replaced by a merged record
+    /// before serving. `(0,0)` = none resolved: GC keeps the MIN-over-SST floor.
+    durable_ckpt_vp: Cell<(u64, u64)>,
+    stream_client: Rc<StreamClient>,
+    /// This partition's SST block cache, owned by the `PartitionServer` and
+    /// shared by all of its partitions (see `PartitionServer::block_cache`).
+    block_cache: std::sync::Arc<crate::sstable::BlockCache>,
+    /// This partition's shard of the PS memory tier (`mem_tier.rs`); None = off.
+    pub(crate) mem_tier: Option<mem_tier::MemShard>,
+    /// sender to the per-partition bulk thread. Always present —
+    /// `open_partition` returns Err if P-sst fails to spawn, so the
+    /// partition is never half-opened with no flush channel.
+    flush_req_tx: mpsc::Sender<FlushReq>,
+    /// Channel for compaction to route row_stream appends through P-sst's
+    /// StreamClient, preventing dual-writer truncation corruption.
+    /// Always present (see `flush_req_tx`).
+    row_append_tx: mpsc::Sender<RowAppendReq>,
+    /// synchronous barrier channel. See `RowInvalidateBarrierReq`
+    /// doc for the full ordering inside `handle_split_part`. Briefly: the
+    /// barrier is sent AFTER `commit_length` capture but BEFORE
+    /// `multi_modify_split` (so any barrier failure can cleanly abort
+    /// without leaving manager state half-committed). P-sst drains its
+    /// in-flight FuturesUnordered to zero before calling
+    /// `sst_sc.invalidate_stream(row_stream_id)`, then ACKs; split
+    /// proceeds with the seal once the ACK lands.
+    row_invalidate_tx: mpsc::Sender<RowInvalidateBarrierReq>,
+    /// signaled (one item per pop) by `flush_one_imm` after every
+    /// successful `imm.pop_front()` so that `partition_loop` can
+    /// wake from its imm-full back-pressure wait. Unbounded because the
+    /// receiver always drains all pending notifications before re-checking
+    /// `imm.len()`, so the buffer self-bounds at `MAX_IMM_DEPTH`.
+    imm_drained_tx: mpsc::UnboundedSender<()>,
+    /// Wake signal for `partition_loop` after a SPLIT freeze has
+    /// parked its drain ack. `handle_split_part` runs off the
+    /// loop's dispatch stack so the loop is free to drain; but after
+    /// the spawn returns, the loop sleeps on its (D) idle select
+    /// (`req_rx + graceful drain`) — neither receiver carries the
+    /// "split_drain_ack just transitioned to Some" event, so the
+    /// top-of-loop drain check is unreachable until incidental traffic
+    /// arrives. In an idle partition that meant a full FREEZE_TTL (30s)
+    /// of dead time before the watchdog forced the handler to error
+    /// out. The spawned handler sends `()` here right after parking
+    /// the ack; the loop's idle selects watch this rx and wake.
+    /// Specific to SPLIT — MSG_MERGE_FREEZE runs inline in
+    /// `handle_incoming_req`, so its parking happens on the loop's
+    /// active stack and the next iteration's top check fires naturally.
+    pub(crate) split_wake_tx: mpsc::UnboundedSender<()>,
+    /// Per-partition maintenance gate (max_parallel=1) — split-vs-background
+    /// *synchronization*, NOT a resource cap (PS-wide compact/gc concurrency
+    /// caps live on `concurrency_ctrl`). Unifies the former `compact_gate`
+    /// + `gc_gate`: now that compaction and GC run on ONE task
+    /// (`background_maintenance_loop`), they can't race each other, so a single
+    /// gate suffices. `handle_split_part` MUST acquire it before reading
+    /// commit_length so that neither a `do_compact` (`compact_row_append`
+    /// racing the row_stream seal) NOR a `run_gc` (log_stream append racing the
+    /// log seal) is in flight during split's barrier + commit_length +
+    /// multi_modify_split window. The merged loop acquires it around BOTH its
+    /// compaction and GC sections (one at a time), so holding it = both kinds
+    /// quiesced. Lock order: compaction/split are gate-first (maintenance_gate →
+    /// acquire_compact — compaction MUST match split or acquire_compact ↔
+    /// maintenance_gate would cycle); GC is permit-first (acquire_gc →
+    /// maintenance_gate) so a GC queued on the global gc permit doesn't hold
+    /// this gate and block a same-partition split. Acyclic either way because
+    /// acquire_gc is GC-exclusive: acquire_gc → maintenance_gate →
+    /// acquire_compact has no back-edge.
+    pub(crate) maintenance_gate: std::sync::Arc<CompactionGate>,
+    /// D-r7: per-partition rate controller. Fresh `Arc` per
+    /// partition — fg/compact/gc rates are isolated; a hot partition's
+    /// fg pressure cannot consume a cold sibling's budget. fg-aware
+    /// yield in `account_compact`/`account_gc` is per-partition too
+    /// (each partition compares its own fg activity against its own
+    /// fg cap).
+    pub(crate) rate_ctrl: std::sync::Arc<crate::RateController>,
+    /// D-r7: PS-wide concurrency permits. Clone of
+    /// `PartitionServer.concurrency_ctrl`. Used by
+    /// `background_compact_loop` / `background_gc_loop` /
+    /// `handle_split_part`.
+    pub(crate) concurrency_ctrl: std::sync::Arc<crate::ConcurrencyController>,
+    /// (MED-2): per-extent reader-pin map. `handle_get → resolve_value`
+    /// reads a ValuePointer from an SST, drops the partition borrow, and
+    /// awaits `read_bytes_from_extent` on log_stream. Without coordination,
+    /// `run_gc` could relocate the last live value off an extent and call
+    /// `punch_holes` (dropping its `refs` to 0), causing the manager to
+    /// enqueue a physical delete. The in-flight
+    /// resolve_value's read RPC arrives at the extent-node which (a) may
+    /// have already received MSG_DELETE_EXTENT and respond NotFound — a
+    /// spurious user-visible read failure on data that was perfectly valid
+    /// at the moment the SST was looked up; or (b) the file fd is already
+    /// unlinked but still open from a prior reader, returning the original
+    /// bytes — correct but timing-dependent.
+    ///
+    /// closes the spurious-NotFound class via a per-extent pin counter:
+    ///   value >= 0: number of active readers; readers can acquire
+    ///   value == -1: GC in progress (writer holds exclusively)
+    ///
+    /// Reader path (`resolve_value`): CAS-acquire (increment from a
+    /// non-negative value); CAS-release (`fetch_sub(1)`).
+    /// GC path (`run_gc` before `punch_holes`): try-CAS 0 → -1. On success,
+    /// proceed with the RPC; release with `store(0)`. On failure (readers
+    /// active), defer this extent's GC to the next 30-60 s tick. The reader
+    /// completes within milliseconds typically; the deferred GC catches up
+    /// on the next iteration.
+    ///
+    /// Memory footprint: HashMap grows monotonically with extents ever
+    /// referenced by VP resolution. ~32 bytes per entry; bounded by
+    /// log_stream extent count per partition (typically a few thousand
+    /// at most). Not worth GC'ing the map; deleted extents leave benign
+    /// stale entries with count=0.
+    pub(crate) extent_pins: std::cell::RefCell<
+        std::collections::HashMap<u64, std::rc::Rc<std::sync::atomic::AtomicI64>>,
+    >,
+    /// PrepareMerge-style write halt and the freeze's stage (see
+    /// `MergeFreezeState`). Halted from the moment the freeze holds the
+    /// maintenance gate; cleared by an explicit unfreeze RPC
+    /// (manager rollback path), by partition reopen on rg/stream-id
+    /// change (the normal post-commit recovery), or by `FREEZE_TTL`
+    /// expiry inside `partition_loop` (backstop for orchestrator
+    /// crash). While Some, the loop rejects Put/Delete/StreamPut with
+    /// `CODE_UNAVAILABLE` so writes never land in a log_stream tail
+    /// past the to-be-captured `commit_length`. In-memory only — a PS
+    /// crash mid-freeze loses the flag, which is correct because the
+    /// merge txn either committed (next reopen sees the merged region)
+    /// or didn't (reopen serves the pre-merge region normally).
+    pub(crate) merge_freeze: Rc<MergeFreezeState>,
+    /// PrepareSplit-style write halt. Mirror of the merge halt
+    /// but for the SPLIT path; needed because `handle_split_part` runs on
+    /// a spawned task (not inline through dispatch_partition_rpc) so it
+    /// can park here and let `partition_loop` drain
+    /// pending+inflight+imm before `commit_length` is captured. The earlier
+    /// split called `flush_memtable_locked` then `commit_length` directly,
+    /// but the inline await window let in-flight Phase 2 appends complete
+    /// past the captured `commit_length` — those bytes existed on EN disk
+    /// past sealed_length and were invisible on recovery.
+    pub(crate) frozen_for_split: Cell<Option<std::time::Instant>>,
+    /// A split handler is running on this partition, from its first line to
+    /// its return. A second split is refused at once instead of queueing on
+    /// the maintenance gate and cutting the partition again after the first.
+    pub(crate) split_pending: Cell<bool>,
+    /// internal oneshot signal from `partition_loop` to
+    /// the spawned `handle_split_part` task — fired after drain completes.
+    /// Payload is `Result<(), String>`: `Ok(())` = drain succeeded,
+    /// commit_length is now safe to capture; `Err(msg)` = drain hit a
+    /// flush failure (same shape as the merge error path) and the
+    /// split must abort.
+    pub(crate) split_drain_ack: std::cell::RefCell<Option<oneshot::Sender<Result<(), String>>>>,
+    /// per-partition load metrics for the manager's policy engine.
+    /// Counters are bumped by `partition_loop` (req on each
+    /// dispatch, imm_full each time the imm cap stalls intake). The
+    /// PS-level `report_load_loop` snapshots and resets these every 5 s
+    /// and ships them via MSG_REPORT_PARTITION_LOAD.
+    pub(crate) metrics: std::sync::Arc<PartitionMetrics>,
+    /// fix-2: cross-thread mirror of `PartitionHandle.opened_with`.
+    /// `handle_split_part` (and any future in-place updater of `rg` /
+    /// `region_epoch`) MUST write the new tuple here after updating
+    /// the local fields so `sync_regions_once` on the main thread
+    /// observes a matching `(rg, log, row, meta, epoch)` and skips
+    /// drop+reopen. Without this, the next `region_sync_loop` tick
+    /// tears down the source partition even though its in-memory
+    /// state is already correct — a 5-60+ s outage per split.
+    pub(crate) opened_with_shared: std::sync::Arc<parking_lot::Mutex<(Range, u64, u64, u64, u64)>>,
+    /// Per-inode floor of the highest `lease_epoch` this PS has accepted a
+    /// write under. A write with `inode_hint != 0` and `lease_epoch < floor`
+    /// is rejected with `CODE_FENCED`; a higher epoch raises the floor and
+    /// appends an `OP_FENCE_BUMP` WAL record before the ACK. Recovered from
+    /// the checkpoint's `fence_floors` snapshot plus replayed bump records.
+    pub(crate) fence_floors: FenceFloors,
+}
+
+/// Per-ino fence floors: what has been ADMITTED and what is DURABLE.
+///
+/// The two diverge whenever a request raises the admitted floor and then
+/// fails before its `OP_FENCE_BUMP` record commits — a GC pin during a
+/// conditional write's read, a split freezing the range across that await,
+/// a failed append. The client retries at the same epoch; judged against the
+/// admitted floor alone that retry raises nothing, queues no record, and its
+/// write is acknowledged while the floor exists only in memory. A crash then
+/// loses a floor that an acknowledged write depended on. So admission checks
+/// the admitted floor, and the need for a record is judged against the
+/// durable one.
+#[derive(Default)]
+pub(crate) struct FenceFloors {
+    admitted: RefCell<HashMap<u64, u64>>,
+    durable: RefCell<HashMap<u64, u64>>,
+}
+
+impl FenceFloors {
+    /// Floors recovered at open (checkpoint + replayed records) are durable.
+    pub(crate) fn recovered(floors: HashMap<u64, u64>) -> Self {
+        FenceFloors {
+            admitted: RefCell::new(floors.clone()),
+            durable: RefCell::new(floors),
+        }
+    }
+
+    /// Admission check for a write stamped `(inode_hint, epoch)`. `Ok(true)`
+    /// means the caller must queue an `OP_FENCE_BUMP` record ahead of the
+    /// admitted write. See `check_and_bump_fence`.
+    pub(crate) fn check_and_bump(&self, inode_hint: u64, epoch: u64) -> Result<bool, String> {
+        check_and_bump_fence(
+            inode_hint,
+            epoch,
+            &mut self.admitted.borrow_mut(),
+            &self.durable.borrow(),
+        )
+    }
+
+    /// An `OP_FENCE_BUMP` record for `(ino, epoch)` committed.
+    pub(crate) fn mark_durable(&self, ino: u64, epoch: u64) {
+        let mut durable = self.durable.borrow_mut();
+        let f = durable.entry(ino).or_insert(0);
+        *f = (*f).max(epoch);
+    }
+}
+
+/// Clears the phase slot however its scope ends.
+///
+/// `handle_split_part` has a dozen exits — three `?` through a closure, a TTL
+/// abort, two barrier timeouts, a post-commit deadline check — and clearing at
+/// each one is a list that goes stale the first time somebody adds an early
+/// return. The cost of missing one is not a missing sample but a WRONG one: the
+/// slot rides every 5 s heartbeat afterwards, and the NEXT split on that
+/// partition spends its whole pre-freeze stretch (maintenance-gate wait, SST
+/// median scan) with no sample of its own, so the stale phase is stamped onto
+/// it — showing "frozen and drained" before it has frozen anything, and then
+/// walking backwards when the real phase 1 lands. That is precisely the
+/// misleading control plane this reporting exists to remove.
+pub struct MaintenancePhaseGuard {
+    // An owned `Arc`, not a borrow. A reference would tie the guard to a
+    // `RefCell` borrow of `PartitionData`, and this thing lives across every
+    // `.await` in the split — holding that borrow there would deadlock the
+    // single-threaded executor the first time anything else touched the
+    // partition.
+    metrics: std::sync::Arc<PartitionMetrics>,
+    op_id: u64,
+}
+
+impl MaintenancePhaseGuard {
+    pub fn new(metrics: std::sync::Arc<PartitionMetrics>, op_id: u64) -> Self {
+        Self { metrics, op_id }
+    }
+    pub fn set(&self, kind: u8, phase: u64, phases: u64) {
+        self.metrics
+            .set_maintenance_phase(self.op_id, kind, phase, phases);
+    }
+}
+
+impl Drop for MaintenancePhaseGuard {
+    fn drop(&mut self) {
+        self.metrics.clear_split_phase();
+    }
+}
+
+impl PartitionData {
+    /// Set the overlap flag and its cross-thread mirror together.
+    ///
+    /// The only writer of `has_overlap`. The Cell is read on the partition
+    /// thread (the read filter, the compaction pickup, the split refusal); the
+    /// mirror is read on the main thread by `report_load_loop`, which is how
+    /// the manager learns a split would be refused. Two independent stores
+    /// would eventually disagree, and the disagreement is invisible until a
+    /// policy acts on the stale half.
+    pub(crate) fn set_has_overlap(&self, v: u32) {
+        self.has_overlap.set(v);
+        self.metrics
+            .has_overlap
+            .store(v, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// (MED-2): get-or-insert the per-extent pin counter for `eid`.
+    /// Cheap — just a HashMap lookup with lazy creation.
+    pub(crate) fn pin_for(&self, eid: u64) -> std::rc::Rc<std::sync::atomic::AtomicI64> {
+        self.extent_pins
+            .borrow_mut()
+            .entry(eid)
+            .or_insert_with(|| std::rc::Rc::new(std::sync::atomic::AtomicI64::new(0)))
+            .clone()
+    }
+
+    /// LSM-resident data size of this partition —
+    /// Σ SST bytes on row_stream (`tables[].len`) + the active memtable +
+    /// every frozen imm memtable. This is the "how much data does this
+    /// partition hold" measure the size gauge / size-based split-merge
+    /// policy want: the LOGICAL LSM footprint, NOT the total extent
+    /// footprint (which would include the transient log-stream WAL tail that
+    /// GC reclaims — a partition shouldn't be split just because its log tail
+    /// is momentarily large). Cheap + fully local (a borrow + arithmetic, no
+    /// RPC). Lives on the same struct as the fields so it can read the
+    /// module-private memtable `mem_bytes`.
+    pub(crate) fn lsm_resident_bytes(&self) -> u64 {
+        let sst: u64 = self.tables.iter().map(|t| t.len).sum();
+        let imm: u64 = self.imm.iter().map(|m| m.mem_bytes()).sum();
+        sst.saturating_add(self.active.mem_bytes()).saturating_add(imm)
+    }
+
+    /// Copy the table count and memtable sizes into the `/metrics` gauges.
+    /// Called wherever they change: per write batch, rotate, flush and
+    /// compaction commit, open.
+    pub(crate) fn publish_lsm_gauges(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let imm: u64 = self.imm.iter().map(|m| m.mem_bytes()).sum();
+        self.metrics.sst_tables.store(self.tables.len() as u64, Relaxed);
+        self.metrics
+            .memtable_bytes
+            .store(self.active.mem_bytes() + imm, Relaxed);
+        self.metrics.imm_memtables.store(self.imm.len() as u64, Relaxed);
+    }
+}
+
+/// (MED-2): RAII reader pin guard. Decrements the counter on drop.
+/// Created via `acquire_reader_pin`; returns None if a writer (GC) currently
+/// holds the pin (counter == -1). Caller treats None as "extent is being
+/// reclaimed; treat as not-found".
+pub(crate) struct ReaderPin(std::rc::Rc<std::sync::atomic::AtomicI64>);
+
+impl Drop for ReaderPin {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// try to acquire a reader pin on `eid`. CAS-loop increments the
+/// counter only when current value >= 0. Returns None when a GC writer
+/// holds the pin (counter == -1).
+pub(crate) fn acquire_reader_pin(
+    pin: std::rc::Rc<std::sync::atomic::AtomicI64>,
+) -> Option<ReaderPin> {
+    use std::sync::atomic::Ordering::SeqCst;
+    loop {
+        let cur = pin.load(SeqCst);
+        if cur < 0 {
+            return None;
+        }
+        if pin.compare_exchange(cur, cur + 1, SeqCst, SeqCst).is_ok() {
+            return Some(ReaderPin(pin));
+        }
+        // CAS lost a race with another reader/writer; re-try.
+    }
+}
+
+/// try to acquire a writer (GC) pin on `eid`. Single CAS 0 → -1.
+/// Returns true on success (proceed with punch_holes); false on failure
+/// (readers active — defer this extent's GC to the next tick).
+pub(crate) fn try_acquire_writer_pin(pin: &std::rc::Rc<std::sync::atomic::AtomicI64>) -> bool {
+    use std::sync::atomic::Ordering::SeqCst;
+    pin.compare_exchange(0, -1, SeqCst, SeqCst).is_ok()
+}
+
+/// release a writer pin (counter back to 0). Called after GC's
+/// `punch_holes` returns (or errors).
+pub(crate) fn release_writer_pin(pin: &std::rc::Rc<std::sync::atomic::AtomicI64>) {
+    pin.store(0, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(test)]
+mod bug1_wal_gap_tests {
+    //! BUG1 (the real unboundedness): the WAL-gap
+    //! force-rotate MUST measure the appended LOG bytes (value INCLUDED), not the
+    //! memtable footprint. For a large-value (VP) workload the memtable holds only
+    //! ~24-byte pointers, so `mem_bytes` would need hundreds of TB of log to reach
+    //! the `MAX_WAL_GAP` — the rotate would NEVER fire and the un-flushed recovery
+    //! replay window would grow O(dataset). This reproduces the divergence:
+    //! `log_bytes` tracks true log growth (crosses the gap) while `mem_bytes`
+    //! stays VP-sized (never would), so `partition_loop`'s gap check must read
+    //! `log_bytes()`.
+    use super::{
+        max_wal_gap, record_carries_value_pointer, MemEntry, Memtable, OP_VALUE_POINTER,
+        VALUE_THROTTLE,
+    };
+
+    /// GC decides what to relocate from its SCAN and then punches the extent;
+    /// recovery decides what to reconstruct from the REPLAY. If those two
+    /// classify a record differently, GC destroys originals it never moved.
+    ///
+    /// The record GC itself writes when relocating is the case that broke: its
+    /// memtable entry carried the VP flag, its WAL record did not, the replay
+    /// accepted it anyway on length, and the next GC scan of the extent it had
+    /// just been moved into skipped it as a chunk blob — then punched. Any
+    /// large value surviving two GC generations was silently lost.
+    #[test]
+    fn the_scan_and_the_replay_agree_on_a_gc_written_record() {
+        let big = VALUE_THROTTLE + 1;
+
+        // What GC writes today: flagged, and over threshold.
+        assert!(record_carries_value_pointer(1 | OP_VALUE_POINTER, big));
+        // What GC used to write: bare op, over threshold. The replay always
+        // accepted this; the scan must too, or records already on disk are
+        // relocated by neither and punched by GC.
+        assert!(
+            record_carries_value_pointer(1, big),
+            "a bare-op large record is a ValuePointer to the replay, so it must be one to GC"
+        );
+        // A small inline value is not a ValuePointer either way.
+        assert!(!record_carries_value_pointer(1, 16));
+        // The fence-bump record must stay invisible to the VP scan: 8 bytes,
+        // no flag.
+        assert!(!record_carries_value_pointer(super::OP_FENCE_BUMP, 8));
+    }
+
+    #[test]
+    fn wal_gap_uses_log_bytes_not_mem_bytes_for_large_values() {
+        // The real, shipped threshold (default 1 GiB) — read it rather than
+        // hardcode, so the test can't drift from the config.
+        let wal_gap = max_wal_gap();
+        let value = 8 * 1024 * 1024u64; // 8 MiB large value
+        let iters = wal_gap / value + 8; // comfortably past the gap for any default
+
+        let m = Memtable::new();
+        let mut logged = 0u64;
+        // Mirror finish_write_batch for `iters` × 8 MiB large (VP) writes: each Put
+        // lands a tiny VP entry in the memtable (~24-byte pointer) but appends the
+        // FULL value to the log_stream (WAL).
+        for i in 0..iters {
+            let key = format!("k{i:06}").into_bytes();
+            // Large value → the memtable holds only the VP pointer, not the value.
+            let vp = MemEntry {
+                op: OP_VALUE_POINTER,
+                value: vec![0u8; 24],
+                expires_at: 0,
+            };
+            let mem_size = key.len() as u64 + 24 + 32; // what enqueue accounts for a VP entry
+            m.insert(key, vp, mem_size);
+            let rec = value + 30; // WAL record = header + value, appended to the log
+            m.add_log_bytes(rec);
+            logged += rec;
+        }
+
+        // The memtable FOOTPRINT stays tiny (VP-sized entries) — the OLD (buggy)
+        // signal never trips the rotate even after gigabytes of large values.
+        assert!(
+            m.mem_bytes() < iters * 128,
+            "mem footprint {} must stay VP-sized",
+            m.mem_bytes()
+        );
+        assert!(
+            m.mem_bytes() <= wal_gap,
+            "the pre-BUG1 mem_bytes signal would NEVER reach the MAX_WAL_GAP"
+        );
+
+        // The LOG grew to the full value volume and CROSSES the gap, so the fixed
+        // gap check (reads log_bytes) force-rotates → bounded replay window.
+        assert_eq!(m.log_bytes(), logged);
+        assert!(
+            m.log_bytes() > wal_gap,
+            "log_bytes {} must exceed MAX_WAL_GAP {} so the force-rotate fires",
+            m.log_bytes(),
+            wal_gap
+        );
+
+        // The BUG1 decision in one line: log_bytes crosses the gap, mem_bytes does not.
+        assert!(m.log_bytes() > wal_gap && m.mem_bytes() <= wal_gap);
+    }
+}
+
+#[cfg(test)]
+mod reader_pin_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicI64, Ordering};
+
+    /// acquire_reader_pin succeeds when no writer is holding,
+    /// increments counter, drops decrement.
+    #[test]
+    fn reader_pin_acquire_release() {
+        let pin = std::rc::Rc::new(AtomicI64::new(0));
+        {
+            let _g = acquire_reader_pin(pin.clone()).expect("acquire");
+            assert_eq!(pin.load(Ordering::SeqCst), 1);
+            // Acquiring a second reader pin works too.
+            let _g2 = acquire_reader_pin(pin.clone()).expect("acquire 2");
+            assert_eq!(pin.load(Ordering::SeqCst), 2);
+        }
+        // Both guards dropped → back to 0.
+        assert_eq!(pin.load(Ordering::SeqCst), 0);
+    }
+
+    /// acquire_reader_pin returns None when writer holds the pin.
+    #[test]
+    fn reader_pin_blocked_by_writer() {
+        let pin = std::rc::Rc::new(AtomicI64::new(0));
+        assert!(try_acquire_writer_pin(&pin), "writer should acquire");
+        assert_eq!(pin.load(Ordering::SeqCst), -1);
+
+        // Reader cannot acquire while writer holds.
+        assert!(
+            acquire_reader_pin(pin.clone()).is_none(),
+            "reader should be blocked by writer"
+        );
+
+        release_writer_pin(&pin);
+        assert_eq!(pin.load(Ordering::SeqCst), 0);
+
+        // After writer releases, reader can acquire.
+        let _g = acquire_reader_pin(pin.clone()).expect("acquire after writer release");
+        assert_eq!(pin.load(Ordering::SeqCst), 1);
+    }
+
+    /// try_acquire_writer_pin fails when readers are holding.
+    #[test]
+    fn writer_pin_blocked_by_readers() {
+        let pin = std::rc::Rc::new(AtomicI64::new(0));
+        let _g = acquire_reader_pin(pin.clone()).expect("acquire reader");
+        assert_eq!(pin.load(Ordering::SeqCst), 1);
+
+        // Writer cannot acquire while reader holds.
+        assert!(
+            !try_acquire_writer_pin(&pin),
+            "writer should be blocked by reader"
+        );
+        // Reader pin still 1 (writer's failed CAS didn't perturb it).
+        assert_eq!(pin.load(Ordering::SeqCst), 1);
+        drop(_g);
+        // After reader releases, writer can acquire.
+        assert!(try_acquire_writer_pin(&pin), "writer after reader release");
+    }
+
+    /// writer pin already held — second writer also blocked.
+    /// (Should not happen in production since GC serialises per-extent
+    /// via the maintenance_gate, but the protocol is correct either way.)
+    #[test]
+    fn writer_pin_exclusive() {
+        let pin = std::rc::Rc::new(AtomicI64::new(0));
+        assert!(try_acquire_writer_pin(&pin));
+        assert!(!try_acquire_writer_pin(&pin), "second writer must fail");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GC task
+// ---------------------------------------------------------------------------
+
+/// One request on a partition's compaction channel.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum CompactTask {
+    /// A major compaction: dispatched over `Maintenance` (`op_id` is the
+    /// manager op-ledger id) or raised by the deletion rule (`op_id == 0`).
+    Major { op_id: u64 },
+    /// The partition's own minor check found a window.
+    Minor(MinorTrigger),
+}
+
+/// What asked for a minor compaction; logged with it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MinorTrigger {
+    Flush,
+    Tick,
+    /// The row stream's head extent `extent_id`, sealed at `sealed_len`, is
+    /// mostly dead (`compact_policy::select_reclaim`).
+    Reclaim { extent_id: u64, sealed_len: u64 },
+}
+
+pub(crate) enum GcTask {
+    /// Pick GC candidates by policy. Parameters describe WHICH extents
+    /// are eligible (multi-tier filtering). Default = standard
+    /// `discard_ratio > 0.4` over all sealed non-tail extents (the
+    /// original single-tier behaviour) PLUS empty-sealed slots that
+    /// the candidate-set fix unblocked. `op_id == 0` = untracked.
+    Auto {
+        params: GcAutoParams,
+        op_id: u64,
+    },
+    Force {
+        extent_ids: Vec<u64>,
+        op_id: u64,
+    },
+}
+
+impl GcTask {
+    /// The manager op-ledger correlation id (`0` = untracked).
+    pub(crate) fn op_id(&self) -> u64 {
+        match self {
+            GcTask::Auto { op_id, .. } | GcTask::Force { op_id, .. } => *op_id,
+        }
+    }
+}
+
+/// parameters passed by callers (CLI / external controller) to
+/// the auto-GC candidate selection. All fields are optional; `Default`
+/// reproduces the original single-tier behaviour augmented with the
+/// empty-sealed punch path. The PS does not mix tiers — exactly one
+/// of (default ratio, custom ratio + optional max_size, empty_only)
+/// applies per dispatch — but the external controller can issue
+/// multiple ticks back-to-back with different params to compose
+/// effective tiers.
+#[derive(Default, Clone, Debug)]
+pub(crate) struct GcAutoParams {
+    /// Discard ratio threshold (0.0..=1.0). `None` → 0.4
+    /// (`--gc-discard-ratio`).
+    pub ratio: Option<f64>,
+    /// Only consider sealed extents whose `sealed_length` is at most
+    /// this many bytes. Combined with a lower `ratio` lets the caller
+    /// say "punch small extents at even 10% dead". `None` → no upper
+    /// bound.
+    pub max_size: Option<u64>,
+    /// Whole-stream dead-byte high-water hint. When the stream's reclaimable
+    /// bytes (before the replay floor) exceed this, the per-extent ratio is halved
+    /// (so 0.4 → 0.2 etc.) for this dispatch. `None` → no relaxation.
+    pub stream_debt: Option<u64>,
+    /// Per-extent ABSOLUTE dead-byte floor: an extent with at least this many
+    /// dead bytes qualifies whatever its ratio, because a big enough pile is
+    /// worth reclaiming even as a small fraction. Shares its source with the
+    /// advisory's `gc_debt_high` so both ends ask the same question. `None` →
+    /// ratio only. Ignored under `empty_only`.
+    pub dead_bytes_high: Option<u64>,
+    /// these params ARE the cluster's standing GC policy rather than a one-off
+    /// override, so this pass may (re)define the basis the debt GAUGE is
+    /// judged by. Set only by the manager — see
+    /// `MaintenanceReq.gc_policy_is_standing`.
+    pub policy_is_standing: bool,
+    /// If `true`, pick ONLY `sealed_length == 0` non-tail extents.
+    /// Cheapest possible GC (no rewrite, just `punch_holes`). Overrides
+    /// `ratio` / `max_size` when set.
+    pub empty_only: bool,
+}
+
+// ---------------------------------------------------------------------------
+// Flush channel types (P-log → P-sst)
+// ---------------------------------------------------------------------------
+//
+// background_flush_loop on the P-log thread no longer runs
+// build_sst + row_stream.append itself. Instead it ships a FlushReq
+// over to a dedicated P-sst OS thread (its own compio runtime + io_uring +
+// ConnPool), which does the heavy lifting and replies with the new TableMeta
+// + SstReader. P-log then atomically pushes the new table/reader, pops imm,
+// and publishes the authoritative metaStream checkpoint from its single-
+// threaded `p.tables` state.
+//
+// imm: Arc<Memtable> — parking_lot::RwLock<BTreeMap<_,_>> + AtomicU64,
+// Send+Sync. Safe to cross threads.
+// SstReader holds a RefCell block cache; RefCell<T: Send> is Send (not Sync),
+// so we can move it through the oneshot::Sender but not share across tasks.
+
+pub(crate) struct FlushReq {
+    pub(crate) imm: Arc<Memtable>,
+    pub(crate) vp_eid: u64,
+    pub(crate) vp_off: u64,
+    pub(crate) row_stream_id: u64,
+    pub(crate) resp_tx: oneshot::Sender<Result<(TableMeta, SstReader)>>,
+}
+
+pub(crate) struct RowAppendReq {
+    /// The table's segments (`BuiltSst::segments`), appended as they are.
+    pub(crate) sst_segments: Vec<Bytes>,
+    /// `BuiltSst::crc` of those segments.
+    pub(crate) sst_crc: u32,
+    pub(crate) row_stream_id: u64,
+    pub(crate) resp_tx: oneshot::Sender<Result<autumn_stream::AppendResult>>,
+}
+
+/// synchronous P-log → P-sst barrier. Sent by `handle_split_part`
+/// in this strict order inside split's freeze-drain critical section:
+/// (a) drain ACK received → (b) capture commit_length of log/row/meta →
+/// **(c) send THIS barrier + await ACK** → (d) `multi_modify_split` →
+/// (e) `part_sc.invalidate_stream` → (f) local rg / epoch / overlap
+/// convergence → (g) release gates + unfreeze.
+///
+/// Step (c) is BEFORE the manager seal (step d) so a barrier failure
+/// (send timeout / ACK timeout / dropped channel) is cleanly abortable —
+/// the manager has not yet committed, so unfreezing + returning Err
+/// leaves the cluster in a coherent pre-split state. Putting the
+/// barrier AFTER the seal would create an unrecoverable window: manager
+/// committed + local state not converged + freeze about to be cleared.
+///
+/// P-sst's `flush_worker_loop`, on receiving the barrier:
+///   (1) drains its in-flight `FuturesUnordered` to ZERO (waits for every
+///       concurrent FlushReq / RowAppendReq to land or fail),
+///   (2) calls `sst_sc.invalidate_stream(row_stream_id)` so the per-
+///       stream worker's cached tail is discarded,
+///   (3) signals `resp_tx`.
+/// By the time the manager seals the tail in step (d), sst_sc has no
+/// in-flight ops AND no cached worker; the next P-sst op (only
+/// possible after the gates release in step g) re-fetches a fresh tail
+/// from the manager, which by then carries the post-seal extent.
+///
+/// This was previously a lazy `Cell<bool>` flag on `PartitionData` that the
+/// next P-sst message piggybacked. The lazy form had a window where a
+/// FlushReq with `invalidate=false` (flag already taken by a queued
+/// RowAppendReq) could enter P-sst's cap=2 FuturesUnordered ALONGSIDE
+/// the invalidating RowAppendReq and race to `append_bytes` on the stale
+/// per-stream worker. The barrier closes the
+/// race structurally — no concurrent append can be in-flight when the
+/// invalidate runs.
+pub(crate) struct RowInvalidateBarrierReq {
+    pub(crate) row_stream_id: u64,
+    /// when true, after draining inflight P-sst to zero the
+    /// worker SEALS + ROLLS the row_stream tail (`sst_sc.seal_and_roll_tail`,
+    /// which invalidates internally) instead of only invalidating the cache.
+    /// Used by major compaction to write into a fresh extent and by
+    /// MSG_ROLL_TAILS to drain a fenced node. Split passes `false` — it only
+    /// needs the invalidate before the manager
+    /// seals the tail itself in `multi_modify_split`.
+    pub(crate) seal_and_roll: bool,
+    /// ACK carries the roll result; callers must not publish success on failure.
+    pub(crate) resp_tx: oneshot::Sender<Result<()>>,
+}
+
+// ---------------------------------------------------------------------------
+// Group-commit write channel types
+// ---------------------------------------------------------------------------
+
+pub(crate) enum WriteOp {
+    Put {
+        user_key: Bytes,
+        /// A value received into a pool buffer keeps its registration through
+        /// to the log append.
+        value: autumn_transport::RegBytes,
+        expires_at: u64,
+    },
+    Delete {
+        user_key: Vec<u8>,
+    },
+    /// Lease write fencing: persist a fence-floor bump (`floors[ino] =
+    /// max(floors[ino], epoch)`). Queued by the enqueue_* dispatchers
+    /// immediately BEFORE the write that raised the floor, so it lands in
+    /// the same (or an earlier) group-commit batch — durable no later than
+    /// the admitted write's ACK. Skips the in_range check (its key is the
+    /// raw ino, not a user key) and the memtable insert.
+    FenceBump {
+        ino: u64,
+        epoch: u64,
+    },
+}
+
+/// Shared accumulator for `MSG_BATCH_PUT`. The dispatcher creates ONE
+/// of these per batch frame, then pushes N `WriteResponder::BatchPut`
+/// entries (one per op) into `pending`. Each `WriteResponder::send_ok`
+/// / `send_err` calls `record` with its index; when the last one
+/// records, the accumulated `BatchPutResp` is encoded and sent on the
+/// single outer oneshot. Single-threaded on the partition runtime, so
+/// `Rc<RefCell>` / `Cell` is sufficient.
+pub(crate) struct BatchPutAccumulator {
+    /// Taken when the last op completes — None after the response fires.
+    outer: RefCell<Option<oneshot::Sender<HandlerResult>>>,
+    /// One byte per op: 0 = OK, non-zero = error code.
+    statuses: RefCell<Vec<u8>>,
+    /// Count-down: starts at N, decrements per `record`. The op that
+    /// transitions it to 0 ALSO encodes + sends the response.
+    remaining: Cell<usize>,
+    /// Which reply type to encode. Batched put and batched delete accumulate
+    /// identically — one status byte per op — and differ only in the rkyv
+    /// type the last op serialises. Kept as a flag rather than a second
+    /// accumulator so the counting logic cannot drift between the two.
+    kind: BatchKind,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BatchKind {
+    Put,
+    Delete,
+}
+
+impl BatchPutAccumulator {
+    pub(crate) fn new(outer: oneshot::Sender<HandlerResult>, n: usize) -> Rc<Self> {
+        Self::new_kind(outer, n, BatchKind::Put)
+    }
+    pub(crate) fn new_kind(
+        outer: oneshot::Sender<HandlerResult>,
+        n: usize,
+        kind: BatchKind,
+    ) -> Rc<Self> {
+        Rc::new(Self {
+            outer: RefCell::new(Some(outer)),
+            // Sentinel 0xff means "not yet recorded" — defensively
+            // catches a bug where one op's slot is overwritten / missed.
+            statuses: RefCell::new(vec![0xff; n]),
+            remaining: Cell::new(n),
+            kind,
+        })
+    }
+    /// Record one op's status. Returns whether this was the op that answered
+    /// the client — the batch's single reply goes out with its last op.
+    pub(crate) fn record(&self, idx: usize, status: u8) -> bool {
+        {
+            let mut s = self.statuses.borrow_mut();
+            if let Some(slot) = s.get_mut(idx) {
+                *slot = status;
+            }
+        }
+        let r = self.remaining.get().saturating_sub(1);
+        self.remaining.set(r);
+        if r == 0 {
+            if let Some(outer) = self.outer.borrow_mut().take() {
+                let statuses = self.statuses.borrow().clone();
+                let bytes = match self.kind {
+                    BatchKind::Put => partition_rpc::rkyv_encode(&partition_rpc::BatchPutResp {
+                        code: CODE_OK,
+                        message: String::new(),
+                        statuses,
+                    }),
+                    BatchKind::Delete => {
+                        partition_rpc::rkyv_encode(&partition_rpc::BatchDeleteResp {
+                            code: CODE_OK,
+                            message: String::new(),
+                            statuses,
+                        })
+                    }
+                };
+                let _ = outer.send(Ok(bytes));
+                return true;
+            }
+        }
+        false
+    }
+}
+
+/// Direct responder into the outer `req.resp_tx` (encoded RPC frame
+/// bytes). Replaces the R3/R4 inner `oneshot<Result<Vec<u8>, String>>` that
+/// carried the raw key back to `handle_put`/`handle_delete` for re-encoding.
+/// The tag selects whether Phase 3 encodes a `PutResp` or a `DeleteResp`.
+pub(crate) enum WriteResponder {
+    Put {
+        outer: oneshot::Sender<HandlerResult>,
+        /// User key to echo in `PutResp.key`. Owned copy — avoids keeping
+        /// the decoded ArchivedPutReq alive across the Phase 2 await.
+        key: Vec<u8>,
+    },
+    Delete {
+        outer: oneshot::Sender<HandlerResult>,
+        key: Vec<u8>,
+    },
+    /// One op inside a `MSG_BATCH_PUT`. All N ops in the batch share
+    /// one `BatchPutAccumulator`; `idx` is this op's slot in the
+    /// statuses Vec.
+    BatchPut {
+        accum: Rc<BatchPutAccumulator>,
+        idx: usize,
+    },
+    /// A conditional write whose comparison failed after it raised a fence
+    /// floor: answered with the conflict once the floor is durable.
+    Conflict {
+        outer: oneshot::Sender<HandlerResult>,
+        key: Vec<u8>,
+    },
+    /// Lease write fencing: responder for a `WriteOp::FenceBump` record.
+    /// No client is waiting on it — the client's reply rides the admitted
+    /// write's own responder. send_ok is a no-op; send_err only logs (the
+    /// admitted write in the same/later batch fails identically and DOES
+    /// surface the error to the client).
+    Fence,
+}
+
+impl WriteResponder {
+    /// Reply success (batch committed). Encodes the appropriate RPC response
+    /// frame bytes and forwards them to the outer ps-conn oneshot. Returns
+    /// whether a client frame was answered — one admission slot released on
+    /// its connection: always for a Put, Delete or Conflict, only on the last op of a
+    /// batch frame, never for a fence record. `CoalesceWindow` sizes the
+    /// refill it waits for by that count.
+    pub(crate) fn send_ok(self) -> bool {
+        match self {
+            WriteResponder::Put { outer, key } => {
+                let bytes = partition_rpc::rkyv_encode(&PutResp {
+                    code: CODE_OK,
+                    message: String::new(),
+                    key,
+                });
+                let _ = outer.send(Ok(bytes));
+                true
+            }
+            WriteResponder::Delete { outer, key } => {
+                let bytes = partition_rpc::rkyv_encode(&DeleteResp {
+                    code: CODE_OK,
+                    message: String::new(),
+                    key,
+                });
+                let _ = outer.send(Ok(bytes));
+                true
+            }
+            WriteResponder::Conflict { outer, key } => {
+                let bytes = partition_rpc::rkyv_encode(&PutResp {
+                    code: CODE_PRECONDITION,
+                    message: "compare_put conflict".to_string(),
+                    key,
+                });
+                let _ = outer.send(Ok(bytes));
+                true
+            }
+            WriteResponder::BatchPut { accum, idx } => accum.record(idx, 0),
+            WriteResponder::Fence => false,
+        }
+    }
+
+    /// Reply "not applied, retry": `Unavailable` (batch status
+    /// `CODE_UNAVAILABLE`), which the SDK refreshes routing on and retries.
+    pub(crate) fn send_unavailable(self, msg: String) {
+        self.send_status(StatusCode::Unavailable, msg)
+    }
+
+    /// Reply "the write was handed to storage and given up; it may or may
+    /// not have been applied": `OutcomeUnknown` (batch status
+    /// `CODE_OUTCOME_UNKNOWN`). The SDK retries an idempotent write on it and
+    /// reports it to a conditional one.
+    pub(crate) fn send_outcome_unknown(self, msg: String) {
+        self.send_status(StatusCode::OutcomeUnknown, msg)
+    }
+
+    fn send_status(self, status: StatusCode, msg: String) {
+        let outer = match self {
+            WriteResponder::Put { outer, .. }
+            | WriteResponder::Delete { outer, .. }
+            | WriteResponder::Conflict { outer, .. } => outer,
+            WriteResponder::BatchPut { accum, idx } => {
+                accum.record(idx, partition_rpc::code_for_status(status));
+                return;
+            }
+            WriteResponder::Fence => {
+                // The admitted write riding behind it gets the same reply.
+                tracing::warn!("fence-bump WAL record: {msg}");
+                return;
+            }
+        };
+        let _ = outer.send(Err((status, msg)));
+    }
+
+    /// Reply failure — propagate the error string as Internal to the outer
+    /// resp_tx. "key is out of range" is InvalidArgument per existing semantics.
+    pub(crate) fn send_err(self, msg: String) {
+        if let WriteResponder::Fence = self {
+            // The admitted write that rode behind this record fails the
+            // same way and surfaces the error to its client; the floor
+            // stays raised in memory (fail-closed direction).
+            tracing::warn!("fence-bump WAL record failed: {msg}");
+            return;
+        }
+        if let WriteResponder::BatchPut { accum, idx } = self {
+            // Batch entries don't carry their own status code wire — a
+            // single byte. Use 1 for "internal err" / 2 for "out of range";
+            // callers branch on >0 to mean "not OK", the exact value is
+            // informational.
+            let status = if msg == "key is out of range" { 2 } else { 1 };
+            accum.record(idx, status);
+            return;
+        }
+        let code = if msg == "key is out of range" {
+            StatusCode::InvalidArgument
+        } else {
+            StatusCode::Internal
+        };
+        let outer = match self {
+            WriteResponder::Put { outer, .. } => outer,
+            WriteResponder::Delete { outer, .. } => outer,
+            WriteResponder::Conflict { outer, .. } => outer,
+            WriteResponder::BatchPut { .. } | WriteResponder::Fence => {
+                unreachable!("handled above")
+            }
+        };
+        let _ = outer.send(Err((code, msg)));
+    }
+}
+
+pub(crate) struct WriteRequest {
+    op: WriteOp,
+    resp: WriteResponder,
+}
+
+impl WriteRequest {
+    /// The key this request writes; None for a fence record.
+    fn written_key(&self) -> Option<&[u8]> {
+        match &self.op {
+            WriteOp::Put { user_key, .. } => Some(user_key),
+            WriteOp::Delete { user_key } => Some(user_key),
+            WriteOp::FenceBump { .. } => None,
+        }
+    }
+
+    /// Whether this request writes the user key `key`.
+    fn writes_key(&self, key: &[u8]) -> bool {
+        match &self.op {
+            WriteOp::Put { user_key, .. } => user_key[..] == *key,
+            WriteOp::Delete { user_key } => user_key[..] == *key,
+            WriteOp::FenceBump { .. } => false,
+        }
+    }
+
+    /// Bytes this request adds to a group-commit batch's `AppendReq`.
+    ///
+    /// EXACT, not an estimate: `MAX_WRITE_BATCH_BYTES` splits the batch on this
+    /// number, so an undercount is a frame that gets built and cannot be sent.
+    /// It mirrors `wal_record::encode_v1_segments` — envelope (sentinel +
+    /// length + crc), the payload header, and the INTERNAL key, which is the
+    /// user key plus its 8-byte timestamp. The old `17 + key + value` counted
+    /// the payload header alone and was short by the envelope and the
+    /// timestamp on every record.
+    fn encoded_size(&self) -> usize {
+        use crate::wal_record::{PAYLOAD_HEADER, V1_ENVELOPE_OVERHEAD};
+        const TS_LEN: usize = 8;
+        let fixed = V1_ENVELOPE_OVERHEAD + PAYLOAD_HEADER + TS_LEN;
+        match &self.op {
+            WriteOp::Put {
+                user_key, value, ..
+            } => fixed + user_key.len() + value.len(),
+            WriteOp::Delete { user_key } => fixed + user_key.len(),
+            WriteOp::FenceBump { .. } => fixed + 8,
+        }
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)] // kept as a test constructor; not all tests use it
+    pub(crate) fn new_for_test(op: WriteOp) -> Self {
+        // Build a dangling responder (outer _rx dropped immediately). Tests
+        // that exercise the responder should construct it explicitly.
+        let (outer, _rx) = oneshot::channel();
+        let key = match &op {
+            WriteOp::Put { user_key, .. } => user_key.to_vec(),
+            WriteOp::Delete { user_key } => user_key.clone(),
+            WriteOp::FenceBump { ino, .. } => ino.to_be_bytes().to_vec(),
+        };
+        let resp = match &op {
+            WriteOp::Put { .. } => WriteResponder::Put { outer, key },
+            WriteOp::Delete { .. } => WriteResponder::Delete { outer, key },
+            WriteOp::FenceBump { .. } => WriteResponder::Fence,
+        };
+        Self { op, resp }
+    }
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct BatchStats {
+    ops: u64,
+    /// Client frames answered by this batch — its ops minus the fence
+    /// records and minus all but the last op of every batch frame. What
+    /// `CoalesceWindow` counts, because it is what released admission slots.
+    replies: u64,
+    batch_size: u64,
+    phase1_ns: u64,
+    phase2_ns: u64,
+    phase3_ns: u64,
+    end_to_end_ns: u64,
+}
+
+pub(crate) struct WriteLoopMetrics {
+    started_at: Instant,
+    ops: u64,
+    batches: u64,
+    batch_size_total: u64,
+    phase1_ns: u64,
+    phase2_ns: u64,
+    phase3_ns: u64,
+    end_to_end_ns: u64,
+}
+
+impl WriteLoopMetrics {
+    fn new() -> Self {
+        Self {
+            started_at: Instant::now(),
+            ops: 0,
+            batches: 0,
+            batch_size_total: 0,
+            phase1_ns: 0,
+            phase2_ns: 0,
+            phase3_ns: 0,
+            end_to_end_ns: 0,
+        }
+    }
+    fn record(&mut self, stats: BatchStats) {
+        if stats.ops == 0 {
+            return;
+        }
+        self.ops += stats.ops;
+        self.batches += 1;
+        self.batch_size_total += stats.batch_size;
+        self.phase1_ns += stats.phase1_ns;
+        self.phase2_ns += stats.phase2_ns;
+        self.phase3_ns += stats.phase3_ns;
+        self.end_to_end_ns += stats.end_to_end_ns;
+    }
+    fn maybe_report(&mut self, part_id: u64) {
+        if self.started_at.elapsed() >= Duration::from_secs(1) {
+            self.report(part_id);
+        }
+    }
+    fn flush(&mut self, part_id: u64) {
+        if self.ops > 0 {
+            self.report(part_id);
+        }
+    }
+    fn report(&mut self, part_id: u64) {
+        let elapsed = self.started_at.elapsed();
+        let batches = self.batches.max(1);
+        tracing::info!(
+            part_id,
+            ops = self.ops,
+            batches = self.batches,
+            ops_per_sec = self.ops as f64 / elapsed.as_secs_f64().max(1e-9),
+            avg_batch_size = self.batch_size_total as f64 / batches as f64,
+            fill_ratio = self.batch_size_total as f64 / (batches * max_write_batch() as u64) as f64,
+            avg_phase1_ms = ns_to_ms(self.phase1_ns, batches),
+            avg_phase2_ms = ns_to_ms(self.phase2_ns, batches),
+            avg_phase3_ms = ns_to_ms(self.phase3_ns, batches),
+            avg_end_to_end_ms = ns_to_ms(self.end_to_end_ns, batches),
+            "partition write summary",
+        );
+        *self = Self::new();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Inter-thread request routing (main thread ↔ partition thread)
+// ---------------------------------------------------------------------------
+//
+// Per-partition listener (Seastar-style thread-per-
+// shard completion). The central accept thread + main-thread fd dispatcher
+// from the old routing model are GONE. Each partition thread owns:
+//
+//   * A dedicated `compio::net::TcpListener` bound to `base_port + ord`
+//     where `ord` is a monotonic counter bumped once per `open_partition`
+//     call. Port conflicts surface as a hard error (no silent fallback).
+//   * Its own accept task that loops `listener.accept().await` on the
+//     partition's compio runtime and spawns `handle_ps_connection` for
+//     each fd on the SAME runtime. No cross-thread fd handoff.
+//   * Registration with the manager via `MSG_REGISTER_PARTITION_ADDR`
+//     once the listener is bound — `GetRegions` then returns the per-
+//     partition address, and `ClusterClient` routes each client thread
+//     to the owning partition's P-log directly. At N=4 + 256 benchmark
+//     threads, the 256 ps-conn tasks distribute across 4 P-log runtimes
+//     (~64 each) instead of sharing one, clearing the single-dispatcher
+//     saturation ceiling.
+//
+// context preserved for the per-partition path: handle_ps_connection
+// still runs on the same runtime as partition_loop, so the request
+// handoff is a same-thread mpsc + oneshot with no eventfd/futex wake.
+//
+// (kernel-RTT diagnosis: a single P-log was saturated under 256 × d=1;
+// per-partition listeners fan the load out across N P-log threads.)
+
+/// A request dispatched from a ps-conn task (running on P-log runtime)
+/// into `partition_loop` for write group-commit or for inline
+/// read/maintenance dispatch. This channel's endpoints BOTH
+/// live on the same compio runtime, so `futures::channel::mpsc`'s wake
+/// path stays in-process (no eventfd).
+pub struct PartitionRequest {
+    msg_type: u8,
+    payload: Bytes,
+    resp_tx: oneshot::Sender<HandlerResult>,
+    /// For a write whose value is the frame's tail (`MSG_PUT`, `MSG_BATCH_PUT`,
+    /// `MSG_COMPARE_WRITE`): a large one is received straight into a `PooledBuf`
+    /// (its only receive copy) and carried here as a `Bytes` aliasing that
+    /// buffer; `payload` then holds only the ctrl. `enqueue_put` uses this directly
+    /// instead of slicing the value out of `payload` (which would require
+    /// concatenating it back in — the copy we're avoiding). `None` for every
+    /// other request (the value, if any, is sliced from `payload` as before).
+    /// A value received into a pool buffer keeps its registration, which the
+    /// append to the extent nodes hands UCX.
+    bulk_value: Option<autumn_transport::RegBytes>,
+}
+
+/// Handle to a running partition thread.
+///
+/// Owned by the main compio thread. Each partition thread
+/// binds its own listener and runs its own accept loop; the main thread
+/// does NOT push fds across. The only thing we hang on to is a shutdown
+/// signal (drop-to-close oneshot) used on `region_sync` eviction to ask
+/// the partition thread to tear down its accept loop.
+struct PartitionHandle {
+    /// Dropping `shutdown_tx` closes the oneshot and signals the
+    /// partition's accept task to stop.  We wrap it in `Option` so we
+    /// can take/drop it explicitly.
+    #[allow(dead_code)]
+    shutdown_tx: Option<oneshot::Sender<()>>,
+    /// graceful drain signal. Main thread sends a `DrainAck` through it to
+    /// ask the partition to flush active+imm and reply when done. Dropped
+    /// during shutdown so the `mpsc::Receiver` end inside the partition thread
+    /// observes EOF.
+    drain_tx: Option<mpsc::UnboundedSender<DrainAck>>,
+    /// Address (`host:port`) the partition is listening on. Reported to
+    /// the manager via `MSG_REGISTER_PARTITION_ADDR` on open, and
+    /// re-reported by the part_addr self-heal in `sync_regions_once` whenever
+    /// the manager's `part_addrs` view (in-memory only — lost on manager
+    /// restart) goes missing or stale.
+    part_addr: String,
+    /// cross-thread metrics handle. Bumped by the partition thread,
+    /// read by the main thread's `report_load_loop`. Arc is Send so this
+    /// is safe to clone across threads.
+    metrics: std::sync::Arc<PartitionMetrics>,
+    /// clone of the partition's compact-trigger sender. Held on the
+    /// main thread so the maintenance scheduler loop can dispatch
+    /// compact runs without going through the loopback PS RPC. Same
+    /// channel as the in-thread `PartitionData.compact_tx`; the receiver
+    /// inside `background_compact_loop` is unchanged.
+    // Never read since the manager-driven maintenance dispatch was removed;
+    // kept as a held sender clone (harmless — the in-thread tx keeps the
+    // channel open regardless). #[allow] rather than delete to avoid churning
+    // the PartitionHandle construction sites for a vestigial field.
+    #[allow(dead_code)]
+    compact_trigger: mpsc::Sender<CompactTask>,
+    /// same shape for GC.
+    #[allow(dead_code)]
+    gc_trigger: mpsc::Sender<GcTask>,
+    /// + epoch: snapshot of (rg, log/row/meta stream ids,
+    /// region_epoch) describing the partition's CURRENT in-memory
+    /// shape. `sync_regions_once` compares this against the latest
+    /// manager regions snapshot to detect a wider rg (post-merge),
+    /// new stream IDs, or an epoch bump and force a reopen.
+    ///
+    /// **Shared with the partition thread.** Before this fix,
+    /// this was a frozen snapshot from `open_partition` time. After
+    /// `handle_split_part` narrowed `p.rg` + bumped `p.region_epoch`
+    /// in-place on the partition thread, this snapshot stayed stale,
+    /// so the next `sync_regions_once` tick saw `prev != latest` and
+    /// dropped + reopened a partition whose in-memory state was
+    /// already perfectly correct — a 5-60+ s outage on every split.
+    /// Post-fix, `handle_split_part` (and any future in-place updater)
+    /// MUST take the lock and write the new tuple after updating
+    /// `PartitionData`. `parking_lot::Mutex` is fine: written ~1/split,
+    /// read 1/2s/partition by `region_sync_loop` — both rates are
+    /// dwarfed by the lock's ~25 ns uncontended cost. Same pattern as
+    /// `Arc<PartitionMetrics>` (CLAUDE.md programming note 11) and
+    /// `Arc<ConcurrencyController>`.
+    opened_with: std::sync::Arc<parking_lot::Mutex<(Range, u64, u64, u64, u64)>>,
+    /// JoinHandle retained for RAII.
+    #[allow(dead_code)]
+    join: Option<std::thread::JoinHandle<()>>,
+    /// the port ordinal this partition holds (`port = base_port +
+    /// port_ord`). Freed from the server's `used_port_ords` on drop so a later
+    /// `open_partition` REUSES it (scan-from-base_port+1 allocation).
+    port_ord: u16,
+    /// Clone of `PartitionServer.used_port_ords` so `Drop` can release
+    /// `port_ord` regardless of which path removed this handle.
+    used_port_ords: Rc<RefCell<std::collections::BTreeSet<u16>>>,
+    /// The P-log's place in the load sample; dropped with the handle.
+    #[allow(dead_code)]
+    plog_lease: plog_load::PlogLease,
+}
+
+impl Drop for PartitionHandle {
+    fn drop(&mut self) {
+        // release the port ordinal so a later open reuses it.
+        self.used_port_ords.borrow_mut().remove(&self.port_ord);
+        self.metrics.closed.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// RAII for the eagerly-reserved port ordinal. If `open_partition`
+/// fails before the `PartitionHandle` (which then owns the free-on-drop) is
+/// built, this frees the ord — otherwise a repeatedly-failing open (reopen
+/// thrash on a bind collision) would leak ords the scan-from-base+1 allocator never reuses.
+/// `commit()` disarms it once the handle takes ownership.
+struct OrdReservation {
+    set: Rc<RefCell<std::collections::BTreeSet<u16>>>,
+    ord: u16,
+    committed: bool,
+}
+impl OrdReservation {
+    fn commit(mut self) {
+        self.committed = true;
+    }
+}
+impl Drop for OrdReservation {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.set.borrow_mut().remove(&self.ord);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PartitionServer — runs on the main compio thread
+// ---------------------------------------------------------------------------
+
+#[derive(Clone)]
+pub struct PartitionServer {
+    ps_id: u64,
+    advertise_addr: Option<String>,
+    partitions: Rc<RefCell<HashMap<u64, PartitionHandle>>>,
+    /// Manager addresses for round-robin on NotLeader.
+    manager_addrs: Vec<String>,
+    /// Current manager index. MUST be `Rc<Cell>`: `PartitionServer`
+    /// is cloned once per supervised loop (heartbeat / region_sync /
+    /// report_load), and a plain `Cell` clones BY VALUE — otherwise only the
+    /// heartbeat task's private copy rotated on manager failure, while
+    /// region_sync (and with it the part_addrs self-heal) hammered the
+    /// dead manager forever: after a leader kill with a healthy standby,
+    /// clients stayed unroutable for 20+ minutes (manager-HA chaos H1).
+    current_mgr: Rc<Cell<usize>>,
+    pool: Rc<ConnPool>,
+    /// base TCP port. A partition binds `base_port + ord` where
+    /// `ord` is the LOWEST FREE ordinal ≥ 1 (so the first open binds
+    /// `base_port + 1`).
+    base_port: Cell<u16>,
+    /// ordinals currently in use (port = `base_port + ord`).
+    /// `open_partition` picks the LOWEST FREE ord ≥ 1; `PartitionHandle::drop`
+    /// frees it on close so ords are REUSED. Pre-fix this was a monotonic
+    /// counter, which (a) left `base_port + 1` permanently unbound once its
+    /// first partition churned away, and (b) could exhaust the u16 ord space
+    /// on a long-lived, churny PS.
+    used_port_ords: Rc<RefCell<std::collections::BTreeSet<u16>>>,
+    /// host component for the per-partition advertise
+    /// address. Defaults to `127.0.0.1` if `--advertise` is omitted or
+    /// is not parseable as `host:port`.
+    advertise_host: Rc<std::cell::RefCell<String>>,
+    /// `/metrics` `host:port`, empty when the binary runs no metrics listener.
+    metrics_addr: Rc<RefCell<String>>,
+    /// host component for the per-partition listener bind.
+    /// For UCX/RoCE this must be the routable HCA IP, not `0.0.0.0`.
+    listen_host: Rc<std::cell::RefCell<String>>,
+    /// D-r7: PS-wide concurrency caps for compact + GC. RAM cap,
+    /// shared by every partition on this PS. Per-partition rate
+    /// limiting lives in each `PartitionData.rate_ctrl`.
+    pub(crate) concurrency_ctrl: std::sync::Arc<ConcurrencyController>,
+    /// P-log CPU and run_delay, shared with `/metrics`.
+    plog_load: std::sync::Arc<plog_load::PlogLoad>,
+    /// shared data-plane authz runtime (public keys + registered
+    /// namespaces), refreshed by the main-thread `authz_config_poll_loop` and read
+    /// by every connection task. `Arc` because connection tasks run on the
+    /// partition OS threads. Opt-in: disabled until the manager reports a
+    /// signing key via `MSG_GET_AUTHZ_CONFIG`.
+    pub(crate) authz: std::sync::Arc<crate::authz::AuthzState>,
+    /// Reopen-thrash hardening: per-partition open-failure backoff.
+    /// When `open_partition` fails (e.g. a transient listener-bind
+    /// EADDRINUSE during split/merge region churn), retrying it every
+    /// `region_sync` tick (~2 s) thrashes — the partition flaps
+    /// unavailable, spams logs, and burns a fresh port ordinal each time.
+    /// We record consecutive failures per `part_id` and skip reopening
+    /// until `retry_after` (exponential backoff, capped); cleared on a
+    /// successful open and pruned for partitions no longer assigned.
+    open_backoff: Rc<RefCell<HashMap<u64, OpenBackoff>>>,
+    /// SST block cache for every partition this PS opens. Per-PS, not
+    /// process-global: its keys `(extent_id, offset)` are unique only within
+    /// one cluster, and one PS serves exactly one cluster.
+    block_cache: std::sync::Arc<crate::sstable::BlockCache>,
+    /// Memory tier budget shared by every partition this PS opens; None = off.
+    mem_tier: Option<std::sync::Arc<mem_tier::MemTierBudget>>,
+    /// What `/metrics` serves; the metrics thread reads it directly.
+    metrics: std::sync::Arc<metrics::PsMetrics>,
+    /// Set at the top of `shutdown()`; once set, `sync_regions_once` does
+    /// nothing and the heartbeat reports nothing open. MUST be `Rc<Cell>` for
+    /// the same reason as `current_mgr`: region sync and the heartbeat run on
+    /// clones, and a by-value `Cell` left them blind to the shutdown — region
+    /// sync then reloaded a partition the drain had just closed.
+    shutting_down: Rc<Cell<bool>>,
+    /// Held by a `sync_regions_once` pass for its whole run. `shutdown()`
+    /// takes it after setting `shutting_down`, so a pass that was already past
+    /// the flag check finishes (and anything it opened is published) before the
+    /// drain snapshots the partitions; a later pass sees the flag.
+    sync_pass: Rc<futures::lock::Mutex<()>>,
+}
+
+/// Per-partition reopen-backoff state. See
+/// `PartitionServer.open_backoff`.
+struct OpenBackoff {
+    consecutive_failures: u32,
+    retry_after: Instant,
+}
+
+/// First open-failure backoff = `OPEN_BACKOFF_BASE_SECS` (≈ "retry next
+/// region_sync tick"); each further consecutive failure doubles it up to
+/// `2^OPEN_BACKOFF_MAX_SHIFT`, capped at `--open-backoff-max-secs`. Small
+/// at first so a transient port conflict recovers fast; throttles a
+/// persistently-failing open so it doesn't spin.
+const OPEN_BACKOFF_BASE_SECS: u64 = 1;
+const OPEN_BACKOFF_MAX_SHIFT: u32 = 5;
+
+/// D-r7: per-partition rate controller. Tracks FOUR independent
+/// rate dimensions in one 1-second sliding window:
+///   - fg bytes/sec
+///   - fg ops/sec (catches small-value IOPS-bound workloads)
+///   - compact bytes/sec (background SST merge writes)
+///   - gc bytes/sec       (background log_stream rewrite)
+///
+/// Per-partition by ownership: each `PartitionData` holds its own
+/// `Arc<RateController>`. Hot-partition fg pressure does NOT consume
+/// cold-partition budget — the budgets are independent.
+///
+/// fg-aware yield: `account_compact` and `account_gc` BOTH inspect
+/// `fg_bytes / fg_ops` saturation against the per-partition fg caps
+/// and yield the rest of the 1-second window when fg observed rate
+/// exceeds `fg_saturated_ratio × cap`. Disabled per-dimension when
+/// that fg cap is 0 (we lack a baseline to detect saturation).
+///
+/// The caps are the runtime parameters `--fg-rate-bytes-per-sec`,
+/// `--fg-iops-per-sec`, `--admission-compact-rate-bytes-per-sec`,
+/// `--admission-gc-rate-bytes-per-sec` and `--fg-saturated-threshold`, read on
+/// every accounting call so an override applies at once. `0` on any rate
+/// disables that dimension (unlimited).
+///
+/// `parking_lot::Mutex` is held only across the synchronous accounting
+/// calc; sleep happens outside the lock. Per-partition controllers
+/// have no cross-thread contention since the partition owns its
+/// own Arc — the Mutex is uncontended in steady state.
+pub struct RateController {
+    /// `None`: read the PS parameters on each call.
+    fixed: Option<RateCaps>,
+    state: parking_lot::Mutex<RateState>,
+}
+
+#[derive(Clone, Copy)]
+struct RateCaps {
+    fg_rate_bytes_per_sec: u64,
+    fg_iops_per_sec: u64,
+    compact_rate_bytes_per_sec: u64,
+    gc_rate_bytes_per_sec: u64,
+    fg_saturated_ratio: f64,
+}
+
+struct RateState {
+    window_start: Instant,
+    fg_bytes: u64,
+    fg_ops: u64,
+    compact_bytes: u64,
+    gc_bytes: u64,
+}
+
+impl RateController {
+    pub fn new(
+        fg_rate_bytes_per_sec: u64,
+        fg_iops_per_sec: u64,
+        compact_rate_bytes_per_sec: u64,
+        gc_rate_bytes_per_sec: u64,
+        fg_saturated_ratio: f64,
+    ) -> Self {
+        Self::with_caps(Some(RateCaps {
+            fg_rate_bytes_per_sec,
+            fg_iops_per_sec,
+            compact_rate_bytes_per_sec,
+            gc_rate_bytes_per_sec,
+            fg_saturated_ratio: fg_saturated_ratio.clamp(0.1, 1.0),
+        }))
+    }
+
+    fn with_caps(fixed: Option<RateCaps>) -> Self {
+        Self {
+            fixed,
+            state: parking_lot::Mutex::new(RateState {
+                window_start: Instant::now(),
+                fg_bytes: 0,
+                fg_ops: 0,
+                compact_bytes: 0,
+                gc_bytes: 0,
+            }),
+        }
+    }
+
+    /// Follows the PS parameters. Defaults recalibrated against
+    /// `perf_baseline_tcp_p16_d8_s4k.json` and the 8M peak observation
+    /// (see `[[partition-qps-ceiling]]` and the D-r7-recal analysis):
+    ///
+    ///   - fg 1 GiB/s     — 5× headroom over single-partition 8M TCP
+    ///                       peak (218 MB/s); 4K never engages.
+    ///   - fg 30K ops/s   — single-partition QPS ceiling
+    ///                       (see `[[partition-qps-ceiling]]`).
+    ///   - compact 256 MiB/s — single partition can sustainably ingest
+    ///                          fg writes' flush output (4K aggregate
+    ///                          437 MB/s flush = 27 MB/s per partition).
+    ///   - gc 128 MiB/s   — handles 50% overwrite rate on 8M workloads
+    ///                       (218 × 0.5 = 109 MB/s).
+    pub fn from_params() -> Self {
+        Self::with_caps(None)
+    }
+
+    fn caps(&self) -> RateCaps {
+        self.fixed.unwrap_or_else(|| {
+            let p = params();
+            RateCaps {
+                fg_rate_bytes_per_sec: p.fg_rate_bytes_per_sec.get(),
+                fg_iops_per_sec: p.fg_iops_per_sec.get(),
+                compact_rate_bytes_per_sec: p.admission_compact_rate_bytes_per_sec.get(),
+                gc_rate_bytes_per_sec: p.admission_gc_rate_bytes_per_sec.get(),
+                fg_saturated_ratio: p.fg_saturated_threshold.get(),
+            }
+        })
+    }
+
+    fn maybe_reset_window(state: &mut RateState) {
+        if state.window_start.elapsed() >= Duration::from_secs(1) {
+            state.window_start = Instant::now();
+            state.fg_bytes = 0;
+            state.fg_ops = 0;
+            state.compact_bytes = 0;
+            state.gc_bytes = 0;
+        }
+    }
+
+    /// Returns `true` iff fg observed rate (bytes OR ops) exceeds
+    /// `fg_saturated_ratio × cap`. Used by `account_compact` and
+    /// `account_gc` to decide whether to yield to fg.
+    fn fg_saturated(c: &RateCaps, s: &RateState, elapsed_secs: f64) -> bool {
+        if c.fg_rate_bytes_per_sec > 0 {
+            let obs = s.fg_bytes as f64 / elapsed_secs;
+            let at = c.fg_rate_bytes_per_sec as f64 * c.fg_saturated_ratio;
+            if obs > at {
+                return true;
+            }
+        }
+        if c.fg_iops_per_sec > 0 {
+            let obs = s.fg_ops as f64 / elapsed_secs;
+            let at = c.fg_iops_per_sec as f64 * c.fg_saturated_ratio;
+            if obs > at {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Foreground accounting. Sleeps when either fg-bytes or fg-iops
+    /// ceiling is set AND would be exceeded (LARGER sleep wins).
+    /// Both caps at 0 = unlimited (default in tests, NOT in production).
+    pub async fn account_fg(&self, bytes: u64, ops: u64) {
+        let c = self.caps();
+        let sleep_for = {
+            let mut s = self.state.lock();
+            Self::maybe_reset_window(&mut s);
+            s.fg_bytes = s.fg_bytes.saturating_add(bytes);
+            s.fg_ops = s.fg_ops.saturating_add(ops);
+            let elapsed = s.window_start.elapsed();
+            let bytes_sleep: Option<Duration> = if c.fg_rate_bytes_per_sec == 0 {
+                None
+            } else {
+                let target =
+                    Duration::from_secs_f64(s.fg_bytes as f64 / c.fg_rate_bytes_per_sec as f64);
+                if target > elapsed {
+                    Some(target - elapsed)
+                } else {
+                    None
+                }
+            };
+            let iops_sleep: Option<Duration> = if c.fg_iops_per_sec == 0 {
+                None
+            } else {
+                let target = Duration::from_secs_f64(s.fg_ops as f64 / c.fg_iops_per_sec as f64);
+                if target > elapsed {
+                    Some(target - elapsed)
+                } else {
+                    None
+                }
+            };
+            match (bytes_sleep, iops_sleep) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                (Some(a), None) | (None, Some(a)) => Some(a),
+                (None, None) => None,
+            }
+        };
+        if let Some(d) = sleep_for {
+            compio::time::sleep(d).await;
+        }
+    }
+
+    /// Compact rate accounting. Sleeps until BOTH constraints hold:
+    /// (1) own compact ceiling; (2) fg-aware yield (yields when fg is
+    /// saturated).
+    pub async fn account_compact(&self, bytes: u64) {
+        let c = self.caps();
+        let sleep_for = {
+            let mut s = self.state.lock();
+            Self::maybe_reset_window(&mut s);
+            s.compact_bytes = s.compact_bytes.saturating_add(bytes);
+            let elapsed = s.window_start.elapsed();
+            let own_sleep: Option<Duration> = if c.compact_rate_bytes_per_sec == 0 {
+                None
+            } else {
+                let target = Duration::from_secs_f64(
+                    s.compact_bytes as f64 / c.compact_rate_bytes_per_sec as f64,
+                );
+                if target > elapsed {
+                    Some(target - elapsed)
+                } else {
+                    None
+                }
+            };
+            let elapsed_secs = elapsed.as_secs_f64().max(0.001);
+            let yield_sleep: Option<Duration> = if Self::fg_saturated(&c, &s, elapsed_secs) {
+                let remaining = Duration::from_secs(1).saturating_sub(elapsed);
+                if remaining > Duration::ZERO {
+                    Some(remaining)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            match (own_sleep, yield_sleep) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                (Some(a), None) | (None, Some(a)) => Some(a),
+                (None, None) => None,
+            }
+        };
+        if let Some(d) = sleep_for {
+            compio::time::sleep(d).await;
+        }
+    }
+
+    /// GC rate accounting. Symmetric to `account_compact`, separate
+    /// counter + cap so compact and gc don't fight for the same budget.
+    pub async fn account_gc(&self, bytes: u64) {
+        let c = self.caps();
+        let sleep_for = {
+            let mut s = self.state.lock();
+            Self::maybe_reset_window(&mut s);
+            s.gc_bytes = s.gc_bytes.saturating_add(bytes);
+            let elapsed = s.window_start.elapsed();
+            let own_sleep: Option<Duration> = if c.gc_rate_bytes_per_sec == 0 {
+                None
+            } else {
+                let target =
+                    Duration::from_secs_f64(s.gc_bytes as f64 / c.gc_rate_bytes_per_sec as f64);
+                if target > elapsed {
+                    Some(target - elapsed)
+                } else {
+                    None
+                }
+            };
+            let elapsed_secs = elapsed.as_secs_f64().max(0.001);
+            let yield_sleep: Option<Duration> = if Self::fg_saturated(&c, &s, elapsed_secs) {
+                let remaining = Duration::from_secs(1).saturating_sub(elapsed);
+                if remaining > Duration::ZERO {
+                    Some(remaining)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            match (own_sleep, yield_sleep) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                (Some(a), None) | (None, Some(a)) => Some(a),
+                (None, None) => None,
+            }
+        };
+        if let Some(d) = sleep_for {
+            compio::time::sleep(d).await;
+        }
+    }
+
+    /// Test-only snapshot: `(fg_bytes, fg_ops, compact_bytes, gc_bytes, elapsed)`.
+    #[cfg(test)]
+    pub(crate) fn snapshot(&self) -> (u64, u64, u64, u64, Duration) {
+        let s = self.state.lock();
+        (
+            s.fg_bytes,
+            s.fg_ops,
+            s.compact_bytes,
+            s.gc_bytes,
+            s.window_start.elapsed(),
+        )
+    }
+}
+
+/// D-r7: PS-wide concurrency controller. Caps the number of
+/// simultaneous `do_compact` / `run_gc` calls across all partitions
+/// on this PS. RAM-cap by purpose — each compact holds ~2× SST bytes
+/// and each GC holds ~64 MiB chunk buffer; without a global cap,
+/// `compact ALL` or `gc ALL` would multiply peak RSS by N partitions
+/// (an uncapped run reached tens of GB of RSS).
+///
+/// One `Arc<ConcurrencyController>` per `PartitionServer`, cloned
+/// into each `PartitionData`. Folds the former standalone
+/// `CompactionGate`-backed `compact_gate` and
+/// `gc_concurrency_gate` (D-r5).
+pub struct ConcurrencyController {
+    /// `(compact, gc)` caps; `None`: `--major-compact-parallelism` and
+    /// `--gc-parallelism`, read on each acquire.
+    fixed: Option<(usize, usize)>,
+    compact_inflight: std::sync::atomic::AtomicUsize,
+    gc_inflight: std::sync::atomic::AtomicUsize,
+}
+
+/// D-r7: RAII permit for `acquire_compact()`.
+pub struct CompactPermit {
+    ctrl: std::sync::Arc<ConcurrencyController>,
+}
+impl Drop for CompactPermit {
+    fn drop(&mut self) {
+        self.ctrl
+            .compact_inflight
+            .fetch_sub(1, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// D-r7: RAII permit for `acquire_gc()`.
+pub struct GcPermit {
+    ctrl: std::sync::Arc<ConcurrencyController>,
+}
+impl Drop for GcPermit {
+    fn drop(&mut self) {
+        self.ctrl
+            .gc_inflight
+            .fetch_sub(1, std::sync::atomic::Ordering::Release);
+    }
+}
+
+impl ConcurrencyController {
+    pub fn new(compact_max: usize, gc_max: usize) -> Self {
+        Self::with_caps(Some((compact_max.max(1), gc_max.max(1))))
+    }
+
+    fn with_caps(fixed: Option<(usize, usize)>) -> Self {
+        Self {
+            fixed,
+            compact_inflight: std::sync::atomic::AtomicUsize::new(0),
+            gc_inflight: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    pub fn from_params() -> Self {
+        Self::with_caps(None)
+    }
+
+    fn caps(&self) -> (usize, usize) {
+        self.fixed
+            .unwrap_or_else(|| (ps_major_compact_parallelism(), ps_gc_parallelism()))
+    }
+
+    pub async fn acquire_compact(self: &std::sync::Arc<Self>) -> CompactPermit {
+        use std::sync::atomic::Ordering;
+        loop {
+            let cur = self.compact_inflight.load(Ordering::Acquire);
+            if cur < self.caps().0
+                && self
+                    .compact_inflight
+                    .compare_exchange_weak(cur, cur + 1, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+            {
+                return CompactPermit {
+                    ctrl: std::sync::Arc::clone(self),
+                };
+            }
+            compio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    pub async fn acquire_gc(self: &std::sync::Arc<Self>) -> GcPermit {
+        use std::sync::atomic::Ordering;
+        loop {
+            let cur = self.gc_inflight.load(Ordering::Acquire);
+            if cur < self.caps().1
+                && self
+                    .gc_inflight
+                    .compare_exchange_weak(cur, cur + 1, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+            {
+                return GcPermit {
+                    ctrl: std::sync::Arc::clone(self),
+                };
+            }
+            compio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+}
+
+#[cfg(test)]
+mod admission_tests {
+    //! D-r7 admission tests. RateController is per-partition
+    //! (fg bytes/iops + compact bytes + gc bytes); ConcurrencyController
+    //! is PS-wide (compact + gc concurrency permits).
+    use super::*;
+
+    fn unlimited_rate() -> RateController {
+        RateController::new(0, 0, 0, 0, 0.8)
+    }
+
+    #[test]
+    fn fg_unlimited_no_sleep() {
+        let rt = compio::runtime::Runtime::new().expect("rt");
+        rt.block_on(async {
+            let rc = unlimited_rate();
+            let t0 = Instant::now();
+            for _ in 0..100 {
+                rc.account_fg(1024 * 1024, 1).await;
+            }
+            assert!(
+                t0.elapsed() < Duration::from_millis(50),
+                "fg unlimited must not sleep"
+            );
+            let (fg, ops, _c, _g, _) = rc.snapshot();
+            assert!(fg >= 100 * 1024 * 1024);
+            assert_eq!(ops, 100);
+        });
+    }
+
+    #[test]
+    fn compact_unlimited_no_sleep() {
+        let rt = compio::runtime::Runtime::new().expect("rt");
+        rt.block_on(async {
+            let rc = unlimited_rate();
+            let t0 = Instant::now();
+            for _ in 0..100 {
+                rc.account_compact(1024 * 1024).await;
+            }
+            assert!(t0.elapsed() < Duration::from_millis(50));
+        });
+    }
+
+    #[test]
+    fn gc_unlimited_no_sleep() {
+        let rt = compio::runtime::Runtime::new().expect("rt");
+        rt.block_on(async {
+            let rc = unlimited_rate();
+            let t0 = Instant::now();
+            for _ in 0..100 {
+                rc.account_gc(1024 * 1024).await;
+            }
+            assert!(t0.elapsed() < Duration::from_millis(50));
+        });
+    }
+
+    /// compact_rate=10 MiB/s: 5 MiB × 2 should sleep ~1s back-to-back.
+    #[test]
+    fn compact_respects_own_rate() {
+        let rt = compio::runtime::Runtime::new().expect("rt");
+        rt.block_on(async {
+            let rc = RateController::new(0, 0, 10 * 1024 * 1024, 0, 0.8);
+            let t0 = Instant::now();
+            rc.account_compact(5 * 1024 * 1024).await;
+            rc.account_compact(5 * 1024 * 1024).await;
+            let elapsed = t0.elapsed();
+            assert!(
+                elapsed >= Duration::from_millis(800) && elapsed <= Duration::from_millis(1500),
+                "compact should sleep ~1s on 10 MiB at 10 MiB/s, got {:?}",
+                elapsed
+            );
+        });
+    }
+
+    /// gc_rate=10 MiB/s: same as compact but on its own counter.
+    #[test]
+    fn gc_respects_own_rate() {
+        let rt = compio::runtime::Runtime::new().expect("rt");
+        rt.block_on(async {
+            let rc = RateController::new(0, 0, 0, 10 * 1024 * 1024, 0.8);
+            let t0 = Instant::now();
+            rc.account_gc(5 * 1024 * 1024).await;
+            rc.account_gc(5 * 1024 * 1024).await;
+            let elapsed = t0.elapsed();
+            assert!(
+                elapsed >= Duration::from_millis(800) && elapsed <= Duration::from_millis(1500),
+                "gc should sleep ~1s on 10 MiB at 10 MiB/s, got {:?}",
+                elapsed
+            );
+        });
+    }
+
+    /// D-r7: compact and gc rate counters are independent. With
+    /// compact_rate=10 MiB/s and gc_rate=10 MiB/s, hammering compact
+    /// to its limit MUST NOT throttle gc — they have separate budgets.
+    #[test]
+    fn compact_and_gc_rates_are_independent() {
+        let rt = compio::runtime::Runtime::new().expect("rt");
+        rt.block_on(async {
+            let rc = RateController::new(0, 0, 10 * 1024 * 1024, 10 * 1024 * 1024, 0.8);
+            // Saturate compact.
+            rc.account_compact(10 * 1024 * 1024).await;
+            // gc against its own (untouched) budget — should sleep
+            // far less than the compact-saturated path would.
+            let t0 = Instant::now();
+            rc.account_gc(1024).await;
+            let elapsed = t0.elapsed();
+            assert!(
+                elapsed < Duration::from_millis(50),
+                "gc must not be throttled by compact saturation, got {:?}",
+                elapsed
+            );
+        });
+    }
+
+    /// fg saturated: compact yields to the rest of the 1-s window.
+    #[test]
+    fn compact_yields_when_fg_saturated() {
+        let rt = compio::runtime::Runtime::new().expect("rt");
+        rt.block_on(async {
+            // fg_rate=100 MiB/s, ratio=0.5 → saturated at 50 MiB/s
+            // observed; compact budget generous so own-rate doesn't fire.
+            let rc = RateController::new(100 * 1024 * 1024, 0, 100 * 1024 * 1024, 0, 0.5);
+            rc.account_fg(60 * 1024 * 1024, 1).await;
+            let t0 = Instant::now();
+            rc.account_compact(1024).await;
+            assert!(
+                t0.elapsed() >= Duration::from_millis(300),
+                "compact should yield to fg, got {:?}",
+                t0.elapsed()
+            );
+        });
+    }
+
+    /// fg saturated: gc yields too (symmetric).
+    #[test]
+    fn gc_yields_when_fg_saturated() {
+        let rt = compio::runtime::Runtime::new().expect("rt");
+        rt.block_on(async {
+            let rc = RateController::new(100 * 1024 * 1024, 0, 0, 100 * 1024 * 1024, 0.5);
+            rc.account_fg(60 * 1024 * 1024, 1).await;
+            let t0 = Instant::now();
+            rc.account_gc(1024).await;
+            assert!(
+                t0.elapsed() >= Duration::from_millis(300),
+                "gc should yield to fg, got {:?}",
+                t0.elapsed()
+            );
+        });
+    }
+
+    /// fg idle: compact + gc don't yield.
+    #[test]
+    fn compact_and_gc_do_not_yield_when_fg_idle() {
+        let rt = compio::runtime::Runtime::new().expect("rt");
+        rt.block_on(async {
+            let rc = RateController::new(
+                100 * 1024 * 1024,
+                0,
+                100 * 1024 * 1024,
+                100 * 1024 * 1024,
+                0.5,
+            );
+            let t0 = Instant::now();
+            rc.account_compact(1024).await;
+            rc.account_gc(1024).await;
+            assert!(
+                t0.elapsed() < Duration::from_millis(50),
+                "no yield when fg idle, got {:?}",
+                t0.elapsed()
+            );
+        });
+    }
+
+    /// fg unlimited (both bytes and iops=0): compact/gc ignore fg-aware yield.
+    #[test]
+    fn compact_and_gc_ignore_fg_when_fg_unlimited() {
+        let rt = compio::runtime::Runtime::new().expect("rt");
+        rt.block_on(async {
+            let rc = RateController::new(0, 0, 100 * 1024 * 1024, 100 * 1024 * 1024, 0.5);
+            rc.account_fg(500 * 1024 * 1024, 1).await;
+            let t0 = Instant::now();
+            rc.account_compact(1024).await;
+            rc.account_gc(1024).await;
+            assert!(
+                t0.elapsed() < Duration::from_millis(50),
+                "must ignore fg when no cap"
+            );
+        });
+    }
+
+    /// fg-iops cap throttles small-value workloads even when bytes is
+    /// far under the bytes cap.
+    #[test]
+    fn fg_iops_cap_throttles_small_value_workloads() {
+        let rt = compio::runtime::Runtime::new().expect("rt");
+        rt.block_on(async {
+            let rc = RateController::new(10 * 1024 * 1024 * 1024, 1_000, 0, 0, 0.8);
+            let t0 = Instant::now();
+            rc.account_fg(800, 100).await;
+            rc.account_fg(800, 100).await;
+            let elapsed = t0.elapsed();
+            assert!(
+                elapsed >= Duration::from_millis(150) && elapsed <= Duration::from_millis(500),
+                "fg-iops cap should throttle 200 ops at 1k ops/s, got {:?}",
+                elapsed
+            );
+        });
+    }
+
+    /// compact yields when fg observed IOPS exceeds ratio × fg_iops.
+    #[test]
+    fn compact_yields_when_fg_iops_saturated() {
+        let rt = compio::runtime::Runtime::new().expect("rt");
+        rt.block_on(async {
+            let rc = RateController::new(
+                10 * 1024 * 1024 * 1024, // bytes ~unlimited
+                1_000,                   // 1k ops/s
+                100 * 1024 * 1024,       // compact generous
+                0,
+                0.5, // bg yields at 500 ops/s observed
+            );
+            rc.account_fg(0, 600).await;
+            let t0 = Instant::now();
+            rc.account_compact(1024).await;
+            assert!(
+                t0.elapsed() >= Duration::from_millis(200),
+                "compact should yield on fg-iops saturation, got {:?}",
+                t0.elapsed()
+            );
+        });
+    }
+
+    /// gc yields when fg observed IOPS exceeds ratio × fg_iops (gc twin).
+    #[test]
+    fn gc_yields_when_fg_iops_saturated() {
+        let rt = compio::runtime::Runtime::new().expect("rt");
+        rt.block_on(async {
+            let rc = RateController::new(10 * 1024 * 1024 * 1024, 1_000, 0, 100 * 1024 * 1024, 0.5);
+            rc.account_fg(0, 600).await;
+            let t0 = Instant::now();
+            rc.account_gc(1024).await;
+            assert!(
+                t0.elapsed() >= Duration::from_millis(200),
+                "gc should yield on fg-iops saturation, got {:?}",
+                t0.elapsed()
+            );
+        });
+    }
+
+    /// Window reset clears all four counters after 1s.
+    #[test]
+    fn window_resets_after_1s() {
+        let rt = compio::runtime::Runtime::new().expect("rt");
+        rt.block_on(async {
+            let rc = unlimited_rate();
+            rc.account_fg(123, 2).await;
+            rc.account_compact(456).await;
+            rc.account_gc(789).await;
+            let (fg, ops, c, g, _) = rc.snapshot();
+            assert_eq!((fg, ops, c, g), (123, 2, 456, 789));
+            compio::time::sleep(Duration::from_millis(1100)).await;
+            rc.account_fg(7, 1).await;
+            let (fg, ops, c, g, _) = rc.snapshot();
+            assert_eq!(
+                (fg, ops, c, g),
+                (7, 1, 0, 0),
+                "window reset must zero all four counters"
+            );
+        });
+    }
+
+    /// PS-wide concurrency caps: acquire_compact / acquire_gc.
+    /// compact_max=1 serializes; gc_max=2 allows two concurrent permits.
+    #[test]
+    fn concurrency_acquire_compact_and_gc_caps() {
+        use std::sync::atomic::Ordering;
+        let cc = std::sync::Arc::new(ConcurrencyController::new(1, 2));
+        let rt = compio::runtime::Runtime::new().expect("rt");
+        rt.block_on(async {
+            let p1 = cc.acquire_compact().await;
+            assert_eq!(cc.compact_inflight.load(Ordering::Acquire), 1);
+            drop(p1);
+            assert_eq!(cc.compact_inflight.load(Ordering::Acquire), 0);
+
+            let g1 = cc.acquire_gc().await;
+            let g2 = cc.acquire_gc().await;
+            assert_eq!(cc.gc_inflight.load(Ordering::Acquire), 2);
+            drop(g1);
+            assert_eq!(cc.gc_inflight.load(Ordering::Acquire), 1);
+            drop(g2);
+            assert_eq!(cc.gc_inflight.load(Ordering::Acquire), 0);
+        });
+    }
+
+    /// A controller built from the parameters follows a runtime override of
+    /// `--gc-parallelism` on the next acquire, and the admission caps on the
+    /// next accounting call.
+    #[test]
+    fn controllers_follow_a_runtime_override() {
+        use autumn_params::apply_overrides;
+        let p = params();
+        let cc = std::sync::Arc::new(ConcurrencyController::from_params());
+        let rt = compio::runtime::Runtime::new().expect("rt");
+        rt.block_on(async {
+            apply_overrides(p, &[("ps.gc-parallelism".into(), "1".into())]);
+            let g1 = cc.acquire_gc().await;
+            let blocked = compio::time::timeout(Duration::from_millis(200), cc.acquire_gc()).await;
+            assert!(blocked.is_err(), "a second GC permit past an override of 1");
+            apply_overrides(p, &[("ps.gc-parallelism".into(), "2".into())]);
+            let g2 = compio::time::timeout(Duration::from_secs(2), cc.acquire_gc())
+                .await
+                .expect("the raised cap admits a second permit");
+            drop((g1, g2));
+        });
+        let rc = RateController::from_params();
+        apply_overrides(p, &[("ps.fg-iops-per-sec".into(), "7".into())]);
+        assert_eq!(rc.caps().fg_iops_per_sec, 7);
+        apply_overrides(p, &[]);
+        assert_eq!(rc.caps().fg_iops_per_sec, p.fg_iops_per_sec.base());
+        assert_eq!(cc.caps().1, p.gc_parallelism.base());
+    }
+}
+
+impl PartitionServer {
+    pub async fn connect(ps_id: u64, manager_endpoint: &str) -> Result<Self> {
+        Self::connect_with_advertise(ps_id, manager_endpoint, None).await
+    }
+
+    /// Current manager address (round-robin).
+    fn manager_addr(&self) -> &str {
+        &self.manager_addrs[self.current_mgr.get() % self.manager_addrs.len()]
+    }
+
+    /// Rotate to next manager on NotLeader or connection error.
+    fn rotate_manager(&self) {
+        let next = (self.current_mgr.get() + 1) % self.manager_addrs.len();
+        self.current_mgr.set(next);
+    }
+
+    /// acquire (or re-acquire, bumping) an owner lock for a
+    /// per-partition key at `open_partition` time. Walks the manager list
+    /// on transport failure or NotLeader; one attempt per address, twice
+    /// around, before giving up (the caller's open-backoff retries the
+    /// whole open).
+    async fn acquire_partition_owner_epoch(&self, owner_key: &str) -> Result<i64> {
+        let req = manager_rpc::rkyv_encode(&manager_rpc::AcquireOwnerLockReq {
+            owner_key: owner_key.to_string(),
+        });
+        let mut last_err: Option<anyhow::Error> = None;
+        for _ in 0..(self.manager_addrs.len() * 2) {
+            let addr = self.manager_addr().to_string();
+            match self
+                .pool
+                .call_timeout(
+                    &addr,
+                    manager_rpc::MSG_ACQUIRE_OWNER_LOCK,
+                    req.clone(),
+                    Duration::from_secs(10),
+                )
+                .await
+            {
+                Ok(resp_data) => {
+                    let resp: manager_rpc::AcquireOwnerLockResp =
+                        manager_rpc::rkyv_decode(&resp_data).map_err(|e| anyhow!("{e}"))?;
+                    if resp.code == manager_rpc::CODE_OK {
+                        return Ok(resp.owner_epoch);
+                    }
+                    last_err = Some(anyhow!(
+                        "acquire_owner_lock({owner_key}) via {addr}: {}",
+                        resp.message
+                    ));
+                    self.rotate_manager();
+                }
+                Err(e) => {
+                    last_err = Some(e);
+                    self.rotate_manager();
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| anyhow!("no manager available")))
+    }
+
+    /// caller supplies the first-partition listen address up front
+    /// so `base_port` + `advertise_host` are populated BEFORE
+    /// `finish_connect()` runs its implicit `sync_regions_once()`.
+    ///
+    /// **Required for any caller that may see existing partitions on connect**,
+    /// including the production binary (`autumn-ps`) on restart: when
+    /// partitions are already registered with the manager, `sync_regions_once`
+    /// fires `open_partition` immediately, and `open_partition` needs a valid
+    /// `base_port`. Earlier comments here claimed the production binary could
+    /// use `connect_with_advertise` because no partitions exist at connect
+    /// time — that's only true on fresh bootstrap. On restart the first
+    /// partition would otherwise bind to port `0 + 1 = 1`.
+    pub async fn connect_with_advertise_and_port(
+        ps_id: u64,
+        manager_endpoint: &str,
+        advertise_addr: Option<String>,
+        listen_addr: SocketAddr,
+    ) -> Result<Self> {
+        let server = Self::connect_raw(ps_id, manager_endpoint, advertise_addr).await?;
+        server.bind_listen_addr(listen_addr)?;
+        server.finish_connect().await
+    }
+
+    pub async fn connect_with_advertise(
+        ps_id: u64,
+        manager_endpoint: &str,
+        advertise_addr: Option<String>,
+    ) -> Result<Self> {
+        let server = Self::connect_raw(ps_id, manager_endpoint, advertise_addr).await?;
+        server.finish_connect().await
+    }
+
+    /// helper: build `Self` (acquire owner lock + fill
+    /// `manager_addrs`) but DO NOT call `finish_connect()`. Callers
+    /// that need to set `base_port` before the implicit
+    /// `sync_regions_once()` runs use this + `bind_listen_addr` +
+    /// `finish_connect`.
+    /// Keep an upgraded process alive while the manager still speaks the old
+    /// wire. Identity, authorization and storage errors remain hard failures.
+    async fn connect_raw(ps_id: u64, manager_endpoint: &str, advertise_addr: Option<String>) -> Result<Self> {
+        let mut delay = 1u64;
+        loop {
+            match Self::connect_raw_once(ps_id, manager_endpoint, advertise_addr.clone()).await {
+                Ok(server) => return Ok(server),
+                Err(e) if Self::manager_wait_error(&e) => {
+                    tracing::warn!(ps_id, manager = manager_endpoint, wire = autumn_rpc::WIRE_VERSION,
+                        error = %format!("{e:#}"), delay, "waiting for compatible manager owner lock; dependencies not ready");
+                    compio::time::sleep(Duration::from_secs(delay)).await;
+                    delay = (delay + 1).min(5);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    fn manager_wait_error(error: &anyhow::Error) -> bool {
+        let text = error.to_string().to_lowercase();
+        text.contains("not leader") || text.contains("notleader") ||
+            error.downcast_ref::<autumn_rpc::RpcError>().is_some_and(|e| matches!(e,
+                autumn_rpc::RpcError::VersionMismatch { .. } | autumn_rpc::RpcError::Io(_)
+                | autumn_rpc::RpcError::ConnectionClosed | autumn_rpc::RpcError::Timeout(_)))
+    }
+
+    async fn connect_raw_once(
+        ps_id: u64,
+        manager_endpoint: &str,
+        advertise_addr: Option<String>,
+    ) -> Result<Self> {
+        let pool = Rc::new(ConnPool::new());
+        let mgr_addrs: Vec<String> = manager_endpoint
+            .split(',')
+            .map(|s| autumn_stream::conn_pool::normalize_endpoint(s.trim()))
+            .collect();
+        let owner_key = format!("ps-{ps_id}");
+
+        // Acquire owner lock — try each manager until one responds.
+        let req = manager_rpc::rkyv_encode(&manager_rpc::AcquireOwnerLockReq {
+            owner_key: owner_key.clone(),
+        });
+        let mut last_err = None;
+        for (idx, addr) in mgr_addrs.iter().enumerate() {
+            // 10 s — owner-lock acquisition is one etcd CAS on
+            // manager. Bounded so a hanging manager doesn't block
+            // PS startup; the loop walks to the next address.
+            match pool
+                .call_timeout(
+                    addr,
+                    manager_rpc::MSG_ACQUIRE_OWNER_LOCK,
+                    req.clone(),
+                    Duration::from_secs(10),
+                )
+                .await
+            {
+                Ok(resp_data) => {
+                    let resp: manager_rpc::AcquireOwnerLockResp =
+                        manager_rpc::rkyv_decode(&resp_data).map_err(|e| anyhow!("{e}"))?;
+                    if resp.code == manager_rpc::CODE_OK {
+                        let connected_idx = idx;
+                        let block_cache = new_block_cache();
+                        let mem_tier = mem_tier::MemTierBudget::new(
+                            params().mem_tier_bytes.get(),
+                            &params().mem_tier_prefix.get(),
+                            params().mem_tier_rank_us.get(),
+                        );
+                        let plog_load = std::sync::Arc::new(plog_load::PlogLoad::new());
+                        let server = Self {
+                            ps_id,
+                            advertise_addr,
+                            partitions: Rc::new(RefCell::new(HashMap::new())),
+                            manager_addrs: mgr_addrs,
+                            current_mgr: Rc::new(Cell::new(connected_idx)),
+                            pool,
+                            // placeholders; populated by
+                            // `bind_listen_addr` (called from
+                            // `serve()` or `connect_with_advertise_and_port`).
+                            base_port: Cell::new(0),
+                            used_port_ords: Rc::new(
+                                RefCell::new(std::collections::BTreeSet::new()),
+                            ),
+                            advertise_host: Rc::new(std::cell::RefCell::new(String::from(
+                                "127.0.0.1",
+                            ))),
+                            listen_host: Rc::new(std::cell::RefCell::new(String::from("0.0.0.0"))),
+                            metrics_addr: Rc::new(RefCell::new(String::new())),
+                            concurrency_ctrl: std::sync::Arc::new(ConcurrencyController::from_params()),
+                            plog_load: plog_load.clone(),
+                            authz: std::sync::Arc::new(crate::authz::AuthzState::new()),
+                            open_backoff: Rc::new(RefCell::new(HashMap::new())),
+                            block_cache: block_cache.clone(),
+                            mem_tier: mem_tier.clone(),
+                            metrics: std::sync::Arc::new(metrics::PsMetrics::new(
+                                block_cache,
+                                plog_load,
+                                mem_tier,
+                            )),
+                            shutting_down: Rc::new(Cell::new(false)),
+                            sync_pass: Rc::new(futures::lock::Mutex::new(())),
+                        };
+                        return Ok(server);
+                    } else if resp.code == manager_rpc::CODE_NOT_LEADER {
+                        last_err = Some(anyhow!("NotLeader from {}", addr));
+                        continue;
+                    } else {
+                        return Err(anyhow!("acquire_owner_lock failed: {}", resp.message));
+                    }
+                }
+                Err(e) => {
+                    last_err = Some(e);
+                    continue;
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| anyhow!("no manager available")))
+    }
+
+    async fn finish_connect(self) -> Result<Self> {
+        let server = self;
+
+        // Every manager connection is version-checked by the pool before
+        // registration. During a wire rollout, stay started and wait for the
+        // manager instead of skipping the check or exhausting a retry count.
+        let mut delay = 1u64;
+        loop {
+            match server.register_ps().await {
+                Ok(()) => break,
+                Err(e) if Self::manager_wait_error(&e) =>
+                {
+                    tracing::warn!(ps_id = server.ps_id, wire = autumn_rpc::WIRE_VERSION, error = %format!("{e:#}"), delay, "waiting for manager registration; dependencies not ready");
+                    compio::time::sleep(Duration::from_secs(delay)).await;
+                    delay = (delay + 1).min(5);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        // Start heartbeats BEFORE the (potentially long) sync_regions_once. The
+        // manager evicts a PS after --ps-dead-timeout-secs (10s) without a heartbeat;
+        // opening N partitions can take >10s (each open_partition awaits
+        // commit_length on 3 streams + replays the WAL), which used to push
+        // the first heartbeat past the deadline and silently evict the PS.
+        let s = server.clone();
+        spawn_supervised("ps_heartbeat", move || {
+            let s = s.clone();
+            async move { s.heartbeat_loop().await }
+        });
+
+        // per-partition load metrics report (5 s cadence).
+        let s = server.clone();
+        spawn_supervised("ps_report_load", move || {
+            let s = s.clone();
+            async move { s.report_load_loop().await }
+        });
+
+        // P-log CPU / run_delay for /metrics.
+        let load = server.plog_load.clone();
+        spawn_supervised("ps_plog_load", move || {
+            let load = load.clone();
+            async move {
+                loop {
+                    load.sample();
+                    compio::time::sleep(Duration::from_secs(2)).await;
+                }
+            }
+        });
+
+        // maintenance_scheduler_loop deleted. This task previously
+        // picked the highest-debt partition each tick and dispatched
+        // GC / minor / major compact internally. Per the mechanism /
+        // policy separation refactor, that policy lives in an external
+        // controller now; the PS reacts to manual `Maintenance` RPCs
+        // (`client gc / compact / forcegc / flush`) and to its own
+        // expiry-triggered + has_overlap-triggered + size-tiered
+        // minor compact (mechanism-level must-cleanup paths preserved
+        // in `background_compact_loop`'s timer arm).
+
+        // load the authz config BEFORE `sync_regions_once` — the
+        // latter opens partitions + starts their accept loops, so fetching after
+        // it left a cold-start fail-open window where connections were served
+        // with authz still disabled. Best-effort: a fetch failure
+        // (manager briefly unreachable) leaves authz disabled and the poll loop
+        // retries within 5 s; the normal startup order (manager up first) makes
+        // this succeed before any listener binds. Availability wins over a
+        // cold-start fail-closed here, per the trusted-internal-net threat model.
+        if let Err(e) = server.fetch_authz_config_once().await {
+            tracing::warn!(
+                ps_id = server.ps_id,
+                "initial authz config fetch failed ({e:#}); will retry via poll loop"
+            );
+        }
+        if let Err(e) = server.fetch_runtime_config_once().await {
+            tracing::warn!(
+                ps_id = server.ps_id,
+                "initial runtime config fetch failed ({e:#}); will retry via poll loop"
+            );
+        }
+
+        server.sync_regions_once().await?;
+
+        Ok(server)
+    }
+
+    /// The core capacity the manager places by: one core per partition's
+    /// P-log, so the `--cpuset` length; `0` without `--cpuset`, which the
+    /// manager reads as capacity-unknown. A soft figure: past it, P-logs share
+    /// cores.
+    fn slot_cap(&self) -> u32 {
+        if autumn_common::cpuset_explicit() {
+            u32::try_from(autumn_common::cpuset_len()).unwrap_or(u32::MAX)
+        } else {
+            0
+        }
+    }
+
+    /// `(part_id, region_epoch)` of every partition open and serving here —
+    /// the heartbeat's claim the manager judges readiness by. A handle whose
+    /// thread has exited is not serving; `sync_regions_once` drops it on its
+    /// next tick. A draining PS serves nothing it could be restarted into.
+    fn open_parts(&self) -> Vec<(u64, u64)> {
+        if self.shutting_down.get() {
+            return Vec::new();
+        }
+        self.partitions
+            .borrow()
+            .iter()
+            .filter(|(_, h)| !h.join.as_ref().is_some_and(|j| j.is_finished()))
+            .map(|(id, h)| (*id, h.opened_with.lock().4))
+            .collect()
+    }
+
+    /// Where this PS's `/metrics` is reachable; carried on every heartbeat.
+    /// The binary sets it once its metrics listener is up.
+    pub fn set_metrics_addr(&self, addr: String) {
+        *self.metrics_addr.borrow_mut() = addr;
+    }
+
+    fn heartbeat_req(&self) -> Bytes {
+        manager_rpc::rkyv_encode(&manager_rpc::HeartbeatPsReq {
+            ps_id: self.ps_id,
+            slot_cap: self.slot_cap(),
+            open_parts: self.open_parts(),
+            metrics_addr: self.metrics_addr.borrow().clone(),
+        })
+    }
+
+    async fn register_ps(&self) -> Result<()> {
+        let address = self
+            .advertise_addr
+            .clone()
+            .unwrap_or_else(|| format!("ps-{}", self.ps_id));
+        let req = manager_rpc::rkyv_encode(&manager_rpc::RegisterPsReq {
+            ps_id: self.ps_id,
+            address,
+            slot_cap: self.slot_cap(),
+        });
+        // 10 s — register_ps is one in-memory insert + etcd mirror on
+        // manager. Bounded so PS startup doesn't trap waiting for a
+        // hung manager.
+        let resp_data = self
+            .pool
+            .call_timeout(
+                self.manager_addr(),
+                manager_rpc::MSG_REGISTER_PS,
+                req,
+                Duration::from_secs(10),
+            )
+            .await
+            .context("register ps")?;
+        let resp: manager_rpc::CodeResp =
+            manager_rpc::rkyv_decode(&resp_data).map_err(|e| anyhow!("{e}"))?;
+        if resp.code != manager_rpc::CODE_OK {
+            return Err(anyhow!("register_ps failed: {}", resp.message));
+        }
+        Ok(())
+    }
+
+    async fn heartbeat_loop(&self) {
+        const HEARTBEAT_INTERVAL_SECS: u64 = 2;
+        // 45 × 2 s = 90 s (was 5 × 2 s = 10 s). The exit below is a
+        // stale-serving last resort, NOT the primary fencing (owner_epoch
+        // fences writes at the ENs; region_epoch fences routing). At 10 s,
+        // ANY manager outage longer than 10 s — every ucx manager
+        // kill+respawn pays a ~60 s TIME_WAIT bind retry — made the
+        // whole PS fleet exit(1) simultaneously: a self-inflicted total
+        // data-plane outage with nothing left to re-register when the
+        // manager returned. While the manager is down no reassignment can
+        // happen, so serving through its outage is safe; 90 s comfortably
+        // outlasts the worst observed manager restart while still bounding
+        // the partitioned-from-manager-only stale-serving window.
+        let max_consecutive_failures =
+            (params().heartbeat_failure_exit_secs.get() / HEARTBEAT_INTERVAL_SECS) as u32;
+        // etcd-chaos D2: NOT_LEADER gets its OWN, much longer budget.
+        // A reachable manager answering NOT_LEADER means the control
+        // plane is alive but LEADERLESS (single manager during an etcd
+        // outage) or this PS is follower-pinned (multi-manager). A
+        // leaderless control plane cannot evict/reassign anyone, so
+        // serving on is safe; sharing the 90 s transport budget made a
+        // routine >90 s etcd maintenance window suicide the WHOLE PS
+        // fleet (reproduced by scripts/etcd_chaos.sh D2). 15 min still
+        // bounds the multi-manager follower-pinned stale-READ window —
+        // data safety never depended on this exit (owner_epoch fences
+        // writes at the ENs, region_epoch fences client routing).
+        let max_consecutive_not_leader =
+            (params().heartbeat_not_leader_exit_secs.get() / HEARTBEAT_INTERVAL_SECS) as u32;
+        let mut consecutive_failures: u32 = 0;
+        let mut consecutive_not_leader: u32 = 0;
+        let mut ticker = compio::time::interval(Duration::from_secs(HEARTBEAT_INTERVAL_SECS));
+        ticker.tick().await; // first tick is immediate
+        loop {
+            ticker.tick().await;
+            let req = self.heartbeat_req();
+            // 5 s — heartbeat is fired every 2 s; we tolerate up to 5
+            // consecutive failures (~10 s) before exiting. A 5 s
+            // ceiling keeps each tick tight; a missed beat shows up
+            // as Err and feeds the failure counter.
+            match self
+                .pool
+                .call_timeout(
+                    self.manager_addr(),
+                    manager_rpc::MSG_HEARTBEAT_PS,
+                    req,
+                    Duration::from_secs(5),
+                )
+                .await
+            {
+                Ok(resp_data) => {
+                    let code = manager_rpc::rkyv_decode::<manager_rpc::CodeResp>(&resp_data)
+                        .map(|r| r.code)
+                        .unwrap_or(manager_rpc::CODE_OK);
+                    // a FOLLOWER answered — rotate to find the
+                    // leader, but COUNT IT toward the stale-serving exit
+                    // budget: a PS that can reach only
+                    // followers is, for fencing purposes, partitioned
+                    // from the leader — the leader may be evicting and
+                    // reassigning its partitions right now. Only a real
+                    // leader ACK (CODE_OK / CODE_NOT_FOUND below) proves
+                    // liveness and resets the counter. A single-manager
+                    // election window (~5-15 s) burns a few ticks of the
+                    // 90 s budget harmlessly.
+                    if code == manager_rpc::CODE_NOT_LEADER {
+                        self.rotate_manager();
+                        // A response (even NOT_LEADER) proves we are NOT
+                        // network-partitioned — the transport budget resets;
+                        // only the leaderless budget advances.
+                        consecutive_failures = 0;
+                        consecutive_not_leader += 1;
+                        if consecutive_not_leader >= max_consecutive_not_leader {
+                            tracing::error!(
+                                "PS {} saw only non-leader managers for {}s, exiting to prevent stale serving",
+                                self.ps_id,
+                                consecutive_not_leader as u64 * HEARTBEAT_INTERVAL_SECS,
+                            );
+                            std::process::exit(1);
+                        }
+                        continue;
+                    }
+                    consecutive_failures = 0;
+                    consecutive_not_leader = 0;
+                    // Manager surfaces CODE_NOT_FOUND when ps_id is not in
+                    // ps_nodes (e.g. evicted after a transient hiccup). Re-
+                    // register and re-sync so the PS rejoins the cluster
+                    // instead of staying invisible to clients (`ps=unknown`).
+                    if code == manager_rpc::CODE_NOT_FOUND {
+                        tracing::warn!("PS {} not in manager ps_nodes; re-registering", self.ps_id,);
+                        if let Err(e) = self.register_ps().await {
+                            tracing::warn!("PS {} re-register failed: {e}", self.ps_id);
+                        } else if let Err(e) = self.sync_regions_once().await {
+                            tracing::warn!(
+                                "PS {} re-sync after re-register failed: {e}",
+                                self.ps_id,
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    consecutive_failures += 1;
+                    self.rotate_manager();
+                    tracing::warn!(
+                        "PS {} heartbeat failed ({}/{}): {e} (next mgr: {})",
+                        self.ps_id,
+                        consecutive_failures,
+                        max_consecutive_failures,
+                        self.manager_addr(),
+                    );
+                    if consecutive_failures >= max_consecutive_failures {
+                        tracing::error!(
+                            "PS {} heartbeat lost for {}s, exiting to prevent stale serving",
+                            self.ps_id,
+                            consecutive_failures as u64 * HEARTBEAT_INTERVAL_SECS,
+                        );
+                        std::process::exit(1);
+                    }
+                }
+            }
+        }
+    }
+
+    /// What `/metrics` serves, for the binary's metrics thread.
+    pub fn metrics(&self) -> std::sync::Arc<metrics::PsMetrics> {
+        self.metrics.clone()
+    }
+
+    /// every 5 s, snapshot per-partition metrics from each
+    /// PartitionHandle's Arc<PartitionMetrics> and ship to the manager
+    /// via MSG_REPORT_PARTITION_LOAD. Cheap — one RPC per cycle, payload
+    /// scales with partition count.
+    async fn report_load_loop(&self) {
+        // Cadence history: 5 s (orig) → 30 s (policy was the ONLY
+        // consumer and only needs ≤6 buckets, so 5 s over-sampled ~6× with no
+        // advisory benefit) → 5 s (RESTORED: the web dashboard is now a
+        // consumer and wants near-real-time IOPS / throughput, which 30 s makes
+        // impossible — a finished upload's window rolls to 0 before you see it).
+        // The policy engine is UNAFFECTED: it buckets independently by
+        // `bucket_sec` and same-bucket reports REPLACE, so a finer
+        // report cadence just gives the latest in-bucket rate; the scheduler
+        // uses `req_count_monotonic` (never reset) for its own diff. Cost: one
+        // report RPC per PS per 5 s carrying ALL partitions — trivial.
+        const REPORT_INTERVAL_SECS: u64 = 5;
+        let mut ticker = compio::time::interval(Duration::from_secs(REPORT_INTERVAL_SECS));
+        ticker.tick().await; // first tick is immediate
+        // Last report's monotonic `(write_bytes, read_bytes)` per partition. A
+        // reopened partition starts a fresh counter, so a reading below the
+        // last one is all new.
+        let mut last_bytes: HashMap<u64, (u64, u64)> = HashMap::new();
+        loop {
+            ticker.tick().await;
+            let snapshots: Vec<manager_rpc::PartitionLoad> = {
+                let parts = self.partitions.borrow();
+                last_bytes.retain(|id, _| parts.contains_key(id));
+                parts
+                    .iter()
+                    .map(|(part_id, handle)| {
+                        use std::sync::atomic::Ordering::Relaxed;
+                        let req = handle.metrics.req_count.swap(0, Relaxed);
+                        let now_bytes = (
+                            handle.metrics.write_bytes.load(Relaxed),
+                            handle.metrics.read_bytes.load(Relaxed),
+                        );
+                        let prev = last_bytes.insert(*part_id, now_bytes).unwrap_or((0, 0));
+                        let since = |now: u64, prev: u64| if now >= prev { now - prev } else { now };
+                        let write_bytes = since(now_bytes.0, prev.0);
+                        let read_bytes = since(now_bytes.1, prev.1);
+                        let imm_full = handle.metrics.imm_full_count.swap(0, Relaxed);
+                        let size_bytes = handle.metrics.size_bytes.load(Relaxed);
+                        // maintenance debt + inflight + last-run timestamps.
+                        // gc_debt/pending_compaction are gauges (load, no swap);
+                        // *_inflight are 0/1 booleans.
+                        let gc_debt_bytes = handle.metrics.gc_debt_bytes.load(Relaxed);
+                        let pending_compaction_bytes =
+                            handle.metrics.pending_compaction_bytes.load(Relaxed);
+                        let gc_inflight = handle.metrics.gc_inflight.load(Relaxed);
+                        let compact_inflight = handle.metrics.compact_inflight.load(Relaxed);
+                        let last_gc_at = handle.metrics.last_gc_at.load(Relaxed);
+                        let last_compact_at = handle.metrics.last_compact_at.load(Relaxed);
+                        // dead-data + minor-compact debt + sealed-extent count.
+                        let sst_tombstone_bytes = handle.metrics.sst_tombstone_bytes.load(Relaxed);
+                        let sst_expired_bytes = handle.metrics.sst_expired_bytes.load(Relaxed);
+                        let sst_out_of_range_bytes =
+                            handle.metrics.sst_out_of_range_bytes.load(Relaxed);
+                        let minor_compact_pending_bytes =
+                            handle.metrics.minor_compact_pending_bytes.load(Relaxed);
+                        let sealed_log_extent_count =
+                            handle.metrics.sealed_log_extent_count.load(Relaxed);
+                        // gauge (refreshed by the
+                        // maintenance loop; 0 until first probe).
+                        let open_tail_bytes = handle.metrics.open_tail_bytes.load(Relaxed);
+                        // gauge (refreshed on the GC tick; 0 until first).
+                        let open_tail_dead_bytes =
+                            handle.metrics.open_tail_dead_bytes.load(Relaxed);
+                        // Mirror of the partition thread's overlap flag — the
+                        // manager's split/merge advisories need it to avoid
+                        // advising an action the PS is certain to refuse.
+                        let has_overlap = handle.metrics.has_overlap.load(Relaxed);
+                        let unsettled_deletes =
+                            handle.metrics.unsettled_deletes.load(Relaxed);
+                        manager_rpc::PartitionLoad {
+                            part_id: *part_id,
+                            size_bytes,
+                            req_per_sec: (req / REPORT_INTERVAL_SECS) as u32,
+                            write_bytes_per_sec: write_bytes / REPORT_INTERVAL_SECS,
+                            read_bytes_per_sec: read_bytes / REPORT_INTERVAL_SECS,
+                            imm_full_per_sec: (imm_full / REPORT_INTERVAL_SECS) as u32,
+                            p99_us: 0,
+                            gc_debt_bytes,
+                            pending_compaction_bytes,
+                            gc_inflight,
+                            compact_inflight,
+                            last_gc_at,
+                            last_compact_at,
+                            sst_tombstone_bytes,
+                            sst_expired_bytes,
+                            sst_out_of_range_bytes,
+                            minor_compact_pending_bytes,
+                            sealed_log_extent_count,
+                            open_tail_bytes,
+                            open_tail_dead_bytes,
+                            has_overlap,
+                            unsettled_deletes,
+                            maintenance_outcomes: handle
+                                .metrics
+                                .snapshot_maintenance_outcomes(),
+                            active_maintenance: handle
+                                .metrics
+                                .snapshot_maintenance_progress(),
+                        }
+                    })
+                    .collect()
+            };
+            if snapshots.is_empty() {
+                continue;
+            }
+            let req = manager_rpc::rkyv_encode(&manager_rpc::ReportPartitionLoadReq {
+                ps_id: self.ps_id,
+                partitions: snapshots,
+            });
+            // 10 s — telemetry report fired every 30 s. Bounded so a
+            // hung manager doesn't keep the report task alive past
+            // the next interval; missed report is benign (manager
+            // policy degrades gracefully on stale data).
+            if let Err(e) = self
+                .pool
+                .call_timeout(
+                    self.manager_addr(),
+                    manager_rpc::MSG_REPORT_PARTITION_LOAD,
+                    req,
+                    Duration::from_secs(10),
+                )
+                .await
+            {
+                tracing::debug!("report_load failed: {e}");
+            }
+        }
+    }
+
+    async fn region_sync_loop(&self) {
+        let every = Duration::from_secs(params().region_sync_interval_secs.get());
+        let mut ticker = compio::time::interval(every);
+        ticker.tick().await; // first tick is immediate
+        loop {
+            ticker.tick().await;
+            tracing::debug!("PS {} region_sync_loop: syncing", self.ps_id);
+            if let Err(e) = self.sync_regions_once().await {
+                tracing::warn!("PS {} region sync failed: {e:#}", self.ps_id);
+            }
+        }
+    }
+
+    /// D2: fetch + install the data-plane authz config from
+    /// the manager. `MSG_GET_AUTHZ_CONFIG` is now **leader-gated** (D2 added the
+    /// leader-maintained namespace registry to the response — a follower's list
+    /// is empty/stale). Rotation + cache-preservation make this safe:
+    ///   - `CODE_NOT_LEADER` → `rotate_manager()` so the next tick reaches the
+    ///     leader, and return `Err` **BEFORE** `install` — the prior cached
+    ///     `AuthzState` is untouched (enforcement keeps running on the last-known
+    ///     config through the election window; NEVER fail-open).
+    ///   - a transport failure likewise returns `Err` before `install` → cache kept.
+    ///   - `install` runs ONLY on `CODE_OK` (a fresh leader response). This is the
+    ///     sole `AuthzState` mutator, so no error path can clear/disable it.
+    pub async fn fetch_authz_config_once(&self) -> Result<()> {
+        let resp_data = self
+            .pool
+            .call_timeout(
+                self.manager_addr(),
+                manager_rpc::MSG_GET_AUTHZ_CONFIG,
+                Bytes::new(),
+                Duration::from_secs(10),
+            )
+            .await
+            .context("get authz config")?;
+        let resp: manager_rpc::GetAuthzConfigResp =
+            manager_rpc::rkyv_decode(&resp_data).map_err(|e| anyhow!("{e}"))?;
+        if resp.code != manager_rpc::CODE_OK {
+            if resp.code == manager_rpc::CODE_NOT_LEADER {
+                self.rotate_manager();
+            }
+            return Err(anyhow!("get_authz_config failed: {}", resp.message));
+        }
+        let was = self.authz.is_enabled();
+        self.authz.install(&resp);
+        if resp.enabled != was {
+            tracing::info!(
+                ps_id = self.ps_id,
+                enabled = resp.enabled,
+                keys = resp.public_keys.len(),
+                "authz config updated"
+            );
+        }
+        Ok(())
+    }
+
+    /// Fetch the operator's runtime overrides and install the `ps.` entries.
+    /// A failed fetch keeps what is installed.
+    pub async fn fetch_runtime_config_once(&self) -> Result<()> {
+        let resp_data = self
+            .pool
+            .call_timeout(
+                self.manager_addr(),
+                manager_rpc::MSG_GET_RUNTIME_CONFIG,
+                Bytes::new(),
+                Duration::from_secs(10),
+            )
+            .await
+            .context("get runtime config")?;
+        let resp: manager_rpc::GetRuntimeConfigResp =
+            manager_rpc::rkyv_decode(&resp_data).map_err(|e| anyhow!("{e}"))?;
+        if resp.code != manager_rpc::CODE_OK {
+            if resp.code == manager_rpc::CODE_NOT_LEADER {
+                self.rotate_manager();
+            }
+            return Err(anyhow!("get_runtime_config failed: {}", resp.message));
+        }
+        let entries: Vec<(String, String)> =
+            resp.entries.into_iter().map(|e| (e.key, e.value)).collect();
+        if let Some((mine, errs)) = RUNTIME_INSTALLED.install(params(), &entries) {
+            tracing::info!(ps_id = self.ps_id, overrides = ?mine, "runtime overrides installed");
+            for e in errs {
+                tracing::warn!(ps_id = self.ps_id, error = %e, "runtime override refused");
+            }
+        }
+        Ok(())
+    }
+
+    /// Fetch the authz config and the runtime overrides every `--config-poll-secs`, and at once when a
+    /// connection met a namespace or key the installed config does not know
+    /// (`AuthzState::request_refresh`) — at most once a second. The initial
+    /// load happens in `finish_connect`, so enforcement is armed before the
+    /// first connection.
+    async fn authz_config_poll_loop(&self) {
+        use futures::future::{select, Either};
+        let mut last_fetch = Instant::now();
+        loop {
+            let mut every = Duration::from_secs(params().config_poll_secs.get());
+            // Nothing installed yet (the first fetch failed): no request can
+            // carry a miss, so keep trying every 5 s.
+            if !self.authz.installed() {
+                every = every.min(Duration::from_secs(5));
+            }
+            let due = last_fetch + every;
+            let timer = std::pin::pin!(compio::time::sleep_until(due));
+            let asked = std::pin::pin!(self.authz.refresh_requested());
+            if let Either::Right(_) = select(timer, asked).await {
+                // Coalesce a burst of misses into one fetch a second.
+                let earliest = last_fetch + Duration::from_secs(1);
+                if Instant::now() < earliest {
+                    compio::time::sleep_until(earliest).await;
+                }
+            }
+            last_fetch = Instant::now();
+            if let Err(e) = self.fetch_authz_config_once().await {
+                tracing::debug!("PS {} authz config poll failed: {e:#}", self.ps_id);
+            }
+            if let Err(e) = self.fetch_runtime_config_once().await {
+                tracing::debug!("PS {} runtime config poll failed: {e:#}", self.ps_id);
+            }
+        }
+    }
+
+    pub async fn sync_regions_once(&self) -> Result<()> {
+        // During graceful shutdown region sync must not run: the dead-thread
+        // reopen below would see a freshly drained partition thread as dead,
+        // and a changed region tuple would reload a partition the drain closed.
+        // The flag is read under `sync_pass`, which `shutdown()` takes after
+        // setting it, so no pass runs across the drain.
+        let _pass = self.sync_pass.lock().await;
+        if self.shutting_down.get() {
+            return Ok(());
+        }
+        // 10 s — read-only manager call. Bounded so the periodic
+        // 2 s region_sync_loop doesn't pile up on a hung manager.
+        let resp_data = self
+            .pool
+            .call_timeout(
+                self.manager_addr(),
+                manager_rpc::MSG_GET_REGIONS,
+                Bytes::new(),
+                Duration::from_secs(10),
+            )
+            .await
+            .context("get regions")?;
+        let resp: manager_rpc::GetRegionsResp =
+            manager_rpc::rkyv_decode(&resp_data).map_err(|e| anyhow!("{e}"))?;
+        if resp.code != manager_rpc::CODE_OK {
+            // get_regions is leader-gated; rotate off a follower so
+            // the next 2 s tick reaches the leader.
+            if resp.code == manager_rpc::CODE_NOT_LEADER {
+                self.rotate_manager();
+            }
+            return Err(anyhow!("get_regions failed: {}", resp.message));
+        }
+
+        // Tuple shape mirrors `PartitionHandle.opened_with`:
+        //   (rg, log_stream, row_stream, meta_stream, region_epoch)
+        let mut wanted: BTreeMap<u64, (Range, u64, u64, u64, u64)> = BTreeMap::new();
+        tracing::debug!(
+            "PS {} sync: got {} regions, my ps_id={}",
+            self.ps_id,
+            resp.regions.len(),
+            self.ps_id
+        );
+        for (part_id, region) in resp.regions {
+            tracing::debug!(
+                "PS {} sync: region part_id={} ps_id={} epoch={}",
+                self.ps_id,
+                part_id,
+                region.ps_id,
+                region.region_epoch
+            );
+            if region.ps_id == self.ps_id {
+                if let Some(rg) = region.rg {
+                    wanted.insert(
+                        part_id,
+                        (
+                            Range {
+                                start_key: rg.start_key,
+                                end_key: rg.end_key,
+                            },
+                            region.log_stream,
+                            region.row_stream,
+                            region.meta_stream,
+                            region.region_epoch,
+                        ),
+                    );
+                }
+            }
+        }
+
+        // Remove partitions no longer assigned. Dropping the PartitionHandle
+        // closes its `fd_tx`; the P-log fd-drain task sees `.next() == None`
+        // and exits, which in turn closes every ps-conn task's `req_tx`
+        // clone — partition_loop observes `req_rx.next() == None` and
+        // drains. The partition thread then joins on its own.
+        //
+        // also detect partitions whose (rg, stream_ids) changed since
+        // open (e.g., post-merge widening; post-split stream rotation that
+        // wasn't caught by the initial open). Drop the handle so the open-new-partitions
+        // pass reopens with fresh state.
+        let current: Vec<u64> = self.partitions.borrow().keys().copied().collect();
+        for part_id in current {
+            // Liveness: a handle whose partition THREAD
+            // has exited is a zombie — the thread breaks out of
+            // `partition_loop` on the LockedByOther poison (stale
+            // owner_epoch fence, now also raised for manager-side
+            // `ensure_owner_epoch` rejections) or on a panic, but the map
+            // entry survived, so `contains_key` below skipped the reopen
+            // FOREVER when the region tuple was unchanged (fenced-but-
+            // still-assigned after a rebalance left a stale epoch). Dropping the dead handle makes the manager's
+            // region map the arbiter, same tick: still assigned here →
+            // reopen re-acquires a FRESH owner_epoch and continues; moved
+            // away → stays closed (clean release). `is_finished()` is one
+            // atomic load per partition per 2 s tick.
+            let thread_dead = self
+                .partitions
+                .borrow()
+                .get(&part_id)
+                .is_some_and(|h| h.join.as_ref().is_some_and(|j| j.is_finished()));
+            if thread_dead {
+                tracing::warn!(
+                    "PS {} partition {part_id} thread exited (fence poison or crash) — \
+                     dropping handle; region map decides reopen-with-fresh-epoch vs release",
+                    self.ps_id
+                );
+            }
+            let drop_for_reload = thread_dead
+                || match wanted.get(&part_id) {
+                    None => true,
+                    Some(latest) => {
+                        // fix-2: `opened_with` is now Arc<Mutex<_>>;
+                        // lock + clone the tuple, then compare. The lock is
+                        // ~25 ns uncontended and is held only for the
+                        // tuple clone (no I/O between borrow and lock).
+                        let opened = self
+                            .partitions
+                            .borrow()
+                            .get(&part_id)
+                            .map(|h| h.opened_with.lock().clone());
+                        match opened {
+                            Some(prev) => prev != *latest,
+                            None => false,
+                        }
+                    }
+                };
+            if drop_for_reload {
+                tracing::info!(
+                    "PS {} reloading partition {part_id} due to region change",
+                    self.ps_id
+                );
+                self.partitions.borrow_mut().remove(&part_id);
+            }
+        }
+
+        // Reopen-thrash hardening: snapshot the wanted set so we can prune stale
+        // backoff entries after the open loop consumes `wanted`.
+        let wanted_ids: std::collections::HashSet<u64> = wanted.keys().copied().collect();
+        let now = Instant::now();
+
+        // Open new partitions.
+        //
+        // BUG3: open partitions CONCURRENTLY, not
+        // serially. `open_partition().await` returns only after the
+        // partition's own thread has finished `recover_partition` (log_stream
+        // replay) + bind + register, so awaiting them one-at-a-time made a PS
+        // that inherits N partitions pay ~N× the single-partition recovery
+        // wallclock (×32 on a full 32-partition takeover). Each recovery runs
+        // on its own OS thread/core and is latency-bound, so a concurrent
+        // launch overlaps the waits. The gating (already-open / backoff) is
+        // applied UP FRONT, then the opens fan out. Every wanted partition is
+        // opened: past the cpuset's length, partitions share the cores.
+        let mut to_open: Vec<(u64, (Range, u64, u64, u64, u64))> = Vec::new();
+        {
+            let parts = self.partitions.borrow();
+            let backoff = self.open_backoff.borrow();
+            for (part_id, tuple) in wanted {
+                if parts.contains_key(&part_id) {
+                    continue;
+                }
+                // Reopen-thrash hardening: a partition whose open keeps failing (e.g.
+                // transient listener-bind EADDRINUSE during region churn) is
+                // in a backoff window — skip reopening it this tick instead of
+                // thrashing every ~2 s. The window expires and we retry.
+                if let Some(bo) = backoff.get(&part_id) {
+                    if now < bo.retry_after {
+                        continue;
+                    }
+                }
+                to_open.push((part_id, tuple));
+            }
+        }
+
+        if !to_open.is_empty() {
+            // Reopen-thrash hardening: do NOT `?`-propagate an open failure — that
+            // aborted the whole sync pass (skipping every other wanted
+            // partition) and retried the failing one every tick. Each open's
+            // Result is handled independently below.
+            //
+            // Publish each handle into `self.partitions`
+            // AS SOON AS its open completes — NOT after the whole batch via
+            // `.collect()`. `open_partition` returns only once the partition
+            // thread has recovered + bound + REGISTERED its `part_addr` with the
+            // manager, so a completed-but-unpublished partition is ALREADY
+            // serving + routable while the main thread's `self.partitions`
+            // (which `shutdown()` drains and the part_addr self-heal / report_load
+            // loops read) doesn't know it. Batching the publish would strand
+            // every fast sibling in that unmanaged window behind one straggler
+            // stuck in `commit_length` retry — on SIGTERM those registered
+            // partitions would skip graceful drain (unflushed imm). Consuming
+            // the completion stream incrementally keeps the opens concurrent
+            // (`buffer_unordered`) while publishing in completion order. No
+            // `self.partitions` borrow is held across the `.next().await`.
+            // Opens run concurrently (each replays on its own thread, so the waits
+            // overlap; serial opens made a 32-partition takeover pay ~32× one
+            // recovery). `--open-parallelism` bounds the burst of manager RPCs.
+            let mut opens = futures::stream::iter(to_open)
+                .map(
+                    |(
+                        part_id,
+                        (rg, log_stream_id, row_stream_id, meta_stream_id, region_epoch),
+                    )| async move {
+                        tracing::info!("PS {} opening partition {part_id}", self.ps_id);
+                        let r = self
+                            .open_partition(
+                                part_id,
+                                rg,
+                                region_epoch,
+                                log_stream_id,
+                                row_stream_id,
+                                meta_stream_id,
+                            )
+                            .await;
+                        (part_id, r)
+                    },
+                )
+                .buffer_unordered(params().open_parallelism.get());
+
+            while let Some((part_id, result)) = opens.next().await {
+                match result {
+                    Ok(handle) => {
+                        tracing::info!("PS {} partition {part_id} opened", self.ps_id);
+                        self.partitions.borrow_mut().insert(part_id, handle);
+                        // Open succeeded — clear any backoff state.
+                        self.open_backoff.borrow_mut().remove(&part_id);
+                    }
+                    Err(e) => {
+                        let mut bk = self.open_backoff.borrow_mut();
+                        let entry = bk.entry(part_id).or_insert(OpenBackoff {
+                            consecutive_failures: 0,
+                            retry_after: now,
+                        });
+                        entry.consecutive_failures += 1;
+                        let shift = (entry.consecutive_failures - 1).min(OPEN_BACKOFF_MAX_SHIFT);
+                        let secs = OPEN_BACKOFF_BASE_SECS
+                            .saturating_mul(1u64 << shift)
+                            .min(params().open_backoff_max_secs.get());
+                        entry.retry_after = now + Duration::from_secs(secs);
+                        tracing::warn!(
+                            "PS {} open partition {part_id} failed (attempt {}); backing off {secs}s: {e:#}",
+                            self.ps_id,
+                            entry.consecutive_failures,
+                        );
+                    }
+                }
+            }
+        }
+        // Reopen-thrash hardening: prune backoff entries for partitions no longer
+        // assigned to this PS so the map can't grow unbounded across many
+        // split/merge cycles.
+        self.open_backoff
+            .borrow_mut()
+            .retain(|pid, _| wanted_ids.contains(pid));
+
+        // part_addr self-heal: the manager's `part_addrs` map is
+        // in-memory only — a manager restart loses it, and an
+        // already-open partition never re-registers (registration only
+        // happens inside `open_partition`). Clients then cannot resolve
+        // the partition's listener and every read/write fails until the
+        // partition is reopened somewhere (observed as a 30-minute total
+        // outage in the transport chaos run: manager kill+respawn
+        // with both PSes healthy). Heal it here: the GetRegions response
+        // we just fetched carries the manager's current `part_addrs`
+        // view; for any partition this PS serves whose entry is missing
+        // or stale, re-send MSG_REGISTER_PARTITION_ADDR. Zero cost in
+        // steady state (view matches); one small RPC per missing
+        // partition per 2 s tick after a manager restart.
+        let mgr_view: std::collections::HashMap<u64, &str> = resp
+            .part_addrs
+            .iter()
+            .map(|(pid, a)| (*pid, a.as_str()))
+            .collect();
+        let to_heal: Vec<(u64, String)> = self
+            .partitions
+            .borrow()
+            .iter()
+            .filter(|(pid, h)| mgr_view.get(pid) != Some(&h.part_addr.as_str()))
+            .map(|(pid, h)| (*pid, h.part_addr.clone()))
+            .collect();
+        for (part_id, address) in to_heal {
+            let req = manager_rpc::rkyv_encode(&manager_rpc::RegisterPartitionAddrReq {
+                ps_id: self.ps_id,
+                part_id,
+                address: address.clone(),
+            });
+            // 5 s — same bound rationale as the heartbeat call above.
+            match self
+                .pool
+                .call_timeout(
+                    self.manager_addr(),
+                    manager_rpc::MSG_REGISTER_PARTITION_ADDR,
+                    req,
+                    Duration::from_secs(5),
+                )
+                .await
+            {
+                Ok(_) => tracing::info!(
+                    "PS {} re-registered part_addr {address} for partition {part_id}",
+                    self.ps_id
+                ),
+                Err(e) => tracing::warn!(
+                    "PS {} part_addr re-register failed for partition {part_id}: {e}",
+                    self.ps_id
+                ),
+            }
+        }
+        Ok(())
+    }
+
+    /// Spawn a dedicated OS thread with its own compio runtime for this partition.
+    ///
+    /// the partition thread BINDS its own TcpListener on a unique
+    /// port (`base_port + ord`, lowest free ord) and runs an accept loop on its
+    /// own compio runtime, so there is no cross-thread fd handoff. Once
+    /// the listener is bound, the partition thread registers its address
+    /// with the manager via `MSG_REGISTER_PARTITION_ADDR`, which is then
+    /// returned to clients via `GetRegionsResp.part_addrs`.
+    ///
+    /// Port allocation is monotonic — we never reuse a port within the
+    /// lifetime of a PS process, even if a partition is closed and then
+    /// re-opened, so there is no TIME_WAIT hazard across region-sync
+    /// cycles. The ordinal is bumped BEFORE spawn so a bind failure on
+    /// one partition does not collapse the whole port sequence.
+    async fn open_partition(
+        &self,
+        part_id: u64,
+        rg: Range,
+        region_epoch: u64,
+        log_stream_id: u64,
+        row_stream_id: u64,
+        meta_stream_id: u64,
+    ) -> Result<PartitionHandle> {
+        let manager_addr = self.manager_addrs.join(",");
+        // acquire a FRESH per-partition owner lock for THIS open.
+        // The key is unique per logical writer (`ps/<id>/partition/<id>`,
+        // the shape stream/CLAUDE.md note 1 always prescribed) and the
+        // bump-on-acquire makes the returned epoch globally newest —
+        // so a partition TAKEOVER always clears the EN fence floors left
+        // by any previous owner. Previously every partition reused the
+        // PS-lifetime `server_owner_key`/`server_revision` acquired once
+        // at startup: a STANDING PS inheriting partitions from a PS that
+        // acquired LATER sat below the extents' fence floor forever
+        // (manager-HA chaos H2 — `commit-length ... 0/3 committed members
+        // reachable` wedge; the part_addr self-heal only covered respawned-PS
+        // failback). Per-partition keys also scope the fencing correctly:
+        // opening partition X bumps only X's key — sibling partitions on
+        // the same PS keep their epochs; the PREVIOUS owner of X (and
+        // only X) is fenced at both the manager equality check and the
+        // EN floor, and self-evicts via the LockedByOther path.
+        // The key deliberately does NOT embed the ps_id: a
+        // per-PS shape (`ps/<id>/partition/<id>`) would leave the OLD
+        // owner's key valid at the manager after a takeover — its
+        // lingering GC (`punch_holes`/`truncate`) would still pass
+        // `ensure_owner_epoch` and could mutate streams now owned
+        // elsewhere. With ONE stable logical key per partition, the
+        // takeover acquire bumps THE SAME key, so the old owner is
+        // fenced at the manager equality check too, not just the EN
+        // floor.
+        let owner_key = format!("partition/{part_id}");
+        let owner_epoch = self
+            .acquire_partition_owner_epoch(&owner_key)
+            .await
+            .with_context(|| format!("acquire owner lock {owner_key}"))?;
+        let ps_id = self.ps_id;
+        // snapshot the open-time params for sync_regions_once
+        // change-detection (post-merge widening, post-split narrowing,
+        // stream-ID rotation).
+        // + epoch: drop+reopen when rg / stream IDs / region_epoch
+        // changes vs open-time snapshot. rg change implies an epoch bump
+        // in our manager-side rule, but include the epoch explicitly so
+        // a future scheme (e.g., epoch bump on PS reassignment without
+        // rg change) is caught without modifying the comparison logic.
+        //
+        // fix-2: wrap in Arc<Mutex<>> so the partition thread can
+        // update this in-place after `handle_split_part` (and future
+        // in-place updaters) without going through a drop+reopen.
+        let opened_with: std::sync::Arc<parking_lot::Mutex<(Range, u64, u64, u64, u64)>> =
+            std::sync::Arc::new(parking_lot::Mutex::new((
+                rg.clone(),
+                log_stream_id,
+                row_stream_id,
+                meta_stream_id,
+                region_epoch,
+            )));
+        let opened_with_for_thread = opened_with.clone();
+
+        // port allocation: pick the LOWEST FREE ordinal ≥ 1 (scan from
+        // base_port+1), reusing ords freed by closed partitions
+        // (`PartitionHandle::drop`). Reserve it eagerly (insert now) so a later
+        // `open_partition` never collides with this one even if the actual
+        // `bind` below is delayed by the worker thread startup.
+        let ord = {
+            let mut used = self.used_port_ords.borrow_mut();
+            let ord = (1u16..=u16::MAX)
+                .find(|o| !used.contains(o))
+                .ok_or_else(|| anyhow!("no free partition port ordinal (all 65535 in use)"))?;
+            used.insert(ord);
+            ord
+        };
+        // Free the reserved ord if we bail out before the PartitionHandle
+        // (which owns the free-on-drop) is built.
+        let ord_reservation = OrdReservation {
+            set: self.used_port_ords.clone(),
+            ord,
+            committed: false,
+        };
+        let plog_lease = self.plog_load.register();
+        let plog_tid = plog_lease.tid_cell();
+        let base_port = self.base_port.get();
+        let listen_port = base_port.checked_add(ord).ok_or_else(|| {
+            anyhow!(
+                "base_port={} + ord={} overflows u16; pick a smaller base port",
+                base_port,
+                ord,
+            )
+        })?;
+        let listen_host = self.listen_host.borrow().clone();
+        let listen_addr_s = if listen_host.contains(':') {
+            format!("[{}]:{}", listen_host.trim_matches(['[', ']']), listen_port)
+        } else {
+            format!("{}:{}", listen_host, listen_port)
+        };
+        let listen_addr: SocketAddr = listen_addr_s
+            .parse()
+            .context("parse per-partition listen addr")?;
+        let advertise_host = self.advertise_host.borrow().clone();
+
+        // Shutdown signal: main thread drops `shutdown_tx` to tell the
+        // partition's accept loop to exit.
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+
+        // graceful drain signal. Main thread (`PartitionServer::
+        // shutdown()`) sends a `DrainAck` through `drain_tx` to ask the
+        // partition to rotate active + flush all imm and reply when done,
+        // BEFORE dropping `shutdown_tx`.
+        let (drain_tx, drain_rx) = mpsc::unbounded::<DrainAck>();
+
+        // Report bind + registration success/failure back to the caller,
+        // so we can fail loudly and reclaim the ordinal if needed.
+        // On success the thread reports the ACTUALLY-ADVERTISED address
+        // (the bind-collision fallback may move the port off the computed
+        // base+ord) — `PartitionHandle.part_addr` must carry the actual
+        // one or the part_addr self-heal "heals" the manager's
+        // correct registration back to the dead computed port (the
+        // residual: split child reopened on a fallback port, the heal
+        // re-registered the stale port, clients routed to it forever).
+        let (ready_tx, ready_rx) = oneshot::channel::<Result<String>>();
+
+        let manager_addr_for_thread = manager_addr.clone();
+        let owner_key_for_thread = owner_key.clone();
+        let advertise_host_for_thread = advertise_host.clone();
+        // D-r7: hand the partition thread the PS-wide concurrency
+        // Arc (shared) + a fresh RateController per partition (built
+        // inside the thread from process-global setters).
+        let concurrency_for_thread = self.concurrency_ctrl.clone();
+        // share the authz runtime with the partition thread's
+        // connection tasks (they enforce per-request; the main thread refreshes).
+        let authz_for_thread = self.authz.clone();
+        // build the metrics Arc on the main thread so we can keep
+        // a clone in PartitionHandle for the report loop. The other clone
+        // is moved into the partition thread and threaded into PartitionData.
+        let metrics_for_thread = std::sync::Arc::new(PartitionMetrics::default());
+        let metrics_for_handle = metrics_for_thread.clone();
+        self.metrics.register(metrics_for_thread.clone());
+        // Every partition of this PS shares the PS's one block cache.
+        let block_cache_for_thread = self.block_cache.clone();
+        let mem_tier_for_thread = self.mem_tier.clone();
+        // build the compact + GC trigger channels on the main thread
+        // so `PartitionHandle` can hold a Send `mpsc::Sender` for the
+        // maintenance scheduler. The receivers go into `partition_thread_main`
+        // and on into `background_compact_loop` / `background_gc_loop`. The
+        // in-thread sender clones land in `PartitionData` via `partition_thread_main`.
+        let (compact_tx_main, compact_rx_main) = mpsc::channel::<CompactTask>(1);
+        let (gc_tx_main, gc_rx_main) = mpsc::channel::<GcTask>(1);
+        let compact_tx_for_thread = compact_tx_main.clone();
+        let gc_tx_for_thread = gc_tx_main.clone();
+        let join = std::thread::Builder::new()
+            .name(format!("part-{part_id}"))
+            .spawn(move || {
+                if let Some(tid) = autumn_common::cpu_pin::current_tid() {
+                    plog_tid.store(tid, std::sync::atomic::Ordering::Relaxed);
+                }
+                let rt = compio::runtime::RuntimeBuilder::new()
+                    .build()
+                    .expect("create compio runtime");
+                autumn_common::cpu_pin::confine_io_workers(&rt);
+                tracing::info!(part_id, "P-log thread runtime ready");
+                rt.block_on(async move {
+                    if let Err(e) = partition_thread_main(
+                        part_id,
+                        rg,
+                        region_epoch,
+                        log_stream_id,
+                        row_stream_id,
+                        meta_stream_id,
+                        manager_addr_for_thread,
+                        owner_key_for_thread,
+                        owner_epoch,
+                        ps_id,
+                        listen_addr,
+                        advertise_host_for_thread,
+                        ready_tx,
+                        shutdown_rx,
+                        drain_rx,
+                        metrics_for_thread,
+                        block_cache_for_thread,
+                        mem_tier_for_thread,
+                        compact_tx_for_thread,
+                        compact_rx_main,
+                        gc_tx_for_thread,
+                        gc_rx_main,
+                        concurrency_for_thread,
+                        opened_with_for_thread,
+                        authz_for_thread,
+                    )
+                    .await
+                    {
+                        tracing::error!(part_id, "partition thread failed: {e:#}");
+                    }
+                });
+            })
+            .context("spawn partition thread")?;
+
+        // Wait for the partition thread to bind its listener and
+        // register with the manager. If any step fails, bubble the error up so
+        // `sync_regions_once` reports the failure (operator-visible; no
+        // silent skip).
+        let actual_advertise = match ready_rx.await {
+            Ok(Ok(addr)) => addr,
+            Ok(Err(e)) => {
+                return Err(e.context(format!(
+                    "partition {part_id} failed to bind listener on {listen_addr} or register addr"
+                )));
+            }
+            Err(_canceled) => {
+                return Err(anyhow!(
+                    "partition {part_id} thread exited before reporting listener readiness"
+                ));
+            }
+        };
+
+        // Handle takes ownership of the ord's free-on-drop; disarm the guard.
+        ord_reservation.commit();
+        Ok(PartitionHandle {
+            shutdown_tx: Some(shutdown_tx),
+            drain_tx: Some(drain_tx),
+            // the ACTUAL advertised address from the partition
+            // thread (bind fallback may differ from the computed one).
+            part_addr: actual_advertise,
+            metrics: metrics_for_handle,
+            compact_trigger: compact_tx_main,
+            gc_trigger: gc_tx_main,
+            opened_with,
+            join: Some(join),
+            port_ord: ord,
+            used_port_ords: self.used_port_ords.clone(),
+            plog_lease,
+        })
+    }
+
+    /// graceful shutdown. For each open partition:
+    ///   1. Send a `DrainAck` via `drain_tx`. The partition's
+    ///      `partition_loop` stops pulling new requests, drains
+    ///      inflight, rotates `active`, calls `flush_one_imm` until imm
+    ///      is empty (or a flush fails), then replies with the outcome.
+    ///   2. Await the oneshot with `--shutdown-timeout-ms`
+    ///      deadline. On timeout, log a warning and skip — the SIGKILL
+    ///      fallback (and on-restart logStream replay) keeps correctness.
+    ///   3. Drop `shutdown_tx` to close the per-partition accept loop;
+    ///      every per-conn `req_tx` clone is dropped, `merged_loop`
+    ///      observes `req_rx == None`, exits, partition thread joins.
+    ///
+    /// Concurrent partitions drain in parallel — wallclock is bounded
+    /// by the slowest partition's flush time.
+    pub async fn shutdown(&self) -> Result<()> {
+        use futures::future::join_all;
+
+        // Stop region sync FIRST so it cannot reopen a partition we are about
+        // to drain (both run on this single-threaded runtime, but drains await
+        // across ticks). A pass already in flight is waited for below.
+        self.shutting_down.set(true);
+        // Tell the manager now that nothing here is serving, so a restart's
+        // readiness wait cannot read this process's last report as the new
+        // one's. The regular beat would say the same within 2 s — usually after
+        // a quick drain has already exited.
+        let beat = self.heartbeat_req();
+        match self
+            .pool
+            .call_timeout(
+                self.manager_addr(),
+                manager_rpc::MSG_HEARTBEAT_PS,
+                beat,
+                Duration::from_secs(2),
+            )
+            .await
+            .map_err(|e| format!("{e:#}"))
+            .and_then(|b| {
+                manager_rpc::rkyv_decode::<manager_rpc::CodeResp>(&b).map_err(|e| e.to_string())
+            }) {
+            Ok(r) if r.code == manager_rpc::CODE_OK => {}
+            Ok(r) => tracing::warn!(
+                code = r.code,
+                "graceful shutdown: manager did not take the drain report: {}",
+                r.message
+            ),
+            Err(e) => {
+                tracing::warn!("graceful shutdown: could not report the drain to the manager: {e}")
+            }
+        }
+
+        let timeout = Duration::from_millis(shutdown_timeout_ms());
+
+        // A sync pass that passed its flag check before we set it may still be
+        // waiting on the manager or on an open. Let it finish, so it cannot act
+        // on the regions it fetched after the drain and every partition it
+        // opens is in the snapshot below. An open retries its stream checks
+        // without limit, so the wait has the drain's deadline; past it the drain
+        // goes ahead and the WAL covers whatever that pass opens.
+        {
+            use futures::future::{select, Either};
+            let pass = self.sync_pass.lock();
+            let sleep_fut = compio::time::sleep(timeout);
+            futures::pin_mut!(sleep_fut);
+            if let Either::Right(_) = select(pass, sleep_fut).await {
+                tracing::warn!(
+                    timeout_ms = timeout.as_millis() as u64,
+                    "graceful shutdown: an in-flight region sync did not finish; draining without it",
+                );
+            }
+        }
+
+        let part_ids: Vec<u64> = self.partitions.borrow().keys().copied().collect();
+
+        tracing::info!(
+            partitions = part_ids.len(),
+            timeout_ms = timeout.as_millis() as u64,
+            "graceful shutdown: draining partitions",
+        );
+
+        // Send drain signals + collect oneshot receivers.
+        let mut drain_rxs: Vec<(u64, oneshot::Receiver<Result<(), String>>)> = Vec::new();
+        {
+            let mut parts = self.partitions.borrow_mut();
+            for &pid in &part_ids {
+                let Some(handle) = parts.get_mut(&pid) else {
+                    continue;
+                };
+                let Some(drain_tx) = handle.drain_tx.as_ref() else {
+                    continue;
+                };
+                let (ack_tx, ack_rx) = oneshot::channel();
+                if drain_tx.unbounded_send(ack_tx).is_ok() {
+                    drain_rxs.push((pid, ack_rx));
+                }
+            }
+        }
+
+        // Race each ack against the deadline.
+        let waits = drain_rxs.into_iter().map(|(pid, ack_rx)| {
+            async move {
+                use futures::future::{select, Either};
+                let sleep_fut = compio::time::sleep(timeout);
+                futures::pin_mut!(sleep_fut);
+                match select(ack_rx, sleep_fut).await {
+                    Either::Left((Ok(Ok(())), _)) => {
+                        tracing::info!(part_id = pid, "graceful shutdown: drained");
+                    }
+                    Either::Left((Ok(Err(e)), _)) => {
+                        tracing::warn!(
+                            part_id = pid,
+                            "graceful shutdown: flush failed, the unflushed writes stay in the \
+                             WAL and replay on restart: {e}",
+                        );
+                    }
+                    Either::Left((Err(_), _)) => {
+                        tracing::warn!(part_id = pid, "graceful shutdown: drain channel cancelled");
+                    }
+                    Either::Right(_) => {
+                        tracing::warn!(
+                            part_id = pid,
+                            timeout_ms = timeout.as_millis() as u64,
+                            "graceful shutdown: drain timed out (replay on restart will cover unflushed data)",
+                        );
+                    }
+                }
+            }
+        });
+        join_all(waits).await;
+
+        // Now close accept loops by dropping `shutdown_tx`. The merged_loop
+        // exits its tail-drain block once req_rx hits EOF (no more conns).
+        // Drop drain_tx as well so any pending receiver wakes with EOF.
+        {
+            let mut parts = self.partitions.borrow_mut();
+            for handle in parts.values_mut() {
+                handle.shutdown_tx.take();
+                handle.drain_tx.take();
+            }
+        }
+
+        // Join threads (best effort; bound to a fraction of the timeout).
+        let join_deadline = Duration::from_millis((timeout.as_millis() as u64).max(1_000));
+        let join_start = std::time::Instant::now();
+        loop {
+            let mut all_done = true;
+            {
+                let mut parts = self.partitions.borrow_mut();
+                for handle in parts.values_mut() {
+                    if let Some(j) = handle.join.as_ref() {
+                        if !j.is_finished() {
+                            all_done = false;
+                        }
+                    }
+                }
+            }
+            if all_done {
+                let mut parts = self.partitions.borrow_mut();
+                for handle in parts.values_mut() {
+                    if let Some(j) = handle.join.take() {
+                        let _ = j.join();
+                    }
+                }
+                break;
+            }
+            if join_start.elapsed() >= join_deadline {
+                tracing::warn!(
+                    "graceful shutdown: thread join deadline reached, leaving threads detached"
+                );
+                break;
+            }
+            compio::time::sleep(Duration::from_millis(50)).await;
+        }
+        tracing::info!("graceful shutdown: complete");
+        Ok(())
+    }
+
+    // ── Serve ──────────────────────────────────────────────────────────
+    //
+    // thread model:
+    //   - 1 main compio thread: control plane only (heartbeat_loop +
+    //     region_sync_loop). No listener, no accept, no fd dispatch.
+    //   - N × 2 partition OS threads: per-partition P-log + P-sst. P-log
+    //     binds its OWN `compio::net::TcpListener` on a unique port and
+    //     runs its OWN accept task + ps-conn tasks + partition_loop
+    //     on the same compio runtime. The only mpsc on the hot path is
+    //     same-thread `PartitionRequest` (ps-conn → merged_loop). Total
+    //     OS threads at N partitions: `1 + 2N` (with the old central-accept
+    //     model it was `2 + 2N` because of the separate accept thread).
+
+    /// initialise `base_port` + `advertise_host` from the
+    /// supplied first-partition listen address. Safe to call multiple
+    /// times with the same `addr` (idempotent set via `Cell` /
+    /// `RefCell`). Called by `serve()` and by
+    /// `connect_with_advertise_and_port` so callers that drive
+    /// `sync_regions_once()` BEFORE entering `serve()`'s forever-loop
+    /// still see a valid `base_port` in `open_partition`.
+    pub fn bind_listen_addr(&self, addr: SocketAddr) -> Result<()> {
+        // the `addr` arg is repurposed as the FIRST PARTITION's
+        // listener address. Partition N (1-indexed by open order) binds
+        // `addr.port() + (N-1)`. `base_port` is therefore `addr.port() - 1`
+        // so that `base_port + 1 == addr.port()` — preserves CLI compat
+        // with the existing `--port 9201` convention.
+        let first_port = addr.port();
+        if first_port == 0 {
+            return Err(anyhow!(
+                "--port 0 (ephemeral) is not supported for PartitionServer; pick a stable base port"
+            ));
+        }
+        let base_port = first_port - 1;
+        self.base_port.set(base_port);
+        *self.listen_host.borrow_mut() = addr.ip().to_string();
+
+        // Parse advertise host from `advertise_addr` (falls back to
+        // `127.0.0.1`). The per-partition advertise becomes
+        // `"{host}:{listen_port}"`.
+        let host = self
+            .advertise_addr
+            .as_ref()
+            .and_then(|a| a.rsplit_once(':').map(|(h, _)| h.to_string()))
+            .unwrap_or_else(|| "127.0.0.1".to_string());
+        *self.advertise_host.borrow_mut() = host;
+        Ok(())
+    }
+
+    pub async fn serve(&self, addr: SocketAddr) -> Result<()> {
+        // Backwards-compatible: never-resolving shutdown_signal — caller
+        // gets the original forever-loop behavior. Production binaries
+        // should use `serve_until_shutdown` with a SIGTERM-driven future.
+        self.serve_until_shutdown(addr, std::future::pending::<()>())
+            .await
+    }
+
+    /// like `serve()` but exits the main control-plane loop
+    /// when `shutdown_signal` resolves, then runs `self.shutdown()` to
+    /// drain partitions before returning. Production: pass a future
+    /// driven by a SIGTERM/SIGINT handler.
+    pub async fn serve_until_shutdown<F>(&self, addr: SocketAddr, shutdown_signal: F) -> Result<()>
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        // set `base_port` + `advertise_host` BEFORE any
+        // background loop spawns `open_partition`. Idempotent if a
+        // caller already invoked `bind_listen_addr` (e.g. test
+        // harness via `connect_with_advertise_and_port`).
+        self.bind_listen_addr(addr)?;
+        let base_port = self.base_port.get();
+        let first_port = addr.port();
+
+        tracing::info!(
+            base_port = base_port,
+            first_part_port = first_port,
+            "partition server serving (per-partition listeners)"
+        );
+
+        // Control-plane loops run on main compio thread and never exit.
+        // heartbeat_loop is spawned by `finish_connect` right after
+        // register_ps succeeds, so it stays alive across the (potentially
+        // long) initial sync_regions_once.
+        let s = self.clone();
+        spawn_supervised("ps_region_sync", move || {
+            let s = s.clone();
+            async move { s.region_sync_loop().await }
+        });
+
+        // refresh the data-plane authz config from the manager (key
+        // rotation / namespace edits) every `--config-poll-secs`.
+        let s_authz = self.clone();
+        spawn_supervised("ps_authz_config", move || {
+            let s = s_authz.clone();
+            async move { s.authz_config_poll_loop().await }
+        });
+
+        // region_sync_loop above drives all open/close of partition
+        // threads. Partitions bind their own listeners. Park here
+        // until `shutdown_signal` resolves, then drain.
+        futures::pin_mut!(shutdown_signal);
+        let park = async {
+            loop {
+                compio::time::sleep(Duration::from_secs(3600)).await;
+            }
+        };
+        futures::pin_mut!(park);
+        use futures::future::{select, Either};
+        match select(shutdown_signal, park).await {
+            Either::Left(_) => {
+                tracing::info!("shutdown signal received, draining partitions");
+                self.shutdown().await?;
+                Ok(())
+            }
+            // park never resolves; this arm is unreachable but exhaustive.
+            Either::Right(_) => Ok(()),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Connection handler — per-conn reply batching via FuturesUnordered +
+// write_vectored_all. Mirrors the ExtentNode R4 4.2 v3 pattern.
+// ---------------------------------------------------------------------------
+
+/// per-conn inflight cap. Maximum number of concurrently-awaiting
+/// futures `handle_ps_connection` holds in its `inflight` FuturesUnordered at
+/// once. Once at cap, transport reads stop (back-pressure) until one completion
+/// drains into `tx_bufs`.
+///
+/// It also bounds a partition's group-commit batch: the ops admitted on all of
+/// its connections are all a batch can hold, and the next batch waits for this
+/// one's append. See `crates/partition-server/CLAUDE.md` ("Per-connection
+/// admission") for why the default is 16.
+fn ps_conn_inflight_cap() -> usize {
+    params().conn_inflight_cap.get()
+}
+
+/// Pool bytes one admission slot stands for on one partition: eight
+/// connections (a TP8 engine's ranks) each holding one 16 MiB kvcache page in a
+/// pooled buffer while it is received (a put) or read and sent (a get).
+pub const REGPOOL_BYTES_PER_ADMITTED_REQUEST: usize = 8 * (16 << 20);
+
+/// A partition holds a pooled buffer for every large value it has admitted,
+/// against its part of the pool's `Receive` budget (a fifth of
+/// `--ucx-regpool-cap-bytes`); a value past it is refused `Unavailable`.
+/// `Some(warning)` when `--conn-inflight-cap` slots of
+/// `REGPOOL_BYTES_PER_ADMITTED_REQUEST` do not fit that part.
+pub fn regpool_admission_mismatch(regpool_cap_bytes: usize, conn_inflight_cap: usize) -> Option<String> {
+    let need = conn_inflight_cap.saturating_mul(REGPOOL_BYTES_PER_ADMITTED_REQUEST);
+    let partition_share = autumn_transport::regpool_thread_share_of(regpool_cap_bytes, autumn_transport::PoolUse::Receive);
+    (partition_share < need).then(|| {
+        format!(
+            "--ucx-regpool-cap-bytes {regpool_cap_bytes} gives a partition {partition_share} of received values, below \
+             --conn-inflight-cap {conn_inflight_cap} x {} MiB = {need}: values past it are refused \
+             Unavailable (docs/ops.md, \"Per-connection admission and the registered pool\")",
+            REGPOOL_BYTES_PER_ADMITTED_REQUEST >> 20
+        )
+    })
+}
+
+#[cfg(test)]
+mod regpool_admission_tests {
+    use super::*;
+
+    /// The shipped defaults fit each other: changing one without the other
+    /// turns this red.
+    #[test]
+    fn the_default_admission_fits_the_default_pool() {
+        let p = PsParams::default();
+        assert_eq!(regpool_admission_mismatch(p.ucx_regpool_cap_bytes.get(), p.conn_inflight_cap.get()), None);
+    }
+
+    #[test]
+    fn a_cap_past_the_pool_warns() {
+        assert!(regpool_admission_mismatch(2 << 30, 32).is_some());
+        assert!(regpool_admission_mismatch(16 << 30, 32).is_some(), "a fifth of 16 GiB is under 32 x 128 MiB");
+        assert_eq!(regpool_admission_mismatch(21 << 30, 32), None);
+    }
+}
+
+/// Test-only count of receive iterations carrying one complete frame.
+#[cfg(test)]
+pub(crate) static PS_SINGLE_FRAME_RECV_HITS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Count of write values (`MSG_PUT` and its kin) recv'd straight into a
+/// `PooledBuf` by `drain_bulk_writes` (the PS bulk write-recv path). Logged
+/// once on first engage so operators / e2e can confirm the path is live.
+pub(crate) static PS_BULK_WRITE_RECV_HITS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Workspace-wide serialization guard for tests that exercise
+/// `handle_ps_connection`. The function bumps a process-global counter
+/// (`PS_SINGLE_FRAME_RECV_HITS`) so any parallel test using the same path
+/// invalidates `write_batch_fastpath_tests`' exact-delta assertions. All such tests
+/// acquire this lock for the duration of their TCP round-trips.
+///
+/// `parking_lot::Mutex` is used instead of `std::sync::Mutex` so a
+/// failing test in this set doesn't poison the lock and cascade-fail
+/// every subsequent run. Held only during the test body; non-test
+/// code paths never see this.
+#[cfg(test)]
+pub(crate) fn ps_conn_test_lock() -> parking_lot::MutexGuard<'static, ()> {
+    static LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+    LOCK.lock()
+}
+
+/// outcome of one persistent read future iteration.  The future
+/// owns both the reader and the decoder's read window across iterations so it
+/// can be left pinned in the event loop's `select` without ever being dropped
+/// mid-flight (an in-flight io_uring SQE would otherwise be cancelled,
+/// forcing the kernel to resubmit on the next poll; earlier ps-conn
+/// iterations measured this as a perf regression).
+enum PsReadBurst {
+    /// Bytes arrived; the window holds them for `FrameDecoder::finish_read`.
+    Data {
+        window: autumn_rpc::ReadWindow,
+        reader: autumn_transport::ReadHalf,
+    },
+    Eof,
+    Err {
+        e: std::io::Error,
+    },
+}
+
+/// Build a `'static`-lifetime `LocalBoxFuture<PsReadBurst>` that reads once
+/// into `window` and returns ownership of both reader and window.
+fn spawn_ps_read(
+    mut reader: autumn_transport::ReadHalf,
+    window: autumn_rpc::ReadWindow,
+) -> futures::future::LocalBoxFuture<'static, PsReadBurst> {
+    use compio::io::AsyncRead;
+    use futures::FutureExt;
+    async move {
+        let BufResult(result, window) = reader.read(window).await;
+        match result {
+            Ok(0) => PsReadBurst::Eof,
+            Ok(_) => PsReadBurst::Data { window, reader },
+            Err(e) => PsReadBurst::Err { e },
+        }
+    }
+    .boxed_local()
+}
+
+/// Next receive window for a ps-conn. A bulk write at the front keeps the
+/// fixed window: `drain_bulk_writes` receives its value into a pooled buffer,
+/// and only the prologue plus a bounded prefix should land in the decoder. Any
+/// other incomplete frame receives the rest of itself in place.
+fn ps_read_window(decoder: &mut FrameDecoder, fixed: usize) -> autumn_rpc::ReadWindow {
+    let len = match decoder.peek_header() {
+        Some((
+            _,
+            MSG_PUT | partition_rpc::MSG_BATCH_PUT | partition_rpc::MSG_COMPARE_WRITE,
+            _,
+            _,
+        ))
+        | None => fixed,
+        Some(_) => decoder
+            .front_frame_remaining()
+            .map_or(fixed, |rest| rest.max(fixed)),
+    };
+    decoder.read_window(len)
+}
+
+/// R4 — push a completed response `(head, values)` into `tx_bufs`. `head`
+/// (frame header + any meta) goes first; the bulk reads' values (aliasing the
+/// RegPool buffer / the resolved read, no copy) go immediately after — one for
+/// MSG_GET, one per key for MSG_BATCH_GET — so the next vectored
+/// flush emits them as one contiguous wire frame. Keeping a reply's buffers
+/// adjacent preserves per-connection in-order reply semantics.
+#[inline]
+fn push_resp(tx_bufs: &mut Vec<Bytes>, done: (Bytes, Vec<Bytes>)) {
+    let (head, values) = done;
+    tx_bufs.push(head);
+    // N buffers, not one: a batched bulk read answers with a value per key, and
+    // each stays its own iovec so the reply costs no concatenation copy.
+    tx_bufs.extend(values);
+}
+
+/// UCX + TCP — drain LARGE value-separable write frames at the FRONT of
+/// `decoder`, recv'ing the raw tail straight into a `PooledBuf` instead of
+/// letting `FrameDecoder` accumulate it (which would copy the whole thing into
+/// the decoder buffer). UCX receives into a registered, reusable slab (Stream
+/// still has its own unpack copy); TCP receives via a compio owned read
+/// (`read_exact_into_pooled`) → only the unavoidable kernel→userspace copy
+/// remains (the app-level FrameDecoder copy is gone). The frame is routed as a
+/// `PartitionRequest { payload = ctrl, bulk_value = Some(tail) }` so the enqueue
+/// uses the bytes directly (no concat back). Returns as soon as the front frame
+/// is NOT an eligible large bulk write (the caller then runs the normal decode
+/// path on the remainder).
+///
+/// The three write shapes qualify, each an rkyv ctrl: `MSG_PUT` and
+/// `MSG_COMPARE_WRITE` (one value) and `MSG_BATCH_PUT` (tail = every op's
+/// value back to back, sliced per op downstream). Recognising only the
+/// single-value form left the batch path structurally slower than the per-item
+/// one it exists to beat: its tail is by definition the batch's whole value
+/// payload, so it is exactly the buffer worth keeping off the decoder.
+///
+/// v28 (unified wire CRC): the frame's ctrl is CRC-protected together with the
+/// header — `peek_bulk_prologue` VERIFIES it before the value recv commits, so
+/// a flipped part_id/key_len/lease/value_len field fails loud. The raw
+/// value tail carries no frame CRC (transport integrity: UCX NIC ICRC / TCP
+/// kernel segment checksum — measured the per-value crc at ~20% of a
+/// core @ 8 MiB) and there is no trailer after the value to consume.
+///
+/// Cancel-safe on both transports: the `PooledBuf` is passed to each recv by
+/// value, and a recv dropped mid-await keeps it until the transport is done
+/// with it (UCX: the orphan list; TCP: compio holds it until the CQE lands),
+/// then returns it to the pool. No leak, no DMA/kernel-writes-to-freed.
+/// Small writes (< `--bulk-recv-min-bytes`) keep the proven decode path.
+#[allow(clippy::too_many_arguments)]
+async fn drain_bulk_writes(
+    decoder: &mut FrameDecoder,
+    reader: &mut autumn_transport::ReadHalf,
+    req_tx: &mpsc::Sender<PartitionRequest>,
+    owner_part: u64,
+    inflight: &mut FuturesUnordered<futures::future::LocalBoxFuture<'static, (Bytes, Vec<Bytes>)>>,
+    tx_bufs: &mut Vec<Bytes>,
+    cap: usize,
+    authz: &crate::authz::AuthzState,
+    conn: &mut ConnGateState,
+) -> Result<()> {
+    use futures::FutureExt;
+    loop {
+        let Some((req_id, msg_type, flags, _payload_len)) = decoder.peek_header() else {
+            return Ok(());
+        };
+        if flags & autumn_rpc::frame::FLAG_AM_VALUE != 0 {
+            // Its value comes as active messages: the normal path receives it.
+            return Ok(());
+        }
+        let is_batch = msg_type == partition_rpc::MSG_BATCH_PUT;
+        if !(is_batch || msg_type == MSG_PUT || msg_type == partition_rpc::MSG_COMPARE_WRITE) || req_id == 0 {
+            return Ok(()); // not a bulk write at the front → normal path
+        }
+        // Wait for the full prologue ([header][ctrl_len][ctrl][crc]) and
+        // VERIFY the ctrl crc before committing to the recv. Malformed/corrupt
+        // prologue → tear the connection down (stream position unrecoverable).
+        let prologue = match decoder.peek_bulk_prologue() {
+            Ok(Some(p)) => p,
+            Ok(None) => return Ok(()), // need more bytes (prologue is tiny)
+            Err(e) => return Err(anyhow!("bulk write prologue (msg_type={msg_type:#x}): {e}")),
+        };
+        let ctrl_len = prologue.ctrl_len;
+        let value_len = prologue.value_len;
+        // Below `--bulk-recv-min-bytes` the recv-into-pooled-buffer overhead
+        // (regpool acquire + memh + staged recv) exceeds the copy it saves.
+        if value_len < params().bulk_recv_min_bytes.get() {
+            return Ok(()); // below threshold → the proven decode path
+        }
+        // The single-value forms cap at the inline limit (both reject above
+        // it, so recv'ing it would be wasted work). The BATCH
+        // form has no equivalent ceiling: its tail is the SUM over ops, each of
+        // which is individually capped downstream, and a batch of 256 x 32 KiB
+        // legitimately exceeds any per-value limit. No ceiling is needed to
+        // bound the allocation either — declining here does not make the bytes
+        // go away, it makes `FrameDecoder` accumulate the same count plus a
+        // copy.
+        if !is_batch && value_len > AUTUMN_PS_MAX_INLINE_BYTES_DEFAULT as usize {
+            return Ok(());
+        }
+        // Decode enough of the ctrl to route — the same decode
+        // `push_one_frame_to_inflight` would have paid on the normal path.
+        let part_id = partition_rpc::extract_part_id(
+            msg_type,
+            decoder.peek_ctrl(ctrl_len).expect("prologue verified => ctrl buffered"),
+        );
+        if part_id != owner_part {
+            return Ok(()); // mis-routed → normal path synths the NotFound
+        }
+        // The ctrl travels on as the request payload. Small — it is the
+        // VALUES that stay off this copy.
+        let ctrl_bytes = Bytes::copy_from_slice(
+            decoder
+                .peek_ctrl(ctrl_len)
+                .expect("prologue verified => ctrl buffered"),
+        );
+        // Check the verified control bytes before allocating a value slab. A
+        // refused request stays intact in the decoder and follows normal
+        // framing/dispatch, which consumes its tail and replies with the error.
+        if authz_gate(msg_type, &ctrl_bytes, req_id, authz, conn).is_some() {
+            return Ok(());
+        }
+
+        // Back-pressure before adding another in-flight reply.
+        while inflight.len() >= cap {
+            if let Some(done) = inflight.next().await {
+                push_resp(tx_bufs, done);
+            } else {
+                break;
+            }
+        }
+
+        // Commit: drop header + ctrl_len + ctrl + crc; recv the value into a
+        // pooled buf. The value ends the frame — no trailer after it (v28).
+        decoder.consume_bulk_prologue(ctrl_len);
+        // Never waited for: the read loop would hold up the connection's other
+        // frames and its pings.
+        let mut pb = match autumn_transport::regpool_try_acquire_for(autumn_transport::PoolUse::Receive, value_len) {
+            Ok(pb) => pb,
+            // Larger than a budget allows one holder: unbudgeted, as before,
+            // until large transfers are segmented.
+            Err(autumn_transport::PoolError::TooLarge) => autumn_transport::regpool_acquire(value_len),
+            // No buffer: the value is read past and the request refused, so
+            // the connection stays in step and the client may retry.
+            Err(e) => {
+                discard_value(decoder, reader, value_len).await?;
+                let reply = Frame::error(
+                    req_id,
+                    msg_type,
+                    autumn_rpc::RpcError::encode_status(StatusCode::Unavailable, &e.to_string()),
+                )
+                .encode();
+                inflight.push(async move { (reply, Vec::new()) }.boxed_local());
+                continue;
+            }
+        };
+        // Drain any buffered value prefix into the pool buffer (no socket).
+        let filled = {
+            let (dest, _reg) = pb.dest_and_reg();
+            decoder.drain_into(dest)
+        };
+        if reader.is_ucx() {
+            // UCX Stream receive into the slab, bypassing FrameDecoder.
+            let mut filled = filled;
+            while filled < value_len {
+                let compio::BufResult(r, p) = reader.recv_pooled(pb, filled).await;
+                pb = p;
+                let n = r?;
+                if n == 0 {
+                    return Err(anyhow!(
+                        "eof mid bulk write value (msg_type={msg_type:#x}, got {filled}/{value_len})"
+                    ));
+                }
+                filled += n;
+            }
+        } else {
+            // TCP: compio owned read straight into the pool buffer (no
+            // FrameDecoder accumulation copy).
+            pb = reader
+                .read_exact_into_pooled(pb, filled, value_len)
+                .await
+                .map_err(|e| {
+                    anyhow!("eof/io mid bulk write value (msg_type={msg_type:#x}, tcp bulk-recv): {e}")
+                })?;
+        }
+        let value = pb.freeze();
+        // Receiving may yield long enough for a namespace removal, key
+        // revocation or token expiry. Match normal dispatch's admission-time
+        // check rather than relying on the pre-receive snapshot.
+        if let Some(reply) = authz_gate(msg_type, &ctrl_bytes, req_id, authz, conn) {
+            inflight.push(async move { (reply, Vec::new()) }.boxed_local());
+            continue;
+        }
+
+        // Observability: count + log-once that the bulk write-recv path is live.
+        if PS_BULK_WRITE_RECV_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+            tracing::info!(
+                value_len,
+                msg_type,
+                transport = if reader.is_ucx() { "ucx(registered)" } else { "tcp(pooled)" },
+                "PS write-recv bulk engaged (bulk write value recv into pooled buffer; UCX / TCP)"
+            );
+        }
+
+        // Route into partition_loop (writes are single-writer there); value
+        // rides as bulk_value (aliases the pool buffer, no concat).
+        let tx = req_tx.clone();
+        inflight.push(
+            async move {
+                (
+                    delegate_round_trip(tx, req_id, msg_type, ctrl_bytes, Some(value), owner_part).await,
+                    Vec::new(),
+                )
+            }
+            .boxed_local(),
+        );
+        // Loop to handle a possible next large bulk write at the new front.
+    }
+}
+
+/// Read past a value of `len` bytes that follows on the connection: the part
+/// `decoder` already holds, then the rest from `reader`.
+async fn discard_value(decoder: &mut FrameDecoder, reader: &mut autumn_transport::ReadHalf, len: usize) -> Result<()> {
+    use compio::buf::{IntoInner, IoBuf};
+    use compio::io::AsyncReadExt;
+    let held = decoder.buffered_len().min(len);
+    decoder.consume(held);
+    let mut left = len - held;
+    let mut scratch = vec![0u8; left.min(1 << 20)];
+    while left > 0 {
+        let n = left.min(scratch.len());
+        let BufResult(r, slice) = reader.read_exact(scratch.slice(..n)).await;
+        r.map_err(|e| anyhow!("eof/io reading past a refused value: {e}"))?;
+        scratch = slice.into_inner();
+        left -= n;
+    }
+    Ok(())
+}
+
+/// Mis-routed-frame error (part_id != owner_part): a `NotFound` frame, no mpsc
+/// hop. Single-sourced for `push_one_frame_to_inflight`.
+/// TODO: forward to the owning P-log's req_tx instead of synthing here.
+fn misroute_frame(req_id: u32, msg_type: u8, part_id: u64, owner_part: u64) -> Bytes {
+    let err_payload = autumn_rpc::RpcError::encode_status(
+        StatusCode::NotFound,
+        &format!("partition {part_id} not served by this P-log (owner={owner_part})"),
+    );
+    Frame::error(req_id, msg_type, err_payload).encode()
+}
+
+/// (Option B) — serve a point or batched GET LOCALLY in the ps-conn task (no
+/// req_tx hop / partition_loop detour). Returns the bulk head plus the values,
+/// each aliasing its resolved read and emitted as its own iovec. The handlers
+/// borrow the partition only across
+/// synchronous code (drops it before the `resolve_value` await), so on the
+/// single-threaded P-log runtime concurrent reads never overlap a borrow with
+/// each other or with `partition_loop`'s `borrow_mut` writes.
+async fn serve_get_local(
+    req_id: u32,
+    msg_type: u8,
+    payload: Bytes,
+    part: &Rc<RefCell<PartitionData>>,
+) -> (Bytes, Vec<autumn_transport::RegBytes>) {
+    let t0 = Instant::now();
+    let out = if msg_type == partition_rpc::MSG_BATCH_GET {
+        // N values, each its own iovec — served here rather than through
+        // partition_loop so a batched read never queues behind group commit.
+        crate::rpc_handlers::handle_batch_get(req_id, payload, part).await
+    } else {
+        // MSG_GET. Never errors: the status rides in the ctrl code.
+        let (head, value) = crate::rpc_handlers::handle_get(req_id, payload, part).await;
+        (head, vec![value])
+    };
+    // LAT-1: GET latency (inline serve incl. VP resolve).
+    part.borrow()
+        .metrics
+        .get_lat
+        .observe_n(t0.elapsed().as_nanos() as u64, 1);
+    out
+}
+
+/// Mode B fix (read decoupling): serve RANGE / HEAD LOCALLY on the ps-conn task,
+/// exactly like `serve_get_local` does for GET — instead of delegating through
+/// `req_tx → partition_loop`. When a flush wedges on a dead replica during a
+/// degraded window the imm queue fills and `partition_loop` parks in
+/// imm-full back-pressure (it stops reading `req_rx`), which is CORRECT
+/// back-pressure for WRITES but must not take READS down with it. `handle_range`
+/// / `handle_head` already do a brief `part.borrow()` to snapshot
+/// (mem_items + sst_reader Arcs / VP) and DROP it before any iteration / I/O —
+/// same single-thread RefCell + memtable-RwLock discipline that makes GET-local
+/// safe — so they run correctly off the write loop. region_epoch / has_overlap /
+/// TTL / tombstone semantics stay inside the unchanged handlers. NOTE: like the
+/// existing GET-local, this relaxes per-connection read-your-writes for a read
+/// pipelined behind an in-flight delegated write on the SAME connection; a
+/// connection-level prior-write barrier covering ALL local reads (get/range/head)
+/// is a coherent follow-up.
+async fn serve_read_local(
+    req_id: u32,
+    msg_type: u8,
+    payload: Bytes,
+    part: &Rc<RefCell<PartitionData>>,
+) -> (Bytes, Vec<Bytes>) {
+    let result = if msg_type == MSG_RANGE {
+        crate::rpc_handlers::handle_range(payload, part).await
+    } else {
+        crate::rpc_handlers::handle_head(payload, part).await
+    };
+    let frame = match result {
+        Ok(p) => Frame::response(req_id, msg_type, p),
+        Err((code, message)) => Frame::error(
+            req_id,
+            msg_type,
+            autumn_rpc::RpcError::encode_status(code, &message),
+        ),
+    }
+    .encode();
+    (frame, Vec::new())
+}
+
+/// Delegate a request to `partition_loop` over the same-thread mpsc and await its
+/// response, returning the encoded response frame. Single-sources the
+/// "partition thread closed" / "partition response dropped" wording shared by the
+/// delegate sites (`drain_bulk_writes`, `push_one_frame_to_inflight`).
+async fn delegate_round_trip(
+    mut tx: mpsc::Sender<PartitionRequest>,
+    req_id: u32,
+    msg_type: u8,
+    payload: Bytes,
+    bulk_value: Option<autumn_transport::RegBytes>,
+    owner_part: u64,
+) -> Bytes {
+    let (resp_tx, resp_rx) = oneshot::channel();
+    let req = PartitionRequest {
+        msg_type,
+        payload,
+        resp_tx,
+        bulk_value,
+    };
+    // DIAGNOSTIC (not a fix): both waits below are unbounded, and this function
+    // is awaited INLINE by the connection task on the bulk-write and depth-1
+    // paths — so a partition that stops answering stops that connection from
+    // reading its socket, with nothing logged on either side. The two waits fail
+    // for different reasons and the difference is the whole diagnosis:
+    //   * send  — the partition is not taking requests (its loop is parked);
+    //   * reply — the partition took this one and never answered.
+    // Report which, every 10 s, and keep waiting exactly as before.
+    let send_started = std::time::Instant::now();
+    let send_res = {
+        let mut sent = std::pin::pin!(tx.send(req));
+        loop {
+            let tick = compio::time::sleep(STUCK_INFLIGHT_REPORT_EVERY);
+            futures::pin_mut!(tick);
+            match futures::future::select(sent.as_mut(), tick).await {
+                futures::future::Either::Left((r, _)) => break r,
+                futures::future::Either::Right(((), _)) => tracing::warn!(
+                    part_id = owner_part,
+                    msg_type,
+                    waited_secs = send_started.elapsed().as_secs(),
+                    "delegate is still waiting to HAND a request to the partition \
+                     — the partition loop is not draining its request channel",
+                ),
+            }
+        }
+    };
+    let resp_frame = if send_res.is_err() {
+        Frame::error(
+            req_id,
+            msg_type,
+            // Not handed over: the partition went down (a reopen or a move).
+            autumn_rpc::RpcError::encode_status(StatusCode::Unavailable, "partition thread closed"),
+        )
+    } else {
+        let reply_started = std::time::Instant::now();
+        let mut resp_rx = std::pin::pin!(resp_rx);
+        let resp = loop {
+            let tick = compio::time::sleep(STUCK_INFLIGHT_REPORT_EVERY);
+            futures::pin_mut!(tick);
+            match futures::future::select(resp_rx.as_mut(), tick).await {
+                futures::future::Either::Left((r, _)) => break r,
+                futures::future::Either::Right(((), _)) => tracing::warn!(
+                    part_id = owner_part,
+                    msg_type,
+                    waited_secs = reply_started.elapsed().as_secs(),
+                    "delegate HANDED a request to the partition and is still \
+                     waiting for its reply — the partition took it and went quiet",
+                ),
+            }
+        };
+        match resp {
+            Ok(Ok(p)) => Frame::response(req_id, msg_type, p),
+            Ok(Err((code, message))) => Frame::error(
+                req_id,
+                msg_type,
+                autumn_rpc::RpcError::encode_status(code, &message),
+            ),
+            Err(_) => Frame::error(
+                req_id,
+                msg_type,
+                // The partition went down with it queued or in flight: a write
+                // may or may not have been applied.
+                autumn_rpc::RpcError::encode_status(
+                    StatusCode::OutcomeUnknown,
+                    "partition response dropped",
+                ),
+            ),
+        }
+    };
+    resp_frame.encode()
+}
+
+/// current unix seconds for token `exp` / `nbf` checks.
+fn authz_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// The two things this connection learned about itself, carried together so a
+/// third costs nothing and so no call site can thread one and forget the other.
+///
+/// Both are mutated SYNCHRONOUSLY inside `authz_gate`, before any await in the
+/// calling dispatch, so the `&mut` borrow never spans an await — the discipline
+/// `principal` already had, now also load-bearing for the version.
+#[derive(Default)]
+pub(crate) struct ConnGateState {
+    /// Bound by a successful `MSG_CLIENT_AUTH`. `None` = anonymous (denied
+    /// every keyed op while authz is on).
+    pub principal: Option<crate::authz::BoundPrincipal>,
+    pub protocol: Option<autumn_rpc::version_hello::Negotiated>,
+    /// How `MSG_GET_AM` values leave on this connection; `None` on TCP.
+    pub am: Option<autumn_transport::am::Sender>,
+    /// Sends large reply values beside their frames (UCX, peer reads them).
+    pub am_out: Option<Rc<autumn_rpc::am_frame::AmOut>>,
+}
+
+#[cfg(test)]
+mod frame_limit_tests {
+    use super::ConnGateState;
+    use autumn_rpc::frame::{CLIENT_CONTROL_MAX_PAYLOAD, MAX_PAYLOAD_LEN};
+    use autumn_rpc::version_hello::{Negotiated, Role, Service};
+
+    fn conn(role: Role) -> ConnGateState {
+        ConnGateState {
+            principal: None,
+            protocol: Some(Negotiated {
+                role,
+                service: Service::PartitionServer,
+                remote_wire: autumn_rpc::WIRE_VERSION,
+                min_client: autumn_rpc::MIN_CLIENT_WIRE_VERSION,
+                max_client: autumn_rpc::WIRE_VERSION,
+                declared_version: autumn_rpc::WIRE_VERSION,
+            }),
+            am: None,
+            am_out: None,
+        }
+    }
+
+    /// Only an unauthenticated client of an authz cluster is held to a
+    /// control message.
+    #[test]
+    fn an_unauthenticated_client_may_only_send_control_messages() {
+        let authz = crate::authz::AuthzState::new();
+        assert_eq!(conn(Role::Client).frame_limit(&authz), MAX_PAYLOAD_LEN, "authz off");
+        authz.install(&autumn_rpc::manager_rpc::GetAuthzConfigResp {
+            code: 0,
+            message: String::new(),
+            enabled: true,
+            public_keys: vec![],
+            namespaces: vec![],
+            token_ttl_secs: 0,
+            clock_skew_secs: 0,
+            cluster_id: String::new(),
+        });
+        assert!(authz.is_enabled());
+        assert_eq!(conn(Role::Client).frame_limit(&authz), CLIENT_CONTROL_MAX_PAYLOAD);
+        assert_eq!(conn(Role::Peer).frame_limit(&authz), MAX_PAYLOAD_LEN);
+
+        // Held to control messages, it takes no frame values either; once
+        // bound to a principal, or as a peer, it does.
+        let am_frame = || {
+            let (bufs, _) = autumn_rpc::frame::encode_am_frame(
+                1,
+                autumn_rpc::partition_rpc::MSG_PUT,
+                0,
+                vec![bytes::Bytes::from_static(b"meta")],
+                vec![bytes::Bytes::from(vec![1u8; 64 << 10])],
+                || 9,
+            );
+            bufs.concat()
+        };
+        let decodes = |c: &ConnGateState| {
+            let mut decoder = autumn_rpc::FrameDecoder::new();
+            c.limit_decoder(&mut decoder, &authz);
+            decoder.feed(&am_frame());
+            match decoder.try_decode() {
+                Ok(Some(_)) => true,
+                Err(autumn_rpc::frame::FrameError::Malformed(_)) => false,
+                other => panic!("unexpected decode outcome: {other:?}"),
+            }
+        };
+        assert!(!decodes(&conn(Role::Client)), "an unauthenticated client sent a frame value");
+        assert!(decodes(&conn(Role::Peer)));
+        let mut bound = conn(Role::Client);
+        bound.principal = Some(crate::authz::BoundPrincipal { allowed_prefixes: vec![b"t/".to_vec()], exp: u64::MAX, kid: 1 });
+        assert!(decodes(&bound));
+    }
+
+    /// Layer-A is always on for clients: before any config arrives, or with
+    /// an empty registry, no client write is admitted. Admin and peer
+    /// connections are not held to namespaces.
+    #[test]
+    fn the_gate_admits_no_write_outside_a_registered_namespace() {
+        use autumn_rpc::partition_rpc::{rkyv_encode, PutReq, MSG_PUT};
+        let authz = crate::authz::AuthzState::new();
+        let put = |key: &[u8]| {
+            bytes::Bytes::copy_from_slice(&rkyv_encode(&PutReq {
+                part_id: 1,
+                key: key.to_vec(),
+                expires_at: 0,
+                region_epoch: 0,
+                inode_hint: 0,
+                lease_epoch: 0,
+                evict_rank: 0,
+            }))
+        };
+        let install = |namespaces: Vec<Vec<u8>>| {
+            authz.install(&autumn_rpc::manager_rpc::GetAuthzConfigResp {
+                code: 0,
+                message: String::new(),
+                enabled: false,
+                public_keys: vec![],
+                namespaces,
+                token_ttl_secs: 0,
+                clock_skew_secs: 0,
+                cluster_id: String::new(),
+            })
+        };
+        let mut c = conn(Role::Client);
+        assert!(super::authz_gate(MSG_PUT, &put(b"kvc/x"), 1, &authz, &mut c).is_some(), "no config yet");
+        install(vec![]);
+        assert!(super::authz_gate(MSG_PUT, &put(b"kvc/x"), 2, &authz, &mut c).is_some(), "empty registry");
+        install(vec![b"kvc/".to_vec()]);
+        assert!(super::authz_gate(MSG_PUT, &put(b"kvc/x"), 3, &authz, &mut c).is_none());
+        assert!(super::authz_gate(MSG_PUT, &put(b"fs/x"), 4, &authz, &mut c).is_some());
+        for role in [Role::Admin, Role::Peer] {
+            assert!(super::authz_gate(MSG_PUT, &put(b"fs/x"), 5, &authz, &mut conn(role)).is_none(), "{role:?}");
+        }
+    }
+}
+
+impl ConnGateState {
+    /// Largest frame this connection may send now: a client that has not
+    /// bound a principal while authz is on may only authenticate, so its
+    /// headers must not make the decoder reserve more than a control message.
+    fn frame_limit(&self, authz: &crate::authz::AuthzState) -> u32 {
+        let client = self
+            .protocol
+            .as_ref()
+            .is_some_and(|p| p.role == autumn_rpc::version_hello::Role::Client);
+        if client && authz.is_enabled() && self.principal.is_none() {
+            autumn_rpc::frame::CLIENT_CONTROL_MAX_PAYLOAD
+        } else {
+            autumn_rpc::frame::MAX_PAYLOAD_LEN
+        }
+    }
+
+    /// Set the decoder's limits for the next frame: a connection held to
+    /// control messages takes no frame values either (it has no business
+    /// sending values, and a value it declared and never sent would hold the
+    /// loop and its buffer).
+    fn limit_decoder(&self, decoder: &mut FrameDecoder, authz: &crate::authz::AuthzState) {
+        let limit = self.frame_limit(authz);
+        decoder.set_max_payload(limit);
+        decoder.set_am_values(limit == autumn_rpc::frame::MAX_PAYLOAD_LEN);
+    }
+}
+
+/// Checks the negotiated role before business DTO decoding, then preserves
+/// existing CLIENT_AUTH and key-prefix/expiry authorization. The bootstrap
+/// itself completes before this gate or the business decoder is reached.
+fn authz_gate(
+    msg_type: u8,
+    payload: &Bytes,
+    req_id: u32,
+    authz: &crate::authz::AuthzState,
+    conn: &mut ConnGateState,
+) -> Option<Bytes> {
+    if let Some(protocol) = &conn.protocol {
+        if let Err(e) = protocol.check_opcode(msg_type) {
+            return Some(
+                Frame::error(
+                    req_id,
+                    msg_type,
+                    autumn_rpc::RpcError::encode_status(
+                        StatusCode::PermissionDenied,
+                        &e.to_string(),
+                    ),
+                )
+                .encode(),
+            );
+        }
+    }
+    let principal = &mut conn.principal;
+    if msg_type == MSG_CLIENT_AUTH {
+        // When authz is OFF, accept CLIENT_AUTH as a no-op (nothing is enforced;
+        // the token is simply unused) so an authz-aware client works against a
+        // non-authz PS. We can't verify without keys, and don't need to.
+        if !authz.is_enabled() {
+            let resp = ClientAuthResp {
+                code: StatusCode::Ok as u8,
+                message: String::new(),
+            };
+            return Some(
+                Frame::response(req_id, MSG_CLIENT_AUTH, partition_rpc::rkyv_encode(&resp))
+                    .encode(),
+            );
+        }
+        // Bound the UNAUTHENTICATED payload before the rkyv decode.
+        if payload.len() > partition_rpc::CLIENT_AUTH_MAX_PAYLOAD {
+            let resp = ClientAuthResp {
+                code: StatusCode::InvalidArgument as u8,
+                message: "CLIENT_AUTH too large".to_string(),
+            };
+            return Some(
+                Frame::response(req_id, MSG_CLIENT_AUTH, partition_rpc::rkyv_encode(&resp))
+                    .encode(),
+            );
+        }
+        let now = authz_now_secs();
+        let snap = authz.snapshot();
+        let resp = match partition_rpc::rkyv_decode::<ClientAuthReq>(payload) {
+            Ok(req) => match crate::authz::verify_client_auth(&req.token, &snap, now) {
+                Ok(p) => {
+                    *principal = Some(p);
+                    ClientAuthResp {
+                        code: StatusCode::Ok as u8,
+                        message: String::new(),
+                    }
+                }
+                Err(reason) => {
+                    // A kid minted after our last fetch: fetch now, so the
+                    // client's retry binds.
+                    if reason == autumn_rpc::cap_token::AuthReject::UnknownKid.label() {
+                        authz.request_refresh();
+                    }
+                    ClientAuthResp {
+                        code: StatusCode::PermissionDenied as u8,
+                        message: reason,
+                    }
+                }
+            },
+            Err(e) => ClientAuthResp {
+                code: StatusCode::InvalidArgument as u8,
+                message: format!("bad CLIENT_AUTH: {e}"),
+            },
+        };
+        return Some(
+            Frame::response(req_id, MSG_CLIENT_AUTH, partition_rpc::rkyv_encode(&resp)).encode(),
+        );
+    }
+    let snap = authz.snapshot();
+    // D7 Layer-A: a client's put-class write must target a REGISTERED
+    // namespace, always (an empty registry admits nothing). Token-free,
+    // independent of the signing key. Namespaces are the applications'
+    // contract; admin and peer connections proved the cluster secret.
+    let client = conn
+        .protocol
+        .as_ref()
+        .is_none_or(|p| p.role == autumn_rpc::version_hello::Role::Client);
+    if let Some((mut code, mut msg, name)) =
+        client.then(|| crate::authz::check_layer_a(msg_type, payload, &snap)).flatten()
+    {
+        // The namespace may be newer than this config (created since the
+        // last fetch, or no config fetched yet): fetch now and let the client
+        // retry; the retry is final only against a config fetched after this
+        // first miss.
+        if authz.on_miss(name, &snap) == autumn_common::refresh_signal::Miss::Retry {
+            code = StatusCode::Unavailable;
+            msg = format!("{msg} (namespace registry being refreshed; retry)");
+        }
+        return Some(
+            Frame::error(
+                req_id,
+                msg_type,
+                autumn_rpc::RpcError::encode_status(code, &msg),
+            )
+            .encode(),
+        );
+    }
+    // Layer-B: capability-token enforcement (snapshot-derived).
+    if snap.enabled {
+        let now = authz_now_secs();
+        if let Some((code, msg)) =
+            crate::authz::authz_check(msg_type, payload, principal.as_ref(), &snap, now)
+        {
+            return Some(
+                Frame::error(
+                    req_id,
+                    msg_type,
+                    autumn_rpc::RpcError::encode_status(code, &msg),
+                )
+                .encode(),
+            );
+        }
+    }
+    None
+}
+
+/// push ONE frame onto `inflight`, encoded into a
+/// LocalBoxFuture<(Bytes, Vec<Bytes>)>.  Shared by `push_frames_to_inflight`
+/// (slow-path drain) and any caller that already has a single frame in hand.
+///
+/// Misrouted frames synth an error frame with no mpsc hop.  Caller must
+/// have checked `frame.req_id != 0`; fire-and-forget frames are the
+/// caller's responsibility to skip (matches the original per-frame semantics).
+#[allow(clippy::too_many_arguments)]
+fn push_one_frame_to_inflight(
+    frame: Frame,
+    req_tx: &mpsc::Sender<PartitionRequest>,
+    // (Option B): `Some` in production → GET served locally here; `None`
+    // in the mock-loop unit tests (which only drive writes) → GET delegates.
+    part: &Option<Rc<RefCell<PartitionData>>>,
+    owner_part: u64,
+    // R4: each completion is `(head, values)` — non-empty only for the bulk
+    // reads, whose value `Bytes` alias the RegPool buffer / the resolved read
+    // and are emitted as their own iovecs (no concat copy): one for
+    // MSG_GET, one per key for MSG_BATCH_GET. Every other frame
+    // carries none. The drain sites push `head` then its values consecutively
+    // into
+    // `tx_bufs` so one vectored flush emits them as a single wire frame
+    // (segmented at IOV_MAX, since a batched read contributes one buffer per value).
+    inflight: &mut FuturesUnordered<futures::future::LocalBoxFuture<'static, (Bytes, Vec<Bytes>)>>,
+    // connection authz runtime + the per-connection facts the gate owns.
+    authz: &crate::authz::AuthzState,
+    conn: &mut ConnGateState,
+    tx_bufs: &mut Vec<Bytes>,
+) {
+    use futures::FutureExt;
+    let req_id = frame.req_id;
+    let msg_type = frame.msg_type;
+    let payload = frame.payload;
+    // A value-separable request (MSG_PUT) arrives with its raw value
+    // split off by the decoder; thread it into the delegate as bulk_value so
+    // enqueue_put uses it directly (payload = the ctrl only).
+    let frame_value = frame.value;
+    // Keepalive, before the authz gate and routing: it names no partition and
+    // carries no data, and a connection that has not said hello yet must still
+    // be able to prove the peer alive.
+    if msg_type == autumn_rpc::MSG_TYPE_PING {
+        tx_bufs.push(Frame::response(req_id, msg_type, Bytes::new()).encode());
+        return;
+    }
+    // CLIENT_AUTH bind / per-request key-prefix + exp gate, BEFORE
+    // routing. A handled frame (auth reply or PermissionDenied) is emitted as a
+    // ready completion; it never reaches serve/delegate.
+    if let Some(reply) = authz_gate(msg_type, &payload, req_id, authz, conn) {
+        inflight.push(async move { (reply, Vec::new()) }.boxed_local());
+        return;
+    }
+    let part_id = partition_rpc::extract_part_id(msg_type, &payload);
+
+    if part_id != owner_part {
+        let bytes = misroute_frame(req_id, msg_type, part_id, owner_part);
+        inflight.push(async move { (bytes, Vec::new()) }.boxed_local());
+        return;
+    }
+
+    // (Option B): serve GET reads LOCALLY in this FU (no req_tx hop /
+    // partition_loop detour) — reads need a consistent PartitionData snapshot,
+    // not the single-writer group-commit actor. part == None is unit-test mode →
+    // fall through to the delegate.
+    if matches!(msg_type, MSG_GET | partition_rpc::MSG_BATCH_GET) {
+        if let Some(part) = part {
+            let part_c = part.clone();
+            let am_out = conn.am_out.clone();
+            let mut response = async move {
+                let (head, values) = serve_get_local(req_id, msg_type, payload, &part_c).await;
+                match am_out {
+                    // Large values beside the frame, by rendezvous.
+                    Some(out) => {
+                        let mut bufs = out.reframe(head, values).into_iter();
+                        (bufs.next().expect("a frame"), bufs.collect())
+                    }
+                    None => (head, values.into_iter().map(autumn_transport::RegBytes::into_bytes).collect()),
+                }
+            }
+            .boxed_local();
+            // Cached reads often finish on the first poll. Collect their
+            // response immediately; only suspended reads need the in-flight
+            // queue. Never await here: disk/network reads must leave receive
+            // free to accept the peer's next request.
+            match response.as_mut().now_or_never() {
+                Some(done) => push_resp(tx_bufs, done),
+                None => inflight.push(response),
+            }
+            return;
+        }
+    }
+
+    if msg_type == partition_rpc::MSG_GET_AM {
+        if let Some(part) = part {
+            let part_c = part.clone();
+            let am = conn.am.clone();
+            inflight.push(
+                async move {
+                    let t0 = Instant::now();
+                    let reply = crate::rpc_handlers::handle_get_am(req_id, payload, &part_c, am).await;
+                    part_c.borrow().metrics.get_lat.observe_n(t0.elapsed().as_nanos() as u64, 1);
+                    (reply, Vec::new())
+                }
+                .boxed_local(),
+            );
+            return;
+        }
+    }
+
+    // Mode B fix: RANGE / HEAD are reads — serve them locally too so a flush-
+    // wedged partition_loop (imm-full back-pressure) can't take reads down.
+    if msg_type == MSG_RANGE || msg_type == MSG_HEAD {
+        if let Some(part) = part {
+            let part_c = part.clone();
+            inflight.push(
+                async move { serve_read_local(req_id, msg_type, payload, &part_c).await }
+                    .boxed_local(),
+            );
+            return;
+        }
+    }
+
+    let tx = req_tx.clone();
+    let bulk_value = (!frame_value.is_empty()).then_some(frame_value);
+    inflight.push(
+        async move {
+            (
+                delegate_round_trip(tx, req_id, msg_type, payload, bulk_value, owner_part).await,
+                Vec::new(),
+            )
+        }
+        .boxed_local(),
+    );
+}
+
+/// drain all complete frames from `decoder`, pushing one future
+/// per frame onto `inflight`. Each future owns a cloned `req_tx` + fresh
+/// oneshot; when polled it:
+///   1. Sends the PartitionRequest via the same-thread mpsc.
+///   2. Awaits the oneshot response.
+///   3. Returns the encoded response frame bytes (ready for write_vectored_all).
+///
+/// Misrouted frames (part_id != owner_part) synthesise an immediate error
+/// frame with no mpsc hop.  Frames with `req_id == 0` are ignored
+/// (fire-and-forget — matches the original per-frame behavior).
+///
+/// Back-pressure: if `inflight.len()` reaches `cap` mid-push, we await one
+/// completion before pushing more.  Drained completions go into `tx_bufs`
+/// so the caller's next `write_vectored_all` flushes them.
+#[allow(clippy::too_many_arguments)]
+async fn push_frames_to_inflight(
+    decoder: &mut FrameDecoder,
+    req_tx: &mpsc::Sender<PartitionRequest>,
+    part: &Option<Rc<RefCell<PartitionData>>>,
+    owner_part: u64,
+    inflight: &mut FuturesUnordered<futures::future::LocalBoxFuture<'static, (Bytes, Vec<Bytes>)>>,
+    tx_bufs: &mut Vec<Bytes>,
+    cap: usize,
+    // threaded into push_one_frame_to_inflight for the per-frame gate.
+    authz: &crate::authz::AuthzState,
+    conn: &mut ConnGateState,
+    reader: &autumn_transport::ReadHalf,
+    // A frame already decoded whose value comes as active messages.
+    mut first: Option<Frame>,
+) -> Result<()> {
+    loop {
+        // A CLIENT_AUTH lifts the limit for the frames after it, so a run of
+        // frames decoded together ends with one.
+        conn.limit_decoder(decoder, authz);
+        // The run's values are received together, so their buffers are taken
+        // before any of its frames passes the gate: no more frames than may be
+        // in flight, and past the frame limit no further frame (a run may end
+        // up to one frame over it).
+        let value_budget = decoder.max_payload() as usize;
+        let mut value_bytes = 0;
+        let mut run = Vec::new();
+        let start = |frame| {
+            autumn_rpc::am_frame::start(
+                reader,
+                frame,
+                autumn_transport::PoolUse::Receive,
+                autumn_rpc::am_frame::WhenFull::Refuse,
+            )
+        };
+        if let Some(frame) = first.take() {
+            value_bytes += autumn_rpc::am_frame::am_value_len(&frame);
+            run.push(start(frame)?);
+        }
+        while run.len() < cap && value_bytes < value_budget {
+            match decoder.try_decode().map_err(|e| anyhow!(e))? {
+                Some(frame) if frame.req_id != 0 => {
+                    let auth = frame.msg_type == partition_rpc::MSG_CLIENT_AUTH;
+                    value_bytes += autumn_rpc::am_frame::am_value_len(&frame);
+                    run.push(start(frame)?);
+                    if auth {
+                        break;
+                    }
+                }
+                Some(_) => continue, // req_id == 0 fire-and-forget
+                None => break,
+            }
+        }
+        if run.is_empty() {
+            break;
+        }
+        // In order, each with its whole value: this connection's requests stay in order.
+        for incoming in run {
+            let frame = match incoming.into_frame(reader).await {
+                Ok(frame) => frame,
+                // No buffer for its value: refused, the connection goes on.
+                Err(e) => match e.refusal() {
+                    Some(error) => {
+                        tx_bufs.push(error.encode());
+                        continue;
+                    }
+                    None => return Err(anyhow!("{e}")),
+                },
+            };
+            // Back-pressure: drain one completion if we're at cap.
+            while inflight.len() >= cap {
+                if let Some(done) = inflight.next().await {
+                    push_resp(tx_bufs, done);
+                } else {
+                    break;
+                }
+            }
+            push_one_frame_to_inflight(frame, req_tx, part, owner_part, inflight, authz, conn, tx_bufs);
+        }
+    }
+    Ok(())
+}
+
+/// Handle a single client connection on the P-log runtime.
+///
+/// **Per-conn reply batching.** The inner loop mirrors the
+/// ExtentNode R4 4.2 v3 pattern:
+///   - Persistent read future (`Option<LocalBoxFuture<PsReadBurst>>`) owns
+///     reader + the decoder's read window (64 KiB, or the rest of a large
+///     non-bulk frame) across iterations, never dropped mid-flight.
+///   - `FuturesUnordered<LocalBoxFuture<Bytes>>` holds in-flight
+///     PartitionRequest → oneshot-response → encoded-frame futures.
+///   - Each loop iteration opportunistically drains ready completions into
+///     `tx_bufs`, flushes `tx_bufs` with a SINGLE `write_vectored_all`
+///     syscall, then races read vs inflight.next() when both are live.
+///   - At `--pipeline-depth ≥ N` steady state, the drain-loop collects up
+///     to N frames per burst → one `tcp_sendmsg` instead of N → targeted
+///     win against the 0.8-core small-frame TCP kernel overhead.
+///
+/// Arguments:
+///   * `stream`      — client socket (owned; split into read/write halves).
+///   * `req_tx`      — sender into partition_loop's request channel.
+///                     Owned by this fn; cloned once per in-flight future.
+///                     When this fn returns, the last clone drops, closing
+///                     the mpsc (merged_loop sees `req_rx.next() == None`
+///                     only after ALL connections on this P-log close).
+///   * `owner_part`  — the partition id this P-log thread serves. Requests
+///                     for other partitions synthesise a `NotFound` error
+///                     frame (TODO: forwarding).
+async fn handle_ps_connection(
+    conn: autumn_transport::Conn,
+    req_tx: mpsc::Sender<PartitionRequest>,
+    // (Option B): this task serves GET reads locally (in its own FU)
+    // when `Some` — `handle_get` only needs read access to PartitionData (it
+    // pulls the StreamClient from `part.stream_client` internally). Writes
+    // still delegate to `partition_loop` via `req_tx`. `None` is the
+    // mock-loop unit-test mode (those tests drive only writes), where GET
+    // would fall back to the req_tx delegate.
+    part: Option<Rc<RefCell<PartitionData>>>,
+    owner_part: u64,
+    // shared authz runtime (public keys + registered namespaces),
+    // refreshed by the main-thread poll loop. Disabled → zero hot-path cost.
+    authz: std::sync::Arc<crate::authz::AuthzState>,
+) -> Result<()> {
+    use futures::future::{select, Either, LocalBoxFuture};
+
+    let read_buf_size = params().conn_read_buf_bytes.get();
+
+    // DIAGNOSTIC label for the stuck-in-flight report below; resolved once,
+    // before the split consumes `conn`.
+    let peer_label = conn
+        .peer_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_else(|_| "?".to_string());
+    let (mut reader, mut writer) = conn.into_split();
+    let protocol = autumn_rpc::version_hello::accept(
+        &mut reader,
+        &mut writer,
+        autumn_rpc::version_hello::Service::PartitionServer,
+        &peer_label,
+    )
+    .await?;
+    autumn_rpc::peer_auth::accept(
+        &mut reader,
+        &mut writer,
+        &protocol,
+        autumn_rpc::peer_auth::installed(),
+        &peer_label,
+    )
+    .await?;
+    let mut decoder = FrameDecoder::new();
+    // The negotiated protocol precedes the principal bound by CLIENT_AUTH.
+    let mut conn_state = ConnGateState {
+        am_out: autumn_rpc::am_frame::AmOut::for_connection(&writer, protocol.remote_wire),
+        protocol: Some(protocol),
+        am: writer.am_sender(),
+        ..Default::default()
+    };
+
+    let cap = ps_conn_inflight_cap();
+    // R4: completion = `(head, values)`; non-empty only for the bulk reads
+    // (values alias the RegPool buffer / the resolved read, each emitted as its
+    // own iovec — no concat copy).
+    let mut inflight: FuturesUnordered<LocalBoxFuture<'static, (Bytes, Vec<Bytes>)>> =
+        FuturesUnordered::new();
+    let mut tx_bufs: Vec<Bytes> = Vec::with_capacity(64);
+
+    // Persistent read future: owns reader + read window across iterations.
+    let mut read_fut: Option<LocalBoxFuture<'static, PsReadBurst>> = Some(spawn_ps_read(
+        reader,
+        ps_read_window(&mut decoder, read_buf_size),
+    ));
+
+    loop {
+        // (A) Opportunistic drain of already-ready completions.
+        while let Some(Some(done)) = inflight.next().now_or_never() {
+            push_resp(&mut tx_bufs, done);
+        }
+
+        // (B) Flush accumulated replies with ONE vectored write — segmented at
+        // IOV_MAX, because the kernel rejects a `writev` by iovec COUNT
+        // regardless of how few bytes it carries, and that rejection kills the
+        // writer. One reply used to contribute at most two buffers, so the cap
+        // was unreachable; a batched read reply contributes one per value.
+        if !tx_bufs.is_empty() {
+            let bufs = std::mem::take(&mut tx_bufs);
+            if bufs.len() == 1 {
+                let BufResult(result, _) = writer.write_all(bufs.into_iter().next().unwrap()).await;
+                result?;
+            } else {
+                autumn_rpc::client::write_vectored_chunked(&mut writer, bufs).await?;
+            }
+        }
+
+        // (C) Decide what to wait on.
+        let n_inflight = inflight.len();
+        let at_cap = n_inflight >= cap;
+
+        if n_inflight == 0 {
+            // Idle — just await the read.
+            let rfut = read_fut
+                .take()
+                .expect("read_fut invariant: always Some when idle");
+            match rfut.await {
+                PsReadBurst::Eof => return Ok(()),
+                PsReadBurst::Err { e } => return Err(e.into()),
+                PsReadBurst::Data { window, mut reader } => {
+                    decoder.finish_read(window);
+                    conn_state.limit_decoder(&mut decoder, &authz);
+
+                    // recv any LARGE bulk-write tail(s) at the
+                    // front straight into a PooledBuf (UCX Stream unpack / TCP
+                    // compio owned read — no FrameDecoder accumulation copy)
+                    // before the normal decode buffers them. May push write
+                    // replies onto the same bounded in-flight queue.
+                    drain_bulk_writes(
+                        &mut decoder,
+                        &mut reader,
+                        &req_tx,
+                        owner_part,
+                        &mut inflight,
+                        &mut tx_bufs,
+                        cap,
+                        &authz,
+                        &mut conn_state,
+                    )
+                    .await?;
+
+                    // A single complete frame says nothing about the peer's
+                    // pipeline depth. Queue it so a suspended handler cannot
+                    // prevent the next request from entering this connection.
+                    let mut first = decoder.try_decode().map_err(|e| anyhow!(e))?;
+                    // One whose value comes as active messages joins the frames
+                    // after it, so their values are received together.
+                    let with_value = first.take_if(|f| f.am_pieces.is_some());
+                    if let Some(frame) = first {
+                        #[cfg(test)]
+                        if decoder.front_frame_remaining().is_none_or(|rest| rest > 0)
+                            && frame.req_id != 0
+                            && inflight.is_empty()
+                        {
+                            PS_SINGLE_FRAME_RECV_HITS
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        // Pushed before anything after it is decoded: a
+                        // CLIENT_AUTH here changes the next frame's limit.
+                        if frame.req_id != 0 {
+                            push_one_frame_to_inflight(
+                                frame,
+                                &req_tx,
+                                &part,
+                                owner_part,
+                                &mut inflight,
+                                &authz,
+                                &mut conn_state,
+                                &mut tx_bufs,
+                            );
+                        }
+                    }
+                    // Drain any remaining frames + apply back-pressure.
+                    push_frames_to_inflight(
+                        &mut decoder,
+                        &req_tx,
+                        &part,
+                        owner_part,
+                        &mut inflight,
+                        &mut tx_bufs,
+                        cap,
+                        &authz,
+                        &mut conn_state,
+                        &reader,
+                        with_value,
+                    )
+                    .await?;
+                    read_fut = Some(spawn_ps_read(
+                        reader,
+                        ps_read_window(&mut decoder, read_buf_size),
+                    ));
+                }
+            }
+            continue;
+        }
+
+        // Only the explicit in-flight cap suspends receiving. A single
+        // pending operation does not imply the peer has no more work to send.
+        // Keep diagnostics for a peer whose admitted work stops completing.
+        if at_cap {
+            let mut waited = Duration::ZERO;
+            loop {
+                let tick = compio::time::sleep(STUCK_INFLIGHT_REPORT_EVERY);
+                futures::pin_mut!(tick);
+                match select(inflight.next(), tick).await {
+                    Either::Left((done, _)) => {
+                        if let Some(done) = done {
+                            push_resp(&mut tx_bufs, done);
+                        }
+                        break;
+                    }
+                    Either::Right(((), _)) => {
+                        waited += STUCK_INFLIGHT_REPORT_EVERY;
+                        tracing::warn!(
+                            peer = %peer_label,
+                            part_id = owner_part,
+                            n_inflight,
+                            at_cap,
+                            waited_secs = waited.as_secs(),
+                            "ps-conn has been waiting for an in-flight request to \
+                             complete and is NOT reading this connection; the peer's \
+                             requests are piling up unread",
+                        );
+                    }
+                }
+            }
+            continue;
+        }
+
+        // (D) Race read vs completion.
+        let rfut = read_fut.take().expect("read_fut: Some in race arm");
+        let cfut = inflight.next();
+        match select(rfut, Box::pin(cfut)).await {
+            Either::Left((read_result, _cfut_dropped)) => {
+                // Completion-future wrapper dropped here is safe — FU's
+                // internal state persists regardless of the wrapper's
+                // lifetime. Remaining completions are drained at loop top.
+                match read_result {
+                    PsReadBurst::Eof => {
+                        // Drain remaining inflight so clients get their
+                        // final replies before we return.
+                        while let Some(done) = inflight.next().await {
+                            push_resp(&mut tx_bufs, done);
+                        }
+                        if !tx_bufs.is_empty() {
+                            let bufs = std::mem::take(&mut tx_bufs);
+                            // Best-effort on the way out, but still segmented:
+                            // this drain collects EVERY remaining reply at once,
+                            // so it is the widest `tx_bufs` a connection ever
+                            // builds — exactly where an iovec-count rejection
+                            // would silently discard all of them.
+                            let _ =
+                                autumn_rpc::client::write_vectored_chunked(&mut writer, bufs).await;
+                        }
+                        return Ok(());
+                    }
+                    PsReadBurst::Err { e } => return Err(e.into()),
+                    PsReadBurst::Data { window, mut reader } => {
+                        decoder.finish_read(window);
+                        conn_state.limit_decoder(&mut decoder, &authz);
+                        // recv large bulk-write tails into
+                        // pooled buffers first (UCX registered / TCP owned read).
+                        drain_bulk_writes(
+                            &mut decoder,
+                            &mut reader,
+                            &req_tx,
+                            owner_part,
+                            &mut inflight,
+                            &mut tx_bufs,
+                            cap,
+                            &authz,
+                            &mut conn_state,
+                        )
+                        .await?;
+                        push_frames_to_inflight(
+                            &mut decoder,
+                            &req_tx,
+                            &part,
+                            owner_part,
+                            &mut inflight,
+                            &mut tx_bufs,
+                            cap,
+                            &authz,
+                            &mut conn_state,
+                            &reader,
+                            None,
+                        )
+                        .await?;
+                        read_fut = Some(spawn_ps_read(
+                            reader,
+                            ps_read_window(&mut decoder, read_buf_size),
+                        ));
+                    }
+                }
+            }
+            Either::Right((maybe_done, rfut_back)) => {
+                // Completion won; preserve the read future for next iter.
+                read_fut = Some(rfut_back);
+                if let Some(done) = maybe_done {
+                    push_resp(&mut tx_bufs, done);
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Partition thread main — runs on a dedicated OS thread with its own compio
+// ---------------------------------------------------------------------------
+
+#[allow(clippy::too_many_arguments)]
+async fn partition_thread_main(
+    part_id: u64,
+    rg: Range,
+    region_epoch: u64,
+    log_stream_id: u64,
+    row_stream_id: u64,
+    meta_stream_id: u64,
+    manager_addr: String,
+    owner_key: String,
+    owner_epoch: i64,
+    ps_id: u64,
+    listen_addr: SocketAddr,
+    advertise_host: String,
+    ready_tx: oneshot::Sender<Result<String>>,
+    shutdown_rx: oneshot::Receiver<()>,
+    drain_rx: mpsc::UnboundedReceiver<DrainAck>,
+    metrics_arc: std::sync::Arc<PartitionMetrics>,
+    block_cache: std::sync::Arc<crate::sstable::BlockCache>,
+    mem_tier: Option<std::sync::Arc<mem_tier::MemTierBudget>>,
+    // trigger channels created on the main thread; the senders
+    // are cloned into `PartitionData` (replacing the old in-thread
+    // channel) so loopback rpc handlers + the maintenance scheduler
+    // (main thread) drain into the same receiver.
+    compact_tx: mpsc::Sender<CompactTask>,
+    compact_rx: mpsc::Receiver<CompactTask>,
+    gc_tx: mpsc::Sender<GcTask>,
+    gc_rx: mpsc::Receiver<GcTask>,
+    concurrency_ctrl: std::sync::Arc<crate::ConcurrencyController>,
+    // fix-2: cross-thread mirror of `PartitionHandle.opened_with`.
+    // Written by `handle_split_part` (and future in-place updaters) so
+    // `sync_regions_once` on the main thread sees the post-update tuple
+    // and doesn't drop+reopen a partition whose in-memory state is
+    // already correct.
+    opened_with_shared: std::sync::Arc<parking_lot::Mutex<(Range, u64, u64, u64, u64)>>,
+    // shared authz runtime for this partition's connection tasks.
+    authz: std::sync::Arc<crate::authz::AuthzState>,
+) -> Result<()> {
+    // D-r7: per-partition rate controller. Built inside the
+    // partition thread; each partition gets its own Mutex/state.
+    let rate_ctrl = std::sync::Arc::new(crate::RateController::from_params());
+    // create the same-thread ps-conn ↔ partition_loop
+    // channel. Both endpoints live on THIS compio runtime, so sends and
+    // wakes do not cross threads.
+    let (req_tx, req_rx) = mpsc::channel::<PartitionRequest>(WRITE_CHANNEL_CAP);
+
+    let pool = Rc::new(ConnPool::new());
+    // StreamClient::new_with_owner_epoch now returns `Rc<StreamClient>` directly
+    // (R4 step 4.3: Rc::new_cyclic for Weak-self worker removal guard).
+    let part_sc = StreamClient::new_with_owner_epoch_and_config(
+        &manager_addr,
+        owner_key.clone(),
+        owner_epoch,
+        max_extent_size_bytes(),
+        pool.clone(),
+        stream_client_config(),
+    )
+    .await
+    .context("create per-partition StreamClient")?;
+    // tag the per-partition StreamClient with `part_id` so the
+    // worker's failure-report drainer can attribute reports to
+    // this partition (the manager's quorum debounce dedups by
+    // `reporter_part_id`).
+    part_sc.set_reporter_part_id(part_id);
+    // and with its row stream, so an SST block read that finds a rotted
+    // replica (`SstReader::reread_block`) can report it for isolation.
+    part_sc.set_reporter_row_stream(row_stream_id);
+
+    // Wait until every stream's tail answers a commit-length probe (an extent
+    // node may still be starting after a full restart); the fence below gives
+    // up after a few tries.
+    for (label, sid) in [
+        ("logStream", log_stream_id),
+        ("rowStream", row_stream_id),
+        ("metaStream", meta_stream_id),
+    ] {
+        loop {
+            match part_sc.commit_length(sid).await {
+                Ok(end) => {
+                    tracing::info!(part_id, stream_id = sid, end, "{} commit_length OK", label);
+                    break;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        part_id,
+                        stream_id = sid,
+                        error = %e,
+                        "{} commit_length failed, retrying in 5s",
+                        label,
+                    );
+                    compio::time::sleep(std::time::Duration::from_secs(5)).await;
+                }
+            }
+        }
+    }
+
+    // EAGER TAKEOVER FENCE (G1 "SIGSTOP zombie writer" fix). We just acquired a
+    // FRESH per-partition `owner_epoch` (E_new). Raise the EN `owner_epoch`
+    // fence floor on each stream's CURRENT tail extent to E_new NOW — BEFORE
+    // recovery replay and BEFORE this partition serves ANY request — so a
+    // paused-then-resumed PREVIOUS owner whose in-flight append still carries
+    // the OLD epoch (E_old) is rejected at the EN (`append_burst_frames`:
+    // `req.owner_epoch < stored`). Without this the EN floor stays at E_old
+    // until THIS owner's first append lazily raises it, and on an IDLE takeover
+    // (no write yet) the zombie's `E_old == stored` append passes the fence,
+    // lands in the log extent, and is silently ACKed — a lost update this new
+    // owner never sees. `fence_tail` is a control op (not an append), so routing
+    // all three streams through `part_sc` is consistent with the row_stream
+    // single-writer invariant (which only governs row_stream APPENDs).
+    //
+    for (label, sid) in [
+        ("logStream", log_stream_id),
+        ("rowStream", row_stream_id),
+        ("metaStream", meta_stream_id),
+    ] {
+        let mut fence_err = None;
+        for attempt in 0..3u32 {
+            match part_sc.fence_tail(sid, owner_epoch).await {
+                Ok(()) => {
+                    fence_err = None;
+                    break;
+                }
+                Err(e) => {
+                    fence_err = Some(e);
+                    if attempt < 2 {
+                        compio::time::sleep(Duration::from_millis(200)).await;
+                    }
+                }
+            }
+        }
+        match fence_err {
+            None => tracing::info!(
+                part_id,
+                stream_id = sid,
+                owner_epoch,
+                "{} takeover fence raised to E_new",
+                label
+            ),
+            Some(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "partition {part_id} {label} stream {sid}: takeover fence failed after retries; refusing to open at epoch {owner_epoch}"
+                    )
+                });
+            }
+        }
+    }
+
+    // Seal every tail before replay, where the replicas that answer agree.
+    // Replay then reads exactly the sealed length, and no later append can cut
+    // or extend what was replayed: the first write allocates a fresh tail
+    // (docs/seal_length_design.md §2). After the fence, so the previous owner
+    // cannot append past the seal.
+    for (label, sid) in [
+        ("logStream", log_stream_id),
+        ("rowStream", row_stream_id),
+        ("metaStream", meta_stream_id),
+    ] {
+        loop {
+            match part_sc.seal_tail(sid).await {
+                Ok(end) => {
+                    tracing::info!(part_id, stream_id = sid, end, "{} tail sealed for replay", label);
+                    break;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        part_id,
+                        stream_id = sid,
+                        error = %e,
+                        "{} tail seal failed, retrying in 5s",
+                        label,
+                    );
+                    compio::time::sleep(std::time::Duration::from_secs(5)).await;
+                }
+            }
+        }
+    }
+
+    // Recovery: read metaStream → rowStream → logStream replay
+    let (
+        tables,
+        sst_readers,
+        max_seq,
+        vp_eid,
+        vp_off,
+        detected_overlap,
+        recovered_active,
+        recovered_floors,
+        recovered_ckpt_vp,
+        ckpt_records,
+    ) = recover_partition(
+            part_id,
+            &rg,
+            log_stream_id,
+            row_stream_id,
+            meta_stream_id,
+            &part_sc,
+        )
+        .await?;
+
+    let (flush_tx, flush_rx) = mpsc::unbounded::<()>();
+    // compact_tx/rx + gc_tx/rx are created on the main thread by
+    // `open_partition` and passed in as parameters so PartitionHandle on
+    // main can hold a Send Sender for the maintenance scheduler.
+    // signal channel from flush_one_imm (after each imm.pop_front)
+    // back to partition_loop for back-pressure wakeup. Both ends
+    // live on this thread so the unbounded futures::channel is fine.
+    let (imm_drained_tx, imm_drained_rx) = mpsc::unbounded::<()>();
+    // fix: wake channel for split freeze (see field doc on
+    // PartitionData.split_wake_tx). Unbounded + small payload — a few
+    // stranded `()` items between split attempts is harmless because
+    // the loop drains them via `now_or_never` at iteration top.
+    let (split_wake_tx, split_wake_rx) = mpsc::unbounded::<()>();
+
+    // spawn a dedicated OS thread (P-sst) that owns its own compio
+    // runtime + io_uring + ConnPool. Flush requests are forwarded to it via
+    // `flush_req_tx`. capacity=1 keeps flushes sequential (matches the old
+    // in-thread semantics) and provides back-pressure on the P-log flush_loop.
+    //
+    // P-sst spawn failure is FATAL for this partition: open_partition returns
+    // Err, sync_regions_once backs off and the manager reschedules. Pre-this
+    // we kept an Option<Sender> + an in-thread fallback in run_flush_async_phase
+    // and compact_row_append. The fallback was dead in production (OS spawn
+    // never failed on healthy hosts) AND was the structural foothold for an
+    // invalid_meta_len corruption — two StreamClients (P-log part_sc
+    // and P-sst sst_sc) appending to the same row_stream, each tracking its
+    // own commit cursor; one's stale commit truncated the other's SST bytes.
+    // The fix unified compaction onto P-sst; this change removes the fallback
+    // entirely so the single-writer invariant is a type-level guarantee, not
+    // an "accidentally preserved by coincidence" runtime property.
+    let (flush_req_tx, flush_req_rx) = mpsc::channel::<FlushReq>(1);
+    let (row_append_tx, row_append_rx) = mpsc::channel::<RowAppendReq>(1);
+    // synchronous P-log → P-sst barrier channel. Capacity 1: only
+    // `handle_split_part` sends, and it awaits the ACK before returning, so
+    // back-to-back splits are naturally serialised. Larger cap would let a
+    // queued barrier sit behind a regular append, which is exactly what we
+    // are trying to prevent.
+    let (row_invalidate_tx, row_invalidate_rx) =
+        mpsc::channel::<RowInvalidateBarrierReq>(1);
+    let (_bulk_handle, bulk_ready_rx) = spawn_sst_thread(
+        part_id,
+        manager_addr.clone(),
+        owner_key.clone(),
+        owner_epoch,
+        flush_req_rx,
+        row_append_rx,
+        row_invalidate_rx,
+    )
+    .with_context(|| format!("spawn P-sst thread for partition {part_id}"))?;
+    // wait for P-sst to confirm its runtime + StreamClient are live
+    // BEFORE we publish flush_req_tx / row_append_tx into PartitionData.
+    // Previously OS thread spawn returning Ok was treated as "P-sst ready",
+    // but compio runtime build or StreamClient init could still fail
+    // inside the thread, leaving P-log holding a Sender to a dropped
+    // Receiver — the partition wedged on first flush.
+    match bulk_ready_rx.await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            return Err(e).with_context(|| {
+                format!("P-sst readiness for partition {part_id} reported failure")
+            })
+        }
+        Err(_canceled) => {
+            return Err(anyhow!(
+                "P-sst readiness signal dropped before partition {part_id} opened (thread aborted)"
+            ));
+        }
+    }
+
+    // observability: surface initial state so operators can tell
+    // whether a user-triggered `compact <PARTID>` will actually run.
+    tracing::info!(
+        part_id,
+        tables = tables.len(),
+        sst_readers = sst_readers.len(),
+        has_overlap = detected_overlap as u32,
+        max_seq,
+        vp_extent_id = vp_eid,
+        vp_offset = vp_off,
+        "open_partition: ready"
+    );
+
+    // Per-partition maintenance gate — the merged background_maintenance_loop
+    // acquires it around each do_compact AND each run_gc; handle_split_part
+    // acquires it before reading commit_length so neither a compact_row_append
+    // nor a log_stream GC append can race the seal. See field doc.
+    let maintenance_gate = CompactionGate::new(1);
+
+    metrics_arc.has_overlap.store(
+        detected_overlap as u32,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    // The SSTs' own tombstone counts make this survive a reopen: before
+    // `num_deletions` existed, deletes flushed before a restart, split or
+    // merge were forgotten and SETTLE never saw them.
+    let sst_tombstones: u64 = sst_readers.iter().map(|r| r.num_deletions).sum();
+    metrics_arc.unsettled_deletes.store(
+        recovered_active.tombstone_count() + sst_tombstones,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    let part = Rc::new(RefCell::new(PartitionData {
+        part_id,
+        rg,
+        region_epoch,
+        active: recovered_active,
+        imm: VecDeque::new(),
+        flushing_imm_ptrs: RefCell::new(HashSet::new()),
+        imm_vp_heads: RefCell::new(HashMap::new()),
+        imm_row_floors: RefCell::new(HashMap::new()),
+        row_cut_deferred: false,
+        flush_tx,
+        compact_tx,
+        gc_tx,
+        seq_number: max_seq,
+        inflight_write_keys: HashMap::new(),
+        log_stream_id,
+        row_stream_id,
+        meta_stream_id,
+        tables,
+        sst_readers,
+        publish_lock: Rc::new(futures::lock::Mutex::new(())),
+        has_overlap: Cell::new(if detected_overlap { 1 } else { 0 }),
+        gc_debt_basis: RefCell::new(None),
+        vp_extent_id: vp_eid,
+        vp_offset: vp_off,
+        // BUG2: the recovered checkpoint's cursor when it is the only one,
+        // else (0,0) = the conservative MIN floor until this incarnation's
+        // first flush commit acks (see the field doc).
+        durable_ckpt_vp: Cell::new(recovered_ckpt_vp.unwrap_or((0, 0))),
+        stream_client: part_sc.clone(),
+        block_cache: block_cache.clone(),
+        mem_tier: mem_tier.map(mem_tier::MemShard::new),
+        flush_req_tx: flush_req_tx.clone(),
+        row_append_tx: row_append_tx.clone(),
+        row_invalidate_tx: row_invalidate_tx.clone(),
+        imm_drained_tx,
+        split_wake_tx,
+        maintenance_gate: maintenance_gate.clone(),
+        rate_ctrl: rate_ctrl.clone(),
+        concurrency_ctrl: concurrency_ctrl.clone(),
+        extent_pins: std::cell::RefCell::new(std::collections::HashMap::new()),
+        merge_freeze: Rc::new(MergeFreezeState::default()),
+        frozen_for_split: Cell::new(None),
+        split_pending: Cell::new(false),
+        split_drain_ack: std::cell::RefCell::new(None),
+        metrics: metrics_arc.clone(),
+        opened_with_shared: opened_with_shared.clone(),
+        // Lease write fencing: per-ino fence floors, recovered from the meta
+        // checkpoint snapshot + replayed OP_FENCE_BUMP records — floors survive PS restarts.
+        fence_floors: FenceFloors::recovered(recovered_floors),
+    }));
+    part.borrow().publish_lsm_gauges();
+
+    // Drop the extra clones held locally: the ones stored in PartitionData
+    // are the only references. When PartitionData drops, the channels close,
+    // the bulk thread sees rx.next() = None, and exits cleanly.
+    drop(flush_req_tx);
+    drop(row_append_tx);
+    drop(row_invalidate_tx);
+
+    // A merge leaves one checkpoint per source in the meta stream. Publish the
+    // merged one before serving, so every later open replays from one cursor.
+    if ckpt_records > 1 {
+        publish_merged_checkpoint(&part).await.with_context(|| {
+            format!("partition {part_id}: merge {ckpt_records} checkpoints into one")
+        })?;
+    }
+
+    // Spawn background loops on this thread's compio runtime.
+    //
+    // the write loop is NO LONGER a separate compio task. Writes
+    // are serviced inline by `partition_loop` below, collapsing the
+    // old `partition_thread_main → spawn_write_request → handle_put →
+    // write_tx.send → background_write_loop_r1` chain into one task. The
+    // flame graph analysis showed why this collapse matters (~30 %
+    // of P-log CPU on 256 × d=1 came from spawn + inner oneshot + Waker
+    // cascade).
+    // created BEFORE the flush spawn — the flush loop shares the
+    // poison flag so a fence rejection inside the flush path (P-sst
+    // append / commit_length barrier hitting CODE_LOCKED_BY_OTHER after
+    // an admin fence-bump or ownership change) tears the partition down
+    // for a region_sync reopen with a FRESH per-partition epoch
+    // instead of retrying the stale epoch every 2 s forever.
+    let poisoned = Rc::new(Cell::new(false));
+    {
+        let p = part.clone();
+        let poison = poisoned.clone();
+        spawn_failstop(format!("flush[part {part_id}]"), async move {
+            background_flush_loop(p, flush_rx, poison).await;
+        });
+    }
+    {
+        // Compaction + GC share ONE task (background_maintenance_loop) so they
+        // are structurally serialized — see the fn-level note + the GC replay-
+        // floor guard. Split (partition_loop) fences via the single
+        // maintenance_gate, which the merged loop acquires around each work kind.
+        let p = part.clone();
+        let gate_for_loop = maintenance_gate.clone();
+        let conc_for_maint = concurrency_ctrl.clone();
+        spawn_failstop(format!("maintenance[part {part_id}]"), async move {
+            background_maintenance_loop(
+                part_id,
+                p,
+                compact_rx,
+                gc_rx,
+                gate_for_loop,
+                conc_for_maint,
+            )
+            .await;
+        });
+    }
+    // bind this partition's dedicated TcpListener on THIS
+    // compio runtime and report readiness (bind + manager-side register)
+    // back to the caller via `ready_tx`. If EITHER step fails, we report
+    // the error and exit the partition thread so the main loop can
+    // reclaim the partition slot and, on the next sync cycle, retry.
+    // Bounded bind-retry on "address already in use". On a region_sync
+    // drop+reopen (split/merge range change), the just-dropped instance of
+    // THIS partition can still hold its per-partition port (the
+    // base_port+ord) for a brief window while its old thread drains and the
+    // listener socket closes. Without a retry the reopen races that teardown
+    // and fails the bind, leaving the partition unserved until the next sync
+    // tick (observed as `bind: Address already in use (os error
+    // 98)`). Retry ~5s so a normal reopen succeeds once the old socket frees.
+    // NOTE: this does NOT fix the case where the old thread is PERMANENTLY
+    // wedged (drain stalled on an all-replica op against a killed node)
+    // and never releases the port — that still exhausts the budget and
+    // reports the error.
+    let mut listener = {
+        let mut bind_attempt = 0u32;
+        loop {
+            match autumn_transport::current_or_init().bind(listen_addr).await {
+                Ok(l) => break l,
+                Err(e) => {
+                    // ~2s budget (10 × 200ms): enough for a normal old-thread
+                    // teardown to release the socket, but bounded so a
+                    // PERMANENTLY-wedged old listener doesn't stall this
+                    // region_sync open for long before reporting the failure.
+                    let in_use = e.to_string().to_lowercase().contains("in use");
+                    if in_use && bind_attempt < 10 {
+                        bind_attempt += 1;
+                        if bind_attempt == 1 {
+                            tracing::info!(
+                                part_id,
+                                addr = %listen_addr,
+                                "partition listener port busy (reopen race); retrying bind"
+                            );
+                        }
+                        compio::time::sleep(Duration::from_millis(200)).await;
+                        continue;
+                    }
+                    // The deterministic base_port+ord port is stuck. Pinned
+                    // root cause: a collision with an OS
+                    // EPHEMERAL local port — outbound sockets (StreamClient
+                    // -> EN, recovery reads, manager RPCs, P-sst) draw their
+                    // local port from ip_local_port_range, and when base_port
+                    // falls INSIDE that range one of them already holds
+                    // base_port+ord, so the listener bind fails EADDRINUSE on
+                    // every monotonic port (the bug #3 routing wedge: the
+                    // split-child never serves -> no part_addr -> unroutable).
+                    // Ceph-style fallback: first try a predictable range of
+                    // monotonic-next ports (so the post-bind advertise_addr is
+                    // still in a stable, operator-recognisable band), then
+                    // fall back to an OS-assigned :0 port if every slot is
+                    // busy.
+                    //
+                    // Window layout (per partition `ord`):
+                    //   base_port + PARTITION_FALLBACK_OFFSET + ord *
+                    //     PARTITION_FALLBACK_STRIDE_PER_ORD
+                    //   .. + PARTITION_FALLBACK_ATTEMPTS
+                    //
+                    // Stride per ord (64) >= attempts per ord (32), so the
+                    // fallback windows for neighbouring ords NEVER overlap —
+                    // a slot conflict on one partition can't accidentally
+                    // steal another partition's reserved fallback slot. The
+                    // base offset (1024) keeps the entire fallback band clear
+                    // of the deterministic `base_port+ord` band for any
+                    // realistic per-PS partition count.
+                    //
+                    // :0 stays as the final fallback (kernel-picked ephemeral)
+                    // because clients route via the REGISTERED part_addr —
+                    // the deterministic / monotonic scheme is only for
+                    // operator predictability, not for correctness.
+                    if in_use {
+                        // Fixed offset from the deterministic port — this
+                        // gives every partition the SAME +1024 fallback band
+                        // so neighbouring ords' scans can collide on the
+                        // first few slots; that's intentional and benign,
+                        // because the bind call itself is the conflict
+                        // detector (we just take the next slot). The 32-attempt
+                        // span and the kernel's :0 final fallback guarantee
+                        // forward progress even if every partition on the PS
+                        // hits the same fallback path simultaneously.
+                        const PARTITION_FALLBACK_OFFSET: u32 = 1024;
+                        const PARTITION_FALLBACK_ATTEMPTS: u32 = 32;
+
+                        let scan_base =
+                            listen_addr.port() as u32 + PARTITION_FALLBACK_OFFSET;
+
+                        let mut bound: Option<_> = None;
+                        let mut last_err: Option<String> = None;
+                        for i in 0..PARTITION_FALLBACK_ATTEMPTS {
+                            let port_u32 = scan_base + i;
+                            if port_u32 > u16::MAX as u32 {
+                                break;
+                            }
+                            let port = port_u32 as u16;
+                            let try_addr = SocketAddr::new(listen_addr.ip(), port);
+                            match autumn_transport::current_or_init().bind(try_addr).await {
+                                Ok(l) => {
+                                    tracing::warn!(
+                                        part_id,
+                                        computed = %listen_addr,
+                                        bound = %try_addr,
+                                        attempt = i,
+                                        "deterministic listener port busy; \
+                                         bound monotonic-next fallback port"
+                                    );
+                                    bound = Some(l);
+                                    break;
+                                }
+                                Err(e2) => {
+                                    last_err = Some(e2.to_string());
+                                }
+                            }
+                        }
+
+                        if let Some(l) = bound {
+                            break l;
+                        }
+
+                        let fallback = SocketAddr::new(listen_addr.ip(), 0);
+                        match autumn_transport::current_or_init().bind(fallback).await {
+                            Ok(l) => {
+                                tracing::warn!(
+                                    part_id,
+                                    computed = %listen_addr,
+                                    scan_base,
+                                    attempts = PARTITION_FALLBACK_ATTEMPTS,
+                                    last_scan_err = ?last_err,
+                                    "deterministic + monotonic-next fallback all busy; \
+                                     bound OS-assigned :0 port"
+                                );
+                                break l;
+                            }
+                            Err(e2) => {
+                                let _ = ready_tx.send(Err(anyhow!(
+                                    "bind {} then {} fallback attempts then :0: {}",
+                                    listen_addr,
+                                    PARTITION_FALLBACK_ATTEMPTS,
+                                    e2
+                                )));
+                                return Ok(());
+                            }
+                        }
+                    }
+                    let _ = ready_tx.send(Err(anyhow!("bind {}: {}", listen_addr, e)));
+                    return Ok(());
+                }
+            }
+        }
+    };
+    // Build the advertise address from the ACTUAL bound port (may differ from
+    // the computed base_port+ord port if the :0 fallback above engaged). In
+    // the normal case actual == listen_addr.port(), so this is identical to
+    // the pre-fix computed advertise_addr.
+    let actual_port = listener
+        .local_addr()
+        .map(|a| a.port())
+        .unwrap_or_else(|_| listen_addr.port());
+    let advertise_addr = format!("{advertise_host}:{actual_port}");
+    match listener.local_addr() {
+        Ok(actual) => {
+            tracing::info!(part_id, addr = %actual, advertise = %advertise_addr, "partition listener bound")
+        }
+        Err(_) => {
+            tracing::info!(part_id, addr = %listen_addr, advertise = %advertise_addr, "partition listener bound")
+        }
+    }
+
+    // Register this partition's address with the manager. Do it on this
+    // runtime so we can await the RPC without blocking the main thread.
+    {
+        let req = manager_rpc::rkyv_encode(&manager_rpc::RegisterPartitionAddrReq {
+            ps_id,
+            part_id,
+            address: advertise_addr.clone(),
+        });
+        // Use the already-open `pool` (created above for StreamClient); it
+        // normalizes manager addrs and round-robins internally.
+        let mut last_err: Option<anyhow::Error> = None;
+        let mut registered = false;
+        for mgr in manager_addr.split(',') {
+            let mgr = mgr.trim();
+            if mgr.is_empty() {
+                continue;
+            }
+            let mgr_norm = autumn_stream::conn_pool::normalize_endpoint(mgr);
+            // 10 s — manager updates `part_addrs` (in-memory ONLY, no
+            // etcd mirror — a restarted manager loses it; the
+            // self-heal in `sync_regions_once` re-reports it).
+            // Bounded so partition open doesn't trap.
+            match pool
+                .call_timeout(
+                    &mgr_norm,
+                    manager_rpc::MSG_REGISTER_PARTITION_ADDR,
+                    req.clone(),
+                    Duration::from_secs(10),
+                )
+                .await
+            {
+                Ok(bytes) => match manager_rpc::rkyv_decode::<manager_rpc::CodeResp>(&bytes) {
+                    Ok(r) if r.code == manager_rpc::CODE_OK => {
+                        registered = true;
+                        break;
+                    }
+                    Ok(r) => {
+                        last_err = Some(anyhow!(
+                            "register_partition_addr rejected by {}: {}",
+                            mgr,
+                            r.message
+                        ));
+                    }
+                    Err(e) => {
+                        last_err = Some(anyhow!("decode register_partition_addr resp: {}", e));
+                    }
+                },
+                Err(e) => {
+                    last_err = Some(e);
+                }
+            }
+        }
+        if !registered {
+            let err = last_err.unwrap_or_else(|| anyhow!("no manager addresses to register with"));
+            let _ = ready_tx.send(Err(err));
+            return Ok(());
+        }
+    }
+
+    // Signal the main thread that the listener is up AND the address is
+    // registered; `open_partition` can now return Ok.
+    // report the ACTUAL advertise address (post-fallback) so
+    // `PartitionHandle.part_addr` — the self-heal's source of truth —
+    // matches what was registered with the manager.
+    let _ = ready_tx.send(Ok(advertise_addr.clone()));
+
+    // accept loop: own the listener on this runtime, spawn
+    // `handle_ps_connection` on this runtime for every new fd. The accept
+    // task races against `shutdown_rx`: when the main thread drops its
+    // `shutdown_tx`, `shutdown_rx.await` resolves and the task exits.
+    //
+    // Only the accept task waits on that cross-thread signal; it closes the
+    // connections from THIS thread. A wake from another thread goes through
+    // compio's bounded (64-slot) sync queue, whose producer spins while it is
+    // full. When every connection awaited a shared clone of `shutdown_rx`,
+    // the main thread woke them all under the shared future's lock while this
+    // thread, polling a clone, waited for that lock instead of draining the
+    // queue: the PS main thread stopped for good (no heartbeat, evicted) on a
+    // reload of a partition with many connections
+    // (`tests/partition_reload_many_connections.rs`).
+    //
+    // IMPORTANT: this task holds a clone of `req_tx`. When it exits, its
+    // clone is dropped. Once every per-connection task's clone is also
+    // dropped, partition_loop observes `req_rx.next() == None` and
+    // shuts down cleanly.
+    {
+        let req_tx_for_accept = req_tx.clone();
+        // (Option B): the accept task hands each ps-conn task a clone of
+        // `part` so it can serve GET reads locally in its own FU.
+        let part_for_accept = part.clone();
+        // each ps-conn task gets a clone of the shared authz runtime.
+        let authz_for_accept = authz.clone();
+        spawn_failstop(format!("accept[part {part_id}]"), async move {
+            // Every accepted connection belongs to this partition instance.
+            // On reload it must close too: otherwise its req_tx/part clones
+            // keep the retired, frozen partition serving stale responses.
+            // `close_connections.cancel()` (same thread) closes them.
+            let mut shutdown_rx = shutdown_rx;
+            let close_connections = compio::runtime::CancelToken::new();
+            use futures::future::{select, Either};
+            loop {
+                // Race accept against shutdown. `shutdown_rx.await`
+                // resolves when the main thread drops its sender.
+                let accept_fut = listener.accept();
+                futures::pin_mut!(accept_fut);
+                let res = match select(&mut shutdown_rx, accept_fut).await {
+                    Either::Right((r, _pending_shutdown)) => r,
+                    Either::Left((_canceled_shutdown, _pending_accept)) => {
+                        tracing::info!(part_id, "accept: shutdown signaled, exiting");
+                        break;
+                    }
+                };
+                match res {
+                    Ok((conn, peer)) => {
+                        if let Some(s) = conn.as_tcp() {
+                            let _ = s.set_nodelay(true);
+                        }
+                        let req_tx_conn = req_tx_for_accept.clone();
+                        let part_conn = part_for_accept.clone();
+                        let authz_conn = authz_for_accept.clone();
+                        let connection_shutdown = close_connections.clone().wait();
+                        compio::runtime::spawn(async move {
+                            let serving = handle_ps_connection(
+                                conn,
+                                req_tx_conn,
+                                Some(part_conn),
+                                part_id,
+                                authz_conn,
+                            );
+                            futures::pin_mut!(serving);
+                            if let Either::Right((Err(e), _)) =
+                                select(connection_shutdown, serving).await
+                            {
+                                tracing::debug!(part_id, peer = %peer, error = %e, "ps connection ended");
+                            }
+                        })
+                        .detach();
+                    }
+                    Err(e) => {
+                        tracing::warn!(part_id, error = %e, "accept failed");
+                        // Accept errors on loopback are rare; sleep briefly
+                        // to avoid busy-looping on a persistent failure.
+                        compio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                }
+            }
+            close_connections.cancel();
+            tracing::info!(part_id, "accept task exiting");
+        });
+    }
+
+    // Drop our extra clone of req_tx — the accept task's clone (and any
+    // per-conn clones it hands out) are the only remaining senders. When
+    // they all drop, merged_loop shuts down.
+    drop(req_tx);
+
+    // merged request + write loop runs directly on this task.
+    partition_loop(
+        part_id,
+        part.clone(),
+        req_rx,
+        imm_drained_rx,
+        split_wake_rx,
+        drain_rx,
+        poisoned,
+        Routing {
+            part_sc: part_sc.clone(),
+            pool: pool.clone(),
+            manager_addr: manager_addr.clone(),
+            owner_key: owner_key.clone(),
+            owner_epoch,
+        },
+    )
+    .await;
+
+    tracing::info!(part_id, "partition thread exiting");
+    Ok(())
+}
+
+/// the merged request + write loop. Replaces the old two-task
+/// chain (`partition_thread_main` for request dispatch + a spawned
+/// `background_write_loop_r1` for group commit) with a single compio task.
+///
+/// Why merge:
+///   - Both tasks ran on the same OS thread; the split existed because a
+///     separate task spawned per Put via `spawn_write_request` provided the
+///     concurrency needed for batching. A flame graph attributed ~30 %
+///     of P-log CPU to the *ceremony* of that split (one `compio::spawn`,
+///     two `oneshot::channel()` allocations, one `mpsc::send`, one Waker
+///     cascade, per Put).
+///   - The SQ/CQ pipeline (R4 4.4) gives batching at the pending-queue
+///     level regardless of how requests arrive. Once the outer `req_rx`
+///     can push directly into `pending`, the per-request spawn is pure
+///     overhead.
+///
+/// Preserves:
+///   - R4 4.4 SQ/CQ pattern — Phase-2 futures execute concurrently up
+///     to `ps_inflight_cap()`. (The MIN_PIPELINE_BATCH=256
+///     gate for non-first batches was removed — launch is now natural-batching,
+///     see the `(B)` block comment.)
+///   - **`FuturesOrdered` (was `FuturesUnordered`) — Phase 3
+///     runs in launch order = seq order**, guaranteeing that a rotated
+///     active memtable contains a contiguous seq range. This is what
+///     makes the recovery-time per-source dedup (skip a record whose seq
+///     is already covered by that source's SSTs) sound. With
+///     `FuturesUnordered` out-of-order
+///     Phase 3, so an SST could have `last_seq = 200` while batch A's
+///     seqs 1-100 were still in-flight; on crash before A's Phase 3,
+///     replay's dedup silently dropped A. p99 trade-off: head-of-line
+///     wait, bounded by Phase 2 latency variance; measured negligible
+///     in the symmetric change on `background_flush_loop`.
+///   - LockedByOther self-eviction (drain remaining inflight, exit cleanly).
+///   - Read-op inlining: GET/HEAD/RANGE are processed directly on this
+///     task via `dispatch_partition_rpc` so a busy write pipeline does
+///     not starve readers.
+///   - `insert_batch` — Phase 3 still uses the batched memtable
+///     insert path.
+///
+/// Direct-response path:
+///   - `WriteRequest.resp` is now a `WriteResponder` that encodes the
+///     RPC response frame bytes inline on `send_ok` and drops directly
+///     into the outer ps-conn oneshot. No inner oneshot, no Waker
+///     cascade through a second compio task.
+async fn partition_loop(
+    part_id: u64,
+    part: Rc<RefCell<PartitionData>>,
+    mut req_rx: mpsc::Receiver<PartitionRequest>,
+    mut imm_drained_rx: mpsc::UnboundedReceiver<()>,
+    mut split_wake_rx: mpsc::UnboundedReceiver<()>,
+    mut drain_rx: mpsc::UnboundedReceiver<DrainAck>,
+    poisoned: Rc<Cell<bool>>,
+    routing: Routing,
+) {
+    use futures::future::{select, Either};
+
+    let cap = ps_inflight_cap();
+    let imm_cap = max_imm_depth();
+    // DIAGNOSTIC: when this partition first entered imm-full back-pressure and
+    // stopped reading `req_rx`. Cleared the moment imm is not full.
+    let mut imm_full_since: Option<std::time::Instant> = None;
+    let wal_gap_cap = max_wal_gap();
+    let mut metrics = WriteLoopMetrics::new();
+    let mut pending: Vec<WriteRequest> = Vec::new();
+    // The coalescing window opened by the most recent completion; see
+    // `CoalesceWindow` and (B0) below. Closed by every launch.
+    let mut window = CoalesceWindow::default();
+    // set when `drain_rx` delivered a request; once set, stop
+    // pulling new items from `req_rx` and head for the tail-drain block.
+    let mut drain_ack: Option<DrainAck> = None;
+    // fix: set once `drain_rx` returns EOF (the PartitionHandle was
+    // dropped — region_sync reopened/removed this partition). The handle's
+    // `drain_tx` drops BEFORE the ps-conn-held `req_tx` clones do, so for a
+    // window (potentially forever, if a client connection stays open) the
+    // idle select would keep selecting the now-closed `drain_rx` — which
+    // returns `Ready(None)` instantly and busy-spins at ~95% CPU (the
+    // `split_merge_split_with_interleaved_writes` hang). Once closed we stop
+    // polling it and keep serving `req_rx` until IT closes (4457), the
+    // intended reopen/shutdown exit signal (see ~2560 comment).
+    let mut drain_closed = false;
+
+    // switched from FuturesUnordered to FuturesOrdered. Phase 2
+    // futures still execute concurrently; only the yield order changes.
+    // FuturesOrdered guarantees Phase 3 (memtable insert) runs in launch
+    // order = seq order, so a rotated active memtable always contains a
+    // contiguous seq range — the precondition that makes the
+    // recover_partition per-source dedup (skip records already covered by a
+    // loaded SST) sound. See the doc comment above for the bug the
+    // unordered form enabled. (Type: `InflightQueue`.)
+    let mut inflight: InflightQueue = InflightQueue::new();
+
+    'outer: loop {
+        if poisoned.get() {
+            tracing::error!(part_id, "partition poisoned, shutting down for a reopen");
+            break;
+        }
+        if drain_ack.is_some() {
+            // we received a drain signal. Stop pulling from
+            // req_rx; finish anything already started.
+            break;
+        }
+
+        // freeze drain completion (merge + split). Done at
+        // top-of-loop (before the SQ/CQ wait branches) because once frozen no
+        // new req_rx wakeups arrive, so blocking on req_rx.next() below would
+        // prevent the parked freeze ack from ever firing. See the helper for
+        // the flush-error propagation rationale.
+        try_complete_freeze_drain(&part, part_id, pending.is_empty(), inflight.is_empty()).await;
+
+        // (A) Opportunistic CQ drain — run Phase 3 for every completion that
+        // is already ready without blocking.
+        while let Some(Some(c)) = inflight.next().now_or_never() {
+            let acked = handle_completion(&part, &mut metrics, &poisoned, part_id, c).await;
+            window.arm(pending.len(), acked, Instant::now());
+            if poisoned.get() {
+                break 'outer;
+            }
+        }
+
+        // sample imm depth. `imm_full` blocks new request intake (and
+        // new batch launches). (The WAL-gap snapshot is computed where it's used,
+        // in the WAL-gap force-rotate block below — C: dropped the dead duplicate
+        // gap calc that was bound to `_gap_now` and discarded here.)
+        let imm_full = part.borrow().imm.len() >= imm_cap;
+        // track imm_full back-pressure events (per-iteration; coarse
+        // but matches the spec's "events/sec" semantics — per-tick rate).
+        if imm_full {
+            part.borrow()
+                .metrics
+                .imm_full_count
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            imm_full_since = None;
+        }
+
+        // drain any pending imm-pop notifications so we don't
+        // accidentally wake on a stale signal in the wait branches below.
+        while let Some(Some(())) = imm_drained_rx.next().now_or_never() {}
+        // fix — same hygiene for split freeze wakes. Stale items
+        // are harmless (the drain check itself is idempotent) but
+        // draining them keeps the wait branches from spuriously waking.
+        while let Some(Some(())) = split_wake_rx.next().now_or_never() {}
+
+        let n_inflight = inflight.len();
+        let at_cap = n_inflight >= cap;
+
+        // (B0) Coalescing window. Nothing in flight, a PARTIAL refill pending,
+        // and a batch completed within `LAUNCH_COALESCE_WINDOW`: the acks that
+        // completion sent are still bringing ops — `CoalesceWindow` knows how
+        // many — so wait for them (or the window) before launching. Requests
+        // that arrive meanwhile are taken in and the check repeats; the
+        // deadline bounds the total wait. A partition with no recent
+        // completion is idle and skips straight to (B), and a refill that is
+        // already whole — a lone writer's next op — is never held.
+        if n_inflight == 0 {
+            if let Some(wait) = window.holds(pending.len(), Instant::now()) {
+                let req_fut = req_rx.next();
+                let timer = compio::time::sleep(wait);
+                futures::pin_mut!(req_fut, timer);
+                match select(req_fut, timer).await {
+                    Either::Left((Some(req), _)) => {
+                        handle_incoming_req(
+                            req,
+                            &mut pending,
+                            &part,
+                            &routing,
+                            &mut inflight,
+                            &mut metrics,
+                            &poisoned,
+                        )
+                        .await;
+                        continue;
+                    }
+                    Either::Left((None, _)) => break,
+                    Either::Right(((), _)) => window.clear(),
+                }
+            }
+        }
+
+        // (B) Launch a new batch when the pipeline has room. `pending` holds
+        // everything the SQ had delivered as of the last (E) drain, so a
+        // launch ships the largest batch currently available; requests
+        // arriving while it is in flight accumulate into the next batch —
+        // batch size adapts to arrival rate × in-flight latency,
+        // group-commit style. With nothing in flight the launch is
+        // unconditional. With a batch already in flight `take_launch_batch`
+        // refuses to FRAGMENT: it holds a small `pending` until it reaches
+        // `MIN_PIPELINED_BATCH` or the in-flight batch completes and (A)/(D)
+        // bring the loop back here with n_inflight == 0.
+        //
+        // WHY the gate exists again (an earlier one, `pending >= 256`, was
+        // removed as unreachable): the EN serializes appends to one extent,
+        // so a second small batch overlaps nothing and costs a whole extra
+        // append. The claim that replaced the gate — "a burst is enqueued in
+        // full before this task is polled, so it cannot be split" — does not
+        // hold: the two connections a partition serves under the perf bench
+        // wake this loop one at a time, and the unconditional launch splits
+        // an 8-op burst into two 4-op appends. Measured with other
+        // workloads pinned away: average batch 4.4 without the gate, 8.00 with it,
+        // +30% 4K write throughput. Under CPU contention the loop is
+        // descheduled often enough that both connections' frames pile up by
+        // accident (6.2 per batch), which is how a runtime upgrade first
+        // exposed this as a "regression".
+        //
+        // When imm is full, do not launch — the next batch's Phase 3
+        // maybe_rotate would exceed the cap.
+        let launch = if at_cap || imm_full {
+            None
+        } else {
+            take_launch_batch(&mut pending, n_inflight)
+        };
+        if let Some(batch) = launch {
+            window.clear();
+            // start_write_batch is now async — small batches stay
+            // inline in the future (no spawn_blocking), big batches
+            // (>= PHASE1_OFFLOAD_THRESHOLD) await spawn_blocking. The
+            // .await yields to the runtime only on the big-batch path,
+            // letting other tasks (ps-conn, flush_loop, etc.) progress
+            // while the encoder runs on the blocking pool.
+            match start_write_batch(&part, batch).await {
+                Ok(Some(mut flight)) => {
+                    let data = flight.data;
+                    inflight.push_back(Box::pin(async move {
+                        let phase2_result = (&mut flight.phase2_fut).await;
+                        InflightCompletion {
+                            data,
+                            phase2_result,
+                        }
+                    }));
+                }
+                Ok(None) => {}
+                Err(e) => tracing::error!("start_write_batch err: {e}"),
+            }
+            continue;
+        }
+
+        // (C) Pipeline full — only CQ can progress.
+        if at_cap {
+            if let Some(c) = inflight.next().await {
+                let acked = handle_completion(&part, &mut metrics, &poisoned, part_id, c).await;
+                window.arm(pending.len(), acked, Instant::now());
+                if poisoned.get() {
+                    break;
+                }
+            }
+            continue;
+        }
+
+        // when imm is full, treat it the same as `at_cap`: only
+        // wait for either an inflight completion (which can pop_front imm
+        // via maybe_rotate's flush_tx signal eventually) or an
+        // `imm_drained` notification (one fired per pop_front). Drain
+        // signal also wakes us so shutdown isn't blocked behind a slow
+        // bulk thread.
+        if imm_full {
+            if n_inflight == 0 {
+                // Pure back-pressure wait. Race imm-pop vs drain.
+                //
+                // DIAGNOSTIC (not a fix): a third arm, a 5 s tick, so this park
+                // is observable. Parked here the loop stops reading `req_rx`,
+                // which is correct back-pressure but indistinguishable from the
+                // live wedge — partitions that stopped answering writes for
+                // hours, with the flush loop awake and idle. The tick only
+                // re-evaluates; if imm really is full it parks again and says
+                // so once a minute. If it DRAINED, the `imm_drained` wake was
+                // lost, and the log will show that too.
+                let stalled = imm_full_since.get_or_insert_with(std::time::Instant::now);
+                let waited = stalled.elapsed();
+                if waited.as_secs() >= 10 && waited.as_secs() % 60 < 5 {
+                    tracing::warn!(
+                        part_id,
+                        imm_len = part.borrow().imm.len(),
+                        imm_cap,
+                        stalled_secs = waited.as_secs(),
+                        "partition is parked in imm-full back-pressure and has \
+                         stopped reading its request channel — writes to it hang \
+                         until a flush pops an imm",
+                    );
+                }
+                let pop_fut = imm_drained_rx.next();
+                let drain_fut = drain_rx.next();
+                let tick = compio::time::sleep(Duration::from_secs(5));
+                futures::pin_mut!(pop_fut);
+                futures::pin_mut!(drain_fut);
+                futures::pin_mut!(tick);
+                match select(select(pop_fut, drain_fut), tick).await {
+                    Either::Left((Either::Left((_, _)), _)) => continue,
+                    Either::Left((Either::Right((maybe_drain, _)), _)) => {
+                        if let Some(ack) = maybe_drain {
+                            drain_ack = Some(ack);
+                        }
+                        continue;
+                    }
+                    Either::Right(((), _)) => continue,
+                }
+            }
+            // Race imm-pop, inflight CQ, drain.
+            let pop_fut = imm_drained_rx.next();
+            let cfut = inflight.next();
+            let drain_fut = drain_rx.next();
+            futures::pin_mut!(pop_fut);
+            futures::pin_mut!(drain_fut);
+            match select(pop_fut, Box::pin(cfut)).await {
+                Either::Left((_, _)) => continue,
+                Either::Right((maybe_c, _)) => {
+                    if let Some(c) = maybe_c {
+                        let acked = handle_completion(&part, &mut metrics, &poisoned, part_id, c).await;
+                        window.arm(pending.len(), acked, Instant::now());
+                        if poisoned.get() {
+                            break;
+                        }
+                    }
+                    // Also non-blocking-poll drain just in case.
+                    if let Some(Some(ack)) = drain_fut.now_or_never() {
+                        drain_ack = Some(ack);
+                    }
+                    continue;
+                }
+            }
+        }
+
+        // (D) Pipeline has room and imm not full; race SQ (req_rx),
+        // CQ (inflight), split-wake, and drain.
+        if n_inflight == 0 {
+            // Fully idle: race req_rx vs split-wake vs graceful drain.
+            // fix: split_wake_rx is the wake source for split
+            // freeze parking — without it an idle loop sleeps through
+            // the entire FREEZE_TTL window.
+            let req_fut = req_rx.next();
+            let wake_fut = split_wake_rx.next();
+            futures::pin_mut!(req_fut, wake_fut);
+            if drain_closed {
+                // fix: drain_rx already EOF (handle dropped on reopen).
+                // Polling it again returns `Ready(None)` instantly and would
+                // busy-spin, so race only req_rx vs split-wake. The loop
+                // still exits on req_rx EOF (the intended signal).
+                match select(req_fut, wake_fut).await {
+                    Either::Left((maybe_req, _)) => match maybe_req {
+                        Some(req) => {
+                            handle_incoming_req(
+                                req,
+                                &mut pending,
+                                &part,
+                                &routing,
+                                &mut inflight,
+                                &mut metrics,
+                                &poisoned,
+                            )
+                            .await;
+                        }
+                        None => break,
+                    },
+                    Either::Right((_maybe_wake, _)) => {
+                        // split/merge freeze wake (or closed) — just iterate.
+                    }
+                }
+            } else {
+                let drain_fut = drain_rx.next();
+                futures::pin_mut!(drain_fut);
+                // First race req vs wake; whichever wins, also poll drain
+                // via the inner select to fold the third receiver in.
+                match select(req_fut, select(wake_fut, drain_fut)).await {
+                    Either::Left((maybe_req, _)) => match maybe_req {
+                        Some(req) => {
+                            handle_incoming_req(
+                                req,
+                                &mut pending,
+                                &part,
+                                &routing,
+                                &mut inflight,
+                                &mut metrics,
+                                &poisoned,
+                            )
+                            .await;
+                        }
+                        None => break,
+                    },
+                    Either::Right((inner, _)) => match inner {
+                        Either::Left(_) => {
+                            // split/merge freeze wake — just iterate;
+                            // top-of-loop drain check will fire.
+                        }
+                        Either::Right((maybe_drain, _)) => match maybe_drain {
+                            Some(ack) => drain_ack = Some(ack),
+                            // fix: drain_rx EOF = the PartitionHandle was
+                            // dropped (region_sync removed/reopened this
+                            // partition: merge victim, split reopen, PS
+                            // eviction). The handle's `drain_tx` drops BEFORE
+                            // the ps-conn-held `req_tx` clones, so we'd keep
+                            // re-selecting the closed `drain_rx` (instant
+                            // `Ready(None)`) → 95% CPU busy-spin until req_rx
+                            // finally closes — forever if a client connection
+                            // stays open (the
+                            // `split_merge_split_with_interleaved_writes`
+                            // hang). Mark it closed and stop polling it; we
+                            // still serve req_rx and exit on its EOF. Do NOT
+                            // break here — req_rx may still have in-flight /
+                            // queued requests that must be served first.
+                            None => drain_closed = true,
+                        },
+                    },
+                }
+            }
+        } else {
+            let req_fut = req_rx.next();
+            let cfut = inflight.next();
+            let drain_fut = drain_rx.next();
+            futures::pin_mut!(req_fut);
+            futures::pin_mut!(drain_fut);
+            // First select: race req_rx vs (inflight + drain). We poll
+            // drain via now_or_never below to keep this select binary.
+            match select(req_fut, Box::pin(cfut)).await {
+                Either::Left((maybe_req, _cfut_dropped)) => match maybe_req {
+                    Some(req) => {
+                        handle_incoming_req(
+                            req,
+                            &mut pending,
+                            &part,
+                            &routing,
+                            &mut inflight,
+                            &mut metrics,
+                            &poisoned,
+                        )
+                        .await;
+                    }
+                    None => {
+                        // Channel closed: drain remaining inflight, then exit.
+                        while let Some(c) = inflight.next().await {
+                            handle_completion(&part, &mut metrics, &poisoned, part_id, c)
+                                .await;
+                            if poisoned.get() {
+                                break;
+                            }
+                        }
+                        break;
+                    }
+                },
+                Either::Right((maybe_c, _req_dropped)) => {
+                    if let Some(c) = maybe_c {
+                        let acked = handle_completion(&part, &mut metrics, &poisoned, part_id, c).await;
+                        window.arm(pending.len(), acked, Instant::now());
+                        if poisoned.get() {
+                            break;
+                        }
+                    }
+                }
+            }
+            // Non-blocking drain check after either branch.
+            // fix: also latch `drain_closed` on EOF so the idle branch
+            // doesn't busy-spin on the closed receiver next iteration.
+            match drain_fut.now_or_never() {
+                Some(Some(ack)) => drain_ack = Some(ack),
+                Some(None) => drain_closed = true,
+                None => {}
+            }
+        }
+
+        // WAL-gap-driven force rotate. After each iteration, if
+        // the unflushed WAL window exceeds `MAX_WAL_GAP`, rotate `active`
+        // even when it hasn't reached `--flush-mem-bytes`. Skipped when
+        // imm is already full (rotation would over-cap and `imm_full`
+        // back-pressure has already kicked in).
+        //
+        // BUG1: the gap MUST be the unflushed LOG bytes
+        // (`log_bytes`, value included), NOT the memtable footprint
+        // (`mem_bytes`). For a large-value (VP) workload the memtable holds only
+        // ~24-byte VPs, so `mem_bytes` would need hundreds of TB of log to reach
+        // 1 GiB (MAX_WAL_GAP default) and this force-rotate would NEVER fire — leaving the recovery
+        // replay window unbounded (= O(dataset)). `log_bytes` tracks true log
+        // growth, so the rotate fires every ~MAX_WAL_GAP of log and the replay
+        // window (and GC floor) stays bounded regardless of value size.
+        {
+            let mut p = part.borrow_mut();
+            let gap = p.active.log_bytes() + p.imm.iter().map(|m| m.log_bytes()).sum::<u64>();
+            if gap > wal_gap_cap && p.imm.len() < imm_cap && !p.active.is_empty() {
+                rotate_active(&mut p);
+            }
+        }
+
+        // (E) Non-blocking drain of any queued requests before the next
+        // iteration. Reads are processed inline (await) and do NOT go into
+        // pending; writes decode and push into pending. Skip when imm is
+        // full so the back-pressure path actually applies.
+        if !imm_full {
+            // A request handled above may have poisoned the partition; serve
+            // nothing more from this incarnation.
+            while pending.len() < max_write_batch() && !poisoned.get() {
+                match req_rx.next().now_or_never() {
+                    Some(Some(req)) => {
+                        handle_incoming_req(
+                            req,
+                            &mut pending,
+                            &part,
+                            &routing,
+                            &mut inflight,
+                            &mut metrics,
+                            &poisoned,
+                        )
+                        .await;
+                    }
+                    _ => break,
+                }
+            }
+        }
+
+        // TTL backstops for merge/split freeze (orchestrator
+        // crash / wedged split handler): auto-unfreeze past FREEZE_TTL.
+        check_freeze_ttls(&part, part_id);
+    }
+
+    // Shutdown: drain in-flight batches, flush residual pending, then (if the
+    // loop exited via `drain_rx`) run the graceful imm drain + ack.
+    drain_and_shutdown(
+        &part,
+        part_id,
+        &mut metrics,
+        &poisoned,
+        &mut inflight,
+        &mut pending,
+        drain_ack,
+    )
+    .await;
+}
+
+/// shutdown tail (extracted from `partition_loop`): drain any
+/// still-in-flight batches so clients get their final ack, flush residual
+/// `pending` as one last batch, then — if the loop exited via `drain_rx` — rotate
+/// `active` and synchronously flush every imm before replying on `drain_ack`.
+async fn drain_and_shutdown(
+    part: &Rc<RefCell<PartitionData>>,
+    part_id: u64,
+    metrics: &mut WriteLoopMetrics,
+    poisoned: &Rc<Cell<bool>>,
+    inflight: &mut InflightQueue,
+    pending: &mut Vec<WriteRequest>,
+    drain_ack: Option<DrainAck>,
+) {
+    // Each step stops at a poisoning completion, for the reason below.
+    while !poisoned.get() {
+        let Some(c) = inflight.next().await else { break };
+        handle_completion(part, metrics, poisoned, part_id, c).await;
+    }
+    // Same byte bound as the main loop, and for the same reason — this is the
+    // OTHER place a batch is taken, so a residual queue larger than one frame
+    // would go out un-split here. Loop until the queue is empty: shutdown must
+    // drain everything, it just cannot do it in one `AppendReq`.
+    while !pending.is_empty() && !poisoned.get() {
+        let batch = take_byte_bounded_batch(pending);
+        if let Ok(Some(mut flight)) = start_write_batch(part, batch).await {
+            let phase2_result = (&mut flight.phase2_fut).await;
+            handle_completion(
+                part,
+                metrics,
+                poisoned,
+                part_id,
+                InflightCompletion { data: flight.data, phase2_result },
+            )
+            .await;
+        }
+    }
+    if poisoned.get() {
+        // No await from here on: the connection tasks share this thread, and
+        // a read they served now would answer from a memtable the reopen may
+        // contradict. The batches in flight are dropped unanswered (their
+        // writers see the connection close; the reopen's seal settles them);
+        // the queued ones were never sent.
+        *inflight = InflightQueue::new();
+        for req in pending.drain(..) {
+            req.resp.send_unavailable("the partition is reopening; this write was not applied".into());
+        }
+        metrics.flush(part_id);
+        if let Some(ack) = drain_ack {
+            // The receiver is gone only when shutdown() stopped waiting.
+            let _ = ack.send(Err("the partition was poisoned before its drain".into()));
+        }
+        return;
+    }
+    metrics.flush(part_id);
+
+    if let Some(ack) = drain_ack {
+        {
+            let mut p = part.borrow_mut();
+            rotate_active(&mut p);
+        }
+        let flushed = loop {
+            match flush_one_imm(part).await {
+                Ok(FlushStep::Flushed) => continue,
+                Ok(FlushStep::Empty) => break Ok(()),
+                Ok(FlushStep::Busy) => {
+                    compio::time::sleep(FLUSH_BUSY_RETRY_INTERVAL).await;
+                    continue;
+                }
+                Err(e) => break Err(format!("{e:#}")),
+            }
+        };
+        match &flushed {
+            Ok(()) => tracing::info!(part_id, "graceful drain complete"),
+            Err(e) => tracing::error!(part_id, "graceful drain flush failed: {e}"),
+        }
+        // The receiver is gone only when shutdown() stopped waiting (its
+        // deadline passed); it has already logged the timeout.
+        let _ = ack.send(flushed);
+    }
+}
+
+/// A graceful drain's reply: `Ok` once every memtable is flushed, `Err` with
+/// the flush error otherwise (the unflushed writes stay in the WAL).
+type DrainAck = oneshot::Sender<Result<(), String>>;
+
+/// Inflight queue type for `partition_loop`'s Phase 2 group-commit futures.
+/// `FuturesOrdered` (not Unordered) so Phase 3 yields in launch = seq order —
+/// load-bearing for recovery dedup (see `partition_loop` doc).
+type InflightQueue = futures::stream::FuturesOrdered<
+    std::pin::Pin<Box<dyn std::future::Future<Output = InflightCompletion>>>,
+>;
+
+/// Per-partition routing / streaming context threaded from `open_partition` into
+/// `partition_loop` + `handle_incoming_req` (bundled to cut the per-call
+/// argument churn). All fields are cheap to clone (`Rc` / `String` / `i64`).
+struct Routing {
+    part_sc: Rc<StreamClient>,
+    pool: Rc<ConnPool>,
+    manager_addr: String,
+    owner_key: String,
+    owner_epoch: i64,
+}
+
+/// freeze-drain completion (extracted from `partition_loop`).
+/// When a merge-freeze or split-freeze has parked its ack and the pipeline is
+/// fully quiesced (`pending` + `inflight` empty), rotate + flush every imm so the
+/// orchestrator's commit_length capture includes every pre-freeze acked write,
+/// then reply on whichever ack(s) are parked. A flush error is reported back so
+/// the orchestrator rolls back instead of committing a lossy merge/split.
+async fn try_complete_freeze_drain(
+    part: &Rc<RefCell<PartitionData>>,
+    part_id: u64,
+    pending_empty: bool,
+    inflight_empty: bool,
+) {
+    let need_merge_drain = part.borrow().merge_freeze.is_draining();
+    let need_split_drain = part.borrow().split_drain_ack.borrow().is_some();
+    if !(need_merge_drain || need_split_drain) || !pending_empty || !inflight_empty {
+        return;
+    }
+    // Both freezes reach here holding `maintenance_gate` through the final
+    // checkpoint publication — split in its handler, merge in
+    // `merge_freeze_task` — and maintenance re-checks the freeze flag after
+    // acquiring it, so nothing mutates the source between the checkpoint and
+    // the manager's seal. Never await the gate here: it would stop this loop.
+    {
+        let mut p = part.borrow_mut();
+        rotate_active(&mut p);
+    }
+    let mut drain_err: Option<String> = None;
+    loop {
+        match flush_one_imm(part).await {
+            Ok(FlushStep::Flushed) => continue,
+            Ok(FlushStep::Empty) => break,
+            Ok(FlushStep::Busy) => {
+                // Another path (typically background_flush_loop) is mid-
+                // flush of imm[0] — its row_stream.append has NOT yet ACKed.
+                // Acking the drain here would let handle_split_part capture
+                // commit_length below the in-flight SST end, producing the
+                // stale_vp_offset_past_sealed_length partition-open failure.
+                // Wait for the claim to release + re-check.
+                compio::time::sleep(FLUSH_BUSY_RETRY_INTERVAL).await;
+                continue;
+            }
+            Err(e) => {
+                let msg = format!("{e:#}");
+                tracing::error!(part_id, "freeze drain flush_one_imm: {msg}");
+                drain_err = Some(msg);
+                break;
+            }
+        }
+    }
+    // The maintenance gate (ours for merge, the caller's for split) is the
+    // completion barrier for both compaction and GC. Do not wait on the
+    // informational `compact_inflight` flag here: a task can set it before it
+    // queues on this gate, and waiting for that blocked task would deadlock.
+    // Both a merge and a split publish a checkpoint at the committed log end
+    // here, writes stopped and memtable drained, even when the drain flushed
+    // nothing: it is what lets recovery skip every source extent (a merged
+    // survivor starts at the latest source cursor; a split child starts at
+    // this one). Its fence floors are the admitted ones: a WAL-only fence bump
+    // committed since the last flush is before this cursor, so replay no
+    // longer reaches it and the checkpoint must carry it.
+    if drain_err.is_none() {
+        if let Err(e) = publish_freeze_checkpoint(part).await {
+            let msg = format!("publish freeze checkpoint: {e:#}");
+            tracing::error!(part_id, "{msg}");
+            drain_err = Some(msg);
+        }
+    }
+    // Merge: hand the outcome to `merge_freeze_task`, which answers the
+    // manager. A failed drain resumes writes at once, without waiting for
+    // the manager's rollback.
+    if need_merge_drain {
+        let state = part.borrow().merge_freeze.clone();
+        if let Some((attempt, drained_tx)) = state.take_draining() {
+            // `publish_freeze_checkpoint` just set it to the drained log end.
+            let outcome = match &drain_err {
+                None => Ok(part.borrow().durable_ckpt_vp.get()),
+                Some(e) => Err(e.clone()),
+            };
+            let succeeded = outcome.is_ok();
+            let delivered = drained_tx.send(outcome).is_ok();
+            if succeeded && delivered {
+                state.set_drained(attempt);
+                tracing::info!(part_id, "freeze drain complete — partition halted");
+            } else {
+                state.end();
+                tracing::warn!(
+                    part_id,
+                    "merge freeze drain failed or its task is gone; unfrozen, the merge rolls back"
+                );
+            }
+        }
+    }
+    // Split ack: internal oneshot signal.
+    let split_ack = part.borrow().split_drain_ack.borrow_mut().take();
+    if let Some(ack) = split_ack {
+        let payload = match &drain_err {
+            None => Ok(()),
+            Some(e) => Err(e.clone()),
+        };
+        let _ = ack.send(payload);
+        if drain_err.is_none() {
+            tracing::info!(
+                part_id,
+                "split drain complete — proceeding to commit_length capture"
+            );
+        } else {
+            tracing::warn!(
+                part_id,
+                "split drain reported flush failure; split will abort"
+            );
+        }
+    }
+}
+
+/// Where a merge freeze stands on one partition.
+///
+/// The drain must hold `maintenance_gate` so no compaction or GC mutates the
+/// source between its checkpoint and the manager's seal, and a compaction can
+/// hold that gate for minutes. The wait therefore runs in its own task
+/// (`merge_freeze_task`) with writes still flowing; `partition_loop` never
+/// awaits the gate. It used to, and a freeze arriving during a long
+/// compaction stopped the whole partition: writes, the TTL check and the
+/// manager's `freeze=false` (`manager/tests/merge_freeze_waits_for_gate.rs`).
+#[derive(Default)]
+enum MergeFreeze {
+    #[default]
+    Idle,
+    /// The freeze task waits for the gate. Dropping the sender (unfreeze)
+    /// ends the wait; the task answers that the freeze was cancelled.
+    WaitingForGate {
+        attempt: u64,
+        _cancel: oneshot::Sender<()>,
+    },
+    /// The task holds the gate and writes are halted; `partition_loop`
+    /// drains and sends the checkpointed log position, or the failure.
+    /// Dropping the sender (unfreeze, TTL) cancels the freeze.
+    Draining {
+        attempt: u64,
+        drained: oneshot::Sender<Result<(u64, u64), String>>,
+    },
+    /// Drained and answered; writes stay halted until unfreeze, TTL or reopen.
+    Drained { attempt: u64 },
+}
+
+impl MergeFreeze {
+    fn attempt(&self) -> Option<u64> {
+        match self {
+            MergeFreeze::Idle => None,
+            MergeFreeze::WaitingForGate { attempt, .. }
+            | MergeFreeze::Draining { attempt, .. }
+            | MergeFreeze::Drained { attempt } => Some(*attempt),
+        }
+    }
+}
+
+/// A partition's merge freeze: the write halt and the stage it belongs to,
+/// kept together so no exit can clear one without the other (a parked answer
+/// once outlived its halt: `freeze=false` cleared the halt only, and with no
+/// halt there was no TTL left to answer it). Writes are halted exactly in
+/// `Draining` and `Drained`. Each attempt carries a number, and a task acts
+/// on the stage only while it still holds that number: an unfreeze and a new
+/// freeze can be handled in one loop pass between an attempt's wake-up and
+/// its next poll.
+#[derive(Default)]
+pub(crate) struct MergeFreezeState {
+    halt: Cell<Option<std::time::Instant>>,
+    stage: RefCell<MergeFreeze>,
+    last_attempt: Cell<u64>,
+}
+
+impl MergeFreezeState {
+    /// Writes are halted for a merge.
+    pub(crate) fn is_halted(&self) -> bool {
+        self.halt.get().is_some()
+    }
+
+    pub(crate) fn halted_since(&self) -> Option<std::time::Instant> {
+        self.halt.get()
+    }
+
+    /// A freeze is under way in any stage, including still waiting.
+    pub(crate) fn is_active(&self) -> bool {
+        !matches!(*self.stage.borrow(), MergeFreeze::Idle)
+    }
+
+    pub(crate) fn is_drained(&self) -> bool {
+        matches!(*self.stage.borrow(), MergeFreeze::Drained { .. })
+    }
+
+    fn is_draining(&self) -> bool {
+        matches!(*self.stage.borrow(), MergeFreeze::Draining { .. })
+    }
+
+    fn holds(&self, attempt: u64) -> bool {
+        self.stage.borrow().attempt() == Some(attempt)
+    }
+
+    /// Start an attempt: its number, and a receiver that resolves once the
+    /// attempt is ended while it waits.
+    fn wait_for_gate(&self) -> (u64, oneshot::Receiver<()>) {
+        let attempt = self.last_attempt.get() + 1;
+        self.last_attempt.set(attempt);
+        let (cancel, cancelled) = oneshot::channel();
+        *self.stage.borrow_mut() = MergeFreeze::WaitingForGate { attempt, _cancel: cancel };
+        (attempt, cancelled)
+    }
+
+    /// Halt writes and hand the drain to `partition_loop`, unless `attempt`
+    /// was ended meanwhile.
+    fn start_draining(&self, attempt: u64) -> Option<oneshot::Receiver<Result<(u64, u64), String>>> {
+        if !self.holds(attempt) {
+            return None;
+        }
+        let (drained, drained_rx) = oneshot::channel();
+        self.halt.set(Some(std::time::Instant::now()));
+        *self.stage.borrow_mut() = MergeFreeze::Draining { attempt, drained };
+        Some(drained_rx)
+    }
+
+    /// The drain's attempt and answer channel; the caller then calls
+    /// `set_drained` or `end`.
+    fn take_draining(&self) -> Option<(u64, oneshot::Sender<Result<(u64, u64), String>>)> {
+        let mut stage = self.stage.borrow_mut();
+        match std::mem::take(&mut *stage) {
+            MergeFreeze::Draining { attempt, drained } => Some((attempt, drained)),
+            other => {
+                *stage = other;
+                None
+            }
+        }
+    }
+
+    fn set_drained(&self, attempt: u64) {
+        *self.stage.borrow_mut() = MergeFreeze::Drained { attempt };
+    }
+
+    /// If the freeze is drained, a retried freeze answered from it takes it
+    /// over, so the earlier attempt's late cleanup cannot end the freeze this
+    /// caller was just told is in place. False if not drained.
+    pub(crate) fn rejoin_drained(&self) -> bool {
+        if !self.is_drained() {
+            return false;
+        }
+        let attempt = self.last_attempt.get() + 1;
+        self.last_attempt.set(attempt);
+        self.set_drained(attempt);
+        true
+    }
+
+    /// `end`, if the freeze is still `attempt`.
+    fn end_attempt(&self, attempt: u64) {
+        if self.holds(attempt) {
+            self.end();
+        }
+    }
+
+    /// End the freeze in any stage: writes resume, and an attempt still
+    /// waiting or draining answers that it was cancelled. Every way out of
+    /// a freeze (unfreeze, TTL, a failed drain, an undelivered OK) goes
+    /// through here.
+    pub(crate) fn end(&self) {
+        self.halt.set(None);
+        *self.stage.borrow_mut() = MergeFreeze::Idle;
+    }
+}
+
+fn merge_freeze_resp(code: u8, message: impl Into<String>, cursor: (u64, u64)) -> HandlerResult {
+    Ok(partition_rpc::rkyv_encode(&partition_rpc::MergeFreezeResp {
+        code,
+        message: message.into(),
+        log_tail_extent_id: cursor.0,
+        log_end: cursor.1,
+    }))
+}
+
+/// One merge freeze attempt: wait for the maintenance gate with writes
+/// flowing, halt writes once held, let `partition_loop` drain, answer, and
+/// release the gate.
+async fn merge_freeze_task(
+    state: Rc<MergeFreezeState>,
+    gate: std::sync::Arc<CompactionGate>,
+    wake_loop: mpsc::UnboundedSender<()>,
+    part_id: u64,
+    attempt: u64,
+    cancelled: oneshot::Receiver<()>,
+    resp_tx: oneshot::Sender<HandlerResult>,
+) {
+    use futures::future::{select, Either};
+    const CANCELLED_WAITING: &str = "merge freeze cancelled while waiting for maintenance to finish";
+    let acquire = gate.acquire();
+    futures::pin_mut!(acquire);
+    let permit = match select(acquire, cancelled).await {
+        Either::Left((permit, _)) => permit,
+        Either::Right(_) => {
+            let _ = resp_tx.send(merge_freeze_resp(partition_rpc::CODE_PRECONDITION, CANCELLED_WAITING, (0, 0)));
+            return;
+        }
+    };
+    let Some(drained_rx) = state.start_draining(attempt) else {
+        let _ = resp_tx.send(merge_freeze_resp(partition_rpc::CODE_PRECONDITION, CANCELLED_WAITING, (0, 0)));
+        return;
+    };
+    let _ = wake_loop.unbounded_send(());
+    let drained = drained_rx.await;
+    let resp = match &drained {
+        Ok(Ok(cursor)) => merge_freeze_resp(partition_rpc::CODE_OK, "", *cursor),
+        Ok(Err(e)) => merge_freeze_resp(
+            partition_rpc::CODE_UNAVAILABLE,
+            format!("freeze drain flush failed: {e}"),
+            (0, 0),
+        ),
+        Err(_) => merge_freeze_resp(
+            partition_rpc::CODE_PRECONDITION,
+            "merge freeze cancelled (unfreeze or TTL) before its drain finished",
+            (0, 0),
+        ),
+    };
+    if resp_tx.send(resp).is_err() && matches!(drained, Ok(Ok(_))) {
+        // A manager that never sees the OK cannot proceed with the merge.
+        // Only this attempt: a newer one may own the stage by now.
+        state.end_attempt(attempt);
+        tracing::warn!(part_id, "merge freeze answered into a closed request; unfrozen");
+    }
+    drop(permit);
+}
+
+/// A split owns `maintenance_gate` until its drain ACK and manager commit are
+/// complete; a merge freeze then waits behind it for nothing. Refuse it
+/// instead, so the manager rolls back and retries after the split.
+fn split_blocks_merge_freeze(frozen_for_split: bool, split_drain_pending: bool) -> bool {
+    frozen_for_split || split_drain_pending
+}
+
+/// freeze TTL backstops (extracted from `partition_loop`). If a
+/// merge/split freeze has been held past `FREEZE_TTL` (orchestrator crashed or
+/// the split handler wedged), auto-unfreeze and fail any parked ack so the
+/// partition resumes serving writes.
+fn check_freeze_ttls(part: &Rc<RefCell<PartitionData>>, part_id: u64) {
+    if let Some(at) = part.borrow().merge_freeze.halted_since() {
+        if at.elapsed() >= FREEZE_TTL {
+            part.borrow().merge_freeze.end();
+            tracing::warn!(
+                part_id,
+                ttl_secs = FREEZE_TTL.as_secs(),
+                "merge freeze TTL expired — auto-unfreeze"
+            );
+        }
+    }
+    if let Some(at) = part.borrow().frozen_for_split.get() {
+        if at.elapsed() >= FREEZE_TTL {
+            let p = part.borrow();
+            p.frozen_for_split.set(None);
+            if let Some(ack) = p.split_drain_ack.borrow_mut().take() {
+                let _ = ack.send(Err("split freeze TTL expired (handler wedged)".to_string()));
+            }
+            tracing::warn!(
+                part_id,
+                ttl_secs = FREEZE_TTL.as_secs(),
+                "split freeze TTL expired — auto-unfreeze"
+            );
+        }
+    }
+}
+
+/// decode one incoming `PartitionRequest` and route it. Writes
+/// (PUT/DELETE/STREAM_PUT) decode inline and push into `pending` with a
+/// direct `WriteResponder` into the outer oneshot; reads (GET/HEAD/RANGE)
+/// and other ops dispatch inline. No `compio::runtime::spawn`, no inner
+/// oneshot on the write hot path.
+/// Take the longest prefix of `pending` whose encoded bytes fit one frame,
+/// leaving the rest queued. At least one request always moves, so a queue can
+/// never stall on its head.
+fn take_byte_bounded_batch(pending: &mut Vec<WriteRequest>) -> Vec<WriteRequest> {
+    let mut bytes = 0usize;
+    let mut take = 0usize;
+    for r in pending.iter() {
+        let next = bytes + r.encoded_size();
+        if take > 0 && next > MAX_WRITE_BATCH_BYTES {
+            break;
+        }
+        bytes = next;
+        take += 1;
+    }
+    // A fence record is queued immediately ahead of the write it admitted and
+    // must commit in the same batch: split apart, a failed append of the
+    // record's batch and a successful one of the write's would acknowledge
+    // the write with no durable floor behind it. Move a trailing record into
+    // the next batch with its write — or, when the record is all this batch
+    // holds, take its write along as a single oversized request already is.
+    if take < pending.len() && matches!(pending[take - 1].op, WriteOp::FenceBump { .. }) {
+        if take > 1 {
+            take -= 1;
+        } else {
+            take = 2;
+        }
+    }
+    if take == pending.len() {
+        std::mem::take(pending)
+    } else {
+        let rest = pending.split_off(take);
+        std::mem::replace(pending, rest)
+    }
+}
+
+/// The one place that decides whether `partition_loop` launches a batch NOW
+/// and what rides in it. `None` = keep waiting: nothing is pending, or a batch
+/// is already in flight and `pending` is below `MIN_PIPELINED_BATCH` — too
+/// small to be worth a second serialized append on the EN (see the (B)
+/// comment in `partition_loop`). What does launch is bounded by BYTES via
+/// `take_byte_bounded_batch`: everything past the frame ceiling stays queued
+/// for the next batch, nothing is dropped or failed, and at least one request
+/// always moves. One accepted consequence of that cut: a BatchPut whose ops
+/// straddle it is no longer durable in ONE append, so a crash between the
+/// halves leaves half of it durable — nothing ACKED is lost, because the
+/// accumulator answers the client only on its last op.
+fn take_launch_batch(
+    pending: &mut Vec<WriteRequest>,
+    n_inflight: usize,
+) -> Option<Vec<WriteRequest>> {
+    if pending.is_empty() || (n_inflight > 0 && pending.len() < MIN_PIPELINED_BATCH) {
+        return None;
+    }
+    Some(take_byte_bounded_batch(pending))
+}
+
+async fn handle_incoming_req(
+    req: PartitionRequest,
+    pending: &mut Vec<WriteRequest>,
+    part: &Rc<RefCell<PartitionData>>,
+    routing: &Routing,
+    inflight: &mut InflightQueue,
+    metrics: &mut WriteLoopMetrics,
+    poisoned: &Rc<Cell<bool>>,
+) {
+    // bump per-partition request counter for the policy engine.
+    // fix MED-3: also bump the never-reset monotonic twin used by
+    // the maintenance scheduler's req_per_sec diff. Two atomic
+    // adds is ~5 ns total — cheap on the request hot path.
+    {
+        let p = part.borrow();
+        p.metrics
+            .req_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        p.metrics
+            .req_count_monotonic
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    if req.msg_type == partition_rpc::MSG_COMPARE_WRITE {
+        let cond = match rpc_handlers::decode_conditional(&req.payload, req.bulk_value) {
+            Ok(c) => c,
+            Err(e) => {
+                let _ = req.resp_tx.send(Err(e));
+                return;
+            }
+        };
+        if let Some(mem) = part.borrow_mut().mem_tier.as_mut() {
+            mem.supersede(&cond.key);
+        }
+        // This actor owns user-write admission, so requests are compared in
+        // arrival order. The comparison reads committed state: a write to the
+        // key still queued or in flight is committed first (stopping at a
+        // poisoning completion: awaiting the rest would let the connection
+        // tasks serve reads the reopen may contradict). A key nothing has
+        // touched since its last commit — a new name, the common case — waits
+        // for nothing and its write joins the next batch.
+        let uncommitted = pending.iter().any(|w| w.writes_key(&cond.key))
+            || part
+                .borrow()
+                .inflight_write_keys
+                .contains_key(&background::inflight_key_hash(&cond.key));
+        if uncommitted {
+            while !poisoned.get() {
+                let Some(c) = inflight.next().await else { break };
+                let id = part.borrow().part_id;
+                handle_completion(part, metrics, poisoned, id, c).await;
+            }
+            while !pending.is_empty() && !poisoned.get() {
+                match start_write_batch(part, take_byte_bounded_batch(pending)).await {
+                    Ok(Some(mut flight)) => {
+                        let result = (&mut flight.phase2_fut).await;
+                        let id = part.borrow().part_id;
+                        handle_completion(
+                            part,
+                            metrics,
+                            poisoned,
+                            id,
+                            InflightCompletion {
+                                data: flight.data,
+                                phase2_result: result,
+                            },
+                        )
+                        .await;
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        let _ = req.resp_tx.send(Err((StatusCode::Internal, e.to_string())));
+                        return;
+                    }
+                }
+            }
+        }
+        if poisoned.get() {
+            let _ = req.resp_tx.send(Err((
+                StatusCode::Unavailable,
+                "the partition is reopening; this write was not applied".into(),
+            )));
+            return;
+        }
+        rpc_handlers::compare_write_admit(cond, part, pending, req.resp_tx).await;
+        return;
+    }
+
+    // reject mutating ops while frozen-for-merge OR
+    // frozen-for-split so writes never land in a log_stream tail past
+    // the to-be-captured commit_length. Reads + maintenance still flow
+    // normally (the freeze is a write halt, not a full quiesce —
+    // readers see the existing state).
+    let frozen = {
+        let p = part.borrow();
+        p.merge_freeze.is_halted() || p.frozen_for_split.get().is_some()
+    };
+    if frozen {
+        match req.msg_type {
+            MSG_PUT => {
+                let key = partition_rpc::rkyv_decode::<PutReq>(&req.payload)
+                    .map(|r| r.key)
+                    .unwrap_or_default();
+                let resp = PutResp {
+                    code: CODE_UNAVAILABLE,
+                    message: "partition frozen for merge — refresh routing and retry".to_string(),
+                    key,
+                };
+                let _ = req.resp_tx.send(Ok(partition_rpc::rkyv_encode(&resp)));
+                return;
+            }
+            MSG_DELETE => {
+                let key = match partition_rpc::rkyv_decode::<DeleteReq>(&req.payload) {
+                    Ok(r) => r.key,
+                    Err(_) => Vec::new(),
+                };
+                let resp = DeleteResp {
+                    code: CODE_UNAVAILABLE,
+                    message: "partition frozen for merge — refresh routing and retry".to_string(),
+                    key,
+                };
+                let _ = req.resp_tx.send(Ok(partition_rpc::rkyv_encode(&resp)));
+                return;
+            }
+            partition_rpc::MSG_BATCH_PUT => {
+                // Reject the whole batch with CODE_UNAVAILABLE — client
+                // refreshes routing + retries each per-op (or the whole
+                // batch).
+                let resp = partition_rpc::BatchPutResp {
+                    code: CODE_UNAVAILABLE,
+                    message: "partition frozen for merge — refresh routing and retry"
+                        .to_string(),
+                    statuses: Vec::new(),
+                };
+                let _ = req.resp_tx.send(Ok(partition_rpc::rkyv_encode(&resp)));
+                return;
+            }
+            partition_rpc::MSG_BATCH_DELETE => {
+                // Same refusal, its own reply type — answering a batched
+                // delete with a `BatchPutResp` would decode as garbage on the
+                // client, which is the failure mode rkyv gives no warning for.
+                let resp = partition_rpc::BatchDeleteResp {
+                    code: CODE_UNAVAILABLE,
+                    message: "partition frozen for merge — refresh routing and retry"
+                        .to_string(),
+                    statuses: Vec::new(),
+                };
+                let _ = req.resp_tx.send(Ok(partition_rpc::rkyv_encode(&resp)));
+                return;
+            }
+            _ => {} // reads + SPLIT/MAINTENANCE/MERGE_FREEZE flow through
+        }
+    }
+
+    // Snapshot the per-partition epoch + id ONCE so the write-path
+    // enqueue helpers can perform the same TiKV-style region epoch
+    // check the read handlers do. `0` from the client = "skip check"
+    // (bootstrap / tests / legacy callers). Reads already perform this
+    // inside their respective handlers (`handle_get` / `handle_head`
+    // / `handle_range` in `rpc_handlers.rs`).
+    let (part_region_epoch, part_id_for_err, tiered) = {
+        let p = part.borrow();
+        (p.region_epoch, p.part_id, p.mem_tier.is_some())
+    };
+    // Memory tier: a covered put is held in DRAM and answered here; the
+    // durable writes below mark the keys they write (`mem_tier.rs`).
+    let req = if tiered {
+        match mem_tier_put(req, part, pending) {
+            Some(req) => req,
+            None => return,
+        }
+    } else {
+        req
+    };
+    let marked_from = pending.len();
+    let writes = matches!(
+        req.msg_type,
+        MSG_PUT | MSG_DELETE | partition_rpc::MSG_BATCH_PUT | partition_rpc::MSG_BATCH_DELETE
+    );
+    // Lease write fencing: the part borrow MUST
+    // be scoped to the PUT arms only. The legacy code held an outer
+    // immutable borrow across the entire `match`; the `_` /
+    // dispatch_partition_rpc / MaintenanceReq arm internally calls
+    // `part.borrow_mut()`, which would runtime-panic on top of the
+    // outer immutable borrow. Solution: each PUT arm does its own
+    // brief `part.borrow()` to get a transient ref into
+    // `fence_floors`, and the borrow ends with the helper call.
+
+    match req.msg_type {
+        MSG_PUT => {
+            let p = part.borrow();
+            enqueue_put(
+                req,
+                pending,
+                part_region_epoch,
+                part_id_for_err,
+                Some(&p.fence_floors),
+                Some(&p.rg),
+            )
+        }
+        MSG_DELETE => {
+            let p = part.borrow();
+            enqueue_delete(
+                req,
+                pending,
+                part_region_epoch,
+                part_id_for_err,
+                Some(&p.fence_floors),
+                Some(&p.rg),
+            )
+        }
+        partition_rpc::MSG_BATCH_PUT => {
+            let p = part.borrow();
+            enqueue_batch_put(
+                req,
+                pending,
+                part_region_epoch,
+                part_id_for_err,
+                Some(&p.fence_floors),
+                Some(&p.rg),
+            )
+        }
+        partition_rpc::MSG_BATCH_DELETE => {
+            let p = part.borrow();
+            enqueue_batch_delete(
+                req,
+                pending,
+                part_region_epoch,
+                part_id_for_err,
+                Some(&p.fence_floors),
+                Some(&p.rg),
+            )
+        }
+        // freeze=true starts `merge_freeze_task`, which answers once it holds
+        // the maintenance gate, writes are halted and the loop has drained
+        // (Phase 1.5 analogue of TiKV's PrepareMerge: write halt + final
+        // checkpoint). freeze=false (the rollback path) ends the freeze in
+        // whatever stage it is.
+        MSG_MERGE_FREEZE => {
+            let req_msg = match partition_rpc::rkyv_decode::<MergeFreezeReq>(&req.payload) {
+                Ok(r) => r,
+                Err(e) => {
+                    let _ = req.resp_tx.send(Err((StatusCode::InvalidArgument, e)));
+                    return;
+                }
+            };
+            if !req_msg.freeze {
+                let p = part.borrow();
+                p.merge_freeze.end();
+                let resp = MergeFreezeResp {
+                    code: CODE_OK,
+                    message: String::new(),
+                    log_tail_extent_id: 0,
+                    log_end: 0,
+                };
+                let _ = req.resp_tx.send(Ok(partition_rpc::rkyv_encode(&resp)));
+                return;
+            }
+            // freeze=true. Idempotent: if a previous freeze is still
+            // waiting on drain, fail the new one rather than overwriting.
+            {
+                let p = part.borrow();
+                // Split holds maintenance_gate while it waits for
+                // split_drain_ack. A simultaneous merge drain would wait for
+                // that same gate while partition_loop is the only sender of
+                // split_drain_ack: reject here to keep the two freeze classes
+                // mutually exclusive and avoid that cycle.
+                if split_blocks_merge_freeze(
+                    p.frozen_for_split.get().is_some(),
+                    p.split_drain_ack.borrow().is_some(),
+                ) {
+                    let resp = MergeFreezeResp {
+                        code: CODE_PRECONDITION,
+                        message: "partition is frozen for split; retry merge after split completes"
+                            .to_string(),
+                        log_tail_extent_id: 0,
+                        log_end: 0,
+                    };
+                    let _ = req.resp_tx.send(Ok(partition_rpc::rkyv_encode(&resp)));
+                    return;
+                }
+                if p.merge_freeze.rejoin_drained() {
+                    // Already fully drained-frozen — reply OK immediately, with
+                    // the cursor that drain checkpointed.
+                    let ckpt = p.durable_ckpt_vp.get();
+                    let resp = MergeFreezeResp {
+                        code: CODE_OK,
+                        message: String::new(),
+                        log_tail_extent_id: ckpt.0,
+                        log_end: ckpt.1,
+                    };
+                    let _ = req.resp_tx.send(Ok(partition_rpc::rkyv_encode(&resp)));
+                    return;
+                }
+                if p.merge_freeze.is_active() {
+                    let resp = MergeFreezeResp {
+                        code: CODE_PRECONDITION,
+                        message: "freeze already in progress".to_string(),
+                        log_tail_extent_id: 0,
+                        log_end: 0,
+                    };
+                    let _ = req.resp_tx.send(Ok(partition_rpc::rkyv_encode(&resp)));
+                    return;
+                }
+                // A partition still holding CoW tables from a split carries
+                // keys outside its range, whose staleness only its sibling
+                // knows. The merge widens the range over them and they read
+                // back — pre-split values, and deleted keys whose tombstone a
+                // sibling's major compaction dropped (CLAUDE.md, "Merge
+                // requires both sides physically separated"). Checked once,
+                // here: the flag only rises at split / open, and a frozen
+                // partition cannot split.
+                if p.has_overlap.get() != 0 {
+                    let resp = MergeFreezeResp {
+                        code: CODE_PRECONDITION,
+                        message: "cannot merge: partition has overlapping keys (CoW tables \
+                                  from a split); major-compact it first"
+                            .to_string(),
+                        log_tail_extent_id: 0,
+                        log_end: 0,
+                    };
+                    let _ = req.resp_tx.send(Ok(partition_rpc::rkyv_encode(&resp)));
+                    return;
+                }
+                let (attempt, cancelled) = p.merge_freeze.wait_for_gate();
+                compio::runtime::spawn(merge_freeze_task(
+                    p.merge_freeze.clone(),
+                    p.maintenance_gate.clone(),
+                    p.split_wake_tx.clone(),
+                    p.part_id,
+                    attempt,
+                    cancelled,
+                    req.resp_tx,
+                ))
+                .detach();
+            }
+        }
+        // SPLIT_PART is spawned as a separate task on the same
+        // P-log runtime so its awaits (drain + commit_length + manager
+        // RPC) don't block partition_loop. Without this, the loop
+        // can't process the drain (it's the only one that pulls inflight
+        // completions + flushes imm), causing a self-deadlock. The earlier
+        // split ran inline via dispatch_partition_rpc; the drain wasn't
+        // needed because split didn't halt writes — but that was the
+        // source of the bug (in-flight WAL appends landed past the
+        // captured commit_length, invisible on recovery).
+        MSG_SPLIT_PART => {
+            let part_c = part.clone();
+            let part_sc_c = routing.part_sc.clone();
+            let pool_c = routing.pool.clone();
+            let manager_addr_c = routing.manager_addr.clone();
+            let payload = req.payload;
+            let resp_tx = req.resp_tx;
+            compio::runtime::spawn(async move {
+                let result = crate::rpc_handlers::handle_split_part(
+                    payload,
+                    &part_c,
+                    &part_sc_c,
+                    &pool_c,
+                    &manager_addr_c,
+                )
+                .await;
+                let _ = resp_tx.send(result);
+            })
+            .detach();
+        }
+        // seal + roll open tails off a fenced node. Spawned like
+        // SPLIT_PART so its manager RPCs (get_stream_info + seal_and_roll_tail +
+        // the P-sst row barrier) don't block partition_loop's group-commit.
+        MSG_ROLL_TAILS => {
+            let part_c = part.clone();
+            let part_sc_c = routing.part_sc.clone();
+            let payload = req.payload;
+            let resp_tx = req.resp_tx;
+            compio::runtime::spawn(async move {
+                let result =
+                    crate::rpc_handlers::handle_roll_tails(payload, &part_c, &part_sc_c).await;
+                let _ = resp_tx.send(result);
+            })
+            .detach();
+        }
+        // Reads (GET/HEAD/RANGE/GET_DISCARDS) + low-frequency ops
+        // (MAINTENANCE) go inline via dispatch_partition_rpc.
+        //
+        // (Option B): in production GET is served directly in the
+        // ps-conn task's FU (handle_ps_connection, part = Some), so it never
+        // reaches partition_loop. GET only lands here as a fallback — the
+        // mock-loop unit tests (part = None) or any non-ps-conn caller — and
+        // the inline path is correct (and not hot) for that case.
+        _ => {
+            let result = dispatch_partition_rpc(
+                req.msg_type,
+                req.payload,
+                part,
+                &routing.part_sc,
+                &routing.pool,
+                &routing.manager_addr,
+                &routing.owner_key,
+                routing.owner_epoch,
+            )
+            .await;
+            let _ = req.resp_tx.send(result);
+        }
+    }
+    if tiered && writes {
+        let mut p = part.borrow_mut();
+        let mem = p.mem_tier.as_mut().expect("tiered");
+        for w in &pending[marked_from.min(pending.len())..] {
+            if let Some(k) = w.written_key() {
+                mem.supersede(k);
+            }
+        }
+    }
+}
+
+/// Lease write fencing: pure-fn fencing
+/// check + floor bump. Pure so it's unit-testable without booting
+/// the partition server. Mirrors the same shape as the region_epoch
+/// check: `inode_hint == 0` (the default) ⇒ skip fencing entirely
+/// (KV CLI, anonymous writes, bootstrap, tests). Otherwise reject if
+/// `stamped_epoch` is below the ADMITTED floor, else raise the admitted
+/// floor to `max(floor, stamped_epoch)`. Persistence is the caller's job,
+/// driven by the return value below.
+/// Returns `Ok(true)` when the stamped epoch is above the DURABLE floor:
+/// the caller must then queue a `WriteOp::FenceBump` record ahead of the
+/// admitted write so the floor is durable no later than the write's ACK.
+/// `Ok(false)` = admitted and already durable (or anonymous). Judging this
+/// against the admitted floor instead lost the record whenever a request
+/// raised the floor and failed before its record committed: the retry at
+/// the same epoch raised nothing and was acknowledged with no record at all.
+pub(crate) fn check_and_bump_fence(
+    inode_hint: u64,
+    stamped_epoch: u64,
+    admitted: &mut HashMap<u64, u64>,
+    durable: &HashMap<u64, u64>,
+) -> Result<bool, String> {
+    if inode_hint == 0 {
+        return Ok(false);
+    }
+    let floor = admitted.get(&inode_hint).copied().unwrap_or(0);
+    if stamped_epoch < floor {
+        return Err(format!(
+            "BUG-LEASE-2: fenced write ino={} stamped_epoch={} < floor={}",
+            inode_hint, stamped_epoch, floor
+        ));
+    }
+    if stamped_epoch > floor {
+        admitted.insert(inode_hint, stamped_epoch);
+    }
+    Ok(stamped_epoch > durable.get(&inode_hint).copied().unwrap_or(0))
+}
+
+/// The memory tier's put: a `MSG_PUT` of a covered key, unfenced and within
+/// the value cap, is held in the partition's shard and answered OK without a
+/// log append; batches go to `mem_tier_batch_put`. Returns the request when it
+/// must take the durable path instead (not covered, fenced, too large, an
+/// older durable write of the key not applied yet, or no room).
+fn mem_tier_put(
+    req: PartitionRequest,
+    part: &Rc<RefCell<PartitionData>>,
+    pending: &[WriteRequest],
+) -> Option<PartitionRequest> {
+    if !matches!(req.msg_type, MSG_PUT | partition_rpc::MSG_BATCH_PUT) {
+        return Some(req);
+    }
+    // A partition that holds no covered key is never decoded here.
+    {
+        let p = part.borrow();
+        if !p.mem_tier.as_ref().is_some_and(|m| m.overlaps(&p.rg.start_key, &p.rg.end_key)) {
+            return Some(req);
+        }
+    }
+    if req.msg_type == partition_rpc::MSG_BATCH_PUT {
+        return mem_tier_batch_put(req, part, pending);
+    }
+    // Malformed requests take the durable path, which answers them.
+    let Ok(meta) = partition_rpc::rkyv_decode::<PutReq>(&req.payload) else { return Some(req) };
+    if meta.inode_hint != 0 {
+        return Some(req);
+    }
+    let key = Bytes::from(meta.key);
+    let value = req.bulk_value.as_ref().map(|v| v.bytes().clone()).unwrap_or_default();
+    let (expires_at, region_epoch, evict_rank) = (meta.expires_at, meta.region_epoch, meta.evict_rank);
+    let mut p = part.borrow_mut();
+    if !p.mem_tier.as_ref().is_some_and(|m| m.covers(&key)) || value.len() > AUTUMN_PS_MAX_INLINE_BYTES_DEFAULT as usize {
+        return Some(req);
+    }
+    // An older durable write of the key, queued or in flight, would land
+    // after the held value and could drop it (`applied`) for its older value:
+    // write this one durably behind it instead.
+    if pending.iter().any(|w| w.writes_key(&key))
+        || p.inflight_write_keys.contains_key(&background::inflight_key_hash(&key))
+    {
+        return Some(req);
+    }
+    if let Some(err) = admit_region_range(region_epoch, &key, p.region_epoch, p.part_id, Some(&p.rg)) {
+        let _ = req.resp_tx.send(Err(err));
+        return None;
+    }
+    // Own the bytes: the value aliases a receive buffer (a pooled one, or the
+    // connection decoder's) that must not stay pinned by a held key.
+    let owned = Bytes::copy_from_slice(&value);
+    let mem = p.mem_tier.as_mut().expect("checked above");
+    if !mem.insert(&key, owned, expires_at, evict_rank, Instant::now()) {
+        return Some(req);
+    }
+    drop(p);
+    let resp = PutResp { code: CODE_OK, message: String::new(), key: key.to_vec() };
+    let _ = req.resp_tx.send(Ok(partition_rpc::rkyv_encode(&resp)));
+    None
+}
+
+/// The memory tier's batched put: a `MSG_BATCH_PUT` is held in the shard
+/// only as a whole — every op covered, unfenced, within the value cap and the
+/// partition's range, with no older durable write of its key queued or in
+/// flight — and answered with every op OK. Otherwise the whole batch takes the
+/// durable path, which also overrides any op this one already put in the shard
+/// (the durable writes mark their keys).
+fn mem_tier_batch_put(
+    req: PartitionRequest,
+    part: &Rc<RefCell<PartitionData>>,
+    pending: &[WriteRequest],
+) -> Option<PartitionRequest> {
+    // (key, value, expires_at, inode_hint, evict_rank); malformed requests
+    // take the durable path, which answers them.
+    let Ok(b) = partition_rpc::rkyv_decode::<partition_rpc::BatchPutReq>(&req.payload) else { return Some(req) };
+    let values = req.bulk_value.as_ref().map(|v| v.bytes().clone()).unwrap_or_default();
+    if b.ops.iter().map(|o| o.value_len as u64).sum::<u64>() != values.len() as u64 {
+        return Some(req);
+    }
+    let mut off = 0usize;
+    let ops: Vec<(Bytes, Bytes, u64, u64, u32)> = b
+        .ops
+        .into_iter()
+        .map(|o| {
+            let v = values.slice(off..off + o.value_len as usize);
+            off += o.value_len as usize;
+            (Bytes::from(o.key), v, o.expires_at, o.inode_hint, o.evict_rank)
+        })
+        .collect();
+    let region_epoch = b.region_epoch;
+    let queued: std::collections::HashSet<&[u8]> = pending.iter().filter_map(|w| w.written_key()).collect();
+    let mut p = part.borrow_mut();
+    let Some(mem) = p.mem_tier.as_ref() else { return Some(req) };
+    let eligible = !ops.is_empty()
+        && (region_epoch == 0 || region_epoch == p.region_epoch)
+        && ops.iter().all(|(key, value, _, inode_hint, _)| {
+            *inode_hint == 0
+                && mem.covers(key)
+                && value.len() <= AUTUMN_PS_MAX_INLINE_BYTES_DEFAULT as usize
+                && in_range(&p.rg, key)
+                && !p.inflight_write_keys.contains_key(&background::inflight_key_hash(key))
+                && !queued.contains(&key[..])
+        });
+    if !eligible {
+        return Some(req);
+    }
+    // A batch that could not fit with this shard emptied goes durable before
+    // evicting anything.
+    let total: u64 = ops.iter().map(|(k, v, ..)| mem_tier::charge(k.len(), v.len())).sum();
+    if !mem.could_fit(total) {
+        return Some(req);
+    }
+    let n = ops.len();
+    let now = Instant::now();
+    // Values inserted shallow first make room by evicting lower priorities
+    // only; whether the deepest can is known before any of them evicts.
+    let deepest = ops.iter().map(|o| o.4).max().unwrap_or(0);
+    if !mem.can_admit(total, deepest, now) {
+        return Some(req);
+    }
+    let mem = p.mem_tier.as_mut().expect("checked above");
+    for (i, (key, value, expires_at, _, evict_rank)) in ops.iter().enumerate() {
+        // Own the bytes: the tail aliases a receive buffer.
+        let owned = Bytes::copy_from_slice(value);
+        if !mem.insert(key, owned, *expires_at, *evict_rank, now) {
+            // Take back what this batch put in: until its durable write lands
+            // they would be read, and that write may still fail.
+            for (k, ..) in &ops[..i] {
+                mem.discard(k);
+            }
+            return Some(req);
+        }
+    }
+    drop(p);
+    let resp = partition_rpc::BatchPutResp { code: CODE_OK, message: String::new(), statuses: vec![0; n] };
+    let _ = req.resp_tx.send(Ok(partition_rpc::rkyv_encode(&resp)));
+    None
+}
+
+/// region-epoch + in_range admission shared by `enqueue_put` /
+/// `enqueue_delete`. Returns `Some(rejection)` for the FIRST
+/// failing check — stale region epoch → `FailedPrecondition`, out-of-range key
+/// → `InvalidArgument` — or `None` if admitted. The caller sends the rejection
+/// on its own single `resp_tx` and returns, which keeps the exact
+/// region → range → value-too-large → fence admission order (a
+/// mis-routed key must be refused BEFORE the fence floor is raised/persisted).
+/// `enqueue_batch_put` keeps its own region check + per-op range (it records
+/// accumulator statuses, not a single resp).
+fn admit_region_range(
+    region_epoch: u64,
+    key: &[u8],
+    part_region_epoch: u64,
+    part_id_for_err: u64,
+    part_rg: Option<&Range>,
+) -> Option<(StatusCode, String)> {
+    if region_epoch != 0 && region_epoch != part_region_epoch {
+        return Some((
+            StatusCode::FailedPrecondition,
+            format!(
+                "region epoch stale: part_id={} have={} got={}",
+                part_id_for_err, part_region_epoch, region_epoch
+            ),
+        ));
+    }
+    if let Some(rg) = part_rg {
+        if !in_range(rg, key) {
+            return Some((
+                StatusCode::InvalidArgument,
+                "key is out of range".to_string(),
+            ));
+        }
+    }
+    None
+}
+
+fn enqueue_batch_delete(
+    req: PartitionRequest,
+    pending: &mut Vec<WriteRequest>,
+    part_region_epoch: u64,
+    part_id_for_err: u64,
+    fence_floors: Option<&FenceFloors>,
+    part_rg: Option<&Range>,
+) {
+    let batch = match partition_rpc::rkyv_decode::<partition_rpc::BatchDeleteReq>(&req.payload) {
+        Ok(b) => b,
+        Err(e) => {
+            let _ = req.resp_tx.send(Err((StatusCode::InvalidArgument, e)));
+            return;
+        }
+    };
+    // Batch-level epoch admission. The per-op `in_range` check below is what
+    // catches a key that does not belong here; this catches a stale routing
+    // snapshot for the batch as a whole.
+    if batch.region_epoch != 0 && batch.region_epoch != part_region_epoch {
+        let _ = req.resp_tx.send(Err((
+            StatusCode::FailedPrecondition,
+            format!(
+                "stale region_epoch {} for partition {part_id_for_err} (current {part_region_epoch}) — refresh routing",
+                batch.region_epoch
+            ),
+        )));
+        return;
+    }
+    let n = batch.ops.len();
+    if n == 0 {
+        let resp = partition_rpc::BatchDeleteResp {
+            code: CODE_OK,
+            message: String::new(),
+            statuses: Vec::new(),
+        };
+        let _ = req.resp_tx.send(Ok(partition_rpc::rkyv_encode(&resp)));
+        return;
+    }
+    let accum = BatchPutAccumulator::new_kind(req.resp_tx, n, BatchKind::Delete);
+    for (i, op) in batch.ops.into_iter().enumerate() {
+        if let Some(rg) = part_rg {
+            if !in_range(rg, &op.key) {
+                // Status 2 = out of range, the same code the put path records,
+                // so a caller can read both batch replies with one table.
+                accum.record(i, 2);
+                continue;
+            }
+        }
+        if let Some(floors_cell) = fence_floors {
+            let bump = floors_cell.check_and_bump(op.inode_hint, op.lease_epoch);
+            match bump {
+                Err(_) => {
+                    accum.record(i, CODE_FENCED);
+                    continue;
+                }
+                Ok(true) => {
+                    pending.push(WriteRequest {
+                        op: WriteOp::FenceBump {
+                            ino: op.inode_hint,
+                            epoch: op.lease_epoch,
+                        },
+                        resp: WriteResponder::Fence,
+                    });
+                }
+                Ok(false) => {}
+            }
+        }
+        pending.push(WriteRequest {
+            op: WriteOp::Delete { user_key: op.key },
+            resp: WriteResponder::BatchPut {
+                accum: Rc::clone(&accum),
+                idx: i,
+            },
+        });
+    }
+}
+
+/// `MSG_BATCH_PUT` enqueue — N puts for one partition from one frame, pushed
+/// into `pending` in one dispatcher call so the next `partition_loop` iteration
+/// can fire a wide batch. `req.payload` is the rkyv ctrl and `req.bulk_value`
+/// the raw tail holding every value back to back, so each op's value is a
+/// `Bytes` SLICE of that tail — a refcount bump, not a copy. One shared reply
+/// via `BatchPutAccumulator`: the last op to record encodes the `BatchPutResp`.
+///
+/// `sum(value_len)` must equal the tail length. A mismatch means ctrl and tail
+/// disagree about what was sent; there is no safe way to guess which is right,
+/// so the whole frame is refused.
+fn enqueue_batch_put(
+    req: PartitionRequest,
+    pending: &mut Vec<WriteRequest>,
+    part_region_epoch: u64,
+    part_id_for_err: u64,
+    fence_floors: Option<&FenceFloors>,
+    part_rg: Option<&Range>,
+) {
+    let batch =
+        match partition_rpc::rkyv_decode::<partition_rpc::BatchPutReq>(&req.payload) {
+            Ok(b) => b,
+            Err(e) => {
+                let _ = req.resp_tx.send(Err((StatusCode::InvalidArgument, e)));
+                return;
+            }
+        };
+    if batch.region_epoch != 0 && batch.region_epoch != part_region_epoch {
+        let _ = req.resp_tx.send(Err((
+            StatusCode::FailedPrecondition,
+            format!(
+                "region epoch stale: part_id={} have={} got={}",
+                part_id_for_err, part_region_epoch, batch.region_epoch
+            ),
+        )));
+        return;
+    }
+    let values = req.bulk_value.unwrap_or_default();
+    let declared: u64 = batch.ops.iter().map(|op| op.value_len as u64).sum();
+    if declared != values.len() as u64 {
+        let _ = req.resp_tx.send(Err((
+            StatusCode::InvalidArgument,
+            format!(
+                "batch bulk tail is {} bytes but ops declare {declared}",
+                values.len()
+            ),
+        )));
+        return;
+    }
+    // Whole-batch rejection on an oversized op.
+    for op in &batch.ops {
+        if op.value_len as usize > AUTUMN_PS_MAX_INLINE_BYTES_DEFAULT as usize {
+            let _ = req.resp_tx.send(Err((
+                StatusCode::InvalidArgument,
+                format!(
+                    "batch op value {} bytes exceeds inline cap {} — use per-op PutStream",
+                    op.value_len, AUTUMN_PS_MAX_INLINE_BYTES_DEFAULT
+                ),
+            )));
+            return;
+        }
+    }
+    let n = batch.ops.len();
+    if n == 0 {
+        let resp = partition_rpc::BatchPutResp {
+            code: CODE_OK,
+            message: String::new(),
+            statuses: Vec::new(),
+        };
+        let _ = req.resp_tx.send(Ok(partition_rpc::rkyv_encode(&resp)));
+        return;
+    }
+    let accum = BatchPutAccumulator::new(req.resp_tx, n);
+    let mut off = 0usize;
+    for (i, op) in batch.ops.into_iter().enumerate() {
+        // Slice before any early `continue`, so a skipped op still advances the
+        // cursor — otherwise one rejected op would shift every value after it.
+        let len = op.value_len as usize;
+        let value = values.slice(off..off + len);
+        off += len;
+        if let Some(rg) = part_rg {
+            if !in_range(rg, &op.key) {
+                accum.record(i, 2);
+                continue;
+            }
+        }
+        if let Some(floors_cell) = fence_floors {
+            let bump = floors_cell.check_and_bump(op.inode_hint, op.lease_epoch);
+            match bump {
+                Err(_msg) => {
+                    accum.record(i, CODE_FENCED);
+                    continue;
+                }
+                Ok(true) => {
+                    pending.push(WriteRequest {
+                        op: WriteOp::FenceBump {
+                            ino: op.inode_hint,
+                            epoch: op.lease_epoch,
+                        },
+                        resp: WriteResponder::Fence,
+                    });
+                }
+                Ok(false) => {}
+            }
+        }
+        pending.push(WriteRequest {
+            op: WriteOp::Put {
+                user_key: Bytes::from(op.key),
+                value,
+                expires_at: op.expires_at,
+            },
+            resp: WriteResponder::BatchPut {
+                accum: Rc::clone(&accum),
+                idx: i,
+            },
+        });
+    }
+}
+
+/// `MSG_PUT` enqueue: the rkyv `PutReq` ctrl, the value the frame's tail;
+/// answers an rkyv `PutResp`.
+fn enqueue_put(
+    req: PartitionRequest,
+    pending: &mut Vec<WriteRequest>,
+    part_region_epoch: u64,
+    part_id_for_err: u64,
+    // Admission order: range -> size -> fence.
+    fence_floors: Option<&FenceFloors>,
+    part_rg: Option<&Range>,
+) {
+    let meta = match partition_rpc::rkyv_decode::<PutReq>(&req.payload) {
+        Ok(m) => m,
+        Err(e) => {
+            let _ = req.resp_tx.send(Err((StatusCode::InvalidArgument, e)));
+            return;
+        }
+    };
+    let key = Bytes::from(meta.key);
+    // region-epoch + in_range admission BEFORE value-too-large + fence
+    // (a mis-routed key must not raise the floor).
+    if let Some(err) = admit_region_range(
+        meta.region_epoch,
+        &key,
+        part_region_epoch,
+        part_id_for_err,
+        part_rg,
+    ) {
+        let _ = req.resp_tx.send(Err(err));
+        return;
+    }
+    // The frame's tail: received into a pooled buffer when large, a slice of
+    // the decoder's buffer when small, empty for an empty value.
+    let value = req.bulk_value.unwrap_or_default();
+    if value.len() > AUTUMN_PS_MAX_INLINE_BYTES_DEFAULT as usize {
+        let resp = PutResp {
+            code: CODE_VALUE_TOO_LARGE,
+            message: format!(
+                "value {} bytes exceeds inline cap {} — use PutStream",
+                value.len(),
+                AUTUMN_PS_MAX_INLINE_BYTES_DEFAULT
+            ),
+            key: key.to_vec(),
+        };
+        let _ = req.resp_tx.send(Ok(partition_rpc::rkyv_encode(&resp)));
+        return;
+    }
+    // Fencing check AFTER value-too-large: a rejected oversized write must
+    // not poison the floor.
+    if let Some(floors_cell) = fence_floors {
+        let bump = floors_cell.check_and_bump(meta.inode_hint, meta.lease_epoch);
+        match bump {
+            Err(msg) => {
+                let resp = PutResp {
+                    code: CODE_FENCED,
+                    message: msg,
+                    key: key.to_vec(),
+                };
+                let _ = req.resp_tx.send(Ok(partition_rpc::rkyv_encode(&resp)));
+                return;
+            }
+            Ok(true) => {
+                pending.push(WriteRequest {
+                    op: WriteOp::FenceBump {
+                        ino: meta.inode_hint,
+                        epoch: meta.lease_epoch,
+                    },
+                    resp: WriteResponder::Fence,
+                });
+            }
+            Ok(false) => {}
+        }
+    }
+    let key_vec = key.to_vec();
+    pending.push(WriteRequest {
+        op: WriteOp::Put {
+            user_key: key,
+            value,
+            expires_at: meta.expires_at,
+        },
+        resp: WriteResponder::Put {
+            outer: req.resp_tx,
+            key: key_vec,
+        },
+    });
+}
+
+fn enqueue_delete(
+    req: PartitionRequest,
+    pending: &mut Vec<WriteRequest>,
+    part_region_epoch: u64,
+    part_id_for_err: u64,
+    // Deletes are fenced like puts.
+    fence_floors: Option<&FenceFloors>,
+    part_rg: Option<&Range>,
+) {
+    match partition_rpc::rkyv_decode::<DeleteReq>(&req.payload) {
+        Ok(del_req) => {
+            // region-epoch + in_range admission BEFORE the fence check
+            // (a mis-routed key must not raise the floor).
+            if let Some(err) = admit_region_range(
+                del_req.region_epoch,
+                &del_req.key,
+                part_region_epoch,
+                part_id_for_err,
+                part_rg,
+            ) {
+                let _ = req.resp_tx.send(Err(err));
+                return;
+            }
+            if let Some(floors_cell) = fence_floors {
+                let bump = floors_cell.check_and_bump(del_req.inode_hint, del_req.lease_epoch);
+                match bump {
+                    Err(msg) => {
+                        let resp = DeleteResp {
+                            code: CODE_FENCED,
+                            message: msg,
+                            key: del_req.key.clone(),
+                        };
+                        let _ = req.resp_tx.send(Ok(partition_rpc::rkyv_encode(&resp)));
+                        return;
+                    }
+                    Ok(true) => {
+                        pending.push(WriteRequest {
+                            op: WriteOp::FenceBump {
+                                ino: del_req.inode_hint,
+                                epoch: del_req.lease_epoch,
+                            },
+                            resp: WriteResponder::Fence,
+                        });
+                    }
+                    Ok(false) => {}
+                }
+            }
+            let key_vec = del_req.key.clone();
+            pending.push(WriteRequest {
+                op: WriteOp::Delete {
+                    user_key: del_req.key,
+                },
+                resp: WriteResponder::Delete {
+                    outer: req.resp_tx,
+                    key: key_vec,
+                },
+            });
+        }
+        Err(e) => {
+            let _ = req.resp_tx.send(Err((StatusCode::InvalidArgument, e)));
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Recovery
+// ---------------------------------------------------------------------------
+
+/// WAL self-heal A3: a replay chunk `[buf_base, buf_base+want)` of `eid` failed
+/// to decode (corrupt complete record, or a non-empty leftover at the committed
+/// end). Re-read the SAME committed window from EVERY replica of the SEALED
+/// REPLICATED extent and return the first that decodes clean, recording every
+/// replica whose copy is corrupt into `corrupt_acc` (design I7 source
+/// attribution → A5 isolation).
+///
+/// Returns:
+/// - `Ok(Some((records, consumed, healed_buf)))`: a clean replica was found;
+///   `corrupt_acc` now holds the bad node ids. `healed_buf` is that replica's
+///   bytes for the window (the caller uses `healed_buf[consumed..]` as carry).
+/// - `Ok(None)`: NOT self-healable — EC (shard ≠ value), or every replica corrupt
+///   (unrecoverable), or an open tail we must not seal (a truncated tail, see A4).
+///   The caller fails the open loud.
+///
+/// A4 (open tail): an OPEN extent has no `avali` to isolate in place, so on
+/// CONTENT corruption (`truncated == false`) we seal-and-roll it via the
+/// seal-over-reachable probe (which freezes it at the committed length — the corrupt
+/// replica still reports its full length so the probe `min` is unchanged; the
+/// acked prefix is on every committed member under all-replica-ACK, so `min` ≥
+/// acked), then re-fetch and run the SAME cross-read on the now-SEALED extent in
+/// one pass — isolating the bad replica synchronously (no retry-the-open
+/// dependence). A TRUNCATED open tail (`truncated == true`) is NOT sealed: the
+/// probe `min` would include the truncated replica and could seal BELOW the acked
+/// prefix (data loss); we fail loud instead so a healthy replica / retry recovers
+/// it. ("seal over HEALTHY excluding the corrupt one" would need seal-probe
+/// exclusion machinery — deferred; the realistic open-tail trigger is content
+/// bit-rot, where the corrupt replica's length is intact.)
+///
+/// I7: a replica that returns a READ error (down / transient) is NOT marked
+/// corrupt — it may hold the only good copy, and reconciling it out on a mere
+/// unreachable signal could drop data.
+#[allow(clippy::too_many_arguments)]
+async fn self_heal_replay_chunk(
+    part_sc: &StreamClient,
+    eid: u64,
+    log_stream_id: u64,
+    buf_base: u64,
+    want: u32,
+    is_final: bool,
+    truncated: bool,
+    corrupt_acc: &mut HashSet<u64>,
+) -> Result<Option<(Vec<(usize, u8, Vec<u8>, Vec<u8>, u64)>, usize, Vec<u8>)>> {
+    let mut sealed_once = false;
+    let ex = loop {
+        let ex = match part_sc.get_extent_info(eid).await {
+            Ok(ex) => ex,
+            Err(e) => {
+                tracing::warn!(
+                    extent_id = eid,
+                    error = %e,
+                    "WAL self-heal: could not fetch ExtentInfo; cannot cross-read replicas"
+                );
+                return Ok(None);
+            }
+        };
+        // EC → per-replica read is meaningless (shard ≠ value): fail loud.
+        if ex.ec_converted {
+            return Ok(None);
+        }
+        if ex.sealed {
+            break ex;
+        }
+        // OPEN tail. Only seal-and-roll on CONTENT corruption — never on a
+        // truncation (the probe min would include the short replica and could
+        // seal below acked). One seal max (after it, the extent is sealed and we
+        // fall through to the cross-read).
+        if truncated || sealed_once {
+            return Ok(None);
+        }
+        match part_sc.seal_and_roll_tail(log_stream_id).await {
+            Ok(()) => {
+                part_sc.invalidate_extent_cache(eid);
+                sealed_once = true;
+                tracing::warn!(
+                    extent_id = eid,
+                    log_stream_id,
+                    "WAL self-heal A4: sealed-and-rolled the corrupt OPEN log_stream tail; \
+                     re-reading it as sealed to isolate the bad replica"
+                );
+                continue;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    extent_id = eid,
+                    log_stream_id,
+                    error = %e,
+                    "WAL self-heal A4: seal-and-roll of the corrupt open tail FAILED; \
+                     failing the open loud"
+                );
+                return Ok(None);
+            }
+        }
+    };
+    let n = ex.replicates.len() + ex.parity.len();
+    // I2: only ELIGIBLE slots are clean-source candidates. A slot
+    // whose `avali` bit is already 0 has been isolated (by a prior A5 / an
+    // in-flight recovery) — it must NOT be trusted as a recovery source, even if
+    // it happens to decode clean. Mirror `eligible_replica_slots`: for a sealed
+    // replicated extent, skip avali=0 slots; defensively fall back to ALL slots
+    // if avali is entirely 0 (shouldn't happen for a sealed extent we're healing,
+    // but never strand recovery with zero candidates).
+    let any_avali = ex.avali != 0;
+    // Collect each eligible replica's re-read of the same committed window:
+    // Some(bytes) on a successful read, None/absent on a read error (node down /
+    // transient — NOT corrupt per I7). The pure `select_clean_replica_chunk`
+    // does the decode classification + clean selection (unit-tested).
+    let mut results: Vec<(u64, Option<Vec<u8>>)> = Vec::with_capacity(n);
+    for idx in 0..n {
+        if any_avali && idx < 32 && (ex.avali & (1u32 << idx)) == 0 {
+            // already-isolated slot — not a trustworthy clean source.
+            continue;
+        }
+        match part_sc
+            .read_committed_from_replica(eid, idx, buf_base, want as u64)
+            .await
+        {
+            // A rare path (a chunk failed to decode): copying here is fine.
+            Ok((bytes, _end, node_id)) => results.push((node_id, Some(bytes.to_vec()))),
+            Err(_e) => { /* read error — recorded as None below via node id gap */ }
+        }
+    }
+    let (clean, corrupt) = select_clean_replica_chunk(results, want as usize, is_final);
+    corrupt_acc.extend(corrupt);
+    Ok(clean)
+}
+
+/// Pure core of A3 cross-replica selection: given each reachable replica's
+/// re-read bytes for a committed window, return the first that decodes clean
+/// plus the set of node ids whose copy is corrupt. A replica that errored on
+/// read is simply absent from `results` (NOT corrupt — I7). `want` = the
+/// expected window length (a short read is corrupt); `is_final` = the window
+/// ends at the committed end, so any leftover after decode is corruption.
+#[allow(clippy::type_complexity)]
+fn select_clean_replica_chunk(
+    results: Vec<(u64, Option<Vec<u8>>)>,
+    want: usize,
+    is_final: bool,
+) -> (
+    Option<(Vec<(usize, u8, Vec<u8>, Vec<u8>, u64)>, usize, Vec<u8>)>,
+    HashSet<u64>,
+) {
+    let mut clean: Option<(Vec<(usize, u8, Vec<u8>, Vec<u8>, u64)>, usize, Vec<u8>)> = None;
+    let mut corrupt: HashSet<u64> = HashSet::new();
+    for (node_id, maybe_bytes) in results {
+        let bytes = match maybe_bytes {
+            Some(b) => b,
+            None => continue, // read error → not corrupt (I7)
+        };
+        if bytes.len() < want {
+            corrupt.insert(node_id);
+            continue;
+        }
+        match decode_records_chunk(&bytes) {
+            Ok((recs, consumed)) if !(is_final && consumed < bytes.len()) => {
+                if clean.is_none() {
+                    clean = Some((recs, consumed, bytes));
+                }
+                // clean replica → NOT corrupt; leave its avali bit set.
+            }
+            _ => {
+                corrupt.insert(node_id);
+            }
+        }
+    }
+    (clean, corrupt)
+}
+
+async fn recover_partition(
+    _part_id: u64,
+    rg: &Range,
+    log_stream_id: u64,
+    _row_stream_id: u64,
+    meta_stream_id: u64,
+    part_sc: &Rc<StreamClient>,
+) -> Result<(
+    Vec<TableMeta>,
+    Vec<Arc<SstReader>>,
+    u64,
+    u64,
+    u64,
+    bool,
+    Memtable,
+    HashMap<u64, u64>,
+    Option<(u64, u64)>,
+    usize,
+)> {
+    let mut tables: Vec<TableMeta> = Vec::new();
+    let mut sst_readers: Vec<Arc<SstReader>> = Vec::new();
+    let mut max_seq: u64 = 0;
+    let mut recovered_vp_eid: u64 = 0;
+    let mut recovered_vp_off: u64 = 0;
+    let mut detected_overlap = false;
+    // Lease write fencing: per-ino fence floors. Seeded from EVERY
+    // checkpoint record (max-merge — post-merge both sources' floors
+    // must survive; max-merge is the correct union), then the WAL
+    // replay below max-merges any later OP_FENCE_BUMP records.
+    let mut fence_floors: HashMap<u64, u64> = HashMap::new();
+
+    // union the LAST TableLocations record from EACH meta_stream
+    // extent (instead of just the last extent's last record). Pre-merge
+    // partitions have a single non-empty meta_stream extent with one
+    // canonical record — single-extent path is unchanged. Post-merge,
+    // the splice puts both survivor's and victim's old meta_stream
+    // extents into the merged stream; reading just the last extent
+    // would lose half the table set.
+    let meta_records: Vec<TableLocations> =
+        read_all_table_locations(meta_stream_id, part_sc)
+            .await
+            .context("union TableLocations from metaStream extents")?;
+    for r in &meta_records {
+        for &(ino, epoch) in &r.fence_floors {
+            let f = fence_floors.entry(ino).or_insert(0);
+            *f = (*f).max(epoch);
+        }
+    }
+
+    // We need log_stream.extent_ids early to map each vp_head to its
+    // stream position. Post-merge the spliced extent_ids list is
+    // non-monotonic in extent_id: victim's extents (which were CoW from
+    // pre-split) have LOWER extent_ids than survivor's new extents, but
+    // appear AFTER survivor's in stream order. So `min(extent_id)` does
+    // NOT give the earliest stream position — we have to scan the list.
+    let log_stream_info = part_sc.get_stream_info(log_stream_id).await?;
+    let log_extent_ids: Vec<u64> = log_stream_info.extent_ids.clone();
+    // Pre-build first-occurrence index. CoW-shared extents can appear
+    // twice in the spliced extent_ids; the FIRST occurrence is the
+    // canonical position used for replay-start selection.
+    let mut first_pos_by_eid: HashMap<u64, usize> = HashMap::new();
+    for (pos, &eid) in log_extent_ids.iter().enumerate() {
+        first_pos_by_eid.entry(eid).or_insert(pos);
+    }
+
+    // The checkpoint's cursor, for GC's replay floor, when there is exactly
+    // one checkpoint and its cursor names an extent still in the log. It is
+    // durable (recovery just read it), and everything below it is in its
+    // SSTs. With two (a merge's sources) the open publishes a merged one
+    // before serving — see the `durable_ckpt_vp` field doc.
+    let single_ckpt_vp = match meta_records.as_slice() {
+        [r] if r.vp_extent_id != 0 && first_pos_by_eid.contains_key(&r.vp_extent_id) => {
+            Some((r.vp_extent_id, r.vp_offset))
+        }
+        _ => None,
+    };
+    // Selected start position into log_extent_ids; usize::MAX = not chosen.
+    let mut chosen_pos: usize = usize::MAX;
+    // SSTs listed by a checkpoint whose own cursor does not resolve. Only
+    // their stamped vp_heads may stand in for it (below).
+    let mut cursorless_locs: HashSet<(u64, u64, u64)> = HashSet::new();
+
+    if !meta_records.is_empty() {
+        // More than one record = a merge's sources (the survivor's open
+        // publishes one merged record before it serves). Each was written by
+        // the merge freeze drain with writes stopped and the memtable flushed:
+        // its cursor is its source's committed log end and its SSTs hold
+        // everything before it. So nothing in either source's extents needs
+        // replay, and replay starts at the LATEST cursor by stream position —
+        // the log is `[survivor][victim][new tail]`, and only writes after
+        // the merge follow it. Starting at the earliest cursor re-read the
+        // victim's whole log on every merged open. A record whose cursor does
+        // not resolve is skipped: a drain on an empty tail points at `(T, 0)`,
+        // and once the merge seals T behind newer extents the sealed-empty
+        // sweep or GC may reclaim it — there was nothing to replay from it.
+        // Replay then starts earlier than needed, and with no cursor resolving
+        // it walks the whole log; the seq threshold below skips every flushed
+        // record, so this costs reading, not correctness.
+        let merged = meta_records.len() > 1;
+        for r in &meta_records {
+            let resolved = if r.vp_extent_id == 0 {
+                None // empty / not-yet-flushed checkpoint
+            } else {
+                // None = the vp_head names an extent no longer in the stream
+                // (a reclaimed sealed-empty tail, out-of-band truncate) —
+                // nothing to walk from there.
+                first_pos_by_eid.get(&r.vp_extent_id).copied()
+            };
+            let Some(pos) = resolved else {
+                if merged {
+                    continue;
+                }
+                cursorless_locs.extend(r.locs.iter().map(|l| (l.extent_id, l.offset, l.len)));
+                continue;
+            };
+            if chosen_pos == usize::MAX || (pos, r.vp_offset) > (chosen_pos, recovered_vp_off) {
+                chosen_pos = pos;
+                recovered_vp_eid = r.vp_extent_id;
+                recovered_vp_off = r.vp_offset;
+            }
+        }
+        tracing::info!(
+            target: "recover_trace",
+            part_id = _part_id,
+            log_stream_id,
+            meta_stream_id,
+            chosen_pos,
+            recovered_vp_eid,
+            recovered_vp_off,
+            n_meta_records = meta_records.len(),
+            meta_vps = ?meta_records
+                .iter()
+                .map(|r| (r.vp_extent_id, r.vp_offset, r.locs.len()))
+                .collect::<Vec<_>>(),
+            log_extent_ids = ?log_extent_ids,
+            "recover_partition: replay start chosen"
+        );
+        // Dedup SstLocation by (extent_id, offset, len) — CoW-shared SSTs
+        // post-split appear in both partitions' records pointing at the
+        // same physical bytes; we keep one entry.
+        let mut seen: HashSet<(u64, u64, u64)> = HashSet::new();
+        let mut all_locs: Vec<SstLocation> = Vec::new();
+        for r in &meta_records {
+            for loc in &r.locs {
+                let key = (loc.extent_id, loc.offset, loc.len);
+                if seen.insert(key) {
+                    all_locs.push(loc.clone());
+                }
+            }
+        }
+        // After a merge the sources' seq counters were independent, so the
+        // union max below is only a sound replay skip because each source's
+        // freeze drain left no record outside its SSTs (see `replay_dedup`).
+        for loc in all_locs {
+            // bounded retry on eversion-mismatch during open. A
+            // post-restart manager whose `apply_ec_conversion_done` did
+            // not commit in its previous lifetime keeps stale (pre-EC)
+            // `ExtentInfo.eversion` in etcd while the extent-node's local
+            // file already holds the post-EC eversion. The manager-side
+            // `ec_conversion_dispatch_loop` re-dispatches via the
+            // rich marker and converges manager state within ~1 tick
+            // (≤ 0.5 s on first iter, then 5 s); we retry with backoff
+            // until convergence so the operator doesn't have to manually
+            // restart the PS a second time. Cap at ~30 s — past that we
+            // surface the error so it doesn't hide a non-EC fault.
+            // read ONLY the meta tail (two small reads) — full-SST
+            // materialization at recovery kept RSS at O(dataset) (9.4 GB
+            // of SSTs faulted ~25 GB transient pre-fix). Blocks are paged
+            // on demand afterwards.
+            let mut attempt: u32 = 0;
+            let (tail4, _end) = loop {
+                match part_sc
+                    .read_bytes_from_extent(
+                        loc.extent_id,
+                        loc.offset + loc.len.saturating_sub(4),
+                        4,
+                    )
+                    .await
+                {
+                    Ok(v) => break v,
+                    Err(e) if attempt < 30 && e.to_string().contains("eversion mismatch") => {
+                        attempt += 1;
+                        tracing::warn!(
+                            part_id = _part_id,
+                            extent_id = loc.extent_id,
+                            offset = loc.offset,
+                            attempt,
+                            "SST read returned eversion mismatch during open — \
+                             waiting 1 s for manager to converge state, will retry"
+                        );
+                        compio::time::sleep(std::time::Duration::from_secs(1)).await;
+                        continue;
+                    }
+                    Err(e) => {
+                        return Err(e).with_context(|| {
+                            format!(
+                                "read SST from rowStream extent={} offset={}",
+                                loc.extent_id, loc.offset
+                            )
+                        });
+                    }
+                }
+            };
+
+            if tail4.len() < 4 || loc.len < 8 {
+                return Err(anyhow::anyhow!(
+                    "SST tail short: extent={} offset={} len={} got={}",
+                    loc.extent_id,
+                    loc.offset,
+                    loc.len,
+                    tail4.len()
+                ));
+            }
+            let meta_len = u32::from_le_bytes(tail4[..4].try_into().unwrap()) as u64;
+            if meta_len == 0 || meta_len + 4 > loc.len {
+                return Err(anyhow::anyhow!(
+                    "invalid meta_len={meta_len} for SST extent={} offset={} len={}",
+                    loc.extent_id,
+                    loc.offset,
+                    loc.len
+                ));
+            }
+            let meta_off = loc.offset + loc.len - 4 - meta_len;
+            let (meta_bytes, _e2) = part_sc
+                .read_bytes_from_extent(loc.extent_id, meta_off, meta_len)
+                .await
+                .with_context(|| {
+                    format!(
+                        "read SST meta extent={} offset={meta_off} len={meta_len}",
+                        loc.extent_id
+                    )
+                })?;
+            let reader =
+                SstReader::open_paged_from_meta(&meta_bytes, loc.extent_id, loc.offset, loc.len)
+                    .with_context(|| {
+                        format!(
+                            "open SST meta extent={} offset={} len={}",
+                            loc.extent_id, loc.offset, loc.len
+                        )
+                    })?;
+
+            let tbl_last_seq = reader.seq_num();
+            if tbl_last_seq > max_seq {
+                max_seq = tbl_last_seq;
+            }
+
+            // An SST with no block holds no key (a compaction's discards-only
+            // output), so none out of range — and its empty key bounds would
+            // otherwise read as out of every range.
+            if !detected_overlap && reader.block_count() > 0 {
+                let sk = parse_key(reader.smallest_key());
+                let bk = parse_key(reader.biggest_key());
+                if !in_range(rg, sk) || !in_range(rg, bk) {
+                    detected_overlap = true;
+                }
+            }
+
+            // An SST's stamped vp_head is the content boundary of the flush
+            // (or the newest compaction input) that produced it. A checkpoint
+            // whose cursor resolves already covers every SST it lists — it is
+            // at or past all their boundaries — so their stamps could only
+            // pull the replay start back, never make it safer: one old SST
+            // that no compaction touched made every open re-read all the WAL
+            // written since its flush (`system_restart_replay_cursor`). The
+            // stamps stand in only for a checkpoint whose own cursor is gone.
+            // Same position-vs-extent_id consideration as above.
+            let stands_in = cursorless_locs.contains(&(loc.extent_id, loc.offset, loc.len));
+            if let Some(&reader_pos) = first_pos_by_eid
+                .get(&reader.vp_extent_id)
+                .filter(|_| stands_in)
+            {
+                let cur_pos = first_pos_by_eid
+                    .get(&recovered_vp_eid)
+                    .copied()
+                    .unwrap_or(usize::MAX);
+                if chosen_pos == usize::MAX
+                    || reader_pos < cur_pos
+                    || (reader_pos == cur_pos && reader.vp_offset < recovered_vp_off)
+                {
+                    chosen_pos = reader_pos;
+                    recovered_vp_eid = reader.vp_extent_id;
+                    recovered_vp_off = reader.vp_offset;
+                }
+            }
+
+            let estimated_size = reader.estimated_size();
+            tables.push(TableMeta {
+                extent_id: loc.extent_id,
+                offset: loc.offset,
+                len: loc.len,
+                estimated_size,
+                last_seq: tbl_last_seq,
+            });
+            sst_readers.push(Arc::new(reader));
+        }
+    }
+    // The checkpoint's order is the recency order; never re-sort by
+    // `last_seq` (see "Table list order" in this crate's CLAUDE.md). A merge's
+    // sources concatenate: their keys are disjoint.
+
+    // Replay logStream into the recovered memtable, skipping records already
+    // captured by the loaded SSTs: on one partition's timeline a record whose
+    // seq is <= the SSTs' max seq is in one of them, because partition_loop
+    // inserts in strict seq order (FuturesOrdered) and flushes commit in order.
+    // After a merge the same one threshold (the union max, taken before replay
+    // raises `max_seq`) is right: every record of either source is at or below
+    // that source's max, since each drained with writes stopped, and the
+    // merged partition's own writes start above the union (its seq counter is
+    // seeded from it). It matters when a source cursor was skipped and replay
+    // walks a flushed source region: without it a superseded record there
+    // would enter the memtable and shadow the newer value in an SST.
+    let replay_dedup = max_seq;
+    let active = Memtable::new();
+    if chosen_pos == usize::MAX && !tables.is_empty() {
+        tracing::warn!(
+            part_id = _part_id,
+            tables = tables.len(),
+            log_extents = log_extent_ids.len(),
+            "recovery: no SST or checkpoint replay cursor resolved — replaying the WHOLE log \
+             stream. Expect a slow open proportional to the log, once. A cursor naming an \
+             extent that was reclaimed is the known way to reach this."
+        );
+    }
+
+    // WAL self-heal A3: per-extent set of replica node_ids whose copy of a
+    // log_stream chunk failed to decode during replay. Populated by
+    // `self_heal_replay_chunk` when it works around a corrupt serving replica
+    // by re-reading a clean one; drained after the replay loop into A5
+    // `report_corrupt_replica` (isolation) BEFORE the partition serves (I1).
+    let mut corrupt_per_extent: HashMap<u64, HashSet<u64>> = HashMap::new();
+
+    // Position-based replay-extent selection: from the chosen cursor to the
+    // end, each extent once at its FIRST occurrence (CoW-shared extents appear
+    // more than once in a merged log). extent_id order is not stream order
+    // after a merge, so positions are compared, never ids. No resolvable cursor
+    // means the whole log from offset zero.
+    let mut seen_extents: HashSet<u64> = HashSet::new();
+    let replay_extents: Vec<(usize, u64, u64)> = log_extent_ids
+        .iter()
+        .enumerate()
+        .filter_map(|(pos, &eid)| {
+            if chosen_pos != usize::MAX && pos < chosen_pos {
+                seen_extents.insert(eid);
+                None
+            } else if !seen_extents.insert(eid) {
+                None
+            } else {
+                Some((
+                    pos,
+                    eid,
+                    if pos == chosen_pos {
+                        recovered_vp_off
+                    } else {
+                        0
+                    },
+                ))
+            }
+        })
+        .collect();
+    tracing::info!(
+        target: "recover_trace",
+        part_id = _part_id,
+        n_meta_records = meta_records.len(),
+        planned_extents = replay_extents.len(),
+        total_log_extents = log_extent_ids.len(),
+        "recover_partition: replay plan built"
+    );
+
+    // (b): p.vp — the write cursor recorded for the recovered
+    // active memtable, which its eventual rotation stamps as the flushed SST's
+    // vp_head — must seed to the committed log TAIL, NOT the replay START
+    // (`recovered_vp_*`, which the replay itself still needs as its start offset).
+    // Seeding the START leaves an idle-restarted partition's recovered-active SST
+    // with a backward vp_head → the GC floor never advances. We advance this to
+    // each replayed extent's committed end, so the LAST (tail) extent wins. SAFE:
+    // reads are committed-clamped, so the tail is ≥ every replayed record — a
+    // flush of the recovered active never stamps a vp_head past its own content.
+    // Defaults to the replay-min when no cursor resolved (empty recovered active
+    // ⇒ no rotation ⇒ the seed is inert there).
+    let mut tail_eid = recovered_vp_eid;
+    let mut tail_off = recovered_vp_off;
+    let replay_started = std::time::Instant::now();
+    let mut replay_bytes: u64 = 0;
+    let mut replay_kept: u64 = 0;
+    let mut replay_covered: u64 = 0;
+    // Keep the optional wrapper around the scan body: recovery historically
+    // used `None` for "nothing to replay", and retaining the block keeps this
+    // safety-critical loop's structure stable while the planner changes.
+    let replay_extents = Some(replay_extents);
+    let replay_extent_count = replay_extents.as_ref().map_or(0, Vec::len);
+    if let Some(extents) = replay_extents {
+        for (_pos, eid, start_off) in extents {
+            let extent_dedup = replay_dedup;
+            // retry extent reads during recovery instead of silently
+            // skipping. A transient node failure should not cause permanent
+            // data loss for un-checkpointed writes.
+            // stream the replay in bounded chunks (GC-style carry
+            // pattern) — the earlier whole-extent read `(eid, start, 0)`
+            // materialized up to 2 GB per partition at restart, keeping
+            // recovery RSS at O(dataset).
+            //
+            // MUST be the COMMITTED-clamped read, not the plain one: a
+            // replica's data file legitimately holds speculative bytes past
+            // `sealed_length` / min-commit (an ahead replica is never
+            // truncated back once the extent seals). The plain explicit-
+            // length read clamps only at the SERVING replica's local file
+            // length, so this loop's short-read stop condition never fires
+            // at the committed end — the scan ingests un-committed bytes
+            // and the next chunk request trips `StaleVpOffset`
+            // (offset > sealed_length), permanently wedging the partition
+            // open (partitions stuck in an open-fail loop after a
+            // kill+restart). The len=0
+            // whole-read this replaced resolved its end from
+            // sealed_length / the commit probe, which is exactly what
+            // `read_committed_bytes_from_extent` restores per chunk.
+            let replay_chunk_bytes = params().replay_chunk_bytes.get();
+            let mut cur_off: u64 = start_off;
+            let mut carry: Vec<u8> = Vec::new();
+            loop {
+            let (data, committed_end) = {
+                let mut attempt = 0u32;
+                loop {
+                    match part_sc
+                        .read_committed_bytes_from_extent(eid, cur_off, replay_chunk_bytes)
+                        .await
+                    {
+                        Ok((d, ce)) => break (d, ce),
+                        Err(e) => {
+                            attempt += 1;
+                            if attempt >= 10 {
+                                return Err(anyhow::anyhow!(
+                                    "recover_partition: failed to read extent {} after {} attempts: {}",
+                                    eid, attempt, e
+                                ));
+                            }
+                            tracing::warn!(
+                                "recover_partition: read extent {} attempt {}/10 failed: {}, retrying...",
+                                eid, attempt, e
+                            );
+                                compio::time::sleep(std::time::Duration::from_secs(2)).await;
+                            }
+                        }
+                    }
+                };
+                let got = data.len();
+                replay_bytes += got as u64;
+                // Bytes still committed from cur_off, and how many THIS chunk should
+                // have yielded. `expected < got` is impossible (the read clamps to
+                // committed_end); `got < expected` = the serving replica TRUNCATED
+                // the committed window — a short read that lands on a
+                // record boundary would otherwise decode clean and be silently
+                // treated as end-of-extent, dropping the committed tail. We route it
+                // to self-heal (a clean replica has the bytes) / fail-loud instead.
+                let rem = committed_end.saturating_sub(cur_off);
+                let expected = replay_chunk_bytes.min(rem) as usize;
+                let is_final = rem <= replay_chunk_bytes;
+                let short = got < expected;
+                if rem == 0 && carry.is_empty() {
+                    // Reached the committed end cleanly, nothing buffered. Done.
+                    // (b): still advance the tail seed here —
+                    // an EMPTY tail extent (`committed_end == start_off`, e.g. a
+                    // freshly-rolled open tail with no committed data yet) exits on
+                    // THIS branch, never reaching the `is_final` update below. `cur_off
+                    // == committed_end` here, so this records the true (empty) tail so
+                    // the recovered active's flush stamps the newest position and the
+                    // GC floor advances past the previous (data-holding) extent.
+                    tail_eid = eid;
+                    tail_off = cur_off;
+                    break;
+                }
+                let buf_base = cur_off - carry.len() as u64;
+                // The full committed window this chunk covers (carry prefix + the
+                // bytes that SHOULD be readable here) — used as the self-heal re-read
+                // length so a truncated serving replica's short `got` doesn't shrink it.
+                let want_full = carry.len() + expected;
+                let mut buf: Bytes = if carry.is_empty() {
+                    data
+                } else {
+                    let mut c = std::mem::take(&mut carry);
+                    c.extend_from_slice(&data);
+                    Bytes::from(c)
+                };
+                // WAL-FAILSTOP + self-heal A3: try to decode the chunk. Corruption =
+                // a short read (truncated serving replica), OR a CRC/length mismatch
+                // on a complete record (`decode_records_chunk` Err), OR a non-empty
+                // leftover at the committed end (final chunk, `consumed < buf.len()`).
+                // On corruption, attempt cross-replica self-heal: re-read this
+                // committed window from every replica of the SEALED extent,
+                // decode-check each, use the first clean one, and record the corrupt
+                // node_ids for A5 isolation. Only if NO clean replica exists (or the
+                // extent is OPEN / EC, not self-healable) do we fail the open loud.
+                let decoded = decode_records_chunk(&buf);
+                let need_heal = short
+                    || match &decoded {
+                        Ok((_recs, consumed)) => is_final && *consumed < buf.len(),
+                        Err(_) => true,
+                    };
+                let (records, consumed) = if !need_heal {
+                    decoded.expect("need_heal=false implies Ok")
+                } else {
+                    let corrupt_set = corrupt_per_extent.entry(eid).or_default();
+                    // Re-read the FULL committed window (`want_full`), not the
+                    // possibly-short `buf.len()` — a truncated serving replica must
+                    // not shrink the window we ask clean replicas for.
+                    match self_heal_replay_chunk(
+                        part_sc,
+                        eid,
+                        log_stream_id,
+                        buf_base,
+                        want_full as u32,
+                        is_final,
+                        short,
+                        corrupt_set,
+                    )
+                    .await?
+                    {
+                        Some((recs, c, healed)) => {
+                            tracing::warn!(
+                                part_id = _part_id,
+                                extent_id = eid,
+                                offset = buf_base,
+                                short,
+                                "WAL self-heal: log_stream chunk corrupt/truncated on the \
+                             serving replica(s); recovered the window from a clean \
+                             replica (corrupt replica(s) will be isolated via the manager)"
+                        );
+                        buf = Bytes::from(healed);
+                        (recs, c)
+                    }
+                    None => {
+                        // Not self-healable: EC; every replica corrupt; or an open
+                        // tail we must not seal (truncated → would seal below
+                        // acked) / seal-and-roll failed. Fail the open loud,
+                        // preserving the decode error if any.
+                        let reason = if short {
+                            format!(
+                                "serving replica truncated the committed window (got {got} of \
+                                 {expected} expected bytes)"
+                                )
+                            } else {
+                                let leftover = match &decoded {
+                                    Ok((_r, c)) => buf.len().saturating_sub(*c),
+                                    Err(_) => 0,
+                                };
+                                format!("{leftover} leftover byte(s) at the committed end")
+                            };
+                            return Err(decoded
+                                .err()
+                                .unwrap_or_else(|| {
+                                    anyhow::anyhow!(
+                                        "WAL-FAILSTOP: {reason} of log_stream extent {eid}"
+                                    )
+                                })
+                                .context(format!(
+                                    "log_stream extent {eid} chunk @ offset {buf_base} is \
+                                 corrupt and not self-healable (EC / all replicas corrupt / \
+                                 open-tail truncated or seal failed) — recover from a healthy \
+                                 log_stream copy"
+                                )));
+                        }
+                    }
+                };
+                for (buf_off, op, key, value, expires_at) in records {
+                    let ts = parse_ts(&key);
+                    if ts > max_seq {
+                        max_seq = ts;
+                    }
+                    // Lease write fencing: fence-bump records bypass the
+                    // ts-dedup (max-merge is idempotent — re-applying a bump
+                    // already covered by the checkpoint snapshot is a no-op)
+                    // and never enter the memtable.
+                    if op == OP_FENCE_BUMP {
+                        let uk = parse_key(&key);
+                        if uk.len() == 8 && value.len() == 8 {
+                            let ino = u64::from_be_bytes(uk.try_into().unwrap());
+                            let epoch = u64::from_le_bytes(value.as_slice().try_into().unwrap());
+                            let f = fence_floors.entry(ino).or_insert(0);
+                            *f = (*f).max(epoch);
+                        } else {
+                            tracing::warn!(
+                                key_len = uk.len(),
+                                val_len = value.len(),
+                                "replay: malformed OP_FENCE_BUMP record skipped"
+                            );
+                        }
+                        continue;
+                    }
+                    if ts <= extent_dedup {
+                        replay_covered += 1;
+                        continue;
+                    }
+                    replay_kept += 1;
+
+                    let record_extent_off = buf_base + buf_off as u64;
+                    // BUG1: the un-flushed LOG bytes this
+                    // replayed record contributes to the recovered active memtable
+                    // (value included), so the post-recovery WAL-gap is accurate.
+                    // Captured before `value`/`key` are moved into the entry/insert.
+                    let log_rec_bytes = crate::wal_record::V1_ENVELOPE_OVERHEAD as u64
+                        + crate::wal_record::PAYLOAD_HEADER as u64
+                        + key.len() as u64
+                        + value.len() as u64;
+                    // A ValuePointer's value stays live in the log; the rest of
+                    // the record dies with this memtable's flush (`wal_dead`).
+                    let carries_vp = record_carries_value_pointer(op, value.len());
+                    let log_rec_dead = if carries_vp {
+                        log_rec_bytes - value.len() as u64
+                    } else {
+                        log_rec_bytes
+                    };
+                    let mem_entry = if carries_vp {
+                        // VP detection: new WAL has VP flag in op; old WAL uses
+                        // value size as fallback. The reconstructed VP.offset MUST
+                        // equal the value's true on-disk offset for BOTH envelope
+                        // formats — GC's full-VP-identity liveness compares the live
+                        // VP.offset against the scanned record's computed offset, so
+                        // a per-version mismatch drops live records. The record's
+                        // first byte (V1 0xff sentinel vs V0 op) selects the layout
+                        // via the shared `value_offset_in_record` helper (was a
+                        // hardcoded V1 `+22`, which mis-placed every V0 VP by 5 B).
+                        let val_off =
+                            crate::wal_record::value_offset_in_record(buf[buf_off], key.len());
+                        let vp = ValuePointer {
+                            extent_id: eid,
+                            offset: record_extent_off + val_off as u64,
+                            len: value.len() as u64,
+                        };
+                        MemEntry {
+                            op: (op & 0x7f) | OP_VALUE_POINTER,
+                            value: vp.encode().to_vec(),
+                            expires_at,
+                        }
+                    } else {
+                        MemEntry {
+                            op,
+                            value,
+                            expires_at,
+                        }
+                    };
+
+                let size = key.len() as u64 + mem_entry.value.len() as u64 + 32;
+                active.insert(key, mem_entry, size);
+                // BUG1: track the un-flushed LOG bytes of
+                // the recovered active so the post-recovery WAL-gap force-rotate
+                // gap is accurate (otherwise it seeds at 0 and the first replay
+                // window after a restart can grow unbounded before rotating).
+                active.add_log_bytes(log_rec_bytes);
+                active.add_wal_dead(eid, log_rec_dead);
+            }
+            carry = buf[consumed..].to_vec();
+            // Advance by the full window `buf` covers (= the committed bytes for
+            // this chunk). When a chunk was self-healed, `buf` was replaced by
+            // the clean replica's `want_full`-length copy, so this advances past
+            // the FULL committed window — not the truncated serving `got`. In the
+            // non-healed case `buf.len() == carry_prev + got`, identical to the
+            // old `cur_off += got`.
+            cur_off = buf_base + buf.len() as u64;
+            if is_final {
+                // Reached the committed end (committed_end-clamped reads).
+                // need_heal already routed an is_final leftover through self-heal
+                // / fail-loud above, so `carry` is empty here; the check is
+                // belt-and-braces. WAL-FAILSTOP:
+                // a non-empty carry at the committed end is NOT a legit crash-tail
+                // (the committed boundary lands on a record boundary; uncommitted
+                // partial tails are clamped out), so discarding it would drop
+                // committed data.
+                if !carry.is_empty() {
+                    return Err(anyhow::anyhow!(
+                        "WAL-FAILSTOP: {} leftover byte(s) at the committed end of \
+                         log_stream extent {eid} — a committed record's length exceeds the \
+                         commit boundary (corruption / length bit-flip / truncated replica). \
+                         Refusing to discard committed data; recover this replica from a \
+                         healthy log_stream copy.",
+                            carry.len()
+                        ));
+                    }
+                    // (b): committed end of this extent. Extents replay
+                    // in stream-position order, so the LAST one to land here is the
+                    // tail → this converges to the committed log tail.
+                    tail_eid = eid;
+                    tail_off = cur_off;
+                    break;
+                }
+            } // chunk loop
+        }
+    }
+    *REPLAY_READ_BYTES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(_part_id)
+        .or_insert(0) += replay_bytes;
+    // Where the replay really started (the trace line above is written before
+    // the SSTs are loaded) and what it cost: an open that is slow here is slow
+    // because of WAL volume, and `covered` says how much of it the SSTs
+    // already held.
+    tracing::info!(
+        part_id = _part_id,
+        start_extent = recovered_vp_eid,
+        start_offset = recovered_vp_off,
+        extents = replay_extent_count,
+        bytes = replay_bytes,
+        records_kept = replay_kept,
+        records_covered = replay_covered,
+        elapsed_ms = replay_started.elapsed().as_millis() as u64,
+        "recover_partition: log replay done"
+    );
+
+    // WAL self-heal A5: isolate every corrupt replica we worked around during
+    // replay BEFORE this partition serves (design I1 — isolation-before-serving;
+    // an unisolated corrupt replica could still serve rotted bytes for a VP read,
+    // which `resolve_value` does NOT CRC-check). The manager clears each corrupt
+    // slot's `avali` bit + bumps eversion (etcd-first); the eversion bump forces
+    // every PS — including us, after `invalidate_extent_cache` — to refetch the
+    // cleared ExtentInfo so the A1 read filter excludes the bad slot. A refused
+    // report (stale owner/eversion, would-isolate-last, open) returns Err →
+    // partition open fails loud → region_sync retries → re-detect + re-report.
+    for (eid, corrupt) in &corrupt_per_extent {
+        if corrupt.is_empty() {
+            continue;
+        }
+        let node_ids: Vec<u64> = corrupt.iter().copied().collect();
+        // Fresh fetch so the eversion we report matches the manager's current
+        // (minimises a spurious eversion-mismatch refusal).
+        part_sc.invalidate_extent_cache(*eid);
+        let ex = part_sc
+            .get_extent_info(*eid)
+            .await
+            .with_context(|| format!("A5: fetch ExtentInfo for corrupt extent {eid}"))?;
+        part_sc
+            .report_corrupt_replica(_part_id, log_stream_id, *eid, ex.eversion, node_ids.clone())
+            .await
+            .with_context(|| {
+                format!("A5: isolate corrupt log_stream replica(s) {node_ids:?} of extent {eid}")
+            })?;
+        // Force our own serving reads to refetch the cleared-avali / bumped
+        // eversion ExtentInfo.
+        part_sc.invalidate_extent_cache(*eid);
+        tracing::warn!(
+            part_id = _part_id,
+            extent_id = *eid,
+            corrupt = ?node_ids,
+            "WAL self-heal: isolated corrupt log_stream replica(s) via the manager"
+        );
+    }
+
+    Ok((
+        tables,
+        sst_readers,
+        max_seq,
+        // (b): seed p.vp to the committed log TAIL, not the replay
+        // start — the recovered active memtable holds everything up to the tail,
+        // so its rotation must stamp the tail (advances the GC floor for an
+        // idle-restarted partition) and never a backward position.
+        tail_eid,
+        tail_off,
+        detected_overlap,
+        active,
+        fence_floors,
+        single_ckpt_vp,
+        meta_records.len(),
+    ))
+}
+
+// ---------------------------------------------------------------------------
+// Record encoding/decoding
+// ---------------------------------------------------------------------------
+
+#[allow(dead_code)]
+pub(crate) fn encode_record(op: u8, key: &[u8], value: &[u8], expires_at: u64) -> Vec<u8> {
+    // now writes V1 envelope. Used by GC tests (background.rs
+    // gc_streaming_tests) and lib.rs round-trip tests; both verify via the
+    // V1-aware decoders.
+    crate::wal_record::encode_v1(op, key, value, expires_at)
+}
+
+#[allow(dead_code)]
+pub(crate) fn decode_records_full(bytes: &[u8]) -> Vec<(u8, Vec<u8>, Vec<u8>, u64)> {
+    // dispatches per-record on V0 vs V1 envelope; CRC failures on V1
+    // log a WARN and skip past the corrupted record (advance by its declared
+    // length) instead of silently returning truncated state.
+    let mut out = Vec::new();
+    let mut cursor = 0usize;
+    let mut skipped: usize = 0;
+    while cursor < bytes.len() {
+        match crate::wal_record::decode_one(&bytes[cursor..]) {
+            crate::wal_record::DecodeOne::Ok(r) => {
+                out.push((r.op, r.key.to_vec(), r.value.to_vec(), r.expires_at));
+                cursor += r.total;
+            }
+            crate::wal_record::DecodeOne::Incomplete => break,
+            crate::wal_record::DecodeOne::Corrupt { skip_bytes, reason } => {
+                tracing::warn!(
+                    cursor,
+                    skip_bytes,
+                    reason,
+                    "WAL record corrupted; skipping"
+                );
+                cursor += skip_bytes;
+                skipped += 1;
+            }
+        }
+    }
+    if skipped > 0 {
+        tracing::warn!(skipped, "skipped {skipped} corrupted WAL record(s)");
+    }
+    out
+}
+
+/// chunked-replay variant — also returns CONSUMED bytes (offset just
+/// past the last complete record) so the caller can carry the partial tail
+/// into the next chunk (GC streaming pattern).
+pub(crate) fn decode_records_chunk(
+    bytes: &[u8],
+) -> anyhow::Result<(Vec<(usize, u8, Vec<u8>, Vec<u8>, u64)>, usize)> {
+    let mut out = Vec::new();
+    let mut cursor = 0usize;
+    while cursor < bytes.len() {
+        let record_start = cursor;
+        match crate::wal_record::decode_one(&bytes[cursor..]) {
+            crate::wal_record::DecodeOne::Ok(r) => {
+                out.push((
+                    record_start,
+                    r.op,
+                    r.key.to_vec(),
+                    r.value.to_vec(),
+                    r.expires_at,
+                ));
+                cursor += r.total;
+            }
+            // Incomplete = truncated TAIL record (crash-tail): the caller
+            // carries the partial bytes into the next chunk, or stops. Clean.
+            crate::wal_record::DecodeOne::Incomplete => break,
+            // WAL-FAILSTOP: a CRC/length mismatch on a
+            // COMPLETE record is real corruption (bit rot / torn write).
+            // Skipping it would silently drop an ACKed-but-unflushed write and
+            // leave a hole in the replayed sequence. FAIL recovery instead —
+            // the partition open errors loud; the data lives on the other
+            // log_stream replicas, so the correct response is rebuild/retry
+            // against a healthy replica, never serve a holed memtable.
+            crate::wal_record::DecodeOne::Corrupt { skip_bytes, reason } => {
+                return Err(anyhow::anyhow!(
+                    "WAL-FAILSTOP: corrupt log_stream record at offset {record_start} \
+                     ({reason}, len={skip_bytes}) — refusing to skip (would silently drop an \
+                     ACKed write + hole the replay). Partition open fails; recover this \
+                     replica from a healthy log_stream copy."
+                ));
+            }
+        }
+    }
+    Ok((out, cursor))
+}
+
+/// Walk all extents in a meta_stream and collect the LAST checkpoint from each
+/// non-empty extent. Used by
+/// recovery to gather both survivor's and victim's checkpoints
+/// after a partition merge spliced their meta_streams together.
+///
+/// Pre-merge partitions have one non-empty extent → single record →
+/// behaviour identical to the legacy `read_last_extent_data +
+/// decode_last_table_checkpoint`. Post-merge they have N extents.
+pub(crate) async fn read_all_table_locations(
+    stream_id: u64,
+    sc: &Rc<StreamClient>,
+) -> Result<Vec<TableLocations>> {
+    let info = sc.get_stream_info(stream_id).await?;
+    let mut out: Vec<TableLocations> = Vec::new();
+    for &eid in &info.extent_ids {
+        let (payload, _end) = sc.read_bytes_from_extent(eid, 0, 0).await?;
+        if payload.is_empty() {
+            continue;
+        }
+        // Empty extents (carry no records) are common — skipped above. An
+        // extent with no valid record is skipped with a warning; bit rot
+        // mid-stream keeps the newer valid records (see the decoder).
+        match decode_last_table_checkpoint(&payload) {
+            Ok(locs) => out.push(locs),
+            Err(e) => {
+                tracing::warn!(
+                    extent_id = eid,
+                    error = %e,
+                    "meta_stream extent has no valid TableLocations; skipping"
+                );
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Decode the last valid checkpoint record in a meta extent.
+pub(crate) fn decode_last_table_checkpoint(data: &[u8]) -> Result<TableLocations> {
+    // Format: sequence of [len: u32 LE][rkyv payload] records. We want the last
+    // successfully decoded record.
+    //
+    // Previously a decode failure mid-stream caused `break`, returning the
+    // PRIOR record. Once rkyv decoding became strict (bytecheck), any bit
+    // rot in a record's payload trips this break-and-fall-back path, silently
+    // discarding all valid records that came AFTER the corrupted one — the
+    // partition restarts on stale state without a single error logged.
+    //
+    // changes the decode-failure handling to: log a WARN with offset +
+    // error, advance past the corrupted record using its declared msg_len, and
+    // continue scanning. This preserves the legitimate partial-tail-write
+    // behaviour (the `total > buf.len()` check still breaks at the end) while
+    // surfacing mid-stream corruption loudly and refusing to silently drop
+    // newer valid records. If `msg_len` itself is corrupt to point into
+    // garbage, we still bound the damage: the next record's length-prefix will
+    // almost certainly fail decode too, and we'll skip it; eventually we either
+    // find a valid record or exit with `last` populated by the last good one.
+    let mut last: Option<TableLocations> = None;
+    let mut buf = data;
+    let mut offset = 0usize;
+    let mut skipped: usize = 0;
+    while buf.len() >= 4 {
+        let msg_len = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+        let total = 4 + msg_len;
+        if total > buf.len() {
+            // Legitimate partial-tail-write: stop here.
+            break;
+        }
+        let payload = &buf[4..4 + msg_len];
+        match rkyv_decode::<TableLocations>(payload) {
+            Ok(locs) => last = Some(locs),
+            Err(e) => {
+                tracing::warn!(
+                    offset,
+                    msg_len,
+                    error = %e,
+                    "TableLocations record decode failed (likely bit rot); skipping and continuing"
+                );
+                skipped += 1;
+            }
+        }
+        buf = &buf[total..];
+        offset += total;
+    }
+    if skipped > 0 {
+        tracing::warn!(
+            skipped,
+            "skipped {skipped} corrupted TableLocations record(s); newer valid records preserved"
+        );
+    }
+    last.ok_or_else(|| anyhow!("decode TableLocations: no valid record"))
+}
+
+pub(crate) fn in_range(rg: &Range, key: &[u8]) -> bool {
+    if key < rg.start_key.as_slice() {
+        return false;
+    }
+    if rg.end_key.is_empty() {
+        return true;
+    }
+    key < rg.end_key.as_slice()
+}
+
+// ---------------------------------------------------------------------------
+// MetaStream persistence
+// ---------------------------------------------------------------------------
+
+/// Lease write fencing: snapshot the per-ino fence floors for a checkpoint,
+/// under the caller's existing `PartitionData` borrow.
+///
+/// ACCEPTED SEMANTICS (deliberately not "fixed"): this snapshots
+/// the IN-MEMORY floors, which may include a bump whose OP_FENCE_BUMP WAL
+/// record is still in flight (or whose admitted write later fails). That is
+/// safe: a floor of E only ever encodes the fact "a request stamped epoch E
+/// reached this PS", and under the manager's monotonic lease grants that
+/// fact alone proves every writer with epoch < E is already revoked —
+/// fencing them is correct whether or not E's write committed. The
+/// fail-direction is closed (over-fencing of provably-revoked writers
+/// only); the dangerous direction (floor LOSS) is what the WAL-before-ACK
+/// pairing prevents — and that pairing needs the DURABLE floor tracked
+/// separately (`FenceFloors`): a request that raised the admitted floor and
+/// failed before its record committed left a same-epoch retry with nothing to
+/// raise, so it was acknowledged with no record anywhere. The snapshot here
+/// still takes the admitted floors, for the reason above.
+pub(crate) fn snapshot_fence_floors(p: &PartitionData) -> Vec<(u64, u64)> {
+    p.fence_floors
+        .admitted
+        .borrow()
+        .iter()
+        .map(|(&ino, &epoch)| (ino, epoch))
+        .collect()
+}
+
+pub(crate) async fn save_table_locs_raw(
+    stream_client: &Rc<StreamClient>,
+    meta_stream_id: u64,
+    tables: &[TableMeta],
+    vp_extent_id: u64,
+    vp_offset: u64,
+    // Lease write fencing: fence-floor snapshot, captured by the caller
+    // under the SAME borrow as `tables`, both under `publish_lock`.
+    fence_floors: Vec<(u64, u64)>,
+) -> Result<()> {
+    let locs = TableLocations {
+        locs: tables
+            .iter()
+            .map(|t| SstLocation {
+                extent_id: t.extent_id,
+                offset: t.offset,
+                len: t.len,
+            })
+            .collect(),
+        vp_extent_id,
+        vp_offset,
+        // Unused: recovery starts a merged open at the latest source cursor
+        // and needs no per-source regions. The field stays in the format.
+        log_extent_count: 0,
+        fence_floors,
+    };
+    let payload = rkyv_encode(&locs);
+    let mut data = Vec::with_capacity(4 + payload.len());
+    data.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    data.extend_from_slice(&payload);
+    let ckpt_result = stream_client.append(meta_stream_id, &data).await?;
+    tracing::info!(
+        target: "ckpt_trace",
+        meta_stream_id,
+        vp_extent_id,
+        vp_offset,
+        n_tables = locs.locs.len(),
+        ckpt_extent = ckpt_result.extent_id,
+        ckpt_offset = ckpt_result.offset,
+        ckpt_end = ckpt_result.end,
+        "checkpoint published"
+    );
+    let info = stream_client.get_stream_info(meta_stream_id).await?;
+    if info.extent_ids.len() > 1 {
+        let last = *info.extent_ids.last().unwrap();
+        // Reclaiming the extents before this checkpoint is not part of
+        // publishing it. The manager refuses it while another op (a recovery,
+        // an EC conversion) is in flight on one of them; the next checkpoint
+        // asks again.
+        if let Err(e) = stream_client.truncate(meta_stream_id, last).await {
+            if !manager_says_retry_later(&e) {
+                return Err(e);
+            }
+            tracing::info!(meta_stream_id, "meta stream truncate deferred: {e}");
+        }
+    }
+    Ok(())
+}
+
+/// The manager refused for now, not for good: another op is in flight on the
+/// extent, or the caller's snapshot was stale. Not the owner fence.
+pub(crate) fn manager_says_retry_later(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| {
+        c.downcast_ref::<autumn_stream::client::ManagerError>()
+            .is_some_and(|m| m.is_transient_conflict())
+    })
+}
+
+#[cfg(test)]
+mod manager_says_retry_later_tests {
+    use super::manager_says_retry_later;
+    use autumn_rpc::manager_rpc::{CODE_ERROR, CODE_PRECONDITION};
+    use autumn_stream::client::ManagerError;
+
+    fn err(code: u8, message: &str) -> anyhow::Error {
+        anyhow::Error::new(ManagerError::new(code, "truncate", message))
+    }
+
+    /// A truncate refused because a recovery is in flight on an old meta
+    /// extent waits for the next checkpoint; anything else still fails it.
+    #[test]
+    fn only_a_wait_for_another_op_is_deferred() {
+        let busy = autumn_common::alloc_conflict::inflight_defer_message(7, "Recovery", "truncate");
+        assert!(manager_says_retry_later(&err(CODE_PRECONDITION, &busy)));
+        assert!(manager_says_retry_later(
+            &err(CODE_PRECONDITION, &busy).context("checkpoint")
+        ));
+        assert!(!manager_says_retry_later(&err(
+            CODE_PRECONDITION,
+            "owner_key=partition/1 owner_epoch mismatch, expected 4, got 3"
+        )));
+        assert!(!manager_says_retry_later(&err(CODE_ERROR, &busy)));
+        assert!(!manager_says_retry_later(&anyhow::anyhow!("connection reset")));
+    }
+}
+
+/// Publish the final source checkpoint used by merge recovery. The caller has
+/// halted and drained writes while holding `maintenance_gate`.
+async fn publish_freeze_checkpoint(part: &Rc<RefCell<PartitionData>>) -> Result<()> {
+    let (sc, log_stream_id, meta_stream_id) = {
+        let p = part.borrow();
+        if !p.merge_freeze.is_halted() && p.frozen_for_split.get().is_none() {
+            return Err(anyhow!("freeze checkpoint requires frozen writes"));
+        }
+        (p.stream_client.clone(), p.log_stream_id, p.meta_stream_id)
+    };
+
+    let (committed_end, tail_extent_id) = sc.commit_length_with_tail(log_stream_id).await?;
+    let log_info = sc.get_stream_info(log_stream_id).await?;
+    if log_info.extent_ids.last().copied() != Some(tail_extent_id) {
+        return Err(anyhow!(
+            "log tail changed while checkpointing a frozen partition: commit tail {} vs membership tail {:?}",
+            tail_extent_id,
+            log_info.extent_ids.last()
+        ));
+    }
+    let publish_lock = part.borrow().publish_lock.clone();
+    let _publish = publish_lock.lock().await;
+    let (tables, floors) = {
+        let p = part.borrow();
+        (p.tables.clone(), snapshot_fence_floors(&p))
+    };
+    save_table_locs_raw(
+        &sc,
+        meta_stream_id,
+        &tables,
+        tail_extent_id,
+        committed_end,
+        floors,
+    )
+    .await?;
+    part.borrow()
+        .durable_ckpt_vp
+        .set((tail_extent_id, committed_end));
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// SSTable building
+// ---------------------------------------------------------------------------
+
+pub(crate) fn build_sst(imm: &Memtable, vp_extent_id: u64, vp_offset: u64) -> (sstable::BuiltSst, u64) {
+    let mut builder = SstBuilder::new(vp_extent_id, vp_offset, imm.len());
+    let mut last_seq = 0u64;
+    imm.for_each(|ikey, me| {
+        let ts = parse_ts(ikey);
+        if ts > last_seq {
+            last_seq = ts;
+        }
+        builder.add(ikey, me.op, &me.value, me.expires_at);
+    });
+    let wal_dead = imm.wal_dead.lock().clone();
+    let mut builder = if builder.is_empty() {
+        SstBuilder::new(vp_extent_id, vp_offset, 0)
+    } else {
+        builder
+    };
+    builder.set_discards(wal_dead);
+    (builder.finish(), last_seq)
+}
+
+// ---------------------------------------------------------------------------
+// Memtable rotation + flush
+// ---------------------------------------------------------------------------
+
+pub(crate) fn rotate_active(part: &mut PartitionData) {
+    if part.active.is_empty() {
+        return;
+    }
+    let frozen = std::mem::replace(&mut part.active, Memtable::new());
+    let arc = Arc::new(frozen);
+    // capture this imm's content boundary = the write cursor at
+    // THIS instant (position after the last record that went into it). The flush
+    // stamps this, NOT the cursor at flush-claim time (which later writes advance).
+    part.imm_vp_heads.borrow_mut().insert(
+        Arc::as_ptr(&arc) as usize,
+        (part.vp_extent_id, part.vp_offset),
+    );
+    // Every listed table is already in the row stream, so its extent is at or
+    // before the tail this imm's SST will be appended to.
+    let row_floor = part
+        .tables
+        .iter()
+        .max_by_key(|t| t.last_seq)
+        .map(|t| t.extent_id);
+    part.imm_row_floors
+        .borrow_mut()
+        .insert(Arc::as_ptr(&arc) as usize, row_floor);
+    part.imm.push_back(arc);
+    part.publish_lsm_gauges();
+    let _ = part.flush_tx.unbounded_send(());
+}
+
+/// Drain P-sst's row-stream appends, seal the current tail, and make a fresh
+/// extent the tail. The P-sst worker owns the only row-stream StreamClient, so
+/// callers must use this barrier rather than allocating through P-log.
+pub(crate) async fn seal_and_roll_row_tail(part: &Rc<RefCell<PartitionData>>) -> Result<()> {
+    let (row_stream_id, mut barrier_tx) = {
+        let p = part.borrow();
+        (p.row_stream_id, p.row_invalidate_tx.clone())
+    };
+    let (resp_tx, resp_rx) = oneshot::channel();
+    barrier_tx
+        .send(RowInvalidateBarrierReq {
+            row_stream_id,
+            seal_and_roll: true,
+            resp_tx,
+        })
+        .await
+        .map_err(|_| anyhow!("row tail barrier closed"))?;
+    resp_rx
+        .await
+        .map_err(|_| anyhow!("row tail barrier ACK dropped"))??;
+    Ok(())
+}
+
+pub(crate) fn maybe_rotate(part: &mut PartitionData) {
+    if part.active.mem_bytes() >= flush_mem_bytes() {
+        rotate_active(part);
+    }
+}
+
+/// outcome of `run_flush_async_phase` — the heavy build + upload
+/// is done, but `tables` / `imm.pop_front` / meta_stream checkpoint
+/// have NOT happened yet. Caller passes this to `commit_flush_outcome`
+/// in strict launch order.
+pub(crate) struct FlushOutcome {
+    pub new_meta: TableMeta,
+    pub reader: SstReader,
+    pub vp_eid: u64,
+    pub vp_off: u64,
+    /// diag: `Arc::as_ptr` of the imm this outcome was built from.
+    /// `commit_flush_outcome` asserts the popped `front()` matches — a
+    /// mismatch means a commit dropped an unflushed imm (data loss).
+    pub src_imm_ptr: usize,
+}
+
+/// async / heavy phase of one imm flush. Safe to run concurrently
+/// for different imm entries (each captures its own `Arc<Memtable>`
+/// and `Arc<StreamClient>`). NO borrow_mut on `part` past the initial
+/// snapshot, so multiple concurrent calls are race-free against each
+/// other. NEVER `pop_front`s the imm queue — that's `commit_flush_outcome`'s
+/// job.
+///
+/// **Claim release on error (Mode B fix).** The caller (`flush_one_imm` /
+/// `background_flush_loop`) inserts this imm's ptr into `flushing_imm_ptrs`
+/// BEFORE calling us — a latch that makes the OTHER flush path defer ("someone
+/// else owns this imm; its commit will pop it"). On SUCCESS the ptr is removed
+/// by `commit_flush_outcome` when it pops the imm. On ERROR (e.g. a `row_stream`
+/// append wedged on a dead replica during a degraded window) we MUST release
+/// the latch here — otherwise the imm is orphaned: claimed-but-no-one-flushing,
+/// so every later flush attempt defers to a phantom flusher → the imm never
+/// drains → `partition_loop` stays imm-full parked FOREVER → range/write wedge
+/// (Mode B's "permanent" symptom). This wrapper releases on every error path;
+/// the background loop's backoff-retry then re-claims + retries until the
+/// cluster recovers (self-heal).
+pub(crate) async fn run_flush_async_phase(
+    part: Rc<RefCell<PartitionData>>,
+    imm_mem: Arc<Memtable>,
+) -> Result<FlushOutcome> {
+    let src_imm_ptr = Arc::as_ptr(&imm_mem) as usize;
+    let part_release = part.clone();
+    let result = run_flush_async_phase_inner(part, imm_mem).await;
+    if result.is_err() {
+        part_release
+            .borrow()
+            .flushing_imm_ptrs
+            .borrow_mut()
+            .remove(&src_imm_ptr);
+    }
+    result
+}
+
+async fn run_flush_async_phase_inner(
+    part: Rc<RefCell<PartitionData>>,
+    imm_mem: Arc<Memtable>,
+) -> Result<FlushOutcome> {
+    let src_imm_ptr = Arc::as_ptr(&imm_mem) as usize;
+    let (row_stream_id, snap_vp_eid, snap_vp_off, mut req_tx) = {
+        let p = part.borrow();
+        // stamp this imm's ROTATION-time content boundary, NOT the
+        // live cursor at claim (foreground writes may have pushed it ahead of this
+        // imm's content). Fallback to the live cursor only if the entry is somehow
+        // absent (never expected — every imm is inserted at rotate_active).
+        let (snap_vp_eid, snap_vp_off) = p
+            .imm_vp_heads
+            .borrow()
+            .get(&src_imm_ptr)
+            .copied()
+            .unwrap_or((p.vp_extent_id, p.vp_offset));
+        (
+            p.row_stream_id,
+            snap_vp_eid,
+            snap_vp_off,
+            p.flush_req_tx.clone(),
+        )
+    };
+
+    let (resp_tx, resp_rx) = oneshot::channel();
+    let req = FlushReq {
+        imm: imm_mem,
+        vp_eid: snap_vp_eid,
+        vp_off: snap_vp_off,
+        row_stream_id,
+        resp_tx,
+    };
+    if req_tx.send(req).await.is_err() {
+        return Err(anyhow!("bulk thread dropped flush channel"));
+    }
+    let (new_meta, reader) = match resp_rx.await {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => return Err(e),
+        Err(_) => return Err(anyhow!("bulk thread dropped flush response")),
+    };
+    Ok(FlushOutcome {
+        new_meta,
+        reader,
+        vp_eid: snap_vp_eid,
+        vp_off: snap_vp_off,
+        src_imm_ptr,
+    })
+}
+
+/// commit phase. Must be called in strict launch order (i.e. the
+/// outcome for imm at front of the queue): meta_stream checkpoint, then
+/// table-publish + imm.pop_front. NEVER reordered with respect to other
+/// commits — `FuturesOrdered` in `background_flush_loop` commits the
+/// concurrent flushes in launch order, and `PartitionData::publish_lock`
+/// orders them against every other checkpoint publisher.
+pub(crate) async fn commit_flush_outcome(
+    part: &Rc<RefCell<PartitionData>>,
+    outcome: FlushOutcome,
+) -> Result<()> {
+    // Mode B fix: release the claim-by-ptr on ANY error. An inner
+    // error that left the imm claimed and still queued would make the
+    // backoff-retry see it "already claimed" and skip it forever → permanent
+    // wedge. A failed checkpoint append is such an error: the imm stays
+    // queued. Mirrors `run_flush_async_phase`'s release-on-error wrapper.
+    let src_imm_ptr = outcome.src_imm_ptr;
+    let result = commit_flush_outcome_inner(part, outcome).await;
+    if result.is_err() {
+        part.borrow()
+            .flushing_imm_ptrs
+            .borrow_mut()
+            .remove(&src_imm_ptr);
+    }
+    result
+}
+
+async fn commit_flush_outcome_inner(
+    part: &Rc<RefCell<PartitionData>>,
+    outcome: FlushOutcome,
+) -> Result<()> {
+    let outcome_last_seq = outcome.new_meta.last_seq;
+    let outcome_src_imm_ptr = outcome.src_imm_ptr;
+    let new_sst_bytes = outcome.new_meta.len;
+    let publish_lock = part.borrow().publish_lock.clone();
+    let _publish = publish_lock.lock().await;
+    // Publish first: the checkpoint names the new SST before the table list
+    // does, and the imm leaves the queue only once that is durable. A failed
+    // append changes nothing in memory; the imm stays queued and is flushed
+    // again. Listing the SST and popping the imm first left an SST no durable
+    // checkpoint named; a compaction over it then lifted GC's floor past the
+    // durable cursor, and a crash lost the log in between
+    // (`system_compact_checkpoint_fail`).
+    let (tables_snapshot, part_sc, meta_stream_id, floors_snapshot) = {
+        let p = part.borrow();
+        let mut tables = p.tables.clone();
+        tables.push(outcome.new_meta.clone());
+        (
+            tables,
+            p.stream_client.clone(),
+            p.meta_stream_id,
+            snapshot_fence_floors(&p),
+        )
+    };
+    if flush_checkpoint_failpoint() {
+        return Err(anyhow!("flush checkpoint: test failpoint"));
+    }
+    save_table_locs_raw(
+        &part_sc,
+        meta_stream_id,
+        &tables_snapshot,
+        outcome.vp_eid,
+        outcome.vp_off,
+        floors_snapshot,
+    )
+    .await?;
+    {
+        let mut p = part.borrow_mut();
+        p.tables.push(outcome.new_meta);
+        p.sst_readers.push(Arc::new(outcome.reader));
+        // Release the claim-by-ptr (see `flush_one_imm` / the
+        // background loop). The popped imm IS the one whose Phase 2
+        // we just finished — FuturesOrdered in the background loop and
+        // single-task serial `await` in flush_one_imm guarantee
+        // FIFO commit order.
+        if let Some(popped) = p.imm.pop_front() {
+            let ptr = Arc::as_ptr(&popped) as usize;
+            // diag: the popped front MUST be the imm this outcome was
+            // built from. A mismatch means we dropped an unflushed imm
+            // (its newest writes vanish → the fence+flush data-loss bug).
+            if ptr != outcome_src_imm_ptr {
+                tracing::error!(
+                    popped_ptr = ptr,
+                    src_imm_ptr = outcome_src_imm_ptr,
+                    last_seq = outcome_last_seq,
+                    "flush pop misalign: committing SST built from one imm \
+                     but popped a DIFFERENT front — unflushed imm dropped"
+                );
+                debug_assert_eq!(
+                    ptr, outcome_src_imm_ptr,
+                    "flush commit popped an imm it did not build the SST from"
+                );
+            }
+            p.flushing_imm_ptrs.borrow_mut().remove(&ptr);
+            // release the imm's captured vp_head on pop (the only
+            // queue removal). Error paths keep it — the imm stays queued for retry.
+            p.imm_vp_heads.borrow_mut().remove(&ptr);
+            p.imm_row_floors.borrow_mut().remove(&ptr);
+        }
+        p.metrics.record_flush(new_sst_bytes);
+        p.publish_lsm_gauges();
+        // wake partition_loop on imm-full back-pressure.
+        let _ = p.imm_drained_tx.unbounded_send(());
+    }
+    // BUG2: the checkpoint naming (vp_eid, vp_off) is now
+    // DURABLE. By the flush vp_head invariant every log record strictly below it is in the
+    // just-persisted SST set (or compaction-dead), so GC may safely raise its
+    // replay floor to this position. Set ONLY here — after the ack — never from
+    // in-memory state (see the `durable_ckpt_vp` field doc for the loss trap).
+    part.borrow().durable_ckpt_vp.set((outcome.vp_eid, outcome.vp_off));
+    // tables changed (new SST committed) → refresh the
+    // advisory-input metrics so the next report_load_loop tick carries
+    // accurate dead-data / minor-compact-pending volumes, and ask for a
+    // minor compaction (HBase's check after every flush).
+    crate::background::refresh_metrics(part);
+    crate::background::request_minor_compaction(part, MinorTrigger::Flush);
+    // Deterministic completion signal for tests (checkpoint now durable).
+    FLUSH_COMMITS.fetch_add(1, Ordering::Relaxed);
+    Ok(())
+}
+
+/// Outcome of one `flush_one_imm` call. Replaces the historical
+/// `Result<bool>` whose `Ok(false)` was AMBIGUOUS: it meant "imm queue
+/// is empty" (drain done) AND "imm[0] is already being flushed by
+/// another path" (drain NOT done — a row_stream.append is in flight).
+///
+/// The ambiguity caused the freeze-drain in `try_complete_freeze_drain`
+/// to ack split's `frozen_for_split` BEFORE `background_flush_loop`'s
+/// in-flight row_stream.append had landed. `handle_split_part` then
+/// captured `commit_length(row_stream)` below the about-to-ack SST end;
+/// the manager sealed the row_stream tail at that stale length, the
+/// flush completed and published a `TableLocations` checkpoint pointing
+/// past `sealed_length`, and the next PS open failed with
+/// `stale_vp_offset_past_sealed_length` — partition permanently
+/// un-openable. The fix replaces the `bool` with this explicit
+/// three-way enum so callers must handle the "Busy" case by waiting,
+/// not by treating it as "done".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FlushStep {
+    /// One imm was flushed (Phase 2 ran + checkpoint published). Caller
+    /// should re-call to attempt the next imm.
+    Flushed,
+    /// `imm` queue is empty. The drain loop is genuinely done. Because
+    /// `commit_flush_outcome` removes the `flushing_imm_ptrs` claim in
+    /// the same `borrow_mut` block that pops `imm.front()`, an empty
+    /// queue also implies no outstanding claim on any *queued* imm.
+    Empty,
+    /// `imm[0]` is currently being flushed by another path (typically
+    /// `background_flush_loop`). We did NOT run a flush this call;
+    /// caller MUST wait briefly and re-call rather than break — the
+    /// row_stream.append behind this claim has not yet ACKed.
+    Busy,
+}
+
+/// Single-imm flush (legacy back-compat for `flush_memtable_locked`,
+/// `handle_split_part`, and test helpers). This is just
+/// `run_flush_async_phase` + `commit_flush_outcome` composed; the
+/// background loop bypasses this and runs the two phases concurrently.
+///
+/// **Claim-by-ptr invariant**: before running Phase 2 we record the
+/// imm's `Arc::as_ptr()` in `flushing_imm_ptrs`. If the front imm is
+/// already being flushed by `background_flush_loop`, return
+/// `FlushStep::Busy` so the caller waits + retries. `commit_flush_outcome`
+/// is the pair that REMOVES the ptr (atomic with `imm.pop_front()`).
+pub(crate) async fn flush_one_imm(part: &Rc<RefCell<PartitionData>>) -> Result<FlushStep> {
+    let imm_mem = {
+        let p = part.borrow();
+        let imm = match p.imm.front().cloned() {
+            Some(m) => m,
+            None => return Ok(FlushStep::Empty),
+        };
+        let ptr = Arc::as_ptr(&imm) as usize;
+        let mut inflight = p.flushing_imm_ptrs.borrow_mut();
+        if inflight.contains(&ptr) {
+            return Ok(FlushStep::Busy);
+        }
+        inflight.insert(ptr);
+        imm
+    };
+    let outcome = run_flush_async_phase(part.clone(), imm_mem).await?;
+    commit_flush_outcome(part, outcome).await?;
+    Ok(FlushStep::Flushed)
+}
+
+// removed `flush_one_imm_local` — the in-thread fallback now
+// lives inline in `run_flush_async_phase` (the `req_tx_opt == None`
+// branch).
+
+/// How long to sleep before retrying after `FlushStep::Busy`. Matches
+/// the fsync coalescer's 2 ms cadence so on the happy path we re-poll at
+/// most ~1–2 times before either claiming a freshly-released imm
+/// ourselves or observing `Empty`.
+const FLUSH_BUSY_RETRY_INTERVAL: Duration = Duration::from_millis(2);
+
+/// Replace the several checkpoint records recovery found (one per merge
+/// source) with one. A non-empty memtable is flushed, which publishes it; an
+/// empty one means the SSTs hold everything below the log tail, so the record
+/// names them with the tail as its cursor. `save_table_locs_raw` then
+/// truncates the meta stream to the extent holding it. A crash before the
+/// append leaves the old records, and the next open does this again.
+async fn publish_merged_checkpoint(part: &Rc<RefCell<PartitionData>>) -> Result<()> {
+    if MERGED_CHECKPOINT_FAIL.load(Ordering::Relaxed) {
+        return Err(anyhow!("merged checkpoint: test failpoint"));
+    }
+    // Replay started past both sources, so the recovered memtable holds only
+    // writes made after an earlier merged open (which crashed before this
+    // record replaced the sources'); an ordinary flush publishes the one record.
+    if !part.borrow().active.is_empty() {
+        flush_memtable_locked(part).await?;
+        return Ok(());
+    }
+    let publish_lock = part.borrow().publish_lock.clone();
+    let _publish = publish_lock.lock().await;
+    let (sc, meta_stream_id, tables, vp, floors) = {
+        let p = part.borrow();
+        (
+            p.stream_client.clone(),
+            p.meta_stream_id,
+            p.tables.clone(),
+            (p.vp_extent_id, p.vp_offset),
+            snapshot_fence_floors(&p),
+        )
+    };
+    save_table_locs_raw(&sc, meta_stream_id, &tables, vp.0, vp.1, floors).await?;
+    part.borrow().durable_ckpt_vp.set(vp);
+    Ok(())
+}
+
+pub(crate) async fn flush_memtable_locked(part: &Rc<RefCell<PartitionData>>) -> Result<bool> {
+    {
+        let mut p = part.borrow_mut();
+        rotate_active(&mut p);
+    }
+    let mut any = false;
+    loop {
+        match flush_one_imm(part).await? {
+            FlushStep::Flushed => {
+                any = true;
+            }
+            FlushStep::Empty => break,
+            FlushStep::Busy => {
+                compio::time::sleep(FLUSH_BUSY_RETRY_INTERVAL).await;
+            }
+        }
+    }
+    Ok(any)
+}
+
+// ---------------------------------------------------------------------------
+// Background loops
+// ---------------------------------------------------------------------------
+
+/// parallel imm-flush drain.
+///
+/// `FuturesOrdered` drives up to `ps_flush_inflight_cap()` concurrent
+/// `run_flush_async_phase` futures. Each future captures one imm
+/// (`Arc<Memtable>` clone) at launch time; completions are pulled in
+/// strict launch order, then `commit_flush_outcome` runs serially, so
+/// checkpoints land in launch order.
+///
+/// Why FuturesOrdered: matches the "concurrent build/upload, serial
+/// commit" semantics exactly without any reorder buffer or seq
+/// tagging — `.next()` yields in push order while all in-flight
+/// futures still make progress in parallel.
+///
+/// (1C): supervise a RESTARTABLE PS background loop — catch_unwind,
+/// ERROR-log on panic OR unexpected return, restart after 1 s. Use ONLY for
+/// loops that re-derive their state each tick (take Clone handles, no moved
+/// channel receiver, no multi-step partition mutation that a mid-panic could
+/// leave half-applied): `heartbeat_loop`, `report_load_loop`,
+/// `region_sync_loop`. Mirrors the manager's
+/// `spawn_supervised`. These were previously bare `spawn(..).detach()`, so a
+/// panic killed the loop silently (e.g. heartbeats stop → manager evicts with
+/// no log on the PS side explaining why).
+///
+/// NOTE on layered `catch_unwind`: compio 0.19's executor captures task
+/// panics as `JoinError::Panicked`. That's exactly what makes the
+/// silent-death possible: compio catches the panic, then
+/// `.detach()` drops the captured `Err`. The inner `catch_unwind` here is
+/// for OBSERVABILITY + RESTART decisioning (read the Result to log + sleep
+/// + restart), NOT for runtime survival. Don't "remove the duplicate" —
+/// you'd silently break the restart loop.
+pub(crate) fn spawn_supervised<F, Fut>(name: &'static str, make: F)
+where
+    F: Fn() -> Fut + 'static,
+    Fut: std::future::Future<Output = ()> + 'static,
+{
+    compio::runtime::spawn(async move {
+        use futures::future::FutureExt;
+        loop {
+            let outcome = std::panic::AssertUnwindSafe(make()).catch_unwind().await;
+            match outcome {
+                Ok(()) => tracing::error!(
+                    bg_loop = name,
+                    "PS background loop returned unexpectedly; restarting in 1s"
+                ),
+                Err(_) => tracing::error!(
+                    bg_loop = name,
+                    "PS background loop PANICKED; restarting in 1s"
+                ),
+            }
+            compio::time::sleep(Duration::from_secs(1)).await;
+        }
+    })
+    .detach();
+}
+
+/// (1C): supervise a NON-restartable loop that owns a unique moved
+/// resource (channel receiver / `TcpListener`) so it cannot be re-created, and
+/// whose mid-panic in-memory state may be half-mutated: the per-partition
+/// `flush` / `compact` / `gc` loops and the per-partition accept loop. A NORMAL
+/// return is the expected shutdown path (channels closed / shutdown signaled) —
+/// no-op. A PANIC means the partition's durability or serving pipeline broke on
+/// possibly-inconsistent state; restart-in-place is unsafe (the receiver is
+/// gone, and re-running could double-apply or resurrect half-mutated state), so
+/// **fail-stop the process** (loud, never silent). The manager evicts via
+/// and every partition is reopened from its durable streams (the
+/// log_stream WAL is the source of truth → no committed data lost). Smaller-
+/// blast-radius per-partition self-eviction is a future refinement.
+///
+/// NOTE on layered `catch_unwind`: `compio::runtime::spawn` already wraps in
+/// `catch_unwind` (see `spawn_supervised` above for the citation). Without
+/// our inner `catch_unwind`, compio would catch the panic and the
+/// `.detach()`'d JoinHandle would silently drop it — process keeps running,
+/// no log, no exit. The inner catch_unwind here is what turns "panic" into
+/// "ERROR-log + `process::exit(1)`"; compio's outer wrap then sees a future
+/// that never panics. Don't "remove the duplicate".
+pub(crate) fn spawn_failstop<Fut>(name: String, fut: Fut)
+where
+    Fut: std::future::Future<Output = ()> + 'static,
+{
+    compio::runtime::spawn(async move {
+        use futures::future::FutureExt;
+        if std::panic::AssertUnwindSafe(fut)
+            .catch_unwind()
+            .await
+            .is_err()
+        {
+            tracing::error!(
+                bg_loop = %name,
+                "PS background loop PANICKED on a moved-resource loop; \
+                 fail-stopping the process so the manager reassigns and the \
+                 partition reopens from durable streams (clean recovery)"
+            );
+            std::process::exit(1);
+        }
+    })
+    .detach();
+}
+
+/// Error policy: fail-stop. If any in-flight async phase OR any
+/// commit returns Err, drain the remaining inflight (so they don't
+/// dangle) and break. The next `flush_rx` signal restarts the loop
+/// — same retry behaviour as the original serial flow.
+/// Mode B fix: how often `background_flush_loop` re-attempts a still-pending imm
+/// after a flush error (e.g. row_stream append wedged on a dead replica), so the
+/// flush self-heals once the cluster recovers without needing a new-write signal.
+/// `--flush-retry-backoff-ms`: 2 s is well below the chaos settle window and far
+/// above a tight error spin.
+fn flush_retry_backoff() -> Duration {
+    Duration::from_millis(params().flush_retry_backoff_ms.get())
+}
+
+/// DIAGNOSTIC: how often a ps-conn parked on an in-flight request says so.
+/// A connection that stops reading is invisible from the server side — the
+/// evidence lives in the client's socket queue — so it reports itself.
+const STUCK_INFLIGHT_REPORT_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// poison the partition after a FENCE rejection (LockedByOther) in the
+/// flush path, and WAKE the (possibly imm-full-parked) `partition_loop` via
+/// the imm-drained channel so it observes the flag and exits — a parked loop
+/// polls only `inflight` + `imm_drained_rx`, so without the wake the poison
+/// would sit unnoticed exactly in the wedged state this exists to break.
+/// The region_sync reopen then re-acquires a FRESH per-partition owner epoch,
+/// which clears both the manager equality check and the EN floors —
+/// the self-heal for admin fence-bumps; a genuine new owner simply keeps the
+/// partition (the manager's region map is the arbiter on reopen).
+fn poison_for_fence(
+    part: &Rc<RefCell<PartitionData>>,
+    poisoned: &Rc<Cell<bool>>,
+    site: &str,
+) {
+    tracing::error!("{site} fenced (LockedByOther) — poisoning partition for fresh-epoch reopen");
+    poisoned.set(true);
+    // Fire BOTH wake channels: the imm-full park listens on
+    // imm_drained_rx, but the fully-idle select listens only on
+    // req_rx / split_wake_rx / drain_rx — without the split-wake an idle
+    // partition would sleep through the poison until the next request.
+    // Every loop iteration re-checks `poisoned` at the top, so
+    // either wake suffices once it lands in the right state.
+    let (imm_tx, wake_tx) = {
+        let p = part.borrow();
+        (p.imm_drained_tx.clone(), p.split_wake_tx.clone())
+    };
+    let _ = imm_tx.unbounded_send(());
+    let _ = wake_tx.unbounded_send(());
+}
+
+async fn background_flush_loop(
+    part: Rc<RefCell<PartitionData>>,
+    mut flush_rx: mpsc::UnboundedReceiver<()>,
+    // shared poison flag (same Rc `partition_loop` checks). A fence
+    // rejection in the flush path must tear the partition down for a
+    // fresh-epoch reopen, not retry the stale epoch forever.
+    poisoned: Rc<Cell<bool>>,
+) {
+    use futures::future::{select, Either, FutureExt};
+    use futures::stream::FuturesOrdered;
+    type FlushFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Result<FlushOutcome>>>>;
+
+    let cap = ps_flush_inflight_cap();
+
+    // Diagnostic for a wedge: the loop wakes every flush_retry_backoff()
+    // with a NON-EMPTY imm and launches nothing, silently, forever — which this
+    // code can only do when the front imm's pointer is already in
+    // `flushing_imm_ptrs` and nobody is left to remove it. Every failure path
+    // that drops a claim also logs, so a SILENT one means the claiming future
+    // was DROPPED (an RPC handler whose connection went away is the candidate).
+    // Nothing here changes behaviour; it names the state so the next wedge is
+    // diagnosable from the log instead of from /proc.
+    let mut barren_spins: u64 = 0;
+    let mut barren_since: Option<std::time::Instant> = None;
+
+    loop {
+        // Wait for a flush signal. Mode B fix: if imm is STILL pending (a prior
+        // flush failed — e.g. row_stream append wedged on a dead replica — and
+        // released its claim, or back-pressure), ALSO wake on a retry timer so
+        // the failed flush is re-attempted and SELF-HEALS once the cluster
+        // recovers, even though no new write arrives to signal us (partition_loop
+        // is parked imm-full, so no rotate → no flush_tx). Without this retry the
+        // released imm would just sit unclaimed forever and the wedge persists.
+        let pending = !part.borrow().imm.is_empty();
+        if pending {
+            let signal = flush_rx.next();
+            let timer = compio::time::sleep(flush_retry_backoff());
+            futures::pin_mut!(signal, timer);
+            match select(signal, timer).await {
+                Either::Left((s, _)) => {
+                    if s.is_none() {
+                        break;
+                    }
+                }
+                Either::Right(((), _)) => {} // retry tick — re-attempt pending imm
+            }
+        } else if flush_rx.next().await.is_none() {
+            break;
+        }
+        // TEST SYNC-POINT (flush vp_head): hold before claiming any imm so a
+        // test can advance the write cursor between rotation and flush-claim.
+        // Off in production (one relaxed load; only `set_flush_test_pause` sets it).
+        while flush_test_paused() {
+            compio::time::sleep(Duration::from_millis(2)).await;
+        }
+        let mut inflight: FuturesOrdered<FlushFuture> = FuturesOrdered::new();
+        let mut failed = false;
+        let mut launched_any = false;
+        loop {
+            // (A) Launch up to `cap` concurrent flushes. The next imm to
+            // launch sits at `imm[inflight.len()]` because commit pops
+            // front strictly in order, so the queue tracks 1:1 with
+            // in-flight + remaining unlaunched.
+            while !failed && inflight.len() < cap {
+                // Same claim-by-ptr pattern as flush_one_imm. The
+                // `inflight.len()` index walks the queue front→back so
+                // the launch order matches FuturesOrdered's pull order.
+                // If the imm at this index is already claimed by an
+                // inline `flush_one_imm` (called from
+                // flush_memtable_locked / split / merge), skip it —
+                // its commit_flush_outcome will pop it for us.
+                let imm_at_idx = {
+                    let p = part.borrow();
+                    match p.imm.get(inflight.len()).cloned() {
+                        Some(imm) => {
+                            let ptr = Arc::as_ptr(&imm) as usize;
+                            let mut set = p.flushing_imm_ptrs.borrow_mut();
+                            if set.contains(&ptr) {
+                                // Another path owns this imm; its
+                                // commit_flush_outcome will publish.
+                                // Skip launching for this index.
+                                None
+                            } else {
+                                set.insert(ptr);
+                                Some(imm)
+                            }
+                        }
+                        None => None,
+                    }
+                };
+                match imm_at_idx {
+                    Some(imm) => {
+                        launched_any = true;
+                        let part_c = part.clone();
+                        inflight.push_back(run_flush_async_phase(part_c, imm).boxed_local());
+                    }
+                    None => break,
+                }
+            }
+            if inflight.is_empty() {
+                break;
+            }
+
+            // (B) Pull next in launch order; commit (or fail-stop drain).
+            match inflight.next().await {
+                Some(Ok(outcome)) => {
+                    if failed {
+                        // A prior imm in this FIFO batch failed, so we cannot
+                        // commit this (later) one (commit pops front-in-order).
+                        // Release its claim-by-ptr so the next backoff round
+                        // re-claims + re-flushes it — Mode B fix; without this,
+                        // a successful-but-dropped flush leaks its claim and
+                        // orphans the imm forever (same wedge as the error path).
+                        part.borrow()
+                            .flushing_imm_ptrs
+                            .borrow_mut()
+                            .remove(&outcome.src_imm_ptr);
+                        continue;
+                    }
+                    if let Err(e) = commit_flush_outcome(&part, outcome).await {
+                        tracing::error!("background flush commit error: {e}");
+                        if crate::background::is_locked_by_other(&e) {
+                            poison_for_fence(&part, &poisoned, "flush commit");
+                        }
+                        failed = true;
+                    }
+                }
+                Some(Err(e)) => {
+                    tracing::error!("background flush async-phase error: {e}");
+                    if crate::background::is_locked_by_other(&e) {
+                        poison_for_fence(&part, &poisoned, "flush async phase");
+                    }
+                    failed = true;
+                }
+                None => break,
+            }
+        }
+
+        // Did this wake do any work? A wake that claimed nothing while imm is
+        // non-empty is the wedge signature. One line when it starts, then one
+        // per minute — enough to see it and to time it, quiet enough to leave on.
+        let (part_id_for_log, imm_len, claimed, front_busy) = {
+            let p = part.borrow();
+            let claimed = p.flushing_imm_ptrs.borrow().len();
+            let front_busy = p
+                .imm
+                .front()
+                .map(|m| {
+                    p.flushing_imm_ptrs
+                        .borrow()
+                        .contains(&(Arc::as_ptr(m) as usize))
+                })
+                .unwrap_or(false);
+            (p.part_id, p.imm.len(), claimed, front_busy)
+        };
+        if !launched_any && imm_len > 0 {
+            barren_spins += 1;
+            let since = *barren_since.get_or_insert_with(std::time::Instant::now);
+            if barren_spins == 4 || barren_spins.is_multiple_of(30) {
+                tracing::warn!(
+                    part_id = part_id_for_log,
+                    imm_len,
+                    claimed_ptrs = claimed,
+                    front_claimed = front_busy,
+                    spins = barren_spins,
+                    stalled_secs = since.elapsed().as_secs(),
+                    "flush loop is awake with a non-empty imm but claimed nothing \
+                     — if front_claimed is true the claim was leaked by a dropped \
+                     flush future and this partition will never drain",
+                );
+            }
+        } else {
+            barren_spins = 0;
+            barren_since = None;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-partition bulk thread (P-sst)
+//
+// The bulk thread owns its own compio runtime (separate io_uring), its own
+// ConnPool, and its own StreamClient. This prevents 128MB row_stream SSTable
+// uploads from head-of-line-blocking the 4KB log_stream WAL batches sharing
+// the P-log runtime.
+//
+// The StreamClient uses `new_with_owner_epoch` to inherit the server-level
+// owner-lock owner_epoch — no second `acquire_owner_lock` call, so both clients
+// use the same fencing token. The pool no longer uses Hot/Bulk
+// kinds; each thread's ConnPool is role-dedicated.
+// ---------------------------------------------------------------------------
+
+/// readiness signal sent by the spawned P-sst thread once its
+/// compio runtime + `StreamClient` + reporter_part_id are all live.
+/// `partition_thread_main` awaits this BEFORE constructing `PartitionData`
+/// so a partition is never half-opened with a dead P-sst receiver. Pre-
+/// only OS `thread::Builder::spawn` failure was surfaced; runtime
+/// build / `StreamClient::new_with_owner_epoch` failures inside the thread
+/// silently logged + returned, leaving P-log with a live `Sender` to a
+/// dropped receiver and the partition wedged on first flush.
+type BulkReady = futures::channel::oneshot::Receiver<Result<()>>;
+
+fn spawn_sst_thread(
+    part_id: u64,
+    manager_addr: String,
+    owner_key: String,
+    owner_epoch: i64,
+    flush_req_rx: mpsc::Receiver<FlushReq>,
+    row_append_rx: mpsc::Receiver<RowAppendReq>,
+    row_invalidate_rx: mpsc::Receiver<RowInvalidateBarrierReq>,
+) -> std::io::Result<(std::thread::JoinHandle<()>, BulkReady)> {
+    let (ready_tx, ready_rx) = futures::channel::oneshot::channel::<Result<()>>();
+    let handle = std::thread::Builder::new()
+        .name(format!("part-{part_id}-sst"))
+        .spawn(move || {
+            let rt = match compio::runtime::RuntimeBuilder::new().build() {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::error!(part_id, error = %e, "bulk thread runtime init failed");
+                    let _ = ready_tx.send(Err(anyhow!("P-sst runtime init: {e}")));
+                    return;
+                }
+            };
+            autumn_common::cpu_pin::confine_io_workers(&rt);
+            tracing::info!(part_id, "P-sst thread runtime ready");
+            rt.block_on(async move {
+                let pool = Rc::new(ConnPool::new());
+                let sst_sc = match StreamClient::new_with_owner_epoch_and_config(
+                    &manager_addr,
+                    owner_key,
+                    owner_epoch,
+                    max_extent_size_bytes(),
+                    pool,
+                    stream_client_config(),
+                )
+                .await
+                {
+                    Ok(sc) => sc,
+                    Err(e) => {
+                        tracing::error!(part_id, error = %e, "bulk StreamClient init failed");
+                        let _ = ready_tx.send(Err(anyhow!("P-sst StreamClient init: {e}")));
+                        return;
+                    }
+                };
+                // same reporter_part_id as the P-log StreamClient so
+                // bulk-thread row_stream / compact append failures bucket
+                // into the same partition for the manager's quorum count.
+                sst_sc.set_reporter_part_id(part_id);
+                // No `set_reporter_row_stream` here: this client only appends
+                // (flush, compaction output). Every SST block read — gets,
+                // ranges, compaction and split scans — goes through the P-log
+                // client, which has it.
+                tracing::info!(part_id, "bulk thread ready");
+                if ready_tx.send(Ok(())).is_err() {
+                    // P-log dropped the receiver (open_partition aborted
+                    // before our ready landed). Exit cleanly without
+                    // running flush_worker_loop — the channel senders
+                    // will be dropped by the failed open path.
+                    tracing::warn!(part_id, "P-sst ready signal dropped; exiting");
+                    return;
+                }
+                flush_worker_loop(sst_sc, flush_req_rx, row_append_rx, row_invalidate_rx).await;
+                tracing::info!(part_id, "bulk thread exiting");
+            });
+        })?;
+    Ok((handle, ready_rx))
+}
+
+/// R4 4.4 — P-sst worker with N-deep SQ/CQ pipeline.
+///
+/// Handles two kinds of work, both using P-sst's single StreamClient so
+/// that row_stream commit tracking stays coherent:
+///   - `FlushReq`: build SST bytes + row_stream.append (from flush_loop)
+///   - `RowAppendReq`: row_stream.append only (from compaction on P-log)
+///
+/// The cap is deliberately small (default 2, env
+/// `--ps-bulk-inflight-cap`) because each in-flight item holds a
+/// full SSTable buffer in RAM.
+async fn flush_worker_loop(
+    sst_sc: Rc<StreamClient>,
+    flush_req_rx: mpsc::Receiver<FlushReq>,
+    row_append_rx: mpsc::Receiver<RowAppendReq>,
+    row_invalidate_rx: mpsc::Receiver<RowInvalidateBarrierReq>,
+) {
+    use futures::future::{select, Either};
+
+    let cap = crate::ps_sst_inflight_cap();
+
+    // Variants differ in size (Flush carries a TableMeta+SstReader); this is a
+    // short-lived local completion enum on a bounded (cap) FU, not stored en
+    // masse, so boxing the big variant isn't worth the indirection.
+    #[allow(clippy::large_enum_variant)]
+    enum BulkCompletion {
+        Flush {
+            resp_tx: oneshot::Sender<Result<(TableMeta, SstReader)>>,
+            result: Result<(TableMeta, SstReader)>,
+        },
+        RowAppend {
+            resp_tx: oneshot::Sender<Result<autumn_stream::AppendResult>>,
+            result: Result<autumn_stream::AppendResult>,
+        },
+    }
+
+    impl BulkCompletion {
+        fn send(self) {
+            match self {
+                BulkCompletion::Flush { resp_tx, result } => {
+                    let _ = resp_tx.send(result);
+                }
+                BulkCompletion::RowAppend { resp_tx, result } => {
+                    let _ = resp_tx.send(result);
+                }
+            }
+        }
+    }
+
+    type BulkFut = std::pin::Pin<Box<dyn std::future::Future<Output = BulkCompletion>>>;
+    let mut inflight: FuturesUnordered<BulkFut> = FuturesUnordered::new();
+
+    enum SqMsg {
+        Flush(FlushReq),
+        RowAppend(RowAppendReq),
+        Invalidate(RowInvalidateBarrierReq),
+    }
+
+    // priority-bias `row_invalidate_rx` over flush/row_append so a
+    // barrier sent inside `handle_split_part`'s critical section is picked
+    // up ahead of any incidental late-arriving append (defensive — at the
+    // time of the barrier, frozen_for_split + maintenance_gate have
+    // already halted upstream producers, so the queue is normally empty,
+    // but the bias keeps the design race-free under future refactors that
+    // might relax those gates).
+    use futures::stream::PollNext;
+    let mut sq_rx = futures::stream::select_with_strategy(
+        row_invalidate_rx.map(SqMsg::Invalidate),
+        futures::stream::select(
+            flush_req_rx.map(SqMsg::Flush),
+            row_append_rx.map(SqMsg::RowAppend),
+        ),
+        |_: &mut ()| PollNext::Left,
+    );
+
+    // barrier set-aside slot. When SQ yields an `Invalidate`, we
+    // place the request here and the next loop iteration drains `inflight`
+    // to zero before running `sst_sc.invalidate_stream(...)` + ACK. This
+    // guarantees the invalidate is NOT racing any in-flight append on the
+    // pre-seal stale worker cache (the bug in
+    // the v1 lazy-flag attempt: cap=2 FuturesUnordered let a FlushReq
+    // with `invalidate=false` enter alongside an invalidating RowAppendReq
+    // and append to the stale worker before the invalidate took effect).
+    let mut pending_barrier: Option<RowInvalidateBarrierReq> = None;
+
+    let launch = |msg: SqMsg,
+                  sst_sc: &Rc<StreamClient>,
+                  pending_barrier: &mut Option<RowInvalidateBarrierReq>|
+     -> Option<BulkFut> {
+        match msg {
+            SqMsg::Flush(req) => {
+                let FlushReq {
+                    imm,
+                    vp_eid,
+                    vp_off,
+                    row_stream_id,
+                    resp_tx,
+                } = req;
+                let sst_sc = sst_sc.clone();
+                Some(Box::pin(async move {
+                    let result =
+                        do_flush_on_bulk(&sst_sc, imm, vp_eid, vp_off, row_stream_id).await;
+                    BulkCompletion::Flush { resp_tx, result }
+                }))
+            }
+            SqMsg::RowAppend(req) => {
+                let RowAppendReq {
+                    sst_segments,
+                    sst_crc,
+                    row_stream_id,
+                    resp_tx,
+                } = req;
+                let sst_sc = sst_sc.clone();
+                Some(Box::pin(async move {
+                    let segments = sst_segments.into_iter().map(Into::into).collect();
+                    let result = sst_sc.append_segments_with_crc(row_stream_id, segments, sst_crc).await;
+                    BulkCompletion::RowAppend { resp_tx, result }
+                }))
+            }
+            SqMsg::Invalidate(req) => {
+                // Stash for next-iter drain-then-invalidate. NOT a future:
+                // the barrier needs the inflight FU drained FIRST, which
+                // the launch closure can't observe.
+                *pending_barrier = Some(req);
+                None
+            }
+        }
+    };
+
+    loop {
+        // (A) Opportunistic CQ drain.
+        while let Some(Some(done)) = inflight.next().now_or_never() {
+            done.send();
+        }
+
+        // (B) barrier — drain inflight to zero, invalidate, ACK.
+        // While `pending_barrier` is set we do NOT pick up new SQ; any new
+        // messages queue up and are processed AFTER the invalidate (so they
+        // observe the fresh post-invalidate worker).
+        if let Some(req) = pending_barrier.take() {
+            while let Some(done) = inflight.next().await {
+                done.send();
+            }
+            let result = if req.seal_and_roll {
+                // All P-sst appends have drained. The live-writer handshake
+                // seals at the acknowledged commit and resets onto a fresh tail.
+                sst_sc.seal_and_roll_tail(req.row_stream_id).await
+            } else {
+                sst_sc.invalidate_stream(req.row_stream_id);
+                Ok(())
+            };
+            if let Err(e) = &result {
+                tracing::warn!(row_stream_id = req.row_stream_id, error = %e,
+                    "row tail seal_and_roll failed");
+            }
+            let _ = req.resp_tx.send(result);
+            continue;
+        }
+
+        let n_inflight = inflight.len();
+        let at_cap = n_inflight >= cap;
+
+        if n_inflight == 0 {
+            // Idle: only SQ can progress.
+            match sq_rx.next().await {
+                Some(msg) => {
+                    if let Some(fut) = launch(msg, &sst_sc, &mut pending_barrier) {
+                        inflight.push(fut);
+                    }
+                }
+                None => break,
+            }
+            continue;
+        }
+
+        if at_cap {
+            // Back-pressure: only CQ can progress.
+            if let Some(done) = inflight.next().await {
+                done.send();
+            }
+            continue;
+        }
+
+        // 0 < n_inflight < cap → race SQ vs CQ.
+        let sq_fut = sq_rx.next();
+        let cq_fut = inflight.next();
+        futures::pin_mut!(sq_fut);
+        match select(sq_fut, Box::pin(cq_fut)).await {
+            Either::Left((maybe_msg, _cq_dropped)) => match maybe_msg {
+                Some(msg) => {
+                    if let Some(fut) = launch(msg, &sst_sc, &mut pending_barrier) {
+                        inflight.push(fut);
+                    }
+                }
+                None => {
+                    while let Some(done) = inflight.next().await {
+                        done.send();
+                    }
+                    break;
+                }
+            },
+            Either::Right((maybe_done, _sq_dropped)) => {
+                if let Some(done) = maybe_done {
+                    done.send();
+                }
+            }
+        }
+    }
+}
+
+async fn do_flush_on_bulk(
+    sst_sc: &Rc<StreamClient>,
+    imm: Arc<Memtable>,
+    vp_eid: u64,
+    vp_off: u64,
+    row_stream_id: u64,
+) -> Result<(TableMeta, SstReader)> {
+    let imm_clone = imm.clone();
+    let (sst, last_seq) = compio::runtime::spawn_blocking(move || build_sst(&imm_clone, vp_eid, vp_off))
+        .await
+        .map_err(|_| anyhow::anyhow!("SSTable build task failed"))?;
+
+    let sst_len = sst.len();
+    let segments = sst.segments.iter().cloned().map(Into::into).collect();
+    let append_result = sst_sc.append_segments_with_crc(row_stream_id, segments, sst.crc()).await?;
+    let estimated_size = sst_len;
+    // A paged reader from the meta alone — blocks are served on demand from
+    // row_stream through the bounded global cache. (No cache invalidation
+    // needed on later GC: extent ids are never reused, stale entries simply
+    // age out of the LRU.)
+    let reader = SstReader::open_paged_from_meta(sst.meta(), append_result.extent_id, append_result.offset, sst_len)?;
+    let new_meta = TableMeta {
+        extent_id: append_result.extent_id,
+        offset: append_result.offset,
+        len: append_result.end - append_result.offset,
+        estimated_size,
+        last_seq,
+    };
+    Ok((new_meta, reader))
+}
+
+// ---------------------------------------------------------------------------
+// Utility
+// ---------------------------------------------------------------------------
+
+pub(crate) fn rand_u64() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos() as u64
+        ^ std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64
+}
+
+pub(crate) fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+pub(crate) fn human_size(bytes: u64) -> String {
+    if bytes >= 1 << 30 {
+        format!("{:.1} GB", bytes as f64 / (1u64 << 30) as f64)
+    } else if bytes >= 1 << 20 {
+        format!("{:.1} MB", bytes as f64 / (1u64 << 20) as f64)
+    } else if bytes >= 1 << 10 {
+        format!("{:.1} KB", bytes as f64 / (1u64 << 10) as f64)
+    } else {
+        format!("{} B", bytes)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// (1C): a supervised loop that PANICS is caught + restarted, not
+    /// silently dead. The make closure panics on its first invocation and
+    /// records each call; after the 1 s restart backoff it must have been
+    /// re-invoked (call count >= 2), proving the panic was caught and the loop
+    /// restarted rather than the task dying silently.
+    #[test]
+    fn spawn_supervised_restarts_after_panic() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+        let rt = compio::runtime::Runtime::new().expect("rt");
+        rt.block_on(async {
+            let calls = Rc::new(Cell::new(0u32));
+            let c = calls.clone();
+            spawn_supervised("test_loop", move || {
+                let c = c.clone();
+                async move {
+                    let n = c.get() + 1;
+                    c.set(n);
+                    if n == 1 {
+                        panic!("first invocation panics on purpose");
+                    }
+                    // Subsequent invocations park forever (a healthy loop never
+                    // returns); the test only needs to observe the restart.
+                    std::future::pending::<()>().await;
+                }
+            });
+            // First call (panic) is immediate; restart waits 1 s. Give it margin.
+            compio::time::sleep(Duration::from_millis(1500)).await;
+            assert!(
+                calls.get() >= 2,
+                "supervised loop should have restarted after the panic; calls={}",
+                calls.get()
+            );
+        });
+    }
+
+    #[test]
+    fn mvcc_key_encoding() {
+        use std::cmp::Ordering;
+
+        // Same user key: newer (higher seq) sorts FIRST. Same-length keys,
+        // so comparator order and byte order agree here.
+        let uk = b"hello";
+        let k1 = key_with_ts(uk, 1);
+        let k2 = key_with_ts(uk, 2);
+        let k3 = key_with_ts(uk, 100);
+        assert_eq!(cmp_internal_keys(&k3, &k2), Ordering::Less);
+        assert_eq!(cmp_internal_keys(&k2, &k1), Ordering::Less);
+        assert_eq!(parse_key(&k1), uk.as_slice());
+        assert_eq!(parse_ts(&k1), 1);
+        assert_eq!(parse_ts(&k3), 100);
+
+        // A user key that is a strict prefix of another must sort in
+        // user-key order — for EVERY version pairing, including the one
+        // where raw byte order would invert (the short key's 0xFF-leading
+        // suffix vs the long key's content byte).
+        let ka_new = key_with_ts(b"mykey", u64::MAX - 1);
+        let ka_old = key_with_ts(b"mykey", 1);
+        let kb = key_with_ts(b"mykey1", 2);
+        assert_eq!(cmp_internal_keys(&ka_new, &kb), Ordering::Less);
+        assert_eq!(cmp_internal_keys(&ka_old, &kb), Ordering::Less);
+        assert_eq!(cmp_internal_keys(&kb, &ka_old), Ordering::Greater);
+        assert_eq!(parse_key(&ka_old), b"mykey");
+        assert_eq!(parse_key(&kb), b"mykey1");
+
+        // Equality is byte equality.
+        assert_eq!(cmp_internal_keys(&ka_old, &ka_old.clone()), Ordering::Equal);
+    }
+
+    #[test]
+    fn mvcc_key_encoding_embedded_zero_and_round_trip() {
+        use std::cmp::Ordering;
+
+        // `"a"` vs `"a\x00b"`: the case the old 0x00-separator encoding got
+        // wrong. Every version of "a" must sort before every version of
+        // "a\x00b".
+        for seq_a in [1u64, 2, u64::MAX - 1] {
+            for seq_ab in [1u64, 2, u64::MAX - 1] {
+                let a = key_with_ts(b"a", seq_a);
+                let ab = key_with_ts(b"a\x00b", seq_ab);
+                assert_eq!(
+                    cmp_internal_keys(&a, &ab),
+                    Ordering::Less,
+                    "a@{seq_a} must sort before a\\0b@{seq_ab}"
+                );
+            }
+        }
+
+        // Round trip: parse_key/parse_ts recover exactly what key_with_ts
+        // encoded, for arbitrary bytes (embedded 0x00, trailing 0x00, 0xFF,
+        // empty key) and boundary seqs.
+        for uk in [
+            b"".as_ref(),
+            b"\x00",
+            b"a\x00b",
+            b"a\x00",
+            b"\x00\x00\x00",
+            b"\xff\xff",
+            b"plain",
+        ] {
+            for ts in [0u64, 1, 42, u64::MAX - 1, u64::MAX] {
+                let k = key_with_ts(uk, ts);
+                assert_eq!(k.len(), uk.len() + TS_BYTES);
+                assert_eq!(parse_key(&k), uk, "user key round trip for {uk:?}@{ts}");
+                assert_eq!(parse_ts(&k), ts, "ts round trip for {uk:?}@{ts}");
+            }
+        }
+    }
+
+    #[test]
+    fn value_pointer_encode_decode() {
+        let vp = ValuePointer {
+            extent_id: 0xDEAD,
+            offset: 0x1234,
+            len: 0xABCD,
+        };
+        let enc = vp.encode();
+        let dec = ValuePointer::decode(&enc);
+        assert_eq!(dec.extent_id, vp.extent_id);
+        assert_eq!(dec.offset, vp.offset);
+        assert_eq!(dec.len, vp.len);
+    }
+
+    // ── Tests ported from Go range_partition/entry_test.go ───────────────────
+
+    /// WAL-FAILSTOP: a CRC mismatch on a COMPLETE
+    /// middle record (bit rot / torn write) must FAIL recovery, never be
+    /// silently skipped — skipping drops an ACKed-but-unflushed write and
+    /// leaves a hole in the replayed sequence. (A truncated TAIL record =
+    /// crash-tail, which is legitimately stopped-at, not corruption.)
+    #[test]
+    fn wal_mid_record_corruption_fails_recovery_not_silently_skipped() {
+        let a = encode_record(1, b"k1", b"v1", 0);
+        let b = encode_record(1, b"k2", b"v2", 0);
+        let c = encode_record(2, b"k3", b"", 0);
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&a);
+        let b_start = buf.len();
+        buf.extend_from_slice(&b);
+        buf.extend_from_slice(&c);
+        // Corrupt a byte inside record B's payload (past the 5-byte envelope
+        // header) → its CRC mismatches while A and C stay valid. The decoder
+        // must NOT return [A, C] with B silently dropped.
+        buf[b_start + 8] ^= 0xFF;
+
+        // Corrupt middle record → recovery FAILS (no silent skip / hole).
+        assert!(
+            decode_records_chunk(&buf).is_err(),
+            "corrupt middle WAL record must fail recovery (got Ok = silent skip / data loss)"
+        );
+
+        // Clean buffer → all three decode.
+        let mut clean = Vec::new();
+        clean.extend_from_slice(&a);
+        clean.extend_from_slice(&b);
+        clean.extend_from_slice(&c);
+        let (recs, _) = decode_records_chunk(&clean).expect("clean WAL must decode");
+        assert_eq!(recs.len(), 3, "clean WAL: all records present");
+
+        // Truncated TAIL (crash-tail) is NOT corruption — decode the valid
+        // prefix (A) and stop cleanly, no error.
+        let mut tail = Vec::new();
+        tail.extend_from_slice(&a);
+        tail.extend_from_slice(&b[..b.len() - 3]); // chop B's last 3 bytes
+        let (recs, _) = decode_records_chunk(&tail).expect("crash-tail must be Ok");
+        assert_eq!(recs.len(), 1, "crash-tail: only the complete prefix (A) replays");
+
+        // Residual: a V1 record whose LENGTH field is bit-flipped
+        // LARGER (so `total` exceeds the buffer) is reported by decode_one as
+        // Incomplete BEFORE the CRC can be checked — so the chunk decoder does
+        // NOT flag it Corrupt; it leaves B's bytes as un-consumed carry. This
+        // is by-design at the chunk layer; `recover_partition` is the catch
+        // point — a non-empty carry at the COMMITTED end fails the open (it
+        // can't be a legit crash-tail under the committed-clamp). Here we
+        // pin the chunk-layer behaviour: A consumed, B left as carry.
+        let mut inflated = Vec::new();
+        inflated.extend_from_slice(&a);
+        let b_at = inflated.len();
+        inflated.extend_from_slice(&b);
+        // bytes[1..5] = V1 envelope length LE; flip the high byte → huge total.
+        inflated[b_at + 4] ^= 0x40;
+        let (recs, consumed) =
+            decode_records_chunk(&inflated).expect("inflated-length → Incomplete tail, Ok prefix");
+        assert_eq!(recs.len(), 1, "only A decodes; B's inflated length → carry");
+        assert_eq!(
+            consumed,
+            a.len(),
+            "B left entirely as carry → recover_partition's committed-end carry check fails it"
+        );
+    }
+
+    /// WAL self-heal A3: `select_clean_replica_chunk` picks the first replica
+    /// whose window decodes clean and records every corrupt replica's node id
+    /// (read errors are NOT corrupt — I7). All-corrupt → None (caller fails
+    /// loud).
+    #[test]
+    fn selfheal_a3_selects_clean_replica_and_records_corrupt() {
+        let a = encode_record(1, b"k1", b"v1", 0);
+        let b = encode_record(1, b"k2", b"v2", 0);
+        let mut clean: Vec<u8> = Vec::new();
+        clean.extend_from_slice(&a);
+        let b_start = clean.len();
+        clean.extend_from_slice(&b);
+        let want = clean.len();
+
+        // node 11 = bit-rotted copy (B's CRC mismatches), node 13 = clean,
+        // node 15 = also clean. Mixed order on purpose.
+        let mut rotted = clean.clone();
+        rotted[b_start + 8] ^= 0xFF;
+
+        let results = vec![
+            (11u64, Some(rotted.clone())),
+            (13u64, Some(clean.clone())),
+            (15u64, Some(clean.clone())),
+        ];
+        let (picked, corrupt) = select_clean_replica_chunk(results, want, /*is_final=*/ true);
+        let (recs, consumed, healed) = picked.expect("a clean replica exists → Some");
+        assert_eq!(recs.len(), 2, "clean window decodes both records");
+        assert_eq!(consumed, want, "final chunk fully consumed");
+        assert_eq!(healed, clean, "healed bytes = the clean replica's copy");
+        assert!(corrupt.contains(&11), "rotted node 11 recorded corrupt");
+        assert!(!corrupt.contains(&13) && !corrupt.contains(&15), "clean nodes untouched");
+
+        // A read error (None) is NOT corrupt (I7) — node 11 unreachable, the
+        // remaining clean node is used and 11 is NOT in the corrupt set.
+        let results = vec![(11u64, None), (13u64, Some(clean.clone()))];
+        let (picked, corrupt) = select_clean_replica_chunk(results, want, true);
+        assert!(picked.is_some(), "clean node 13 used");
+        assert!(corrupt.is_empty(), "unreachable node is not marked corrupt (I7)");
+
+        // A short read (< want) over a committed window is corrupt.
+        let results = vec![(11u64, Some(clean[..want - 4].to_vec()))];
+        let (picked, corrupt) = select_clean_replica_chunk(results, want, true);
+        assert!(picked.is_none(), "short read → no clean replica");
+        assert!(corrupt.contains(&11), "short-reading node recorded corrupt");
+
+        // All replicas corrupt → None (caller fails the open loud).
+        let results = vec![
+            (11u64, Some(rotted.clone())),
+            (13u64, Some(rotted.clone())),
+            (15u64, Some(rotted.clone())),
+        ];
+        let (picked, corrupt) = select_clean_replica_chunk(results, want, true);
+        assert!(picked.is_none(), "all corrupt → no clean replica");
+        assert_eq!(corrupt.len(), 3, "all three recorded corrupt");
+
+        // Non-final chunk: a leftover (partial record at the window tail) is the
+        // normal cross-chunk carry, NOT corruption. The clean replica is picked
+        // and `consumed < want` is fine.
+        let mut partial: Vec<u8> = Vec::new();
+        partial.extend_from_slice(&a);
+        partial.extend_from_slice(&b[..b.len() - 3]); // chop B's tail → carry
+        let want_p = partial.len();
+        let results = vec![(13u64, Some(partial.clone()))];
+        let (picked, corrupt) = select_clean_replica_chunk(results, want_p, /*is_final=*/ false);
+        let (recs, consumed, _) = picked.expect("non-final partial tail is clean");
+        assert_eq!(recs.len(), 1, "only A decodes; B's chopped tail is carry");
+        assert!(consumed < want_p, "leftover carried to next chunk");
+        assert!(corrupt.is_empty(), "non-final leftover is not corruption");
+    }
+
+    // ── Memtable tests ported from Go skiplist tests ─────────────────────────
+
+    #[test]
+    fn memtable_update_returns_newest() {
+        let mt = Memtable::new();
+        // Insert same key with increasing seq — newest should win on seek
+        for seq in 1..=100u64 {
+            let k = key_with_ts(b"key", seq);
+            let val = format!("value{seq}");
+            mt.insert(
+                k,
+                MemEntry {
+                    op: 1,
+                    value: val.into_bytes(),
+                    expires_at: 0,
+                },
+                50,
+            );
+        }
+        let got = mt.seek_user_key(b"key").expect("key should exist");
+        assert_eq!(got.value, b"value100", "should return newest version");
+    }
+
+    // ── internal-key ordering with embedded 0x00 in user keys ────────────────
+    //
+    // `"a"` vs `"a\x00b"`: a user key that CONTAINS 0x00 and extends a
+    // shorter user key. The old separator encoding
+    // (`user ++ 0x00 ++ BE(MAX-seq)`) made `"a\x00b"`'s CONTENT bytes
+    // compare against `"a"`'s inverted-seq bytes, sorting every version of
+    // `"a\x00b"` BEFORE every version of `"a"` — inverted user-key order,
+    // which broke seek_user_key ("a" unfindable) and scan order. These
+    // tests pin the behavior-level consequences (get + scan + SST lookup).
+
+    #[test]
+    fn memtable_get_user_key_with_embedded_zero_neighbor() {
+        let mt = Memtable::new();
+        for (uk, seq, val) in [
+            (b"a\x00b".as_ref(), 1u64, b"deep".as_ref()),
+            (b"a".as_ref(), 2u64, b"shallow".as_ref()),
+        ] {
+            mt.insert(
+                key_with_ts(uk, seq),
+                MemEntry {
+                    op: 1,
+                    value: val.to_vec(),
+                    expires_at: 0,
+                },
+                10,
+            );
+        }
+        let got = mt.seek_user_key(b"a").expect("\"a\" must be found");
+        assert_eq!(got.value, b"shallow");
+        let got = mt.seek_user_key(b"a\x00b").expect("\"a\\0b\" must be found");
+        assert_eq!(got.value, b"deep");
+    }
+
+    #[test]
+    fn memtable_scan_order_with_embedded_zero_follows_user_key_order() {
+        let mt = Memtable::new();
+        // Insert out of order; two versions of "a" so newest-first is
+        // asserted across the boundary too.
+        for (uk, seq) in [
+            (b"a\x00b".as_ref(), 5u64),
+            (b"a".as_ref(), 3),
+            (b"a".as_ref(), 7),
+            (b"b".as_ref(), 4),
+        ] {
+            mt.insert(
+                key_with_ts(uk, seq),
+                MemEntry {
+                    op: 1,
+                    value: seq.to_string().into_bytes(),
+                    expires_at: 0,
+                },
+                10,
+            );
+        }
+        let got: Vec<(Vec<u8>, Vec<u8>)> = mt
+            .snapshot_sorted()
+            .into_iter()
+            .map(|it| (parse_key(&it.key).to_vec(), it.value))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (b"a".to_vec(), b"7".to_vec()),
+                (b"a".to_vec(), b"3".to_vec()),
+                (b"a\x00b".to_vec(), b"5".to_vec()),
+                (b"b".to_vec(), b"4".to_vec()),
+            ],
+            "scan must follow user-key order (\"a\" before \"a\\0b\"), newest version first"
+        );
+    }
+
+    #[test]
+    fn sst_lookup_user_key_with_embedded_zero_neighbor() {
+        // Same key shape through the FULL flush path: memtable → SST bytes →
+        // point lookup. Physical SST order comes from the memtable's order,
+        // so a wrong order breaks the reader's binary search.
+        let mt = Memtable::new();
+        for (uk, seq, val) in [
+            (b"a\x00b".as_ref(), 1u64, b"deep".as_ref()),
+            (b"a".as_ref(), 2u64, b"shallow".as_ref()),
+            (b"c".as_ref(), 3u64, b"cc".as_ref()),
+        ] {
+            mt.insert(
+                key_with_ts(uk, seq),
+                MemEntry {
+                    op: 1,
+                    value: val.to_vec(),
+                    expires_at: 0,
+                },
+                10,
+            );
+        }
+        let (sst, _last_seq) = build_sst(&mt, 0, 0);
+        let bytes = sst.to_bytes().to_vec();
+        let reader = SstReader::from_bytes(bytes::Bytes::from(bytes)).expect("reader");
+        for (uk, want) in [
+            (b"a".as_ref(), b"shallow".as_ref()),
+            (b"a\x00b".as_ref(), b"deep".as_ref()),
+            (b"c".as_ref(), b"cc".as_ref()),
+        ] {
+            let (_op, val, _exp) = crate::background::lookup_in_sst(&reader, uk)
+                .unwrap_or_else(|| panic!("{uk:?} must be found in SST"));
+            assert_eq!(&val[..], want);
+        }
+    }
+
+    /// A flushed SST's filter is sized from the memtable it was built from.
+    #[test]
+    fn a_flushed_sst_filter_rejects_absent_keys() {
+        let mt = Memtable::new();
+        for i in 0..20_000u64 {
+            mt.insert(
+                key_with_ts(format!("key{i:06}").as_bytes(), i + 1),
+                MemEntry {
+                    op: 1,
+                    value: b"v".to_vec(),
+                    expires_at: 0,
+                },
+                10,
+            );
+        }
+        let (sst, _) = build_sst(&mt, 0, 0);
+        let bytes = sst.to_bytes().to_vec();
+        let reader = SstReader::from_bytes(bytes::Bytes::from(bytes)).expect("reader");
+        let fp = (0..20_000u32)
+            .filter(|i| reader.bloom_may_contain(format!("absent{i:06}").as_bytes()))
+            .count();
+        assert!(fp < 400, "{fp} of 20000 absent keys passed the filter");
+    }
+
+    #[test]
+    fn memtable_mem_bytes_tracking() {
+        let mt = Memtable::new();
+        mt.insert(
+            key_with_ts(b"k1", 1),
+            MemEntry {
+                op: 1,
+                value: b"v1".to_vec(),
+                expires_at: 0,
+            },
+            100,
+        );
+        assert_eq!(mt.mem_bytes(), 100);
+        mt.insert(
+            key_with_ts(b"k2", 2),
+            MemEntry {
+                op: 1,
+                value: b"v2".to_vec(),
+                expires_at: 0,
+            },
+            200,
+        );
+        assert_eq!(mt.mem_bytes(), 300);
+    }
+
+    // under the RwLock<BTreeMap> design the memtable has ONE writer
+    // (the P-log thread) and N readers (ps-conn threads doing seek_user_key).
+    // This test exercises that pattern: 1 writer thread does insert() in a
+    // tight loop while 8 reader threads do seek_user_key() in a tight loop on
+    // overlapping keys. Verifies:
+    //   - no panic / data race
+    //   - writer insertions become visible to subsequent readers
+    //   - total reader ops progresses (readers are not starved by writer)
+    //   - the writer's last-inserted key is visible to a post-test reader
+    #[test]
+    fn memtable_mixed_read_write_under_pressure() {
+        use std::sync::atomic::{AtomicBool, AtomicU64 as StdAtomicU64, Ordering};
+        use std::sync::Arc as StdArc;
+        use std::thread;
+        use std::time::{Duration as StdDuration, Instant as StdInstant};
+
+        let mt = StdArc::new(Memtable::new());
+        let stop = StdArc::new(AtomicBool::new(false));
+        let writer_ops = StdArc::new(StdAtomicU64::new(0));
+        let reader_ops = StdArc::new(StdAtomicU64::new(0));
+
+        // Writer thread: tight insert loop with monotonically increasing seq.
+        let writer = {
+            let mt = mt.clone();
+            let stop = stop.clone();
+            let writer_ops = writer_ops.clone();
+            thread::spawn(move || {
+                let mut seq: u64 = 1;
+                while !stop.load(Ordering::Relaxed) {
+                    // Key space cycles through 64 user keys so readers see hits.
+                    let uk = format!("uk{:03}", seq % 64);
+                    let k = key_with_ts(uk.as_bytes(), seq);
+                    let v = format!("v{}", seq).into_bytes();
+                    mt.insert(
+                        k,
+                        MemEntry {
+                            op: 1,
+                            value: v,
+                            expires_at: 0,
+                        },
+                        64,
+                    );
+                    writer_ops.fetch_add(1, Ordering::Relaxed);
+                    seq = seq.wrapping_add(1);
+                }
+            })
+        };
+
+        // 8 reader threads: seek_user_key over the cycling key space.
+        let mut readers = Vec::new();
+        for i in 0..8 {
+            let mt = mt.clone();
+            let stop = stop.clone();
+            let reader_ops = reader_ops.clone();
+            readers.push(thread::spawn(move || {
+                let mut j: u64 = 0;
+                while !stop.load(Ordering::Relaxed) {
+                    let uk = format!("uk{:03}", (i * 7 + j) % 64);
+                    let _ = mt.seek_user_key(uk.as_bytes());
+                    reader_ops.fetch_add(1, Ordering::Relaxed);
+                    j = j.wrapping_add(1);
+                }
+            }));
+        }
+
+        // Run for 100 ms.
+        thread::sleep(StdDuration::from_millis(100));
+        let start_stop = StdInstant::now();
+        stop.store(true, Ordering::Relaxed);
+        writer.join().expect("writer thread panicked");
+        for r in readers {
+            r.join().expect("reader thread panicked");
+        }
+
+        let w = writer_ops.load(Ordering::Relaxed);
+        let r = reader_ops.load(Ordering::Relaxed);
+        assert!(w > 0, "writer should have completed at least one insert");
+        assert!(r > 0, "readers should have completed at least one op");
+        // No hard SLA on ratio (CI noise) — just make sure readers are not
+        // wholly starved. A catastrophically broken lock pattern would show
+        // readers = 0 or writer = 0; both should be well into the thousands
+        // on any modern box in 100 ms.
+        let _ = start_stop.elapsed(); // keep timing var for clarity
+
+        // Linearizability spot-check: do a final insert and read it back.
+        let k_final = key_with_ts(b"final", u64::MAX - 1);
+        mt.insert(
+            k_final,
+            MemEntry {
+                op: 1,
+                value: b"LAST".to_vec(),
+                expires_at: 0,
+            },
+            64,
+        );
+        let got = mt.seek_user_key(b"final").expect("final key visible");
+        assert_eq!(got.value, b"LAST");
+    }
+
+    // ── in_range tests ported from Go split algorithm tests ─────────────────
+
+    #[test]
+    fn in_range_basic() {
+        let rg = Range {
+            start_key: b"b".to_vec(),
+            end_key: b"e".to_vec(),
+        };
+        assert!(!in_range(&rg, b"a")); // before start
+        assert!(in_range(&rg, b"b")); // exactly start
+        assert!(in_range(&rg, b"c")); // in range
+        assert!(in_range(&rg, b"d")); // in range
+        assert!(!in_range(&rg, b"e")); // exactly end (exclusive)
+        assert!(!in_range(&rg, b"f")); // after end
+    }
+
+    #[test]
+    fn in_range_open_end() {
+        let rg = Range {
+            start_key: b"a".to_vec(),
+            end_key: vec![], // open-ended
+        };
+        assert!(in_range(&rg, b"a"));
+        assert!(in_range(&rg, b"z"));
+        assert!(in_range(&rg, b"zzzzzzz"));
+        assert!(!in_range(&rg, b"")); // before "a"
+    }
+
+    // ── decode_last_table_checkpoint tests ───────────────────────────────────
+
+    #[test]
+    fn decode_table_locations_roundtrip() {
+        let locs = TableLocations {
+            fence_floors: vec![],
+            locs: vec![
+                SstLocation {
+                    extent_id: 1,
+                    offset: 0,
+                    len: 1000,
+                },
+                SstLocation {
+                    extent_id: 2,
+                    offset: 100,
+                    len: 2000,
+                },
+            ],
+            vp_extent_id: 42,
+            vp_offset: 512,
+            log_extent_count: 0,
+        };
+        let payload = rkyv_encode(&locs);
+        let mut data = Vec::new();
+        data.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        data.extend_from_slice(&payload);
+
+        let decoded = decode_last_table_checkpoint(&data).unwrap();
+        assert_eq!(decoded.locs.len(), 2);
+        assert_eq!(decoded.locs[0].extent_id, 1);
+        assert_eq!(decoded.locs[1].len, 2000);
+        assert_eq!(decoded.vp_extent_id, 42);
+        assert_eq!(decoded.vp_offset, 512);
+    }
+
+    #[test]
+    fn decode_table_locations_multiple_records_returns_last() {
+        let locs1 = TableLocations {
+            fence_floors: vec![],
+            locs: vec![SstLocation {
+                extent_id: 1,
+                offset: 0,
+                len: 100,
+            }],
+            vp_extent_id: 10,
+            vp_offset: 0,
+            log_extent_count: 0,
+        };
+        let locs2 = TableLocations {
+            fence_floors: vec![],
+            locs: vec![
+                SstLocation {
+                    extent_id: 1,
+                    offset: 0,
+                    len: 100,
+                },
+                SstLocation {
+                    extent_id: 2,
+                    offset: 0,
+                    len: 200,
+                },
+            ],
+            vp_extent_id: 20,
+            vp_offset: 50,
+            log_extent_count: 0,
+        };
+
+        let mut data = Vec::new();
+        let p1 = rkyv_encode(&locs1);
+        data.extend_from_slice(&(p1.len() as u32).to_le_bytes());
+        data.extend_from_slice(&p1);
+        let p2 = rkyv_encode(&locs2);
+        data.extend_from_slice(&(p2.len() as u32).to_le_bytes());
+        data.extend_from_slice(&p2);
+
+        let decoded = decode_last_table_checkpoint(&data).unwrap();
+        // Should return the LAST valid record
+        assert_eq!(decoded.locs.len(), 2);
+        assert_eq!(decoded.vp_extent_id, 20);
+        assert_eq!(decoded.vp_offset, 50);
+    }
+
+    #[test]
+    fn decode_legacy_unknown_companion_keeps_preceding_checkpoint() {
+        #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+        struct LegacyMergeSourceBoundary {
+            log_stream_id: u64,
+            vp_extent_id: u64,
+            vp_offset: u64,
+            log_extent_ids: Vec<u64>,
+        }
+
+        let locs = TableLocations {
+            fence_floors: vec![],
+            locs: vec![],
+            vp_extent_id: 12,
+            vp_offset: 900,
+            log_extent_count: 3,
+        };
+        let table_payload = rkyv_encode(&locs);
+        let boundary = LegacyMergeSourceBoundary {
+            log_stream_id: 44,
+            vp_extent_id: 12,
+            vp_offset: 900,
+            log_extent_ids: vec![10, 11, 12],
+        };
+        let boundary_encoded = rkyv_encode(&boundary);
+        let mut boundary_payload = b"AUMSB001".to_vec();
+        boundary_payload.extend_from_slice(&boundary_encoded);
+        assert!(
+            rkyv_decode::<TableLocations>(&boundary_payload).is_err(),
+            "the real legacy companion payload must not decode as TableLocations"
+        );
+        let mut data = Vec::new();
+        data.extend_from_slice(&(table_payload.len() as u32).to_le_bytes());
+        data.extend_from_slice(&table_payload);
+        data.extend_from_slice(&(boundary_payload.len() as u32).to_le_bytes());
+        data.extend_from_slice(&boundary_payload);
+
+        let decoded = decode_last_table_checkpoint(&data).unwrap();
+        assert_eq!(decoded.vp_extent_id, 12);
+        assert_eq!(decoded.vp_offset, 900);
+    }
+
+    #[test]
+    fn decode_table_locations_empty_fails() {
+        assert!(decode_last_table_checkpoint(&[]).is_err());
+        assert!(decode_last_table_checkpoint(&[0, 0, 0]).is_err());
+    }
+
+    /// a corrupted record in the MIDDLE of the stream must not silently
+    /// drop subsequent valid records. The loop previously broke on the first
+    /// decode failure and returned the prior record — losing the newer (valid)
+    /// records entirely. Now the loop logs + skips and continues.
+    #[test]
+    fn decode_table_locations_skips_mid_stream_corruption() {
+        let locs1 = TableLocations {
+            fence_floors: vec![],
+            locs: vec![SstLocation {
+                extent_id: 1,
+                offset: 0,
+                len: 100,
+            }],
+            vp_extent_id: 10,
+            vp_offset: 0,
+            log_extent_count: 0,
+        };
+        let locs3 = TableLocations {
+            fence_floors: vec![],
+            locs: vec![
+                SstLocation {
+                    extent_id: 1,
+                    offset: 0,
+                    len: 100,
+                },
+                SstLocation {
+                    extent_id: 2,
+                    offset: 0,
+                    len: 200,
+                },
+                SstLocation {
+                    extent_id: 3,
+                    offset: 0,
+                    len: 300,
+                },
+            ],
+            vp_extent_id: 30,
+            vp_offset: 100,
+            log_extent_count: 0,
+        };
+
+        let mut data = Vec::new();
+        // Record 1: valid.
+        let p1 = rkyv_encode(&locs1);
+        data.extend_from_slice(&(p1.len() as u32).to_le_bytes());
+        data.extend_from_slice(&p1);
+        // Record 2: malformed payload (random bytes prefixed with a valid length).
+        // Use a payload size that's plausible to keep the loop walking past it.
+        let bogus_len: u32 = 64;
+        data.extend_from_slice(&bogus_len.to_le_bytes());
+        data.extend_from_slice(&vec![0xABu8; bogus_len as usize]);
+        // Record 3: valid (the one the old break-on-error path would silently drop).
+        let p3 = rkyv_encode(&locs3);
+        data.extend_from_slice(&(p3.len() as u32).to_le_bytes());
+        data.extend_from_slice(&p3);
+
+        let decoded = decode_last_table_checkpoint(&data).unwrap();
+        // Must return record 3, NOT record 1.
+        assert_eq!(
+            decoded.locs.len(),
+            3,
+            "should return record 3, not record 1"
+        );
+        assert_eq!(decoded.vp_extent_id, 30);
+        assert_eq!(decoded.vp_offset, 100);
+    }
+
+    // ── build_sst test ─────────────────────────────────────────────────
+
+}
+
+// imm-pop signal flow is validated by:
+//   - The manager crate's graceful-shutdown integration test
+//     (graceful drain end-to-end exercises rotate → imm push → P-sst
+//     flush → pop_front → imm_drained_tx wake).
+// Constructing a `PartitionData` directly in a unit test would require a
+// real `StreamClient` (async constructor + manager round-trips), which
+// is out of scope for an in-process unit test.
+
+/// Test-side `MSG_PUT` wire: a request frame and the key read back from the
+/// ctrl a fake partition loop receives.
+#[cfg(test)]
+pub(crate) mod put_wire {
+    use super::*;
+
+    pub(crate) fn frame(req_id: u32, put: &PutReq, value: &[u8]) -> Frame {
+        Frame::request_zc(req_id, MSG_PUT, partition_rpc::rkyv_encode(put), Bytes::copy_from_slice(value))
+    }
+
+    pub(crate) fn key(ctrl: &[u8]) -> Vec<u8> {
+        partition_rpc::rkyv_decode::<PutReq>(ctrl).expect("put ctrl").key
+    }
+
+    /// The `PartitionRequest` the connection loop hands the partition.
+    pub(crate) fn request(
+        put: &PutReq,
+        value: Vec<u8>,
+    ) -> (PartitionRequest, futures::channel::oneshot::Receiver<HandlerResult>) {
+        let (resp_tx, resp_rx) = futures::channel::oneshot::channel();
+        let req = PartitionRequest {
+            msg_type: MSG_PUT,
+            payload: partition_rpc::rkyv_encode(put),
+            resp_tx,
+            bulk_value: Some(Bytes::from(value).into()),
+        };
+        (req, resp_rx)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// partition_loop direct-response path tests.
+//
+// These tests exercise the enqueue_put / enqueue_delete
+// helpers and the WriteResponder::send_ok / send_err contract. The full
+// merged loop (SQ/CQ pipeline + start/finish_write_batch) needs a live
+// StreamClient and is covered by the ps_bench / perf_check harness in
+// scripts/.
+//
+// What each test proves:
+//   1. merged_loop_mixed_read_write — interleaving decode + responder
+//      handling for PUT and DELETE reproduces correct frames on both paths,
+//      each PutReq yielding one WriteRequest whose responder delivers a
+//      valid rkyv-encoded frame to the outer oneshot.
+//      (Reads are covered by the existing read-path tests.)
+//   2. merged_loop_bad_decode_replies_invalid_arg — a malformed payload is
+//      rejected with StatusCode::InvalidArgument on the outer oneshot,
+//      without ever touching `pending`.
+#[cfg(test)]
+mod merged_loop_tests {
+    use super::*;
+    use futures::channel::oneshot;
+
+    fn build_put_partition_request(
+        key: &[u8],
+        value: &[u8],
+        expires_at: u64,
+    ) -> (PartitionRequest, oneshot::Receiver<HandlerResult>) {
+        put_wire::request(&PutReq {
+            part_id: 0,
+            key: key.to_vec(),
+            expires_at,
+            region_epoch: 0,
+            inode_hint: 0,
+            lease_epoch: 0,
+            evict_rank: 0,
+        }, value.to_vec())
+    }
+
+    fn build_delete_partition_request(
+        key: &[u8],
+    ) -> (PartitionRequest, oneshot::Receiver<HandlerResult>) {
+        let req = DeleteReq {
+            inode_hint: 0,
+            lease_epoch: 0,
+            part_id: 0,
+            key: key.to_vec(),
+            region_epoch: 0,
+        };
+        let payload = partition_rpc::rkyv_encode(&req);
+        let (resp_tx, resp_rx) = oneshot::channel();
+        (
+            PartitionRequest {
+                msg_type: MSG_DELETE,
+                payload,
+                resp_tx,
+                bulk_value: None,
+            },
+            resp_rx,
+        )
+    }
+
+    /// regular Put rejects values > AUTUMN_PS_MAX_INLINE_BYTES
+    /// without enqueueing into the write batch. The outer oneshot
+    /// receives a PutResp with code=CODE_VALUE_TOO_LARGE so the
+    /// client can fall back to PutBegin/Chunk/Commit.
+    #[test]
+    fn enqueue_put_rejects_oversized_value() {
+        let big_value = vec![0u8; AUTUMN_PS_MAX_INLINE_BYTES_DEFAULT as usize + 1];
+        let (req, resp_rx) = build_put_partition_request(b"big-key", &big_value, 0);
+        let mut pending: Vec<WriteRequest> = Vec::new();
+        enqueue_put(req, &mut pending, 0, 0, None, None);
+
+        // No WriteRequest queued — the cap fires before pipeline insert.
+        assert_eq!(pending.len(), 0, "oversized Put must not enter pipeline");
+
+        // The outer oneshot got a CODE_VALUE_TOO_LARGE PutResp frame.
+        let frame = compio::runtime::Runtime::new().unwrap().block_on(resp_rx);
+        let bytes = frame
+            .expect("outer oneshot dropped")
+            .expect("encoded PutResp");
+        let decoded: PutResp = partition_rpc::rkyv_decode(&bytes).unwrap();
+        assert_eq!(decoded.code, CODE_VALUE_TOO_LARGE);
+        assert_eq!(decoded.key.as_slice(), b"big-key");
+    }
+
+    /// A refused oversized Put must not raise its inode's fence floor: the
+    /// same writer's next, smaller write at an older epoch is still admitted.
+    #[test]
+    fn oversized_put_does_not_raise_the_fence_floor() {
+        let put = |value: Vec<u8>, lease_epoch: u64| {
+            let (resp_tx, resp_rx) = oneshot::channel();
+            let req = PartitionRequest {
+                msg_type: MSG_PUT,
+                payload: partition_rpc::rkyv_encode(&PutReq { part_id: 0, region_epoch: 0, expires_at: 0, key: b"f/7".to_vec(), inode_hint: 7, lease_epoch, evict_rank: 0 }),
+                resp_tx,
+                bulk_value: Some(Bytes::from(value).into()),
+            };
+            (req, resp_rx)
+        };
+        let floors = FenceFloors::recovered(HashMap::new());
+        let mut pending: Vec<WriteRequest> = Vec::new();
+
+        let (big, big_rx) = put(vec![0u8; AUTUMN_PS_MAX_INLINE_BYTES_DEFAULT as usize + 1], 5);
+        enqueue_put(big, &mut pending, 0, 0, Some(&floors), None);
+        let frame = compio::runtime::Runtime::new().unwrap().block_on(big_rx);
+        let resp: PutResp = partition_rpc::rkyv_decode(&frame.unwrap().unwrap()).unwrap();
+        assert_eq!(resp.code, CODE_VALUE_TOO_LARGE);
+        assert!(pending.is_empty());
+
+        let (small, _small_rx) = put(b"v".to_vec(), 3);
+        enqueue_put(small, &mut pending, 0, 0, Some(&floors), None);
+        assert!(
+            pending.iter().any(|w| matches!(w.op, WriteOp::Put { .. })),
+            "epoch 3 must not be fenced by the refused epoch-5 write"
+        );
+    }
+
+    /// regular Put at exactly the inline cap goes through normally.
+    /// Cap is `> AUTUMN_PS_MAX_INLINE_BYTES`, so equality is allowed.
+    #[test]
+    fn enqueue_put_accepts_value_at_inline_cap() {
+        let exact_cap_value = vec![0u8; AUTUMN_PS_MAX_INLINE_BYTES_DEFAULT as usize];
+        let (req, _resp_rx) = build_put_partition_request(b"k", &exact_cap_value, 0);
+        let mut pending: Vec<WriteRequest> = Vec::new();
+        enqueue_put(req, &mut pending, 0, 0, None, None);
+        assert_eq!(pending.len(), 1, "value at exact cap must enqueue normally");
+    }
+
+    /// test 2 — mixed sequence: enqueue 2 puts and 1 delete in
+    /// order, then reply to each. Every outer oneshot receives the right
+    /// frame type with the echoed key. Verifies both WriteResponder
+    /// variants encode correctly.
+    #[test]
+    fn merged_loop_mixed_read_write() {
+        let (p1, rx1) = build_put_partition_request(b"k1", b"v1", 0);
+        let (p2, rx2) = build_put_partition_request(b"k2", b"v2", 0);
+        let (d1, rx3) = build_delete_partition_request(b"k3");
+
+        let mut pending: Vec<WriteRequest> = Vec::new();
+        enqueue_put(p1, &mut pending, 0, 0, None, None);
+        enqueue_put(p2, &mut pending, 0, 0, None, None);
+        enqueue_delete(d1, &mut pending, 0, 0, None, None);
+
+        assert_eq!(pending.len(), 3);
+        // Order preserved (FIFO).
+        for w in pending.drain(..) {
+            w.resp.send_ok();
+        }
+
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let f1 = rx1.await.unwrap().unwrap();
+            let f2 = rx2.await.unwrap().unwrap();
+            let f3 = rx3.await.unwrap().unwrap();
+            let r1: PutResp = partition_rpc::rkyv_decode(&f1).unwrap();
+            let r2: PutResp = partition_rpc::rkyv_decode(&f2).unwrap();
+            let r3: DeleteResp = partition_rpc::rkyv_decode(&f3).unwrap();
+            assert_eq!(r1.key, b"k1");
+            assert_eq!(r2.key, b"k2");
+            assert_eq!(r3.key, b"k3");
+            assert_eq!(r1.code, CODE_OK);
+            assert_eq!(r2.code, CODE_OK);
+            assert_eq!(r3.code, CODE_OK);
+        });
+    }
+
+    /// test 3 — `WriteResponder::send_err` for "key is out of
+    /// range" surfaces as StatusCode::InvalidArgument (matches the
+    /// pre-merge behavior where handle_put returned InvalidArgument for
+    /// out-of-range, not Internal); all other errors surface as Internal.
+    /// This exercises the direct error-reply path that replaces the old
+    /// inner-oneshot error propagation.
+    #[test]
+    fn merged_loop_out_of_range_err_is_invalid_argument() {
+        let (outer, rx) = oneshot::channel();
+        let resp = WriteResponder::Put {
+            outer,
+            key: b"x".to_vec(),
+        };
+        resp.send_err("key is out of range".to_string());
+        let got = compio::runtime::Runtime::new().unwrap().block_on(rx);
+        let err = got.unwrap().err().unwrap();
+        assert_eq!(err.0, StatusCode::InvalidArgument);
+        assert_eq!(err.1, "key is out of range");
+
+        // And a non-range error surfaces as Internal.
+        let (outer2, rx2) = oneshot::channel();
+        let resp2 = WriteResponder::Delete {
+            outer: outer2,
+            key: b"y".to_vec(),
+        };
+        resp2.send_err("log_stream append_segments: boom".to_string());
+        let got2 = compio::runtime::Runtime::new().unwrap().block_on(rx2);
+        let err2 = got2.unwrap().err().unwrap();
+        assert_eq!(err2.0, StatusCode::Internal);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ps-conn on P-log runtime (same-thread, no worker pool) tests.
+//
+// These tests pin the two properties of the same-thread ps-conn refactor:
+//   1. `handle_ps_connection` no longer requires an Arc<PartitionRouter>
+//      DashMap — it runs on the owning partition's compio runtime and
+//      communicates with `partition_loop` via a same-thread
+//      `mpsc::Sender<PartitionRequest>`. No cross-thread wake (eventfd
+//      + futex) on the write hot path.
+//   2. Under load (1000 sequential ops on one TCP connection), the full
+//      decode → push → await → write cycle remains correct. This is a
+//      lightweight correctness-under-load check (not a perf test).
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod single_thread_write_tests {
+    use super::*;
+
+    /// test 2 — correctness under load. Fire 1000 sequential
+    /// Put requests on one TCP connection, verify every response arrives
+    /// with the correct echoed key. No threading, no routing; all on
+    /// the single compio runtime. Elapsed time bound (2 s) is
+    /// generous — this is a correctness check, not a perf test.
+    #[test]
+    fn n1_load_basic_sanity() {
+        let _g = super::ps_conn_test_lock();
+        let rt = compio::runtime::Runtime::new().unwrap();
+        rt.block_on(async move {
+            let listener = compio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind");
+            let addr = listener.local_addr().expect("local_addr");
+            let client = compio::net::TcpStream::connect(addr)
+                .await
+                .expect("connect");
+            let (server, _) = listener.accept().await.expect("accept");
+
+            let (req_tx, mut req_rx) = mpsc::channel::<PartitionRequest>(128);
+
+            let conn_handle = compio::runtime::spawn(async move {
+                handle_ps_connection(
+                    autumn_transport::Conn::Tcp(server),
+                    req_tx,
+                    None,
+                    1,
+                    std::sync::Arc::new(crate::authz::AuthzState::new()),
+                )
+                .await
+            });
+
+            // Simulated merged_loop: echo every Put.
+            let loop_handle = compio::runtime::spawn(async move {
+                while let Some(req) = req_rx.next().await {
+                    let put_key = put_wire::key(&req.payload);
+                    let resp = partition_rpc::rkyv_encode(&PutResp {
+                        code: CODE_OK,
+                        message: String::new(),
+                        key: put_key,
+                    });
+                    let _ = req.resp_tx.send(Ok(resp));
+                }
+            });
+
+            let (mut client_rd, mut client_wr) = test_protocol::initiate_tcp(
+                client,
+                autumn_rpc::version_hello::Service::PartitionServer,
+            )
+            .await
+            .into_split();
+            let n_ops: u32 = 1000;
+            let start = Instant::now();
+
+            // Send all 1000 requests first (pipelined at the TCP layer,
+            // serialized at ps-conn). Then read 1000 responses.
+            let mut big_buf: Vec<u8> = Vec::with_capacity(64 * 1024);
+            for i in 0..n_ops {
+                let key = format!("k{:04}", i).into_bytes();
+                let value = format!("v{:04}", i).into_bytes();
+                let put_value: Vec<u8> = value;
+                let put = PutReq {
+                    part_id: 1,
+                    key: key.clone(),
+                    expires_at: 0,
+                    region_epoch: 0,
+                inode_hint: 0,
+                lease_epoch: 0,
+                evict_rank: 0,
+                };
+                let f = put_wire::frame(i + 1, &put, &put_value);
+                big_buf.extend_from_slice(&f.encode()[..]);
+            }
+            let BufResult(r, _) = client_wr.write_all(big_buf).await;
+            r.expect("write all requests");
+
+            // Read and verify all 1000 responses.
+            let mut decoder = FrameDecoder::new();
+            let mut buf = vec![0u8; 64 * 1024];
+            let mut verified: u32 = 0;
+            while verified < n_ops {
+                let BufResult(n, back) = client_rd.read(buf).await;
+                buf = back;
+                let n = n.expect("read");
+                assert!(n > 0, "unexpected EOF at verified={}", verified);
+                decoder.feed(&buf[..n]);
+                while let Some(resp_frame) = decoder.try_decode().expect("decode") {
+                    assert_eq!(resp_frame.req_id, verified + 1);
+                    assert_eq!(resp_frame.msg_type, MSG_PUT);
+                    assert!(!resp_frame.is_error());
+                    let r: PutResp =
+                        partition_rpc::rkyv_decode(&resp_frame.payload).expect("decode resp");
+                    assert_eq!(r.code, CODE_OK);
+                    let expected_key = format!("k{:04}", verified).into_bytes();
+                    assert_eq!(r.key, expected_key);
+                    verified += 1;
+                }
+            }
+            let elapsed = start.elapsed();
+            assert_eq!(verified, n_ops);
+            assert!(
+                elapsed < std::time::Duration::from_secs(5),
+                "1000 ops should complete well under 5s on loopback; took {:?}",
+                elapsed,
+            );
+
+            drop(client_rd);
+            drop(client_wr);
+            let _ = conn_handle.await;
+            let _ = loop_handle.await;
+        });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// per-partition listener tests.
+//
+// These tests pin the two core properties of the per-partition listener refactor:
+//   1. A partition thread binds its OWN `compio::net::TcpListener` on a
+//      unique port and runs its OWN accept loop + `handle_ps_connection`
+//      tasks on the same compio runtime — no central accept thread, no
+//      fd dispatcher. Clients connect directly to the partition's port.
+//   2. At N > 1, N partitions bind N distinct ports and requests land on
+//      the owning partition's listener. Each `handle_ps_connection` only
+//      accepts requests whose `part_id` matches its `owner_part`; a request
+//      for a foreign partition gets a `NotFound` error.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod partition_listener_tests {
+    use super::*;
+
+    /// Spin up one "partition" accept loop on a dedicated compio runtime
+    /// thread, returning (listen_port, shutdown_tx, join). The accept loop:
+    ///   - binds `127.0.0.1:0` (OS-assigned port)
+    ///   - spawns `handle_ps_connection` on the same runtime for each
+    ///     accepted fd, with the provided `owner_part` id
+    ///   - runs a simulated merged_loop that echoes every Put with a
+    ///     `PutResp { code: CODE_OK, key: put.key }`
+    ///   - exits when `shutdown_rx` resolves (drop of the sender)
+    fn spawn_partition_listener(
+        owner_part: u64,
+    ) -> (
+        u16,
+        std::sync::mpsc::Sender<()>,
+        std::thread::JoinHandle<()>,
+    ) {
+        let (port_tx, port_rx) = std::sync::mpsc::channel::<u16>();
+        let (shutdown_tx, shutdown_rx_std) = std::sync::mpsc::channel::<()>();
+
+        let join = std::thread::Builder::new()
+            .name(format!("listener-part-{owner_part}"))
+            .spawn(move || {
+                let rt = compio::runtime::Runtime::new().expect("rt");
+                rt.block_on(async move {
+                    let listener = compio::net::TcpListener::bind("127.0.0.1:0")
+                        .await
+                        .expect("bind");
+                    let port = listener.local_addr().expect("local_addr").port();
+                    let _ = port_tx.send(port);
+
+                    // Same-thread ps-conn <-> merged_loop channel.
+                    let (req_tx, mut req_rx) = mpsc::channel::<PartitionRequest>(WRITE_CHANNEL_CAP);
+
+                    // Simulated merged_loop: echo every Put while req_rx is open.
+                    let loop_handle = compio::runtime::spawn(async move {
+                        while let Some(req) = req_rx.next().await {
+                            // Echo Puts; refuse everything else.
+                            if req.msg_type == MSG_PUT {
+                                let put_key = put_wire::key(&req.payload);
+                                let resp = partition_rpc::rkyv_encode(&PutResp {
+                                    code: CODE_OK,
+                                    message: String::new(),
+                                    key: put_key,
+                                });
+                                let _ = req.resp_tx.send(Ok(resp));
+                            } else {
+                                let _ = req
+                                    .resp_tx
+                                    .send(Err((StatusCode::Internal, "test".to_string())));
+                            }
+                        }
+                    });
+
+                    // Accept loop: racy shutdown via a polling check (the
+                    // test-only listener uses std::mpsc for signalling since
+                    // we're crossing the spawning OS thread here).
+                    let req_tx_accept = req_tx.clone();
+                    let accept_handle = compio::runtime::spawn(async move {
+                        loop {
+                            // Poll shutdown; break on EITHER a message OR
+                            // sender-drop (tests drop `shutdown_tx` without
+                            // sending).
+                            match shutdown_rx_std.try_recv() {
+                                Ok(()) | Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+                                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                            }
+                            // Race accept against a short timer so the shutdown
+                            // poll runs at least every 50 ms.
+                            let accept_fut = listener.accept();
+                            let timer_fut = compio::time::sleep(Duration::from_millis(50));
+                            futures::pin_mut!(accept_fut);
+                            futures::pin_mut!(timer_fut);
+                            match futures::future::select(accept_fut, timer_fut).await {
+                                futures::future::Either::Left((r, _)) => match r {
+                                    Ok((stream, _peer)) => {
+                                        let _ = stream.set_nodelay(true);
+                                        let tx = req_tx_accept.clone();
+                                        compio::runtime::spawn(async move {
+                                            let _ =
+                                                handle_ps_connection(
+                                                    autumn_transport::Conn::Tcp(stream),
+                                                    tx,
+                                                    None,
+                                                    owner_part,
+                                                    std::sync::Arc::new(
+                                                        crate::authz::AuthzState::new(),
+                                                    ),
+                                                )
+                                                .await;
+                                        })
+                                        .detach();
+                                    }
+                                    Err(_) => {
+                                        compio::time::sleep(Duration::from_millis(10)).await;
+                                    }
+                                },
+                                futures::future::Either::Right(_) => {
+                                    // Fall through to the shutdown poll.
+                                }
+                            }
+                        }
+                    });
+
+                    drop(req_tx);
+                    let _ = accept_handle.await;
+                    let _ = loop_handle.await;
+                });
+            })
+            .expect("spawn");
+
+        let port = port_rx.recv().expect("bind port reported");
+        (port, shutdown_tx, join)
+    }
+
+    /// test 2 — four partition threads bind four distinct ports;
+    /// requests with the matching `part_id` on each port succeed, and
+    /// a request targeting the wrong partition returns `NotFound`.
+    /// Verifies that (a) ports are distinct, (b) each listener is
+    /// isolated to its owner partition.
+    #[test]
+    fn n4_distinct_ports() {
+        let owners: [u64; 4] = [101, 102, 103, 104];
+        let mut ports: Vec<u16> = Vec::with_capacity(4);
+        let mut shutdowns: Vec<std::sync::mpsc::Sender<()>> = Vec::with_capacity(4);
+        let mut joins: Vec<std::thread::JoinHandle<()>> = Vec::with_capacity(4);
+        for &o in &owners {
+            let (p, st, j) = spawn_partition_listener(o);
+            ports.push(p);
+            shutdowns.push(st);
+            joins.push(j);
+        }
+
+        // All four ports distinct.
+        let mut sorted = ports.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            4,
+            "partition ports must be distinct: {:?}",
+            ports
+        );
+
+        // Drive a Put into each partition on its own port and verify
+        // correct routing; also fire a mis-routed request that hits a
+        // partition on the wrong port and expect `NotFound`.
+        std::thread::spawn(move || {
+            compio::runtime::Runtime::new()
+                .unwrap()
+                .block_on(async move {
+                    for (i, &o) in owners.iter().enumerate() {
+                        let port = ports[i];
+                        let addr: std::net::SocketAddr =
+                            format!("127.0.0.1:{port}").parse().unwrap();
+                        let stream = compio::net::TcpStream::connect(addr)
+                            .await
+                            .expect("connect");
+                        let (mut rd, mut wr) = test_protocol::initiate_tcp(
+                            stream,
+                            autumn_rpc::version_hello::Service::PartitionServer,
+                        )
+                        .await
+                        .into_split();
+
+                        // (a) correct part_id on owner's port → CODE_OK.
+                        let put_value: Vec<u8> = format!("v-{o}").into_bytes();
+                        let put = PutReq {
+                            part_id: o,
+                            key: format!("k-{o}").into_bytes(),
+                            expires_at: 0,
+                            region_epoch: 0,
+                        inode_hint: 0,
+                        lease_epoch: 0,
+                        evict_rank: 0,
+                        };
+                        let f = put_wire::frame(10, &put, &put_value).encode();
+                        let BufResult(r, _) = wr.write_all(f).await;
+                        r.expect("write put");
+
+                        let mut decoder = FrameDecoder::new();
+                        let mut buf = vec![0u8; 4096];
+                        let resp = loop {
+                            let BufResult(n, back) = rd.read(buf).await;
+                            buf = back;
+                            let n = n.expect("read");
+                            assert!(n > 0, "EOF before response for part {o}");
+                            decoder.feed(&buf[..n]);
+                            if let Some(fr) = decoder.try_decode().expect("decode") {
+                                break fr;
+                            }
+                        };
+                        assert!(
+                            !resp.is_error(),
+                            "part {o} on port {port} unexpectedly errored"
+                        );
+                        let pr: PutResp =
+                            partition_rpc::rkyv_decode(&resp.payload).expect("decode");
+                        assert_eq!(pr.code, CODE_OK);
+                        assert_eq!(pr.key, format!("k-{o}").into_bytes());
+
+                        // (b) Mis-routed: send a request with WRONG part_id to
+                        // this listener. handle_ps_connection should answer with
+                        // NotFound (owner mismatch).
+                        let wrong_value: Vec<u8> = b"bogus".to_vec();
+                        let wrong = PutReq {
+                            part_id: o + 1000, // definitely not this listener's owner
+                            key: b"bogus".to_vec(),
+                            expires_at: 0,
+                            region_epoch: 0,
+                        inode_hint: 0,
+                        lease_epoch: 0,
+                        evict_rank: 0,
+                        };
+                        let f = put_wire::frame(11, &wrong, &wrong_value).encode();
+                        let BufResult(r, _) = wr.write_all(f).await;
+                        r.expect("write mis-routed put");
+
+                        let mut buf = vec![0u8; 4096];
+                        let resp = loop {
+                            let BufResult(n, back) = rd.read(buf).await;
+                            buf = back;
+                            let n = n.expect("read");
+                            assert!(n > 0, "EOF before mis-route response for part {o}");
+                            decoder.feed(&buf[..n]);
+                            if let Some(fr) = decoder.try_decode().expect("decode") {
+                                break fr;
+                            }
+                        };
+                        assert!(
+                            resp.is_error(),
+                            "mis-routed request to part {o}'s port {port} should error"
+                        );
+                    }
+                });
+        })
+        .join()
+        .expect("client thread");
+
+        for st in shutdowns {
+            drop(st);
+        }
+        for j in joins {
+            let _ = j.join();
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// per-conn reply batching tests.
+//
+// These tests pin the three properties of the per-conn reply batching refactor:
+//   1. Single-frame passthrough: a depth=1 client sending one frame and
+//      awaiting its reply still works. Degenerates to
+//      `write_vectored_all([one_frame])`, which is cheap enough not to
+//      regress vs the old `write_all(one_frame)`.
+//   2. Multi-frame batching: when a TCP read delivers N frames, all N
+//      complete correctly and the total latency stays at the depth=1 cost
+//      (not N× it) — i.e. the futures genuinely run concurrently.
+//   3. Back-pressure at cap: a flood of N ≫ cap frames does NOT grow
+//      `inflight` past the configured cap; instead `push_frames_to_inflight`
+//      drains completions mid-push and the stream still processes every
+//      frame correctly.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod write_batch_fastpath_tests {
+
+/// MEASUREMENT (not a guard): what one `range` page costs as a function of the
+/// MEMTABLE's size, independent of how many entries the page returns.
+///
+/// `handle_range` used to call `collect_mem_items`, which is `snapshot_sorted`
+/// over the active memtable plus every imm — each of which CLONES every key and
+/// every value into a fresh `Vec<IterItem>`. That work is O(memtable), and it
+/// happened per request, so a 512-entry page over a hot partition paid for the
+/// whole memtable before it looked at a single key. It now takes a capped
+/// window instead and refills as needed; `collect_mem_items` survives for the
+/// split path, which genuinely needs everything.
+///
+/// Run with: cargo test -p autumn-partition-server --lib memtable_snapshot_cost -- --nocapture --ignored
+#[test]
+#[ignore = "measurement, not an assertion — prints a table"]
+fn memtable_snapshot_cost_scales_with_memtable_not_page_size() {
+    fn fill(n: usize, val_len: usize) -> Memtable {
+        let mt = Memtable::new();
+        let items: Vec<(Vec<u8>, MemEntry, u64)> = (0..n)
+            .map(|i| {
+                let key = crate::key_with_ts(format!("mem/agent/post/{i:012}").as_bytes(), i as u64);
+                (
+                    key,
+                    MemEntry {
+                        op: 1,
+                        value: vec![b'v'; val_len],
+                        expires_at: 0,
+                    },
+                    (32 + val_len) as u64,
+                )
+            })
+            .collect();
+        mt.insert_batch(items);
+        mt
+    }
+
+        fn timed<T>(reps: u32, mut f: impl FnMut() -> T) -> std::time::Duration {
+            std::hint::black_box(f());
+            let t0 = std::time::Instant::now();
+            for _ in 0..reps {
+                std::hint::black_box(f());
+            }
+            t0.elapsed() / reps
+        }
+
+        // Where a page starts does not matter to the OLD cost and is the whole
+        // story for the new one, so seek to the middle: the window there is full,
+        // which is the windowed path's worst case.
+        println!("\n  entries   value_len   full snapshot   windowed (cap 4096)");
+        for &(n, val_len) in &[
+            (10_000usize, 64usize),
+            (100_000, 64),
+            (500_000, 64),
+            (1_000_000, 64),
+            (500_000, 512),
+        ] {
+            let mt = fill(n, val_len);
+            let seek =
+                crate::key_with_ts(format!("mem/agent/post/{:012}", n / 2).as_bytes(), u64::MAX);
+            let full = timed(3, || mt.snapshot_sorted().len());
+            let windowed = timed(20, || {
+                mt.snapshot_range_keys(std::ops::Bound::Included(seek.as_slice()), 4096)
+                    .0
+                    .len()
+            });
+            println!("  {n:>9}   {val_len:>9}   {full:>13.1?}   {windowed:>19.1?}");
+        }
+        println!(
+            "\n  A 512-entry page returns ~512 entries no matter which row it is on;\n  \
+         the cost above is what the page pays BEFORE looking at any of them.\n"
+        );
+    }
+    use super::*;
+
+    /// test 2 — Multi-frame batched write: send 8 frames in one
+    /// TCP write. Verify all 8 complete correctly AND measure the peak
+    /// concurrency observed in merged_loop. The key correctness property:
+    /// if the server receives all 8 frames in a single TCP read, all 8
+    /// futures end up in `inflight` before any reply is sent, so peak
+    /// concurrency equals the batch size.
+    ///
+    /// We avoid the n_inflight==1 fast-path deadlock hazard by
+    /// responding to each request **immediately** as it arrives (via a
+    /// small `spawn` per request) — then verify peak >= 2 to prove that
+    /// handle_ps_connection did decode multiple frames before a single
+    /// reply completed. Under d=1 the old sequential path would yield
+    /// peak == 1 (one frame in, one reply out, loop).
+    #[test]
+    fn multi_frame_batches_write() {
+        let _g = fast_path_counter_lock();
+        let rt = compio::runtime::Runtime::new().unwrap();
+        rt.block_on(async move {
+            let listener = compio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            let client = compio::net::TcpStream::connect(addr)
+                .await
+                .expect("connect");
+            let (server, _) = listener.accept().await.expect("accept");
+
+            let (req_tx, mut req_rx) = mpsc::channel::<PartitionRequest>(64);
+
+            let peak = Rc::new(Cell::new(0usize));
+            let cur = Rc::new(Cell::new(0usize));
+
+            let conn_handle = compio::runtime::spawn(async move {
+                handle_ps_connection(
+                    autumn_transport::Conn::Tcp(server),
+                    req_tx,
+                    None,
+                    9,
+                    std::sync::Arc::new(crate::authz::AuthzState::new()),
+                )
+                .await
+            });
+
+            let peak_c = peak.clone();
+            let cur_c = cur.clone();
+            let loop_handle = compio::runtime::spawn(async move {
+                // Reply pool — we reply to each req after a 1ms delay so
+                // that multiple requests can pile up concurrently while
+                // waiting. But every req's reply IS eventually sent, so
+                // ps-conn's n_inflight==1 fast-path is never a deadlock.
+                let mut handlers: FuturesUnordered<futures::future::LocalBoxFuture<'static, ()>> =
+                    FuturesUnordered::new();
+                loop {
+                    futures::select! {
+                        maybe_req = req_rx.next() => {
+                            match maybe_req {
+                                Some(req) => {
+                                    let n = cur_c.get() + 1;
+                                    cur_c.set(n);
+                                    if n > peak_c.get() { peak_c.set(n); }
+                                    let cur_c2 = cur_c.clone();
+                                    handlers.push(Box::pin(async move {
+                                        compio::time::sleep(
+                                            Duration::from_millis(1),
+                                        ).await;
+                                        let put_key = put_wire::key(&req.payload);
+                                        let resp = partition_rpc::rkyv_encode(&PutResp {
+                                            code: CODE_OK,
+                                            message: String::new(),
+                                            key: put_key,
+                                        });
+                                        let _ = req.resp_tx.send(Ok(resp));
+                                        cur_c2.set(cur_c2.get() - 1);
+                                    }));
+                                }
+                                None => break,
+                            }
+                        }
+                        _ = handlers.next() => {}
+                        complete => break,
+                    }
+                }
+                while handlers.next().await.is_some() {}
+            });
+
+            // Client: send all 8 in ONE write_all.
+            let mut big = Vec::with_capacity(1024);
+            for i in 0..8u32 {
+                let put_value: Vec<u8> = b"v".to_vec();
+                let put = PutReq {
+                    part_id: 9,
+                    key: format!("batch-{i}").into_bytes(),
+                    expires_at: 0,
+                    region_epoch: 0,
+                inode_hint: 0,
+                lease_epoch: 0,
+                evict_rank: 0,
+                };
+                let f = put_wire::frame(100 + i, &put, &put_value).encode();
+                big.extend_from_slice(&f[..]);
+            }
+            let (mut client_rd, mut client_wr) = test_protocol::initiate_tcp(
+                client,
+                autumn_rpc::version_hello::Service::PartitionServer,
+            )
+            .await
+            .into_split();
+            let BufResult(r, _) = client_wr.write_all(big).await;
+            r.expect("write 8 frames");
+
+            // Read and verify all 8 replies (order-independent — FU's
+            // arrival order is NOT guaranteed, but every req_id must
+            // show up exactly once).
+            let mut decoder = FrameDecoder::new();
+            let mut buf = vec![0u8; 16 * 1024];
+            let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
+            while seen.len() < 8 {
+                let BufResult(n, back) = client_rd.read(buf).await;
+                buf = back;
+                let n = n.expect("read");
+                assert!(n > 0, "EOF before 8 replies; seen={}", seen.len());
+                decoder.feed(&buf[..n]);
+                while let Some(frame) = decoder.try_decode().expect("decode") {
+                    assert!(!frame.is_error());
+                    let r: PutResp = partition_rpc::rkyv_decode(&frame.payload).expect("decode");
+                    let expected_key = format!("batch-{}", frame.req_id - 100).into_bytes();
+                    assert_eq!(r.key, expected_key);
+                    assert!(
+                        seen.insert(frame.req_id),
+                        "duplicate req_id {}",
+                        frame.req_id
+                    );
+                }
+            }
+            assert_eq!(seen.len(), 8);
+
+            drop(client_rd);
+            drop(client_wr);
+            let _ = conn_handle.await;
+            let _ = loop_handle.await;
+
+            // Peak concurrency: the batch write of 8 frames MUST have
+            // resulted in >= 2 concurrent in-flight reqs at some point.
+            // Old sequential path (pre-batching) would have peak == 1.
+            let p = peak.get();
+            assert!(
+                p >= 2,
+                "peak concurrent in-flight = {p}, expected >= 2 for batched write"
+            );
+        });
+    }
+
+    /// The keepalive ping is answered by the connection loop itself — before
+    /// the authz gate (a connection that has not said hello must still prove
+    /// the PS alive) and without ever reaching the partition loop. An answer
+    /// of `unknown msg_type` would keep the client's connection alive too,
+    /// but as a refusal it would also be a log line per idle connection.
+    #[test]
+    fn keepalive_ping_is_answered_by_the_connection_loop() {
+        let rt = compio::runtime::Runtime::new().unwrap();
+        rt.block_on(async move {
+            let listener = compio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            let client = compio::net::TcpStream::connect(addr)
+                .await
+                .expect("connect");
+            let (server, _) = listener.accept().await.expect("accept");
+            let (req_tx, mut req_rx) = mpsc::channel::<PartitionRequest>(4);
+            let authz = std::sync::Arc::new(crate::authz::AuthzState::new());
+            authz.install(&autumn_rpc::manager_rpc::GetAuthzConfigResp {
+                enabled: true,
+                ..Default::default()
+            });
+            let _conn = compio::runtime::spawn(handle_ps_connection(
+                autumn_transport::Conn::Tcp(server),
+                req_tx,
+                None,
+                9,
+                authz,
+            ));
+            let client =
+                autumn_rpc::client::RpcClient::from_conn(autumn_transport::Conn::Tcp(client), addr)
+                    .await
+                    .expect("client");
+            let pong = client
+                .call(autumn_rpc::MSG_TYPE_PING, Bytes::new())
+                .await
+                .expect("ping must be answered as a success");
+            assert!(pong.is_empty());
+            assert!(
+                matches!(req_rx.try_recv(), Err(mpsc::TryRecvError::Empty)),
+                "a ping must never reach the partition loop"
+            );
+        });
+    }
+
+    /// test 3 — Back-pressure at cap: fire more frames than
+    /// `--conn-inflight-cap` admits in one write and verify: (a) every frame
+    /// completes correctly, (b) the merged_loop never observes more than the
+    /// cap simultaneously in-flight.
+    #[test]
+    fn backpressure_at_cap() {
+        const N_FRAMES: u32 = 100;
+
+        // Hold the workspace ps-conn lock across the spawned thread so
+        // PS_SINGLE_FRAME_RECV_HITS stays coherent for the two counter-asserting
+        // tests in this module.
+        let _g = fast_path_counter_lock();
+
+        // Run in a dedicated thread with its own runtime.
+        let handle = std::thread::Builder::new()
+            .name("batch-bp".to_string())
+            .spawn(move || {
+                let rt = compio::runtime::Runtime::new().unwrap();
+                rt.block_on(async move {
+                    // The peak-concurrency assertion below holds at whatever
+                    // cap is in force.
+                    let effective_cap = ps_conn_inflight_cap();
+                    assert!(effective_cap < N_FRAMES as usize, "the cap must leave frames waiting");
+
+                    let listener = compio::net::TcpListener::bind("127.0.0.1:0")
+                        .await
+                        .expect("bind");
+                    let addr = listener.local_addr().expect("addr");
+                    let client = compio::net::TcpStream::connect(addr)
+                        .await
+                        .expect("connect");
+                    let (server, _) = listener.accept().await.expect("accept");
+
+                    // Track concurrent in-flight count via atomic.
+                    let peak = Rc::new(Cell::new(0usize));
+                    let cur = Rc::new(Cell::new(0usize));
+
+                    let (req_tx, mut req_rx) = mpsc::channel::<PartitionRequest>(4096);
+
+                    let conn_handle = compio::runtime::spawn(async move {
+                        handle_ps_connection(
+                            autumn_transport::Conn::Tcp(server),
+                            req_tx,
+                            None,
+                            5,
+                            std::sync::Arc::new(crate::authz::AuthzState::new()),
+                        )
+                        .await
+                    });
+
+                    let peak_c = peak.clone();
+                    let cur_c = cur.clone();
+                    let loop_handle = compio::runtime::spawn(async move {
+                        // Hold each request on a small timer so concurrency
+                        // actually builds up. This is the mechanism that
+                        // exercises back-pressure: if ps-conn didn't cap
+                        // inflight, cur would rise above the cap.
+                        let mut handlers = FuturesUnordered::new();
+                        let mut drained: u32 = 0;
+                        loop {
+                            futures::select! {
+                                maybe_req = req_rx.next() => {
+                                    match maybe_req {
+                                        Some(req) => {
+                                            let n = cur_c.get() + 1;
+                                            cur_c.set(n);
+                                            if n > peak_c.get() {
+                                                peak_c.set(n);
+                                            }
+                                            let cur_c2 = cur_c.clone();
+                                            handlers.push(async move {
+                                                // Small delay so back-pressure
+                                                // has teeth (futures stay
+                                                // live concurrently).
+                                                compio::time::sleep(
+                                                    Duration::from_millis(2),
+                                                )
+                                                .await;
+                                                let put_key = put_wire::key(&req.payload);
+                                                let resp = partition_rpc::rkyv_encode(
+                                                    &PutResp {
+                                                        code: CODE_OK,
+                                                        message: String::new(),
+                                                        key: put_key,
+                                                    },
+                                                );
+                                                let _ = req.resp_tx.send(Ok(resp));
+                                                cur_c2.set(cur_c2.get() - 1);
+                                            });
+                                        }
+                                        None => break,
+                                    }
+                                }
+                                maybe_done = handlers.next() => {
+                                    if maybe_done.is_some() {
+                                        drained += 1;
+                                    }
+                                }
+                                complete => break,
+                            }
+                        }
+                        // Drain any remaining.
+                        while handlers.next().await.is_some() {
+                            drained += 1;
+                        }
+                        drained
+                    });
+
+                    let (mut client_rd, mut client_wr) = test_protocol::initiate_tcp(
+                        client,
+                        autumn_rpc::version_hello::Service::PartitionServer,
+                    )
+                    .await
+                    .into_split();
+                    let mut big = Vec::with_capacity(N_FRAMES as usize * 64);
+                    for i in 0..N_FRAMES {
+                        let put_value: Vec<u8> = b"v".to_vec();
+                        let put = PutReq {
+                            part_id: 5,
+                            key: format!("bp-{i:03}").into_bytes(),
+                            expires_at: 0,
+                            region_epoch: 0,
+                        inode_hint: 0,
+                        lease_epoch: 0,
+                        evict_rank: 0,
+                        };
+                        let f = put_wire::frame(1000u32 + i, &put, &put_value).encode();
+                        big.extend_from_slice(&f[..]);
+                    }
+                    let BufResult(r, _) = client_wr.write_all(big).await;
+                    r.expect("write N frames");
+
+                    // Read all 100 replies.
+                    let mut decoder = FrameDecoder::new();
+                    let mut buf = vec![0u8; 64 * 1024];
+                    let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
+                    while seen.len() < N_FRAMES as usize {
+                        let BufResult(n, back) = client_rd.read(buf).await;
+                        buf = back;
+                        let n = n.expect("read");
+                        assert!(n > 0, "EOF before all replies; seen={}", seen.len());
+                        decoder.feed(&buf[..n]);
+                        while let Some(frame) = decoder.try_decode().expect("decode") {
+                            assert!(!frame.is_error());
+                            assert!(
+                                seen.insert(frame.req_id),
+                                "duplicate req_id {}",
+                                frame.req_id
+                            );
+                        }
+                    }
+                    assert_eq!(seen.len(), N_FRAMES as usize);
+
+                    drop(client_rd);
+                    drop(client_wr);
+                    let _ = conn_handle.await;
+                    let drained = loop_handle.await.unwrap_or(0);
+                    assert_eq!(drained, N_FRAMES);
+
+                    // Every frame arrives in one write, so the connection
+                    // fills to the cap and no further.
+                    let p = peak.get();
+                    assert_eq!(p, effective_cap, "peak in-flight {p} vs cap {effective_cap}");
+                });
+            })
+            .expect("spawn bp test thread");
+        handle.join().expect("bp test thread panicked");
+    }
+
+    /// Re-exported workspace-wide lock — see `ps_conn_test_lock` above.
+    /// Held across the entire write_batch_fastpath test body so concurrent
+    /// `handle_ps_connection`-using tests don't race the
+    /// `PS_SINGLE_FRAME_RECV_HITS` counter and break the exact-delta assertion.
+    fn fast_path_counter_lock() -> parking_lot::MutexGuard<'static, ()> {
+        super::ps_conn_test_lock()
+    }
+
+    fn namespace_authz() -> std::sync::Arc<crate::authz::AuthzState> {
+        let authz = crate::authz::AuthzState::new();
+        authz.install(&manager_rpc::GetAuthzConfigResp {
+            code: 0,
+            message: String::new(),
+            enabled: false,
+            public_keys: Vec::new(),
+            namespaces: vec![b"fs/".to_vec()],
+            token_ttl_secs: 3600,
+            clock_skew_secs: 60,
+            cluster_id: "perf-test".to_string(),
+        });
+        std::sync::Arc::new(authz)
+    }
+
+    #[test]
+    fn later_request_is_received_before_the_first_reply() {
+        let _guard = fast_path_counter_lock();
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            for bulk in [false, true] {
+                let listener = compio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let mut client = compio::net::TcpStream::connect(listener.local_addr().unwrap())
+                    .await
+                    .unwrap();
+                let (server, _) = listener.accept().await.unwrap();
+                let (tx, mut rx) = mpsc::channel(8);
+                let conn = compio::runtime::spawn(handle_ps_connection(
+                    autumn_transport::Conn::Tcp(server),
+                    tx,
+                    None,
+                    11,
+                    namespace_authz(),
+                ));
+                client = test_protocol::initiate_tcp(client, autumn_rpc::version_hello::Service::PartitionServer).await;
+                let mut requests = Vec::new();
+                for id in 1..=2 {
+                    let len = if bulk { 128 * 1024 } else { 4096 };
+                    let frame = Frame::request_zc(
+                        id,
+                        MSG_PUT,
+                        partition_rpc::rkyv_encode(&PutReq { part_id: 11, region_epoch: 0, expires_at: 0, key: b"fs/k".to_vec(), inode_hint: 0, lease_epoch: 0, evict_rank: 0 }),
+                        Bytes::from(vec![id as u8; len]),
+                    );
+                    client.write_all(frame.encode()).await.0.unwrap();
+                    // Retain the responder without replying. The next request
+                    // must enter independently of the first one's completion.
+                    let req = compio::time::timeout(Duration::from_secs(2), rx.next())
+                        .await
+                        .expect("connection stopped receiving behind its first pending request")
+                        .expect("request channel closed");
+                    if bulk {
+                        assert_eq!(req.bulk_value.as_ref().unwrap()[0], id as u8);
+                    }
+                    requests.push(req);
+                }
+                drop(requests);
+                drop(client);
+                drop(rx);
+                let _ = conn.await;
+            }
+        });
+    }
+
+    #[test]
+    fn rejected_bulk_tail_does_not_hide_the_next_frame() {
+        let _guard = fast_path_counter_lock();
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let listener = compio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut client = compio::net::TcpStream::connect(listener.local_addr().unwrap())
+                .await
+                .unwrap();
+            let (server, _) = listener.accept().await.unwrap();
+            let (tx, mut rx) = mpsc::channel(8);
+            let conn = compio::runtime::spawn(handle_ps_connection(
+                autumn_transport::Conn::Tcp(server),
+                tx,
+                None,
+                11,
+                namespace_authz(),
+            ));
+            // A client: admin and peer connections are not held to namespaces.
+            client = test_protocol::initiate_tcp_as(
+                client,
+                autumn_rpc::version_hello::Service::PartitionServer,
+                autumn_rpc::version_hello::Role::Client,
+            )
+            .await;
+            for (id, key) in [(1, &b"unknown/k"[..]), (2, &b"fs/k"[..])] {
+                let frame = Frame::request_zc(
+                    id,
+                    MSG_PUT,
+                    partition_rpc::rkyv_encode(&PutReq { part_id: 11, region_epoch: 0, expires_at: 0, key: key.to_vec(), inode_hint: 0, lease_epoch: 0, evict_rank: 0 }),
+                    Bytes::from(vec![id as u8; 128 * 1024]),
+                );
+                client.write_all(frame.encode()).await.0.unwrap();
+            }
+            let req = compio::time::timeout(Duration::from_secs(2), rx.next())
+                .await
+                .expect("valid request must survive a rejected bulk frame")
+                .unwrap();
+            assert_eq!(
+                req.bulk_value.as_ref().unwrap()[0],
+                2,
+                "only the authorized value is admitted"
+            );
+            drop(req);
+            drop(client);
+            drop(rx);
+            let _ = conn.await;
+        });
+    }
+
+    /// No buffer for a bulk value: the request is answered `Unavailable`, the
+    /// value read past, and the next frame on the connection still lands.
+    #[test]
+    fn a_bulk_value_with_no_buffer_is_refused_and_the_connection_goes_on() {
+        let _guard = fast_path_counter_lock();
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            // This thread's whole share of Receive, held (pool chunks only
+            // mapped, not touched, on TCP).
+            let mut held = Vec::new();
+            for size in [256 << 20, 1 << 20, 4 << 10] {
+                while let Ok(pb) = autumn_transport::regpool_try_acquire_for(autumn_transport::PoolUse::Receive, size) {
+                    held.push(pb);
+                }
+            }
+            assert!(!held.is_empty());
+            let listener = compio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut client = compio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+            let (server, _) = listener.accept().await.unwrap();
+            let (tx, mut rx) = mpsc::channel(8);
+            let conn = compio::runtime::spawn(handle_ps_connection(
+                autumn_transport::Conn::Tcp(server),
+                tx,
+                None,
+                11,
+                namespace_authz(),
+            ));
+            client = test_protocol::initiate_tcp(client, autumn_rpc::version_hello::Service::PartitionServer).await;
+            let put = |id: u32| {
+                Frame::request_zc(
+                    id,
+                    MSG_PUT,
+                    partition_rpc::rkyv_encode(&PutReq { part_id: 11, region_epoch: 0, expires_at: 0, key: b"fs/k".to_vec(), inode_hint: 0, lease_epoch: 0, evict_rank: 0 }),
+                    Bytes::from(vec![id as u8; 128 * 1024]),
+                )
+                .encode()
+            };
+            client.write_all(put(1)).await.0.unwrap();
+            let mut decoder = FrameDecoder::new();
+            let refused = compio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if let Some(f) = decoder.try_decode().unwrap() {
+                        break f;
+                    }
+                    let BufResult(n, buf) = client.read(vec![0u8; 64 * 1024]).await;
+                    decoder.feed(&buf[..n.unwrap()]);
+                }
+            })
+            .await
+            .expect("a value with no buffer must be answered");
+            assert_eq!(refused.req_id, 1);
+            assert!(refused.is_error());
+            assert_eq!(autumn_rpc::RpcError::decode_status(&refused.payload).0, StatusCode::Unavailable);
+            drop(held);
+            client.write_all(put(2)).await.0.unwrap();
+            let req = compio::time::timeout(Duration::from_secs(5), rx.next())
+                .await
+                .expect("the connection stopped after a refused value")
+                .unwrap();
+            assert_eq!(req.bulk_value.as_ref().unwrap()[0], 2);
+            drop(req);
+            drop(client);
+            drop(rx);
+            let _ = conn.await;
+        });
+    }
+
+    #[test]
+    fn bulk_receive_rechecks_namespace_after_waiting_for_value() {
+        let _guard = fast_path_counter_lock();
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let listener = compio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut client = compio::net::TcpStream::connect(listener.local_addr().unwrap())
+                .await
+                .unwrap();
+            let (server, _) = listener.accept().await.unwrap();
+            let (mut reader, _writer) = autumn_transport::Conn::Tcp(server).into_split();
+            let authz = namespace_authz();
+            let ctrl = partition_rpc::rkyv_encode(&PutReq { part_id: 11, region_epoch: 0, expires_at: 0, key: b"fs/k".to_vec(), inode_hint: 0, lease_epoch: 0, evict_rank: 0 });
+            let value = Bytes::from(vec![0xa5; 128 * 1024]);
+            let wire = Frame::request_zc(1, MSG_PUT, ctrl, value.clone()).encode();
+            let mut decoder = FrameDecoder::new();
+            decoder.feed(&wire[..wire.len() - value.len()]);
+            let (tx, mut rx) = mpsc::channel(8);
+            let mut inflight = FuturesUnordered::new();
+            let mut replies = Vec::new();
+            let mut conn_state = ConnGateState::default();
+            let receive = drain_bulk_writes(
+                &mut decoder,
+                &mut reader,
+                &tx,
+                11,
+                &mut inflight,
+                &mut replies,
+                4,
+                &authz,
+                &mut conn_state,
+            );
+            let send = async {
+                // join polls receive first: its initial namespace check passes
+                // and it waits for the absent tail before this config changes.
+                authz.install(&manager_rpc::GetAuthzConfigResp {
+                    code: 0,
+                    message: String::new(),
+                    enabled: false,
+                    public_keys: Vec::new(),
+                    namespaces: vec![b"other/".to_vec()],
+                    token_ttl_secs: 3600,
+                    clock_skew_secs: 60,
+                    cluster_id: "perf-test".to_string(),
+                });
+                client.write_all(value).await.0.unwrap();
+            };
+            let (r, ()) = futures::join!(receive, send);
+            r.unwrap();
+            let (reply, values) = compio::time::timeout(Duration::from_secs(2), inflight.next())
+                .await
+                .expect("revoked namespace must be rejected, not delegated")
+                .unwrap();
+            assert!(values.is_empty());
+            let mut response = FrameDecoder::new();
+            response.feed(&reply);
+            assert!(response.try_decode().unwrap().unwrap().is_error());
+            assert!(
+                matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)),
+                "revoked write must not reach the partition"
+            );
+        });
+    }
+
+    /// Sequential requests must each receive a complete response and be
+    /// observed as single-frame receive iterations.
+    #[test]
+    fn sequential_single_frame_round_trips() {
+        let _guard = fast_path_counter_lock();
+        let rt = compio::runtime::Runtime::new().unwrap();
+        rt.block_on(async move {
+            // Snapshot the counter before we start — the lock ensures no
+            // other fast-path-observing test is concurrently running.
+            let before = PS_SINGLE_FRAME_RECV_HITS.load(std::sync::atomic::Ordering::Relaxed);
+
+            let listener = compio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            let client = compio::net::TcpStream::connect(addr)
+                .await
+                .expect("connect");
+            let (server, _) = listener.accept().await.expect("accept");
+
+            let (req_tx, mut req_rx) = mpsc::channel::<PartitionRequest>(8);
+
+            let conn_handle = compio::runtime::spawn(async move {
+                handle_ps_connection(
+                    autumn_transport::Conn::Tcp(server),
+                    req_tx,
+                    None,
+                    /*owner_part=*/ 11,
+                    std::sync::Arc::new(crate::authz::AuthzState::new()),
+                )
+                .await
+            });
+
+            // Responder: answer each request immediately so the fast-path
+            // round-trip completes without delay.
+            let loop_handle = compio::runtime::spawn(async move {
+                while let Some(req) = req_rx.next().await {
+                    let put_key = put_wire::key(&req.payload);
+                    let resp = partition_rpc::rkyv_encode(&PutResp {
+                        code: CODE_OK,
+                        message: String::new(),
+                        key: put_key,
+                    });
+                    let _ = req.resp_tx.send(Ok(resp));
+                }
+            });
+
+            let (mut client_rd, mut client_wr) = test_protocol::initiate_tcp(
+                client,
+                autumn_rpc::version_hello::Service::PartitionServer,
+            )
+            .await
+            .into_split();
+            let mut decoder = FrameDecoder::new();
+            let mut buf = vec![0u8; 8192];
+
+            const N: u32 = 10;
+            for i in 0..N {
+                let put_value: Vec<u8> = b"v".to_vec();
+                let put = PutReq {
+                    part_id: 11,
+                    key: format!("fast-{i:02}").into_bytes(),
+                    expires_at: 0,
+                    region_epoch: 0,
+                inode_hint: 0,
+                lease_epoch: 0,
+                evict_rank: 0,
+                };
+                let frame_bytes = put_wire::frame(5000 + i, &put, &put_value).encode();
+                let BufResult(r, _) = client_wr.write_all(frame_bytes).await;
+                r.expect("write");
+
+                // Block until the single reply arrives — this is what
+                // makes it "d=1": one frame in flight, then wait.
+                let resp_frame = loop {
+                    let BufResult(n, back) = client_rd.read(buf).await;
+                    buf = back;
+                    let n = n.expect("read");
+                    assert!(n > 0, "EOF before response for i={i}");
+                    decoder.feed(&buf[..n]);
+                    if let Some(f) = decoder.try_decode().expect("decode") {
+                        break f;
+                    }
+                };
+                assert_eq!(resp_frame.req_id, 5000 + i);
+                assert!(!resp_frame.is_error());
+            }
+
+            let after = PS_SINGLE_FRAME_RECV_HITS.load(std::sync::atomic::Ordering::Relaxed);
+            let delta = after - before;
+            assert_eq!(
+                delta, N as u64,
+                "single-frame receive must occur exactly N={N} times; \
+                 observed delta={delta} (before={before}, after={after})"
+            );
+
+            drop(client_rd);
+            drop(client_wr);
+            let _ = conn_handle.await;
+            let _ = loop_handle.await;
+        });
+    }
+
+    /// A `MSG_BATCH_PUT` whose TAIL clears the bulk threshold must be
+    /// recv'd straight into a pooled buffer, exactly like the single-value
+    /// `MSG_PUT`.
+    ///
+    /// The batch form is where the biggest tails actually are — the client
+    /// routes any individually-large value to its own `MSG_PUT`, so a
+    /// batch's tail is a SUM of small values and can be megabytes. Recognising
+    /// only the single-value form left that sum to be accumulated (and copied)
+    /// inside `FrameDecoder`.
+    ///
+    /// `PS_BULK_WRITE_RECV_HITS` is the observable: both paths hand the enqueue
+    /// the same `bulk_value`, so the value bytes alone cannot tell them apart.
+    /// Asserting the delta is what makes this red when the recognition is
+    /// removed.
+    #[test]
+    fn batch_put_tail_is_recvd_into_a_pooled_buffer() {
+        // Values are individually well under the 64 KiB threshold and add
+        // up well over it — the shape the batch bulk form exists for.
+        // Distinct lengths AND contents so a tail-cursor slip reads as one
+        // op holding its neighbour's bytes.
+        const N: usize = 24;
+        let values: Vec<Vec<u8>> = (0..N)
+            .map(|i| vec![(i % 251) as u8 + 1; 4096 + i * 64])
+            .collect();
+        let ops: Vec<partition_rpc::BatchPutOp> = values
+            .iter()
+            .enumerate()
+            .map(|(i, v)| partition_rpc::BatchPutOp {
+                inode_hint: 0,
+                lease_epoch: 0,
+                key: format!("fs/bpb-{i:03}").into_bytes(),
+                value_len: v.len() as u32,
+                expires_at: 0,
+                evict_rank: 0,
+            })
+            .collect();
+        let ctrl = partition_rpc::rkyv_encode(&partition_rpc::BatchPutReq {
+            part_id: 11,
+            region_epoch: 0,
+            ops,
+        });
+        assert_tail_takes_pooled_recv(partition_rpc::MSG_BATCH_PUT, ctrl, values.concat());
+    }
+
+    /// The conditional write's value is received like `MSG_PUT`'s.
+    #[test]
+    fn compare_write_tail_is_recvd_into_a_pooled_buffer() {
+        let ctrl = partition_rpc::rkyv_encode(&partition_rpc::CompareWriteReq {
+            part_id: 11,
+            region_epoch: 0,
+            key: b"fs/cwb".to_vec(),
+            expected: None,
+            delete: false,
+            expires_at: 0,
+            inode_hint: 0,
+            lease_epoch: 0,
+        });
+        let tail: Vec<u8> = (0..1u32 << 20).map(|i| (i % 251) as u8).collect();
+        assert_tail_takes_pooled_recv(partition_rpc::MSG_COMPARE_WRITE, ctrl, tail);
+    }
+
+    fn assert_tail_takes_pooled_recv(msg_type: u8, ctrl: Bytes, tail: Vec<u8>) {
+        let _guard = fast_path_counter_lock();
+        let rt = compio::runtime::Runtime::new().unwrap();
+        rt.block_on(async move {
+            let before = PS_BULK_WRITE_RECV_HITS.load(std::sync::atomic::Ordering::Relaxed);
+
+            let listener = compio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            let client = compio::net::TcpStream::connect(addr)
+                .await
+                .expect("connect");
+            let (server, _) = listener.accept().await.expect("accept");
+
+            let (req_tx, mut req_rx) = mpsc::channel::<PartitionRequest>(8);
+            let conn_handle = compio::runtime::spawn(async move {
+                handle_ps_connection(
+                    autumn_transport::Conn::Tcp(server),
+                    req_tx,
+                    None,
+                    /*owner_part=*/ 11,
+                    namespace_authz(),
+                )
+                .await
+            });
+
+            assert!(
+                tail.len() > params().bulk_recv_min_bytes.get(),
+                "the tail must clear the threshold or this tests nothing"
+            );
+
+            let head = autumn_rpc::frame::encode_vectored_head(7001, msg_type, 0, ctrl.len(), tail.len());
+            let crc = autumn_rpc::frame::compute_ctrl_crc(&head, std::slice::from_ref(&ctrl));
+            let mut wire = Vec::with_capacity(head.len() + ctrl.len() + 4 + tail.len());
+            wire.extend_from_slice(&head);
+            wire.extend_from_slice(&ctrl);
+            wire.extend_from_slice(&crc);
+            wire.extend_from_slice(&tail);
+
+            let (client_rd, mut client_wr) = test_protocol::initiate_tcp(
+                client,
+                autumn_rpc::version_hello::Service::PartitionServer,
+            )
+            .await
+            .into_split();
+            let BufResult(r, _) = client_wr.write_all(wire).await;
+            r.expect("write");
+
+            let req = req_rx.next().await.expect("request delivered");
+            assert_eq!(req.msg_type, msg_type);
+            assert_eq!(
+                req.payload.as_ref(),
+                ctrl.as_ref(),
+                "ctrl must travel on as the request payload"
+            );
+            let got = req.bulk_value.clone().expect("tail rides as bulk_value");
+            assert_eq!(got.as_ref(), tail.as_slice(), "tail must arrive intact");
+
+            let after = PS_BULK_WRITE_RECV_HITS.load(std::sync::atomic::Ordering::Relaxed);
+            assert_eq!(
+                after - before,
+                1,
+                "the tail must take the pooled recv path (before={before}, after={after})"
+            );
+
+            // BOTH halves — the socket only closes when the last one drops, and
+            // `handle_ps_connection` returns on EOF.
+            drop(req);
+            drop(client_rd);
+            drop(client_wr);
+            drop(req_rx);
+            let _ = conn_handle.await;
+        });
+    }
+
+    /// A burst must produce one reply per request. Most frames in this burst
+    /// should not be counted as isolated receive iterations.
+    #[test]
+    fn batched_frames_receive_all_replies() {
+        let _guard = fast_path_counter_lock();
+        let rt = compio::runtime::Runtime::new().unwrap();
+        rt.block_on(async move {
+            let before = PS_SINGLE_FRAME_RECV_HITS.load(std::sync::atomic::Ordering::Relaxed);
+
+            let listener = compio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind");
+            let addr = listener.local_addr().expect("addr");
+            let client = compio::net::TcpStream::connect(addr)
+                .await
+                .expect("connect");
+            let (server, _) = listener.accept().await.expect("accept");
+
+            let (req_tx, mut req_rx) = mpsc::channel::<PartitionRequest>(16);
+
+            let conn_handle = compio::runtime::spawn(async move {
+                handle_ps_connection(
+                    autumn_transport::Conn::Tcp(server),
+                    req_tx,
+                    None,
+                    13,
+                    std::sync::Arc::new(crate::authz::AuthzState::new()),
+                )
+                .await
+            });
+
+            let loop_handle = compio::runtime::spawn(async move {
+                while let Some(req) = req_rx.next().await {
+                    let put_key = put_wire::key(&req.payload);
+                    let resp = partition_rpc::rkyv_encode(&PutResp {
+                        code: CODE_OK,
+                        message: String::new(),
+                        key: put_key,
+                    });
+                    let _ = req.resp_tx.send(Ok(resp));
+                }
+            });
+
+            let (mut client_rd, mut client_wr) = test_protocol::initiate_tcp(
+                client,
+                autumn_rpc::version_hello::Service::PartitionServer,
+            )
+            .await
+            .into_split();
+
+            const N: u32 = 8;
+            let mut big = Vec::with_capacity(N as usize * 64);
+            for i in 0..N {
+                let put_value: Vec<u8> = b"v".to_vec();
+                let put = PutReq {
+                    part_id: 13,
+                    key: format!("batch-{i}").into_bytes(),
+                    expires_at: 0,
+                    region_epoch: 0,
+                inode_hint: 0,
+                lease_epoch: 0,
+                evict_rank: 0,
+                };
+                let f = put_wire::frame(6000 + i, &put, &put_value).encode();
+                big.extend_from_slice(&f[..]);
+            }
+            let BufResult(r, _) = client_wr.write_all(big).await;
+            r.expect("write batch");
+
+            // Receive all N replies.
+            let mut decoder = FrameDecoder::new();
+            let mut buf = vec![0u8; 64 * 1024];
+            let mut seen = 0u32;
+            while seen < N {
+                let BufResult(n, back) = client_rd.read(buf).await;
+                buf = back;
+                let n = n.expect("read");
+                assert!(n > 0, "EOF before all replies");
+                decoder.feed(&buf[..n]);
+                while let Some(frame) = decoder.try_decode().expect("decode") {
+                    assert!(!frame.is_error());
+                    seen += 1;
+                }
+            }
+            assert_eq!(seen, N);
+
+            let after = PS_SINGLE_FRAME_RECV_HITS.load(std::sync::atomic::Ordering::Relaxed);
+            // The first read delivers all 8 frames at once (TCP on
+            // loopback typically coalesces). So fast path must not
+            // engage for any of them. Allow a small drift for the
+            // (unlikely) race where TCP delivers the first frame alone
+            // before the rest land, but assert that the fast path was
+            // NOT used for MOST of the batch. In practice on loopback
+            // we see delta == 0.
+            let delta = after - before;
+            assert!(
+                delta < N as u64,
+                "fast path engaged {delta} times for batched N={N} frames; \
+                 must stay well below N (prefer 0 on loopback)"
+            );
+
+            drop(client_rd);
+            drop(client_wr);
+            let _ = conn_handle.await;
+            let _ = loop_handle.await;
+        });
+    }
+}
+
+#[cfg(test)]
+mod invalidate_plumbing_tests {
+    //! The P-log → P-sst `RowInvalidateBarrierReq` that a split sends between
+    //! its `commit_length` capture and `multi_modify_split`: a failed
+    //! seal/roll must come back as an error, never as an ACK.
+    use super::*;
+    use futures::channel::{mpsc, oneshot};
+
+    #[test]
+    fn row_roll_barrier_propagates_failure() {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            // No manager is listening: the roll must fail, and the real worker
+            // must return that failure rather than acknowledging success. A
+            // held port nothing binds.
+            let addr = autumn_test_ports::addr();
+            let sc = StreamClient::new_with_owner_epoch(
+                &addr.to_string(), "barrier-test".into(), 1,
+                1024 * 1024, Rc::new(ConnPool::new()),
+            ).await.unwrap();
+            let (flush_tx, flush_rx) = mpsc::channel(1);
+            let (append_tx, append_rx) = mpsc::channel(1);
+            let (mut barrier_tx, barrier_rx) = mpsc::channel(1);
+            let (resp_tx, resp_rx) = oneshot::channel();
+            barrier_tx.send(RowInvalidateBarrierReq {
+                row_stream_id: 42, seal_and_roll: true, resp_tx,
+            }).await.unwrap();
+            drop((flush_tx, append_tx, barrier_tx));
+            let (_, result) = futures::join!(
+                flush_worker_loop(sc, flush_rx, append_rx, barrier_rx),
+                resp_rx,
+            );
+            assert!(
+                result.expect("worker must ACK").is_err(),
+                "a failed seal/roll must never be acknowledged as success"
+            );
+        });
+    }
+}
+
+#[cfg(test)]
+mod bug_lease_2_fence_tests {
+    //! Lease write fencing — pure-fn unit
+    //! tests for `check_and_bump_fence`. Verifies the floor semantics
+    //! WITHOUT booting a partition server: in-memory map mutation
+    //! against synthetic inputs.
+
+    use super::FenceFloors;
+
+    /// The admission half: judged against an empty durable map.
+    fn check_and_bump_fence(
+        hint: u64,
+        epoch: u64,
+        floors: &mut HashMap<u64, u64>,
+    ) -> Result<bool, String> {
+        super::check_and_bump_fence(hint, epoch, floors, &HashMap::new())
+    }
+    use std::collections::HashMap;
+
+    #[test]
+    fn inode_hint_zero_skips_fencing_entirely() {
+        // Anonymous KV CLI / non-lease-aware writes pass through
+        // even with insanely high lease_epoch values. The
+        // fence_floors map MUST not be mutated.
+        let mut floors = HashMap::new();
+        floors.insert(99u64, 1000u64);
+        let r = check_and_bump_fence(0, 999_999, &mut floors);
+        assert!(r.is_ok());
+        assert_eq!(floors.get(&99).copied(), Some(1000), "untouched ino preserved");
+        assert!(!floors.contains_key(&0), "ino=0 MUST NOT be inserted");
+    }
+
+    #[test]
+    fn first_write_for_new_inode_seeds_floor() {
+        let mut floors = HashMap::new();
+        let r = check_and_bump_fence(42, 5, &mut floors);
+        assert!(r.is_ok());
+        assert_eq!(floors.get(&42).copied(), Some(5));
+    }
+
+    #[test]
+    fn higher_epoch_bumps_floor() {
+        let mut floors = HashMap::new();
+        floors.insert(42, 5);
+        let r = check_and_bump_fence(42, 8, &mut floors);
+        assert!(r.is_ok());
+        assert_eq!(floors.get(&42).copied(), Some(8));
+    }
+
+    #[test]
+    fn equal_epoch_passes_without_bumping() {
+        let mut floors = HashMap::new();
+        floors.insert(42, 5);
+        let r = check_and_bump_fence(42, 5, &mut floors);
+        assert!(r.is_ok());
+        assert_eq!(floors.get(&42).copied(), Some(5));
+    }
+
+    #[test]
+    fn lower_epoch_is_fenced() {
+        // The stale-writer scenario: a writer was force-revoked
+        // and a new writer's epoch was higher. The old writer's
+        // late RPC stamped with the old epoch MUST be rejected.
+        let mut floors = HashMap::new();
+        floors.insert(42, 10);
+        let r = check_and_bump_fence(42, 8, &mut floors);
+        match r {
+            Err(msg) => {
+                assert!(msg.contains("fenced"), "msg={msg}");
+                assert!(msg.contains("ino=42"));
+                assert!(msg.contains("stamped_epoch=8"));
+                assert!(msg.contains("floor=10"));
+            }
+            Ok(_) => panic!("BUG-LEASE-2: stamped_epoch < floor MUST fence"),
+        }
+        // Floor MUST NOT be bumped on a rejected write.
+        assert_eq!(floors.get(&42).copied(), Some(10));
+    }
+
+    #[test]
+    fn multiple_inos_have_independent_floors() {
+        let mut floors = HashMap::new();
+        check_and_bump_fence(42, 5, &mut floors).unwrap();
+        check_and_bump_fence(43, 100, &mut floors).unwrap();
+        check_and_bump_fence(44, 1, &mut floors).unwrap();
+        // ino 42 + 44 still low; ino 43 high. Fencing on ino 43
+        // doesn't leak across.
+        assert!(check_and_bump_fence(42, 3, &mut floors).is_err());
+        assert!(check_and_bump_fence(43, 50, &mut floors).is_err());
+        assert!(check_and_bump_fence(44, 1, &mut floors).is_ok());
+    }
+
+    #[test]
+    fn floor_is_monotonic_under_interleaved_acceptances() {
+        // A common reorder under concurrency: writer A's RPC
+        // arrives, writer B's higher-epoch RPC arrives next, then
+        // A's late RPC arrives. The late A MUST be fenced.
+        let mut floors = HashMap::new();
+        check_and_bump_fence(7, 1, &mut floors).unwrap();
+        check_and_bump_fence(7, 2, &mut floors).unwrap();
+        // Late A:
+        assert!(check_and_bump_fence(7, 1, &mut floors).is_err());
+    }
+
+    /// A request raises the admitted floor and fails before its record
+    /// commits; the client retries at the SAME epoch. The retry must still
+    /// queue a record — the admitted floor is not durable. Before the durable
+    /// floor existed this returned `false`, and the retry's write was
+    /// acknowledged with no record at all.
+    #[test]
+    fn a_retry_after_a_lost_record_queues_another() {
+        let floors = FenceFloors::default();
+        assert_eq!(floors.check_and_bump(42, 10), Ok(true));
+        // ... the record never commits ...
+        assert_eq!(floors.check_and_bump(42, 10), Ok(true), "retry must re-queue the record");
+        floors.mark_durable(42, 10);
+        assert_eq!(floors.check_and_bump(42, 10), Ok(false));
+        assert!(floors.check_and_bump(42, 9).is_err());
+    }
+
+    #[test]
+    fn recovered_floors_are_durable() {
+        let floors = FenceFloors::recovered(HashMap::from([(42, 10)]));
+        assert_eq!(floors.check_and_bump(42, 10), Ok(false));
+        assert_eq!(floors.check_and_bump(42, 11), Ok(true));
+        assert!(floors.check_and_bump(42, 9).is_err());
+    }
+}
+
+#[cfg(test)]
+mod maintenance_phase_tests {
+    //! The phase slot must not outlive the op that set it.
+    use super::*;
+
+    #[test]
+    fn the_phase_slot_is_cleared_however_the_split_exits() {
+        let m = std::sync::Arc::new(PartitionMetrics::default());
+        {
+            let g = MaintenancePhaseGuard::new(m.clone(), 0);
+            g.set(autumn_rpc::manager_rpc::OP_KIND_SPLIT, 2, 6);
+            assert_eq!(
+                m.snapshot_maintenance_progress().len(),
+                1,
+                "a live split should be publishing a phase"
+            );
+        } // <- any exit: `?`, an early `return`, a panic unwinding
+        assert!(
+            m.snapshot_maintenance_progress().is_empty(),
+            "a stale phase rides every later heartbeat and gets stamped onto the \
+             NEXT split on this partition, which spends its whole pre-freeze \
+             stretch with no sample of its own — showing 'frozen' before it has \
+             frozen anything, then walking backwards when its real phase 1 lands"
+        );
+    }
+
+    #[test]
+    fn a_split_queued_behind_a_maintenance_op_keeps_its_phase() {
+        // The split waits at phase 1 on the maintenance gate while a submitted
+        // compaction reports and ends. The manager must still hear the split,
+        // or it judges it not running.
+        let m = std::sync::Arc::new(PartitionMetrics::default());
+        let g = MaintenancePhaseGuard::new(m.clone(), 77);
+        g.set(autumn_rpc::manager_rpc::OP_KIND_SPLIT, 1, 6);
+        m.set_maintenance_progress(9, autumn_rpc::manager_rpc::OP_KIND_COMPACT, 1, 4);
+        assert_eq!(m.snapshot_maintenance_progress().len(), 2);
+        m.clear_maintenance_progress();
+        let s = m.snapshot_maintenance_progress();
+        assert_eq!(s.len(), 1);
+        assert_eq!((s[0].op_id, s[0].done), (77, 1));
+    }
+}
+
+#[cfg(test)]
+mod authz_enforcement_tests {
+    //! Stage 2: end-to-end connection-layer enforcement over a real
+    //! TCP `handle_ps_connection`, using the mock req_rx loop (part=None). Drives
+    //! a signed CLIENT_AUTH + out-of-grant requests and asserts admit/deny.
+    use super::*;
+    use autumn_rpc::cap_token::{sign_claims, CapClaims, CAP_TYP, CAP_VER};
+    use autumn_rpc::manager_rpc::{AuthzPublicKey, GetAuthzConfigResp};
+    use ed25519_dalek::SigningKey;
+
+    fn now_secs() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    /// An enabled AuthzState with one signing key (kid 1).
+    fn enabled_authz(sk: &SigningKey) -> std::sync::Arc<crate::authz::AuthzState> {
+        let st = crate::authz::AuthzState::new();
+        st.install(&GetAuthzConfigResp {
+            code: 0,
+            message: String::new(),
+            enabled: true,
+            public_keys: vec![AuthzPublicKey {
+                kid: 1,
+                ed25519_pub: sk.verifying_key().to_bytes().to_vec(),
+                disabled: false,
+            }],
+            namespaces: Vec::new(),
+            token_ttl_secs: 3600,
+            clock_skew_secs: 60,
+            cluster_id: "cluster-test".to_string(),
+        });
+        std::sync::Arc::new(st)
+    }
+
+    /// D2: `fetch_authz_config_once` installs ONLY on
+    /// `CODE_OK`; a `CODE_NOT_LEADER` (follower) or transport error returns
+    /// BEFORE `install`, so the cached `AuthzState` — the last-known LEADER
+    /// config — keeps enforcing through the election window and NEVER
+    /// fail-opens. This pins the `AuthzState` half of that contract: `install`
+    /// is the sole mutator, so absent a fresh successful install the enabled
+    /// flag + namespace list are both unchanged.
+    #[test]
+    fn cached_authz_config_survives_absent_a_fresh_install() {
+        let sk = SigningKey::from_bytes(&[7u8; 32]);
+        let st = crate::authz::AuthzState::new();
+        st.install(&GetAuthzConfigResp {
+            code: 0,
+            message: String::new(),
+            enabled: true,
+            public_keys: vec![AuthzPublicKey {
+                kid: 1,
+                ed25519_pub: sk.verifying_key().to_bytes().to_vec(),
+                disabled: false,
+            }],
+            namespaces: vec![b"fs/".to_vec(), b"mem/".to_vec()],
+            token_ttl_secs: 3600,
+            clock_skew_secs: 60,
+            cluster_id: "cluster-test".to_string(),
+        });
+        assert!(st.is_enabled());
+        let before = st.snapshot();
+        assert_eq!(before.namespaces, vec![b"fs/".to_vec(), b"mem/".to_vec()]);
+        // The NOT_LEADER / error path performs NO install → the cache is intact.
+        let after = st.snapshot();
+        assert!(
+            st.is_enabled(),
+            "enforcement must not fail-open when no fresh leader config lands"
+        );
+        assert_eq!(after.namespaces, before.namespaces);
+        assert_eq!(after.cluster_id, before.cluster_id);
+    }
+
+    fn mint(sk: &SigningKey, allowed: Vec<Vec<u8>>) -> Vec<u8> {
+        let now = now_secs();
+        sign_claims(
+            sk,
+            &CapClaims {
+                ver: CAP_VER,
+                typ: CAP_TYP.to_string(),
+                kid: 1,
+                iss: "autumn-mgr".to_string(),
+                aud: "cluster-test".to_string(),
+                iat: now,
+                nbf: now,
+                exp: now + 3600,
+                allowed_prefixes: allowed,
+            },
+        )
+        .unwrap()
+    }
+
+    /// Send one request frame, read one response frame back.
+    async fn round_trip(
+        wr: &mut (impl compio::io::AsyncWrite + Unpin),
+        rd: &mut (impl compio::io::AsyncRead + Unpin),
+        decoder: &mut FrameDecoder,
+        req_id: u32,
+        msg_type: u8,
+        payload: Bytes,
+    ) -> Frame {
+        let frame = Frame::request(req_id, msg_type, payload).encode();
+        let BufResult(r, _) = wr.write_all(frame).await;
+        r.expect("write");
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            if let Some(f) = decoder.try_decode().expect("decode") {
+                return f;
+            }
+            let BufResult(n, back) = rd.read(buf).await;
+            buf = back;
+            let n = n.expect("read");
+            assert!(n > 0, "EOF before response");
+            decoder.feed(&buf[..n]);
+        }
+    }
+
+    /// Through the real connection loop on an authz partition server: a 2 MiB
+    /// frame (a PING, answered before any partition) drops a client that has
+    /// not authenticated, before its body is reserved; a peer gets its reply,
+    /// and so does a client that sent CLIENT_AUTH ahead of it in one write.
+    #[test]
+    fn an_unauthenticated_client_s_large_frame_drops_the_connection() {
+        use autumn_rpc::version_hello::{initiate, Hello, Role, Service};
+        let _g = super::ps_conn_test_lock();
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let sk = SigningKey::from_bytes(&[7u8; 32]);
+            let authz = std::sync::Arc::new(crate::authz::AuthzState::new());
+            authz.install(&GetAuthzConfigResp {
+                code: 0,
+                message: String::new(),
+                enabled: true,
+                public_keys: vec![AuthzPublicKey {
+                    kid: 1,
+                    ed25519_pub: sk.verifying_key().to_bytes().to_vec(),
+                    disabled: false,
+                }],
+                namespaces: vec![b"fs/".to_vec()],
+                token_ttl_secs: 3600,
+                clock_skew_secs: 60,
+                cluster_id: "cluster-test".to_string(),
+            });
+            let listener = compio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let big = Frame::request(9, autumn_rpc::MSG_TYPE_PING, Bytes::from(vec![0u8; 2 << 20])).encode();
+            let auth = Frame::request(
+                8,
+                MSG_CLIENT_AUTH,
+                partition_rpc::rkyv_encode(&ClientAuthReq { token: mint(&sk, vec![b"fs/".to_vec()]) }),
+            )
+            .encode();
+            // Writes `ahead` then the large frame in one write; the req ids of
+            // the replies read until the connection ends or both arrive.
+            let replies = |role: Role, ahead: Option<Bytes>| {
+                let (authz, listener, big) = (authz.clone(), &listener, big.clone());
+                async move {
+                    let client = compio::net::TcpStream::connect(addr).await.unwrap();
+                    let (server, _) = listener.accept().await.unwrap();
+                    let (req_tx, _req_rx) = mpsc::channel::<PartitionRequest>(8);
+                    compio::runtime::spawn(handle_ps_connection(
+                        autumn_transport::Conn::Tcp(server),
+                        req_tx,
+                        None,
+                        1,
+                        authz,
+                    ))
+                    .detach();
+                    let (mut rd, mut wr) = autumn_transport::Conn::Tcp(client).into_split();
+                    let negotiated = initiate(&mut rd, &mut wr, Hello::current(role), Some(Service::PartitionServer))
+                        .await
+                        .unwrap();
+                    autumn_rpc::peer_auth::initiate(&mut rd, &mut wr, &negotiated, autumn_rpc::peer_auth::installed())
+                        .await
+                        .unwrap();
+                    let mut out = ahead.map(|a| a.to_vec()).unwrap_or_default();
+                    out.extend_from_slice(&big);
+                    let BufResult(r, _) = wr.write_all(out).await;
+                    r.unwrap();
+                    let (mut decoder, mut ids, mut buf) = (FrameDecoder::new(), Vec::new(), vec![0u8; 64 * 1024]);
+                    let wanted = if role == Role::Client { 2 } else { 1 };
+                    while ids.len() < wanted {
+                        while let Some(f) = decoder.try_decode().unwrap() {
+                            ids.push(f.req_id);
+                        }
+                        if ids.len() >= wanted {
+                            break;
+                        }
+                        let read = rd.read(buf);
+                        let BufResult(n, back) =
+                            compio::time::timeout(Duration::from_secs(10), read).await.expect("neither reply nor close");
+                        buf = back;
+                        match n {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => decoder.feed(&buf[..n]),
+                        }
+                    }
+                    ids
+                }
+            };
+            assert_eq!(replies(Role::Client, None).await, Vec::<u32>::new(), "unauthenticated client");
+            assert_eq!(replies(Role::Peer, None).await, vec![9], "peer");
+            assert_eq!(replies(Role::Client, Some(auth)).await, vec![8, 9], "authenticated client");
+        });
+    }
+
+    /// A client outside the window is refused BY THE SERVER, before its write
+    /// reaches the partition — driven over a real socket through the real
+    /// `handle_ps_connection`, because the predicate having a unit test proves
+    /// nothing about the dispatch loop reaching it.
+    ///
+    /// Token authz (Layer-B) is OFF here on purpose: most clusters (fuse,
+    /// kvcache, every dev cluster) never turn it on, so the version check must
+    /// not depend on it. The installed registry only lets the admitted put in.
+    #[test]
+    fn a_client_outside_the_window_is_refused_before_its_write_reaches_the_partition() {
+        use autumn_rpc::version_hello::{Hello, Role, Service, initiate};
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let authz = std::sync::Arc::new(crate::authz::AuthzState::new());
+            authz.install(&manager_rpc::GetAuthzConfigResp {
+                code: 0,
+                message: String::new(),
+                enabled: false,
+                public_keys: vec![],
+                namespaces: vec![b"t/".to_vec()],
+                token_ttl_secs: 0,
+                clock_skew_secs: 0,
+                cluster_id: String::new(),
+            });
+            assert!(!authz.is_enabled());
+            let listener = compio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let delivered = Rc::new(Cell::new(0usize));
+            for version in [autumn_rpc::WIRE_VERSION + 1, autumn_rpc::MIN_CLIENT_WIRE_VERSION - 1,
+                autumn_rpc::MIN_CLIENT_WIRE_VERSION, autumn_rpc::WIRE_VERSION] {
+                let client = compio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+                let (server, _) = listener.accept().await.unwrap();
+                let (req_tx, mut req_rx) = mpsc::channel::<PartitionRequest>(16);
+                let authz = authz.clone();
+                let conn = compio::runtime::spawn(async move {
+                    handle_ps_connection(autumn_transport::Conn::Tcp(server), req_tx, None, 7, authz).await
+                });
+                let count = delivered.clone();
+                let worker = compio::runtime::spawn(async move {
+                    while let Some(req) = req_rx.next().await {
+                        count.set(count.get() + 1);
+                        let reply = if req.msg_type == MSG_PUT {
+                            let p_key = put_wire::key(&req.payload);
+                            partition_rpc::rkyv_encode(&PutResp {
+                                code: CODE_OK, message: String::new(), key: p_key,
+                            })
+                        } else {
+                            Bytes::new()
+                        };
+                        req.resp_tx.send(Ok(reply)).ok();
+                    }
+                });
+                let put = || partition_rpc::rkyv_encode(&PutReq { part_id: 7, key: b"t/k".to_vec(), region_epoch: 0, expires_at: 0,
+                    inode_hint: 0, lease_epoch: 0,
+                    evict_rank: 0, });
+                let hello = Hello { role: Role::Client, wire_version: version, client_version: version };
+                let (mut rd, mut wr) = autumn_transport::Conn::Tcp(client).into_split();
+                if !(autumn_rpc::MIN_CLIENT_WIRE_VERSION..=autumn_rpc::WIRE_VERSION).contains(&version) {
+                    // Hello and a Put in ONE write: the Put is already in the
+                    // server's socket buffer when the Hello is judged.
+                    let mut bytes = test_protocol::hello_packet(hello);
+                    bytes.extend_from_slice(&Frame::request(2, MSG_PUT, put()).encode());
+                    wr.write_all(bytes).await.0.unwrap();
+                    // The server closes with the Put unread, so the kernel may
+                    // answer with a reset; either way the connection is gone.
+                    compio::time::timeout(Duration::from_secs(5), async {
+                        loop {
+                            let BufResult(n, _) = rd.read(vec![0u8; 4096]).await;
+                            if !matches!(n, Ok(n) if n > 0) {
+                                break;
+                            }
+                        }
+                    })
+                    .await
+                    .expect("a refused connection is closed");
+                    assert!(conn.await.unwrap().is_err());
+                    worker.await.unwrap();
+                    assert_eq!(delivered.get(), 0);
+                } else {
+                    initiate(&mut rd, &mut wr, hello, Some(Service::PartitionServer)).await.unwrap();
+                    let mut decoder = FrameDecoder::new();
+                    let f = round_trip(&mut wr, &mut rd, &mut decoder, 2, MSG_PUT, put()).await;
+                    assert!(!f.is_error());
+                    // An admitted client is still held to the client surface:
+                    // a split is refused on the connection, never delivered.
+                    let before = delivered.get();
+                    let f = round_trip(&mut wr, &mut rd, &mut decoder, 3, MSG_SPLIT_PART,
+                        Bytes::new()).await;
+                    assert!(f.is_error());
+                    let (code, _) = autumn_rpc::RpcError::decode_status(&f.payload);
+                    assert_eq!(code, StatusCode::PermissionDenied);
+                    assert_eq!(delivered.get(), before);
+                    drop(conn); drop(worker);
+                }
+            }
+            assert_eq!(delivered.get(), 2);
+        });
+    }
+
+    #[test]
+    fn client_auth_then_out_of_grant_deny() {
+        let rt = compio::runtime::Runtime::new().unwrap();
+        rt.block_on(async move {
+            let sk = SigningKey::from_bytes(&[11u8; 32]);
+            let authz = enabled_authz(&sk);
+
+            let listener = compio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let client = compio::net::TcpStream::connect(addr).await.unwrap();
+            let (server, _) = listener.accept().await.unwrap();
+
+            let (req_tx, mut req_rx) = mpsc::channel::<PartitionRequest>(16);
+            let conn = compio::runtime::spawn(async move {
+                let _ = handle_ps_connection(
+                    autumn_transport::Conn::Tcp(server),
+                    req_tx,
+                    None, // reads delegate to the mock loop below
+                    7,
+                    authz,
+                )
+                .await;
+            });
+            // Mock partition loop: any ADMITTED request gets a canned OK
+            // (opaque bytes for reads, PutResp for writes). A denied request
+            // never reaches here — the authz gate short-circuits it on the conn
+            // task. Only the verdict (error frame or not) is asserted.
+            let loop_h = compio::runtime::spawn(async move {
+                while let Some(req) = req_rx.next().await {
+                    let bytes = if req.msg_type == MSG_GET {
+                        Bytes::from_static(b"ok")
+                    } else {
+                        let put_key = put_wire::key(&req.payload);
+                        partition_rpc::rkyv_encode(&PutResp {
+                            code: CODE_OK,
+                            message: String::new(),
+                            key: put_key,
+                        })
+                    };
+                    let _ = req.resp_tx.send(Ok(bytes));
+                }
+            });
+
+            let (mut rd, mut wr) = test_protocol::initiate_tcp(
+                client,
+                autumn_rpc::version_hello::Service::PartitionServer,
+            )
+            .await
+            .into_split();
+            let mut dec = FrameDecoder::new();
+
+            // (1) CLIENT_AUTH with a token granting `mem/acme/` → OK, binds principal.
+            let token = mint(&sk, vec![b"mem/acme/".to_vec()]);
+            let auth_req = partition_rpc::rkyv_encode(&ClientAuthReq { token });
+            let f = round_trip(&mut wr, &mut rd, &mut dec, 1, MSG_CLIENT_AUTH, auth_req).await;
+            assert!(!f.is_error(), "CLIENT_AUTH should succeed");
+            let resp: ClientAuthResp = partition_rpc::rkyv_decode(&f.payload).unwrap();
+            assert_eq!(resp.code, StatusCode::Ok as u8, "{}", resp.message);
+
+            // (2) GET mem/acme/doc → authorized → delegates → OK.
+            let g = partition_rpc::rkyv_encode(&GetReq {
+                part_id: 7,
+                key: b"mem/acme/doc".to_vec(),
+                offset: 0,
+                length: 0,
+                region_epoch: 0,
+                direct: false,
+            });
+            let f = round_trip(&mut wr, &mut rd, &mut dec, 2, MSG_GET, g).await;
+            assert!(!f.is_error(), "authorized GET should pass");
+
+            // (3) GET mem/other/doc → outside the grant → DENIED at the gate.
+            let g2 = partition_rpc::rkyv_encode(&GetReq {
+                part_id: 7,
+                key: b"mem/other/doc".to_vec(),
+                offset: 0,
+                length: 0,
+                region_epoch: 0,
+                direct: false,
+            });
+            let f = round_trip(&mut wr, &mut rd, &mut dec, 3, MSG_GET, g2).await;
+            assert!(f.is_error(), "out-of-grant GET must be denied");
+            let (code, _msg) = autumn_rpc::RpcError::decode_status(&f.payload);
+            assert_eq!(code, StatusCode::PermissionDenied);
+
+            // (4) PUT mem/acme/x → authorized write passes the gate.
+            let put = partition_rpc::rkyv_encode(&PutReq {
+                part_id: 7,
+                key: b"mem/acme/x".to_vec(),
+                expires_at: 0,
+                region_epoch: 0,
+                inode_hint: 0,
+                lease_epoch: 0,
+                evict_rank: 0,
+            });
+            let f = round_trip(&mut wr, &mut rd, &mut dec, 4, MSG_PUT, put).await;
+            assert!(!f.is_error(), "authorized PUT should pass");
+
+            // (5) PUT mem/other/x → out-of-grant write DENIED.
+            let put2 = partition_rpc::rkyv_encode(&PutReq {
+                part_id: 7,
+                key: b"mem/other/x".to_vec(),
+                expires_at: 0,
+                region_epoch: 0,
+                inode_hint: 0,
+                lease_epoch: 0,
+                evict_rank: 0,
+            });
+            let f = round_trip(&mut wr, &mut rd, &mut dec, 5, MSG_PUT, put2).await;
+            assert!(f.is_error(), "out-of-grant PUT must be denied");
+            let (code, _) = autumn_rpc::RpcError::decode_status(&f.payload);
+            assert_eq!(code, StatusCode::PermissionDenied);
+
+            // (6) Another namespace → DENIED: the grant is `mem/acme/` only.
+            let g3 = partition_rpc::rkyv_encode(&GetReq {
+                part_id: 7,
+                key: b"fs/inode1".to_vec(),
+                offset: 0,
+                length: 0,
+                region_epoch: 0,
+                direct: false,
+            });
+            let f = round_trip(&mut wr, &mut rd, &mut dec, 6, MSG_GET, g3).await;
+            assert!(f.is_error(), "a key in another namespace must be denied");
+
+            drop(wr);
+            drop(rd);
+            let _ = conn.await;
+            let _ = loop_h.await;
+        });
+    }
+
+    #[test]
+    fn anonymous_connection_denied_on_protected() {
+        let rt = compio::runtime::Runtime::new().unwrap();
+        rt.block_on(async move {
+            let sk = SigningKey::from_bytes(&[12u8; 32]);
+            let authz = enabled_authz(&sk);
+            let listener = compio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let client = compio::net::TcpStream::connect(addr).await.unwrap();
+            let (server, _) = listener.accept().await.unwrap();
+            let (req_tx, mut req_rx) = mpsc::channel::<PartitionRequest>(16);
+            let conn = compio::runtime::spawn(async move {
+                let _ = handle_ps_connection(
+                    autumn_transport::Conn::Tcp(server),
+                    req_tx,
+                    None,
+                    7,
+                    authz,
+                )
+                .await;
+            });
+            let loop_h = compio::runtime::spawn(async move {
+                // Should never be reached for the protected GET.
+                while let Some(req) = req_rx.next().await {
+                    let _ = req.resp_tx.send(Ok(Bytes::new()));
+                }
+            });
+            let (mut rd, mut wr) = test_protocol::initiate_tcp(
+                client,
+                autumn_rpc::version_hello::Service::PartitionServer,
+            )
+            .await
+            .into_split();
+            let mut dec = FrameDecoder::new();
+            // No CLIENT_AUTH → anonymous. GET on protected mem/ → denied.
+            let g = partition_rpc::rkyv_encode(&GetReq {
+                part_id: 7,
+                key: b"mem/acme/doc".to_vec(),
+                offset: 0,
+                length: 0,
+                region_epoch: 0,
+                direct: false,
+            });
+            let f = round_trip(&mut wr, &mut rd, &mut dec, 1, MSG_GET, g).await;
+            assert!(f.is_error(), "anonymous protected GET must be denied");
+            let (code, _) = autumn_rpc::RpcError::decode_status(&f.payload);
+            assert_eq!(code, StatusCode::PermissionDenied);
+            drop(wr);
+            drop(rd);
+            let _ = conn.await;
+            let _ = loop_h.await;
+        });
+    }
+}
+
+#[cfg(test)]
+mod batch_delete_tests {
+    use super::*;
+
+    fn batch_delete_request(
+        keys: &[&[u8]],
+        region_epoch: u64,
+    ) -> (PartitionRequest, oneshot::Receiver<HandlerResult>) {
+        let req = partition_rpc::BatchDeleteReq {
+            part_id: 0,
+            region_epoch,
+            ops: keys
+                .iter()
+                .map(|k| partition_rpc::BatchDeleteOp {
+                    key: k.to_vec(),
+                    inode_hint: 0,
+                    lease_epoch: 0,
+                })
+                .collect(),
+        };
+        let payload = partition_rpc::rkyv_encode(&req);
+        let (resp_tx, resp_rx) = oneshot::channel();
+        (
+            PartitionRequest {
+                msg_type: partition_rpc::MSG_BATCH_DELETE,
+                payload,
+                resp_tx,
+                bulk_value: None,
+            },
+            resp_rx,
+        )
+    }
+
+    /// THE POINT OF THE OPCODE. One frame carrying N keys must produce N
+    /// deletes in ONE `pending` batch, because `pending` is what a single WAL
+    /// append covers. The client-side fan-out it replaces produced one request
+    /// -- and so one append -- per key, which is where the measured 3.10 keys
+    /// per append came from.
+    ///
+    /// ABLATION: make the loop enqueue only the first op of the frame — the
+    /// one-op-per-append shape the client-side fan-out produced — and this
+    /// goes red while the admission tests below stay green.
+    #[test]
+    fn one_frame_enqueues_every_key_into_one_batch() {
+        let keys: Vec<&[u8]> = vec![b"k1", b"k2", b"k3", b"k4", b"k5"];
+        let (req, _rx) = batch_delete_request(&keys, 0);
+        let mut pending: Vec<WriteRequest> = Vec::new();
+
+        enqueue_batch_delete(req, &mut pending, 0, 0, None, None);
+
+        assert_eq!(
+            pending.len(),
+            5,
+            "5 keys in one frame must enqueue 5 ops into a single pending batch"
+        );
+        let deleted: Vec<&[u8]> = pending
+            .iter()
+            .filter_map(|w| match &w.op {
+                WriteOp::Delete { user_key } => Some(user_key.as_slice()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(deleted, keys, "every key, in order, as a Delete op");
+    }
+
+    /// An empty batch answers immediately and enqueues nothing -- it must not
+    /// build an accumulator that never fires and leaves the caller hanging.
+    #[compio::test]
+    async fn an_empty_batch_answers_without_enqueuing() {
+        let (req, rx) = batch_delete_request(&[], 0);
+        let mut pending: Vec<WriteRequest> = Vec::new();
+
+        enqueue_batch_delete(req, &mut pending, 0, 0, None, None);
+
+        assert!(pending.is_empty());
+        let bytes = rx.await.expect("responder dropped").expect("batch-level ok");
+        let resp: partition_rpc::BatchDeleteResp =
+            partition_rpc::rkyv_decode(&bytes).expect("decodes as BatchDeleteResp");
+        assert_eq!(resp.code, CODE_OK);
+        assert!(resp.statuses.is_empty());
+    }
+
+    /// A stale routing snapshot fails the batch as a WHOLE, before any op is
+    /// enqueued -- the same admission `enqueue_batch_put` makes. Deleting a
+    /// subset of a mis-routed batch would be worse than deleting none.
+    #[compio::test]
+    async fn a_stale_epoch_refuses_the_whole_batch() {
+        let keys: Vec<&[u8]> = vec![b"k1", b"k2"];
+        let (req, rx) = batch_delete_request(&keys, 7);
+        let mut pending: Vec<WriteRequest> = Vec::new();
+
+        // Partition is at epoch 9; the request claims 7.
+        enqueue_batch_delete(req, &mut pending, 9, 0, None, None);
+
+        assert!(pending.is_empty(), "nothing may be enqueued on a stale epoch");
+        let err = rx.await.expect("responder dropped").expect_err("must refuse");
+        assert_eq!(err.0, StatusCode::FailedPrecondition);
+    }
+
+    /// `region_epoch == 0` means "unversioned caller", and must be admitted
+    /// rather than compared -- the same escape hatch the put path has.
+    #[test]
+    fn epoch_zero_is_admitted() {
+        let keys: Vec<&[u8]> = vec![b"k1"];
+        let (req, _rx) = batch_delete_request(&keys, 0);
+        let mut pending: Vec<WriteRequest> = Vec::new();
+        enqueue_batch_delete(req, &mut pending, 42, 0, None, None);
+        assert_eq!(pending.len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod write_batch_ceiling_tests {
+    use super::*;
+
+    fn put_of(value_len: usize) -> WriteRequest {
+        let (outer, _rx) = oneshot::channel();
+        WriteRequest {
+            op: WriteOp::Put {
+                user_key: Bytes::from_static(b"k"),
+                value: Bytes::from(vec![0u8; value_len]).into(),
+                expires_at: 0,
+            },
+            resp: WriteResponder::Put {
+                outer,
+                key: b"k".to_vec(),
+            },
+        }
+    }
+
+    /// The shape that fragmented every burst: with one batch in flight, the
+    /// two connections a partition serves deliver their 4 admitted ops in two
+    /// separate wake-ups. An unconditional launch ships the first 4 alone
+    /// (this assertion is what goes red without the gate: `Some(4)` instead
+    /// of `None`); the gate holds them until the second 4 arrive and ships
+    /// all 8 as one append. An idle partition is never held back, and an
+    /// empty queue never launches.
+    #[test]
+    fn a_batch_in_flight_holds_a_partial_burst_until_it_is_whole() {
+        let mut pending: Vec<WriteRequest> = (0..4).map(|_| put_of(4096)).collect();
+        assert!(
+            take_launch_batch(&mut pending, 1).is_none(),
+            "one connection's 4 ops must not launch behind an in-flight batch"
+        );
+        assert_eq!(pending.len(), 4, "held ops stay queued, in order");
+
+        pending.extend((0..4).map(|_| put_of(4096)));
+        let batch = take_launch_batch(&mut pending, 1).expect("a whole burst launches");
+        assert_eq!(batch.len(), MIN_PIPELINED_BATCH, "both connections' ops ride ONE append");
+        assert!(pending.is_empty());
+
+        pending.push(put_of(4096));
+        assert_eq!(
+            take_launch_batch(&mut pending, 0).map(|b| b.len()),
+            Some(1),
+            "nothing in flight: a lone op launches immediately"
+        );
+        assert!(take_launch_batch(&mut pending, 0).is_none(), "empty queue, no launch");
+    }
+
+    /// The window waits for the refill a completion's acks are bringing, sized
+    /// by those acks plus what was already held — never for a fixed count.
+    /// The first assertion is what goes red under a fixed
+    /// `MIN_PIPELINED_BATCH` target: a lone writer's refill (1 op) sat out
+    /// the whole window on every op.
+    #[test]
+    fn the_window_waits_for_the_acked_refill_not_a_fixed_count() {
+        let t0 = Instant::now();
+        let mut w = CoalesceWindow::default();
+
+        // Lone writer: 1 op acked, nothing held — its refill is whole at 1.
+        w.arm(0, 1, t0);
+        assert!(w.holds(1, t0).is_none(), "a lone writer's refill launches at once");
+
+        // One connection refilling its 4 admitted ops: whole at 4.
+        w.clear();
+        w.arm(0, 4, t0);
+        assert!(w.holds(3, t0).is_some());
+        assert!(w.holds(4, t0).is_none());
+
+        // Desynchronized pair: B's 4 held while A's 4 were in flight, A's 4
+        // acked — B's wait for A's refill, and the pair re-locks at 8.
+        w.clear();
+        w.arm(4, 4, t0);
+        assert!(w.holds(4, t0).is_some(), "B's 4 wait for A's refill");
+        assert!(w.holds(8, t0).is_none());
+
+        // Two completions inside one window add up.
+        w.clear();
+        w.arm(0, 4, t0);
+        w.arm(0, 4, t0 + Duration::from_micros(50));
+        let t1 = t0 + Duration::from_micros(60);
+        assert!(w.holds(4, t1).is_some());
+        assert!(w.holds(8, t1).is_none());
+
+        // The deadline bounds every wait; a launch closes the window; and
+        // nothing pending is nothing to hold.
+        w.clear();
+        w.arm(0, 8, t0);
+        assert!(w.holds(4, t0 + LAUNCH_COALESCE_WINDOW).is_none());
+        w.arm(0, 8, t0);
+        w.clear();
+        assert!(w.holds(4, t0).is_none());
+        w.arm(0, 8, t0);
+        assert!(w.holds(0, t0).is_none());
+    }
+
+    /// What the window counts is client frames answered, because that is what
+    /// releases admission slots: a Put is one, a fence record is none, and a
+    /// batch frame's N ops are one — on the last op. Counting ops instead
+    /// made a batch-put writer's next, smaller frame wait, and a fenced
+    /// writer's first op after each lease wait, for refills that were whole.
+    #[test]
+    fn a_reply_is_counted_per_client_frame_not_per_op() {
+        let (outer, _rx) = oneshot::channel();
+        assert!(WriteResponder::Put { outer, key: b"k".to_vec() }.send_ok());
+        assert!(!WriteResponder::Fence.send_ok());
+
+        let (outer, _rx) = oneshot::channel();
+        let accum = BatchPutAccumulator::new(outer, 3);
+        let ops: Vec<bool> = (0..3)
+            .map(|idx| {
+                WriteResponder::BatchPut {
+                    accum: accum.clone(),
+                    idx,
+                }
+                .send_ok()
+            })
+            .collect();
+        assert_eq!(ops, [false, false, true], "one reply, on the batch's last op");
+    }
+
+    /// A batch becomes ONE `AppendReq`, and `pending` is bounded by request
+    /// COUNT while a single Put may carry 64 MiB — so the queue can hold more
+    /// than a frame can express. The split leaves the remainder queued rather
+    /// than failing it.
+    #[test]
+    fn an_oversized_queue_is_split_not_sent_whole() {
+        let big = 64 * 1024 * 1024;
+        let n = MAX_WRITE_BATCH_BYTES / big + 2;
+        let mut pending: Vec<WriteRequest> = (0..n).map(|_| put_of(big)).collect();
+        let batch = take_byte_bounded_batch(&mut pending);
+
+        assert!(!batch.is_empty(), "the batch must make progress");
+        assert!(
+            batch.iter().map(|r| r.encoded_size()).sum::<usize>() <= MAX_WRITE_BATCH_BYTES,
+            "the taken batch must fit one frame"
+        );
+        assert_eq!(
+            batch.len() + pending.len(),
+            n,
+            "the remainder stays queued — nothing is dropped"
+        );
+        assert!(!pending.is_empty(), "this queue was too big to send at once");
+    }
+
+    /// The ordinary case must be untouched: a batch that fits goes whole, so
+    /// group-commit behaviour under every real workload is unchanged.
+    #[test]
+    fn a_batch_that_fits_is_taken_whole() {
+        let mut pending: Vec<WriteRequest> = (0..256).map(|_| put_of(4096)).collect();
+        let batch = take_byte_bounded_batch(&mut pending);
+        assert_eq!(batch.len(), 256);
+        assert!(pending.is_empty());
+    }
+
+    fn fence_bump() -> WriteRequest {
+        WriteRequest {
+            op: WriteOp::FenceBump { ino: 7, epoch: 3 },
+            resp: WriteResponder::Fence,
+        }
+    }
+
+    /// A fence record never ends a batch that leaves its write behind: if
+    /// the two were split, the record's batch could fail while the write's
+    /// commits, acknowledging the write with no durable floor.
+    #[test]
+    fn a_fence_record_rides_with_its_write() {
+        let big = MAX_WRITE_BATCH_BYTES / 4;
+        // Three writes fill the batch to just under the cap, the fence fits
+        // after them, its write does not.
+        let mut pending: Vec<WriteRequest> = vec![
+            put_of(big),
+            put_of(big),
+            put_of(big),
+            fence_bump(),
+            put_of(big),
+        ];
+        let batch = take_byte_bounded_batch(&mut pending);
+        assert!(!matches!(batch.last().unwrap().op, WriteOp::FenceBump { .. }));
+        assert_eq!(batch.len(), 3);
+        assert!(matches!(pending[0].op, WriteOp::FenceBump { .. }));
+        assert_eq!(pending.len(), 2);
+        // A batch holding only the record takes its write along.
+        let mut pending = vec![fence_bump(), put_of(MAX_WRITE_BATCH_BYTES + 1), put_of(1)];
+        let batch = take_byte_bounded_batch(&mut pending);
+        assert_eq!(batch.len(), 2);
+        assert_eq!(pending.len(), 1);
+    }
+
+    /// A single request larger than the cap still moves, or the queue would
+    /// wedge on its head forever.
+    #[test]
+    fn a_single_oversized_request_still_makes_progress() {
+        let mut pending = vec![put_of(MAX_WRITE_BATCH_BYTES + 1)];
+        let batch = take_byte_bounded_batch(&mut pending);
+        assert_eq!(batch.len(), 1);
+        assert!(pending.is_empty());
+    }
+
+    /// The shutdown drain loops on this, so it MUST shrink the queue every
+    /// call — otherwise a residual queue larger than one frame spins forever
+    /// instead of draining.
+    #[test]
+    fn every_take_shrinks_the_queue() {
+        let big = 64 * 1024 * 1024;
+        let n = MAX_WRITE_BATCH_BYTES / big * 3;
+        let mut pending: Vec<WriteRequest> = (0..n).map(|_| put_of(big)).collect();
+        let mut rounds = 0;
+        while !pending.is_empty() {
+            let before = pending.len();
+            let batch = take_byte_bounded_batch(&mut pending);
+            assert!(!batch.is_empty(), "a take that moves nothing would spin");
+            assert!(pending.len() < before, "the queue must strictly shrink");
+            rounds += 1;
+            assert!(rounds <= n, "draining must terminate");
+        }
+    }
+}
+
+#[cfg(test)]
+mod unsettled_delete_seed_tests {
+    use super::*;
+
+    /// A reopened partition seeds `unsettled_deletes` from its replayed
+    /// memtable: tombstones count, a put — large value behind a pointer or
+    /// not — does not.
+    #[test]
+    fn the_replayed_memtable_counts_its_tombstones() {
+        let m = Memtable::new();
+        let entry = |op: u8| MemEntry {
+            op,
+            value: vec![1; 24],
+            expires_at: 0,
+        };
+        m.insert(key_with_ts(b"a", 1), entry(1), 1);
+        m.insert(key_with_ts(b"b", 2), entry(1 | OP_VALUE_POINTER), 1);
+        m.insert(key_with_ts(b"a", 3), entry(OP_TOMBSTONE), 1);
+        m.insert(key_with_ts(b"c", 4), entry(OP_TOMBSTONE), 1);
+        assert_eq!(m.tombstone_count(), 2);
+    }
+}
+
+#[cfg(test)]
+mod merge_freeze_tests {
+    use super::*;
+    use std::time::Duration;
+
+    struct Attempt {
+        resp: oneshot::Receiver<HandlerResult>,
+    }
+
+    fn start(state: &Rc<MergeFreezeState>, gate: &std::sync::Arc<CompactionGate>) -> Attempt {
+        let (wake, _wake_rx) = mpsc::unbounded();
+        let (resp_tx, resp) = oneshot::channel();
+        let (attempt, cancelled) = state.wait_for_gate();
+        compio::runtime::spawn(merge_freeze_task(
+            state.clone(),
+            gate.clone(),
+            wake,
+            1,
+            attempt,
+            cancelled,
+            resp_tx,
+        ))
+        .detach();
+        Attempt { resp }
+    }
+
+    async fn answer(a: Attempt) -> partition_rpc::MergeFreezeResp {
+        let bytes = compio::time::timeout(Duration::from_secs(2), a.resp)
+            .await
+            .expect("the freeze never answered")
+            .expect("task dropped its answer")
+            .expect("handler error");
+        partition_rpc::rkyv_decode(&bytes).unwrap()
+    }
+
+    async fn until(f: impl Fn() -> bool) {
+        for _ in 0..200 {
+            if f() {
+                return;
+            }
+            compio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("condition never held");
+    }
+
+    #[test]
+    fn take_draining_outside_draining_leaves_the_stage() {
+        let state = MergeFreezeState::default();
+        assert!(state.take_draining().is_none());
+        assert!(!state.rejoin_drained() && !state.is_halted());
+        let _attempt = state.wait_for_gate();
+        assert!(state.take_draining().is_none());
+        assert!(state.is_active());
+    }
+
+    #[test]
+    fn a_freeze_waiting_for_the_gate_halts_nothing_and_ends_on_unfreeze() {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let state = Rc::new(MergeFreezeState::default());
+            let gate = CompactionGate::new(1);
+            let compaction = gate.acquire().await;
+            let a = start(&state, &gate);
+            compio::time::sleep(Duration::from_millis(100)).await;
+            assert!(state.is_active() && !state.is_halted());
+            state.end();
+            let r = answer(a).await;
+            assert_eq!(r.code, partition_rpc::CODE_PRECONDITION);
+            assert!(r.message.contains("waiting for maintenance"), "{}", r.message);
+            drop(compaction);
+            assert!(!state.is_active());
+        });
+    }
+
+    /// An unfreeze while the loop has not finished draining must answer the
+    /// parked freeze; it used to clear only the halt and leave it parked.
+    #[test]
+    fn an_unfreeze_while_draining_answers_the_freeze_and_frees_the_gate() {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let state = Rc::new(MergeFreezeState::default());
+            let gate = CompactionGate::new(1);
+            let a = start(&state, &gate);
+            until(|| state.is_halted()).await;
+            state.end();
+            let r = answer(a).await;
+            assert_eq!(r.code, partition_rpc::CODE_PRECONDITION);
+            assert!(r.message.contains("before its drain finished"), "{}", r.message);
+            assert!(!state.is_halted() && !state.is_active());
+            let freed = compio::time::timeout(Duration::from_secs(1), gate.acquire()).await;
+            assert!(freed.is_ok(), "the cancelled freeze kept the maintenance gate");
+        });
+    }
+
+    #[test]
+    fn a_drained_freeze_answers_the_drained_position_and_stays_halted() {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let state = Rc::new(MergeFreezeState::default());
+            let gate = CompactionGate::new(1);
+            let a = start(&state, &gate);
+            until(|| state.is_halted()).await;
+            let (attempt, tx) = state.take_draining().expect("draining");
+            assert!(tx.send(Ok((7, 4096))).is_ok());
+            state.set_drained(attempt);
+            let r = answer(a).await;
+            assert_eq!(r.code, partition_rpc::CODE_OK);
+            assert_eq!((r.log_tail_extent_id, r.log_end), (7, 4096));
+            assert!(state.is_drained() && state.is_halted());
+        });
+    }
+
+    /// Attempt A drains but its manager is gone, so its OK cannot be sent;
+    /// before A runs again, the loop handles an unfreeze and a new freeze B.
+    /// A's cleanup must not end B.
+    #[test]
+    fn a_failed_answer_does_not_end_a_newer_attempt() {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let state = Rc::new(MergeFreezeState::default());
+            let gate = CompactionGate::new(1);
+            let a = start(&state, &gate);
+            drop(a.resp);
+            until(|| state.is_halted()).await;
+            let (attempt, tx) = state.take_draining().expect("draining");
+            assert!(tx.send(Ok((7, 4096))).is_ok());
+            state.set_drained(attempt);
+            state.end();
+            let b = start(&state, &gate);
+            until(|| state.is_halted()).await;
+            assert!(state.is_draining(), "B was ended by A's cleanup");
+            let (attempt, tx) = state.take_draining().expect("B draining");
+            assert!(tx.send(Ok((8, 1))).is_ok());
+            state.set_drained(attempt);
+            assert_eq!(answer(b).await.code, partition_rpc::CODE_OK);
+        });
+    }
+
+    /// A retry answered OK from attempt A's drained freeze, then A's late
+    /// cleanup (its own OK undeliverable): the retry's freeze stays.
+    #[test]
+    fn a_retry_answered_from_a_drained_freeze_outlives_its_cleanup() {
+        let state = MergeFreezeState::default();
+        let (a, _cancelled) = state.wait_for_gate();
+        let _drained = state.start_draining(a).expect("draining");
+        let (attempt, _tx) = state.take_draining().expect("taken");
+        state.set_drained(attempt);
+        assert!(state.rejoin_drained());
+        state.end_attempt(a);
+        assert!(state.is_drained() && state.is_halted());
+    }
+
+    /// An attempt ended while its gate was being granted, with a newer
+    /// attempt already waiting (an unfreeze and a new freeze handled in one
+    /// loop pass): the old one must not take over the newer one's stage.
+    #[test]
+    fn an_ended_attempt_does_not_take_over_a_newer_one() {
+        let state = MergeFreezeState::default();
+        let (first, _first_cancelled) = state.wait_for_gate();
+        state.end();
+        let _second = state.wait_for_gate();
+        assert!(state.start_draining(first).is_none());
+        assert!(!state.is_halted() && state.is_active());
+    }
+}

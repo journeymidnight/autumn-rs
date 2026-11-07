@@ -1,0 +1,12 @@
+# cargo nextest run --workspace: every test in its own process, many at once.
+# Doc tests are not run by nextest: `cargo test --workspace --doc`.
+[profile.default]
+test-threads = 32
+fail-fast = false
+# Reported as slow after 60 s; ended (a failure) after 10 periods, so a hung
+# test cannot hold the run forever. The slowest test takes ~150 s.
+slow-timeout = { period = "60s", terminate-after = 10 }
+
+# GitHub runners (ubuntu-latest: 4 vCPUs); everything else as default.
+[profile.ci]
+test-threads = 4

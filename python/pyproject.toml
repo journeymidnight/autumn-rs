@@ -1,0 +1,29 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+# The import name is `autumn`; `autumn` on PyPI is an unrelated project.
+name = "autumn-rs"
+version = "0.1.0"
+description = "Python client for autumn-rs: KV (zero-copy batch reads and writes) and the fs/ tree"
+readme = "README.md"
+license = "Apache-2.0"
+# The published wheels are abi3 (cp311-abi3), so pip only installs them on
+# >= 3.11; a source build without the `abi3` feature works on older CPython.
+requires-python = ">=3.8"
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Rust",
+  "Operating System :: POSIX :: Linux",
+  "Topic :: Database",
+  "Topic :: System :: Distributed Computing",
+]
+
+[project.urls]
+Homepage = "https://github.com/journeymidnight/autumn-rs"
+Source = "https://github.com/journeymidnight/autumn-rs/tree/main/python"
+
+[tool.maturin]
+module-name = "autumn"
+features = ["pyo3/extension-module"]

@@ -1,0 +1,107 @@
+# etcd control-plane store. Single member by default (bump replicas to 3 for a
+# fault-tolerant control plane and set --initial-cluster accordingly — see
+# "Deployment" in docs/ops.md). autumn stores all cluster metadata here.
+apiVersion: v1
+kind: Service
+metadata:
+  name: autumn-etcd
+  namespace: autumn
+  labels:
+    app.kubernetes.io/name: autumn
+    app.kubernetes.io/component: etcd
+spec:
+  # Headless: gives each etcd pod a stable DNS name (autumn-etcd-0.autumn-etcd)
+  # for peer discovery, and doubles as the client endpoint (the entrypoint
+  # resolves it to a member IP; any member serves client requests).
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: autumn
+    app.kubernetes.io/component: etcd
+  ports:
+    - name: client
+      port: 2379
+      targetPort: 2379
+    - name: peer
+      port: 2380
+      targetPort: 2380
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: autumn-etcd
+  namespace: autumn
+  labels:
+    app.kubernetes.io/name: autumn
+    app.kubernetes.io/component: etcd
+spec:
+  serviceName: autumn-etcd
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: autumn
+      app.kubernetes.io/component: etcd
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: autumn
+        app.kubernetes.io/component: etcd
+    spec:
+      terminationGracePeriodSeconds: 30
+      enableServiceLinks: false   # binaries use ConfigMap+DNS, not service-link env vars (see manager.yaml)
+      containers:
+        - name: etcd
+          # Pin to a 3.5.x etcd (autumn needs etcd v3 API >= 3.5).
+          image: quay.io/coreos/etcd:v3.5.11
+          command: ["/usr/local/bin/etcd"]
+          args:
+            - --name=$(POD_NAME)
+            - --data-dir=/var/run/etcd/data
+            - --listen-client-urls=http://0.0.0.0:2379
+            - --advertise-client-urls=http://$(POD_IP):2379
+            - --listen-peer-urls=http://0.0.0.0:2380
+            - --initial-advertise-peer-urls=http://$(POD_IP):2380
+            # Single-member initial cluster. For a 3-member etcd, replace with
+            # the explicit member list (see "Deployment" in docs/ops.md).
+            - --initial-cluster=$(POD_NAME)=http://$(POD_IP):2380
+            - --initial-cluster-state=new
+            # A partition SPLIT commits one atomic txn whose op count scales with
+            # the partition's extent count (CoW refs++ per shared extent, plus the
+            # stream/partition/region rewrites). etcd's default --max-txn-ops=128
+            # therefore caps a splittable partition at only ~40 extents — e.g. a
+            # partition merged down from 32 (127 extents) refuses EVERY split with `etcdserver: too many operations in txn request`,
+            # which surfaces as a confusing `precondition failed` on presplit.
+            - --max-txn-ops=1024
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+          ports:
+            - { name: client, containerPort: 2379 }
+            - { name: peer, containerPort: 2380 }
+          readinessProbe:
+            tcpSocket: { port: 2379 }
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          volumeMounts:
+            - { name: data, mountPath: /var/run/etcd }
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        # etcd is the opposite of the EN: NETWORK durable storage on purpose.
+        # storageClassName omitted → the cluster's DEFAULT class, which on a
+        # cloud is network block storage (EBS / PD / Azure Disk). That lets a
+        # SINGLE etcd member survive node loss cheaply: if the node dies the pod
+        # reschedules (same AZ) and the volume re-attaches, no 3-member quorum
+        # needed. Metadata is small, so 1Gi + one member is the resource-saving
+        # choice. For control-plane HA instead, use 3 replicas (each still on its
+        # own network volume) and the multi-member --initial-cluster.
+        resources:
+          requests:
+            storage: 1Gi

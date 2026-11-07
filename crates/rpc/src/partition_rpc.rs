@@ -1,0 +1,1083 @@
+//! Wire codec for PartitionKv RPCs over autumn-rpc.
+//!
+//! All 8 PartitionKv RPCs use rkyv serialization.
+//! Message type constants are in the 0x40–0x4F range.
+//! Every request includes `part_id` for thread-per-partition routing.
+//!
+//! ## `region_epoch` (TiKV-style)
+//!
+//! Hot-path data RPCs (Put/Get/Delete/Head/Range/StreamPut) carry a
+//! `region_epoch: u64` field. The client stamps the epoch it has
+//! cached for the partition; the PS rejects the request with
+//! `StatusCode::FailedPrecondition` when the stamp doesn't match its
+//! current `region_epoch`, surfaced from `MgrRegionInfo.region_epoch`.
+//! The manager bumps the epoch on every `rg` rewrite (split / merge).
+//! `0` = "skip check" (bootstrap, tests, legacy callers).
+//!
+//! `RangeResp` additionally carries `cur_end_key: Vec<u8>` — the PS's
+//! authoritative `rg.end_key`. The SDK uses it as a CockroachDB-style
+//! ResumeSpan cursor so a split that happens DURING a multi-partition
+//! scan auto-resolves on the next `resolve_key`. See
+//! `crates/client/CLAUDE.md` for the SDK-side loop.
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  ⚠️  WIRE SCHEMA. Edit an `Archive` type here — add, remove, reorder or
+//  retype a field, or change what one MEANS — and you MUST bump
+//  `WIRE_VERSION` in `crates/rpc/src/lib.rs` — and raise
+//  `MIN_CLIENT_WIRE_VERSION` too if the change breaks the CLIENT surface.
+//
+//  NOTHING CHECKS THIS FOR YOU. The schema fingerprint that used to catch a
+//  forgotten bump was removed; the version integer is the only guard left,
+//  and it is maintained by hand. Forget it and two binaries claiming the same
+//  version will handshake, then decode each other's bytes as garbage — no
+//  error, no log, just wrong data. That has happened here before.
+// ═══════════════════════════════════════════════════════════════════════════
+
+pub use crate::manager_rpc::{rkyv_decode, rkyv_encode};
+
+use rkyv::{Archive, Deserialize, Serialize};
+
+// ── msg_type constants ───────────────────────────────────────────────────────
+
+// 0x40 RESERVED (the rkyv put with the value inside it; wire 81).
+// The rkyv point read (`GetReq` -> `GetResp`, value copied into the archive)
+// was REMOVED in wire v41: every read is `MSG_GET` (0x50), whose value rides
+// as its own tail. 0x41 stays RESERVED like 0x54 below. A stale peer can
+// still send it; `extract_part_id` reads an unknown type's part_id as 0, so the
+// PS refuses it (misroute, or `unknown msg_type` behind a partition 0) without
+// decoding it. Reassigned, the same bytes could bytecheck as the new request.
+//
+//   0x41  RESERVED (was the rkyv point read)
+pub const MSG_DELETE: u8 = 0x42;
+pub const MSG_HEAD: u8 = 0x43;
+pub const MSG_RANGE: u8 = 0x44;
+pub const MSG_SPLIT_PART: u8 = 0x45;
+// MSG_STREAM_PUT (0x46) REMOVED: zero callers once
+// stripe-writes moved client-side, and its PS handler bypassed BOTH the inline
+// value cap AND the lease fence check (an unfenced unbounded-write
+// backdoor). 0x46 stays RESERVED (reserved-constants pattern) to prevent
+// accidental re-use against in-flight old binaries.
+//   pub const MSG_STREAM_PUT: u8 = 0x46;  // RESERVED, removed
+pub const MSG_MAINTENANCE: u8 = 0x47;
+pub const MSG_GET_DISCARDS: u8 = 0x48;
+
+// server-side multipart upload was REMOVED.
+// Wire constants 0x49-0x4C remain RESERVED to prevent accidental re-use
+// while old binaries with handlers may still be in flight in production
+// rolling deploys. Stripe-write is now pure client-side (Ceph
+// striperados pattern): each chunk is a normal Put under a reserved
+// 0xff-prefixed key namespace, and the user key holds a 45-byte Meta
+// blob. See `crates/client/src/lib.rs::PutStreamHandle` + `GetStream`.
+//
+//   pub const MSG_PUT_BEGIN:  u8 = 0x49;  // RESERVED (was multipart upload)
+//   pub const MSG_PUT_CHUNK:  u8 = 0x4A;  // RESERVED (was multipart upload)
+//   pub const MSG_PUT_COMMIT: u8 = 0x4B;  // RESERVED (was multipart upload)
+//   pub const MSG_PUT_ABORT:  u8 = 0x4C;  // RESERVED (was multipart upload)
+//
+// Batched GET with the values encoded INLINE in the response was REMOVED in
+// wire v33, superseded by `MSG_BATCH_GET` (0x5B). 0x54 stays RESERVED for
+// the same reason as the block above, and for one specific to it: the peer
+// version gate is skip-on-transport-failure at bootstrap and the PS does not
+// re-check per connection, so a stale binary CAN still put a 0x54 frame on the
+// wire. Today that dies as `unknown msg_type`; if 0x54 were reassigned to
+// another keyed request, a `BatchGetReq {u64, u64, Vec<Vec<u8>>}` that happened
+// to bytecheck as the new type would be silently misread instead.
+//
+//   0x54  RESERVED (was inline batched GET)
+
+// partition merge — sent to the SURVIVOR's PS.
+pub const MSG_MERGE_PART: u8 = 0x4D;
+
+// PrepareMerge-style freeze. CLI/manager sends to BOTH the survivor and
+// victim's PS BEFORE capturing commit_length so writes that would otherwise
+// fall in the FLUSH→manager.commit window are halted at the source.
+//
+// `freeze=true`  → wait for the maintenance gate (writes flowing), halt
+//                  writes, drain pending + inflight + flush all imm, ack.
+//                  Subsequent Put/Delete/StreamPut return CODE_UNAVAILABLE
+//                  until either an unfreeze RPC clears the flag OR the
+//                  partition is reopened by region_sync_loop on rg/stream-id
+//                  change (post-merge).
+// `freeze=false` → reverse the flag (used by the CLI failure rollback path
+//                  if the manager-side merge txn rejects the request).
+pub const MSG_MERGE_FREEZE: u8 = 0x4E;
+
+// 0x4F retired with the vp_table_refs removal (was MSG_PULL_VP_REFS,
+// manager→PS vp_refs pull). Extent retention is now driven by
+// `refs` (stream membership) alone — see manager `extent_can_delete`.
+
+/// The point read: the value, or where to read it. Request `GetReq`; the reply
+/// is a bulk frame: ctrl = `[code: CODE_*][message]` (CRC'd with the header),
+/// value = the raw value as its own tail, received by
+/// `RpcClient::call_into_pooled` straight into a pooled buffer. With
+/// `GetReq::direct`, a range of a ValuePointer value of at least
+/// `BULK_MIN_BYTES` whose extent a client can read is answered
+/// `CODE_POSITION`, ctrl `[CODE_POSITION][rkyv ValuePosition]` and no value:
+/// the client reads it from an extent node (`MSG_READ`) and asks again
+/// without `direct` if that fails. The code byte is in THIS module's `CODE_*`
+/// space — handlers translate a handler `StatusCode` with `code_for_status`,
+/// never `status as u8`.
+pub const MSG_GET: u8 = 0x50;
+
+/// The put: ctrl = rkyv `PutReq`, the value as the frame's tail — the raw
+/// tail, or frame values over UCX — under transport integrity, never copied
+/// through rkyv. The frame CRC covers the ctrl only. Replied with `PutResp`.
+pub const MSG_PUT: u8 = 0x51;
+
+// 0x53 RESERVED (the batched put with the values inside its rkyv; wire 81).
+
+/// The batched put: N operations on the SAME partition in ONE frame. Ctrl
+/// `BatchPutReq` carries the keys and per-op value LENGTHS; the frame's tail
+/// carries the values back to back (as `MSG_PUT`'s value). The PS injects all
+/// N ops into `partition_loop`'s `pending` at once, so it can fire a wide
+/// batch immediately. Every op must belong to the SAME partition (the client
+/// groups by partition); `region_epoch` as in `MSG_PUT`. Replied with
+/// `BatchPutResp`.
+pub const MSG_BATCH_PUT: u8 = 0x5A;
+
+/// The batched read, one frame per partition: request `BatchGetReq`, reply
+/// ctrl `[code][rkyv BatchGetCtrl]` with each item's status and value length,
+/// and the found values concatenated as the reply's raw tail (they ride
+/// under transport integrity; statuses and lengths stay in the CRC'd ctrl, so
+/// a truncated or reordered reply is still detected structurally). With
+/// `direct`, an item `MSG_GET` would answer with a position gets
+/// `BATCH_GET_POSITION` and the next entry of `positions`, a large one with
+/// no position `BATCH_GET_DECLINED`; any other item comes back as its value. Served on the connection task next to `MSG_GET`:
+/// batched reads have no business queueing behind the single-writer
+/// group-commit actor.
+pub const MSG_BATCH_GET: u8 = 0x5B;
+
+/// Batched DELETE: N keys for ONE partition in a single frame.
+///
+/// `delete_many` used to be pure client-side fan-out — one `MSG_DELETE` per
+/// key, capped at `--batch-put-concurrency` in flight. That looked like N
+/// concurrent requests and was not: a client holds ONE multiplexed connection
+/// per partition, so keys sharing a partition queue on one connection at its
+/// in-flight limit.
+///
+/// The cost it addresses is EXTENT-NODE load rather than latency: an append is
+/// a replicated write, so more appends for the same keys is more work asked of
+/// the extent nodes. (That deletes usually arrive in key order, and so land in
+/// one partition, is inferred from how callers scan — not separately measured.)
+///
+/// Shape mirrors `MSG_BATCH_PUT` deliberately — same per-op fencing, same
+/// per-op range admission, same "one status byte per op" reply — so the two
+/// paths stay readable against each other. There is no bulk variant: a delete
+/// carries no value, so there is no tail to keep out of the rkyv payload.
+pub const MSG_BATCH_DELETE: u8 = 0x5C;
+
+pub const MAX_COMPARE_PUT_BYTES: usize = 64 * 1024;
+
+// 0x5D, 0x5E, 0x60 RESERVED (the older conditional writes; wire 81).
+
+/// The conditional write (`ClusterClient::compare_put`): `CompareWriteReq`
+/// ctrl, the value as the frame's tail, with a TTL and a lease fence, or a
+/// conditional delete. Serialized through the partition write actor. The fence
+/// is checked before the comparison and a raised floor is persisted even when
+/// the comparison then fails, which makes it usable as a pure floor bump.
+/// Replied with `PutResp`: `CODE_OK` applied, `CODE_PRECONDITION` when
+/// `expected` did not hold, `CODE_FENCED` below the floor.
+pub const MSG_COMPARE_WRITE: u8 = 0x61;
+
+/// `MSG_GET` whose value travels as a UCX active message, which UCX moves
+/// by rendezvous straight into the client's memory: `GetAmReq` names the tag
+/// the client registered and the most it can take. Replied with `GetAmResp`
+/// (code and value length) on the connection; the value, when the reply is
+/// `CODE_OK` and it fits `max_len`, as the AM tagged `tag`. Sent only on a UCX
+/// connection to a cluster negotiated at `WIRE_VERSION_WITH_GET_AM` or later.
+pub const MSG_GET_AM: u8 = 0x62;
+
+/// One op inside a `BatchDeleteReq`. Carries its own fence identity because a
+/// batch may span inodes (a directory unlink walks many), exactly as
+/// `BatchPutOp` does.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct BatchDeleteOp {
+    pub key: Vec<u8>,
+    /// See `DeleteReq.inode_hint`. 0 = anonymous (skip fencing).
+    pub inode_hint: u64,
+    pub lease_epoch: u64,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct BatchDeleteReq {
+    pub part_id: u64,
+    pub region_epoch: u64,
+    pub ops: Vec<BatchDeleteOp>,
+}
+
+/// Reply to `MSG_BATCH_DELETE`. Same shape as `BatchPutResp` and read the same
+/// way: `statuses[i]` is op `i`'s result, and is empty only when the failure
+/// was batch-level (wrong partition, stale epoch) rather than per-op.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct BatchDeleteResp {
+    pub code: u8,
+    pub message: String,
+    pub statuses: Vec<u8>,
+}
+
+/// first-frame connection authentication. The client sends a signed
+/// Ed25519 capability token (see `crate::cap_token`); the PS verifies it once
+/// against its cached public keys and binds the connection's `{allowed_prefixes,
+/// exp}` principal. Subsequent per-request enforcement is a byte `starts_with`
+/// + `exp` check with no re-verify. CLIENT_AUTH is OPTIONAL (a connection that
+/// never sends it is anonymous → denied on protected prefixes only). It carries
+/// no `part_id` — it's connection-level, handled before the routing check.
+pub const MSG_CLIENT_AUTH: u8 = 0x55;
+
+/// manager → PS "seal + roll these stream tails". The recovery
+/// sweep sends this when it finds an OPEN tail extent (`!sealed`) with a replica
+/// on a Fenced node — recovery only rebuilds SEALED extents, so an idle
+/// partition's open tail on a fenced node would otherwise never drain and block
+/// `remove` forever. The PS routes each `(stream_id, tail_extent_id)` into the
+/// owning partition's writer thread and calls the existing
+/// `StreamClient::seal_and_roll_tail` (WAL self-heal already uses it): the tail
+/// seals via the manager's lenient probe (dead replicas don't block; all
+/// replicas unreachable → the seal Precondition surfaces), a fresh tail rolls on
+/// healthy nodes (Part A placement exclusion keeps it off fenced nodes), and the
+/// next recovery tick rebuilds the now-sealed extent's fenced slots. Idempotent:
+/// `tail_extent_id` is compared against the current tail; a mismatch (already
+/// rolled) is a no-op.
+pub const MSG_ROLL_TAILS: u8 = 0x57;
+
+/// Largest `MSG_CLIENT_AUTH` payload a server decodes. A legit token is
+/// <= `cap_token::MAX_CAP_TOKEN_LEN` (8 KiB) plus a tiny rkyv envelope; the
+/// bound is checked BEFORE the decode, which would otherwise copy an
+/// attacker-sized token before the token's own cap could reject it.
+pub const CLIENT_AUTH_MAX_PAYLOAD: usize = 16 * 1024;
+
+/// `MSG_CLIENT_AUTH` request — the opaque capability token bytes. Sent to a PS,
+/// and to an EN before direct reads when the cluster runs authz.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct ClientAuthReq {
+    pub token: Vec<u8>,
+}
+
+/// `MSG_CLIENT_AUTH` response. `code == CODE_OK` binds the principal; otherwise
+/// `message` carries the reject reason (`cap_token::AuthReject` label).
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct ClientAuthResp {
+    pub code: u8,
+    pub message: String,
+}
+
+/// Where a value's bytes are, for a client to read them from an extent node
+/// (`MSG_GET` / `MSG_BATCH_GET` with `direct`).
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct ValuePosition {
+    pub extent_id: u64,
+    /// Byte offset of the VALUE bytes inside the extent (the PS already
+    /// skipped the WAL record framing + key, so the client reads value
+    /// bytes directly and needs no WAL format knowledge).
+    pub value_offset: u64,
+    pub value_len: u64,
+    /// EN-side eversion fence for the read.
+    pub eversion: u64,
+    /// Where to read from, and what the entries mean depends on
+    /// `ec_data_shards`:
+    ///
+    /// * `0` — replicated. Every entry is a full copy; read ANY of them (VP
+    ///   extents referenced by live reads are sealed or all-replica-acked at
+    ///   the VP offset), which is why the client rotates its start by a hash.
+    /// * `k > 0` — erasure coded. Entry `i` is the node holding DATA SHARD
+    ///   `i`, positionally, and holds only its own slice of the payload. There
+    ///   is no choice of peer for a given byte.
+    pub replica_addrs: Vec<String>,
+    /// `0` = replicated. Otherwise the number of DATA shards `k`, which with
+    /// `sealed_length` gives the client the geometry it needs to read an
+    /// EC extent directly.
+    ///
+    /// The payload is laid out as `shard0 ‖ shard1 ‖ … ‖ shard_{k-1}` with
+    /// `shard_size = ceil(sealed_length / k)` and the last shard zero-padded,
+    /// so a byte range covers a CONTIGUOUS run of shards and each shard is
+    /// read at its own offset. That is why no Reed-Solomon decode is needed to
+    /// serve a read: decoding is for RECONSTRUCTING a shard whose node cannot
+    /// answer, and a client that cannot do that falls back to the PS.
+    pub ec_data_shards: u32,
+    /// The extent's sealed length — the denominator of `shard_size`. Zero and
+    /// meaningless when `ec_data_shards == 0`.
+    pub ec_sealed_length: u64,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct BatchPutResp {
+    /// `CODE_OK` on full success; otherwise statuses[i] carries the
+    /// per-op result.
+    pub code: u8,
+    pub message: String,
+    /// Per-op status code. Empty iff `code != CODE_OK` AND the failure
+    /// was batch-level (e.g. wrong part_id / stale epoch). Otherwise
+    /// has `req.ops.len()` entries.
+    pub statuses: Vec<u8>,
+}
+
+/// One op inside a `BatchPutReq`: its value lives in the frame's tail —
+/// `value_len` says how much of it belongs to this op. `expires_at = 0` means
+/// no TTL. `inode_hint` / `lease_epoch`: per-op fencing identity (0 =
+/// anonymous); a fenced op gets `CODE_FENCED` in its `BatchPutResp.statuses`
+/// slot without failing the whole batch. `evict_rank`: as `PutReq`'s.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct BatchPutOp {
+    pub key: Vec<u8>,
+    pub value_len: u32,
+    pub expires_at: u64,
+    pub inode_hint: u64,
+    pub lease_epoch: u64,
+    pub evict_rank: u32,
+}
+
+/// Ctrl block of `MSG_BATCH_PUT`; the response is `BatchPutResp`.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct BatchPutReq {
+    pub part_id: u64,
+    pub region_epoch: u64,
+    pub ops: Vec<BatchPutOp>,
+}
+
+/// `BatchGetCtrl::statuses` values.
+pub const BATCH_GET_FOUND: u8 = 0;
+pub const BATCH_GET_NOT_FOUND: u8 = 1;
+pub const BATCH_GET_ERROR: u8 = 2;
+/// Read it from an extent node: the item's `ValuePosition` is the next entry
+/// of `BatchGetCtrl::positions`.
+pub const BATCH_GET_POSITION: u8 = 3;
+/// With `direct`: a range of `BULK_MIN_BYTES` or more that has no position
+/// (held in memory, or on an extent a client cannot read). Read it with its
+/// own `MSG_GET`: the batch neither reads such values one after another nor
+/// gathers them into one frame.
+pub const BATCH_GET_DECLINED: u8 = 4;
+
+/// Ctrl tail of a `MSG_BATCH_GET` response (after the leading code byte).
+/// `value_lens[i]` is item `i`'s slice of the response tail — `0` for every
+/// status but found. `positions` holds one entry per `BATCH_GET_POSITION`, in
+/// item order.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct BatchGetCtrl {
+    pub message: String,
+    pub statuses: Vec<u8>,
+    pub value_lens: Vec<u32>,
+    pub positions: Vec<ValuePosition>,
+}
+
+/// One key of a `BatchGetReq` and the range of its value, as in `GetReq`
+/// (`length == 0` = to the end of the value).
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct BatchGetItem {
+    pub key: Vec<u8>,
+    pub offset: u32,
+    pub length: u32,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct BatchGetReq {
+    pub part_id: u64,
+    pub region_epoch: u64,
+    /// Positions instead of large values, as `GetReq::direct`.
+    pub direct: bool,
+    pub items: Vec<BatchGetItem>,
+}
+
+/// diagnostic: trace where a user_key's MVCC entries live across
+/// memtable / imm / sst — used by the f250 reproducer to localise
+/// data-loss bugs without guessing.
+pub const MSG_DIAG_TRACE_KEY: u8 = 0x52;
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct DiagTraceKeyReq {
+    pub part_id: u64,
+    pub user_key: Vec<u8>,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct DiagTraceKeyResp {
+    pub code: u8,
+    pub message: String,
+    /// Newest seq found in the active memtable, or 0 if absent.
+    pub memtable_seq: u64,
+    /// Per-imm (front..back) newest seq found, 0 = absent.
+    pub imm_seqs: Vec<u64>,
+    /// Per-SST (oldest..newest by vec order) newest seq found, 0 = absent.
+    /// Bloom-gated (mirrors the real GET path).
+    pub sst_seqs: Vec<u64>,
+    /// Same scan but bypassing the bloom filter. A divergence from
+    /// `sst_seqs` (nobloom finds it, bloom-gated returns 0) is a bloom
+    /// FALSE NEGATIVE — the read path silently skips this SST.
+    pub sst_seqs_nobloom: Vec<u64>,
+    /// Per-SST full linear scan over ALL blocks (ignores bloom AND
+    /// find_block_for_key). A divergence from `sst_seqs_nobloom`
+    /// (fullscan finds it, single-block scan returns 0) is a block-
+    /// SELECTION bug in the read path, not data loss.
+    pub sst_seqs_fullscan: Vec<u64>,
+    /// Per-SST table.last_seq (for diagnostic context).
+    pub sst_last_seqs: Vec<u64>,
+}
+
+/// per-partition GC replay-floor + per-SST vp_head snapshot.
+/// Lets `autumn-op info --part P` show WHY a `forcegc P E` on a given extent
+/// would be protected (extent E sits at/before the recovery replay floor →
+/// correct protection, not a bug) without grepping the PS log.
+pub const MSG_DIAG_PARTITION_VP: u8 = 0x58;
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct DiagPartitionVpReq {
+    pub part_id: u64,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct DiagPartitionVpResp {
+    pub code: u8,
+    pub message: String,
+    /// log_stream extent ids in stream order (index 0 = oldest = position 0).
+    pub log_extent_ids: Vec<u64>,
+    /// Per live SST (oldest..newest by vec order): (vp_extent_id, vp_offset).
+    /// The GC replay floor is the MIN stream-position over these vp_extent_ids.
+    pub sst_vp_heads: Vec<(u64, u64)>,
+    /// GC replay floor = MIN stream-position over the SST vp_heads (0 when
+    /// none resolve). GC never punches a NON-EMPTY extent at/after this.
+    pub floor_pos: u64,
+    /// The log extent id at `floor_pos` (0 if the log is empty).
+    pub floor_extent_id: u64,
+    /// `p.vp` seed = the committed log TAIL; the active memtable's next
+    /// rotation stamps its SST vp_head here (so a fresh flush ADVANCES the
+    /// floor toward this). Contrast with `floor_extent_id` (a lagging SST).
+    pub vp_seed_extent_id: u64,
+    pub vp_seed_offset: u64,
+}
+
+// ── Status codes ────────────────────────────────────────────────────────────
+
+pub const CODE_OK: u8 = 0;
+pub const CODE_NOT_FOUND: u8 = 1;
+pub const CODE_INVALID_ARGUMENT: u8 = 2;
+pub const CODE_PRECONDITION: u8 = 3;
+pub const CODE_ERROR: u8 = 4;
+/// regular `Put` value exceeds the
+/// `AUTUMN_PS_MAX_INLINE_BYTES` cap. Caller should split the value into
+/// chunks and stripe-write via `ClusterClient::put_stream_begin`
+/// (client-side striperados — chunks are normal Puts to a
+/// reserved-namespace key + a 45-byte Meta blob at the user key).
+pub const CODE_VALUE_TOO_LARGE: u8 = 5;
+//
+// CODE 6 was `CODE_UPLOAD_NOT_FOUND` for the server-side
+// multipart upload session. Removed (no server-side sessions
+// any more). Code 6 is RESERVED — don't reuse for at least one major
+// version to avoid mis-decoding by stale clients.
+/// Put/Delete/StreamPut rejected because the partition is in the
+/// merge-freeze window. Caller should refresh routing and retry —
+/// the merged topology is committed on the manager and the survivor will
+/// reopen with the wider rg on its next region_sync tick.
+pub const CODE_UNAVAILABLE: u8 = 7;
+
+/// Request's `region_epoch` doesn't match the PS's current
+/// `MgrRegionInfo.region_epoch` — the partition's `rg` has been
+/// rewritten on the manager (split / merge) since the client cached
+/// it. SDK refreshes regions and retries. Reserved for future use as
+/// an inline body code; today the PS surfaces this condition via
+/// `StatusCode::FailedPrecondition` frame error which routes through
+/// the same SDK refresh path.
+pub const CODE_REGION_EPOCH_STALE: u8 = 8;
+/// Lease fencing — storage-layer fencing
+/// token: the PS rejects a write whose stamped `lease_epoch` is
+/// strictly LESS than the per-inode floor the PS has already
+/// observed. A client that has been force-revoked or TTL-revoked
+/// by the manager carries an old `lease_epoch`; without this
+/// fence, the ~5s window between revoke push and the client's
+/// `held_leases` eviction (client-side eviction closes the
+/// user-space half) could still let a stale writer's RPC land at the PS.
+/// SDK maps this to a typed error so apps can re-AcquireLease
+/// and retry.
+pub const CODE_FENCED: u8 = 9;
+/// The op was handed to storage and then given up: it may or may not have
+/// been applied (`StatusCode::OutcomeUnknown`). `CODE_UNAVAILABLE` on a write
+/// means it was not applied.
+pub const CODE_OUTCOME_UNKNOWN: u8 = 10;
+/// `MSG_GET` answered with where the value is (`ValuePosition` in ctrl), not
+/// the value.
+pub const CODE_POSITION: u8 = 11;
+
+/// The `CODE_*` byte that carries a handler `StatusCode` in a response whose
+/// ctrl holds a code instead of a frame-level error (`MSG_GET`).
+///
+/// The two spaces agree only up to 3. `StatusCode::Unavailable` is 5, which
+/// here is `CODE_VALUE_TOO_LARGE`: a raw cast turned a retryable GC-pin
+/// refusal on a bulk read into a terminal "value too large".
+pub fn code_for_status(status: crate::StatusCode) -> u8 {
+    use crate::StatusCode;
+    match status {
+        StatusCode::Ok => CODE_OK,
+        StatusCode::NotFound => CODE_NOT_FOUND,
+        StatusCode::InvalidArgument => CODE_INVALID_ARGUMENT,
+        StatusCode::FailedPrecondition => CODE_PRECONDITION,
+        StatusCode::Unavailable => CODE_UNAVAILABLE,
+        StatusCode::OutcomeUnknown => CODE_OUTCOME_UNKNOWN,
+        StatusCode::Internal
+        | StatusCode::AlreadyExists
+        | StatusCode::PermissionDenied
+        | StatusCode::NamespaceUnknown => CODE_ERROR,
+    }
+}
+
+// ── Request/Response types ─────────────────────────────────────────────────
+
+/// The `MSG_PUT` ctrl; the value is the frame's tail.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct PutReq {
+    pub part_id: u64,
+    pub key: Vec<u8>,
+    /// Expiration timestamp; zero means no expiration.
+    pub expires_at: u64,
+    /// TiKV-style region epoch: client stamps the epoch from its
+    /// routing cache; PS rejects with FailedPrecondition when its own
+    /// epoch differs (split / merge has happened). `0` = skip check
+    /// (bootstrap, tests, legacy paths).
+    pub region_epoch: u64,
+    /// Lease fencing — storage-layer fencing.
+    /// `inode_hint = 0` (the default) means "no fencing for this
+    /// write" (KV CLI, non-lease-aware paths, bootstrap, tests).
+    /// `inode_hint != 0` means "this write logically belongs to
+    /// inode N; please apply per-inode fencing using `lease_epoch`."
+    pub inode_hint: u64,
+    /// Monotonic per-inode epoch from the manager
+    /// (`MgrInodeLeaseInfo.version` from the last successful
+    /// AcquireLease). PS rejects with `CODE_FENCED` when
+    /// `inode_hint != 0` AND `lease_epoch < current_floor`. The
+    /// PS also bumps its in-memory floor to
+    /// `max(floor, lease_epoch)` on every accepted write so a
+    /// new writer's first stamped write learns the higher floor.
+    pub lease_epoch: u64,
+    /// Memory-tier eviction hint: among values used at about the same time,
+    /// a higher rank is evicted first. Ignored where no memory tier holds
+    /// the value; 0 = none.
+    pub evict_rank: u32,
+}
+
+/// `MSG_GET_AM` request: `GetReq` plus where the value goes.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct GetAmReq {
+    pub part_id: u64,
+    pub key: Vec<u8>,
+    pub offset: u32,
+    pub length: u32,
+    pub region_epoch: u64,
+    /// The AM tag the client expects the value under.
+    pub tag: u64,
+    /// A longer value is not sent (`CODE_VALUE_TOO_LARGE`, with its length).
+    pub max_len: u64,
+}
+
+/// `MSG_GET_AM` reply. `value_len` is the value's length for `CODE_OK` (sent
+/// as the AM) and `CODE_VALUE_TOO_LARGE` (not sent); 0 otherwise.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct GetAmResp {
+    pub code: u8,
+    pub message: String,
+    pub value_len: u64,
+}
+
+/// `MSG_COMPARE_WRITE` ctrl; the value (empty for a delete) is the frame's
+/// tail. `expected` is capped at `MAX_COMPARE_PUT_BYTES`.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct CompareWriteReq {
+    pub part_id: u64,
+    pub region_epoch: u64,
+    pub key: Vec<u8>,
+    /// None requires absence, Some requires exact visible-value equality.
+    pub expected: Option<Vec<u8>>,
+    /// True writes a tombstone instead of the tail.
+    pub delete: bool,
+    /// Absolute unix seconds; 0 = no expiry.
+    pub expires_at: u64,
+    /// Fence identity, as in `PutReq`. 0 = anonymous (no fence check).
+    pub inode_hint: u64,
+    pub lease_epoch: u64,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct PutResp {
+    pub code: u8,
+    pub message: String,
+    pub key: Vec<u8>,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct GetReq {
+    pub part_id: u64,
+    pub key: Vec<u8>,
+    /// Sub-range read: byte offset within the value. 0 = start.
+    pub offset: u32,
+    /// Sub-range read: number of bytes to read. 0 = read entire value.
+    pub length: u32,
+    /// See `PutReq.region_epoch`.
+    pub region_epoch: u64,
+    /// The caller can read an extent node itself: a large ValuePointer range
+    /// may be answered with its position (`CODE_POSITION`).
+    pub direct: bool,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct DeleteReq {
+    pub part_id: u64,
+    pub key: Vec<u8>,
+    /// See `PutReq.region_epoch`.
+    pub region_epoch: u64,
+    /// Deletes are fenced like puts —
+    /// a revoked writer's late truncate/unlink must not remove the new
+    /// writer's extents. 0 = anonymous (skip fencing).
+    pub inode_hint: u64,
+    pub lease_epoch: u64,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct DeleteResp {
+    pub code: u8,
+    pub message: String,
+    pub key: Vec<u8>,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct HeadReq {
+    pub part_id: u64,
+    pub key: Vec<u8>,
+    /// See `PutReq.region_epoch`.
+    pub region_epoch: u64,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct HeadResp {
+    pub code: u8,
+    pub message: String,
+    pub found: bool,
+    pub value_length: u64,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct RangeReq {
+    pub part_id: u64,
+    pub prefix: Vec<u8>,
+    /// Where the scan begins, **INCLUSIVE** — an entry whose key equals
+    /// `start` IS returned.
+    ///
+    /// To resume strictly after key K, pass `K ++ 0x00`. That is exact for
+    /// arbitrary user keys: `K ++ 0x00` is K's immediate successor in
+    /// user-key byte order (every user key > K is >= `K ++ 0x00`), and the
+    /// PS orders internal keys with a comparator that compares user keys
+    /// FIRST (`cmp_internal_keys` — the fixed-width inverted-seq suffix only
+    /// breaks ties), so the seek lands after every MVCC version of K and
+    /// before every version of every later key — a real key that IS
+    /// `K ++ 0x00 ++ …` included (inclusive start, nothing skipped, nothing
+    /// double-counted). Range clients paginate exactly that way; unit and
+    /// integration tests pin the page-boundary property.
+    ///
+    /// (Under the older separator encoding — `user ++ 0x00 ++ suffix`
+    /// compared as raw bytes — this idiom double-counted the boundary key
+    /// and `K ++ 0x01` lost `K ++ 0x00 ++ …` keys, which forced a
+    /// pass-last-key-and-drop-the-duplicate dance. The comparator removed
+    /// the whole trap.)
+    pub start: Vec<u8>,
+    pub limit: u32,
+    /// See `PutReq.region_epoch`. Especially important for range:
+    /// `handle_range` historically `continue`d on out-of-range keys
+    /// (rpc_handlers.rs:351), returning `Ok(RangeResp{entries: ...})`
+    /// with valid-but-partial data after a split. Stamping epoch
+    /// converts the silent-truncation failure into a refresh+retry.
+    pub region_epoch: u64,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct RangeEntry {
+    pub key: Vec<u8>,
+    pub value: Vec<u8>,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct RangeResp {
+    pub code: u8,
+    pub message: String,
+    pub entries: Vec<RangeEntry>,
+    pub has_more: bool,
+    /// CockroachDB-style ResumeSpan cursor: the PS's authoritative
+    /// `rg.end_key` (the byte AFTER the last key this partition owns).
+    /// On a successful scan, the SDK uses this as the start_key for
+    /// the next partition lookup — so a split that happened DURING
+    /// the scan auto-resolves: the cursor naturally falls into the
+    /// new sibling's range on the next ps_call. Empty = end of
+    /// keyspace (last partition's end_key was unbounded).
+    pub cur_end_key: Vec<u8>,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct SplitPartReq {
+    pub part_id: u64,
+    /// (design doc D4): operator/controller-specified split
+    /// point. When `Some(key)`, the PS validates the key lies STRICTLY inside
+    /// the partition's authoritative `(start_key, end_key)` interval and uses
+    /// it verbatim as `mid_key`, SKIPPING both median selection AND the
+    /// `>= 2 keys` gate — so an empty / near-empty partition can be split
+    /// (the presplit primitive: cut an empty range into empty children). The key is an ARBITRARY byte string; the PS is
+    /// app-agnostic (D5) — it never inspects namespace/prefix structure.
+    /// `None` = legacy behaviour (median-by-key-count over live user keys,
+    /// which still enforces `>= 2 keys`).
+    pub at_key: Option<Vec<u8>>,
+    /// The manager's ledger op this split serves; 0 = untracked (policy,
+    /// presplit, tests). Carried into the commit and the PS's outcome report.
+    pub op_id: u64,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct SplitPartResp {
+    pub code: u8,
+    pub message: String,
+}
+
+// partition merge. Sent to the SURVIVOR's PS; both partitions
+// must currently be served by that PS (cross-PS merge unsupported).
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct MergePartReq {
+    pub survivor_part_id: u64,
+    pub victim_part_id: u64,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct MergePartResp {
+    pub code: u8,
+    pub message: String,
+}
+
+// PrepareMerge-style freeze RPC. The CLI sends this to each
+// participating partition (survivor + victim) BEFORE capturing
+// commit_length so the merge txn cannot lose writes that would otherwise
+// race the FLUSH→commit window.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct MergeFreezeReq {
+    pub part_id: u64,
+    /// true = enter frozen state (drain + flush + halt new writes);
+    /// false = leave frozen state (used by the CLI's rollback path on
+    /// manager-side failure).
+    pub freeze: bool,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct MergeFreezeResp {
+    pub code: u8,
+    pub message: String,
+    /// On a freeze OK: the log position the drain checkpointed at
+    /// (`(tail extent, committed end)`). The manager's capture must measure
+    /// exactly this, or the partition took writes after the drain. `(0, 0)`
+    /// otherwise.
+    pub log_tail_extent_id: u64,
+    pub log_end: u64,
+}
+
+// manager → PS "seal + roll these open tails" (see MSG_ROLL_TAILS).
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct RollTailsReq {
+    pub part_id: u64,
+    /// `(stream_id, expected_tail_extent_id)` pairs. The PS seals+rolls each
+    /// stream whose current tail still equals `expected_tail_extent_id`
+    /// (idempotent: a stale/already-rolled entry is skipped).
+    pub entries: Vec<(u64, u64)>,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct RollTailsResp {
+    pub code: u8,
+    /// Number of tails actually sealed+rolled this call (0 if all were stale
+    /// or the partition isn't served here).
+    pub rolled: u32,
+    pub message: String,
+}
+
+// StreamPutReq REMOVED with MSG_STREAM_PUT (see the reserved
+// constant note near the msg_type list).
+// PutBegin / PutChunk / PutCommit / PutAbort req/resp removed in
+// Stripe-write is now pure client-side (Ceph striperados pattern):
+// `ClusterClient::put_stream_begin` returns a `PutStreamHandle` that
+// writes each chunk via plain `MSG_PUT` to a reserved-namespace key,
+// then writes a 45-byte Meta blob to the user key as the atomic
+// commit point.
+
+/// Maintenance operations.
+///
+/// **Wire change (backward-incompatible)**: carries the auto-GC filter
+/// parameters (`gc_ratio`, `gc_max_size`, `gc_stream_debt`,
+/// `gc_dead_bytes_high`, `gc_empty_only`). Old binaries
+/// that still encode the 3-field shape will fail to decode against
+/// the new struct, and vice versa. Same-commit upgrade required;
+/// cluster.sh handles this by stopping all roles before restart.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct MaintenanceReq {
+    pub part_id: u64,
+    /// 0 = compact, 1 = auto_gc, 2 = force_gc, 3 = flush
+    pub op: u8,
+    pub extent_ids: Vec<u64>,
+    /// filter — discard ratio threshold (0.0..=1.0). `None` → 0.4
+    /// (`--gc-discard-ratio`). Used only when `op == MAINTENANCE_AUTO_GC`.
+    pub gc_ratio: Option<f64>,
+    /// filter — only consider sealed extents whose `sealed_length`
+    /// is at most this many bytes. Combined with a lower `gc_ratio`
+    /// lets the caller say "punch small extents at even 10% dead".
+    pub gc_max_size: Option<u64>,
+    /// stream-level dead-byte high-water hint. When the partition's
+    /// total reclaimable bytes exceed this, the per-extent ratio is
+    /// halved for this dispatch.
+    pub gc_stream_debt: Option<u64>,
+    /// per-extent ABSOLUTE dead-byte floor: an extent holding at least this
+    /// many dead bytes qualifies whatever its ratio. `None` → no absolute path
+    /// (ratio only).
+    ///
+    /// Its source is the advisory's `gc_debt_high`, deliberately: the advisory
+    /// fires on absolute dead bytes, so selection has to be able to answer on
+    /// the same terms. It is NOT `gc_stream_debt` — that is a STREAM-level
+    /// total that relaxes the ratio, a different judgement about a different
+    /// quantity, and folding two judgements into one number is the shape of
+    /// the bug this exists to fix. 3 GiB dead inside a 16 GiB extent is a
+    /// ratio of 0.195, under every gate, and it is still 3 GiB.
+    ///
+    /// `Some(0)` means no floor, not "take everything".
+    pub gc_dead_bytes_high: Option<u64>,
+    /// only pick `sealed_length == 0` non-tail extents (cheapest
+    /// possible GC — no rewrite, just punch_holes). Overrides
+    /// `gc_ratio` / `gc_max_size` when true.
+    pub gc_empty_only: bool,
+    /// these params ARE the cluster's standing GC policy, not a one-off
+    /// override — so the PS may adopt them as the basis its debt GAUGE is
+    /// judged by, which is what the advisory reads.
+    ///
+    /// It is an EXPLICIT signal because the alternative does not work: the PS
+    /// cannot tell a controller dispatch from an operator's
+    /// `autumn-op gc --ratio 0.9 --dead-bytes 100G PART` by looking at which
+    /// fields are populated, and guessing wrong strands garbage silently —
+    /// the gauge answers a question nobody asked, the advisory goes quiet, and
+    /// the bytes sit until the partition reopens.
+    ///
+    /// Only the manager sets it: for its own auto-policy actuation, and for a
+    /// submitted op that named no gc knobs at all (which it then fills in from
+    /// cluster config, so "just GC this partition" means the usual GC).
+    pub gc_policy_is_standing: bool,
+    /// manager op-ledger correlation id. `0` = untracked (the PS-local
+    /// maintenance scheduler and legacy SDK callers): the PS runs the op but
+    /// records no terminal `MaintenanceOutcome`. Non-zero = the manager
+    /// submitted this op through the ledger and wants the outcome reported back
+    /// (piggybacked on the load heartbeat).
+    pub op_id: u64,
+}
+
+pub const MAINTENANCE_COMPACT: u8 = 0;
+pub const MAINTENANCE_AUTO_GC: u8 = 1;
+pub const MAINTENANCE_FORCE_GC: u8 = 2;
+pub const MAINTENANCE_FLUSH: u8 = 3;
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct MaintenanceResp {
+    pub code: u8,
+    pub message: String,
+}
+
+/// Snapshot of a partition's pending log_stream discards. Used by
+/// `autumn-client info` to surface GC backlog without persisting any
+/// counter state at the manager.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct GetDiscardsReq {
+    pub part_id: u64,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct GetDiscardsResp {
+    pub code: u8,
+    pub message: String,
+    /// (extent_id, reclaimable_bytes). Extents not currently in the
+    /// partition's `log_stream.extent_ids` are filtered out by the handler
+    /// (matches what `background_gc_loop` already does via `valid_discard`).
+    pub discards: Vec<(u64, i64)>,
+}
+
+// ── MetaStream persistence types ────────────────────────────────────────────
+
+/// SSTable location in rowStream.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct SstLocation {
+    pub extent_id: u64,
+    pub offset: u64,
+    pub len: u64,
+}
+
+/// Checkpoint written to metaStream after each flush/compaction.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct TableLocations {
+    pub locs: Vec<SstLocation>,
+    pub vp_extent_id: u64,
+    pub vp_offset: u64,
+    /// Unused; written as 0. (It once let recovery split a merged log into
+    /// per-source regions; a merged open now starts at the latest source
+    /// cursor and needs none.) Kept because the checkpoint format is frozen.
+    pub log_extent_count: u32,
+    /// Snapshot of the partition's per-ino fence
+    /// floors `(ino, lease_epoch)` at checkpoint time. Recovery seeds
+    /// `PartitionData.fence_floors` from this, then WAL replay max-merges
+    /// any later `OP_FENCE_BUMP` records — floors raised before the
+    /// replay window survive PS restarts. Floors change only on lease
+    /// epoch bumps (rare), so this stays small. Empty in legacy
+    /// checkpoints. rkyv struct change ⇒ same-commit cluster upgrade.
+    pub fence_floors: Vec<(u64, u64)>,
+}
+
+// ── Helper: extract part_id from any partition RPC payload ─────────────────
+
+/// Extract the part_id from a partition RPC request payload.
+/// Decodes the full request type based on msg_type. Returns 0 if decoding fails.
+pub fn extract_part_id(msg_type: u8, payload: &[u8]) -> u64 {
+    match msg_type {
+        MSG_COMPARE_WRITE => rkyv_decode::<CompareWriteReq>(payload)
+            .map(|r| r.part_id)
+            .unwrap_or(0),
+        MSG_PUT => rkyv_decode::<PutReq>(payload)
+            .map(|r| r.part_id)
+            .unwrap_or(0),
+        MSG_GET => rkyv_decode::<GetReq>(payload)
+            .map(|r| r.part_id)
+            .unwrap_or(0),
+        MSG_GET_AM => rkyv_decode::<GetAmReq>(payload)
+            .map(|r| r.part_id)
+            .unwrap_or(0),
+        MSG_BATCH_PUT => rkyv_decode::<BatchPutReq>(payload)
+            .map(|r| r.part_id)
+            .unwrap_or(0),
+        MSG_DELETE => rkyv_decode::<DeleteReq>(payload)
+            .map(|r| r.part_id)
+            .unwrap_or(0),
+        MSG_HEAD => rkyv_decode::<HeadReq>(payload)
+            .map(|r| r.part_id)
+            .unwrap_or(0),
+        MSG_RANGE => rkyv_decode::<RangeReq>(payload)
+            .map(|r| r.part_id)
+            .unwrap_or(0),
+        MSG_SPLIT_PART => rkyv_decode::<SplitPartReq>(payload)
+            .map(|r| r.part_id)
+            .unwrap_or(0),
+        MSG_MAINTENANCE => rkyv_decode::<MaintenanceReq>(payload)
+            .map(|r| r.part_id)
+            .unwrap_or(0),
+        MSG_GET_DISCARDS => rkyv_decode::<GetDiscardsReq>(payload)
+            .map(|r| r.part_id)
+            .unwrap_or(0),
+        MSG_MERGE_PART => rkyv_decode::<MergePartReq>(payload)
+            .map(|r| r.survivor_part_id)
+            .unwrap_or(0),
+        MSG_MERGE_FREEZE => rkyv_decode::<MergeFreezeReq>(payload)
+            .map(|r| r.part_id)
+            .unwrap_or(0),
+        MSG_ROLL_TAILS => rkyv_decode::<RollTailsReq>(payload)
+            .map(|r| r.part_id)
+            .unwrap_or(0),
+        MSG_DIAG_TRACE_KEY => rkyv_decode::<DiagTraceKeyReq>(payload)
+            .map(|r| r.part_id)
+            .unwrap_or(0),
+        MSG_BATCH_DELETE => rkyv_decode::<BatchDeleteReq>(payload)
+            .map(|r| r.part_id)
+            .unwrap_or(0),
+        MSG_BATCH_GET => rkyv_decode::<BatchGetReq>(payload)
+            .map(|r| r.part_id)
+            .unwrap_or(0),
+        MSG_DIAG_PARTITION_VP => rkyv_decode::<DiagPartitionVpReq>(payload)
+            .map(|r| r.part_id)
+            .unwrap_or(0),
+        _ => 0,
+    }
+}
+
+#[cfg(test)]
+mod msg_type_tests {
+    use super::*;
+
+    #[test]
+    fn msg_type_constants_dont_collide() {
+        // Every `pub const MSG_*` above; a new opcode goes here too.
+        let all = [
+            MSG_PUT,
+            MSG_COMPARE_WRITE,
+            MSG_GET_AM,
+            MSG_DELETE,
+            MSG_HEAD,
+            MSG_RANGE,
+            MSG_SPLIT_PART,
+            MSG_MAINTENANCE,
+            MSG_GET_DISCARDS,
+            MSG_MERGE_PART,
+            MSG_MERGE_FREEZE,
+            MSG_GET,
+            MSG_BATCH_PUT,
+            MSG_BATCH_DELETE,
+            MSG_BATCH_GET,
+            MSG_CLIENT_AUTH,
+            MSG_ROLL_TAILS,
+            MSG_DIAG_TRACE_KEY,
+            MSG_DIAG_PARTITION_VP,
+        ];
+        for i in 0..all.len() {
+            for j in i + 1..all.len() {
+                assert_ne!(all[i], all[j], "msg_type collision at index {} vs {}", i, j);
+            }
+        }
+    }
+
+    #[test]
+    fn extract_part_id_covers_diag_partition_vp() {
+        // Regression: without the MSG_DIAG_PARTITION_VP arm, extract_part_id
+        // falls to `_ => 0`, so the PS conn layer misroutes the diag frame as
+        // NotFound (0 != owner_part) and `autumn-op info --part` never shows the
+        // replay floor. Assert the arm resolves the real part_id.
+        let payload = rkyv_encode(&DiagPartitionVpReq { part_id: 4242 });
+        assert_eq!(extract_part_id(MSG_DIAG_PARTITION_VP, &payload), 4242);
+    }
+
+    #[test]
+    fn extract_part_id_covers_put_and_batch_put() {
+        let put = rkyv_encode(&PutReq {
+            part_id: 76,
+            key: b"k".to_vec(),
+            expires_at: 0,
+            region_epoch: 3,
+            inode_hint: 0,
+            lease_epoch: 0,
+            evict_rank: 0,
+        });
+        assert_eq!(extract_part_id(MSG_PUT, &put), 76);
+        // Same regression, and it bit during development: a keyed data RPC with
+        // no arm here resolves to 0, the conn layer compares that against the
+        // partition it serves, and every frame comes back NotFound — the whole
+        // batched write path fails while looking like a routing problem.
+        let payload = rkyv_encode(&BatchPutReq {
+            part_id: 77,
+            region_epoch: 3,
+            ops: vec![BatchPutOp {
+                key: b"k".to_vec(),
+                value_len: 4,
+                expires_at: 0,
+                inode_hint: 0,
+                lease_epoch: 0,
+                evict_rank: 0,
+            }],
+        });
+        assert_eq!(extract_part_id(MSG_BATCH_PUT, &payload), 77);
+    }
+
+    /// Same regression class as the bulk case above, and the one the batch
+    /// delete shipped with: with no `MSG_BATCH_DELETE` arm, `extract_part_id`
+    /// falls to `_ => 0`, the PS conn layer compares 0 against the partition it
+    /// serves, and every frame comes back NotFound. Partition ids start at 1,
+    /// so the compare can never accidentally succeed -- `delete_many` fails
+    /// every key while looking like a routing problem.
+    #[test]
+    fn extract_part_id_covers_batch_delete() {
+        let payload = rkyv_encode(&BatchDeleteReq {
+            part_id: 77,
+            region_epoch: 3,
+            ops: vec![BatchDeleteOp {
+                key: b"k".to_vec(),
+                inode_hint: 0,
+                lease_epoch: 0,
+            }],
+        });
+        assert_eq!(extract_part_id(MSG_BATCH_DELETE, &payload), 77);
+    }
+}
+

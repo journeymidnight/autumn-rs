@@ -1,0 +1,248 @@
+//! PS membership against a real etcd: a PS that dies stays in the expected
+//! fleet (evicted, not forgotten) across a leader change, and only an
+//! operator's remove — refused while the PS is live — takes it out.
+
+mod support;
+
+use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+use autumn_rpc::client::RpcClient;
+use autumn_rpc::manager_rpc::*;
+use autumn_rpc::version_hello::Role;
+
+use support::{pick_addr, start_etcd};
+
+fn start_stoppable_etcd_manager(mgr_addr: SocketAddr, etcd_endpoint: String) -> Arc<AtomicBool> {
+    let flag = Arc::new(AtomicBool::new(false));
+    let flag_thread = flag.clone();
+    std::thread::spawn(move || {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let manager = autumn_manager::AutumnManager::new_with_etcd(vec![etcd_endpoint], support::manager_identity())
+                .await
+                .expect("new manager with etcd");
+            compio::runtime::spawn(async move {
+                let _ = manager.serve(mgr_addr).await;
+            })
+            .detach();
+            while !flag_thread.load(Ordering::Acquire) {
+                compio::time::sleep(Duration::from_millis(50)).await;
+            }
+        });
+    });
+    support::wait_accepting(mgr_addr, "start_stoppable_etcd_manager");
+    flag
+}
+
+async fn code_of(mgr: &RpcClient, msg: u8, payload: Vec<u8>) -> CodeResp {
+    let resp = mgr.call(msg, payload.into()).await.expect("rpc");
+    rkyv_decode(&resp).expect("decode CodeResp")
+}
+
+async fn register(mgr: &RpcClient, ps_id: u64) -> CodeResp {
+    let req = RegisterPsReq {
+        ps_id,
+        address: format!("127.0.0.1:{}", 19000 + ps_id),
+        slot_cap: 0,
+    };
+    code_of(mgr, MSG_REGISTER_PS, rkyv_encode(&req).to_vec()).await
+}
+
+async fn heartbeat(mgr: &RpcClient, ps_id: u64) {
+    let req = HeartbeatPsReq {
+        ps_id,
+        slot_cap: 0,
+        open_parts: Vec::new(),
+        metrics_addr: String::new(),
+    };
+    let r = code_of(mgr, MSG_HEARTBEAT_PS, rkyv_encode(&req).to_vec()).await;
+    assert_eq!(r.code, CODE_OK, "heartbeat ps {ps_id}: {}", r.message);
+}
+
+async fn remove(mgr: &RpcClient, ps_id: u64) -> CodeResp {
+    let req = RemoveMemberReq {
+        role: MEMBER_ROLE_PS,
+        id: ps_id,
+        set_by: "ps-members-test".to_string(),
+    };
+    code_of(mgr, MSG_REMOVE_MEMBER, rkyv_encode(&req).to_vec()).await
+}
+
+async fn ps_servers(mgr: &RpcClient) -> Vec<PsOverview> {
+    let resp = mgr
+        .call(MSG_GET_CLUSTER_OVERVIEW, bytes::Bytes::new())
+        .await
+        .expect("overview rpc");
+    let ov: GetClusterOverviewResp = rkyv_decode(&resp).expect("decode overview");
+    assert_eq!(ov.code, CODE_OK, "overview: {}", ov.message);
+    ov.ps_servers
+}
+
+/// Heartbeat each of `ids` once a second for `secs` seconds.
+async fn keep_alive(mgr: &RpcClient, ids: &[u64], secs: u64) {
+    for _ in 0..secs {
+        for &ps_id in ids {
+            heartbeat(mgr, ps_id).await;
+        }
+        compio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+/// Heartbeat PS 1 and 2 (never 3) for `secs` seconds.
+async fn keep_alive_1_2(mgr: &RpcClient, secs: u64) {
+    keep_alive(mgr, &[1, 2], secs).await;
+}
+
+async fn connect_leader(addr: SocketAddr) -> std::rc::Rc<RpcClient> {
+    let mgr = RpcClient::connect_as(addr, Role::Admin, None)
+        .await
+        .expect("connect");
+    // Lease TTL 10 s plus the election tick. The successor seeds a fresh
+    // heartbeat for every replayed PS, so 1 and 2 survive the wait.
+    for _ in 0..40 {
+        let resp = mgr
+            .call(MSG_GET_CLUSTER_OVERVIEW, bytes::Bytes::new())
+            .await
+            .expect("overview rpc");
+        let ov: GetClusterOverviewResp = rkyv_decode(&resp).expect("decode");
+        if ov.code == CODE_OK {
+            return mgr;
+        }
+        compio::time::sleep(Duration::from_secs(1)).await;
+    }
+    panic!("manager at {addr} never became leader");
+}
+
+#[test]
+fn an_evicted_ps_stays_expected_across_a_leader_change_until_removed() {
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        let (_etcd_guard, etcd_endpoint) = start_etcd().await;
+
+        let mgr1_addr = pick_addr();
+        let mgr1_flag = start_stoppable_etcd_manager(mgr1_addr, etcd_endpoint.clone());
+        compio::time::sleep(Duration::from_secs(2)).await;
+        let mgr1 = RpcClient::connect_as(mgr1_addr, Role::Admin, None)
+            .await
+            .expect("connect mgr1");
+
+        for ps_id in [1, 2, 3] {
+            let r = register(&mgr1, ps_id).await;
+            assert_eq!(r.code, CODE_OK, "register ps {ps_id}: {}", r.message);
+        }
+        // PS 3 goes silent; the 10 s eviction drops it from the live registry.
+        keep_alive_1_2(&mgr1, 14).await;
+
+        let servers = ps_servers(&mgr1).await;
+        let ids: Vec<u64> = servers.iter().map(|p| p.ps_id).collect();
+        assert_eq!(ids, vec![1, 2, 3], "the evicted PS must still be listed");
+        let ps3 = &servers[2];
+        assert!(ps3.evicted_at_ms > 0, "ps 3 not marked evicted: {ps3:?}");
+        assert_eq!(ps3.last_heartbeat_secs_ago, u64::MAX);
+        assert!(!ps3.ready());
+        assert!(servers[0].evicted_at_ms == 0 && servers[1].evicted_at_ms == 0);
+        assert!(servers.iter().all(|p| p.joined_at_ms > 0));
+        let evicted_at = ps3.evicted_at_ms;
+
+        let r = remove(&mgr1, 1).await;
+        assert_eq!(r.code, CODE_PRECONDITION, "a live PS must not be removable: {}", r.message);
+        let r = remove(&mgr1, 9).await;
+        assert_eq!(r.code, CODE_NOT_FOUND, "{}", r.message);
+
+        // Leader change: the successor knows the fleet from etcd alone.
+        let mgr2_addr = pick_addr();
+        let _mgr2_flag = start_stoppable_etcd_manager(mgr2_addr, etcd_endpoint.clone());
+        mgr1_flag.store(true, Ordering::Release);
+        let mgr2 = connect_leader(mgr2_addr).await;
+        keep_alive_1_2(&mgr2, 2).await;
+
+        let servers = ps_servers(&mgr2).await;
+        let ids: Vec<u64> = servers.iter().map(|p| p.ps_id).collect();
+        assert_eq!(ids, vec![1, 2, 3], "membership must survive the leader change");
+        assert_eq!(servers[2].evicted_at_ms, evicted_at);
+
+        let r = remove(&mgr2, 3).await;
+        assert_eq!(r.code, CODE_OK, "remove evicted ps 3: {}", r.message);
+        let ids: Vec<u64> = ps_servers(&mgr2).await.iter().map(|p| p.ps_id).collect();
+        assert_eq!(ids, vec![1, 2]);
+        let r = remove(&mgr2, 3).await;
+        assert_eq!(r.code, CODE_NOT_FOUND, "{}", r.message);
+
+        let etcd = autumn_etcd::EtcdClient::connect(&etcd_endpoint)
+            .await
+            .expect("etcd connect");
+        assert!(etcd.get("psMembers/3").await.expect("get").kvs.is_empty());
+        assert!(!etcd.get("psMembers/1").await.expect("get").kvs.is_empty());
+
+        // A removed id that starts again simply rejoins.
+        let r = register(&mgr2, 3).await;
+        assert_eq!(r.code, CODE_OK, "{}", r.message);
+        let servers = ps_servers(&mgr2).await;
+        assert_eq!(servers.len(), 3);
+        assert_eq!(servers[2].evicted_at_ms, 0);
+    });
+}
+
+/// A standby that waited longer than the PS timeout before winning must give
+/// every PS it replays a fresh window: its clocks date from its own start
+/// (a standby answers heartbeats NOT_LEADER). Healthy PSes stay; a silent one
+/// goes after the window; one the old leader evicted is not brought back.
+#[test]
+fn a_standby_promoted_late_keeps_the_heartbeating_fleet() {
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        let (_etcd_guard, etcd_endpoint) = start_etcd().await;
+
+        let mgr1_addr = pick_addr();
+        let mgr1_flag = start_stoppable_etcd_manager(mgr1_addr, etcd_endpoint.clone());
+        compio::time::sleep(Duration::from_secs(2)).await;
+        let mgr1 = RpcClient::connect_as(mgr1_addr, Role::Admin, None)
+            .await
+            .expect("connect mgr1");
+        for ps_id in [1, 2, 3, 4] {
+            let r = register(&mgr1, ps_id).await;
+            assert_eq!(r.code, CODE_OK, "register ps {ps_id}: {}", r.message);
+        }
+
+        // The standby replays 1-4 now, then ages past the 10 s timeout while
+        // the leader evicts the silent PS 4.
+        let mgr2_addr = pick_addr();
+        let _mgr2_flag = start_stoppable_etcd_manager(mgr2_addr, etcd_endpoint.clone());
+        keep_alive(&mgr1, &[1, 2, 3], 14).await;
+        let servers = ps_servers(&mgr1).await;
+        assert!(servers[3].evicted_at_ms > 0, "ps 4 not evicted: {:?}", servers[3]);
+
+        mgr1_flag.store(true, Ordering::Release);
+        let mgr2 = connect_leader(mgr2_addr).await;
+
+        // A PS reaches the new leader only after rotating to it: the first
+        // heartbeat lands past the liveness loop's first 2 s tick.
+        compio::time::sleep(Duration::from_secs(3)).await;
+        keep_alive_1_2(&mgr2, 4).await;
+        let r = code_of(
+            &mgr2,
+            MSG_HEARTBEAT_PS,
+            rkyv_encode(&HeartbeatPsReq {
+                ps_id: 4,
+                slot_cap: 0,
+                open_parts: Vec::new(),
+                metrics_addr: String::new(),
+            })
+            .to_vec(),
+        )
+        .await;
+        assert_eq!(r.code, CODE_NOT_FOUND, "evicted ps 4 came back: {}", r.message);
+        let ps4 = &ps_servers(&mgr2).await[3];
+        assert_eq!(ps4.last_heartbeat_secs_ago, u64::MAX, "evicted ps 4 has a clock: {ps4:?}");
+
+        // PS 3 stopped at the leader change: evicted once the window runs out.
+        keep_alive_1_2(&mgr2, 10).await;
+        let servers = ps_servers(&mgr2).await;
+        let evicted: Vec<u64> = servers
+            .iter()
+            .filter(|p| p.evicted_at_ms > 0)
+            .map(|p| p.ps_id)
+            .collect();
+        assert_eq!(evicted, vec![3, 4], "{servers:?}");
+    });
+}

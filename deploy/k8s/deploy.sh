@@ -1,0 +1,154 @@
+#!/usr/bin/env bash
+# Deploy autumn-rs to the cluster kubectl currently points at.
+#
+# The image (registry AND tag) is not committed: it comes from the environment,
+# so a deploy never dirties git:
+#
+#   export AUTUMN_IMAGE_REPO=<registry>/<namespace>/autumn-rs
+#   export AUTUMN_IMAGE_TAG=<tag>              # optional; defaults to git HEAD
+#   deploy/k8s/deploy.sh                       # apply
+#   deploy/k8s/deploy.sh --restart             # apply + stop-the-world restart
+#
+# Optional:
+#   AUTUMN_KUSTOMIZE_DIR   what to render (default: this dir, the generic base).
+#                          Point it at your own overlay that lists this dir as
+#                          its base to change replicas, StorageClass, node pinning.
+#   AUTUMN_EN_COUNT        extent nodes on a fresh install (default: the
+#                          AUTUMN_EXPECT_NODES of the rendered ConfigMap)
+#   AUTUMN_EN_ORDINALS     explicit extent-node ordinals, e.g. "0 5 6"
+#   AUTUMN_EN_CPU, AUTUMN_EN_NODESELECTOR=key=value   see scripts/en-workload.sh
+#   AUTUMN_AUTH_DISABLE=1  skip generating the data-plane signing key
+#
+# The manifests carry the placeholder `autumn-rs:latest`; this script rewrites
+# it at apply time.
+set -euo pipefail
+
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+kdir="${AUTUMN_KUSTOMIZE_DIR:-$here}"
+
+: "${AUTUMN_IMAGE_REPO:?set AUTUMN_IMAGE_REPO, e.g. <registry>/<namespace>/autumn-rs}"
+: "${AUTUMN_IMAGE_TAG:=$(git -C "$here" rev-parse HEAD)}"
+image="${AUTUMN_IMAGE_REPO}:${AUTUMN_IMAGE_TAG}"
+
+# The cluster secret is REQUIRED: the manager, PS and EN refuse to start
+# without it, and it authorizes every autumn-op call (bootstrap, the manager's
+# readiness probe, admin ops, the dashboard). Provision the
+# `autumn-cluster-secret` Secret ONCE and never overwrite it here: every server
+# must hold the same value, so rotating it is a stop-the-world restart. Same
+# 64-hex format as `autumn-op gen-cluster-secret`, generated with shell so the
+# deploy host needs no autumn binary; written to a restricted temp file and
+# passed with --from-file so it never lands in kubectl's argv.
+kubectl create namespace autumn >/dev/null 2>&1 || true
+if kubectl -n autumn get secret autumn-cluster-secret >/dev/null 2>&1; then
+    echo ">>> Secret autumn-cluster-secret exists (reused — never rotated here)"
+else
+    echo ">>> generating cluster secret → Secret autumn-cluster-secret"
+    cs_tmp="$(umask 077 && mktemp -d)"
+    head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$cs_tmp/cluster.secret"
+    kubectl -n autumn create secret generic autumn-cluster-secret \
+        --from-file=cluster.secret="$cs_tmp/cluster.secret"
+    rm -rf "$cs_tmp"
+fi
+
+# data-plane authz is ON by default. Provision the signing-key
+# Secret ONCE (rotating it invalidates every minted credential, so
+# we never overwrite an existing one). The signing-key file format is
+# `<kid> <hex-32-byte-seed>` — same as `autumn-op gen-signing-key`, generated
+# here with shell so the deploy host needs no autumn binary.
+#
+# To actually DISABLE authz on k8s, set `AUTUMN_AUTH_DISABLE: "1"` in
+# configmap.yaml — the manager entrypoint reads the POD env, not this script.
+# `AUTUMN_AUTH_DISABLE=1` HERE only SKIPS key generation; it does NOT unmount an
+# already-created `autumn-authz` Secret (which the manager would still mount). So
+# a real rollback = configmap flag (or delete the Secret + redeploy).
+if [[ "${AUTUMN_AUTH_DISABLE:-0}" != "1" ]]; then
+    kubectl create namespace autumn >/dev/null 2>&1 || true
+    if kubectl -n autumn get secret autumn-authz >/dev/null 2>&1; then
+        echo ">>> authz Secret autumn-authz exists (reused — never rotated here)"
+    else
+        echo ">>> generating authz signing key → Secret autumn-authz"
+        # Restricted temp files + --from-file (NOT --from-literal) so the seed
+        # never lands in kubectl's argv / /proc/<pid>/cmdline on a shared
+        # deploy host.
+        authz_tmp="$(umask 077 && mktemp -d)"
+        printf '1 %s\n' "$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')" > "$authz_tmp/signing.key"
+        kubectl -n autumn create secret generic autumn-authz \
+            --from-file=signing.key="$authz_tmp/signing.key"
+        rm -rf "$authz_tmp"
+    fi
+fi
+
+echo ">>> deploying image: ${image}"
+kubectl kustomize "$kdir" \
+    | sed -E "s#image: autumn-rs:latest#image: ${image}#g" \
+    | kubectl apply -f -
+
+# Extent nodes are NOT kustomize resources — one Deployment per EN, rendered
+# here. See extent-node.yaml's header for why membership cannot be a
+# count in a manifest.
+#
+# Which ordinals: whatever is already running, so re-applying an existing
+# cluster is idempotent and can never resurrect a RETIRED ordinal on top of its
+# leftover PVC. Only a cluster with no ENs at all falls back to a fresh-install
+# set, and that set must match AUTUMN_EXPECT_NODES in the ConfigMap (the default does) or
+# bootstrap waits forever for nodes that were never created. Override
+# deliberately with AUTUMN_EN_ORDINALS="0 5 6" — adding one is normally
+# `en-workload.sh apply <n>`, not a redeploy.
+if [[ -z "${AUTUMN_EN_ORDINALS:-}" ]]; then
+    AUTUMN_EN_ORDINALS="$(kubectl -n autumn get deploy \
+        -l app.kubernetes.io/component=extent-node \
+        -o jsonpath='{range .items[*]}{.metadata.labels.autumn\.dev/en-ordinal}{" "}{end}' 2>/dev/null || true)"
+    AUTUMN_EN_ORDINALS="$(echo "$AUTUMN_EN_ORDINALS" | tr -s ' ' | sed 's/^ *//;s/ *$//')"
+    if [[ -z "$AUTUMN_EN_ORDINALS" ]]; then
+        # No EN Deployments. That is a fresh install ONLY if the cluster also
+        # has no extent-node PVCs. If it has them, this is a cluster whose ENs
+        # live somewhere else (a StatefulSet not yet migrated, or a set mid
+        # migration) and guessing `0..N-1` would mount whatever those claims
+        # hold — including ordinals that were RETIRED, whose PVCs the
+        # decommission script deliberately keeps.
+        existing_pvcs="$(kubectl -n autumn get pvc \
+            -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null \
+            | grep -c '^data-autumn-en-' || true)"
+        if [[ "${existing_pvcs:-0}" -gt 0 ]]; then
+            echo "refusing: no extent-node Deployments, but ${existing_pvcs} extent-node PVC(s) exist." >&2
+            echo "  This cluster's EN membership is not 0..N-1 and must not be guessed." >&2
+            echo "  Pass it explicitly, e.g. AUTUMN_EN_ORDINALS=\"0 5 6 9 10\"" >&2
+            echo "  (kubectl -n autumn get pvc | grep data-autumn-en- shows what exists)." >&2
+            exit 1
+        fi
+        # Default the count to the AUTUMN_EXPECT_NODES the rendered ConfigMap
+        # carries, so a fresh install can never create fewer nodes than
+        # bootstrap waits for.
+        en_count="${AUTUMN_EN_COUNT:-$(kubectl kustomize "$kdir" \
+            | awk '/AUTUMN_EXPECT_NODES:/ {gsub(/"/, "", $2); print $2; exit}')}"
+        AUTUMN_EN_ORDINALS="$(seq 0 $(( en_count - 1 )) | tr '\n' ' ' | sed 's/ *$//')"
+        echo ">>> no extent nodes and no extent-node PVCs — fresh install, creating ${AUTUMN_EN_ORDINALS}"
+    else
+        echo ">>> reapplying the extent nodes already present: ${AUTUMN_EN_ORDINALS}"
+    fi
+fi
+# shellcheck disable=SC2086
+AUTUMN_EN_IMAGE="${image}" \
+AUTUMN_EN_CPU="${AUTUMN_EN_CPU:-1}" \
+AUTUMN_EN_NODESELECTOR="${AUTUMN_EN_NODESELECTOR:-}" \
+    "$here/scripts/en-workload.sh" apply $AUTUMN_EN_ORDINALS
+
+if [[ "${1:-}" == "--restart" ]]; then
+    # Stop-the-world restart: every autumn role except etcd. WIRE-version bumps
+    # require this (rkyv has no cross-version compat); it also forces a full
+    # recovery, which is what you measure PS reopen time with.
+    #
+    # The selector must be BOTH label keys. The pods label with
+    # `app.kubernetes.io/component`, never a bare `component`, so the old
+    # `-l 'component!=etcd'` was true for every pod in the namespace — it matched
+    # every pod in the namespace (etcd, unrelated app pods and completed Job
+    # pods included), not just the core roles. Deleting etcd here would take
+    # the control plane's store down alongside everything that depends on it.
+    # `app.kubernetes.io/name=autumn` also keeps the blast radius inside this
+    # deployment, so a co-tenant workload in the namespace is never touched.
+    sel='app.kubernetes.io/name=autumn,app.kubernetes.io/component!=etcd'
+    echo ">>> $(date +%T) stop-the-world restart (all autumn roles except etcd)"
+    kubectl get pods -n autumn -l "$sel" -o name
+    kubectl delete pod -n autumn -l "$sel"
+    kubectl get pods -n autumn -w
+fi

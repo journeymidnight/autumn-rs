@@ -1,0 +1,38 @@
+[package]
+name = "autumn-partition-server"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+bytes.workspace = true
+dashmap.workspace = true
+tracing.workspace = true
+autumn-common = { path = "../common" }
+autumn-params = { path = "../params" }
+autumn-rpc = { path = "../rpc" }
+autumn-stream = { path = "../stream" }
+autumn-transport = { path = "../transport" }
+compio = { workspace = true, features = ["net", "time", "macros", "dispatcher"] }
+crc32c.workspace = true
+xxhash-rust.workspace = true
+hashbrown = "0.16"
+rkyv = { version = "0.8.15", features = ["alloc"] }
+futures = "0.3"
+parking_lot.workspace = true
+# Authz: the PS holds only the manager's PUBLIC verifying keys to
+# check capability tokens locally (verify, never sign).
+ed25519-dalek = "2"
+
+[dev-dependencies]
+autumn-test-ports = { path = "../test-ports" }
+tempfile = "3"
+
+[[bench]]
+name = "ps_bench"
+harness = false
+
+[lints]
+workspace = true

@@ -1,0 +1,938 @@
+//! variable-length extents: runtime extent map + the data read/write/
+//! truncate/delete operations keyed by logical byte offset.
+//!
+//! Files are stored as **variable-length extents** keyed by their logical byte
+//! offset (`[0x03][ino][logical_off BE]`, see `key.rs`), each value capped at
+//! [`MAX_EXTENT`] (8 MiB). A sequential (write-once) stream coalesces into
+//! `MAX_EXTENT`-sized extents; the last/partial extent is shorter → "variable
+//! like Linux extents". This replaces the earlier fixed-256 KiB-chunk scheme.
+//!
+//! **Persistent source of truth = the extent KV keys themselves** (the implicit-
+//! key design: no extent list in `InodeMeta`). This module keeps a per-inode
+//! *runtime* cache of `(logical_start, value_len)` (`InodeState.extents`) so the
+//! hot read/write paths don't re-scan; it is rebuilt lazily from a range-scan of
+//! the `[0x03][ino]` prefix (start offsets) + length inference (next start /
+//! file size), and maintained incrementally on write / invalidated on truncate.
+//!
+//! **Invariant maintained by every writer here: extents NEVER overlap.** A read
+//! therefore requests each overlapping extent's exact `[start, start+len)`
+//! sub-range; the PS get clamps to the real value length and the caller's dest
+//! is zero-filled, so short/last extents AND sparse holes both read correctly
+//! even if a cached `len` over-estimates (cold inference of a sparse file).
+
+use autumn_client::WriteOptions;
+use anyhow::{anyhow, Result};
+use bytes::Bytes;
+
+use crate::key;
+use crate::schema::{StripeLayout, MAX_EXTENT};
+use crate::state::FsState;
+
+// There is no fuse-side per-put pipeline depth: `put_many` takes no
+// `concurrency` argument. The SDK groups items by WIRE KEY and fans the groups
+// out at the client's `--batch-put-concurrency` (32); a flush's extent
+// keys are all distinct, so one flush's puts are singleton groups and already
+// go out in parallel over the multiplexed PS connection.
+//
+// The depth that IS tunable sits one level up: `schema::append_inflight_depth`
+// bounds how many FLUSHES — not puts — an inode may have in flight at once.
+
+/// Range-scan page size when rebuilding the extent map of a large file.
+const RANGE_PAGE: u32 = 8192;
+
+/// Return only extents intersecting this read. Cached legacy maps are searched
+/// in place; striped files derive their keys from the requested range instead
+/// of allocating a map proportional to the entire file.
+pub async fn read_extents(
+    state: &mut FsState,
+    ino: u64,
+    file_size: u64,
+    stripe: Option<&StripeLayout>,
+    start: u64,
+    end: u64,
+) -> Result<Vec<(u64, u32)>> {
+    if let Some(stripe) = stripe {
+        let (_, unit) = stripe.checked().map_err(|e| anyhow!(e))?;
+        crate::schema::striped_extent_count(file_size, unit).map_err(|e| anyhow!(e))?;
+        return Ok(striped_read_extents(file_size, unit, start, end));
+    }
+    if let Some(ext) = state.inodes.get(&ino).and_then(|is| is.extents.as_ref()) {
+        return Ok(overlapping_extents(ext, start, end).to_vec());
+    }
+    let ext = scan_extents(state, ino, file_size, None).await?;
+    let selected = overlapping_extents(&ext, start, end).to_vec();
+    if let Some(is) = state.inodes.get_mut(&ino) {
+        is.extents = Some(ext);
+    }
+    Ok(selected)
+}
+
+fn overlapping_extents(ext: &[(u64, u32)], start: u64, end: u64) -> &[(u64, u32)] {
+    if start >= end {
+        return &ext[..0];
+    }
+    let first = ext.partition_point(|&(s, len)| s.saturating_add(len as u64) <= start);
+    let last = ext.partition_point(|&(s, _)| s < end);
+    &ext[first..last]
+}
+
+fn striped_read_extents(file_size: u64, unit: u32, start: u64, end: u64) -> Vec<(u64, u32)> {
+    let end = end.min(file_size);
+    if start >= end {
+        return Vec::new();
+    }
+    let unit = unit as u64;
+    let mut pos = start / unit * unit;
+    let mut out = Vec::new();
+    while pos < end {
+        // Match the legacy map's extent-length cap, including a persisted
+        // stripe unit larger than the current MAX_EXTENT.
+        let len = unit.min(file_size - pos).min(MAX_EXTENT as u64) as u32;
+        if pos.saturating_add(len as u64) > start {
+            out.push((pos, len));
+        }
+        match pos.checked_add(unit) {
+            Some(next) => pos = next,
+            None => break,
+        }
+    }
+    out
+}
+
+/// Return this inode's extent map (`(start, len)` sorted by start), loading the
+/// runtime cache from the KV layer when cold. Returns a clone so callers can use
+/// it without holding a borrow on `state` across `await`s.
+pub async fn extents_snapshot(
+    state: &mut FsState,
+    ino: u64,
+    file_size: u64,
+    stripe: Option<&StripeLayout>,
+) -> Result<Vec<(u64, u32)>> {
+    if let Some(is) = state.inodes.get(&ino) {
+        if let Some(ext) = &is.extents {
+            return Ok(ext.clone());
+        }
+    }
+    // A striped inode's extents live under
+    // `[0x03][lane][ino][off]`, NOT scannable by `[0x03][ino]`, so the map is
+    // COMPUTED from size. `stripe` is passed EXPLICITLY by the caller from the
+    // AUTHORITATIVE meta — NOT read from `state.inodes` (get_inode returns the
+    // meta but does NOT populate the cache on a cold miss, so a cache lookup
+    // would wrongly see None for a striped file → legacy scan → zeros).
+    let extents = scan_extents(state, ino, file_size, stripe).await?;
+    if let Some(is) = state.inodes.get_mut(&ino) {
+        is.extents = Some(extents.clone());
+    }
+    Ok(extents)
+}
+
+/// Build the extent map. STRIPED → COMPUTE the MAX_EXTENT-granular
+/// offsets from `file_size` (extents are aligned + bounded by size; the writer
+/// never exceeds MAX_EXTENT). LEGACY → paginated range-scan of `[0x03][ino]` →
+/// sorted starts. Both then `infer_lengths`.
+async fn scan_extents(
+    state: &mut FsState,
+    ino: u64,
+    file_size: u64,
+    stripe: Option<&StripeLayout>,
+) -> Result<Vec<(u64, u32)>> {
+    if let Some(s) = stripe {
+        // Bounded enumeration (corrupt huge size can't wrap / OOM).
+        // The stride is the file's PERSISTED unit_bytes, not MAX_EXTENT — see
+        // `striped_extent_offsets` for why reading it from the constant is a
+        // silent-zero-fill trap the day the constant is retuned.
+        let (_, unit) = s.checked().map_err(|e| anyhow!(e))?;
+        let starts =
+            crate::schema::striped_extent_offsets(file_size, unit).map_err(|e| anyhow!(e))?;
+        return Ok(infer_lengths(&starts, file_size));
+    }
+    let prefix = key::extent_prefix(ino);
+    let mut starts: Vec<u64> = Vec::new();
+    let mut start_key = prefix.clone();
+    loop {
+        let (keys, has_more) = state.kv_range_page(&prefix, &start_key, RANGE_PAGE).await?;
+        for k in &keys {
+            if let Some((_, off)) = key::parse_extent_key(k) {
+                starts.push(off);
+            }
+        }
+        // Resume past the last RETURNED key, not the last parsed one: 18-byte
+        // striped / data-object keys can share this 9-byte prefix (lane 0 of
+        // an inode numbered `ino << 8 | x`), and a page made only of those
+        // would otherwise never move the cursor.
+        match (has_more, keys.last()) {
+            (true, Some(last)) => start_key = crate::dir::name_successor(last),
+            _ => break,
+        }
+    }
+    starts.sort_unstable();
+    starts.dedup();
+    Ok(infer_lengths(&starts, file_size))
+}
+
+/// Infer extent lengths from neighbouring starts (non-overlap upper bound) and
+/// the file size for the last extent, capped at `MAX_EXTENT`.
+fn infer_lengths(starts: &[u64], file_size: u64) -> Vec<(u64, u32)> {
+    let mut out = Vec::with_capacity(starts.len());
+    for (i, &s) in starts.iter().enumerate() {
+        let end = if i + 1 < starts.len() {
+            starts[i + 1]
+        } else {
+            file_size.max(s)
+        };
+        let len = (end.saturating_sub(s)).min(MAX_EXTENT as u64) as u32;
+        out.push((s, len));
+    }
+    out
+}
+
+/// Force a rebuild of the runtime extent cache on next access.
+pub fn invalidate(state: &mut FsState, ino: u64) {
+    if let Some(is) = state.inodes.get_mut(&ino) {
+        is.extents = None;
+    }
+}
+
+/// `(floor, next)` for `pos` over a sorted extent map: `floor` = the extent with
+/// the largest start `<= pos`; `next` = the start of the first extent `> pos`.
+fn floor_and_next(ext: &[(u64, u32)], pos: u64) -> (Option<(u64, u32)>, Option<u64>) {
+    let idx = ext.partition_point(|&(s, _)| s <= pos);
+    let floor = if idx > 0 { Some(ext[idx - 1]) } else { None };
+    let next = ext.get(idx).map(|&(s, _)| s);
+    (floor, next)
+}
+
+/// Insert or update `(start, len)` in a sorted extent map.
+pub(crate) fn upsert(ext: &mut Vec<(u64, u32)>, start: u64, len: u32) {
+    match ext.binary_search_by_key(&start, |&(s, _)| s) {
+        Ok(i) => ext[i].1 = len,
+        Err(i) => ext.insert(i, (start, len)),
+    }
+}
+
+/// Write `data` at `[offset, offset+data.len())`, splitting into non-overlapping
+/// extents of at most `MAX_EXTENT`. Maintains the runtime extent cache.
+///
+/// - **Append / gap (the write-once hot path):** `offset` lands past every
+///   existing extent (or in a hole) → fresh `kv_put(extent_key(offset), …)`, no
+///   read. Capped at the next extent's start so the new extent can't overlap.
+/// - **Overwrite (rare for model files):** `offset` falls inside an existing
+///   extent → read-modify-write that extent in place (its start key is kept, so
+///   no overlap is introduced); the value may grow up to the next start / cap.
+/// The self-contained half of a PURE-APPEND flush: the keys, their values and
+/// the extent-map updates they will imply, owning all of it.
+///
+/// Splitting the flush this way is what lets the mount overlap the network with
+/// the kernel. `write_region` holds `&mut FsState` across its puts, and the
+/// dispatcher runs one request to completion at a time, so while a flush is in
+/// flight NOTHING is being filled — measured, a 4 GiB write spent 12 s in the
+/// puts and 4 s beside them with the two never overlapping. The read path has
+/// had this shape for a while (`read::prepare` under `&mut state`, then a
+/// spawned `read::execute` that owns its plan), which is why reads already
+/// overlap and writes did not.
+pub struct AppendPlan {
+    keys: Vec<Vec<u8>>,
+    values: Vec<Bytes>,
+    upserts: Vec<(u64, u32)>,
+    lease: autumn_client::WriteLease,
+}
+
+impl AppendPlan {
+    /// The extent-map updates this plan will imply once its puts land.
+    pub fn upserts(&self) -> &[(u64, u32)] {
+        &self.upserts
+    }
+}
+
+/// Plan a flush that is a PURE APPEND — every byte lands past the end of every
+/// existing extent, so no read-modify-write, no hole-filling and no
+/// beyond-EOF residue is involved. Returns `None` for anything else, and the
+/// caller must then use the inline `write_region`, which handles those shapes
+/// and is not safe to run against a stale extent map.
+///
+/// "Stale" is the crux: a spawned flush's extents are not in the map until it
+/// is drained, so a plan made while one is in flight is working from an
+/// incomplete picture. That is harmless HERE — the positions come from the
+/// buffer's own offset, not from the map, and every one of them is past
+/// everything the map could be missing — and it is exactly what makes the RMW
+/// branch unsafe to pipeline, since it would read a stale extent and write back
+/// a merge of the wrong bytes.
+pub async fn plan_append_only(
+    state: &mut FsState,
+    ino: u64,
+    offset: u64,
+    data: &[u8],
+    file_size: u64,
+) -> Result<Option<AppendPlan>> {
+    if data.is_empty() {
+        return Ok(None);
+    }
+    // A striped inode is not this path's business (the mount refuses striped
+    // writes upstream), nor is a segmented one (its writes splice the map);
+    // bail rather than compute extent keys here.
+    if state
+        .inodes
+        .get(&ino)
+        .is_some_and(|is| is.meta.stripe.is_some() || is.meta.segments.is_some())
+    {
+        return Ok(None);
+    }
+    // Same guard `write_region` opens with: beyond-EOF residue needs the
+    // sweep, which mutates. Refuse instead of pipelining it.
+    if offset > file_size {
+        return Ok(None);
+    }
+    let ext = extents_snapshot(state, ino, file_size, None).await?;
+    if ext
+        .iter()
+        .any(|&(s, l)| s >= file_size || s + l as u64 > offset)
+    {
+        return Ok(None);
+    }
+    let lease = state.write_lease_for(ino);
+    let mut keys = Vec::new();
+    let mut values = Vec::new();
+    let mut upserts = Vec::new();
+    let mut pos = offset;
+    let mut rest = data;
+    while !rest.is_empty() {
+        // Every chunk is fresh territory by the check above, so the cap is the
+        // extent size alone — there is no following extent to stop short of.
+        let n = ((pos + MAX_EXTENT as u64).min(pos + rest.len() as u64) - pos) as usize;
+        keys.push(key::extent_key(ino, pos));
+        values.push(Bytes::copy_from_slice(&rest[..n]));
+        upserts.push((pos, n as u32));
+        pos += n as u64;
+        rest = &rest[n..];
+    }
+    Ok(Some(AppendPlan {
+        keys,
+        values,
+        upserts,
+        lease,
+    }))
+}
+
+/// The spawnable half of an append flush: it needs only the client, so it can
+/// run while the dispatcher goes back to serving the kernel. The caller applies
+/// `plan.upserts()` to the extent map when it drains this.
+pub async fn execute_append(
+    client: std::rc::Rc<autumn_client::ClusterClient>,
+    plan: &AppendPlan,
+) -> Result<()> {
+    let items: Vec<(&[u8], Bytes)> = plan
+        .keys
+        .iter()
+        .zip(plan.values.iter())
+        .map(|(k, v)| (k.as_slice(), v.clone()))
+        .collect();
+    for r in client.put_many(&items, WriteOptions::fenced(plan.lease)).await {
+        r.map_err(|e| anyhow::Error::new(e).context("KV put"))?;
+    }
+    Ok(())
+}
+
+pub async fn write_region(
+    state: &mut FsState,
+    ino: u64,
+    offset: u64,
+    data: &[u8],
+    file_size: u64,
+) -> Result<()> {
+    if data.is_empty() {
+        return Ok(());
+    }
+    if state.inodes.get(&ino).is_some_and(|is| is.meta.segments.is_some()) {
+        return crate::segment::write_file_range(state, ino, offset, data).await;
+    }
+    let mut ext = extents_snapshot(state, ino, file_size, None).await?;
+    // Leftover extents from a crashed shrink must
+    // not merge into / resurface under this write. Cold post-crash path —
+    // whole-key leftovers are visible in the prefix scan for free; a
+    // sparse grow is the one shape where a stale straddler TAIL (value
+    // longer than size implies) becomes readable without any key-level
+    // evidence, so it always sweeps.
+    if offset > file_size || ext.iter().any(|&(s, _)| s >= file_size) {
+        clean_beyond_eof(state, ino, file_size).await?;
+        ext = extents_snapshot(state, ino, file_size, None).await?;
+    }
+    // Stamp every data-extent put with the held WRITE
+    // lease's version so a revoked writer's late RPCs are fenced at the PS.
+    let lease = state.write_lease_for(ino);
+
+    // Plan + batch the append steps so the append-only hot path (cp / dd /
+    // model checkpoint streamer — `pos` strictly past every existing extent)
+    // dispatches one put per ≤ 8 MiB chunk via `put_many` (SDK groups by
+    // partition + server-batches). RMW falls back to inline read-modify-write (rare; in-place
+    // overwrite of a previously-written extent).
+    //
+    // Pre-pipelining this loop awaited every `state.kv_put` serially
+    // (in_flight=1), making single-stream cp throughput `~8 MiB / RPC_RTT`.
+    // We accumulate consecutive Append plans into `append_keys` /
+    // `append_values`; an RMW interrupts → flush the pending batch
+    // (preserving correctness: the RMW reads the same KV namespace and
+    // could race a pending put on a nearby key) → do the RMW serial → keep
+    // going. After the loop the trailing batch flushes.
+    let mut pos = offset;
+    let mut rest = data;
+    let mut append_keys: Vec<Vec<u8>> = Vec::new();
+    let mut append_values: Vec<Bytes> = Vec::new();
+    let mut append_upserts: Vec<(u64, u32)> = Vec::new();
+
+    while !rest.is_empty() {
+        let (floor, next) = floor_and_next(&ext, pos);
+        let next_start = next.unwrap_or(u64::MAX);
+
+        match floor {
+            // `pos` is inside an existing extent → read-modify-write it.
+            Some((fs, fl)) if pos < fs + fl as u64 => {
+                // Drain pending appends before any serial KV op on `state`.
+                flush_appends(
+                    state,
+                    &mut append_keys,
+                    &mut append_values,
+                    &mut append_upserts,
+                    &mut ext,
+                    lease,
+                )
+                .await?;
+                let cap = (fs + MAX_EXTENT as u64).min(next_start);
+                let end = (pos + rest.len() as u64).min(cap);
+                let n = (end - pos) as usize;
+                let ck = key::extent_key(ino, fs);
+                // RMW read BARRIER (must mirror `clean_beyond_eof`'s
+                // kv_get_opt): a hard get error (transient RPC / routing /
+                // storage failure) must PROPAGATE, never be swallowed. Treating
+                // the existing extent as empty here zero-fills the untouched
+                // prefix `[fs, pos)` and TRUNCATES the untouched suffix
+                // `[pos+n, …)`, then `put`s the result — fabricating data on a
+                // *successful* write (the one crash/transient window in this
+                // layer that corrupts rather than just loses an un-fsynced
+                // write). Propagate → fuse EIO, the app retries the overwrite;
+                // a genuinely-absent key (`Ok(None)`) is the only case that may
+                // be treated as empty (a mapped extent's key should always
+                // exist, but if it's truly gone there is nothing to preserve —
+                // empty is the safe sparse value).
+                let mut val = state.kv_get_opt(&ck).await?.unwrap_or_default();
+                let in_off = (pos - fs) as usize;
+                if val.len() < in_off + n {
+                    val.resize(in_off + n, 0);
+                }
+                val[in_off..in_off + n].copy_from_slice(&rest[..n]);
+                let new_len = val.len() as u32;
+                state.kv_put_fenced(&ck, &val, lease).await?;
+                upsert(&mut ext, fs, new_len);
+                pos += n as u64;
+                rest = &rest[n..];
+            }
+            // Fresh territory (append past EOF or a clean hole) → new extent.
+            _ => {
+                let cap = (pos + MAX_EXTENT as u64).min(next_start);
+                let end = (pos + rest.len() as u64).min(cap);
+                let n = (end - pos) as usize;
+                append_keys.push(key::extent_key(ino, pos));
+                // One alloc per chunk (same cost the pre-pipelined path paid
+                // via the SDK's internal `value.to_vec()` in `put_opts`).
+                append_values.push(Bytes::copy_from_slice(&rest[..n]));
+                append_upserts.push((pos, n as u32));
+                pos += n as u64;
+                rest = &rest[n..];
+            }
+        }
+    }
+    // Trailing batch — the pure-append hot path lands here.
+    flush_appends(
+        state,
+        &mut append_keys,
+        &mut append_values,
+        &mut append_upserts,
+        &mut ext,
+        lease,
+    )
+    .await?;
+
+    if let Some(is) = state.inodes.get_mut(&ino) {
+        is.extents = Some(ext);
+    }
+    Ok(())
+}
+
+/// Dispatch a batch of append puts via `ClusterClient::put_many` (SDK
+/// groups by partition and issues server-batched MSG_BATCH_PUT for small
+/// values, per-op MSG_PUT for ≥ 64 KiB), then apply the
+/// corresponding `(start, len)` upserts to the in-memory extent map in input
+/// order. Empties the input vecs.
+///
+/// Each item's value is a `Bytes` so bulk engages for ≥ 64 KiB (see
+/// `autumn_client::bulk_worthwhile`). On any item failure the whole batch is
+/// reported as an error and the in-memory extent map is left UN-upserted for
+/// every item past the first failure — callers treat this as a "this fuse
+/// write failed, retry the whole flush" outcome (matches the pre-pipelined
+/// fail-on-first-Err semantics).
+async fn flush_appends(
+    state: &FsState,
+    keys: &mut Vec<Vec<u8>>,
+    values: &mut Vec<Bytes>,
+    upserts: &mut Vec<(u64, u32)>,
+    ext: &mut Vec<(u64, u32)>,
+    lease: autumn_client::WriteLease,
+) -> Result<()> {
+    if keys.is_empty() {
+        return Ok(());
+    }
+    debug_assert_eq!(keys.len(), values.len());
+    debug_assert_eq!(keys.len(), upserts.len());
+    let drained_keys = std::mem::take(keys);
+    let drained_values = std::mem::take(values);
+    let drained_upserts = std::mem::take(upserts);
+    // This append path calls `put_many` directly on the client, which
+    // prepends `fs/` — same as the RMW-overwrite branch (kv_put_fenced)
+    // and the read path (read::prepare). The bare `key::*` keys are relative.
+    let items: Vec<(&[u8], Bytes)> = drained_keys
+        .iter()
+        .zip(drained_values.iter())
+        .map(|(k, v)| (k.as_slice(), v.clone()))
+        .collect();
+    let results = state.client.put_many(&items, WriteOptions::fenced(lease)).await;
+    for (i, r) in results.into_iter().enumerate() {
+        r.map_err(|e| anyhow::Error::new(e).context("KV put"))?;
+        let (start, len) = drained_upserts[i];
+        upsert(ext, start, len);
+    }
+    Ok(())
+}
+
+/// UNLINK-1: remove an UNREACHABLE inode's data under an intent
+/// tombstone — extents, the inode key, then the tombstone itself. Used
+/// by unlink and rename-over-existing once the last dirent is gone, and
+/// replayed by `sweep_unlink_tombstones` after a crash. Idempotent.
+pub async fn remove_unreachable_inode(state: &mut FsState, ino: u64) -> Result<()> {
+    if tombstone_unreachable(state, ino, autumn_client::WriteLease::ANON).await? {
+        reclaim_unreachable(state, ino).await?;
+    }
+    Ok(())
+}
+
+/// Write the tombstone of an inode that just became unreachable. Returns
+/// whether its data can be reclaimed now: not while this session has it open
+/// — POSIX keeps an unlinked file's data until its last close, and that
+/// close reclaims it (`FsState::unlinked_open`). `lease` fences the write:
+/// a publishing session's, so a session recovered by another is refused.
+pub async fn tombstone_unreachable(state: &mut FsState, ino: u64, lease: autumn_client::WriteLease) -> Result<bool> {
+    state.kv_put_fenced(&crate::key::unlink_tombstone_key(ino), b"1", lease).await?;
+    if state.held_leases.borrow().contains_key(&ino) {
+        state.unlinked_open.insert(ino);
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+/// Reclaim a tombstoned inode through the state's background reclaimer if it
+/// has one, else here. The reclaimer is another client, so any lease this
+/// client still holds on `ino` stops it: release those first. A conflict or
+/// a failure leaves the tombstone for the sweep.
+pub async fn reclaim_now_or_later(state: &mut FsState, ino: u64) {
+    if state.defer_reclaim(crate::state::Reclaim::Inode(ino)) {
+        return;
+    }
+    if let Err(e) = reclaim_unreachable(state, ino).await {
+        tracing::warn!(ino, error = %e, "reclaiming an unlinked file failed; the sweep retries");
+    }
+}
+
+/// Delete an unreachable inode's data, inode key and tombstone — once no
+/// other client holds any lease on it. Returns `false`, leaving the
+/// tombstone for a later sweep, while one does: another mount with the file
+/// open, or an S3 GET in progress, must not have the data pulled from under
+/// it. The removal is stamped with the EXCLUSIVE lease's epoch.
+pub async fn reclaim_unreachable(state: &mut FsState, ino: u64) -> Result<bool> {
+    use autumn_client::lease::{self, AcquireResult};
+    let cluster = state.client.clone();
+    let id = state.client_id.clone();
+    let epoch = match lease::acquire(&cluster, &id, ino, autumn_rpc::manager_rpc::LEASE_MODE_EXCLUSIVE)
+        .await
+        .map_err(|e| anyhow!("reclaim {ino}: {e}"))?
+    {
+        AcquireResult::Granted(info) => info.version,
+        AcquireResult::Conflict { .. } | AcquireResult::RevokePending { .. } => return Ok(false),
+    };
+    let lease = autumn_client::WriteLease { inode_hint: ino, lease_epoch: epoch };
+    // Re-acquiring as the same client re-checks every other holder. EXCLUSIVE
+    // is not persisted, so a manager failover forgets it (or replays it as a
+    // plain WRITE, if this client held one) and other clients can then be
+    // granted; exclusivity is confirmed again before each phase that deletes.
+    let still_exclusive = || async {
+        matches!(
+            lease::acquire(&cluster, &id, ino, autumn_rpc::manager_rpc::LEASE_MODE_EXCLUSIVE).await,
+            Ok(AcquireResult::Granted(_))
+        )
+    };
+    let res = async {
+        // A segmented file's data is whatever its reclaim records name; with
+        // the file gone, all of it goes. On a replay the inode may already be
+        // gone, and then the records are consulted whatever it was; a plain
+        // file that still exists has none, so the scan is skipped.
+        let plain = match state.kv_get_opt(&crate::key::inode_key(ino)).await? {
+            Some(b) => crate::schema::decode_inode_meta(&b).is_ok_and(|m| m.segments.is_none()),
+            None => false,
+        };
+        if !plain {
+            crate::segment::reclaim(state, ino, None, lease).await?;
+            let _ = state.kv_delete_fenced(&crate::key::segment_garbage_key(ino), lease).await;
+        }
+        if !still_exclusive().await {
+            return anyhow::Ok(false);
+        }
+        delete_all_extents_with(state, ino, lease).await?;
+        if !still_exclusive().await {
+            return anyhow::Ok(false);
+        }
+        let _ = state.kv_delete_fenced(&crate::key::inode_key(ino), lease).await;
+        state.kv_delete(&crate::key::unlink_tombstone_key(ino)).await?;
+        state.inodes.remove(&ino);
+        state.dirty_inodes.remove(&ino);
+        anyhow::Ok(true)
+    }
+    .await;
+    if let Err(e) = lease::release(&cluster, &id, ino).await {
+        tracing::warn!(ino, error = %e, "reclaim: releasing the exclusive lease failed; TTL revoke is the backstop");
+    }
+    res
+}
+
+/// UNLINK-1: mount-time replay of interrupted unlinks. Returns the
+/// number of tombstones reaped.
+pub async fn sweep_unlink_tombstones(state: &mut FsState) -> Result<usize> {
+    let prefix = crate::key::unlink_tombstone_prefix();
+    let mut start_key = prefix.clone();
+    let mut n = 0;
+    loop {
+        // Paginated like delete_all_extents (a single page
+        // would cap the per-mount sweep at 4096 tombstones).
+        let keys = state.kv_range_keys(&prefix, &start_key, RANGE_PAGE).await?;
+        let got = keys.len();
+        let mut last_ino = 0u64;
+        for k in &keys {
+            if let Some(ino) = crate::key::parse_unlink_tombstone(k) {
+                last_ino = ino;
+                // Still open here: its last close reclaims it.
+                if state.held_leases.borrow().contains_key(&ino) {
+                    continue;
+                }
+                match reclaim_unreachable(state, ino).await {
+                    Ok(true) => n += 1,
+                    // Held elsewhere; the next sweep retries.
+                    Ok(false) => {}
+                    Err(e) => tracing::warn!(ino, "unlink tombstone replay failed (retried next sweep): {e}"),
+                }
+            }
+        }
+        if got < RANGE_PAGE as usize {
+            break;
+        }
+        start_key = crate::key::unlink_tombstone_key(last_ino.saturating_add(1));
+    }
+    Ok(n)
+}
+
+pub async fn delete_all_extents(state: &mut FsState, ino: u64) -> Result<()> {
+    // Unlink's extent deletes are
+    // fenced under the held WRITE lease (anonymous when none is held —
+    // unlink without an open writer is a metadata-path operation).
+    let lease = state.write_lease_for(ino);
+    delete_all_extents_with(state, ino, lease).await
+}
+
+/// `delete_all_extents` stamped with an explicit lease (a reclaim holds an
+/// EXCLUSIVE lease that is not one of this session's open-file leases).
+pub async fn delete_all_extents_with(
+    state: &mut FsState,
+    ino: u64,
+    lease: autumn_client::WriteLease,
+) -> Result<()> {
+    // a striped inode's extents live under `[0x03][lane][ino][off]`,
+    // NOT scannable by the `[0x03][ino]` prefix — a range-scan would MISS them and
+    // leak. Look up stripe+size (cached from the caller's get_inode; on
+    // tombstone-replay the cache is cold, so read the inode from KV if it still
+    // exists) and delete the COMPUTED lane keys (MAX_EXTENT-granular up to size).
+    let stripe_size: Option<(Option<StripeLayout>, u64)> =
+        match state.inodes.get(&ino).map(|is| (is.meta.stripe.clone(), is.meta.size)) {
+            Some(v) => Some(v),
+            None => match state.kv_get_opt(&key::inode_key(ino)).await? {
+                Some(bytes) => {
+                    crate::schema::decode_inode_meta(&bytes).ok().map(|m| (m.stripe, m.size))
+                }
+                None => None, // inode already gone (crash mid-removal) — nothing to scan
+            },
+        };
+    if let Some((Some(s), size)) = stripe_size {
+        // Striped cleanup MUST fail-loud. `remove_unreachable_inode`
+        // deletes the inode key + tombstone only AFTER this returns Ok; a striped
+        // extent can't be re-enumerated without the inode's stripe+size, so if we
+        // swallowed a checked()/delete error and returned Ok, the leftover lane
+        // extents would leak PERMANENTLY (the tombstone-replay path loses its
+        // recompute source). Propagate errors → the tombstone survives → next
+        // mount retries. (Legacy path can range-scan on replay, so it stays
+        // best-effort.)
+        let (lanes, unit) = s.checked().map_err(|e| anyhow!("striped unlink {ino}: {e}"))?;
+        // Stride from the PERSISTED unit_bytes: enumerating on today's
+        // MAX_EXTENT after a retune would compute the WRONG keys and leak every
+        // extent it failed to name (see `striped_extent_offsets`).
+        for off in crate::schema::striped_extent_offsets(size, unit).map_err(|e| anyhow!(e))? {
+            state
+                .kv_delete_fenced(&key::extent_key_striped(ino, off, lanes, unit), lease)
+                .await
+                .map_err(|e| anyhow!("striped unlink {ino} extent @{off}: {e}"))?;
+        }
+        invalidate(state, ino);
+        return Ok(());
+    }
+    // Legacy (non-striped, or meta unavailable): paginated range-scan + delete.
+    let prefix = key::extent_prefix(ino);
+    let mut start_key = prefix.clone();
+    loop {
+        let (keys, has_more) = state.kv_range_page(&prefix, &start_key, RANGE_PAGE).await?;
+        for k in &keys {
+            if key::parse_extent_key(k).is_some() {
+                let _ = state.kv_delete_fenced(k, lease).await;
+            }
+        }
+        // Past the last RETURNED key (see `scan_extents`).
+        match (has_more, keys.last()) {
+            (true, Some(last)) => start_key = crate::dir::name_successor(last),
+            _ => break,
+        }
+    }
+    invalidate(state, ino);
+    Ok(())
+}
+
+/// Shrink a file's extents to `new_size`: delete extents that start at/after
+/// `new_size`, and truncate the value of the extent straddling `new_size`.
+/// Grow (new_size > old_size) is metadata-only (sparse tail) — no extent work.
+pub async fn truncate_extents(
+    state: &mut FsState,
+    ino: u64,
+    new_size: u64,
+    old_size: u64,
+) -> Result<()> {
+    if new_size >= old_size {
+        return Ok(());
+    }
+    let ext = extents_snapshot(state, ino, old_size, None).await?;
+    // Truncate's whole-extent deletes
+    // are fenced too — a revoked writer's late shrink must not delete
+    // extents the new writer kept or rewrote.
+    let lease = state.write_lease_for(ino);
+    for &(s, len) in &ext {
+        if s >= new_size {
+            // Extent begins beyond the new EOF → drop it entirely.
+            let _ = state.kv_delete_fenced(&key::extent_key(ino, s), lease).await;
+        } else if s + len as u64 > new_size {
+            // Extent straddles the new EOF → truncate its value.
+            let keep = (new_size - s) as usize;
+            let ck = key::extent_key(ino, s);
+            if let Ok(mut val) = state.kv_get(&ck).await {
+                if val.len() > keep {
+                    val.truncate(keep);
+                    state.kv_put_fenced(&ck, &val, lease).await?;
+                }
+            }
+        }
+    }
+    invalidate(state, ino);
+    Ok(())
+}
+
+/// Reap LEFTOVER extent state beyond `eof` — the
+/// residue of a crash inside a shrink's post-commit cleanup window
+/// (durable size already shrunk, extent destruction interrupted).
+/// Leftovers are invisible while size stays put, but any later GROW
+/// (truncate-up or a sparse write past EOF) would bring them back into
+/// the readable range as RESURRECTED old data where POSIX requires
+/// zeros. Called from the cold grow paths only:
+/// - `write::truncate` grow branch (before the meta put), and
+/// - `write_region` entry when leftovers are visible (a whole extent key
+///   at/after `eof` in the prefix scan) or the write is a sparse grow
+///   (`offset > file_size` — the one case a stale straddler tail can't
+///   be detected from keys alone).
+/// Deletes whole extent keys starting at/after `eof` and shortens the
+/// straddling extent's VALUE (actual KV length, not the inferred one) to
+/// `eof - start`. Idempotent; an error leaves leftovers for the next
+/// grow to retry.
+pub async fn clean_beyond_eof(state: &mut FsState, ino: u64, eof: u64) -> Result<()> {
+    // Raw starts — inference is size-relative and exactly what we must
+    // NOT trust here.
+    let prefix = key::extent_prefix(ino);
+    let mut starts: Vec<u64> = Vec::new();
+    let mut start_key = prefix.clone();
+    loop {
+        let (keys, has_more) = state.kv_range_page(&prefix, &start_key, RANGE_PAGE).await?;
+        for k in &keys {
+            if let Some((_, off)) = key::parse_extent_key(k) {
+                starts.push(off);
+            }
+        }
+        // Past the last RETURNED key (see `scan_extents`).
+        match (has_more, keys.last()) {
+            (true, Some(last)) => start_key = crate::dir::name_successor(last),
+            _ => break,
+        }
+    }
+    starts.sort_unstable();
+    starts.dedup();
+    let lease = state.write_lease_for(ino);
+    for &s in &starts {
+        if s >= eof {
+            state
+                .kv_delete_fenced(&key::extent_key(ino, s), lease)
+                .await?;
+        }
+    }
+    // Straddler: the largest start below eof may carry a stale tail
+    // (value longer than the durable size implies). This function is the
+    // pre-grow BARRIER — a hard kv error here must PROPAGATE (abort the
+    // grow) rather than read as "already clean"; only a
+    // genuinely absent key (Ok(None)) may be skipped.
+    if let Some(&s) = starts.iter().rev().find(|&&s| s < eof) {
+        let keep = (eof - s) as usize;
+        let ck = key::extent_key(ino, s);
+        if let Some(mut val) = state.kv_get_opt(&ck).await? {
+            if val.len() > keep {
+                val.truncate(keep);
+                state.kv_put_fenced(&ck, &val, lease).await?;
+            }
+        }
+    }
+    invalidate(state, ino);
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn read_selection_matches_full_scan_including_holes_and_boundaries() {
+        let ext = [(0, 4), (4, 6), (20, 8), (100, 3)];
+        for start in 0..110 {
+            for end in start..110 {
+                let expected: Vec<_> = ext
+                    .iter()
+                    .copied()
+                    .filter(|&(s, l)| start < end && s < end && s + l as u64 > start)
+                    .collect();
+                assert_eq!(overlapping_extents(&ext, start, end), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn striped_read_selection_matches_persisted_geometry() {
+        for unit in [1, 4096, MAX_EXTENT as u32, 2 * MAX_EXTENT as u32] {
+            let size = 3 * unit as u64 + 17;
+            let starts = crate::schema::striped_extent_offsets(size, unit).unwrap();
+            let full = infer_lengths(&starts, size);
+            for start in [0, 1, unit as u64 - 1, unit as u64, size - 1, size] {
+                for len in [0, 1, 4096, unit as u64 + 1] {
+                    let end = (start + len).min(size);
+                    assert_eq!(
+                        striped_read_extents(size, unit, start, end),
+                        overlapping_extents(&full, start, end)
+                    );
+                }
+            }
+        }
+        let size = 1u64 << 40;
+        assert_eq!(
+            striped_read_extents(size, MAX_EXTENT as u32, size - 4096, size),
+            vec![(size - MAX_EXTENT as u64, MAX_EXTENT as u32)]
+        );
+        assert_eq!(
+            striped_read_extents(u64::MAX, 4096, u64::MAX - 1, u64::MAX),
+            vec![(u64::MAX - 4095, 4095)]
+        );
+    }
+
+    #[test]
+    fn infer_lengths_contiguous() {
+        // three contiguous extents: [0,8M)[8M,16M)[16M, 20M)
+        let m = MAX_EXTENT as u64;
+        let starts = vec![0, m, 2 * m];
+        let got = infer_lengths(&starts, 2 * m + 4 * 1024 * 1024);
+        assert_eq!(got[0], (0, MAX_EXTENT as u32));
+        assert_eq!(got[1], (m, MAX_EXTENT as u32));
+        assert_eq!(got[2], (2 * m, 4 * 1024 * 1024)); // last = file_size - start
+    }
+
+    #[test]
+    fn infer_lengths_caps_at_max_extent() {
+        // a sparse hole between two starts wider than MAX_EXTENT: len is capped,
+        // not the full gap (the get will clamp the over-request to zeros).
+        let starts = vec![0u64, 100 * 1024 * 1024];
+        let got = infer_lengths(&starts, 200 * 1024 * 1024);
+        assert_eq!(got[0].1, MAX_EXTENT as u32);
+    }
+
+    #[test]
+    fn floor_and_next_basic() {
+        let m = MAX_EXTENT as u64;
+        let ext = vec![(0u64, MAX_EXTENT as u32), (m, MAX_EXTENT as u32)];
+        // inside first extent
+        let (f, n) = floor_and_next(&ext, 1024);
+        assert_eq!(f, Some((0, MAX_EXTENT as u32)));
+        assert_eq!(n, Some(m));
+        // exactly at second start
+        let (f, n) = floor_and_next(&ext, m);
+        assert_eq!(f, Some((m, MAX_EXTENT as u32)));
+        assert_eq!(n, None);
+        // before everything
+        let ext2 = vec![(m, 10u32)];
+        let (f, n) = floor_and_next(&ext2, 0);
+        assert_eq!(f, None);
+        assert_eq!(n, Some(m));
+    }
+
+    /// The premise multi-slot write pipelining rests on: consecutive append
+    /// batches cover DISJOINT, increasing ranges, so applying their upserts as
+    /// they LAND is equivalent to applying them in issue order.
+    /// `InodeState.pending_flushes` may hold more than one flight precisely
+    /// because of this — the queue is drained oldest-first today, but nothing
+    /// in the extent map depends on that.
+    ///
+    /// ABLATION: make `upsert` order-sensitive (push + sort at the end, or
+    /// merge adjacent runs) and this goes red.
+    #[test]
+    fn disjoint_batches_apply_the_same_in_any_order() {
+        const E: u64 = MAX_EXTENT as u64;
+        // Two 64 MiB flushes' worth of 8 MiB extents, back to back.
+        let a: Vec<(u64, u32)> = (0..8).map(|i| (i * E, MAX_EXTENT as u32)).collect();
+        let b: Vec<(u64, u32)> = (8..16).map(|i| (i * E, MAX_EXTENT as u32)).collect();
+
+        let mut issue_order = Vec::new();
+        for &(s, l) in a.iter().chain(b.iter()) {
+            upsert(&mut issue_order, s, l);
+        }
+
+        // The SECOND flush lands first — legal once the queue holds more than
+        // one, and the case a single slot could never produce.
+        let mut landed_out_of_order = Vec::new();
+        for &(s, l) in b.iter().chain(a.iter()) {
+            upsert(&mut landed_out_of_order, s, l);
+        }
+
+        assert_eq!(issue_order, landed_out_of_order);
+        assert_eq!(issue_order.len(), 16);
+        // Still sorted, which is what `floor_and_next`'s binary search needs.
+        assert!(issue_order.windows(2).all(|w| w[0].0 < w[1].0));
+    }
+
+    #[test]
+    fn upsert_keeps_sorted_and_updates() {
+        let mut ext = vec![(0u64, 10u32), (100, 20u32)];
+        upsert(&mut ext, 50, 5);
+        assert_eq!(ext, vec![(0, 10), (50, 5), (100, 20)]);
+        upsert(&mut ext, 0, 99);
+        assert_eq!(ext[0], (0, 99));
+    }
+}

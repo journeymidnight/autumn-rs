@@ -1,0 +1,494 @@
+use std::collections::HashMap;
+
+use anyhow::{anyhow, Result};
+use bytes::Bytes;
+
+pub const BLOCK_SIZE_TARGET: usize = 64 * 1024; // 64 KB
+pub const MAX_ENTRIES_PER_BLOCK: usize = 1000;
+pub const MAGIC: u32 = 0x4155_3742; // "AU7B"
+/// The only MetaBlock version this build reads or writes. v2 added
+/// `num_entries` / `num_deletions`; older SST formats are refused.
+pub const FORMAT_VERSION: u16 = 2;
+/// 13 bytes per SST entry's value section: op(1) + val_len(4) + expires_at(8).
+pub const ENTRY_VALUE_HEADER: usize = 13;
+
+// ---------------------------------------------------------------------------
+// Entry header: prefix-compression metadata for one entry within a block.
+// ---------------------------------------------------------------------------
+
+/// 4-byte per-entry header encoding prefix overlap and diff length.
+#[derive(Debug, Clone, Copy)]
+pub struct EntryHeader {
+    /// Bytes shared with the block's base key (= first key in the block).
+    pub overlap: u16,
+    /// Length of the differing suffix.
+    pub diff_len: u16,
+}
+
+impl EntryHeader {
+    pub const SIZE: usize = 4;
+
+    pub fn encode(self) -> [u8; 4] {
+        let mut b = [0u8; 4];
+        b[0..2].copy_from_slice(&self.overlap.to_le_bytes());
+        b[2..4].copy_from_slice(&self.diff_len.to_le_bytes());
+        b
+    }
+
+    pub fn decode(b: &[u8]) -> Self {
+        Self {
+            overlap: u16::from_le_bytes(b[0..2].try_into().unwrap()),
+            diff_len: u16::from_le_bytes(b[2..4].try_into().unwrap()),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Block index entry stored in the MetaBlock.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub struct BlockOffset {
+    /// Base key (= first key in the block; used for range filtering).
+    pub key: Vec<u8>,
+    /// Byte offset of this block from the start of the SSTable bytes.
+    pub relative_offset: u32,
+    /// Byte length of the block (including footer but not CRC; CRC is last 4B of block).
+    pub block_len: u32,
+}
+
+// ---------------------------------------------------------------------------
+// MetaBlock: the footer appended at the tail of every SSTable.
+// Layout: [encoded_bytes][crc32c: 4B LE][meta_len: 4B LE]
+// The last 4 bytes of the SSTable are meta_len; read them first to locate the MetaBlock.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug)]
+pub struct MetaBlock {
+    pub block_offsets: Vec<BlockOffset>,
+    pub bloom_data: Vec<u8>,
+    pub smallest_key: Vec<u8>,
+    pub biggest_key: Vec<u8>,
+    pub estimated_size: u64,
+    pub seq_num: u64,
+    pub vp_extent_id: u64,
+    pub vp_offset: u64,
+    /// Distinct old log extents still referenced by live ValuePointer
+    /// entries in this SST.
+    pub vp_deps: Vec<u64>,
+    /// Per-logStream-extent discard stats: extentID -> reclaimable bytes.
+    /// Persisted in rowStream as part of the SSTable MetaBlock.
+    pub discards: HashMap<u64, i64>,
+    /// Earliest non-zero expires_at across all entries in this SSTable.
+    /// 0 means no entries have expiry set.
+    pub min_expires_at: u64,
+    /// Every entry in the SST, tombstones and shadowed versions included
+    /// (RocksDB's `num_entries` table property).
+    pub num_entries: u64,
+    /// Tombstone entries (RocksDB's `num_deletions`). The PS compares the sum
+    /// of both over its tables to decide a deletion-triggered compaction.
+    pub num_deletions: u64,
+}
+
+impl MetaBlock {
+    /// Encode returns the MetaBlock bytes including CRC32C (but NOT meta_len trailer).
+    pub fn encode(&self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&MAGIC.to_le_bytes());
+        buf.extend_from_slice(&FORMAT_VERSION.to_le_bytes());
+        buf.extend_from_slice(&(self.block_offsets.len() as u32).to_le_bytes());
+        for bo in &self.block_offsets {
+            buf.extend_from_slice(&(bo.key.len() as u16).to_le_bytes());
+            buf.extend_from_slice(&bo.key);
+            buf.extend_from_slice(&bo.relative_offset.to_le_bytes());
+            buf.extend_from_slice(&bo.block_len.to_le_bytes());
+        }
+        buf.extend_from_slice(&(self.bloom_data.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&self.bloom_data);
+        buf.extend_from_slice(&(self.smallest_key.len() as u16).to_le_bytes());
+        buf.extend_from_slice(&self.smallest_key);
+        buf.extend_from_slice(&(self.biggest_key.len() as u16).to_le_bytes());
+        buf.extend_from_slice(&self.biggest_key);
+        buf.extend_from_slice(&self.estimated_size.to_le_bytes());
+        buf.extend_from_slice(&self.seq_num.to_le_bytes());
+        buf.extend_from_slice(&self.vp_extent_id.to_le_bytes());
+        buf.extend_from_slice(&self.vp_offset.to_le_bytes());
+        buf.extend_from_slice(&(self.vp_deps.len() as u32).to_le_bytes());
+        for &eid in &self.vp_deps {
+            buf.extend_from_slice(&eid.to_le_bytes());
+        }
+        buf.push(0u8); // compression_type = None
+                       // Discard map: [count: u32 LE][extent_id: u64 LE][size: i64 LE] * count
+        buf.extend_from_slice(&(self.discards.len() as u32).to_le_bytes());
+        for (&eid, &sz) in &self.discards {
+            buf.extend_from_slice(&eid.to_le_bytes());
+            buf.extend_from_slice(&sz.to_le_bytes());
+        }
+        // min_expires_at: earliest non-zero expiry timestamp (0 = none)
+        buf.extend_from_slice(&self.min_expires_at.to_le_bytes());
+        buf.extend_from_slice(&self.num_entries.to_le_bytes());
+        buf.extend_from_slice(&self.num_deletions.to_le_bytes());
+        // CRC32C covers everything above
+        let crc = crc32c::crc32c(&buf);
+        buf.extend_from_slice(&crc.to_le_bytes());
+        buf
+    }
+
+    /// Decode a MetaBlock from its encoded bytes (including trailing CRC).
+    pub fn decode(data: &[u8]) -> Result<Self> {
+        if data.len() < 4 + 2 + 4 + 4 {
+            return Err(anyhow!("MetaBlock too short: {} bytes", data.len()));
+        }
+        let (payload, crc_bytes) = data.split_at(data.len() - 4);
+        let stored = u32::from_le_bytes(crc_bytes.try_into().unwrap());
+        let computed = crc32c::crc32c(payload);
+        if stored != computed {
+            return Err(anyhow!(
+                "MetaBlock CRC mismatch: stored={stored:#x} computed={computed:#x}"
+            ));
+        }
+
+        let mut c = 0usize;
+
+        let magic = read_u32(payload, &mut c)?;
+        if magic != MAGIC {
+            return Err(anyhow!("MetaBlock magic mismatch: {magic:#x}"));
+        }
+        let version = read_u16(payload, &mut c)?;
+        if version != FORMAT_VERSION {
+            return Err(anyhow!(
+                "SST MetaBlock format v{version}, this build reads only v{FORMAT_VERSION}"
+            ));
+        }
+        let num_blocks = read_u32(payload, &mut c)? as usize;
+
+        let mut block_offsets = Vec::with_capacity(num_blocks);
+        for _ in 0..num_blocks {
+            let key_len = read_u16(payload, &mut c)? as usize;
+            let key = read_bytes(payload, &mut c, key_len)?;
+            let relative_offset = read_u32(payload, &mut c)?;
+            let block_len = read_u32(payload, &mut c)?;
+            block_offsets.push(BlockOffset {
+                key,
+                relative_offset,
+                block_len,
+            });
+        }
+
+        let bloom_len = read_u32(payload, &mut c)? as usize;
+        let bloom_data = read_bytes(payload, &mut c, bloom_len)?;
+
+        let sk_len = read_u16(payload, &mut c)? as usize;
+        let smallest_key = read_bytes(payload, &mut c, sk_len)?;
+        let bk_len = read_u16(payload, &mut c)? as usize;
+        let biggest_key = read_bytes(payload, &mut c, bk_len)?;
+
+        let estimated_size = read_u64(payload, &mut c)?;
+        let seq_num = read_u64(payload, &mut c)?;
+        let vp_extent_id = read_u64(payload, &mut c)?;
+        let vp_offset = read_u64(payload, &mut c)?;
+        let vp_dep_count = read_u32(payload, &mut c)? as usize;
+        let mut vp_deps = Vec::with_capacity(vp_dep_count);
+        for _ in 0..vp_dep_count {
+            vp_deps.push(read_u64(payload, &mut c)?);
+        }
+        // skip compression_type byte
+        read_bytes(payload, &mut c, 1)?;
+        let discard_count = read_u32(payload, &mut c)? as usize;
+        let mut discards = HashMap::with_capacity(discard_count);
+        for _ in 0..discard_count {
+            let eid = read_u64(payload, &mut c)?;
+            let sz = read_i64(payload, &mut c)?;
+            discards.insert(eid, sz);
+        }
+        let min_expires_at = read_u64(payload, &mut c)?;
+        let num_entries = read_u64(payload, &mut c)?;
+        let num_deletions = read_u64(payload, &mut c)?;
+        if c != payload.len() {
+            return Err(anyhow!(
+                "MetaBlock: {} trailing bytes after the last field",
+                payload.len() - c
+            ));
+        }
+
+        Ok(MetaBlock {
+            block_offsets,
+            bloom_data,
+            smallest_key,
+            biggest_key,
+            estimated_size,
+            seq_num,
+            vp_extent_id,
+            vp_offset,
+            vp_deps,
+            discards,
+            min_expires_at,
+            num_entries,
+            num_deletions,
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Parsed (decoded) data block.
+// ---------------------------------------------------------------------------
+
+/// A decoded data block ready for iteration.
+#[derive(Debug)]
+pub struct DecodedBlock {
+    /// Raw block bytes (CRC-verified payload, without trailing CRC).
+    /// Stored as `Bytes` so value slices can be returned zero-copy.
+    pub data: Bytes,
+    /// Byte offsets of each entry from the start of `data`.
+    pub entry_offsets: Vec<u32>,
+    /// First (base) key in the block. Required for prefix decompression.
+    pub base_key: Vec<u8>,
+}
+
+impl DecodedBlock {
+    /// test helper — fabricate a minimal block for cache unit tests.
+    #[cfg(test)]
+    pub fn test_dummy(data: Bytes) -> Self {
+        Self {
+            data,
+            entry_offsets: vec![0],
+            base_key: vec![],
+        }
+    }
+
+    /// Decode a raw block (bytes from SSTable, including the entry_offsets footer and CRC).
+    /// `base_key_hint` is the key from BlockOffset (= first key in block, from MetaBlock index).
+    /// `raw` is a `Bytes` slice from the SSTable data — the decoded block keeps a zero-copy
+    /// reference to it so value lookups don't require memcpy.
+    pub fn decode(raw: Bytes, base_key_hint: &[u8]) -> Result<Self> {
+        if raw.len() < 8 {
+            return Err(anyhow!("block too short: {} bytes", raw.len()));
+        }
+        // Last 4 bytes: CRC32C
+        let crc_start = raw.len() - 4;
+        let stored_crc = u32::from_le_bytes(raw[crc_start..].try_into().unwrap());
+        let computed_crc = crc32c::crc32c(&raw[..crc_start]);
+        if stored_crc != computed_crc {
+            return Err(anyhow!(
+                "block CRC mismatch: stored={stored_crc:#x} computed={computed_crc:#x}"
+            ));
+        }
+        // Payload is everything before the CRC.
+        let payload = raw.slice(..crc_start);
+        let n = payload.len();
+        if n < 8 {
+            return Err(anyhow!("block payload too short"));
+        }
+        let num_entries = u32::from_le_bytes(payload[n - 4..n].try_into().unwrap()) as usize;
+        let offsets_start = n - 4 - num_entries * 4;
+        if offsets_start > n - 4 {
+            return Err(anyhow!("block entry_offsets overflow"));
+        }
+        let mut entry_offsets = Vec::with_capacity(num_entries);
+        for i in 0..num_entries {
+            let off = u32::from_le_bytes(
+                payload[offsets_start + i * 4..offsets_start + i * 4 + 4]
+                    .try_into()
+                    .unwrap(),
+            );
+            entry_offsets.push(off);
+        }
+        let base_key = base_key_hint.to_vec();
+        Ok(DecodedBlock {
+            data: payload,
+            entry_offsets,
+            base_key,
+        })
+    }
+
+    pub fn num_entries(&self) -> usize {
+        self.entry_offsets.len()
+    }
+
+    /// Reconstruct only the key at index `idx` (no value parsing).
+    /// Cheaper than `get_entry` for binary search comparisons.
+    pub fn get_key(&self, idx: usize) -> Result<Vec<u8>> {
+        let offset = self.entry_offsets[idx] as usize;
+        let data = &self.data;
+        if offset + EntryHeader::SIZE > data.len() {
+            return Err(anyhow!("entry header out of bounds at idx={idx}"));
+        }
+        let hdr = EntryHeader::decode(&data[offset..offset + EntryHeader::SIZE]);
+        let diff_start = offset + EntryHeader::SIZE;
+        let diff_end = diff_start + hdr.diff_len as usize;
+        if diff_end > data.len() {
+            return Err(anyhow!("diff_key out of bounds at idx={idx}"));
+        }
+        let overlap = hdr.overlap as usize;
+        let mut full_key = Vec::with_capacity(overlap + hdr.diff_len as usize);
+        if overlap > 0 {
+            full_key.extend_from_slice(&self.base_key[..overlap.min(self.base_key.len())]);
+        }
+        full_key.extend_from_slice(&data[diff_start..diff_end]);
+        Ok(full_key)
+    }
+
+    /// Decode the entry at index `idx` within this block.
+    /// Returns (full_internal_key, op, value_bytes, expires_at).
+    /// Value is returned as a zero-copy `Bytes` slice into the block data.
+    pub fn get_entry(&self, idx: usize) -> Result<(Vec<u8>, u8, Bytes, u64)> {
+        let offset = self.entry_offsets[idx] as usize;
+        let data = &self.data;
+        if offset + EntryHeader::SIZE > data.len() {
+            return Err(anyhow!("entry header out of bounds at idx={idx}"));
+        }
+        let hdr = EntryHeader::decode(&data[offset..offset + EntryHeader::SIZE]);
+        let diff_start = offset + EntryHeader::SIZE;
+        let diff_end = diff_start + hdr.diff_len as usize;
+        if diff_end > data.len() {
+            return Err(anyhow!("diff_key out of bounds at idx={idx}"));
+        }
+        // Reconstruct full key: base_key[0..overlap] + diff_key
+        let overlap = hdr.overlap as usize;
+        let mut full_key = Vec::with_capacity(overlap + hdr.diff_len as usize);
+        if overlap > 0 {
+            full_key.extend_from_slice(&self.base_key[..overlap.min(self.base_key.len())]);
+        }
+        full_key.extend_from_slice(&data[diff_start..diff_end]);
+
+        // Value section: [op:1][val_len:4][expires_at:8][value]
+        let vs = diff_end;
+        if vs + ENTRY_VALUE_HEADER > data.len() {
+            return Err(anyhow!("entry value header out of bounds at idx={idx}"));
+        }
+        let op = data[vs];
+        let val_len = u32::from_le_bytes(data[vs + 1..vs + 5].try_into().unwrap()) as usize;
+        let expires_at = u64::from_le_bytes(data[vs + 5..vs + 13].try_into().unwrap());
+        let ve = vs + ENTRY_VALUE_HEADER + val_len;
+        if ve > data.len() {
+            return Err(anyhow!(
+                "entry value out of bounds at idx={idx} ve={ve} len={}",
+                data.len()
+            ));
+        }
+        // Zero-copy: slice into the block's Bytes buffer.
+        let value = self.data.slice(vs + ENTRY_VALUE_HEADER..ve);
+        Ok((full_key, op, value, expires_at))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Small read helpers
+// ---------------------------------------------------------------------------
+
+fn read_u16(data: &[u8], c: &mut usize) -> Result<u16> {
+    if *c + 2 > data.len() {
+        return Err(anyhow!("MetaBlock: truncated at u16 offset={c}"));
+    }
+    let v = u16::from_le_bytes(data[*c..*c + 2].try_into().unwrap());
+    *c += 2;
+    Ok(v)
+}
+
+fn read_u32(data: &[u8], c: &mut usize) -> Result<u32> {
+    if *c + 4 > data.len() {
+        return Err(anyhow!("MetaBlock: truncated at u32 offset={c}"));
+    }
+    let v = u32::from_le_bytes(data[*c..*c + 4].try_into().unwrap());
+    *c += 4;
+    Ok(v)
+}
+
+fn read_u64(data: &[u8], c: &mut usize) -> Result<u64> {
+    if *c + 8 > data.len() {
+        return Err(anyhow!("MetaBlock: truncated at u64 offset={c}"));
+    }
+    let v = u64::from_le_bytes(data[*c..*c + 8].try_into().unwrap());
+    *c += 8;
+    Ok(v)
+}
+
+fn read_i64(data: &[u8], c: &mut usize) -> Result<i64> {
+    if *c + 8 > data.len() {
+        return Err(anyhow!("MetaBlock: truncated at i64 offset={c}"));
+    }
+    let v = i64::from_le_bytes(data[*c..*c + 8].try_into().unwrap());
+    *c += 8;
+    Ok(v)
+}
+
+fn read_bytes(data: &[u8], c: &mut usize, len: usize) -> Result<Vec<u8>> {
+    if *c + len > data.len() {
+        return Err(anyhow!(
+            "MetaBlock: truncated at bytes offset={c} len={len}"
+        ));
+    }
+    let v = data[*c..*c + len].to_vec();
+    *c += len;
+    Ok(v)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_meta() -> MetaBlock {
+        let mut discards = HashMap::new();
+        discards.insert(11, 123);
+        MetaBlock {
+            block_offsets: vec![BlockOffset {
+                key: b"k".to_vec(),
+                relative_offset: 7,
+                block_len: 9,
+            }],
+            bloom_data: vec![1, 2, 3],
+            smallest_key: b"a".to_vec(),
+            biggest_key: b"z".to_vec(),
+            estimated_size: 42,
+            seq_num: 99,
+            vp_extent_id: 52,
+            vp_offset: 4096,
+            vp_deps: vec![21, 48, 52],
+            discards,
+            min_expires_at: 1234,
+            num_entries: 5000,
+            num_deletions: 1700,
+        }
+    }
+
+    #[test]
+    fn meta_block_round_trip_preserves_every_field() {
+        let decoded = MetaBlock::decode(&sample_meta().encode()).unwrap();
+        assert_eq!(decoded.vp_deps, vec![21, 48, 52]);
+        assert_eq!(decoded.vp_extent_id, 52);
+        assert_eq!(decoded.vp_offset, 4096);
+        assert_eq!(decoded.discards.get(&11), Some(&123));
+        assert_eq!(decoded.min_expires_at, 1234);
+        assert_eq!(decoded.num_entries, 5000);
+        assert_eq!(decoded.num_deletions, 1700);
+    }
+
+    /// The same MetaBlock as v1 wrote it: version 1 and no counts. The CRC is
+    /// valid, so only the version can refuse it.
+    fn as_v1(v2: &[u8]) -> Vec<u8> {
+        let mut payload = v2[..v2.len() - 4 - 16].to_vec();
+        payload[4..6].copy_from_slice(&1u16.to_le_bytes());
+        let crc = crc32c::crc32c(&payload);
+        payload.extend_from_slice(&crc.to_le_bytes());
+        payload
+    }
+
+    #[test]
+    fn a_v1_meta_block_is_refused_with_the_supported_version() {
+        let err = MetaBlock::decode(&as_v1(&sample_meta().encode()))
+            .err()
+            .expect("a v1 MetaBlock must not decode")
+            .to_string();
+        assert!(err.contains("v1") && err.contains("reads only v2"), "{err}");
+    }
+
+    #[test]
+    fn a_v2_meta_block_missing_its_counts_is_refused() {
+        let mut bytes = as_v1(&sample_meta().encode());
+        let n = bytes.len();
+        bytes[4..6].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
+        let crc = crc32c::crc32c(&bytes[..n - 4]);
+        bytes[n - 4..].copy_from_slice(&crc.to_le_bytes());
+        assert!(MetaBlock::decode(&bytes).is_err());
+    }
+}

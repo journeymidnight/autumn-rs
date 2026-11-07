@@ -1,0 +1,2572 @@
+//! RPC dispatch and handler functions for partition operations.
+//!
+//! `handle_put`, `handle_delete`, and `handle_stream_put` are gone —
+//! writes decode inline in `partition_loop::handle_incoming_req` and
+//! push directly into the SQ/CQ pipeline's pending queue. Only read ops and
+//! low-frequency control ops (SPLIT_PART, MAINTENANCE) are handled here.
+
+use autumn_stream::client::ReadDescriptor;
+use std::cell::RefCell;
+use std::rc::Rc;
+use std::time::{Duration, Instant};
+
+use autumn_common::metrics::ns_to_ms;
+use autumn_rpc::manager_rpc;
+use autumn_rpc::partition_rpc::{self, *};
+use autumn_rpc::{HandlerResult, StatusCode};
+use autumn_stream::{ConnPool, StaleVpOffset, StreamClient};
+use bytes::Bytes;
+
+use crate::sstable::{AsyncMergeIterator, AsyncTableIterator, FetchMode};
+use crate::*;
+
+/// What one `MSG_BATCH_GET` answer costs per item BESIDES its value: one
+/// status byte and one u32 length, plus rkyv framing. Rounded up.
+const BATCH_GET_CTRL_BYTES_PER_ITEM: usize = 8;
+
+/// Fixed allowance for the rest of a batch reply's ctrl — the empty message,
+/// the rkyv archive's own header, the frame's `CTRL_OVERHEAD`.
+const BATCH_GET_CTRL_FIXED_BYTES: usize = 4096;
+
+/// What a position adds to a batch reply's ctrl: its scalars and each
+/// address with its length, rounded up.
+fn position_ctrl_bytes(pos: &ValuePosition) -> usize {
+    64 + pos.replica_addrs.iter().map(|a| a.len() + 16).sum::<usize>()
+}
+
+/// Does this batch no longer fit in one frame?
+///
+/// Both halves count. The values are the obvious half, but the ctrl — one
+/// entry per ITEM, and a position for each item read elsewhere — rides in the
+/// SAME payload, so a budget that reserved a fixed slice for it leaves a
+/// window at large item counts: a million items of ~4 KiB each fits a
+/// value-only budget while its ctrl pushes the frame past the ceiling. The
+/// caller chooses the item count, so it is an input, not a constant.
+///
+/// Split out from the loop so the boundary is testable: driving the handler
+/// needs a live partition AND gigabytes of values, so what a test can pin
+/// cheaply is this arithmetic.
+#[inline]
+pub(crate) fn batch_get_budget_exceeded(value_bytes: usize, items: usize, position_bytes: usize) -> bool {
+    let ctrl = BATCH_GET_CTRL_FIXED_BYTES
+        .saturating_add(items.saturating_mul(BATCH_GET_CTRL_BYTES_PER_ITEM))
+        .saturating_add(position_bytes);
+    value_bytes.saturating_add(ctrl) > autumn_rpc::frame::MAX_PAYLOAD_LEN as usize
+}
+
+/// translate VP-resolve errors into wire status codes that
+/// distinguish "data permanently lost; clean up the key" from
+/// "server bug; investigate".
+///
+/// Most read-side errors today bubble up as `anyhow::Error` and get
+/// uniformly mapped to `StatusCode::Internal`. That collapses two
+/// very different classes — transient/buggy server failures vs known
+/// historical data corruption (`StaleVpOffset` sentinel from
+/// `autumn-stream`). Operational tooling (per
+/// `feedback_ops_tools_in_python` memory: future Python scripts that
+/// consume `autumn-client` output) needs to distinguish them so it
+/// can decide between "retry" and "delete the key + major compact".
+///
+/// The sentinel's Display string is a stable wire contract — see the
+/// `StaleVpOffset` doc comment in `crates/stream/src/client.rs` for
+/// the prefix + field-order guarantees.
+fn map_storage_error(e: &anyhow::Error) -> (StatusCode, String) {
+    if let Some(stale) = e.chain().find_map(|c| c.downcast_ref::<StaleVpOffset>()) {
+        return (StatusCode::FailedPrecondition, stale.to_string());
+    }
+    // `{e:#}` — the WHOLE chain, not just the outermost context.
+    //
+    // `to_string()` sends only the last context added, and every EC read
+    // failure arrives here wrapped: the outer layer says
+    // "ec_reconstruct_shard_subrange: only 3/4 shards available", the inner
+    // one says WHICH peer failed and why — timeout, short read, payload not
+    // here. The inner half is the entire diagnostic value and it was being
+    // dropped at the wire boundary, so an operator saw a symptom with no
+    // cause and no hint that a cause existed. Costs a longer string on a path
+    // that is already an error.
+    //
+    // StaleVpOffset above keeps `to_string()` deliberately: its Display is a
+    // parsed wire contract, not a human message.
+    (StatusCode::Internal, format!("{e:#}"))
+}
+
+/// TiKV-style routing-freshness check shared by the read handlers
+/// (get / head / range / batch_get). `req_epoch == 0` skips the check
+/// (bootstrap / tests / legacy callers). On mismatch returns a
+/// `FailedPrecondition` so the SDK's `Err`-arm refresh+retry engages.
+fn check_region_epoch(part_id: u64, have: u64, req_epoch: u64) -> Result<(), (StatusCode, String)> {
+    if req_epoch != 0 && req_epoch != have {
+        return Err((
+            StatusCode::FailedPrecondition,
+            format!("region epoch stale: part_id={part_id} have={have} got={req_epoch}"),
+        ));
+    }
+    Ok(())
+}
+
+// Per-partition read metrics, tracked in thread-local since partition thread is single-threaded.
+thread_local! {
+    static READ_METRICS: RefCell<ReadMetrics> = RefCell::new(ReadMetrics::new());
+}
+
+struct ReadMetrics {
+    started_at: Instant,
+    ops: u64,
+    lookup_ns: u64,
+    encode_ns: u64,
+    vp_resolve_ns: u64,
+    vp_resolve_count: u64,
+    found_in_mem: u64,
+    found_in_imm: u64,
+    found_in_sst: u64,
+    not_found: u64,
+}
+
+impl ReadMetrics {
+    fn new() -> Self {
+        Self {
+            started_at: Instant::now(),
+            ops: 0,
+            lookup_ns: 0,
+            encode_ns: 0,
+            vp_resolve_ns: 0,
+            vp_resolve_count: 0,
+            found_in_mem: 0,
+            found_in_imm: 0,
+            found_in_sst: 0,
+            not_found: 0,
+        }
+    }
+    fn maybe_report(&mut self) {
+        if self.started_at.elapsed() >= Duration::from_secs(1) && self.ops > 0 {
+            let elapsed = self.started_at.elapsed();
+            let ops = self.ops.max(1);
+            let vp = self.vp_resolve_count.max(1);
+            tracing::info!(
+                ops = self.ops,
+                ops_per_sec = self.ops as f64 / elapsed.as_secs_f64(),
+                avg_lookup_ms = ns_to_ms(self.lookup_ns, ops),
+                avg_encode_ms = ns_to_ms(self.encode_ns, ops),
+                vp_resolve_count = self.vp_resolve_count,
+                avg_vp_resolve_ms = ns_to_ms(self.vp_resolve_ns, vp),
+                mem = self.found_in_mem,
+                imm = self.found_in_imm,
+                sst = self.found_in_sst,
+                miss = self.not_found,
+                "partition read summary",
+            );
+            *self = Self::new();
+        }
+    }
+}
+
+/// PUT / DELETE / STREAM_PUT are handled by `partition_loop`'s
+/// direct `handle_incoming_req` path (no spawn, no inner oneshot). Only
+/// reads and low-frequency control ops route through this dispatch function.
+/// Receiving a write op here is a bug — we short-circuit with an error.
+pub(crate) async fn dispatch_partition_rpc(
+    msg_type: u8,
+    payload: Bytes,
+    part: &Rc<RefCell<PartitionData>>,
+    part_sc: &Rc<StreamClient>,
+    _pool: &Rc<ConnPool>,
+    _manager_addr: &str,
+    _owner_key: &str,
+    _revision: i64,
+) -> HandlerResult {
+    match msg_type {
+        MSG_HEAD => handle_head(payload, part).await,
+        MSG_RANGE => handle_range(payload, part).await,
+        MSG_GET_DISCARDS => handle_get_discards(payload, part, part_sc).await,
+        // SPLIT_PART must NOT be invoked inline through
+        // dispatch_partition_rpc — handle_split_part awaits an internal
+        // drain signal that requires partition_loop to run, and
+        // an inline call would self-deadlock (the loop's stack is parked
+        // here). MSG_SPLIT_PART is now intercepted in
+        // `handle_incoming_req` and dispatched via `compio::runtime::spawn`.
+        MSG_SPLIT_PART => Err((
+            StatusCode::Internal,
+            "MSG_SPLIT_PART must not be dispatched inline — requires a spawned task; \
+             routed via handle_incoming_req's MSG_SPLIT_PART arm"
+                .to_string(),
+        )),
+        MSG_MAINTENANCE => handle_maintenance(payload, part, part_sc).await,
+        MSG_DIAG_TRACE_KEY => handle_diag_trace_key(payload, part).await,
+        partition_rpc::MSG_DIAG_PARTITION_VP => {
+            handle_diag_partition_vp(payload, part, part_sc).await
+        }
+        // server-side multipart (MSG_PUT_BEGIN/CHUNK/COMMIT/ABORT)
+        // removed. Stripe-write is now pure client-side via
+        // ClusterClient::put_stream_begin (Ceph striperados pattern).
+        MSG_PUT | MSG_DELETE => Err((
+            StatusCode::Internal,
+            format!("write msg_type {msg_type} must be routed via partition_loop"),
+        )),
+        _ => Err((
+            StatusCode::InvalidArgument,
+            format!("unknown msg_type {msg_type}"),
+        )),
+    }
+}
+
+/// One key's read: a `GetReq`, a `BatchGetReq` item or a `GetAmReq`.
+pub(crate) struct KeyRead {
+    pub(crate) key: Vec<u8>,
+    /// Byte range within the value; `length == 0` = to its end.
+    pub(crate) offset: u32,
+    pub(crate) length: u32,
+    pub(crate) region_epoch: u64,
+    /// May be answered with a position (`GetReq::direct`).
+    pub(crate) direct: bool,
+    /// A `direct` range of `BULK_MIN_BYTES` or more with no position is read
+    /// here; when false it is `Declined` (a batch leaves it to the client).
+    pub(crate) resolve_large: bool,
+}
+
+/// Outcome of the shared GET resolve core. `Value` is a `RegBytes` that, for a
+/// VP read, ALIASES the pooled buffer the value was received into and carries
+/// its memh — `handle_get` sends it as its own iovec (no copy).
+pub(crate) enum GetOutcome {
+    NotFound,
+    /// A value read from the log keeps its pool buffer's memh.
+    Value(autumn_transport::RegBytes),
+    /// A `direct` read of a large VP range: where the caller reads it.
+    Position(ValuePosition),
+    /// A large `direct` range with no position, not read (`!resolve_large`).
+    Declined,
+}
+
+/// `MSG_BATCH_GET` — resolve each item with `get_value`, then let the values
+/// leave as their own iovecs instead of copying them into the response.
+///
+/// `get_value` already hands back a `Bytes` (for a VP read it aliases the pool
+/// buffer), so the inline form's `v.to_vec()` was pure loss; everything after it
+/// — two copies through `rkyv_encode`, another when `Frame::encode` assembles
+/// the wire buffer, and a CRC pass over the lot — is avoided by putting the
+/// values in the tail and only the statuses and lengths in ctrl.
+///
+/// A batch-level failure (stale epoch) answers with a non-OK code and no
+/// values; per-item outcomes ride `statuses`, exactly as the inline form does.
+/// With `direct`, an item `get_value` answers with a position rides
+/// `positions` instead of the tail.
+pub(crate) async fn handle_batch_get(
+    req_id: u32,
+    payload: Bytes,
+    part: &Rc<RefCell<PartitionData>>,
+) -> (Bytes, Vec<autumn_transport::RegBytes>) {
+    let fail = |code: StatusCode, msg: String| {
+        let ctrl = partition_rpc::rkyv_encode(&partition_rpc::BatchGetCtrl {
+            message: msg,
+            statuses: Vec::new(),
+            value_lens: Vec::new(),
+            positions: Vec::new(),
+        });
+        (
+            autumn_rpc::frame::encode_bulk_response_head_bytes(
+                req_id,
+                partition_rpc::MSG_BATCH_GET,
+                partition_rpc::code_for_status(code),
+                &ctrl,
+                0,
+            ),
+            Vec::new(),
+        )
+    };
+    let req: partition_rpc::BatchGetReq = match partition_rpc::rkyv_decode(&payload) {
+        Ok(r) => r,
+        Err(e) => return fail(StatusCode::InvalidArgument, e),
+    };
+    {
+        let p = part.borrow();
+        if let Err((code, msg)) = check_region_epoch(p.part_id, p.region_epoch, req.region_epoch) {
+            drop(p);
+            return fail(code, msg);
+        }
+    }
+    let n = req.items.len();
+    let mut total: usize = 0;
+    let mut position_bytes: usize = 0;
+    let mut statuses: Vec<u8> = Vec::with_capacity(n);
+    let mut value_lens: Vec<u32> = Vec::with_capacity(n);
+    let mut positions: Vec<ValuePosition> = Vec::new();
+    let mut values: Vec<autumn_transport::RegBytes> = Vec::with_capacity(n);
+    for item in req.items.into_iter() {
+        // Route each item through `get_value` for the same VP resolution /
+        // read-pin / not-found / out-of-range semantics as a MSG_GET.
+        let read = KeyRead {
+            key: item.key,
+            offset: item.offset,
+            length: item.length,
+            region_epoch: req.region_epoch,
+            direct: req.direct,
+            resolve_large: !req.direct,
+        };
+        let (status, value) = match get_value(read, part).await {
+            // A held value has no position; its caller reads it on its own.
+            Ok(GetOutcome::Value(v)) if req.direct && v.len() >= autumn_rpc::BULK_MIN_BYTES => {
+                (BATCH_GET_DECLINED, Default::default())
+            }
+            Ok(GetOutcome::Declined) => (BATCH_GET_DECLINED, Default::default()),
+            Ok(GetOutcome::Value(v)) => (BATCH_GET_FOUND, v),
+            Ok(GetOutcome::NotFound) => (BATCH_GET_NOT_FOUND, Default::default()),
+            Ok(GetOutcome::Position(pos)) => {
+                position_bytes += position_ctrl_bytes(&pos);
+                positions.push(pos);
+                (BATCH_GET_POSITION, Default::default())
+            }
+            Err(_) => (BATCH_GET_ERROR, Default::default()),
+        };
+        statuses.push(status);
+        // Safe only because a single inline value is capped at
+        // `AUTUMN_PS_MAX_INLINE_BYTES_DEFAULT` (64 MiB); nothing else stops
+        // this narrowing.
+        value_lens.push(value.len() as u32);
+        total += value.len();
+        // A batch answers N keys in ONE frame, and nothing upstream bounds N:
+        // the SDK's `get_many` groups EVERY same-partition key into a single
+        // request, and each value may be 64 MiB. Hundreds of 8 MiB values —
+        // the shape a model load produces — aggregate past what the frame
+        // header's `payload_len: u32` can express.
+        //
+        // Refuse rather than build it. Encoding would assert, and release is
+        // `panic = "abort"`, so a single oversized `get_many` would take this
+        // whole partition server down — no unwind, no supervised restart. The
+        // pre-assert behaviour was no better: the length wrapped, the head
+        // declared a small payload, and the client read the value tail as
+        // garbage frames.
+        //
+        // Bail INSIDE the loop, not after it: the values are already
+        // materialised here, so a post-hoc check would hold gigabytes of
+        // `Bytes` on this node before deciding not to send them.
+        //
+        // `CODE_PRECONDITION` is deliberate — `get_many` already falls back to
+        // per-key `get_bound` on it (the stale-epoch path), so an oversized
+        // batch degrades to N small reads instead of failing the caller.
+        if batch_get_budget_exceeded(total, statuses.len(), position_bytes) {
+            return fail(
+                StatusCode::FailedPrecondition,
+                format!(
+                    "batch of {n} keys exceeds one frame's payload ceiling at key {} \
+                     ({total} bytes); retry the keys individually",
+                    statuses.len()
+                ),
+            );
+        }
+        if !value.is_empty() {
+            values.push(value);
+        }
+    }
+    let ctrl = partition_rpc::rkyv_encode(&partition_rpc::BatchGetCtrl {
+        message: String::new(),
+        statuses,
+        value_lens,
+        positions,
+    });
+    (
+        autumn_rpc::frame::encode_bulk_response_head_bytes(
+            req_id,
+            partition_rpc::MSG_BATCH_GET,
+            CODE_OK,
+            &ctrl,
+            total,
+        ),
+        values,
+    )
+}
+
+
+/// rkyv-framed GET (generic SDK path).
+/// seal + roll the requested open tails so a fenced node's
+/// replicas drain. The manager's recovery sweep sends this when an OPEN tail
+/// (`!sealed`) has a replica on a Fenced node — recovery rebuilds only SEALED
+/// extents, so without a roll an idle partition's open tail on a fenced node
+/// never drains and blocks `remove` forever. Log/meta tails roll on P-log's
+/// `part_sc` (the client that owns them); the row tail routes through P-sst's
+/// `row_invalidate_tx` barrier with `seal_and_roll=true` (row_stream
+/// single-writer invariant — lib.rs note 16). Idempotent: an entry whose
+/// current tail no longer equals the requested `expected_tail` (already rolled
+/// by a natural write or a prior sweep) is skipped. Best-effort: a failed roll
+/// (e.g. all replicas unreachable → manager Precondition) is logged; the sweep
+/// retries on its cooldown.
+pub(crate) async fn handle_roll_tails(
+    payload: Bytes,
+    part: &Rc<RefCell<PartitionData>>,
+    part_sc: &Rc<StreamClient>,
+) -> HandlerResult {
+    let req: RollTailsReq =
+        partition_rpc::rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+    let (log_id, row_id, meta_id, part_id, row_inv_tx) = {
+        let p = part.borrow();
+        (
+            p.log_stream_id,
+            p.row_stream_id,
+            p.meta_stream_id,
+            p.part_id,
+            p.row_invalidate_tx.clone(),
+        )
+    };
+    if req.part_id != part_id {
+        return Ok(partition_rpc::rkyv_encode(&RollTailsResp {
+            code: CODE_NOT_FOUND,
+            rolled: 0,
+            message: format!("partition {} not served here", req.part_id),
+        }));
+    }
+    let mut rolled = 0u32;
+    for (stream_id, expected_tail) in req.entries {
+        // Never roll while a split/merge freeze holds this partition: the
+        // orchestration has (or is about to) capture per-stream commit lengths
+        // and the manager applies them to whatever extent is the CURRENT tail
+        // at commit time. A roll landing inside that window swaps the tail,
+        // so the captured length would be stamped onto the roll's fresh empty
+        // extent (sealed longer than any replica holds → the CoW child cannot
+        // read it). The roll is best-effort with a manager-side retry
+        // cooldown, so skipping here just defers it past the freeze.
+        if part.borrow().frozen_for_split.get().is_some()
+            || part.borrow().merge_freeze.is_halted()
+        {
+            tracing::info!(
+                target: "roll_trace",
+                part_id,
+                stream_id,
+                "roll_tails: partition frozen for split/merge — deferring roll"
+            );
+            continue;
+        }
+        // Idempotency: skip if the tail already rolled (current != expected).
+        let cur_tail = match part_sc.get_stream_info(stream_id).await {
+            Ok(info) => info.extent_ids.last().copied().unwrap_or(0),
+            Err(e) => {
+                tracing::warn!(stream_id, error = %e, "roll_tails: get_stream_info failed");
+                continue;
+            }
+        };
+        if cur_tail != expected_tail {
+            continue; // already rolled by a natural write or a prior sweep
+        }
+        // TEST SYNC-POINT: hold the roll here (freeze/idempotency checks done,
+        // seal not yet issued) so a test can start a split freeze and reach its
+        // commit phase while this roll is "in flight". Off in production (one
+        // relaxed load; only `set_roll_tails_pause` sets it).
+        if crate::roll_tails_paused() {
+            crate::note_roll_tails_parked();
+            while crate::roll_tails_paused() {
+                compio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+        }
+        if stream_id == row_id {
+            // row_stream single-writer invariant: seal+roll on P-sst's sst_sc
+            // via the row-invalidate barrier (drains inflight to zero first).
+            let (tx, rx) = futures::channel::oneshot::channel::<anyhow::Result<()>>();
+            let mut inv_tx = row_inv_tx.clone();
+            let br = crate::RowInvalidateBarrierReq {
+                row_stream_id: row_id,
+                seal_and_roll: true,
+                resp_tx: tx,
+            };
+            if inv_tx.send(br).await.is_ok() && matches!(rx.await, Ok(Ok(()))) {
+                rolled += 1;
+            }
+        } else if stream_id == log_id || stream_id == meta_id {
+            tracing::info!(
+                target: "roll_trace",
+                part_id,
+                stream_id,
+                expected_tail,
+                kind = if stream_id == log_id { "log" } else { "meta" },
+                "roll_tails: sealing+rolling live tail"
+            );
+            match part_sc.seal_and_roll_tail(stream_id).await {
+                Ok(()) => rolled += 1,
+                Err(e) => {
+                    tracing::warn!(stream_id, error = %e, "roll_tails: seal_and_roll_tail failed")
+                }
+            }
+        }
+    }
+    Ok(partition_rpc::rkyv_encode(&RollTailsResp {
+        code: CODE_OK,
+        rolled,
+        message: String::new(),
+    }))
+}
+
+/// `MSG_GET`, the one read every SDK point read uses (`get`, `get_range`,
+/// `get_pooled`, `get_into`, `get_direct`): returns the response as TWO
+/// segments — `(head, value)` where `head = [header][ctrl_len][code+message][crc]`
+/// and `value` ALIASES the resolved read (a VP read's pool buffer via
+/// `PooledBuf::freeze`, no copy, its memh kept). The ps-conn pushes `head` then `value` into
+/// `tx_bufs` so the single `write_vectored_all` emits them as one wire frame with
+/// no concat copy.
+///
+/// ALL outcomes (incl errors) map to a bulk-shaped response: the code and a
+/// human-readable message ride in the CRC-protected ctrl, and the SDK refreshes
+/// and retries every code except OK/NotFound. The handler's `StatusCode` is
+/// translated with `partition_rpc::code_for_status`: the two spaces agree only
+/// up to 3, and the GC-pin `Unavailable` (5) is `CODE_VALUE_TOO_LARGE` when cast.
+/// A position goes as `[CODE_POSITION][rkyv ValuePosition]` with no value.
+pub(crate) async fn handle_get(
+    req_id: u32,
+    payload: Bytes,
+    part: &Rc<RefCell<PartitionData>>,
+) -> (Bytes, autumn_transport::RegBytes) {
+    let outcome = match partition_rpc::rkyv_decode::<GetReq>(&payload) {
+        Ok(req) => {
+            let read = KeyRead {
+                key: req.key,
+                offset: req.offset,
+                length: req.length,
+                region_epoch: req.region_epoch,
+                direct: req.direct,
+                resolve_large: true,
+            };
+            get_value(read, part).await
+        }
+        Err(e) => Err((StatusCode::InvalidArgument, e)),
+    };
+    let (code, msg, value): (u8, String, autumn_transport::RegBytes) = match outcome {
+        Ok(GetOutcome::Value(v)) => (CODE_OK, String::new(), v),
+        Ok(GetOutcome::NotFound) => (CODE_NOT_FOUND, String::new(), Default::default()),
+        Ok(GetOutcome::Declined) => unreachable!("a single read resolves large values"),
+        Ok(GetOutcome::Position(pos)) => {
+            let ctrl = partition_rpc::rkyv_encode(&pos);
+            let head = autumn_rpc::frame::encode_bulk_response_head_bytes(req_id, MSG_GET, CODE_POSITION, &ctrl, 0);
+            return (head, Default::default());
+        }
+        Err((status, msg)) => (partition_rpc::code_for_status(status), msg, Default::default()),
+    };
+    (ps_bulk_head(req_id, code, &msg, value.len()), value)
+}
+
+/// `MSG_GET_AM`: the read of `handle_get`, whose value leaves as the AM
+/// the client registered (`req.tag`), moved by UCX rendezvous into its memory.
+/// The reply goes after the value: once it is sent the client's memory holds
+/// it. A value longer than `req.max_len` is not sent. `am` is `None` on a TCP
+/// connection, which a client never asks this on.
+pub(crate) async fn handle_get_am(
+    req_id: u32,
+    payload: Bytes,
+    part: &Rc<RefCell<PartitionData>>,
+    am: Option<autumn_transport::am::Sender>,
+) -> Bytes {
+    let reply = |code, message: String, value_len: usize| {
+        let resp = GetAmResp { code, message, value_len: value_len as u64 };
+        autumn_rpc::Frame::response(req_id, MSG_GET_AM, partition_rpc::rkyv_encode(&resp)).encode()
+    };
+    let req: GetAmReq = match partition_rpc::rkyv_decode(&payload) {
+        Ok(r) => r,
+        Err(e) => return reply(CODE_INVALID_ARGUMENT, e, 0),
+    };
+    let Some(am) = am else {
+        return reply(CODE_INVALID_ARGUMENT, "MSG_GET_AM needs a UCX connection".to_string(), 0);
+    };
+    let read = KeyRead {
+        key: req.key,
+        offset: req.offset,
+        length: req.length,
+        region_epoch: req.region_epoch,
+        direct: false,
+        resolve_large: true,
+    };
+    match get_value(read, part).await {
+        Ok(GetOutcome::Value(v)) if v.len() as u64 > req.max_len => reply(CODE_VALUE_TOO_LARGE, String::new(), v.len()),
+        Ok(GetOutcome::Value(v)) => {
+            let n = v.len();
+            match am.send(req.tag, v).await {
+                Ok(()) => reply(CODE_OK, String::new(), n),
+                Err(e) => reply(CODE_UNAVAILABLE, format!("sending the value: {e}"), 0),
+            }
+        }
+        Ok(GetOutcome::NotFound) => reply(CODE_NOT_FOUND, String::new(), 0),
+        Ok(GetOutcome::Position(_) | GetOutcome::Declined) => unreachable!("not asked for a position"),
+        Err((status, msg)) => reply(partition_rpc::code_for_status(status), msg, 0),
+    }
+}
+
+/// Build the MSG_GET response head — value-separable frame head
+/// `[header][ctrl_len][code+message][crc]` (crc covers header+ctrl; see
+/// autumn-rpc frame.rs). The value is sent as a SEPARATE `Bytes` right after
+/// (aliasing the RegPool buffer) so it is never copied and never crc-scanned.
+pub(crate) fn ps_bulk_head(req_id: u32, code: u8, msg: &str, value_len: usize) -> Bytes {
+    autumn_rpc::frame::encode_bulk_response_head(req_id, MSG_GET, code, msg, value_len)
+}
+
+/// Shared GET resolve core: epoch/range check → memtable/imm/SST lookup →
+/// VP resolve (read_value_from_log), or a position for a `direct` read. Used
+/// by `handle_get`, the batched read and `MSG_GET_AM`. Carries the read
+/// metrics.
+// clippy false-positive: the `part.borrow()` (`p`) is explicitly `drop(p)`-ed
+// (see below) BEFORE the only `.await` (`resolve_value`). The lint flags the
+// borrow because an await exists later in the fn; it doesn't track the drop.
+#[allow(clippy::await_holding_refcell_ref)]
+async fn get_value(
+    read: KeyRead,
+    part: &Rc<RefCell<PartitionData>>,
+) -> Result<GetOutcome, (StatusCode, String)> {
+    get_value_inner(read, part).await
+}
+
+/// A decoded `MSG_COMPARE_WRITE`: a tail value or a delete, TTL, fence.
+pub(crate) struct Conditional {
+    pub(crate) region_epoch: u64,
+    pub(crate) key: Vec<u8>,
+    pub(crate) expected: Option<Vec<u8>>,
+    /// Some writes this value; None deletes the key.
+    pub(crate) value: Option<autumn_transport::RegBytes>,
+    pub(crate) expires_at: u64,
+    pub(crate) inode_hint: u64,
+    pub(crate) lease_epoch: u64,
+}
+
+pub(crate) fn decode_conditional(
+    payload: &Bytes,
+    bulk_value: Option<autumn_transport::RegBytes>,
+) -> Result<Conditional, (StatusCode, String)> {
+    let req: CompareWriteReq = rkyv_decode(payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+    if req.expected.as_ref().is_some_and(|v| v.len() > MAX_COMPARE_PUT_BYTES) {
+        return Err((StatusCode::InvalidArgument, "compare_put expected value exceeds 64 KiB".to_string()));
+    }
+    // The value cap is answered in the reply body (`compare_write_admit`).
+    Ok(Conditional {
+        region_epoch: req.region_epoch,
+        key: req.key,
+        expected: req.expected,
+        value: (!req.delete).then(|| bulk_value.unwrap_or_default()),
+        expires_at: req.expires_at,
+        inode_hint: req.inode_hint,
+        lease_epoch: req.lease_epoch,
+    })
+}
+
+/// A conditional write, run by the partition write actor in arrival order.
+/// The comparison reads committed state, so the caller has first committed
+/// any write to `req.key` still queued or in flight. A guarded write that
+/// holds joins `pending` and commits with the next group-commit batch,
+/// answering `outer` from there like any put; a failed comparison is
+/// answered at once, or once a floor it raised is durable.
+pub(crate) async fn compare_write_admit(
+    req: Conditional,
+    part: &Rc<RefCell<PartitionData>>,
+    pending: &mut Vec<WriteRequest>,
+    outer: futures::channel::oneshot::Sender<HandlerResult>,
+) {
+    let key = req.key.clone();
+    // In the body, as `enqueue_put` does: a frame-level error reads as a
+    // routing miss and the client would re-send the value until it gave up.
+    if let Some(len) = req.value.as_ref().map(|v| v.len()).filter(|&n| n > AUTUMN_PS_MAX_INLINE_BYTES_DEFAULT as usize) {
+        let message = format!("value {len} bytes exceeds inline cap {AUTUMN_PS_MAX_INLINE_BYTES_DEFAULT}");
+        let _ = outer.send(Ok(rkyv_encode(&PutResp { code: CODE_VALUE_TOO_LARGE, message, key })));
+        return;
+    }
+    let conflict = |key: Vec<u8>| PutResp { code: CODE_PRECONDITION, message: "compare_put conflict".into(), key };
+    let (raised, matches) = match compare(&req, part).await {
+        Ok(Compared::Decided { raised, matches }) => (raised, matches),
+        Ok(Compared::Fenced(message)) => {
+            let _ = outer.send(Ok(rkyv_encode(&PutResp { code: CODE_FENCED, message, key })));
+            return;
+        }
+        Err(e) => {
+            let _ = outer.send(Err(e));
+            return;
+        }
+    };
+    if !matches && !raised {
+        // Body-level conflict is terminal, unlike stale-region frame errors.
+        let _ = outer.send(Ok(rkyv_encode(&conflict(key))));
+        return;
+    }
+    // The reply rides the last record queued: the guarded write when the
+    // comparison holds, else the floor bump, so a failed comparison is
+    // reported only once a raised floor is durable.
+    let mut replier = Some(if matches {
+        WriteResponder::Put { outer, key: key.clone() }
+    } else {
+        WriteResponder::Conflict { outer, key: key.clone() }
+    });
+    if raised {
+        pending.push(WriteRequest {
+            op: WriteOp::FenceBump { ino: req.inode_hint, epoch: req.lease_epoch },
+            resp: if matches { WriteResponder::Fence } else { replier.take().expect("unused") },
+        });
+    }
+    if matches {
+        let resp = replier.take().expect("unused");
+        pending.push(match req.value {
+            Some(value) => WriteRequest {
+                op: WriteOp::Put { user_key: Bytes::from(key), value, expires_at: req.expires_at },
+                resp,
+            },
+            None => WriteRequest { op: WriteOp::Delete { user_key: key }, resp },
+        });
+    }
+}
+
+enum Compared {
+    Decided { raised: bool, matches: bool },
+    Fenced(String),
+}
+
+async fn compare(req: &Conditional, part: &Rc<RefCell<PartitionData>>) -> Result<Compared, (StatusCode, String)> {
+    let check = || {
+        let p = part.borrow();
+        check_region_epoch(p.part_id, p.region_epoch, req.region_epoch)?;
+        if !in_range(&p.rg, &req.key) {
+            return Err((StatusCode::InvalidArgument, "key is out of range".into()));
+        }
+        if p.merge_freeze.is_halted() || p.frozen_for_split.get().is_some() {
+            return Err((StatusCode::Unavailable, "partition frozen; refresh routing".into()));
+        }
+        Ok(())
+    };
+    check()?;
+    // Fence before comparing, and only after the range check so a misrouted
+    // request can never raise a floor. A raised floor is made durable
+    // whether or not the comparison holds.
+    let raised = match part.borrow().fence_floors.check_and_bump(req.inode_hint, req.lease_epoch) {
+        Ok(raised) => raised,
+        Err(message) => return Ok(Compared::Fenced(message)),
+    };
+    let matches = match &req.expected {
+        // Absence needs no value read: a large value would otherwise be
+        // fetched from the log just to learn that it is there.
+        None => lookup_live(part, &req.key).await?.is_none(),
+        Some(expected) => {
+            let current = get_value(KeyRead {
+                key: req.key.clone(), offset: 0, length: MAX_COMPARE_PUT_BYTES as u32 + 1,
+                region_epoch: req.region_epoch, direct: false, resolve_large: true,
+            }, part).await?;
+            match current {
+                GetOutcome::NotFound => false,
+                GetOutcome::Value(value) => expected.as_slice() == value.as_ref(),
+                GetOutcome::Position(_) | GetOutcome::Declined => unreachable!("not asked for a position"),
+            }
+        }
+    };
+    // A paged lookup can yield while maintenance freezes or splits the range.
+    check()?;
+    Ok(Compared::Decided { raised, matches })
+}
+
+#[allow(clippy::await_holding_refcell_ref)]
+/// paged SST point-lookup with the compaction-truncate retry — shared by
+/// `get_value_inner` and `handle_head` (the two MUST stay in sync).
+///
+/// A snapshot reader's backing row extent can be TRUNCATED by a compaction
+/// that completes during our block read (paged readers hold metadata only,
+/// not bytes). On a read error, if the live `sst_readers` set changed since
+/// the snapshot, retry ONCE against the fresh set — the key (if it exists)
+/// is in the compaction's output SSTs. Unchanged set or second failure = a
+/// real read error, surfaced as Internal (NEVER a false NotFound).
+///
+/// Borrows `part` internally and releases before every await (note 15);
+/// returns with NO borrow held.
+async fn sst_lookup_paged_retry(
+    part: &Rc<RefCell<PartitionData>>,
+    key: &[u8],
+) -> Result<Option<(u8, Bytes, u64)>, (StatusCode, String)> {
+    let mut attempt = 0u32;
+    'sst_lookup: loop {
+        attempt += 1;
+        // Borrow scoped to the snapshot — released before any await.
+        let (readers, sc, cache) = {
+            let p = part.borrow();
+            (
+                p.sst_readers.to_vec(),
+                p.stream_client.clone(),
+                p.block_cache.clone(),
+            )
+        };
+        let (mut skipped, mut false_positives) = (0u64, 0u64);
+        for reader in readers.iter().rev() {
+            if !reader.may_contain(key) {
+                skipped += 1;
+                continue;
+            }
+            match read_sst_entry_via(reader, key, &sc, &cache).await {
+                Ok(Some(r)) => {
+                    part.borrow().metrics.record_sst_lookup(skipped, true, false_positives);
+                    return Ok(Some(r));
+                }
+                Ok(None) => false_positives += 1,
+                Err(e) => {
+                    let changed =
+                        crate::sst_readers_changed(&part.borrow().sst_readers, &readers);
+                    if attempt == 1 && changed {
+                        continue 'sst_lookup;
+                    }
+                    return Err((StatusCode::Internal, format!("sst block read: {e}")));
+                }
+            }
+        }
+        part.borrow().metrics.record_sst_lookup(skipped, false, false_positives);
+        return Ok(None);
+    }
+}
+
+/// With `req.direct`, a VP range of at least `BULK_MIN_BYTES` whose extent a
+/// client can read (`extent_read_descriptor`) is answered with its position
+/// instead of being resolved through this PS; any other value, and a lookup
+/// that declines or fails, is resolved as usual. The GC writer-pin check runs
+/// first, as for every VP read.
+async fn get_value_inner(
+    req: KeyRead,
+    part: &Rc<RefCell<PartitionData>>,
+) -> Result<GetOutcome, (StatusCode, String)> {
+
+    let lookup_t0 = Instant::now();
+    // Borrow scoped to the epoch/range check + memtable lookups — released
+    // before any await (note 15). `source` tracks where the key was found:
+    // 0=miss, 1=mem, 2=imm, 3=sst.
+    let mut source = 0u8;
+    let mut found: Option<(u8, Bytes, u64)> = {
+        let p = part.borrow();
+        check_region_epoch(p.part_id, p.region_epoch, req.region_epoch)?;
+        if !in_range(&p.rg, &req.key) {
+            return Err((
+                StatusCode::InvalidArgument,
+                "key is out of range".to_string(),
+            ));
+        }
+        // The memory tier holds a newer value than anything in the LSM.
+        mem_tier_get(&p, &req.key)
+            .or_else(|| lookup_in_memtable(&p.active, &req.key))
+            .inspect(|_r| {
+                source = 1;
+            })
+            .or_else(|| {
+                for imm in p.imm.iter().rev() {
+                    if let Some(r) = lookup_in_memtable(imm, &req.key) {
+                        source = 2;
+                        return Some(r);
+                    }
+                }
+                None
+            })
+    };
+    // the SST lookup may FETCH blocks from row_stream (paged
+    // readers) — `sst_lookup_paged_retry` snapshots the reader set, drops
+    // the borrow across its awaits (note 15), and handles the
+    // compaction-truncate single retry. The re-borrow below may observe
+    // post-split state for the pin / redirect section — same relaxation
+    // batch_get already accepts.
+    if found.is_none() {
+        if let Some(r) = sst_lookup_paged_retry(part, &req.key).await? {
+            source = 3;
+            found = Some(r);
+        }
+    }
+    let p = part.borrow();
+    let lookup_ns = lookup_t0.elapsed().as_nanos() as u64;
+
+    // One read-metrics record per outcome. `source` 0 = counted as
+    // not_found (miss, tombstone/expired, or pinned-away); vp fields only
+    // accumulate on the resolved-VP outcome.
+    let record_read = |source: u8, is_vp: bool, vp_resolve_ns: u64| {
+        READ_METRICS.with(|m| {
+            let mut m = m.borrow_mut();
+            m.ops += 1;
+            m.lookup_ns += lookup_ns;
+            if is_vp {
+                m.vp_resolve_ns += vp_resolve_ns;
+                m.vp_resolve_count += 1;
+            }
+            match source {
+                1 => m.found_in_mem += 1,
+                2 => m.found_in_imm += 1,
+                3 => m.found_in_sst += 1,
+                _ => m.not_found += 1,
+            }
+            m.maybe_report();
+        });
+    };
+
+    let (op, raw_value, expires_at) = match found {
+        Some(v) => v,
+        None => {
+            record_read(0, false, 0);
+            return Ok(GetOutcome::NotFound);
+        }
+    };
+    if op == crate::OP_TOMBSTONE || (expires_at > 0 && expires_at <= now_secs()) {
+        record_read(0, false, 0);
+        return Ok(GetOutcome::NotFound);
+    }
+
+    let sc = p.stream_client.clone();
+    let is_vp = (op & crate::OP_VALUE_POINTER) != 0;
+
+    // (MED-2): acquire a per-extent reader pin BEFORE dropping the
+    // partition borrow, so a concurrent run_gc can't decide-and-punch the
+    // log_stream extent during our await on read_bytes_from_extent.
+    // The pin is taken only when the value is a VP (small inline values
+    // never read from log_stream). If the writer (GC) currently holds the
+    // pin, treat as not-found rather than racing the deletion.
+    let _vp_pin = if is_vp && raw_value.len() >= crate::VALUE_POINTER_SIZE {
+        let vp = crate::ValuePointer::decode(&raw_value[..crate::VALUE_POINTER_SIZE]);
+        let pin = p.pin_for(vp.extent_id);
+        match crate::acquire_reader_pin(pin) {
+            Some(g) => Some(g),
+            None => {
+                // GC holds the writer pin on this extent. That means a punch is
+                // imminent — it does NOT mean this value is gone: GC relocates
+                // every live in-range value BEFORE punching (relocate-then-
+                // punch), so a live key's bytes are either still here or already
+                // rewritten elsewhere.
+                //
+                // This used to answer NotFound, which the comment justified as
+                // "the client falls back / retries". It cannot: NotFound is
+                // terminal on the client, so a live key read during a GC window
+                // came back as absent — a false miss, exactly what
+                // `sst_lookup_paged_retry` in this file refuses to produce.
+                // Unavailable maps to a RETRYABLE client error, and the pin is
+                // held only for the length of the punch, so the retry finds
+                // either the original bytes or the relocated VP.
+                record_read(0, false, 0);
+                return Err((
+                    StatusCode::Unavailable,
+                    format!(
+                        "extent {} is being reclaimed by GC; retry",
+                        vp.extent_id
+                    ),
+                ));
+            }
+        }
+    } else {
+        None
+    };
+    // A direct read of a VP range (whole value OR a sub-range) of at least
+    // `BULK_MIN_BYTES`: `req.offset`/`req.length` address bytes WITHIN the
+    // value (`length == 0` = to end); the position carries the absolute
+    // in-extent range `[vp.offset + req.offset, +len)` so the client reads
+    // exactly that from a replica. A range past the value's end and a smaller
+    // one are resolved here.
+    let direct_range = if req.direct && is_vp && raw_value.len() >= crate::VALUE_POINTER_SIZE {
+        let vp = crate::ValuePointer::decode(&raw_value[..crate::VALUE_POINTER_SIZE]);
+        let r_off = req.offset as u64;
+        (r_off <= vp.len)
+            .then(|| {
+                let r_len = match req.length {
+                    0 => vp.len - r_off,
+                    l => (l as u64).min(vp.len - r_off),
+                };
+                (vp.extent_id, vp.offset + r_off, r_len)
+            })
+            .filter(|&(_, _, len)| len >= autumn_rpc::BULK_MIN_BYTES as u64)
+    } else {
+        None
+    };
+    drop(p);
+    if let Some((extent_id, value_offset, value_len)) = direct_range {
+        // The pin drops at return: the client's read is deliberately
+        // unprotected — a GC punch in the window fails that EN read and the
+        // client asks again without `direct` (never a torn read; extents are
+        // unlinked whole and eversion-fenced).
+        let position = |eversion, replica_addrs, ec_data_shards, ec_sealed_length| ValuePosition {
+            extent_id,
+            value_offset,
+            value_len,
+            eversion,
+            replica_addrs,
+            ec_data_shards,
+            ec_sealed_length,
+        };
+        match sc.extent_read_descriptor(extent_id).await {
+            Ok(ReadDescriptor::Direct { eversion, replica_addrs }) => {
+                record_read(source, false, 0);
+                return Ok(GetOutcome::Position(position(eversion, replica_addrs, 0, 0)));
+            }
+            // Erasure coded: `replica_addrs` is positional by shard and the
+            // geometry fields tell the client so.
+            Ok(ReadDescriptor::Ec { eversion, shard_addrs, data_shards, sealed_length }) => {
+                record_read(source, false, 0);
+                return Ok(GetOutcome::Position(position(eversion, shard_addrs, data_shards, sealed_length)));
+            }
+            // A position is an optimization, never a correctness dependency:
+            // both arms answer with the value. They are split because they
+            // are different events: a decline is a permanent property of the
+            // extent (a Suspected shard node, a payload outside `.dat`), a
+            // failed lookup is a manager problem.
+            Ok(ReadDescriptor::NotDirect(why)) => why.log(extent_id, "get: answering with the value"),
+            Err(e) => tracing::warn!(extent_id, error = %e, "get: position lookup failed — answering with the value"),
+        }
+        if !req.resolve_large {
+            record_read(source, false, 0);
+            return Ok(GetOutcome::Declined);
+        }
+    }
+
+    let vp_t0 = Instant::now();
+    let value = resolve_value(op, raw_value, &sc, req.offset as u64, req.length as u64)
+        .await
+        .map_err(|e| map_storage_error(&e))?;
+    let vp_resolve_ns = if is_vp {
+        vp_t0.elapsed().as_nanos() as u64
+    } else {
+        0
+    };
+    // _vp_pin guard drops here, releasing the pin.
+
+    record_read(source, is_vp, vp_resolve_ns);
+
+    // Read-throughput accounting: bytes the PS actually served (resolved-value
+    // path only; large-VP Redirect is read directly from the EN, not here).
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        let p = part.borrow();
+        p.metrics.read_bytes.fetch_add(value.len() as u64, Relaxed);
+        if is_vp {
+            p.metrics.vp_reads.fetch_add(1, Relaxed);
+            p.metrics.vp_read_bytes.fetch_add(value.len() as u64, Relaxed);
+        }
+    }
+
+    Ok(GetOutcome::Value(value))
+}
+
+pub(crate) async fn handle_head(
+    payload: Bytes,
+    part: &Rc<RefCell<PartitionData>>,
+) -> HandlerResult {
+    let req: HeadReq =
+        partition_rpc::rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+    {
+        let p = part.borrow();
+        check_region_epoch(p.part_id, p.region_epoch, req.region_epoch)?;
+        if !in_range(&p.rg, &req.key) {
+            return Err((
+                StatusCode::InvalidArgument,
+                "key is out of range".to_string(),
+            ));
+        }
+    }
+    let Some((op, raw_value)) = lookup_live(part, &req.key).await? else {
+        return Ok(partition_rpc::rkyv_encode(&HeadResp {
+            code: CODE_NOT_FOUND,
+            message: "key not found".to_string(),
+            found: false,
+            value_length: 0,
+        }));
+    };
+
+    let value_len = if op & OP_VALUE_POINTER != 0 && raw_value.len() >= VALUE_POINTER_SIZE {
+        ValuePointer::decode(&raw_value[..VALUE_POINTER_SIZE]).len
+    } else {
+        raw_value.len() as u64
+    };
+
+    Ok(partition_rpc::rkyv_encode(&HeadResp {
+        code: CODE_OK,
+        message: String::new(),
+        found: true,
+        value_length: value_len,
+    }))
+}
+
+/// The newest entry for `key` — memtable, immutables, then SSTs — as
+/// `(op, raw value)`, or None when absent, deleted or expired. Resolves no
+/// value pointer. The caller has checked epoch and range.
+/// A value the memory tier holds for `key`, shaped like a memtable hit.
+fn mem_tier_get(p: &PartitionData, key: &[u8]) -> Option<(u8, Bytes, u64)> {
+    let (value, expires_at) = p.mem_tier.as_ref()?.get(key, now_secs())?;
+    Some((crate::OP_PUT, value, expires_at))
+}
+
+async fn lookup_live(
+    part: &Rc<RefCell<PartitionData>>,
+    key: &[u8],
+) -> Result<Option<(u8, Bytes)>, (StatusCode, String)> {
+    // Borrow released before the SST lookup's awaits (note 15).
+    let mut found = {
+        let p = part.borrow();
+        mem_tier_get(&p, key).or_else(|| lookup_in_memtable(&p.active, key)).or_else(|| {
+            for imm in p.imm.iter().rev() {
+                if let Some(r) = lookup_in_memtable(imm, key) {
+                    return Some(r);
+                }
+            }
+            None
+        })
+    };
+    if found.is_none() {
+        found = sst_lookup_paged_retry(part, key).await?;
+    }
+    Ok(found.and_then(|(op, raw_value, expires_at)| {
+        let gone = op == crate::OP_TOMBSTONE || (expires_at > 0 && expires_at <= now_secs());
+        (!gone).then_some((op, raw_value))
+    }))
+}
+
+pub(crate) async fn handle_range(
+    payload: Bytes,
+    part: &Rc<RefCell<PartitionData>>,
+) -> HandlerResult {
+    let req: RangeReq =
+        partition_rpc::rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+
+    let p = part.borrow();
+    // Load-bearing for `range()` correctness after a split: without it,
+    // mismatched-epoch range requests are silently filtered per-key and
+    // return a valid-but-partial result with `code:OK`.
+    // A stale snapshot's epoch is rejected up-front; SDK refreshes + re-runs.
+    check_region_epoch(p.part_id, p.region_epoch, req.region_epoch)?;
+    // Snapshot the PS's authoritative end_key so the response can carry it
+    // as a resume cursor for the SDK. Empty = unbounded right side (last
+    // partition in the keyspace).
+    let cur_end_key = p.rg.end_key.clone();
+    if req.limit == 0 {
+        return Ok(partition_rpc::rkyv_encode(&RangeResp {
+            code: CODE_OK,
+            message: String::new(),
+            entries: vec![],
+            has_more: true,
+            cur_end_key,
+        }));
+    }
+
+    let start_user_key = if req.start.is_empty() {
+        req.prefix.clone()
+    } else {
+        req.start.clone()
+    };
+    let seek_key = key_with_ts(&start_user_key, u64::MAX);
+
+    drop(p);
+
+    // The scan reads blocks on demand, so a background
+    // compaction that completes MID-SCAN can truncate a snapshot reader's
+    // backing row extent (the Arc holds metadata only) — a longer exposure
+    // window than Stage-1's up-front materialization had. Same remedy as
+    // get/head: on a scan error, if the live sst_readers set changed since
+    // the snapshot, redo the WHOLE scan once against the fresh set (range
+    // is limit-bounded; one redo on a rare race is cheaper than mid-scan
+    // resume bookkeeping). Unchanged set or second failure = real error.
+    // How much memtable one WINDOW holds. Generous relative to the page — the
+    // point is to stop paying O(memtable) per request, not to shave the window
+    // — and it is purely an internal batch size: `range_scan_sst_merge` refills
+    // as often as it needs to, so the window is never visible on the wire.
+    //
+    // INVARIANT: the window MUST NOT change what a page reports. `has_more` is
+    // `out.len() == limit` and a short page still means "prefix exhausted",
+    // because the fuse extent/tombstone loops page by exactly that (they break
+    // on `n < limit` and never read `has_more`), and `ClusterClient::range`
+    // advances its cursor to the partition's END key on any page it believes
+    // complete. Reporting truncation instead of hiding it silently drops keys
+    // in both: the caller stops early, or the cursor jumps the gap.
+    let mem_cap = (req.limit as usize).saturating_mul(4).max(4096);
+    let mut attempt = 0u32;
+    let out = loop {
+        attempt += 1;
+        let p = part.borrow();
+        let (mem_items, mem_bound) =
+            collect_mem_items_for_range(&p, std::ops::Bound::Included(&seek_key), mem_cap);
+        // Unfiltered Arc snapshot for change detection (the scan set below
+        // is pre-filtered, so it can't be ptr-compared against live state).
+        let full_snap: Vec<std::sync::Arc<SstReader>> = p.sst_readers.to_vec();
+        // async block-on-demand iteration over the (paged) SSTs — no
+        // materialization. Blocks fetch through the global BlockCache
+        // (FetchMode::Cached): repeated list calls over the same prefix hit
+        // warm blocks, and per-request memory is O(open blocks), not O(SST
+        // bytes).
+        //
+        // Pre-filter by SST key range — skip
+        // SSTs entirely before the scan start (biggest < seek) and, when a
+        // prefix bounds the scan, SSTs entirely after it. smallest/biggest
+        // are INTERNAL keys (user ++ inv-seq), so the comparison MUST be
+        // `cmp_internal_keys`; seek_key sorts before every real entry of
+        // start_user_key, so `biggest < seek_key` is exact.
+        let readers_snap: Vec<std::sync::Arc<SstReader>> = p
+            .sst_readers
+            .iter()
+            .filter(|r| {
+                if crate::cmp_internal_keys(r.biggest_key(), &seek_key).is_lt() {
+                    return false;
+                }
+                if !req.prefix.is_empty() {
+                    let s_user = parse_key(r.smallest_key());
+                    if s_user > req.prefix.as_slice() && !s_user.starts_with(&req.prefix) {
+                        return false;
+                    }
+                }
+                true
+            })
+            .cloned()
+            .collect();
+        let sc_snap = p.stream_client.clone();
+        let cache_snap = p.block_cache.clone();
+        let now = now_secs();
+        let check_overlap = p.has_overlap.get() != 0;
+        let part_rg = p.rg.clone();
+        drop(p);
+
+        match range_scan_sst_merge(
+            &req,
+            &seek_key,
+            mem_items,
+            &readers_snap,
+            &sc_snap,
+            &cache_snap,
+            now,
+            check_overlap,
+            &part_rg,
+            mem_bound,
+            part,
+            mem_cap,
+        )
+        .await
+        {
+            Ok(entries) => break entries,
+            Err(e) => {
+                let q = part.borrow();
+                let readers_changed = crate::sst_readers_changed(&q.sst_readers, &full_snap);
+                drop(q);
+                if attempt == 1 && readers_changed {
+                    continue;
+                }
+                return Err((StatusCode::Internal, format!("range sst read: {e}")));
+            }
+        }
+    };
+
+    let has_more = out.len() == req.limit as usize;
+    Ok(partition_rpc::rkyv_encode(&RangeResp {
+        code: CODE_OK,
+        message: String::new(),
+        entries: out,
+        has_more,
+        cur_end_key,
+    }))
+}
+
+
+/// One full SST-merge scan pass for `handle_range` — built
+/// from fresh snapshots each call so the caller can retry the whole pass
+/// when a concurrent compaction invalidates the reader set mid-scan.
+/// Mirrors the earlier sync mem/SST 2-way merge exactly; block-read errors
+/// propagate (caller decides retry vs Internal).
+#[allow(clippy::too_many_arguments)]
+async fn range_scan_sst_merge(
+    req: &RangeReq,
+    seek_key: &[u8],
+    mem_items: Vec<IterItem>,
+    readers_snap: &[std::sync::Arc<SstReader>],
+    sc_snap: &Rc<StreamClient>,
+    cache_snap: &std::sync::Arc<crate::sstable::BlockCache>,
+    now: u64,
+    check_overlap: bool,
+    part_rg: &autumn_rpc::manager_rpc::MgrRange,
+    mem_bound: Option<Vec<u8>>,
+    part: &Rc<RefCell<PartitionData>>,
+    mem_cap: usize,
+) -> anyhow::Result<Vec<RangeEntry>> {
+    let mut mem_bound = mem_bound;
+    let mut mem_it = MemtableIterator::new(mem_items);
+    mem_it.seek(seek_key);
+
+    let mut sst_iters: Vec<AsyncTableIterator> = Vec::with_capacity(readers_snap.len());
+    for r in readers_snap.iter().rev() {
+        let mut it = AsyncTableIterator::new(
+            r.clone(),
+            sc_snap.clone(),
+            cache_snap.clone(),
+            FetchMode::Cached,
+        );
+        it.seek(seek_key).await?;
+        sst_iters.push(it);
+    }
+    let mut merge = AsyncMergeIterator::new(sst_iters);
+
+    let mut out: Vec<RangeEntry> = Vec::new();
+    let mut last_user_key: Option<Vec<u8>> = None;
+
+    loop {
+        // REFILL before deciding anything, whenever the next key to consider
+        // is at or past the point where the memtable view goes blind.
+        //
+        // The exhaustion case is the subtle one: with a bound set, BOTH
+        // iterators running dry proves nothing — the memtable may hold more
+        // past the window, and treating that as end-of-scan is how a page ends
+        // early with `has_more == false`. So exhaustion refills too, and only a
+        // refill that finds nothing ends the scan.
+        //
+        // The check runs BEFORE the selection below, not after: selecting
+        // advances an iterator, and an item pulled and then rejected for being
+        // past the bound would be lost.
+        if let Some(b) = mem_bound.clone() {
+            let next_key = match (mem_it.valid(), merge.valid()) {
+                (true, true) => {
+                    let mk = mem_it.item().map(|i| i.key.clone());
+                    let sk = merge.item().map(|i| i.key.clone());
+                    match (mk, sk) {
+                        (Some(m), Some(s)) => {
+                            Some(if crate::cmp_internal_keys(&m, &s).is_le() { m } else { s })
+                        }
+                        (m, s) => m.or(s),
+                    }
+                }
+                (true, false) => mem_it.item().map(|i| i.key.clone()),
+                (false, true) => merge.item().map(|i| i.key.clone()),
+                (false, false) => None,
+            };
+            let refill = match &next_key {
+                None => true,
+                Some(k) => crate::cmp_internal_keys(k, &b).is_gt(),
+            };
+            if refill {
+                let (items, next_bound) = {
+                    let p = part.borrow();
+                    crate::background::collect_mem_items_for_range(
+                        &p,
+                        std::ops::Bound::Excluded(b.as_slice()),
+                        mem_cap,
+                    )
+                };
+                let empty = items.is_empty();
+                mem_it = MemtableIterator::new(items);
+                mem_bound = next_bound;
+                if empty && mem_bound.is_none() {
+                    // The memtable really is exhausted past the old bound; the
+                    // SST side (if any) can now be trusted to the end.
+                    if !merge.valid() {
+                        break;
+                    }
+                }
+                // No seek: the refill was `Excluded(b)`, so every entry in the
+                // new window already sorts strictly after the old bound.
+                continue;
+            }
+        }
+        let mem_key = if mem_it.valid() {
+            mem_it.item().map(|i| i.key.as_slice())
+        } else {
+            None
+        };
+        let sst_key = if merge.valid() {
+            merge.item().map(|i| i.key.as_slice())
+        } else {
+            None
+        };
+
+        let item = match (mem_key, sst_key) {
+            (None, None) => break,
+            (Some(_), None) => {
+                let item = mem_it.item().unwrap().clone();
+                mem_it.next();
+                item
+            }
+            (None, Some(_)) => {
+                let item = merge.item().unwrap().clone();
+                merge.next().await?;
+                item
+            }
+            (Some(mk), Some(sk)) => {
+                if crate::cmp_internal_keys(mk, sk).is_le() {
+                    let item = mem_it.item().unwrap().clone();
+                    let uk_owned = parse_key(mk).to_vec();
+                    mem_it.next();
+                    while merge.valid() {
+                        if let Some(si) = merge.item() {
+                            if parse_key(&si.key) == uk_owned.as_slice() {
+                                merge.next().await?;
+                            } else {
+                                break;
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                    item
+                } else {
+                    let item = merge.item().unwrap().clone();
+                    let uk_owned = parse_key(sk).to_vec();
+                    merge.next().await?;
+                    while mem_it.valid() {
+                        if let Some(mi) = mem_it.item() {
+                            if parse_key(&mi.key) == uk_owned.as_slice() {
+                                mem_it.next();
+                            } else {
+                                break;
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                    item
+                }
+            }
+        };
+
+        let uk = parse_key(&item.key);
+        if check_overlap && !in_range(part_rg, uk) {
+            continue;
+        }
+        if !req.prefix.is_empty() && !uk.starts_with(&req.prefix as &[u8]) {
+            break;
+        }
+        if last_user_key.as_deref() == Some(uk) {
+            continue;
+        }
+        last_user_key = Some(uk.to_vec());
+
+        if item.op == crate::OP_TOMBSTONE {
+            continue;
+        }
+        if item.expires_at > 0 && item.expires_at <= now {
+            continue;
+        }
+
+        out.push(RangeEntry {
+            key: uk.to_vec(),
+            value: vec![],
+        });
+        if out.len() >= req.limit as usize {
+            break;
+        }
+    }
+
+    Ok(out)
+}
+
+/// Phases a split walks, reported on the load heartbeat so the ops table can
+/// say WHERE a frozen partition is rather than only that it is frozen:
+/// 1 = accepted, waiting on the maintenance gate and choosing a split key,
+/// 2 = frozen (writes stop here), 3 = drained, 4 = `commit_length` captured,
+/// 5 = metadata cut committed, 6 = unfrozen. Phases and not bytes because the
+/// costs are wildly uneven — the gate wait, the median scan and the drain
+/// dominate — and a byte counter that sits still through the expensive step
+/// reads as a hang.
+const SPLIT_PHASES: u64 = 6;
+
+/// #6: per-attempt timeout for `multi_modify_split` in the split path. SHORT
+/// (vs the StreamClient default) so the freeze critical section stays under
+/// FREEZE_TTL — a split that COMMITS after the freeze lapsed seals the
+/// log_stream at a stale commit_length and loses the writes that resumed
+/// post-unfreeze.
+const SPLIT_CALL_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// #6: stop launching split attempts once the freeze has been held this long.
+/// A call launched at the deadline still completes/commits within
+/// `deadline + SPLIT_CALL_TIMEOUT` < FREEZE_TTL (2 s margin), so any in-flight
+/// manager commit lands while the partition is STILL frozen — never after the
+/// freeze could have lapsed. Pure for unit-testing the budget invariant.
+fn split_freeze_deadline(freeze_ttl: Duration, call_timeout: Duration) -> Duration {
+    freeze_ttl
+        .saturating_sub(call_timeout)
+        .saturating_sub(Duration::from_secs(2))
+}
+
+/// Render an arbitrary byte string (e.g. a `split --at` key or a partition
+/// range bound, which may contain binary bytes) as lowercase hex for error
+/// messages. Local helper to avoid pulling the `hex` crate into this crate.
+fn hex_str(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
+}
+
+pub(crate) async fn handle_split_part(
+    payload: Bytes,
+    part: &Rc<RefCell<PartitionData>>,
+    part_sc: &Rc<StreamClient>,
+    pool: &Rc<ConnPool>,
+    manager_addr: &str,
+) -> HandlerResult {
+    let req: SplitPartReq =
+        partition_rpc::rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+    // Refused here, not on the maintenance gate: a queued second split would
+    // run after the first committed and cut the partition again.
+    let result = if part.borrow().split_pending.replace(true) {
+        Err((
+            StatusCode::FailedPrecondition,
+            "split already in progress on this partition".to_string(),
+        ))
+    } else {
+        let r = split_part(&req, part, part_sc, pool, manager_addr).await;
+        part.borrow().split_pending.set(false);
+        r
+    };
+    // A submitted split's failure also travels on the load report: the
+    // manager may have stopped waiting for this reply. Success needs no
+    // report — the manager closes the op when it commits the split.
+    if let (Err((_, error)), true) = (&result, req.op_id != 0) {
+        part.borrow()
+            .metrics
+            .push_maintenance_outcome(manager_rpc::MaintenanceOutcome {
+                op_id: req.op_id,
+                kind: manager_rpc::OP_KIND_SPLIT,
+                state: manager_rpc::OP_STATE_FAILED,
+                error: error.clone(),
+                message: String::new(),
+                finished_at: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0),
+            });
+    }
+    result
+}
+
+async fn split_part(
+    req: &SplitPartReq,
+    part: &Rc<RefCell<PartitionData>>,
+    part_sc: &Rc<StreamClient>,
+    pool: &Rc<ConnPool>,
+    manager_addr: &str,
+) -> HandlerResult {
+    if part.borrow().has_overlap.get() != 0 {
+        return Err((
+            StatusCode::FailedPrecondition,
+            "cannot split: partition has overlapping keys".to_string(),
+        ));
+    }
+
+    // Drain in-flight compaction + GC before commit_length. Two gates,
+    // acquired outer→inner:
+    //   1. **Per-partition `maintenance_gate`** — serializes vs the merged
+    //      `background_maintenance_loop` on THIS partition. It runs compaction
+    //      and GC on ONE task and acquires this gate around BOTH, so holding it
+    //      means neither a `do_compact` (`compact_row_append` racing the
+    //      row_stream seal) NOR a `run_gc` (log_stream append racing the log
+    //      seal) is in flight. Unifies the former compact_gate + gc_gate;
+    //      the PS-wide `acquire_compact` permit (default max=4) does NOT
+    //      serialize same-partition, hence the
+    //      dedicated per-partition gate.
+    //   2. **PS-wide `concurrency.acquire_compact`** (D-r7) — caps
+    //      cross-partition peak RAM. Inner to the gate.
+    // Both RAII-held through `multi_modify_split` AND the P-sst barrier
+    // ACK below.
+    let (maintenance_gate, concurrency, phase) = {
+        let p = part.borrow();
+        (
+            p.maintenance_gate.clone(),
+            p.concurrency_ctrl.clone(),
+            // Owns an Arc and clears the slot on drop, so every exit below —
+            // the three `?` through `unfreeze_on_err`, both barrier timeouts,
+            // the TTL aborts — is covered without a list that goes stale.
+            crate::MaintenancePhaseGuard::new(p.metrics.clone(), req.op_id),
+        )
+    };
+    // Reported BEFORE the gate wait, because the gate is the first thing that
+    // can block for a long time (an in-flight compaction on this partition),
+    // and the SST median scan after it is the second. Writes are not frozen
+    // yet, but this is where a split sits when it looks stuck — including
+    // during the `has_overlap` retry loop — so leaving it unnarrated left the
+    // one question this feature answers unanswered for that whole window.
+    phase.set(manager_rpc::OP_KIND_SPLIT, 1, SPLIT_PHASES);
+    let _local_maintenance_gate = maintenance_gate.acquire().await;
+    let _compact_permit = concurrency.acquire_compact().await;
+
+    // Fetch authoritative range from the manager. PartitionData.rg is set
+    // at open_partition and is NOT refreshed by sync_regions_once for an
+    // already-open partition, so after a previous split the local rg
+    // still spans the old wide range. Picking mid_key against the stale
+    // rg can yield a key outside the manager's narrowed range, which
+    // multi_modify_split then rejects.
+    let auth_rg: Range = {
+        // 10 s — read-only manager call. Fetches authoritative range
+        // for the stale-rg fix. Bounded so split doesn't wedge
+        // on a hung manager.
+        let resp_bytes = pool
+            .call_timeout(
+                manager_addr,
+                manager_rpc::MSG_GET_REGIONS,
+                Bytes::new(),
+                Duration::from_secs(10),
+            )
+            .await
+            .map_err(|e| (StatusCode::Internal, format!("get_regions: {e}")))?;
+        let resp: manager_rpc::GetRegionsResp =
+            manager_rpc::rkyv_decode(&resp_bytes).map_err(|e| (StatusCode::Internal, e))?;
+        if resp.code != manager_rpc::CODE_OK {
+            return Err((
+                StatusCode::Internal,
+                format!("get_regions: {}", resp.message),
+            ));
+        }
+        resp.regions
+            .into_iter()
+            .find(|(pid, _)| *pid == req.part_id)
+            .and_then(|(_, info)| info.rg)
+            .ok_or_else(|| {
+                (
+                    StatusCode::NotFound,
+                    format!("partition {} not in manager regions", req.part_id),
+                )
+            })?
+    };
+
+    // (design doc D4): the split point comes from one of two
+    // sources.
+    //   * EXPLICIT (`req.at_key = Some`): an operator/controller names the
+    //     point. We validate it lies STRICTLY inside the authoritative
+    //     `(start_key, end_key)` and use it verbatim — SKIPPING the (paged) SST
+    //     key scan AND the `>= 2 keys` gate. This is what lets an empty / near-
+    //     empty partition be presplit (cut into two empty children; D8 relies
+    //     on it). The PS stays app-agnostic (D5): `at_key` is an arbitrary byte
+    //     string, no namespace/prefix awareness.
+    //   * IMPLICIT (`req.at_key = None`, legacy): median-by-key-count over the
+    //     live in-range user keys, still gated at `>= 2 keys`.
+    let mid = if let Some(at_key) = req.at_key.clone() {
+        // In-range check is STRICT on both ends:
+        //   at_key <= start_key ⇒ empty/backwards left child ⇒ reject.
+        //   at_key >= end_key   ⇒ empty right child / out of range ⇒ reject
+        //                         (end_key is the exclusive upper bound; an
+        //                          empty end_key means +∞, so only the low
+        //                          bound applies).
+        // `in_range(rg, k)` accepts `k == start_key` (it is the range's own
+        // lower bound), which is NOT a valid split point, so we check the
+        // bounds explicitly here rather than reusing it.
+        // NOTE: this validation runs BEFORE the freeze block below, so there is
+        // no `frozen_for_split` to clear on the reject path; the RAII
+        // maintenance_gate / compact_permit drop on return.
+        if at_key.as_slice() <= auth_rg.start_key.as_slice() {
+            return Err((
+                StatusCode::InvalidArgument,
+                format!(
+                    "split --at key {} is at or below partition start {} \
+                     (must be strictly inside [start, end))",
+                    hex_str(&at_key),
+                    hex_str(&auth_rg.start_key),
+                ),
+            ));
+        }
+        if !auth_rg.end_key.is_empty() && at_key.as_slice() >= auth_rg.end_key.as_slice() {
+            return Err((
+                StatusCode::InvalidArgument,
+                format!(
+                    "split --at key {} is at or above partition end {} \
+                     (must be strictly inside [start, end))",
+                    hex_str(&at_key),
+                    hex_str(&auth_rg.end_key),
+                ),
+            ));
+        }
+        at_key
+    } else {
+        // async window scan over the (paged) SSTs — snapshot readers +
+        // sc under one brief borrow, drop, await (note 15). Reader set is
+        // stable: this path holds maintenance_gate.
+        let (uuk_readers, uuk_sc, uuk_cache) = {
+            let p = part.borrow();
+            (
+                p.sst_readers.to_vec(),
+                p.stream_client.clone(),
+                p.block_cache.clone(),
+            )
+        };
+        let sst_seen = sst_user_key_versions(&uuk_readers, &uuk_sc, &uuk_cache)
+            .await
+            .map_err(|e| (StatusCode::Internal, format!("split key scan: {e}")))?;
+        // Sample the memtable AFTER the (long) SST scan, so
+        // writes that landed during it still count toward the `< 2 keys`
+        // check and the midpoint choice.
+        let uuk_mem_items = collect_mem_items(&part.borrow());
+        let user_keys = finalize_unique_user_keys(&uuk_mem_items, sst_seen)
+            .into_iter()
+            .filter(|k| in_range(&auth_rg, k))
+            .collect::<Vec<_>>();
+        if user_keys.len() < 2 {
+            return Err((
+                StatusCode::FailedPrecondition,
+                format!(
+                    "part has fewer than 2 in-range keys (have {}; run major compaction \
+                     first, or pass an explicit split point via `split --at`)",
+                    user_keys.len()
+                ),
+            ));
+        }
+
+        user_keys[user_keys.len() / 2].clone()
+    };
+    let (log_stream_id, row_stream_id, meta_stream_id) = {
+        let p = part.borrow();
+        (p.log_stream_id, p.row_stream_id, p.meta_stream_id)
+    };
+
+    // PrepareSplit-style freeze + drain. Split formerly called
+    // `flush_memtable_locked(part)` directly then `commit_length` — but
+    // partition_loop could still process in-flight Phase 2 writes
+    // (their work is on stream_worker_loop, independent of split's stack)
+    // during the await window. Those writes' bytes landed on EN past the
+    // captured commit_length, then manager sealed at the captured value,
+    // leaving the trailing bytes invisible on recovery. The fix mirrors
+    // the merge freeze: set frozen_for_split → halt new Put/Delete via
+    // handle_incoming_req's reject branch → park split_drain_ack →
+    // partition_loop drains pending+inflight+imm → fires the ack
+    // signal → split resumes. After this drain, commit_length is stable.
+    //
+    // handle_split_part runs on a spawned task (see MSG_SPLIT_PART in
+    // handle_incoming_req) so its awaits don't block partition_loop.
+    //
+    // A second split on this partition was refused at entry
+    // (`split_pending`), so only a merge freeze can be in the way here.
+    let (drain_tx, drain_rx) = futures::channel::oneshot::channel::<Result<(), String>>();
+    {
+        let p = part.borrow();
+        // A merge freeze still waiting for the gate counts too: it is next.
+        if p.merge_freeze.is_active() {
+            return Err((
+                StatusCode::FailedPrecondition,
+                "partition is frozen for merge; retry split after merge completes".to_string(),
+            ));
+        }
+        // Writes stop on this line and do not resume until the end of the
+        // function — the window an operator most needs narrated.
+        phase.set(manager_rpc::OP_KIND_SPLIT, 2, SPLIT_PHASES);
+        p.frozen_for_split.set(Some(std::time::Instant::now()));
+        *p.split_drain_ack.borrow_mut() = Some(drain_tx);
+        // fix — wake partition_loop so its idle-path
+        // select observes that split_drain_ack just transitioned to
+        // Some. Without this the loop sleeps through the full
+        // FREEZE_TTL (30s) on an idle partition and the TTL backstop
+        // is the only thing that ever unwedges the handler. See
+        // PartitionData.split_wake_tx docstring for the full story.
+        let _ = p.split_wake_tx.unbounded_send(());
+    }
+
+    // Await drain. On TTL-driven backstop, drain_rx receives
+    // Err(message). On flush failure, same Err path. Either way we
+    // unfreeze and propagate.
+    let drain_outcome = drain_rx.await;
+    match drain_outcome {
+        Ok(Ok(())) => {
+            // Drained. This and the flush inside it are the expensive part, so
+            // an operator watching a stuck split will usually see it stop here
+            // — which is the point: phase 2 standing still names the step.
+            phase.set(manager_rpc::OP_KIND_SPLIT, 3, SPLIT_PHASES);
+        }
+        Ok(Err(msg)) => {
+            // Drain hit a flush failure or TTL. Clean up.
+            part.borrow().frozen_for_split.set(None);
+            return Err((StatusCode::Internal, format!("split drain failed: {msg}")));
+        }
+        Err(_) => {
+            // Sender dropped without sending — shouldn't happen under
+            // single-threaded compio, but defensive.
+            part.borrow().frozen_for_split.set(None);
+            return Err((
+                StatusCode::Internal,
+                "split drain ack sender dropped without signaling".to_string(),
+            ));
+        }
+    }
+
+    // commit_length on each stream — now stable, because no in-flight
+    // Phase 2 can complete (drain emptied them) and no new writes can
+    // launch (frozen_for_split halts handle_incoming_req).
+    //
+    // **Failure MUST abort the split, NOT default to 1.** Pre-fix
+    // this swallowed errors with `unwrap_or(0).max(1)`. When one replica
+    // is unreachable (e.g. concurrent fence + recovery dispatch),
+    // the all-replica `commit_length` rightly returns `Err`. The old
+    // `unwrap_or(0).max(1)` masked that as "sealed at byte 1", so the
+    // manager sealed the tail extent at byte 1; the right-child opened
+    // post-split with a 1-byte-sealed tail and lost every log_stream
+    // write past byte 1 of that extent (chaos test split+fence repro
+    // surfaced this as ~5–13 q* keys reverting to seq numbers from
+    // hundreds of writes ago — the exact bytes that were in the tail
+    // extent at fence time).
+    //
+    // Returning `FailedPrecondition` lets the client retry the split
+    // once the cluster is healthy enough that all-replica commit_length
+    // succeeds. The split path already unfreezes on the error return below, so
+    // the partition resumes serving writes during the retry gap.
+    let unfreeze_on_err = |e: anyhow::Error, what: &str| {
+        part.borrow().frozen_for_split.set(None);
+        (
+            StatusCode::FailedPrecondition,
+            format!("split aborted: {what} commit_length failed: {e}"),
+        )
+    };
+    // commit==0 → seal at sealed_length=0, NOT 1. A frozen tail whose
+    // all-replica commit is 0 (empty — e.g. a tail that just rolled and took
+    // no writes) MUST seal empty: `compute_duplicate_stream` seals an empty
+    // CoW tail as `sealed=true, sealed_length=0` (recoverable — each child
+    // allocs a fresh tail; manager note 32). The OLD `.max(1)` over-sealed an
+    // empty tail at byte 1 → on the child's cold reopen the WAL replay reaches
+    // it, expects 1 byte, finds 0 → WAL-FAILSTOP → child un-openable. Same root
+    // cause + fix as the merge over-seal (handle_merge_partitions
+    // dropped the same `.max(1)`); the empty-log-tail-at-split window is narrow
+    // so this variant wasn't independently reproduced, but the mechanism is
+    // identical and compute_duplicate_stream is symmetric to compute_merge_streams.
+    // The `?` above still aborts on a genuine commit_length Err (unreachable
+    // replica, the hazard documented above), so OK+0 = genuinely empty,
+    // never a masked failure → safe to seal at 0.
+    // Capture each commit length TOGETHER WITH the tail extent it was
+    // measured on; the manager refuses the commit if any tail moved in
+    // between (e.g. a fence-drain roll already in flight when the freeze
+    // began) — sealing the roll's fresh empty tail at this captured length
+    // would wedge the CoW child permanently.
+    let (log_end, log_tail_eid) = part_sc
+        .commit_length_with_tail(log_stream_id)
+        .await
+        .map_err(|e| unfreeze_on_err(e, "log_stream"))?;
+    let (row_end, row_tail_eid) = part_sc
+        .commit_length_with_tail(row_stream_id)
+        .await
+        .map_err(|e| unfreeze_on_err(e, "row_stream"))?;
+    let (meta_end, meta_tail_eid) = part_sc
+        .commit_length_with_tail(meta_stream_id)
+        .await
+        .map_err(|e| unfreeze_on_err(e, "meta_stream"))?;
+    phase.set(manager_rpc::OP_KIND_SPLIT, 4, SPLIT_PHASES);
+    {
+        let p = part.borrow();
+        tracing::info!(
+            target: "split_trace",
+            part_id = req.part_id,
+            log_stream_id,
+            row_stream_id,
+            meta_stream_id,
+            log_end,
+            row_end,
+            meta_end,
+            vp_extent_id = p.vp_extent_id,
+            vp_offset = p.vp_offset,
+            freeze_elapsed_ms = p
+                .frozen_for_split
+                .get()
+                .map(|t| t.elapsed().as_millis() as u64)
+                .unwrap_or(u64::MAX),
+            "split captured commit lengths"
+        );
+    }
+
+    // synchronous P-log → P-sst barrier. Sent BEFORE
+    // `multi_modify_split` so that any failure here is cleanly abortable:
+    // the manager has not yet sealed the row_stream tail, so unfreezing
+    // and returning Err leaves the cluster in a coherent pre-split state.
+    // Putting the barrier AFTER `multi_modify_split` would create an
+    // unrecoverable window — manager-committed seal + local state not
+    // converged + freeze cleared.
+    //
+    // The barrier itself: P-sst drains its in-flight FuturesUnordered to
+    // zero and calls `sst_sc.invalidate_stream(row_stream_id)` so the
+    // cached per-stream worker is discarded. Any future P-sst op (after
+    // gates release) re-fetches a fresh tail — by then `multi_modify_split`
+    // will have sealed the old tail and the manager will return the
+    // post-seal extent. At the moment of THIS send, gates are still held +
+    // `frozen_for_split` halts new writes, so P-sst's queue is normally
+    // empty (the priority-biased select in `flush_worker_loop` keeps the
+    // ordering race-free defensively).
+    //
+    // Before the current barrier (and the earlier lazy-flag attempt) this was a
+    // `Cell<bool> need_invalidate_row_stream` flag piggybacked on each
+    // P-sst message — racy under P-sst's cap=2 FuturesUnordered (see
+    // fix history in `partition-server/CLAUDE.md` programming note 16).
+    let (inv_resp_tx, inv_resp_rx) = futures::channel::oneshot::channel::<anyhow::Result<()>>();
+    let mut inv_tx = part.borrow().row_invalidate_tx.clone();
+    let inv_req = crate::RowInvalidateBarrierReq {
+        row_stream_id,
+        seal_and_roll: false, // split: manager seals the tail itself; only invalidate here
+        resp_tx: inv_resp_tx,
+    };
+    // BOTH the send and the ACK await are bounded. `FREEZE_TTL`
+    // (30 s, lib.rs) is the partition's unconditional "the handler is
+    // wedged, unfreeze and resume writes" backstop (see
+    // `check_freeze_ttls`). If EITHER step were unbounded, a wedged
+    // P-sst could block the await past the TTL; `check_freeze_ttls`
+    // would unfreeze, new writes would resume + extend the row_stream
+    // tail past the already-captured `commit_length`, and the eventual
+    // continuation would call `multi_modify_split` with the STALE
+    // `row_end` — manager seals at the pre-TTL length, post-TTL writes
+    // end up above sealed_length, invisible on recovery. The SEND can block independently of the ACK:
+    // `row_invalidate_tx` is capacity 1 (shared with major compaction
+    // and tail rolls), so a still-queued barrier whose P-sst
+    // processing never completed (e.g. permanently-down replica on
+    // flush) would back-pressure us here BEFORE the ACK timeout could
+    // even arm. Two separate timers (5 s + 10 s) keep the total budget
+    // (15 s) safely under FREEZE_TTL while still leaving ample
+    // happy-path headroom (when nothing's wedged the send is
+    // microseconds and the ACK lands on the next P-sst poll).
+    let send_timeout = std::time::Duration::from_secs(5);
+    let ack_timeout = std::time::Duration::from_secs(10);
+    {
+        let send_fut = inv_tx.send(inv_req);
+        let send_timer = compio::time::sleep(send_timeout);
+        futures::pin_mut!(send_fut);
+        futures::pin_mut!(send_timer);
+        match futures::future::select(send_fut, send_timer).await {
+            futures::future::Either::Left((Ok(()), _)) => {}
+            futures::future::Either::Left((Err(_), _)) => {
+                part.borrow().frozen_for_split.set(None);
+                return Err((
+                    StatusCode::Internal,
+                    "split: P-sst row_invalidate channel closed".to_string(),
+                ));
+            }
+            futures::future::Either::Right(_elapsed) => {
+                part.borrow().frozen_for_split.set(None);
+                return Err((
+                    StatusCode::FailedPrecondition,
+                    format!(
+                        "split: P-sst row_invalidate send timed out after {}s (channel full \
+                         from prior wedged split); client may retry",
+                        send_timeout.as_secs()
+                    ),
+                ));
+            }
+        }
+    }
+    let ack_timer = compio::time::sleep(ack_timeout);
+    futures::pin_mut!(ack_timer);
+    match futures::future::select(inv_resp_rx, ack_timer).await {
+        futures::future::Either::Left((Ok(Ok(())), _)) => {}
+        futures::future::Either::Left((Ok(Err(e)), _)) => {
+            part.borrow().frozen_for_split.set(None);
+            return Err((
+                StatusCode::Internal,
+                format!("split: row barrier failed: {e:#}"),
+            ));
+        }
+        futures::future::Either::Left((Err(_canceled), _)) => {
+            part.borrow().frozen_for_split.set(None);
+            return Err((
+                StatusCode::Internal,
+                "split: P-sst row_invalidate ACK dropped (bulk thread aborted)".to_string(),
+            ));
+        }
+        futures::future::Either::Right(_elapsed) => {
+            part.borrow().frozen_for_split.set(None);
+            return Err((
+                StatusCode::FailedPrecondition,
+                format!(
+                    "split: P-sst row_invalidate barrier ACK timeout after {}s (bulk thread \
+                     wedged); client may retry",
+                    ack_timeout.as_secs()
+                ),
+            ));
+        }
+    }
+
+    // TEST SYNC-POINT: hold the split here (captures + barrier done, manager
+    // commit not yet issued) so a test can land a concurrent tail roll inside
+    // this window. Off in production (one relaxed load; only
+    // `set_split_commit_pause` sets it).
+    if crate::split_commit_paused() {
+        crate::note_split_commit_parked();
+        while crate::split_commit_paused() {
+            compio::time::sleep(Duration::from_millis(2)).await;
+        }
+    }
+
+    // Call multi_modify_split on the manager. #6: the freeze only guarantees a
+    // STABLE commit_length while it is HELD. If `check_freeze_ttls` auto-
+    // unfreezes (this handler exceeded FREEZE_TTL) and a split then commits, it
+    // seals the log_stream at the now-stale `log_end` while writes have resumed
+    // past it → those writes land above sealed_length and are LOST on recovery.
+    // Pre-#6 this looped `for _ in 0..8` with a 30 s per-call timeout (up to ~4
+    // min), trivially blowing past the 30 s TTL. Now: SHORT per-call timeout and
+    // STOP launching once less than one call's budget remains before the TTL, so
+    // any in-flight commit still lands while frozen. Out of budget → ABORT
+    // cleanly (unfreeze + Err); the client retries the whole split when the
+    // cluster is healthier. We NEVER let a split SUCCEED after the freeze could
+    // have lapsed.
+    let freeze_at = match part.borrow().frozen_for_split.get() {
+        Some(t) => t,
+        None => {
+            // check_freeze_ttls already fired (or someone cleared it) before we
+            // reached the commit phase — abort; the captured commit_length is no
+            // longer protected.
+            return Err((
+                StatusCode::FailedPrecondition,
+                "split: freeze lapsed before commit phase; retry".to_string(),
+            ));
+        }
+    };
+    let split_deadline = split_freeze_deadline(crate::FREEZE_TTL, SPLIT_CALL_TIMEOUT);
+    let mut split_ok = false;
+    let mut split_err =
+        "split: ran out of freeze budget before multi_modify_split succeeded".to_string();
+    let mut backoff = Duration::from_millis(100);
+    loop {
+        if freeze_at.elapsed() >= split_deadline {
+            break; // out of freeze budget → abort below (no stale-seal commit)
+        }
+        match part_sc
+            .multi_modify_split(
+                mid.clone(),
+                req.part_id,
+                req.op_id,
+                [log_end, row_end, meta_end],
+                [log_tail_eid, row_tail_eid, meta_tail_eid],
+                SPLIT_CALL_TIMEOUT,
+            )
+            .await
+        {
+            Ok(()) => {
+                split_ok = true;
+                break;
+            }
+            Err(err) => {
+                tracing::info!(
+                    target: "split_trace",
+                    part_id = req.part_id,
+                    freeze_elapsed_ms = freeze_at.elapsed().as_millis() as u64,
+                    error = %err,
+                    "split multi_modify_split attempt failed"
+                );
+                split_err = format!("{err:#}");
+                // "captured tail moved" is DETERMINISTIC for these captured
+                // values — every retry re-sends the same stale capture and
+                // gets the same refusal. Abort now; the client retries the
+                // whole split, whose fresh capture sees the rolled tails.
+                // So is a refusal of an op the manager has already ended.
+                // An EC conversion or recovery on a source extent runs for
+                // seconds to minutes: waiting for it here holds writes frozen
+                // (the manager waits for those before dispatching).
+                if split_err.contains("split captured tail moved")
+                    || split_err.contains("refusing to commit it")
+                    || split_err.contains("in flight on extent")
+                {
+                    break;
+                }
+                compio::time::sleep(backoff).await;
+                backoff = backoff.saturating_mul(2).min(Duration::from_secs(2));
+            }
+        }
+    }
+    tracing::info!(
+        target: "split_trace",
+        part_id = req.part_id,
+        split_ok,
+        freeze_elapsed_ms = freeze_at.elapsed().as_millis() as u64,
+        "split commit phase done"
+    );
+
+    if !split_ok {
+        // unfreeze on multi_modify_split failure so the partition
+        // resumes serving writes (client will retry split). Without this
+        // the partition stays frozen until FREEZE_TTL backstop fires.
+        part.borrow().frozen_for_split.set(None);
+        return Err((StatusCode::FailedPrecondition, split_err));
+    }
+    phase.set(manager_rpc::OP_KIND_SPLIT, 5, SPLIT_PHASES);
+
+    // #6 belt-and-braces behind the deadline-bound prevention: re-verify the
+    // freeze HELD continuously through the commit. If `check_freeze_ttls`
+    // cleared it anyway, the captured commit_length may be stale + writes
+    // resumed → do NOT apply the split locally; surface loudly. region_sync
+    // reconciles the manager's committed split; the client retries.
+    if part.borrow().frozen_for_split.get().is_none() {
+        return Err((
+            StatusCode::FailedPrecondition,
+            "split: freeze TTL lapsed during multi_modify_split — possible stale seal; \
+             aborting local apply, retry"
+                .to_string(),
+        ));
+    }
+    // The stale-seal SILENT write-loss is
+    // STRUCTURALLY PRECLUDED, not merely unreproduced. The loss requires the
+    // manager's `multi_modify_split` etcd commit to LAND (succeed) at a wall-
+    // clock time AFTER this PS auto-unfroze (>= split_deadline = 20 s) and acked
+    // writes past the captured commit_length. But between the PS capturing
+    // commit_length (the call's send) and the manager's commit,
+    // `handle_multi_modify_split` has ONLY bounded awaits, each with a kill-
+    // timeout that turns slowness into FAILURE (Err -> no commit -> no stale
+    // seal), never late success: the main put_msgs_txn (etcd
+    // request_timeout 10 s); Phase-1 compute before it is fully synchronous.
+    // No code path sleeps there — the only way to land a SUCCESSFUL commit after
+    // the freeze window is an injected sleep, which models a stall that no real
+    // component can both incur AND survive (a real stall = timeout = Err =
+    // abort). Attempts to reproduce it instead surfaced a DIFFERENT real bug — a PS retry storm against a slow manager
+    // committing a SEPARATE split per retry (1->6 CASCADE) — now fixed MANAGER-
+    // side by the per-partition split-inflight guard. Residual tail (documented,
+    // NOT fixed): if all three bounded awaits sit at ~9 s and ALL succeed, the
+    // commit could land at ~27 s > 20 s — three consecutive near-timeout-but-
+    // healthy ops, not naturally reproducible; the only true close (manager re-
+    // validate freeze/commit right before the commit) is revert-prone hot-split
+    // mechanism and is deferred per reproduce-first. The freeze-held re-check
+    // above stays as the belt-and-braces detector for the case the PS DOES
+    // receive the Ok.
+
+    // The manager sealed all 3 stream tails as part of the split. The
+    // P-log stream workers still cache the old (now-sealed) tails and
+    // would keep appending beyond sealed_length. On recovery,
+    // read_last_extent_data only reads up to sealed_length, so any
+    // post-split checkpoint/SST appended beyond that point is invisible
+    // — causing "invalid meta_len" or missing SSTs.
+    part_sc.invalidate_stream(log_stream_id);
+    part_sc.invalidate_stream(row_stream_id);
+    part_sc.invalidate_stream(meta_stream_id);
+    // (The P-sst row_invalidate barrier was already done BEFORE
+    // multi_modify_split above; see commentary at the barrier send site.)
+
+    // Narrow PS-local rg to match the manager's new left range and
+    // re-evaluate has_overlap against the SSTables. Without this,
+    // sync_regions_once would leave the partition with a stale wide rg
+    // and a stale has_overlap=0, perpetuating the bug above.
+    //
+    // fix: bump `region_epoch` in lock-step with the manager's
+    // `next_region_epoch` rule (rg-rewrite ⇒ +1). Pre-fix, a full-keyspace
+    // `range(b"", b"", MAX)` issued before `region_sync_loop` had a
+    // chance to drop+reopen this partition saw BOTH sides stale at the
+    // old epoch: handle_range passed the epoch check, returned the
+    // left-only entries with `cur_end_key = new_rg.end_key (= mid)`,
+    // SDK's still-stale cache routed the next iteration back to the
+    // same partition with `cursor = mid`, handle_range now returned
+    // empty (past the narrowed range) + `cur_end_key = mid`, SDK's
+    // defensive "cur_end_key didn't advance" trip fired, and the
+    // caller's listing came back empty or as an error.
+    {
+        let mut p = part.borrow_mut();
+        let new_rg = Range {
+            start_key: auth_rg.start_key.clone(),
+            end_key: mid.clone(),
+        };
+        let mut overlap = false;
+        // A block-less SST (a compaction's discards-only output) holds no key.
+        for reader in p.sst_readers.iter().filter(|r| r.block_count() > 0) {
+            let sk = parse_key(reader.smallest_key());
+            let bk = parse_key(reader.biggest_key());
+            if !in_range(&new_rg, sk) || !in_range(&new_rg, bk) {
+                overlap = true;
+                break;
+            }
+        }
+        p.rg = new_rg;
+        if overlap {
+            p.set_has_overlap(1);
+        }
+        p.region_epoch = p.region_epoch.saturating_add(1).max(2);
+    }
+
+    // fix-2: publish the new (rg, log, row, meta, region_epoch)
+    // tuple to the cross-thread mirror so `sync_regions_once` on the
+    // main thread observes `prev == latest` on its next tick and
+    // SKIPS the drop+reopen. Pre-fix this mirror was a frozen
+    // snapshot from open time; the partition would get torn down on
+    // every split's first tick even though its in-memory state was
+    // already perfectly correct. The lock is held for one tuple
+    // write; no I/O while holding it. Written AFTER the rg/epoch
+    // borrow_mut block above so a concurrent `sync_regions_once`
+    // observes either the fully-old or fully-new state, never a
+    // half-updated tuple.
+    {
+        let p = part.borrow();
+        let mut shared = p.opened_with_shared.lock();
+        *shared = (
+            p.rg.clone(),
+            p.log_stream_id,
+            p.row_stream_id,
+            p.meta_stream_id,
+            p.region_epoch,
+        );
+    }
+
+    // unfreeze on success — split commit landed; the LEFT
+    // (this partition's) post-split rg is now in effect, and merged
+    // commit_length matches the manager's sealed_length. Writes can
+    // resume against the narrower range.
+    phase.set(manager_rpc::OP_KIND_SPLIT, SPLIT_PHASES, SPLIT_PHASES);
+    part.borrow().frozen_for_split.set(None);
+    // The guard clears the slot as this returns. The manager snaps a SUCCEEDED
+    // op's progress to its total on `finish`, so the terminal row reads 6/6
+    // rather than whichever phase the 5 s heartbeat last caught — the last two
+    // phases have no `.await` between them and the reply, so no tick can land
+    // there.
+
+    Ok(partition_rpc::rkyv_encode(&SplitPartResp {
+        code: CODE_OK,
+        message: String::new(),
+    }))
+}
+
+pub(crate) async fn handle_maintenance(
+    payload: Bytes,
+    part: &Rc<RefCell<PartitionData>>,
+    part_sc: &Rc<StreamClient>,
+) -> HandlerResult {
+    let req: MaintenanceReq =
+        partition_rpc::rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+    if req.op == MAINTENANCE_FORCE_GC {
+        // #3: enqueue the Force GC AND return an advisory so the
+        // operator learns SYNCHRONOUSLY (not by grepping the PS log) that a
+        // requested extent sits inside the recovery replay window and will be
+        // PROTECTED (correct, not a bug). The background loop recomputes the
+        // floor authoritatively; this is a best-effort preview over the SAME
+        // helper (`gc_replay_floor`). Task is still enqueued regardless.
+        let (gc_tx, log_stream_id, sst_vp_eids) = {
+            let p = part.borrow();
+            (
+                p.gc_tx.clone(),
+                p.log_stream_id,
+                p.sst_readers
+                    .iter()
+                    .map(|r| r.vp_extent_id)
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let advisory = match part_sc.get_stream_info(log_stream_id).await {
+            Ok(si) => {
+                let ids = si.extent_ids;
+                let (floor_pos, pos_by_eid) =
+                    crate::background::gc_replay_floor(&ids, sst_vp_eids.iter().copied());
+                let floor_eid = ids.get(floor_pos).copied().unwrap_or(0);
+                // A requested extent that resolves at/after the floor position is
+                // protected IF non-empty (matches `gc_extent_punchable`). We don't
+                // probe sealed_length here, so qualify with "non-empty".
+                let protected: Vec<u64> = req
+                    .extent_ids
+                    .iter()
+                    .copied()
+                    .filter(|e| pos_by_eid.get(e).is_some_and(|&pos| pos >= floor_pos))
+                    .collect();
+                if protected.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        "advisory: extent(s) {protected:?} resolve AT/BEFORE the recovery replay \
+                         floor (extent {floor_eid}, pos {floor_pos}); if non-empty they will be \
+                         PROTECTED by GC (recovery replays from there) — expected, not a bug. \
+                         Advance the floor: flush + MAJOR-compact past extent {floor_eid}, then retry."
+                    )
+                }
+            }
+            Err(_) => String::new(),
+        };
+        let mut gc_tx = gc_tx;
+        let (code, message) = match gc_tx.try_send(GcTask::Force {
+            extent_ids: req.extent_ids,
+            op_id: req.op_id,
+        }) {
+            Ok(()) => (CODE_OK, advisory),
+            Err(_) => (CODE_ERROR, "gc busy".to_string()),
+        };
+        return Ok(partition_rpc::rkyv_encode(&MaintenanceResp { code, message }));
+    }
+    if req.op == MAINTENANCE_FLUSH {
+        // Synchronous flush: rotate active memtable and flush all immutables.
+        flush_memtable_locked(part)
+            .await
+            .map_err(|e| (StatusCode::Internal, e.to_string()))?;
+        return Ok(partition_rpc::rkyv_encode(&MaintenanceResp {
+            code: CODE_OK,
+            message: String::new(),
+        }));
+    }
+    let mut p = part.borrow_mut();
+    let result = match req.op {
+        MAINTENANCE_COMPACT => p
+            .compact_tx
+            .try_send(crate::CompactTask::Major { op_id: req.op_id })
+            .map_err(|_| "compaction busy"),
+        MAINTENANCE_AUTO_GC => {
+            // decode multi-tier filter params from wire request.
+            let params = crate::GcAutoParams {
+                ratio: req.gc_ratio,
+                max_size: req.gc_max_size,
+                stream_debt: req.gc_stream_debt,
+                dead_bytes_high: req.gc_dead_bytes_high,
+                empty_only: req.gc_empty_only,
+                policy_is_standing: req.gc_policy_is_standing,
+            };
+            p.gc_tx
+                .try_send(GcTask::Auto { params, op_id: req.op_id })
+                .map_err(|_| "gc busy")
+        }
+        // MAINTENANCE_FORCE_GC handled above (advisory preview path).
+        _ => Err("unknown op"),
+    };
+    match result {
+        Ok(()) => Ok(partition_rpc::rkyv_encode(&MaintenanceResp {
+            code: CODE_OK,
+            message: String::new(),
+        })),
+        Err(e) => Ok(partition_rpc::rkyv_encode(&MaintenanceResp {
+            code: CODE_ERROR,
+            message: e.to_string(),
+        })),
+    }
+}
+
+/// #2: snapshot the per-partition GC replay floor + per-SST
+/// vp_heads so `autumn-op info --part` can show WHY a `forcegc` on a given
+/// extent would be protected (correct, not a bug). Read-only; borrows briefly,
+/// then does one `get_stream_info` to resolve the log extent order + floor.
+pub(crate) async fn handle_diag_partition_vp(
+    payload: Bytes,
+    part: &Rc<RefCell<PartitionData>>,
+    part_sc: &Rc<StreamClient>,
+) -> HandlerResult {
+    let _req: partition_rpc::DiagPartitionVpReq =
+        partition_rpc::rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+    let (log_stream_id, sst_vp_heads, vp_seed_extent_id, vp_seed_offset) = {
+        let p = part.borrow();
+        let heads: Vec<(u64, u64)> = p
+            .sst_readers
+            .iter()
+            .map(|r| (r.vp_extent_id, r.vp_offset))
+            .collect();
+        (p.log_stream_id, heads, p.vp_extent_id, p.vp_offset)
+    };
+    let log_extent_ids = match part_sc.get_stream_info(log_stream_id).await {
+        Ok(s) => s.extent_ids,
+        Err(e) => {
+            return Ok(partition_rpc::rkyv_encode(
+                &partition_rpc::DiagPartitionVpResp {
+                    code: CODE_ERROR,
+                    message: format!("get_stream_info: {e}"),
+                    log_extent_ids: Vec::new(),
+                    sst_vp_heads,
+                    floor_pos: 0,
+                    floor_extent_id: 0,
+                    vp_seed_extent_id,
+                    vp_seed_offset,
+                },
+            ));
+        }
+    };
+    let (floor_pos, _pos_by_eid) = crate::background::gc_replay_floor(
+        &log_extent_ids,
+        sst_vp_heads.iter().map(|(eid, _)| *eid),
+    );
+    let floor_extent_id = log_extent_ids.get(floor_pos).copied().unwrap_or(0);
+    Ok(partition_rpc::rkyv_encode(
+        &partition_rpc::DiagPartitionVpResp {
+            code: CODE_OK,
+            message: String::new(),
+            log_extent_ids,
+            sst_vp_heads,
+            floor_pos: floor_pos as u64,
+            floor_extent_id,
+            vp_seed_extent_id,
+            vp_seed_offset,
+        },
+    ))
+}
+
+pub(crate) async fn handle_diag_trace_key(
+    payload: Bytes,
+    part: &Rc<RefCell<PartitionData>>,
+) -> HandlerResult {
+    let req: partition_rpc::DiagTraceKeyReq =
+        partition_rpc::rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+    let p = part.borrow();
+    let memtable_seq = p.active.seek_user_key_seq(&req.user_key);
+    let imm_seqs: Vec<u64> = p
+        .imm
+        .iter()
+        .map(|imm| imm.seek_user_key_seq(&req.user_key))
+        .collect();
+    let mut sst_seqs: Vec<u64> = Vec::with_capacity(p.sst_readers.len());
+    let mut sst_seqs_nobloom: Vec<u64> = Vec::with_capacity(p.sst_readers.len());
+    let mut sst_seqs_fullscan: Vec<u64> = Vec::with_capacity(p.sst_readers.len());
+    let mut sst_last_seqs: Vec<u64> = Vec::with_capacity(p.tables.len());
+    for (i, reader) in p.sst_readers.iter().enumerate() {
+        sst_seqs.push(crate::background::lookup_in_sst_seq_opt(
+            reader,
+            &req.user_key,
+            true,
+        ));
+        sst_seqs_nobloom.push(crate::background::lookup_in_sst_seq_opt(
+            reader,
+            &req.user_key,
+            false,
+        ));
+        sst_seqs_fullscan.push(crate::background::lookup_in_sst_seq_fullscan(
+            reader,
+            &req.user_key,
+        ));
+        sst_last_seqs.push(p.tables.get(i).map(|t| t.last_seq).unwrap_or(0));
+    }
+    Ok(partition_rpc::rkyv_encode(
+        &partition_rpc::DiagTraceKeyResp {
+            code: partition_rpc::CODE_OK,
+            message: String::new(),
+            memtable_seq,
+            imm_seqs,
+            sst_seqs,
+            sst_seqs_nobloom,
+            sst_seqs_fullscan,
+            sst_last_seqs,
+        },
+    ))
+}
+
+pub(crate) async fn handle_get_discards(
+    payload: Bytes,
+    part: &Rc<RefCell<PartitionData>>,
+    part_sc: &Rc<StreamClient>,
+) -> HandlerResult {
+    let _req: GetDiscardsReq =
+        partition_rpc::rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+
+    let (log_stream_id, readers) = {
+        let p = part.borrow();
+        (p.log_stream_id, p.sst_readers.clone())
+    };
+
+    let mut discards = crate::background::get_discards(&readers);
+
+    let log_extent_ids = part_sc
+        .get_stream_info(log_stream_id)
+        .await
+        .map(|s| s.extent_ids)
+        .unwrap_or_default();
+    crate::background::valid_discard(&mut discards, &log_extent_ids);
+
+    Ok(partition_rpc::rkyv_encode(&GetDiscardsResp {
+        code: CODE_OK,
+        message: String::new(),
+        discards: discards.into_iter().collect(),
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// `map_storage_error` translation tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod split_freeze_budget_tests {
+    use super::{split_freeze_deadline, SPLIT_CALL_TIMEOUT};
+    use std::time::Duration;
+
+    /// #6 invariant: a split attempt launched at the deadline must finish
+    /// (commit on the manager) BEFORE FREEZE_TTL fires, so any in-flight commit
+    /// lands while the partition is still frozen. If this fails, a stale-seal
+    /// write-loss window has reopened (someone shrank FREEZE_TTL or grew the
+    /// per-call timeout past the budget).
+    #[test]
+    fn deadline_leaves_room_for_one_call_before_ttl() {
+        let ttl = crate::FREEZE_TTL;
+        let deadline = split_freeze_deadline(ttl, SPLIT_CALL_TIMEOUT);
+        assert!(
+            deadline + SPLIT_CALL_TIMEOUT < ttl,
+            "a call launched at the deadline ({deadline:?}) + its timeout \
+             ({SPLIT_CALL_TIMEOUT:?}) must complete before FREEZE_TTL ({ttl:?})"
+        );
+        assert!(deadline > Duration::ZERO, "deadline must leave time to attempt at all");
+    }
+
+    /// Degenerate config (call timeout >= TTL) collapses the deadline to zero —
+    /// the loop never attempts (aborts immediately), never commits-after-lapse.
+    #[test]
+    fn over_budget_config_yields_zero_deadline() {
+        assert_eq!(
+            split_freeze_deadline(Duration::from_secs(5), Duration::from_secs(8)),
+            Duration::ZERO
+        );
+    }
+}
+
+#[cfg(test)]
+mod map_storage_error_tests {
+    use super::map_storage_error;
+    use autumn_rpc::StatusCode;
+    use autumn_stream::StaleVpOffset;
+
+    /// A `StaleVpOffset` anywhere in the anyhow chain must surface as
+    /// `FailedPrecondition` with the sentinel's stable Display string
+    /// preserved verbatim — the Python operational tooling contract.
+    #[test]
+    fn stale_vp_surfaces_as_failed_precondition() {
+        let stale = StaleVpOffset {
+            extent_id: 29,
+            requested_offset: 264_784_123,
+            requested_length: 10_918_365,
+            sealed_length: 11_570_792,
+        };
+        let raw = anyhow::Error::new(stale).context("resolve_value");
+        let (code, msg) = map_storage_error(&raw);
+        assert_eq!(code, StatusCode::FailedPrecondition);
+        // We surface the SENTINEL's Display, not anyhow's full chain.
+        assert!(
+            msg.starts_with("stale_vp_offset_past_sealed_length:"),
+            "wire-contract prefix preserved: {msg}"
+        );
+        assert!(msg.contains("extent=29"));
+        assert!(msg.contains("offset=264784123"));
+        assert!(msg.contains("length=10918365"));
+        assert!(msg.contains("sealed_length=11570792"));
+    }
+
+    /// Generic errors (network / disk / decode / etc.) keep mapping to
+    /// `Internal` so we don't accidentally promote unrelated failures
+    /// into the `FailedPrecondition` channel.
+    #[test]
+    fn unrecognised_error_falls_back_to_internal() {
+        let raw = anyhow::anyhow!("connection closed mid-read");
+        let (code, msg) = map_storage_error(&raw);
+        assert_eq!(code, StatusCode::Internal);
+        assert_eq!(msg, "connection closed mid-read");
+    }
+}
+
+#[cfg(test)]
+mod batch_get_ceiling_tests {
+    use super::*;
+
+    const CEILING: usize = autumn_rpc::frame::MAX_PAYLOAD_LEN as usize;
+
+    /// Exactly at the ceiling is servable; one byte past is not. The boundary
+    /// is where an off-by-one hides, and the loose direction is the one that
+    /// builds a frame the wire cannot express.
+    #[test]
+    fn the_budget_is_exceeded_one_byte_past_the_ceiling() {
+        let fixed = BATCH_GET_CTRL_FIXED_BYTES;
+        assert!(!batch_get_budget_exceeded(0, 0, 0));
+        assert!(!batch_get_budget_exceeded(CEILING - fixed, 0, 0));
+        assert!(batch_get_budget_exceeded(CEILING - fixed + 1, 0, 0));
+    }
+
+    /// The ctrl rides in the SAME payload as the values, one entry per KEY, so
+    /// the key count has to be part of the budget. A value-only budget left a
+    /// window here: a million keys of ~4 KiB fits the values while the ctrl
+    /// pushes the frame over.
+    #[test]
+    fn a_million_small_keys_are_refused_even_though_their_values_would_fit() {
+        let keys = 1_000_000;
+        let value_bytes = 4_293_000_000usize;
+        assert!(
+            value_bytes < CEILING,
+            "the values alone must fit, or this test is not about the ctrl"
+        );
+        assert!(
+            batch_get_budget_exceeded(value_bytes, keys, 0),
+            "the ctrl for {keys} keys has to count against the ceiling"
+        );
+    }
+
+    /// The shape that motivates the cap: `get_many` puts every same-partition
+    /// key in one request, and a model load resolves hundreds of 8 MiB values.
+    #[test]
+    fn a_model_loads_batch_of_8mib_values_crosses_the_cap() {
+        let eight_mib = 8 * 1024 * 1024;
+        let crossing = CEILING / eight_mib + 1;
+        assert!(
+            batch_get_budget_exceeded(crossing * eight_mib, crossing, 0),
+            "{crossing} values of 8 MiB must not be answerable in one frame"
+        );
+        assert!(
+            crossing < 1000,
+            "a realistic key count ({crossing}) has to reach the cap, or it is not a real guard"
+        );
+    }
+
+    /// And an ordinary batch is untouched.
+    #[test]
+    fn an_ordinary_batch_is_not_refused() {
+        assert!(!batch_get_budget_exceeded(512 * 8 * 1024, 512, 0));
+    }
+
+    /// Positions ride the ctrl too: a batch of items all answered with one
+    /// counts their addresses.
+    #[test]
+    fn positions_count_against_the_ceiling() {
+        let pos = ValuePosition {
+            extent_id: 1,
+            value_offset: 0,
+            value_len: 1 << 20,
+            eversion: 1,
+            replica_addrs: vec!["127.0.0.1:9101".to_string(); 3],
+            ec_data_shards: 0,
+            ec_sealed_length: 0,
+        };
+        let each = position_ctrl_bytes(&pos);
+        let items = CEILING / each;
+        assert!(!batch_get_budget_exceeded(0, 0, each * 1000));
+        assert!(batch_get_budget_exceeded(0, items, each * items));
+    }
+}

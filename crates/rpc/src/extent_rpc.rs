@@ -1,0 +1,1576 @@
+//! Wire codec for ExtentService RPCs over autumn-rpc.
+//!
+//! Data-carrying messages (Append, Read, WriteShard) put their bytes in the
+//! frame's value with an rkyv ctrl; small hot-path messages (CommitLength,
+//! FenceExtent, ...) keep fixed-size binary codecs. Everything else is rkyv.
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  ⚠️  WIRE SCHEMA. Edit an `Archive` type here — add, remove, reorder or
+//  retype a field, or change what one MEANS — and you MUST bump
+//  `WIRE_VERSION` in `crates/rpc/src/lib.rs` — and raise
+//  `MIN_CLIENT_WIRE_VERSION` too if the change breaks the CLIENT surface.
+//
+//  NOTHING CHECKS THIS FOR YOU. The schema fingerprint that used to catch a
+//  forgotten bump was removed; the version integer is the only guard left,
+//  and it is maintained by hand. Forget it and two binaries claiming the same
+//  version will handshake, then decode each other's bytes as garbage — no
+//  error, no log, just wrong data. That has happened here before.
+// ═══════════════════════════════════════════════════════════════════════════
+
+use crate::StatusCode;
+use bytes::{Buf, BufMut, Bytes, BytesMut};
+use rkyv::{Archive, Deserialize, Serialize};
+
+// ── msg_type constants ───────────────────────────────────────────────────────
+
+pub const MSG_APPEND: u8 = 1;
+// 2 RESERVED (`READ_BYTES`, the read whose data rode inside ctrl; wire 83).
+pub const MSG_COMMIT_LENGTH: u8 = 3;
+pub const MSG_ALLOC_EXTENT: u8 = 4;
+pub const MSG_DF: u8 = 5;
+pub const MSG_REQUIRE_RECOVERY: u8 = 6;
+pub const MSG_RE_AVALI: u8 = 7;
+// 8 RESERVED (`COPY_EXTENT`, a whole-extent copy in one reply; only tests used it).
+pub const MSG_CONVERT_TO_EC: u8 = 9;
+pub const MSG_WRITE_SHARD: u8 = 10;
+pub const MSG_DELETE_EXTENT: u8 = 11;
+// 12 = MSG_COMMIT_EC_SHARD — retired with the per-node commit phase. EC
+//      conversion is copy-on-write: a shard is staged as an ADDITIVE
+//      `extent-{id}.shard{i}` file and the manager's layout flip is the sole
+//      commit point, so no node ever publishes a shard over its own `.dat`.
+//      The number stays reserved — msg_type values are append-only.
+// 13 was a per-replica fsynced-length query for a flush barrier that only
+// re-asked what an all-replica append ack already guarantees; retired.
+// The number stays reserved — msg_type values are append-only.
+/// Manager-only probe RPC. Returns CommitLengthResp-shaped
+/// `(code, length)` without touching the owner-lock fence — no
+/// owner_epoch check, no mutation of `owner_epoch`, no `.meta`
+/// rewrite. Two call sites today:
+///   - `manager/src/recovery.rs`'s `recovery_dispatch_loop`
+///     liveness probe (uses `code == CODE_OK` to decide whether
+///     to fire `dispatch_recovery_task`; ignores `length`).
+///   - `autumn-client info`'s open-extent live-length display
+///     (uses `length` to render `commit_length` for streams
+///     where no PS-owner context is available).
+/// External (non-manager) callers MUST NOT use this RPC for
+/// seal/consensus reads — those go through `MSG_COMMIT_LENGTH`
+/// with a real owner_epoch so the EN's fence handover side-effect
+/// fires (see `extent_node.rs::handle_commit_length`).
+pub const MSG_PROBE_EXTENT: u8 = 14;
+// 15 = MSG_READ_BYTES_BULK — the exact value read, replaced by `MSG_READ`
+//      (`READ_EXACT`) in wire 79.
+
+// 16 = MSG_APPEND_CHAIN — retired with chained replication. Its ack carried
+//      ONE status for every hop, so the writer could not tell which replica
+//      failed and blamed the head; see "Replication is star-only" in the
+//      stream crate's guide before proposing anything of this shape again.
+//      The number stays reserved — msg_type values are append-only.
+
+/// fence an extent WITHOUT appending: raise the EN's per-extent
+/// `owner_epoch` fence floor to `req.owner_epoch` (durably, across replicas).
+///
+/// Used on partition TAKEOVER to EAGERLY fence the previous owner at the new
+/// owner's epoch (E_new) BEFORE the partition serves any request. Closes the
+/// idle-takeover window: the EN floor is otherwise only raised by the new
+/// owner's FIRST APPEND, so on an idle takeover it stayed at the OLD owner's
+/// epoch (E_old) — and a paused-then-resumed "zombie writer" (the old owner)
+/// whose in-flight append still carries E_old would pass the fence
+/// (`E_old == stored`), land in the log extent, and be ACKed: a silent lost
+/// update the new owner never sees.
+///
+/// The handler mirrors the APPEND fence prologue (`owner_epoch.fetch_max` +
+/// `ensure_fence_durable`, fail-closed on a persist error) MINUS the write.
+/// Raising the floor on a SEALED extent is a harmless no-op (a sealed tail
+/// already rejects the zombie via the sealed check; fencing it is still safe),
+/// so the handler deliberately does NOT special-case-reject sealed.
+pub const MSG_FENCE_EXTENT: u8 = 17;
+/// Manager → EN: scrub these sealed payload files on this node (`ScrubExtentsReq`
+/// → `CodeResp`). ACCEPTED, not done: the node reads and hashes each file
+/// locally, paced by its own byte budget, and reports each outcome on a later
+/// `df` (`DfResp.scrub_done`). Nothing but the request and the outcomes
+/// crosses the network.
+pub const MSG_SCRUB_EXTENTS: u8 = 18;
+/// Read a range of an extent's payload file: the one read message. Request =
+/// rkyv `ReadReq` (ctrl); reply = a value-separable frame whose ctrl is
+/// `[code][rkyv ReadResp]` and whose value is the bytes read (over UCX, from
+/// `BULK_MIN_BYTES` on, a frame value). `ReadReq::mode` says what a range this
+/// replica holds only part of gets.
+pub const MSG_READ: u8 = 19;
+/// `MSG_READ` whose value is sent as the UCX active message the reader tagged,
+/// so it lands in the reader's memory (`ReadAmReq`). The reply is the
+/// `MSG_READ` ctrl with no value, written once the value's send completed.
+/// UCX only; the SDK sends it from `WIRE_VERSION_WITH_READ_AM`.
+pub const MSG_READ_AM: u8 = 20;
+
+/// `ReadReq::mode`: exactly `length` bytes, or a refusal
+/// (`CODE_PRECONDITION`) when this replica holds fewer — a value read.
+pub const READ_EXACT: u8 = 0;
+/// Up to `length` bytes, as many as this replica holds — a scan in chunks.
+pub const READ_UP_TO: u8 = 1;
+/// Everything from `offset` to this replica's end (`length` ignored).
+pub const READ_TO_END: u8 = 2;
+
+/// Length of an OK `MSG_READ` reply's ctrl without block crcs: the code byte
+/// and an archived `ReadResp` with an empty message.
+pub const READ_RESP_OK_CTRL_BYTES: usize = 25;
+
+/// Block crcs (`ReadReq::with_crcs`) are over the read range cut at multiples
+/// of this many bytes of the file (the `.ck` block size).
+pub const READ_CRC_BLOCK_BYTES: u64 = 1 << 20;
+
+/// The most ctrl bytes an OK `MSG_READ` reply can take: its block crcs for a
+/// range as long as a frame can carry, plus rkyv's alignment padding.
+pub const READ_RESP_MAX_OK_CTRL_BYTES: usize =
+    READ_RESP_OK_CTRL_BYTES + 4 * (crate::frame::MAX_PAYLOAD_LEN as usize / READ_CRC_BLOCK_BYTES as usize + 2) + 8;
+
+/// The crc32c of each piece of `data`, which was read at `offset` of its file,
+/// cut where the file offset crosses a multiple of `READ_CRC_BLOCK_BYTES`.
+pub fn read_block_crcs(offset: u64, data: &[u8]) -> Vec<u32> {
+    let mut crcs = Vec::with_capacity(data.len() / READ_CRC_BLOCK_BYTES as usize + 2);
+    let (mut at, mut rest) = (offset, data);
+    while !rest.is_empty() {
+        let take = ((READ_CRC_BLOCK_BYTES - at % READ_CRC_BLOCK_BYTES) as usize).min(rest.len());
+        crcs.push(crc32c::crc32c(&rest[..take]));
+        at += take as u64;
+        rest = &rest[take..];
+    }
+    crcs
+}
+
+/// Check `data`, read at `offset`, against the block crcs its reply carried.
+pub fn check_read_block_crcs(offset: u64, data: &[u8], crcs: &[u32]) -> Result<(), String> {
+    let got = read_block_crcs(offset, data);
+    if got.len() != crcs.len() {
+        return Err(format!("read of {} bytes at {offset} came with {} block crcs, expected {}", data.len(), crcs.len(), got.len()));
+    }
+    match got.iter().zip(crcs).position(|(a, b)| a != b) {
+        None => Ok(()),
+        Some(i) => Err(format!("read at {offset}: block crc mismatch in piece {i}")),
+    }
+}
+
+// MSG_TYPE_PING = 0xFF is reserved by autumn-rpc for heartbeat
+
+// ── Append (hot path) ────────────────────────────────────────────────────────
+
+/// An append's ctrl: where it goes, the writer's fences, and the crc32c of
+/// its payload, which is the frame's value and covered by no frame CRC.
+#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AppendHeader {
+    pub extent_id: u64,
+    pub eversion: u64,
+    /// Byte position in the extent the writer has committed up to.
+    pub commit: u64,
+    pub owner_epoch: i64,
+    pub payload_crc: u32,
+}
+
+impl AppendHeader {
+    /// The request as it is sent: this header with its payload's crc filled
+    /// in (once, for every replica) as ctrl, the payload as the frame's value.
+    /// `crc`: the payload's crc32c when the caller computed it while
+    /// encoding the payload; else it is computed at the first send.
+    pub fn prepared<B: Into<crate::RegBytes>>(
+        self,
+        payload: Vec<B>,
+        crc: Option<u32>,
+    ) -> crate::frame::PreparedPayload {
+        let make_ctrl = move |payload_crc| rkyv_encode(&AppendHeader { payload_crc, ..self });
+        match crc {
+            Some(crc) => crate::frame::PreparedPayload::with_crc(make_ctrl, payload, crc),
+            None => crate::frame::PreparedPayload::new(make_ctrl, payload),
+        }
+    }
+}
+
+pub struct AppendReq {
+    pub extent_id: u64,
+    pub eversion: u64,
+    pub commit: u64,
+    pub owner_epoch: i64,
+    pub payload: AppendPayload,
+}
+
+/// An append's payload: one buffer, or the parts a frame value too large for
+/// one pool buffer was received in, in order.
+#[derive(Clone, Debug)]
+pub enum AppendPayload {
+    One(Bytes),
+    Parts(Vec<Bytes>),
+}
+
+impl AppendPayload {
+    pub fn len(&self) -> usize {
+        match self {
+            AppendPayload::One(b) => b.len(),
+            AppendPayload::Parts(p) => p.iter().map(Bytes::len).sum(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn parts(&self) -> &[Bytes] {
+        match self {
+            AppendPayload::One(b) => std::slice::from_ref(b),
+            AppendPayload::Parts(p) => p,
+        }
+    }
+
+    /// The payload in one buffer (a copy when it is in parts).
+    pub fn to_bytes(&self) -> Bytes {
+        match self {
+            AppendPayload::One(b) => b.clone(),
+            AppendPayload::Parts(p) => {
+                let mut all = BytesMut::with_capacity(self.len());
+                for part in p {
+                    all.extend_from_slice(part);
+                }
+                all.freeze()
+            }
+        }
+    }
+}
+
+impl From<Bytes> for AppendPayload {
+    fn from(b: Bytes) -> Self {
+        AppendPayload::One(b)
+    }
+}
+
+impl AppendReq {
+    pub fn prepared(&self) -> crate::frame::PreparedPayload {
+        AppendHeader {
+            extent_id: self.extent_id,
+            eversion: self.eversion,
+            commit: self.commit,
+            owner_epoch: self.owner_epoch,
+            payload_crc: 0,
+        }
+        .prepared(self.payload.parts().to_vec(), None)
+    }
+
+    /// `ctrl` is an `AppendHeader`; the payload came as the frame's value (a
+    /// raw tail, or frame values over UCX), which no frame CRC covers — so it
+    /// is checked here against the header's crc.
+    pub fn decode_checked(ctrl: Bytes, payload: AppendPayload) -> Result<Self, &'static str> {
+        let (req, crc) = Self::decode_unchecked(ctrl, payload)?;
+        if req.payload.parts().iter().fold(0, |c, p| crc32c::crc32c_append(c, p)) != crc {
+            return Err("append payload crc mismatch");
+        }
+        Ok(req)
+    }
+
+    /// The request and the crc its header claims for the payload, for a
+    /// receiver that checks it in its own pass (the extent node, cutting the
+    /// payload at block boundaries as it hashes it).
+    pub fn decode_unchecked(ctrl: Bytes, payload: AppendPayload) -> Result<(Self, u32), &'static str> {
+        let h: AppendHeader = rkyv_decode(&ctrl).map_err(|_| "append request: undecodable header")?;
+        let req = Self {
+            extent_id: h.extent_id,
+            eversion: h.eversion,
+            commit: h.commit,
+            owner_epoch: h.owner_epoch,
+            payload,
+        };
+        Ok((req, h.payload_crc))
+    }
+}
+
+/// Fixed binary AppendResponse: 17 bytes.
+/// ```text
+/// [code: u8][offset: u64 LE][end: u64 LE]
+/// ```
+/// offset/end are byte positions in the extent (u64-offset widening).
+pub struct AppendResp {
+    pub code: u8,
+    pub offset: u64,
+    pub end: u64,
+}
+
+impl AppendResp {
+    pub fn encode(&self) -> Bytes {
+        let mut buf = BytesMut::with_capacity(17);
+        buf.put_u8(self.code);
+        buf.put_u64_le(self.offset);
+        buf.put_u64_le(self.end);
+        buf.freeze()
+    }
+
+    pub fn decode(mut data: Bytes) -> Result<Self, &'static str> {
+        if data.len() < 17 {
+            return Err("append response too short");
+        }
+        Ok(Self {
+            code: data.get_u8(),
+            offset: data.get_u64_le(),
+            end: data.get_u64_le(),
+        })
+    }
+}
+
+/// `MSG_READ` request.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct ReadReq {
+    pub extent_id: u64,
+    pub eversion: u64,
+    pub offset: u64,
+    pub length: u64,
+    /// `READ_EXACT`, `READ_UP_TO` or `READ_TO_END`.
+    pub mode: u8,
+    /// `PayloadLocation` wire byte and shard index: the file to read.
+    pub payload_location: u8,
+    pub shard_index: u32,
+    /// The reply carries `ReadResp::block_crcs` over what it sends: the
+    /// value is the frame's tail, which no frame CRC covers. Background reads
+    /// whose bytes become durable data or state ask for them.
+    pub with_crcs: bool,
+}
+
+impl ReadReq {
+    pub fn new(extent_id: u64, eversion: u64, offset: u64, length: u64, mode: u8, payload: PayloadRef) -> Self {
+        Self {
+            extent_id,
+            eversion,
+            offset,
+            length,
+            mode,
+            payload_location: payload.location.as_byte(),
+            shard_index: payload.shard_index,
+            with_crcs: false,
+        }
+    }
+
+    /// Ask for the reply's block crcs.
+    pub fn with_crcs(mut self) -> Self {
+        self.with_crcs = true;
+        self
+    }
+
+    /// The file named, or `None` for a location byte this build cannot name.
+    pub fn payload_ref(&self) -> Option<PayloadRef> {
+        PayloadLocation::from_wire_byte(self.payload_location).map(|l| PayloadRef::for_extent(l, self.shard_index))
+    }
+}
+
+/// `MSG_READ_AM` request: a read, the AM tag its value is sent with, and the
+/// most the reader's memory holds (a longer read is refused, not sent).
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct ReadAmReq {
+    pub read: ReadReq,
+    pub tag: u64,
+    pub max_len: u64,
+}
+
+/// `MSG_READ` reply ctrl after its code byte: the replica's end (its local
+/// length, or the shard file's) on an OK and on an exact read refused short
+/// (0 on other refusals), and, on a refusal, why.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+pub struct ReadResp {
+    pub end: u64,
+    pub message: String,
+    /// On an OK to a `with_crcs` read: `read_block_crcs` of the bytes sent.
+    pub block_crcs: Vec<u32>,
+}
+
+impl ReadResp {
+    /// The reply ctrl: `[code][rkyv ReadResp]`.
+    pub fn ctrl(code: u8, end: u64, message: &str, block_crcs: Vec<u32>) -> Bytes {
+        let body = rkyv::to_bytes::<RkyvError>(&ReadResp { end, message: message.to_string(), block_crcs })
+            .expect("rkyv encode");
+        let mut c = BytesMut::with_capacity(1 + body.len());
+        c.put_u8(code);
+        c.extend_from_slice(&body);
+        c.freeze()
+    }
+}
+
+// ── CommitLength (hot path) ──────────────────────────────────────────────────
+
+/// CommitLengthRequest: 16 bytes.
+/// [extent_id: u64 LE][owner_epoch: i64 LE]
+///
+/// **Wire contract on `owner_epoch`:**
+///
+/// `owner_epoch` is an i64 but MUST be `> 0` on the wire — it carries the
+/// caller's owner-lock claim. The EN's `handle_commit_length`:
+///   - returns `CODE_INVALID_ARGUMENT` if `owner_epoch <= 0` (no
+///     "probe sentinel" path — that escape hatch existed earlier
+///     and broke fence semantics; see `MSG_PROBE_EXTENT` instead);
+///   - returns `CODE_LOCKED_BY_OTHER` if `owner_epoch < entry.owner_epoch`
+///     (caller is a stale owner; reject);
+///   - if `owner_epoch >= entry.owner_epoch`, returns the length WITHOUT
+///     mutating `owner_epoch` (CHECK-ONLY; the three-concepts rule).
+///
+/// commit_length is a length PROBE + stale-owner fence CHECK. It does NOT
+/// perform fence handover — write-ownership is established EXCLUSIVELY by
+/// the APPEND path (`append_burst_frames` bumps `owner_epoch` when a
+/// higher-owner_epoch owner writes). The old "owner_epoch > owner_epoch →
+/// bump + persist .meta" handover has been removed: the manager's
+/// control-plane probes (`admin-merge:<v>:<s>` lock in
+/// `handle_merge_partitions`, the seal in `handle_stream_alloc_extent`)
+/// carry a high global owner-owner_epoch counter that does NOT represent a
+/// new PS write-owner; bumping `owner_epoch` on such a probe fenced out
+/// the LIVE PS (which never re-reads the climbing counter) → poison.
+///
+/// This RPC is the canonical seal-consensus primitive. Manager's
+/// `commit_length_on_node(addr, eid, owner_epoch)` helper forwards the
+/// caller's validated `req.owner_epoch` through `handle_check_commit_length`
+/// and `handle_stream_alloc_extent`. Manager probes WITHOUT an owner
+/// context (recovery liveness, `autumn-client info` display) use
+/// `MSG_PROBE_EXTENT` instead — that RPC returns the same `(code, length)`
+/// shape but skips the fence CHECK entirely.
+pub struct CommitLengthReq {
+    pub extent_id: u64,
+    pub owner_epoch: i64,
+}
+
+impl CommitLengthReq {
+    pub fn encode(&self) -> Bytes {
+        let mut buf = BytesMut::with_capacity(16);
+        buf.put_u64_le(self.extent_id);
+        buf.put_i64_le(self.owner_epoch);
+        buf.freeze()
+    }
+
+    pub fn decode(mut data: Bytes) -> Result<Self, &'static str> {
+        if data.len() < 16 {
+            return Err("commit_length request too short");
+        }
+        Ok(Self {
+            extent_id: data.get_u64_le(),
+            owner_epoch: data.get_i64_le(),
+        })
+    }
+}
+
+/// CommitLengthResponse: 9 bytes.
+/// [code: u8][length: u64 LE]
+pub struct CommitLengthResp {
+    pub code: u8,
+    pub length: u64,
+}
+
+impl CommitLengthResp {
+    pub fn encode(&self) -> Bytes {
+        let mut buf = BytesMut::with_capacity(9);
+        buf.put_u8(self.code);
+        buf.put_u64_le(self.length);
+        buf.freeze()
+    }
+
+    pub fn decode(mut data: Bytes) -> Result<Self, &'static str> {
+        if data.len() < 9 {
+            return Err("commit_length response too short");
+        }
+        Ok(Self {
+            code: data.get_u8(),
+            length: data.get_u64_le(),
+        })
+    }
+}
+
+// ── ProbeExtent (manager-only, no fence) ────────────────────────────────────
+
+/// ProbeExtentRequest: 8 bytes. `[extent_id: u64 LE]`
+///
+/// Manager-only liveness + length probe; see `MSG_PROBE_EXTENT` const
+/// docstring for the call-site contract. Response shape matches
+/// `CommitLengthResp` (`(code, length)`) so the manager can reuse the
+/// same `(addr, eid)` plumbing without separate decode paths.
+pub struct ProbeExtentReq {
+    pub extent_id: u64,
+}
+
+impl ProbeExtentReq {
+    pub fn encode(&self) -> Bytes {
+        let mut buf = BytesMut::with_capacity(8);
+        buf.put_u64_le(self.extent_id);
+        buf.freeze()
+    }
+
+    pub fn decode(mut data: Bytes) -> Result<Self, &'static str> {
+        if data.len() < 8 {
+            return Err("probe_extent request too short");
+        }
+        Ok(Self {
+            extent_id: data.get_u64_le(),
+        })
+    }
+}
+
+/// ProbeExtentResponse: 9 bytes. `[code: u8][length: u64 LE]`. Same shape
+/// as `CommitLengthResp` — `code` is `CODE_OK` (extent present) or
+/// `CODE_NOT_FOUND` (extent missing locally); `length` carries
+/// `coalescer.last_synced` for open extents or `sealed_length` for sealed.
+pub type ProbeExtentResp = CommitLengthResp;
+
+// ── FenceExtent (raise the owner_epoch fence floor, no append) ───────────────
+
+/// FenceExtentRequest: 16 bytes.
+/// `[extent_id: u64 LE][owner_epoch: i64 LE]`
+///
+/// Same fixed-header shape as `CommitLengthReq`, but a MUTATING fence op: the
+/// EN raises `entry.owner_epoch` to `owner_epoch` (monotonic `fetch_max`) and
+/// persists it durably (`ensure_fence_durable`); it neither reads nor returns
+/// a length. `owner_epoch` MUST be `> 0` (a real acquired owner epoch); the EN
+/// rejects `<= 0` as a protocol error. See the `MSG_FENCE_EXTENT` docstring.
+pub struct FenceExtentReq {
+    pub extent_id: u64,
+    pub owner_epoch: i64,
+}
+
+impl FenceExtentReq {
+    pub fn encode(&self) -> Bytes {
+        let mut buf = BytesMut::with_capacity(16);
+        buf.put_u64_le(self.extent_id);
+        buf.put_i64_le(self.owner_epoch);
+        buf.freeze()
+    }
+
+    pub fn decode(mut data: Bytes) -> Result<Self, &'static str> {
+        if data.len() < 16 {
+            return Err("fence_extent request too short");
+        }
+        Ok(Self {
+            extent_id: data.get_u64_le(),
+            owner_epoch: data.get_i64_le(),
+        })
+    }
+}
+
+/// FenceExtentResponse: `[code: u8][message: utf8 …]`
+///
+/// `code`:
+///   - `CODE_OK` — the floor is now `>= owner_epoch` AND durable on this
+///     replica (fence installed, or already at/above it).
+///   - `CODE_LOCKED_BY_OTHER` — a HIGHER owner already holds this extent
+///     (`owner_epoch < stored`); the caller is stale. `fence_tail` treats
+///     this as "fine — someone newer already owns it".
+///   - `CODE_PRECONDITION` — fail-closed: the durable `.meta` persist failed
+///     (disk marked offline) or the `.meta` is quarantined, so the fence is
+///     NOT guaranteed durable on this replica.
+/// `message` carries a human-readable reason for the non-OK codes.
+pub struct FenceExtentResp {
+    pub code: u8,
+    pub message: String,
+}
+
+impl FenceExtentResp {
+    pub fn encode(&self) -> Bytes {
+        let mut buf = BytesMut::with_capacity(1 + self.message.len());
+        buf.put_u8(self.code);
+        buf.extend_from_slice(self.message.as_bytes());
+        buf.freeze()
+    }
+
+    pub fn decode(mut data: Bytes) -> Result<Self, &'static str> {
+        if data.is_empty() {
+            return Err("fence_extent response too short");
+        }
+        let code = data.get_u8();
+        let message = String::from_utf8_lossy(&data).into_owned();
+        Ok(Self { code, message })
+    }
+}
+
+// ── rkyv helpers ────────────────────────────────────────────────────────────
+
+use rkyv::api::high::{HighDeserializer, HighSerializer};
+use rkyv::rancor::Error as RkyvError;
+use rkyv::ser::allocator::ArenaHandle;
+
+/// Serialize a value to Bytes using rkyv.
+pub fn rkyv_encode<T>(val: &T) -> Bytes
+where
+    T: for<'a> Serialize<HighSerializer<rkyv::util::AlignedVec, ArenaHandle<'a>, RkyvError>>,
+{
+    let buf = rkyv::to_bytes::<RkyvError>(val).expect("rkyv encode");
+    Bytes::copy_from_slice(&buf)
+}
+
+/// Deserialize a value from bytes using rkyv with archive-bytes validation.
+/// Copies into an AlignedVec if the input is not properly aligned.
+///
+/// switched from `from_bytes_unchecked` to the checked `from_bytes` —
+/// see the matching note in `crates/rpc/src/manager_rpc.rs` for rationale.
+/// Validates archived bytes via bytecheck before deserialising; returns
+/// `Err` on malformed input instead of UB.
+pub fn rkyv_decode<T>(data: &[u8]) -> Result<T, String>
+where
+    T: Archive,
+    T::Archived: Deserialize<T, HighDeserializer<RkyvError>>
+        + for<'a> rkyv::bytecheck::CheckBytes<rkyv::api::high::HighValidator<'a, RkyvError>>,
+{
+    let mut v = rkyv::util::AlignedVec::<16>::with_capacity(data.len());
+    v.extend_from_slice(data);
+    rkyv::from_bytes::<T, RkyvError>(&v).map_err(|e| format!("rkyv decode: {e}"))
+}
+
+// ── Status code constants ────────────────────────────────────────────────────
+
+/// Append response code constants for hot-path binary wire format.
+pub const CODE_OK: u8 = 0;
+pub const CODE_NOT_FOUND: u8 = 1;
+pub const CODE_PRECONDITION: u8 = 3;
+pub const CODE_ERROR: u8 = 4;
+/// Returned when `header.owner_epoch < owner_epoch` — a newer owner has taken the lock.
+pub const CODE_LOCKED_BY_OTHER: u8 = 5;
+/// Returned by ReadBytes when the client's `eversion` is older than the
+/// server's local view (e.g. the extent has been EC-converted under a
+/// stale `StreamClient.extent_info_cache` entry). The client must
+/// invalidate its cached `ExtentInfo` and refetch from the manager.
+pub const CODE_EVERSION_MISMATCH: u8 = 6;
+/// Returned by ReadBytes when this node does not hold the payload file the
+/// request NAMED (`payload_location` + `shard_index`).
+///
+/// It is deliberately distinct from `CODE_NOT_FOUND` ("no such extent here")
+/// and never a silent fallback to whichever payload file this node does hold:
+/// serving shard bytes as a whole value, or the reverse, is exactly the
+/// corruption the location field exists to prevent. The client's response is to
+/// refresh its layout from the manager and retry, which converges because the
+/// manager is the authority on where an extent's payload lives.
+pub const CODE_PAYLOAD_NOT_HERE: u8 = 7;
+/// EC source content failed its stored checksum. The failed attempt has ended;
+/// release its marker so replica recovery can repair the source.
+pub const CODE_CONTENT_CORRUPT: u8 = 8;
+
+/// Which file on an extent-node holds an extent's payload.
+///
+/// Both forms can exist on one node at once (a staged shard beside a still-live
+/// `.dat`), so the layout has to SAY which is authoritative rather than letting
+/// each node infer its own role. The manager owns this decision; the EN obeys
+/// it. Wire form is a `u8` — this codebase keeps rkyv-derived enums out of the
+/// schema (same reason `ExtentOpKind` is a byte).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PayloadLocation {
+    /// `extent-{id}.dat` holds the payload: a full replica, or a shard written
+    /// by the pre-CoW conversion scheme, which renamed its shard over `.dat`.
+    /// This is the DEFAULT for every extent that predates the field.
+    InDat,
+    /// `extent-{id}.shard{i}` holds this node's shard; `.dat` is either absent
+    /// or a redundant full copy awaiting cleanup.
+    InShardFile,
+}
+
+pub const PAYLOAD_LOCATION_IN_DAT: u8 = 0;
+pub const PAYLOAD_LOCATION_IN_SHARD_FILE: u8 = 1;
+
+impl PayloadLocation {
+    pub fn as_byte(self) -> u8 {
+        match self {
+            Self::InDat => PAYLOAD_LOCATION_IN_DAT,
+            Self::InShardFile => PAYLOAD_LOCATION_IN_SHARD_FILE,
+        }
+    }
+
+    /// Reads the byte **this wire** defines. `None` = a byte outside that set.
+    ///
+    /// This used to answer `InDat` for any unrecognised byte, on the stated
+    /// grounds that it could only come from a peer knowing a location this
+    /// build does not, and that the pre-existing layout was the safe reading of
+    /// "I don't know where the payload is". Both halves were wrong:
+    ///
+    /// - **That peer cannot exist**, though NOT by the one rule it is tempting
+    ///   to cite. `cluster_peer_compat_check` covers only the manager / PS / EN
+    ///   (exact `WIRE_VERSION`). An embedded CLIENT also sends this byte, on the
+    ///   default-on direct read straight to an extent node — and **the extent
+    ///   node has no hello and no admission gate at all**. What actually holds
+    ///   is the chain: a client above the cluster's ceiling is refused by the
+    ///   manager and the PS before it can obtain the redirect descriptor a
+    ///   direct read needs, and no wire version has ever defined a third
+    ///   location. So whoever ADDS one must check that chain, not this comment:
+    ///   with a window `[43,45]` and location `2` introduced at 45, a wire-45
+    ///   client is in-window against a wire-43 cluster, and the PS gate is the
+    ///   only thing between it and an EN that would now refuse its read.
+    /// - **`InDat` is not the absence of an answer, it is a positive claim**
+    ///   that `extent-{id}.dat` holds the payload. `ExtentEntry::holds_payload`
+    ///   exists so that serving `.dat` to a request for a shard file "returns
+    ///   shard bytes as a whole value, the exact corruption the location field
+    ///   exists to rule out" — and a lenient fold hands that corruption straight
+    ///   through the check meant to stop it.
+    ///
+    /// The byte is also PERSISTED in two places, and neither inherits its
+    /// meaning from here: the manager's `extentLayout/<id>` etcd value
+    /// (`crates/manager/src/extent_layout.rs`) and the extent node's `.meta`
+    /// sidecar, whose `EXTMETA\x02` magic defines what its byte 41 may hold.
+    /// Each parses its own carrier and converts explicitly.
+    pub fn from_wire_byte(b: u8) -> Option<Self> {
+        match b {
+            PAYLOAD_LOCATION_IN_DAT => Some(Self::InDat),
+            PAYLOAD_LOCATION_IN_SHARD_FILE => Some(Self::InShardFile),
+            _ => None,
+        }
+    }
+}
+
+impl Default for PayloadLocation {
+    fn default() -> Self {
+        Self::InDat
+    }
+}
+
+/// NAMES one payload file on one node: a location plus, when that location is
+/// `InShardFile`, which shard index.
+///
+/// Both halves are needed — a node can hold shard files at two different
+/// indices (two attempts, or a parity slot plus a data slot after a
+/// reassignment), so the location alone does not identify a file. They travel
+/// together as one value because every read path has to carry them through
+/// several layers, and a pair that must not be split is better modelled than
+/// remembered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PayloadRef {
+    pub location: PayloadLocation,
+    pub shard_index: u32,
+}
+
+impl PayloadRef {
+    /// The whole payload in `extent-{id}.dat` — a full replica, or a shard the
+    /// pre-CoW scheme renamed over `.dat`. The default, and what every extent
+    /// that predates the layout field means.
+    pub fn in_dat() -> Self {
+        Self {
+            location: PayloadLocation::InDat,
+            shard_index: 0,
+        }
+    }
+
+    pub fn shard(shard_index: u32) -> Self {
+        Self {
+            location: PayloadLocation::InShardFile,
+            shard_index,
+        }
+    }
+
+    /// Resolve against an extent's published layout: the extent says WHERE its
+    /// payload lives, the caller says WHICH shard it is reading.
+    ///
+    /// Takes the location already resolved, not the raw byte, so that a caller
+    /// holding an unreadable one has to say what it does about that before it
+    /// can name a file (`ExtentInfo::payload` is where the byte is read).
+    ///
+    /// The index is dropped for `InDat`, because there it names nothing: one
+    /// `.dat` is the payload whatever slot the caller happens to be reading
+    /// from. Normalising here — rather than at each comparison — keeps this
+    /// value a true file identity, so the server can group two requests iff
+    /// they name the same file. (Without it, replicated reads of one extent
+    /// from different slots would carry different indices and stop batching,
+    /// even though every one of them means `.dat`.)
+    pub fn for_extent(location: PayloadLocation, shard_index: u32) -> Self {
+        match location {
+            PayloadLocation::InDat => Self::in_dat(),
+            PayloadLocation::InShardFile => Self::shard(shard_index),
+        }
+    }
+}
+
+/// Convert a u8 code from binary wire format to autumn_rpc::StatusCode.
+pub fn code_to_status(code: u8) -> StatusCode {
+    match code {
+        CODE_OK => StatusCode::Ok,
+        CODE_NOT_FOUND => StatusCode::NotFound,
+        CODE_PRECONDITION => StatusCode::FailedPrecondition,
+        CODE_EVERSION_MISMATCH => StatusCode::FailedPrecondition,
+        CODE_PAYLOAD_NOT_HERE => StatusCode::FailedPrecondition,
+        _ => StatusCode::Internal,
+    }
+}
+
+/// Convert a u8 code from binary wire format to a descriptive string.
+pub fn code_description(code: u8) -> &'static str {
+    match code {
+        CODE_OK => "ok",
+        CODE_NOT_FOUND => "not found",
+        CODE_PRECONDITION => "precondition failed",
+        CODE_EVERSION_MISMATCH => "eversion mismatch (stale client cache)",
+        CODE_LOCKED_BY_OTHER => "fenced by a newer owner (stale owner_epoch)",
+        CODE_PAYLOAD_NOT_HERE => "payload not in the named file on this node",
+        CODE_CONTENT_CORRUPT => "content checksum failed",
+        // Callers MUST print the numeric code alongside this string. Rendering
+        // every unnamed code as one generic word collapses distinct refusals
+        // into the same useless message — a stale-fence rejection reading as
+        // "error" is what hid a permanently wedged EC conversion behind an
+        // ordinary-looking retry log.
+        _ => "unrecognised status code",
+    }
+}
+
+// ── rkyv control-plane message types ────────────────────────────────────────
+
+/// ExtentInfo — metadata about a single extent replica set.
+/// Mirrors autumn.proto ExtentInfo; used internally and in manager RPC.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct ExtentInfo {
+    pub extent_id: u64,
+    pub replicates: Vec<u64>,
+    pub parity: Vec<u64>,
+    pub eversion: u64,
+    pub refs: u64,
+    pub sealed_length: u64,
+    /// Mirror of `MgrExtentInfo.sealed`: the authoritative "is this extent
+    /// sealed (immutable)" flag. NOT `sealed_length > 0`, because an
+    /// authoritative empty seal is `sealed = true, sealed_length = 0` (e.g. a
+    /// CoW-shared empty tail frozen by split/merge). `ensure_tail_initialised`
+    /// allocs a fresh tail when this is set, so a child never appends to a
+    /// shared sealed tail. `sealed_length` stays the read-bound.
+    pub sealed: bool,
+    pub avali: u32,
+    pub replicate_disks: Vec<u64>,
+    pub parity_disks: Vec<u64>,
+    /// True iff this extent has actually been EC-converted (sealed +
+    /// RS-encoded by `apply_ec_conversion_done`). The read path uses
+    /// this — NOT `parity.is_empty()` — to decide between
+    /// `ec_subrange_read` and `read_replicated_with_failover`. The
+    /// manager pre-fills `parity` at allocation time on EC streams,
+    /// so an open / pre-conversion extent has `parity != []` but
+    /// still holds full replicated data on every K+M node.
+    pub ec_converted: bool,
+    /// Where each member node keeps this extent's payload. Read it through
+    /// [`ExtentInfo::payload`], never by comparing the byte. `0` = `InDat`,
+    /// which is both the default and what every extent predating this field
+    /// means — the manager stores it beside `extents/<id>` rather than inside
+    /// it, so old records decode unchanged and simply read as `InDat`.
+    ///
+    /// `ec_converted` says the extent's bytes ARE shards; this says which FILE
+    /// they live in. The pre-CoW scheme renamed the shard over `.dat`, so a
+    /// legacy converted extent is `ec_converted = true, InDat` and keeps
+    /// working with no backfill.
+    pub payload_location: u8,
+}
+
+impl ExtentInfo {
+    /// The published layout, resolved. `None` = the byte names a location this
+    /// build does not have, which is the one answer no caller may round down to
+    /// `.dat`: see `PayloadLocation::from_wire_byte`. Every caller that names a
+    /// payload file goes through here, so the refusal is stated once per read
+    /// path rather than per file reference.
+    pub fn payload(&self) -> Option<PayloadLocation> {
+        PayloadLocation::from_wire_byte(self.payload_location)
+    }
+}
+
+/// StreamInfo — stream ID and its ordered list of extent IDs.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct StreamInfo {
+    pub stream_id: u64,
+    pub extent_ids: Vec<u64>,
+    pub ec_data_shard: u32,
+    pub ec_parity_shard: u32,
+}
+
+/// AllocExtent request: pre-create an empty extent file on this node.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct AllocExtentReq {
+    pub extent_id: u64,
+}
+
+/// AllocExtent response.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct AllocExtentResp {
+    pub code: u8,
+    pub disk_id: u64,
+    pub message: String,
+}
+
+/// Disk space statistics for one disk.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct DiskStatus {
+    /// Raw filesystem capacity (statvfs `f_blocks * f_frsize`).
+    pub total: u64,
+    /// Raw filesystem free bytes (statvfs `f_bavail * f_frsize`).
+    pub free: u64,
+    pub online: bool,
+    /// Out of space (ENOSPC/EDQUOT): serves reads and existing extents but
+    /// takes no new ones, until free space is back above 5%. Never set
+    /// together with `!online` (a faulted disk is not reported full).
+    pub full: bool,
+    /// Cluster-df: sum of THIS disk's live extent file lengths
+    /// (`ExtentEntry.len`) — the REAL autumn physical footprint on this
+    /// disk: replicas count their full copy, EC shards count shard size,
+    /// open tails count live appended bytes. The manager sums these across
+    /// all disks/nodes into `physical_used` with no amplification formula.
+    pub extent_bytes: u64,
+}
+
+/// A recovery task descriptor.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct RecoveryTask {
+    pub extent_id: u64,
+    pub replace_id: u64,
+    pub node_id: u64,
+    pub start_time: i64,
+}
+
+/// A completed recovery task.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct RecoveryTaskDone {
+    pub task: RecoveryTask,
+    pub ready_disk_id: u64,
+    pub attempt: RecoveryAttempt,
+}
+
+/// Immutable source and target identity for one manager-owned recovery.
+/// The nonce is the creating marker's etcd revision, never a wall-clock time.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct RecoveryAttempt {
+    pub nonce: u64,
+    pub source_eversion: u64,
+    pub slot: u32,
+    pub sealed_length: u64,
+    pub ec_converted: bool,
+    pub payload_location: u8,
+    pub target_uuid: String,
+    pub target_disks: Vec<(u64, String)>,
+}
+
+/// One finished EC conversion, reported by the coordinator EN on its next `df`.
+/// Deliberately MINIMAL: the manager does NOT trust these fields as the layout
+/// to write — it applies the assignment PINNED in the etcd `ConvertToEc` marker
+/// and uses this only to (a) learn the conversion finished and (b) cross-check
+/// `new_eversion`. A mismatch is refused fail-loud rather than applied.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct EcConvertDone {
+    pub extent_id: u64,
+    pub new_eversion: u64,
+    /// Which ATTEMPT produced this report. Echoed back from
+    /// `ConvertToEcReq.attempt_nonce`; the manager refuses to apply a report
+    /// whose nonce is not the live marker's.
+    ///
+    /// `new_eversion` alone cannot separate attempts: it is `live + 1`, and an
+    /// abandoned attempt never bumps the extent's eversion, so a re-issued
+    /// attempt is handed the SAME value. A stale report from a previous
+    /// attempt's coordinator would then match the current marker and fire the
+    /// layout flip while the current attempt has staged nothing — after which
+    /// cleanup deletes the last full replicas. `0` = a legacy marker created
+    /// before nonces existed (accepted only against a marker that also has 0).
+    pub attempt_nonce: u64,
+}
+
+/// Df (disk-free + recovery heartbeat) request.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct DfReq {
+    pub tasks: Vec<RecoveryTask>,
+    pub disk_ids: Vec<u64>,
+}
+
+/// Df response: completed recovery tasks + per-disk stats.
+///
+/// The trailing three fields ECHO the EN's own live
+/// identity so the manager's `node_health_loop` (the single df caller) can
+/// self-heal stored-location drift and detect pod-IP reuse (a DIFFERENT process
+/// answering at a stored address → `node_uuid` mismatch → refuse to heal). All
+/// three are empty when the EN was not launched with `--advertise` (test /
+/// older deployments) → the manager skips the echo checks.
+/// How far one extent-scoped op this node is EXECUTING has got.
+///
+/// EC conversion and recovery both run in the background on the extent node
+/// and reported only their terminal outcome on `df` — so an operator watching
+/// a multi-hour conversion had a RUNNING row and nothing else. These are live
+/// samples riding the same `df` as those outcomes, mirroring what the PS
+/// already piggybacks on its load heartbeat for compact/gc.
+///
+/// Keyed by `extent_id`, not op_id: the node never learns the manager's op id,
+/// while both kinds are extent-scoped in the ledger, so the manager resolves
+/// it. Raw counts, not a percentage — the consumer derives the ratio, and the
+/// magnitude is what tells an operator whether to wait.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct ExtentOpProgress {
+    pub extent_id: u64,
+    /// `manager_rpc::OP_KIND_EC_CONVERT` or `OP_KIND_RECOVERY`.
+    pub kind: u8,
+    /// Bytes for recovery, shard bytes encoded for EC.
+    pub done: u64,
+    pub total: u64,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct DfResp {
+    pub done_tasks: Vec<RecoveryTaskDone>,
+    /// Completed EC conversions, drained on each `df` (same at-most-once
+    /// heartbeat channel as `done_tasks`). The coordinator EN ACKs
+    /// `MSG_CONVERT_TO_EC` immediately and encodes in the BACKGROUND, so this is
+    /// how the manager learns the 2PC actually finished — it then applies the
+    /// layout from the etcd marker's PINNED assignment. A lost report converges
+    /// via re-dispatch: the EN's idempotency guard re-reports (adopt).
+    pub ec_done: Vec<EcConvertDone>,
+    /// (disk_id, DiskStatus) pairs (HashMap not used for rkyv compat).
+    pub disk_status: Vec<(u64, DiskStatus)>,
+    /// The EN's stable identity (empty = not registered).
+    pub node_uuid: String,
+    /// The address the EN advertises (empty = not registered).
+    pub advertise_addr: String,
+    /// The shard ports this EN process actually binds.
+    pub shard_ports: Vec<u16>,
+    /// Live progress for the extent-scoped ops this node is running
+    /// (EC conversion, recovery). A sample, not a ledger: whatever is in
+    /// flight at df time, empty when nothing is.
+    pub op_progress: Vec<ExtentOpProgress>,
+    /// Scrub tasks this node finished since the last `df`, whatever they
+    /// found. Drained at-most-once like `done_tasks`; a lost report leaves the
+    /// op it belongs to unfinished, never wrong.
+    ///
+    /// A `SCRUB_OUTCOME_ROT` entry is also the finding the manager isolates
+    /// on. A node cannot isolate itself: clearing an `avali` bit is the
+    /// manager's write, and `MSG_REPORT_CORRUPT_REPLICA` is unusable here — it
+    /// CAS-validates a PARTITION owner epoch and its contract is that the
+    /// reporter confirmed some OTHER replica is clean, and an extent node has
+    /// neither. Reporting oneself needs no such fencing: a node saying "my own
+    /// copy is bad" can only ever cost itself.
+    pub scrub_done: Vec<ScrubDone>,
+    /// Ops that still have scrub tasks queued or running on this node. An op
+    /// listed here is alive however long its files wait behind others; an op
+    /// the manager dispatched here that is NOT listed (after a short grace)
+    /// has lost its files — the node restarted, or a report went missing.
+    pub scrub_queued: Vec<u64>,
+    /// Failures this node hit while EXECUTING a recovery, drained at-most-once
+    /// like `done_tasks` / `ec_done` / `scrub_done`. (`kind` is carried so the
+    /// channel generalises, but only the recovery retry loop reports today; EC
+    /// conversion still surfaces its reason in the next dispatch's response.)
+    ///
+    /// Without this a failure inside a rebuild reached only this node's own
+    /// log. The manager learned the reason from the NEXT dispatch's response —
+    /// and re-dispatch is on exponential backoff, so "failing" and "merely
+    /// slow" stayed indistinguishable on the control plane for as long as the
+    /// backoff ran. The progress sample says a rebuild stopped moving; this
+    /// says why, on the same 2 s heartbeat.
+    ///
+    /// A lost report costs nothing: the manager keeps its own dispatch-side
+    /// failures, and the next attempt reports again.
+    pub op_failures: Vec<ExtentOpFailure>,
+    /// Where this node serves `/metrics` (empty: not registered, or no
+    /// endpoint). The manager passes it on as `NodeStateEntry.metrics_addr`,
+    /// which `autumn-op info --file-sd` lists for Prometheus.
+    pub metrics_addr: String,
+}
+
+/// One failure a node hit running an extent-scoped op.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct ExtentOpFailure {
+    pub extent_id: u64,
+    /// `manager_rpc::OP_KIND_*` — which op was running, not which op failed to
+    /// be dispatched. Dispatch failures are the manager's own to record.
+    pub kind: u8,
+    /// `CODE_*`; `0` when the node could not classify it.
+    pub error_code: u8,
+    /// The node's own words, shown verbatim to the operator. This is the only
+    /// place a per-peer reason ("peer 83 answered short", "eversion mismatch")
+    /// can reach the control plane.
+    pub reason: String,
+}
+
+/// What one scrub task found (`ScrubDone.outcome`).
+/// The file matched the checksums recorded for it.
+pub const SCRUB_OUTCOME_CLEAN: u8 = 0;
+/// No checksums were recorded for it; this scrub recorded them.
+pub const SCRUB_OUTCOME_DESCRIBED: u8 = 1;
+/// It differs from its recorded checksums, or lost bytes they cover. The
+/// manager isolates the copy on this outcome.
+pub const SCRUB_OUTCOME_ROT: u8 = 2;
+/// Not looked at: not held here, not the requested length, or an op in
+/// flight is changing it. Says nothing about the content.
+pub const SCRUB_OUTCOME_SKIPPED: u8 = 3;
+/// Could not be read or its checksums could not be written.
+pub const SCRUB_OUTCOME_FAILED: u8 = 4;
+
+/// One sealed payload file to scrub. The MANAGER names the file and its length:
+/// it is what knows the extent is sealed, which file is its payload on this
+/// node, and how long that file must be, so the node never has to ask.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct ScrubTask {
+    pub extent_id: u64,
+    /// `PAYLOAD_LOCATION_*`: `.dat` or one shard file.
+    pub payload_location: u8,
+    pub shard_index: u32,
+    /// Bytes the file holds: the sealed length for `.dat`, a shard's length
+    /// for a shard file. Checksums are recorded for, and compared over,
+    /// exactly this many bytes.
+    pub length: u64,
+    /// The manager's eversion when it planned the task, echoed back on the
+    /// outcome so a finding about content that may since have been replaced
+    /// is checked again instead of believed.
+    pub eversion: u64,
+    /// The `autumn-op` op this task belongs to (`0` = none), echoed back.
+    pub op_id: u64,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct ScrubExtentsReq {
+    pub tasks: Vec<ScrubTask>,
+}
+
+/// One finished scrub task, drained at-most-once on `df`.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct ScrubDone {
+    pub extent_id: u64,
+    pub payload_location: u8,
+    pub shard_index: u32,
+    pub op_id: u64,
+    /// `ScrubTask.eversion`, echoed.
+    pub eversion: u64,
+    /// `SCRUB_OUTCOME_*`.
+    pub outcome: u8,
+    pub message: String,
+}
+
+/// RequireRecovery request: start a background recovery task.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct RequireRecoveryReq {
+    pub task: RecoveryTask,
+    pub attempt: RecoveryAttempt,
+}
+
+/// Generic code + message response for control-plane RPCs.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct CodeResp {
+    pub code: u8,
+    pub message: String,
+}
+
+/// ReAvali request: re-mark a sealed extent as available on this node.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct ReAvaliReq {
+    pub extent_id: u64,
+    pub eversion: u64,
+}
+
+/// DeleteExtent request: unlink the physical extent file (`.dat` + `.meta`).
+///
+/// Sent by the manager after an extent's refcount drops to 0
+/// (`punch_holes` / `truncate` paths). Idempotent: a missing extent on the
+/// receiving node returns `CODE_OK`, so manager retries are safe.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct DeleteExtentReq {
+    pub extent_id: u64,
+    /// WHICH node this delete is for. The one RPC that destroys data used to
+    /// name only an extent id and execute for whoever answered at that
+    /// address — less identity checking than the read-only `df`, which already
+    /// echoes a uuid to catch imposters.
+    ///
+    /// Within one cluster an id is never reused, so a late delete is at worst
+    /// an idempotent no-op. ACROSS clusters ids restart from small integers: if
+    /// cluster A is torn down while its manager still holds persisted delete
+    /// retries, and cluster B comes up on the same host and ports (shared-host
+    /// port bases, IP reuse), A's retry unlinks B's LIVE extent with the
+    /// matching id. The target echoes its own identity here to refuse that.
+    ///
+    /// Empty = unspecified (a legacy persisted retry entry, or a test caller):
+    /// the receiver skips the check, matching `classify_df_echo`.
+    pub node_uuid: String,
+}
+
+/// ConvertToEc request: EC-encode a sealed extent and distribute shards.
+///
+/// `eversion` is the post-EC eversion the manager has decided on (one
+/// greater than the pre-EC value). The coordinator and every target
+/// node must adopt this value locally as part of installing their
+/// shard, so that subsequent `MSG_READ` requests carrying a
+/// stale (pre-EC) eversion are rejected with `CODE_EVERSION_MISMATCH`.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct ConvertToEcReq {
+    pub extent_id: u64,
+    pub data_shards: u32,
+    pub parity_shards: u32,
+    /// k+m target node addresses (data shard nodes first, then parity).
+    pub target_addrs: Vec<String>,
+    pub eversion: u64,
+    /// Owner-lock owner_epoch propagated from manager.
+    /// The coordinator puts this into every `WriteShardReq.owner_epoch`, so a
+    /// FENCED ex-coordinator whose conversion is still streaming stripes runs
+    /// into the bumped revision on the remote ENs and is rejected with
+    /// `CODE_LOCKED_BY_OTHER`. `0` = legacy no-fence.
+    pub owner_epoch: i64,
+    /// Identity of THIS conversion attempt — the etcd revision that created
+    /// the manager's marker, so it is unique per attempt and monotonic across
+    /// them. The coordinator forwards it into every `WriteShardReq` and echoes
+    /// it in `EcConvertDone`; see `EcConvertDone::attempt_nonce` for what it
+    /// defends against. `0` = legacy / memory-only.
+    pub attempt_nonce: u64,
+}
+
+/// `MSG_CONVERT_TO_EC`'s answer. A non-OK `code` is a refusal of the request
+/// (or `CODE_CONTENT_CORRUPT`: the coordinator's own copy rotted); with
+/// `CODE_OK`, `state` says what the request found.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct ConvertToEcResp {
+    pub code: u8,
+    pub message: String,
+    /// `EC_ATTEMPT_*`.
+    pub state: u8,
+    /// `EC_ATTEMPT_FAILED`: which target failed, as an index into the
+    /// request's `target_addrs` (0 = the coordinator itself); `None` when the
+    /// failure names no target.
+    pub failed_target: Option<u32>,
+}
+
+/// The attempt was not running; this request started it.
+pub const EC_ATTEMPT_STARTED: u8 = 0;
+/// This attempt is already running here.
+pub const EC_ATTEMPT_RUNNING: u8 = 1;
+/// This attempt ran here and failed; it is not started again. The manager
+/// cancels the marker, and the next proposal derives a new attempt.
+pub const EC_ATTEMPT_FAILED: u8 = 2;
+
+// ── WriteShard ───────────────────────────────────────────────────────────────
+
+/// A `WRITE_SHARD` request's ctrl: where the stripe goes, the coordinator's
+/// fences, and the crc32c of the stripe, which is the frame's value and covered
+/// by no frame CRC.
+///
+/// `eversion` is the post-EC eversion the manager has decided on; the
+/// receiving node adopts it when it installs the shard, so a read with the
+/// pre-EC eversion is refused `CODE_EVERSION_MISMATCH`. `owner_epoch > 0` is
+/// fenced like an append (`CODE_LOCKED_BY_OTHER` below the extent's floor);
+/// 0 asks for no fence. `shard_offset` is where in the staging `.shard{i}` the
+/// stripe goes: a shard streams as stripes so no frame exceeds its
+/// `payload_len: u32`. `attempt_nonce` names the conversion attempt (an etcd
+/// revision, so monotonic): a receiver refuses a stripe from an attempt older
+/// than the one it is staging.
+#[derive(Archive, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WriteShardHeader {
+    pub extent_id: u64,
+    pub shard_index: u32,
+    pub sealed_length: u64,
+    /// The whole shard's length: the stripe that ends there is the last, and
+    /// the holder then describes the shard (`.shard{i}.ck`).
+    pub shard_len: u64,
+    pub eversion: u64,
+    pub owner_epoch: i64,
+    pub shard_offset: u64,
+    pub attempt_nonce: u64,
+    pub payload_crc: u32,
+}
+
+/// One EC stripe to stage: the header's fields and the stripe bytes.
+pub struct WriteShardReq {
+    pub extent_id: u64,
+    pub shard_index: u32,
+    pub sealed_length: u64,
+    pub shard_len: u64,
+    pub eversion: u64,
+    pub owner_epoch: i64,
+    pub shard_offset: u64,
+    pub attempt_nonce: u64,
+    pub payload: Bytes,
+}
+
+impl WriteShardReq {
+    /// The request as it is sent: ctrl = `WriteShardHeader` with the stripe's
+    /// crc, the stripe the frame's value.
+    pub fn prepared(&self) -> crate::frame::PreparedPayload {
+        let head = WriteShardHeader {
+            extent_id: self.extent_id,
+            shard_index: self.shard_index,
+            sealed_length: self.sealed_length,
+            shard_len: self.shard_len,
+            eversion: self.eversion,
+            owner_epoch: self.owner_epoch,
+            shard_offset: self.shard_offset,
+            attempt_nonce: self.attempt_nonce,
+            payload_crc: 0,
+        };
+        crate::frame::PreparedPayload::new(
+            move |payload_crc| rkyv_encode(&WriteShardHeader { payload_crc, ..head }),
+            vec![self.payload.clone()],
+        )
+    }
+
+    /// `ctrl` is a `WriteShardHeader`; the stripe came as the frame's value
+    /// (in parts when it was too large for one pool buffer, joined here) and is
+    /// checked against the header's crc.
+    pub fn decode_checked(ctrl: &[u8], payload: AppendPayload) -> Result<Self, &'static str> {
+        let h: WriteShardHeader = rkyv_decode(ctrl).map_err(|_| "write_shard request: undecodable header")?;
+        if payload.parts().iter().fold(0, |c, p| crc32c::crc32c_append(c, p)) != h.payload_crc {
+            return Err("write_shard stripe crc mismatch");
+        }
+        Ok(Self {
+            extent_id: h.extent_id,
+            shard_index: h.shard_index,
+            sealed_length: h.sealed_length,
+            shard_len: h.shard_len,
+            eversion: h.eversion,
+            owner_epoch: h.owner_epoch,
+            shard_offset: h.shard_offset,
+            attempt_nonce: h.attempt_nonce,
+            payload: payload.to_bytes(),
+        })
+    }
+}
+
+/// WriteShardResponse: [code: u8]
+pub struct WriteShardResp {
+    pub code: u8,
+}
+
+impl WriteShardResp {
+    pub fn encode(&self) -> Bytes {
+        Bytes::copy_from_slice(&[self.code])
+    }
+
+    pub fn decode(data: Bytes) -> Result<Self, &'static str> {
+        if data.is_empty() {
+            return Err("write_shard response too short");
+        }
+        Ok(Self { code: data[0] })
+    }
+}
+
+
+/// ONE type per extent-service message, checked by the compiler.
+///
+/// `manager_rpc` names these too, because the manager is a client of this
+/// service — but as re-exports of the definitions here, not as its own copies.
+/// It used to define its own (`ExtDfReq`, `ExtDeleteExtentReq`, …), and since
+/// the manager encoded with those while the node decoded with these, a field
+/// added to one side only was a silent rkyv mis-decode. No fingerprint could
+/// catch it either: both files hash into the same one.
+///
+/// Each identity function below compiles only while the two paths name the
+/// SAME type, so reintroducing a mirror struct is a build error rather than a
+/// runtime corruption. `CodeResp` is absent on purpose — `manager_rpc` has its
+/// own, for the manager service's own RPCs.
+const _: () = {
+    macro_rules! one_definition_only {
+        ($($t:ident),+ $(,)?) => { $(
+            #[allow(dead_code, non_snake_case)]
+            fn $t(x: crate::manager_rpc::$t) -> $t { x }
+        )+ };
+    }
+    one_definition_only!(
+        AllocExtentReq,
+        AllocExtentResp,
+        ConvertToEcReq,
+        DeleteExtentReq,
+        DfReq,
+        DfResp,
+        ReAvaliReq,
+        RecoveryTask,
+        RecoveryTaskDone,
+        RequireRecoveryReq,
+    );
+};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The frame-value append carries its payload's crc32c; a payload that
+    /// does not match it is refused, not appended.
+    #[test]
+    fn a_frame_value_append_is_checked_against_its_crc() {
+        let payload = Bytes::from(vec![0xabu8; 100_000]);
+        let ctrl = |payload_crc: u32| {
+            rkyv_encode(&AppendHeader { extent_id: 7, eversion: 2, commit: 4096, owner_epoch: 9, payload_crc })
+        };
+        let good = crc32c::crc32c(&payload);
+        let req = AppendReq::decode_checked(ctrl(good), payload.clone().into()).expect("decode");
+        assert_eq!((req.extent_id, req.eversion, req.commit, req.owner_epoch), (7, 2, 4096, 9));
+        assert_eq!(req.payload.to_bytes(), payload);
+        let mut flipped = payload.to_vec();
+        flipped[50_000] ^= 1;
+        assert_eq!(
+            AppendReq::decode_checked(ctrl(good), Bytes::from(flipped.clone()).into()).err(),
+            Some("append payload crc mismatch")
+        );
+        // In parts (a value too large for one pool buffer): the crc runs on
+        // across them, and a flip in a later part is caught.
+        let parts = |b: &[u8]| AppendPayload::Parts(b.chunks(30_000).map(Bytes::copy_from_slice).collect());
+        let req = AppendReq::decode_checked(ctrl(good), parts(&payload)).expect("decode parts");
+        assert_eq!(req.payload.parts().len(), payload.len().div_ceil(30_000));
+        assert_eq!(req.payload.to_bytes(), payload);
+        assert_eq!(AppendReq::decode_checked(ctrl(good), parts(&flipped)).err(), Some("append payload crc mismatch"));
+        let short = ctrl(good).slice(..8);
+        assert!(AppendReq::decode_checked(short, payload.into()).is_err(), "a truncated header");
+    }
+
+    #[test]
+    fn fence_extent_req_round_trip() {
+        let req = FenceExtentReq {
+            extent_id: 0x0102_0304_0506_0708,
+            owner_epoch: 14396,
+        };
+        let decoded = FenceExtentReq::decode(req.encode()).expect("decode");
+        assert_eq!(decoded.extent_id, req.extent_id);
+        assert_eq!(decoded.owner_epoch, req.owner_epoch);
+    }
+
+    #[test]
+    fn fence_extent_resp_round_trip() {
+        // OK: empty message.
+        let ok = FenceExtentResp {
+            code: CODE_OK,
+            message: String::new(),
+        };
+        let d = FenceExtentResp::decode(ok.encode()).expect("decode ok");
+        assert_eq!(d.code, CODE_OK);
+        assert!(d.message.is_empty());
+
+        // Non-OK carries a readable message.
+        let locked = FenceExtentResp {
+            code: CODE_LOCKED_BY_OTHER,
+            message: "higher owner holds extent 7".to_string(),
+        };
+        let d = FenceExtentResp::decode(locked.encode()).expect("decode locked");
+        assert_eq!(d.code, CODE_LOCKED_BY_OTHER);
+        assert_eq!(d.message, "higher owner holds extent 7");
+
+        // Truncated (empty) response is a decode error, not a panic.
+        assert!(FenceExtentResp::decode(Bytes::new()).is_err());
+    }
+
+    #[test]
+    fn an_ok_read_reply_ctrl_has_the_budgeted_length() {
+        assert_eq!(ReadResp::ctrl(CODE_OK, u64::MAX, "", vec![]).len(), READ_RESP_OK_CTRL_BYTES);
+        assert_eq!(ReadResp::ctrl(CODE_OK, 0, "", vec![]).len(), READ_RESP_OK_CTRL_BYTES);
+        // The crcs of a range as long as a frame can carry, at the worst offset.
+        let n = crate::frame::MAX_PAYLOAD_LEN as usize / READ_CRC_BLOCK_BYTES as usize + 2;
+        assert!(ReadResp::ctrl(CODE_OK, u64::MAX, "", vec![u32::MAX; n]).len() <= READ_RESP_MAX_OK_CTRL_BYTES);
+    }
+
+    /// Pieces are cut at file offsets that are multiples of the block size,
+    /// whatever the read's own offset; a flipped byte fails its piece.
+    #[test]
+    fn block_crcs_follow_the_file_offset_and_catch_a_flip() {
+        let b = READ_CRC_BLOCK_BYTES as usize;
+        let data: Vec<u8> = (0..b * 3).map(|i| (i % 251) as u8).collect();
+        // At offset b - 10: a 10-byte piece, two whole blocks, the rest.
+        let off = READ_CRC_BLOCK_BYTES - 10;
+        let crcs = read_block_crcs(off, &data);
+        assert_eq!(crcs.len(), 4);
+        assert_eq!(crcs[0], crc32c::crc32c(&data[..10]));
+        assert_eq!(crcs[1], crc32c::crc32c(&data[10..10 + b]));
+        assert_eq!(read_block_crcs(0, &data).len(), 3);
+        assert!(read_block_crcs(5, &[]).is_empty());
+        check_read_block_crcs(off, &data, &crcs).unwrap();
+        let mut bad = data.clone();
+        bad[b + 20] ^= 1;
+        assert!(check_read_block_crcs(off, &bad, &crcs).unwrap_err().contains("piece 2"));
+        assert!(check_read_block_crcs(off, &data[..b], &crcs).is_err(), "a short read");
+    }
+
+    /// rkyv_decode rejects malformed input via bytecheck instead of UB.
+    /// Previously this used `from_bytes_unchecked` and a corrupted payload
+    /// (flipped bits past TCP CRC, mixed-version cluster, etc.) caused
+    /// out-of-bounds reads or pointer dereferences into arbitrary memory.
+    /// Now the checked decoder runs validation first and returns Err.
+    #[test]
+    fn rkyv_decode_rejects_malformed() {
+        // Encode a valid CodeResp, then mangle each byte and confirm the
+        // decode path returns Err rather than panicking or reading garbage.
+        let valid = rkyv_encode(&CodeResp {
+            code: CODE_OK,
+            message: "hello".to_string(),
+        });
+
+        // Truncated payload — should fail validation, not UB.
+        let truncated = &valid[..valid.len() / 2];
+        let r: Result<CodeResp, _> = rkyv_decode(truncated);
+        assert!(
+            r.is_err(),
+            "truncated input must Err (got {:?})",
+            r.map(|v| v.code)
+        );
+
+        // Single-byte XOR corruption near the end of the payload — most
+        // likely to land in archive headers / pointer offsets and trigger
+        // the bytecheck validator. We don't assert ALL corruptions fail
+        // (some may land in the inline string body and decode to garbage
+        // text — still safe, just not-Err); we assert at least one of a
+        // sweep does, which proves the validator is running.
+        let mut any_err = false;
+        for offset in 0..valid.len() {
+            let mut corrupted = valid.to_vec();
+            corrupted[offset] ^= 0xff;
+            let r: Result<CodeResp, _> = rkyv_decode(&corrupted);
+            if r.is_err() {
+                any_err = true;
+                break;
+            }
+        }
+        assert!(
+            any_err,
+            "no XOR-corrupted byte triggered Err — bytecheck is probably not running"
+        );
+
+        // Empty payload — should fail (alignment / size validation).
+        let r: Result<CodeResp, _> = rkyv_decode(&[]);
+        assert!(r.is_err(), "empty input must Err");
+    }
+}
+
+#[cfg(test)]
+mod extent_rpc_codec_tests {
+    use super::*;
+
+    #[test]
+    fn append_req_round_trips_through_its_prepared_form() {
+        let req = AppendReq {
+            extent_id: u64::MAX,
+            eversion: 3,
+            commit: 5 * 1024 * 1024 * 1024, // past 4 GiB: the u64 widening
+            owner_epoch: -1,
+            payload: Bytes::from_static(b"durable bytes").into(),
+        };
+        let (ctrl, body) = req.prepared().ctrl_and_body();
+        let ctrl = Bytes::from(ctrl.concat());
+        let body: Vec<Bytes> = body.into_iter().map(|b| b.into_bytes()).collect();
+        let got = AppendReq::decode_checked(ctrl, AppendPayload::Parts(body)).unwrap();
+        assert_eq!(got.extent_id, u64::MAX);
+        assert_eq!(got.eversion, 3);
+        assert_eq!(got.commit, 5 * 1024 * 1024 * 1024);
+        assert_eq!(got.owner_epoch, -1);
+        assert_eq!(&got.payload.to_bytes()[..], b"durable bytes");
+    }
+
+    /// `InDat` names ONE file whatever slot the caller read from, so the shard
+    /// index must not survive into the identity — otherwise replicated reads of
+    /// one extent from different slots would look like different files and the
+    /// server would stop batching them.
+    #[test]
+    fn in_dat_has_one_identity_regardless_of_slot() {
+        assert_eq!(
+            PayloadRef::for_extent(PayloadLocation::InDat, 3),
+            PayloadRef::for_extent(PayloadLocation::InDat, 0)
+        );
+        assert_ne!(
+            PayloadRef::for_extent(PayloadLocation::InShardFile, 3),
+            PayloadRef::for_extent(PayloadLocation::InShardFile, 0),
+            "two shard files on one node are different files"
+        );
+    }
+
+    /// The byte set is closed, and the two members are pinned BY NAME — a
+    /// consistent renumbering (swapping the two constants along with every
+    /// match arm) is invisible to a round-trip assertion, and these two numbers
+    /// are on the wire and in two persisted carriers.
+    #[test]
+    fn the_wire_location_byte_set_is_closed_and_numbered() {
+        assert_eq!(PAYLOAD_LOCATION_IN_DAT, 0);
+        assert_eq!(PAYLOAD_LOCATION_IN_SHARD_FILE, 1);
+        assert_eq!(
+            PayloadLocation::from_wire_byte(0),
+            Some(PayloadLocation::InDat)
+        );
+        assert_eq!(
+            PayloadLocation::from_wire_byte(1),
+            Some(PayloadLocation::InShardFile)
+        );
+        for b in 2u8..=255 {
+            assert_eq!(
+                PayloadLocation::from_wire_byte(b),
+                None,
+                "byte {b} names no location this build has, and must not fold to .dat"
+            );
+        }
+    }
+
+    /// A read naming a location byte this build cannot name names no file:
+    /// `payload_ref` is `None`, and the extent node refuses the request.
+    #[test]
+    fn a_read_naming_an_unknown_location_names_no_file() {
+        let mut req = ReadReq::new(7, 1, 0, 200, READ_EXACT, PayloadRef::in_dat());
+        req.payload_location = 200;
+        assert_eq!(req.payload_ref(), None);
+    }
+}

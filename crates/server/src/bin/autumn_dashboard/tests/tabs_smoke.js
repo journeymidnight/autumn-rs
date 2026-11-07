@@ -1,0 +1,246 @@
+// Tab smoke test: drive the REAL page script, under a minimal DOM stub, through
+// EVERY tab and both lazy drawers, and assert each pane rendered the thing it
+// exists to show.
+//
+// render_check.js lifts individual functions and checks their strings; this one
+// runs the page's own init and tab switching, so it catches the failure that
+// one cannot — a pane that throws, or reaches for an element the markup does
+// not declare (the stub refuses any id absent from the HTML, which is how a
+// renamed container is caught instead of silently painting nothing).
+//
+// The fixtures below are a REAL /api/* capture from
+// `bash crates/server/src/bin/autumn_dashboard/tests/api_contract.sh`, edited only to add the
+// unhappy states a healthy scratch cluster never produces: a faulted disk, a
+// silent partition server, an overlapping partition, an advisory.
+//
+//   node crates/server/src/bin/autumn_dashboard/tests/tabs_smoke.js
+const fs = require("fs"), path = require("path");
+const html = fs.readFileSync(path.join(__dirname, "..", "static", "index.html"), "utf8");
+const script = html.match(/<script>([\s\S]*)<\/script>/)[1];
+
+const ids = new Set([...html.matchAll(/\sid="([^"]+)"/g)].map(m => m[1]));
+const nodes = {};
+const mk = id => (nodes[id] = {
+  id, innerHTML: "", textContent: "", value: (id === "interval" ? "5000" : ""),
+  hidden: false, checked: false, scrollTop: 0, clientHeight: 600,
+  style: {}, className: "", classList: { add() {}, remove() {}, contains() { return false; } },
+  appendChild() {},
+});
+const document = {
+  querySelector(sel) {
+    if (!sel.startsWith("#")) throw new Error("stub only supports #id, got " + sel);
+    const id = sel.slice(1);
+    if (!ids.has(id)) throw new Error(`page queried #${id}, which the markup does not declare`);
+    return nodes[id] || mk(id);
+  },
+  createElement: () => ({ className: "", textContent: "", remove() {} }),
+};
+
+const disk = (id, extra) => Object.assign({
+  disk_id: id, uuid: `uuid-${id}`, total: 3779300532224, free: 345875152896,
+  extent_bytes: 12345678, reported: true, online: true, faulted: false,
+}, extra || {});
+// A synthetic kvc-shaped key used as a split point: long, with a shared prefix
+// and a hash tail, so neighbouring endpoints differ near both ends.
+const LONG_KEY = "kvc/model-a-chat-1/kv/mdla-P128-h512-i128-r0,0" + ",4,128".repeat(22) +
+  ",4-f880640-w17842176/9b1e7a4c03d5f62817e40b9a5c6d1f3e28a7b0c4d9e5f61a2b3c8d7e6f0c5d2e";
+const OVERVIEW = {
+  ts: Math.floor(Date.now() / 1000),
+  part_count: 2, ps_count: 2,
+  total_req_per_sec: 12, total_write_bytes_per_sec: 1048576, total_read_bytes_per_sec: 2097152,
+  errors: [],
+  df: {
+    raw_total: 7558601064448, raw_used: 6866850758656, raw_free: 691750305792,
+    physical_used: 4096, logical_size: 3433425379328, logical_footprint: 3433425379328,
+    logical_wal_debt: 512,
+    amplification: 2.0, node_count_online: 1,
+    per_node: [{ node_id: 1, total: 7558601064448, free: 691750305792, extent_bytes: 4096, online: true, disks: [disk(2), disk(3)] }],
+  },
+  nodes: [
+    { node_id: 1, address: "127.0.0.1:21101", extent_count: 3, total: 7558601064448,
+      free: 691750305792, extent_bytes: 4096, online: true, auto_state: "Online",
+      last_heartbeat_secs_ago: 1, suspected_age_secs: 0, override_kind: "-",
+      override_reason: "", override_set_by: "", node_uuid: "node-uuid", shard_ports: [21101],
+      // one healthy, one the node calls faulted, one the registry has but the
+      // node did not describe, one out of space — the states the tab must
+      // tell apart.
+      disks: [disk(2), disk(3, { faulted: true, online: false }),
+              disk(4, { reported: false, online: false, total: 0, free: 0, extent_bytes: 0 }),
+              disk(5, { full: true })] },
+    // registered but NOT answering df: no per-disk rows at all, and the page
+    // must call its disk state unknown rather than blame a data directory.
+    { node_id: 2, address: "127.0.0.1:21102", extent_count: 0, online: false,
+      auto_state: "Suspected", last_heartbeat_secs_ago: null, suspected_age_secs: 40,
+      override_kind: "-", override_reason: "", override_set_by: "", disks: [] },
+  ],
+  partitions: [
+    { part_id: 1, ps_id: 1, ps_addr: "127.0.0.1:21201", range_start: "", range_end: LONG_KEY,
+      live_size: 1048576, total_extents: 3, req_per_sec: 12,
+      write_bytes_per_sec: 1048576, read_bytes_per_sec: 2097152 },
+    { part_id: 2, ps_id: 1, ps_addr: "127.0.0.1:21202", range_start: LONG_KEY, range_end: "",
+      live_size: 0, total_extents: 3, req_per_sec: 0,
+      write_bytes_per_sec: 0, read_bytes_per_sec: 0 },
+  ],
+  ps_roll: [{ ps_id: 1, addr: "127.0.0.1:21201", n: 2, size: 1048576 }],
+  ps_servers: [
+    { ps_id: 1, addr: "127.0.0.1:21201", last_heartbeat_secs_ago: 1, partition_count: 2,
+      open_count: 2, ready: true, n: 2, size: 1048576, req_per_sec: 12, write_bytes_per_sec: 1048576,
+      read_bytes_per_sec: 2097152, total_extents: 6 },
+    // registered, serving nothing, and silent — the state the partition list
+    // cannot express and the reason ps_servers is on the wire at all.
+    { ps_id: 2, addr: "127.0.0.1:21203", last_heartbeat_secs_ago: null, partition_count: 0,
+      open_count: null, ready: false, n: 0, size: 0, req_per_sec: 0, write_bytes_per_sec: 0, read_bytes_per_sec: 0, total_extents: 0 },
+  ],
+  advisories: [
+    { kind: "major", primary_part_id: 1, secondary_part_id: 0,
+      reason: "major compaction before split: partition still carries CoW-shared out-of-range keys (has_overlap), and split is REFUSED until a major compaction rewrites them",
+      desc: "major  part 1             major compaction before split: partition still carries CoW-shared out-of-range keys (has_overlap), and split is REFUSED until a major compaction rewrites them",
+      action: { action: "compact", part_id: 1 }, key: "major:1" },
+    { kind: "hotcold", primary_part_id: 32, secondary_part_id: 21,
+      reason: "ps_id=3 size_ratio=45 hot=[32] cold=[21]",
+      desc: "hotcold part 32 ps_id=3 size_ratio=45 hot=[32] cold=[21]",
+      action: null, key: "hotcold:32" },
+  ],
+};
+const PART = {
+  part_id: 1, req_per_sec: 12, p99_us: 900, write_bytes_per_sec: 1048576,
+  read_bytes_per_sec: 2097152, size_bytes: 1048576, gc_debt_bytes: 0,
+  pending_compaction_bytes: 2147483648, gc_inflight: 0, compact_inflight: 0,
+  has_overlap: 1, sst_out_of_range_bytes: 4096,
+  extents: [{ extent_id: 9, role: "log", size: 1024, refs: 1, eversion: 1, open: true, ec: false, replicas: [1] }],
+};
+const OPS = {
+  live: [{ op_id: 1, kind: "gc", state: "running", part_id: 1, secondary_id: 0,
+           progress_done: 5, progress_total: 8, started_at: Math.floor(Date.now() / 1000) - 3,
+           submitted_at: 0, finished_at: 0, message: "", requested_by: "auto-policy" }],
+  history: [{ op_id: 2, kind: "compact", state: "failed", part_id: 1, secondary_id: 0,
+              progress_done: 0, progress_total: 0, started_at: 0, submitted_at: 0,
+              finished_at: Math.floor(Date.now() / 1000) - 9, message: "", error: "no address for part 1" }],
+  history_error: null,
+};
+const POLICIES = {
+  enabled: true, mode: "armed", active: "gc-only", allow_mutations: true,
+  policies: [{ name: "gc-only", desc: "Reclaim space only (GC)", builtin: true,
+               interval: 30, cooldown: 120, max_actions: 2,
+               switches: { split: false, ec: false, compact: false, gc: true, merge: false, rebalance: false } }],
+  switch_order: ["split", "ec", "compact", "gc", "merge", "rebalance", "repair", "scrub"],
+};
+// /api/metrics: three rounds; PS 2 cannot be scraped.
+const T0 = Date.now() - 20000;
+const METRICS_SERIES = {
+  requests: [10, 12, 11], write_bytes: [1048576, 2097152, 1048576], read_bytes: [0, 4096, 8192],
+  sst_tables: [6, 7, 5], partition_sst_tables_max: [4, 4, 3],
+  "minor_compactions{trigger=flush}": [null, 0.1, 0],
+  get_duration_seconds_sum: [0.001, 0.002, 0.003], get_duration_seconds_count: [10, 10, 10],
+  "get_duration_seconds_bucket{le=0.0005}": [5, 5, 5], "get_duration_seconds_bucket{le=0.001}": [10, 10, 10],
+};
+const METRICS = {
+  interval_secs: 10, retention_secs: 3600, t: [T0, T0 + 10000, T0 + 20000],
+  series: Object.assign({ block_cache_hits: [null, 2, 3], block_cache_misses: [null, 2, 1] }, METRICS_SERIES),
+  ps: [{ ps_id: 1, metrics_addr: "127.0.0.1:9701", last_ok_ms: T0 + 20000, error: null },
+       { ps_id: 2, metrics_addr: "127.0.0.1:9802", last_ok_ms: null, error: "connection refused" }],
+};
+const payload = { "/api/overview": OVERVIEW, "/api/ops": OPS, "/api/policies": POLICIES, "/api/metrics": METRICS };
+const fetchStub = async p => ({ ok: true, json: async () =>
+  p.startsWith("/api/metrics?scope=ps") ? METRICS : payload[p] ?? PART });
+
+const api = new Function(
+  "document", "location", "window", "fetch", "setInterval", "clearInterval", "setTimeout", "confirm",
+  script + "\nreturn {setTab, openDetail, openNode, openPs};")
+  (document, { hash: "#overview" }, {}, fetchStub, () => 0, () => {}, f => f(), () => false);
+
+const settle = () => new Promise(r => setTimeout(r, 30));
+(async () => {
+  await settle();
+  for (const t of ["overview", "partitions", "servers", "nodes", "policy", "logs", "metrics"]) {
+    api.setTab(t);
+    await settle();
+  }
+  const clusterCharts = nodes.m_charts.innerHTML;
+  const clusterHot = nodes.m_hot.innerHTML;
+  const scopes = nodes.m_scope.innerHTML;
+  nodes.m_scope.onchange({ target: { value: "ps:2" } });
+  await settle();
+  const ps2Hot = nodes.m_hot.innerHTML;
+  await api.openDetail(1);
+  api.openNode(2);
+  const deadNodeDrawer = nodes.nodedrawer.innerHTML;
+  api.openNode(1);
+  api.openPs(2);
+  await settle();
+
+  let bad = 0;
+  const want = (sel, needle, why) => {
+    const got = (nodes[sel.slice(1)] || {}).innerHTML || "";
+    if (!got.includes(needle)) { console.error(`FAIL ${sel}: ${why} — missing ${JSON.stringify(needle)}`); bad++; }
+  };
+  want("#tabbar", "Overview", "the tab bar names every tab");
+  want("#tabbar", "Nodes", "…including Nodes");
+  want("#tabbar", "Logs", "…and Logs");
+  // Nodes: the per-disk state, and the fault called out in words.
+  want("#nodes", "node 1", "the Nodes tab lists the node");
+  want("#nodedrawer", "Disks", "the node drawer has a disk table");
+  want("#nodedrawer", "faulted", "…and names the faulted disk as faulted");
+  want("#nodedrawer", "not reported", "…and separates a disk the node never described");
+  want("#nodedrawer", ">full</span>", "…and marks a disk out of space as full");
+  want("#nodedrawer", "NOT described on its last df", "…with what that actually means");
+  want("#nodedrawer", "uuid-2", "…and shows each disk's identity");
+  // An unreachable node is ONE fact, not N missing disks.
+  if (!deadNodeDrawer.includes("did not answer its last")) {
+    console.error("FAIL #nodedrawer(node 2): an unreachable node must say its disk state is unknown"); bad++;
+  }
+  if (deadNodeDrawer.includes("NOT described on its last df")) {
+    console.error("FAIL #nodedrawer(node 2): an unreachable node was blamed on a dropped data directory"); bad++;
+  }
+  // Servers: the registered-but-silent PS, which no partition row could show.
+  want("#ps_full", "PS 2", "a PS serving nothing is still listed");
+  want("#psdrawer", "Serving no partition", "…and says so");
+  want("#psdrawer", "No heartbeat is on record", "…and calls a missing entry unknown, not dead");
+  // Overview: the health roll-up an operator reads first.
+  want("#ov_fleet", "disk", "the fleet panel counts disks");
+  want("#ov_fleet", "faulted", "…and surfaces the faulted one");
+  want("#ov_space", "raw used", "the space panel reports capacity");
+  want("#ov_space", "raw amplification", "the ratio names its raw-capacity numerator");
+  want("#ov_space", "logical extent size", "the denominator is named explicitly");
+  // Partitions: the precondition warning, before the Split button is clicked.
+  want("#drawer", "Split is refused until a major compaction", "an overlapping partition warns BEFORE the click");
+  want("#drawer", "Extents", "…and still shows the extents");
+  // Partition rows: each endpoint is one line, cut in the middle, so the shared
+  // prefix's start and the differing tail both show.
+  const ends = [...(nodes.spacer.innerHTML || "").matchAll(/class="range-value">([^<]*)</g)].map(m => m[1]);
+  const longEnd = ends.find(e => e.includes("…"));
+  if (ends.length !== 4 || !longEnd || !longEnd.startsWith("kvc/model-a") || !longEnd.endsWith("0c5d2e")
+      || longEnd.length >= LONG_KEY.length / 4) {
+    console.error(`FAIL #spacer: a long range endpoint must be one middle-cut line, got ${JSON.stringify(ends)}`); bad++;
+  }
+  want("#spacer", `title="[${LONG_KEY}`, "…and the row title keeps the full range");
+  // Policy + Logs.
+  want("#advisories", "major compaction before split", "the advisory keeps its whole reason");
+  want("#advisories", "PS 3 partition size imbalance", "hot/cold is rendered in operator language");
+  want("#advisories", "Information only", "hot/cold says it cannot execute an operation");
+  want("#ctlstate", "Running", "the Policy tab says the policy runs");
+  want("#ops_live", "gc", "running ops are on the Logs tab");
+  want("#ops_live", "auto-policy", "…naming who asked, so the policy's own ops are told apart");
+  want("#ops_hist", "no address for part 1", "…and a failed op keeps its reason");
+  // Metrics: charts from the scraped history, and which PS could not be scraped.
+  const has = (html, needle, why) => {
+    if (!html.includes(needle)) { console.error(`FAIL #m_charts: ${why} — missing ${JSON.stringify(needle)}`); bad++; }
+  };
+  has(clusterCharts, "SST tables", "the table count is charted");
+  has(clusterCharts, "largest partition", "…with the largest partition beside the sum");
+  has(clusterCharts, '<path d="M', "a series is drawn as a line");
+  has(clusterCharts, "Block cache hit ratio <b>75.0%</b>", "the cluster view derives the cache hit ratio");
+  has(clusterCharts, "minor · flush", "minor compactions are split by trigger");
+  has(clusterCharts, "GET latency <b>990 µs</b>", "latency is the round's p99, not the average (300 µs)");
+  has(clusterCharts, 'stroke="none"', "latency is drawn as one column per round, not a line that breaks when idle");
+  if (clusterCharts.includes("avg")) { console.error("FAIL #m_charts: latency still draws an average"); bad++; }
+  if (clusterCharts.includes("amplification")) { console.error("FAIL #m_charts: write amplification is not charted"); bad++; }
+  has(clusterHot, "#1</a>", "the hottest partitions list the busy one");
+  if (clusterHot.includes("#2</a>")) { console.error("FAIL #m_hot: an idle partition is listed as hot"); bad++; }
+  has(ps2Hot, "no load reported", "a server scope lists only its own partitions");
+  if (scopes.includes("part:")) { console.error("FAIL #m_scope: partitions are not metrics scopes"); bad++; }
+  want("#m_endpoints", "1/2 partition servers scraped", "the endpoint line counts scraped servers");
+  want("#m_endpoints", "PS 2: connection refused", "…and names the one that could not be");
+  console.log(bad ? `tabs smoke FAILED (${bad})` : "tabs smoke OK — seven tabs + both drawers render");
+  process.exit(bad ? 1 : 0);
+})();

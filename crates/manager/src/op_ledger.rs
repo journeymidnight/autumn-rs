@@ -1,0 +1,1353 @@
+//! The manager's async op-ledger.
+//!
+//! A leader-local, in-memory, bounded record of every submitted long-running op
+//! (split / merge / rebalance / compact / gc / forcegc / ec-convert) and its live
+//! state. This is the OBSERVABILITY half — it recovers the failure reason that the
+//! fire-and-forget maintenance ops used to drop into a `tracing::error!`. The
+//! ORCHESTRATION crash-safety lives elsewhere (fenced split/merge txns, EC
+//! inflight markers), so the ledger need not be durable: terminal outcomes are
+//! ALSO appended to the etcd audit log by the caller, and a query for an
+//! unknown/old id answers `UNKNOWN`, never a false `RUNNING`.
+//!
+//! Pure data structure — the manager passes wall-clock in (`now_s` / `now_ms`),
+//! so this is unit-testable without a clock or a cluster.
+
+use std::collections::{HashMap, VecDeque};
+
+use autumn_rpc::manager_rpc::{
+    OpQueryReq, OpRecord, OP_KIND_COMPACT, OP_KIND_EC_CONVERT, OP_KIND_FORCE_GC, OP_KIND_GC,
+    OP_KIND_RECOVERY, OP_STATE_PENDING, OP_STATE_RUNNING, OP_STATE_SUCCEEDED, OP_STATE_UNKNOWN,
+};
+
+pub(crate) struct OpLedger {
+    /// Live+recent entries kept (`--op-ledger-cap`).
+    cap: usize,
+    /// newest at the front.
+    entries: VecDeque<OpRecord>,
+    seq: u16,
+    /// Terminal records not yet written to durable history (see `op_log`).
+    pending_log: Vec<OpRecord>,
+    /// RUNNING compact/gc/forcegc op -> the owner epoch of its partition when
+    /// it was dispatched. The task lives in that open's memory only.
+    ps_dispatch_epochs: HashMap<u64, Option<i64>>,
+}
+
+impl OpLedger {
+    /// Terminal records awaiting a write to durable history. Filled
+    /// synchronously wherever an op goes terminal, drained by an async caller —
+    /// so the ledger stays a plain synchronous structure and the etcd write
+    /// never sits inside a `borrow_mut`.
+    pub(crate) fn drain_pending_log(&mut self) -> Vec<OpRecord> {
+        std::mem::take(&mut self.pending_log)
+    }
+
+    /// Queue `op_id`'s current record for history, if it is terminal.
+    fn queue_terminal(&mut self, op_id: u64) {
+        if let Some(e) = self.entries.iter().find(|e| e.op_id == op_id) {
+            if e.state != OP_STATE_RUNNING && e.state != OP_STATE_PENDING {
+                self.pending_log.push(e.clone());
+            }
+        }
+    }
+
+    pub(crate) fn new(cap: usize) -> Self {
+        Self {
+            cap,
+            entries: VecDeque::new(),
+            seq: 0,
+            pending_log: Vec::new(),
+            ps_dispatch_epochs: HashMap::new(),
+        }
+    }
+
+    /// op_id = time-sortable, unique across leader incarnations without an etcd
+    /// counter: `(epoch_ms << 16) | seq16`. `now_ms.max(1)` keeps it non-zero
+    /// (0 is the `OpQueryReq` "list" sentinel) — a no-op in production, where the
+    /// clock is always far past the epoch.
+    fn next_id(&mut self, now_ms: i64) -> u64 {
+        let s = self.seq;
+        self.seq = self.seq.wrapping_add(1);
+        ((now_ms.max(1) as u64) << 16) | (s as u64)
+    }
+
+    fn find_mut(&mut self, op_id: u64) -> Option<&mut OpRecord> {
+        self.entries.iter_mut().find(|e| e.op_id == op_id)
+    }
+
+    /// Hold the ring at `cap`, dropping the entry that ENDED longest
+    /// ago first: its history record is already queued, while an active one
+    /// dropped would end with no record at all. By end time, not ring position:
+    /// a long op is the oldest by position the moment it ends, and `ops status
+    /// --wait` and the split commit fence still read it. Only a ring of active
+    /// entries loses its oldest.
+    fn trim(&mut self) {
+        while self.entries.len() > self.cap {
+            let ended_first = self
+                .entries
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| !Self::is_active(e.state))
+                .min_by_key(|(i, e)| (e.finished_at, std::cmp::Reverse(*i)))
+                .map(|(i, _)| i);
+            match ended_first {
+                Some(i) => {
+                    self.entries.remove(i);
+                }
+                None => {
+                    self.entries.pop_back();
+                }
+            }
+        }
+    }
+
+    fn is_active(state: u8) -> bool {
+        state == OP_STATE_PENDING || state == OP_STATE_RUNNING
+    }
+
+    /// May a PS-reported terminal outcome still be written onto this entry?
+    ///
+    /// Active states, obviously — but UNKNOWN too. UNKNOWN is not a verdict,
+    /// it is this ledger admitting it lost track (`sweep_running_ttl`), and the
+    /// PS keeps retransmitting the real outcome on every 5 s load report. If
+    /// UNKNOWN were terminal the truth would be refused forever and never reach
+    /// the audit log, which is where this module promises terminal outcomes
+    /// live. A REAL terminal state is not superseded: a retransmit after a
+    /// genuine transition stays an idempotent no-op.
+    fn accepts_terminal_report(state: u8) -> bool {
+        Self::is_active(state) || state == OP_STATE_UNKNOWN
+    }
+
+    /// Submit a new op, or ATTACH to an in-flight one with the same target
+    /// `(kind, part_id, secondary_id)`. Returns `(op_id, attached)`; attach turns
+    /// an impatient re-run into a status watch (the PS cap-1 channels + the
+    /// manager's merge/EC guards remain the real double-dispatch protection).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn submit(
+        &mut self,
+        kind: u8,
+        part_id: u64,
+        secondary_id: u64,
+        extent_ids: Vec<u64>,
+        requested_by: String,
+        now_s: i64,
+        now_ms: i64,
+    ) -> (u64, bool) {
+        if let Some(e) = self.entries.iter().find(|e| {
+            Self::is_active(e.state)
+                && e.kind == kind
+                && e.part_id == part_id
+                && e.secondary_id == secondary_id
+        }) {
+            return (e.op_id, true);
+        }
+        let op_id = self.next_id(now_ms);
+        self.entries.push_front(OpRecord {
+            op_id,
+            progress_done: 0,
+            progress_total: 0,
+            kind,
+            part_id,
+            secondary_id,
+            extent_ids,
+            state: OP_STATE_PENDING,
+            error: String::new(),
+            error_code: 0,
+            message: String::new(),
+            requested_by,
+            submitted_at: now_s,
+            started_at: 0,
+            finished_at: 0,
+        });
+        self.trim();
+        (op_id, false)
+    }
+
+    pub(crate) fn set_running(&mut self, op_id: u64, now_s: i64) {
+        if let Some(e) = self.find_mut(op_id) {
+            if e.state == OP_STATE_PENDING {
+                e.state = OP_STATE_RUNNING;
+                e.started_at = now_s;
+            }
+        }
+    }
+
+    /// Update the human message of a still-active op without changing its state
+    /// (e.g. the forcegc replay-floor advisory, which is known at dispatch time
+    /// but the op stays RUNNING until the PS reports the terminal outcome).
+    pub(crate) fn set_message(&mut self, op_id: u64, message: String) {
+        if let Some(e) = self.find_mut(op_id) {
+            if Self::is_active(e.state) {
+                e.message = message;
+            }
+        }
+    }
+
+    /// Move a known, still-active op to a terminal state. No-op if the op is gone
+    /// (evicted) or already terminal (idempotent — heartbeat outcomes retransmit).
+    /// Returns whether this call ended the op (it was active), so the caller
+    /// reports the end exactly once.
+    pub(crate) fn finish(
+        &mut self,
+        op_id: u64,
+        state: u8,
+        error: String,
+        message: String,
+        now_s: i64,
+    ) -> bool {
+        let mut went_terminal = false;
+        if let Some(e) = self.find_mut(op_id) {
+            if Self::is_active(e.state) {
+                e.state = state;
+                e.error = error;
+                if !message.is_empty() {
+                    e.message = message;
+                }
+                // Snap to complete, for the same reason `reconcile_outcome`
+                // does. An in-process op closes here the instant its RPC
+                // returns, and the last phase it published had no heartbeat
+                // window to travel in — a split's final phases are separated
+                // from the reply by no `.await` at all — so a SUCCEEDED split
+                // was left displaying whichever middle phase the 5 s tick
+                // happened to catch. A SUCCEEDED op IS done. A FAILED one keeps
+                // its last real phase, because "died at phase 3" is the whole
+                // point of publishing phases.
+                if state == OP_STATE_SUCCEEDED && e.progress_total > 0 {
+                    e.progress_done = e.progress_total;
+                }
+                e.finished_at = now_s;
+                if e.started_at == 0 {
+                    e.started_at = now_s;
+                }
+                went_terminal = true;
+            }
+        }
+        if went_terminal {
+            self.queue_terminal(op_id);
+        }
+        went_terminal
+    }
+
+    pub(crate) fn is_active_op(&self, op_id: u64) -> bool {
+        self.entries
+            .iter()
+            .any(|e| e.op_id == op_id && Self::is_active(e.state))
+    }
+
+    /// The state of an op this ledger knows and has ended; `None` while it is
+    /// active or when it is not here (evicted, or submitted to another leader).
+    pub(crate) fn ended_state(&self, op_id: u64) -> Option<u8> {
+        self.entries
+            .iter()
+            .find(|e| e.op_id == op_id)
+            .map(|e| e.state)
+            .filter(|s| !Self::is_active(*s))
+    }
+
+    pub(crate) fn record(&self, op_id: u64) -> Option<OpRecord> {
+        self.entries.iter().find(|e| e.op_id == op_id).cloned()
+    }
+
+    /// Reconcile a PS-reported terminal maintenance outcome. Returns `true` iff
+    /// this call actually moved a KNOWN op that was still accepting a report
+    /// (active, or UNKNOWN — see `accepts_terminal_report`) to terminal — so
+    /// the caller audits exactly once. A retransmit onto an already-terminal
+    /// entry, or an unknown op_id, returns `false`: an idempotent no-op.
+    pub(crate) fn reconcile_outcome(
+        &mut self,
+        op_id: u64,
+        state: u8,
+        error: String,
+        message: String,
+        now_s: i64,
+    ) -> bool {
+        let mut moved = false;
+        if let Some(e) = self.find_mut(op_id) {
+            if Self::accepts_terminal_report(e.state) {
+                e.state = state;
+                e.error = error;
+                if !message.is_empty() {
+                    e.message = message;
+                }
+                e.finished_at = now_s;
+                if e.started_at == 0 {
+                    e.started_at = now_s;
+                }
+                moved = true;
+            }
+        }
+        if moved {
+            self.queue_terminal(op_id);
+        }
+        moved
+    }
+
+    /// Close the extent-scoped entry of `kind` whose target extent matches.
+    /// Identity is exact (extent_id) and the manager orchestrates both EC and
+    /// recovery, so this is authoritative, not inference.
+    fn complete_by_extent(
+        &mut self,
+        kind: u8,
+        extent_id: u64,
+        state: u8,
+        message: String,
+        error: String,
+        now_s: i64,
+    ) {
+        let mut closed = None;
+        if let Some(e) = self.entries.iter_mut().find(|e| {
+            e.kind == kind && e.secondary_id == extent_id && Self::is_active(e.state)
+        }) {
+            e.state = state;
+            e.message = message;
+            e.error = error;
+            if state == OP_STATE_SUCCEEDED {
+                e.error_code = 0;
+                // Snap progress to complete. The last sample and the completion
+                // arrive in the same `df` window, and progress refuses to write
+                // onto a closed entry — so a finished conversion was left
+                // showing its second-to-last sample (e.g. 75%).
+                // A SUCCEEDED op IS done; reporting less is the misleading
+                // answer. A FAILED one keeps its last real sample, because
+                // "died at 56%" is information.
+                if e.progress_total > 0 {
+                    e.progress_done = e.progress_total;
+                }
+            }
+            e.finished_at = now_s;
+            if e.started_at == 0 {
+                e.started_at = now_s;
+            }
+            closed = Some(e.op_id);
+        }
+        if let Some(id) = closed {
+            self.queue_terminal(id);
+        }
+    }
+
+    /// Close the EC-convert entry for `extent_id` (apply-done, or abandon).
+    pub(crate) fn complete_ec(
+        &mut self,
+        extent_id: u64,
+        state: u8,
+        message: String,
+        error: String,
+        now_s: i64,
+    ) {
+        self.complete_by_extent(OP_KIND_EC_CONVERT, extent_id, state, message, error, now_s);
+    }
+
+    /// Close the recovery entry for `extent_id` — called from
+    /// `apply_recovery_done` (the extent layout is repaired).
+    /// Close a recovery entry that ended WITHOUT completing — its marker was
+    /// dropped, so nothing will report it done.
+    pub(crate) fn abandon_recovery(&mut self, extent_id: u64, reason: String, now_s: i64) {
+        self.complete_by_extent(
+            OP_KIND_RECOVERY,
+            extent_id,
+            autumn_rpc::manager_rpc::OP_STATE_FAILED,
+            String::new(),
+            reason,
+            now_s,
+        );
+    }
+
+    /// Close a recovery entry whose need went away without a rebuild (the copy
+    /// serves again, the extent is gone). Nothing failed, and nothing is left to
+    /// retry, so it ends SUCCEEDED with the reason in its message.
+    pub(crate) fn withdraw_recovery(&mut self, extent_id: u64, reason: &str, now_s: i64) {
+        self.complete_by_extent(
+            OP_KIND_RECOVERY,
+            extent_id,
+            OP_STATE_SUCCEEDED,
+            format!("no rebuild needed any more: {reason}"),
+            String::new(),
+            now_s,
+        );
+    }
+
+    /// Extents with an active recovery entry.
+    pub(crate) fn active_recovery_extents(&self) -> Vec<u64> {
+        self.entries
+            .iter()
+            .filter(|e| e.kind == OP_KIND_RECOVERY && Self::is_active(e.state))
+            .map(|e| e.secondary_id)
+            .collect()
+    }
+
+    pub(crate) fn complete_recovery(&mut self, extent_id: u64, message: String, now_s: i64) {
+        self.complete_by_extent(
+            OP_KIND_RECOVERY,
+            extent_id,
+            OP_STATE_SUCCEEDED,
+            message,
+            String::new(),
+            now_s,
+        );
+    }
+
+    /// A recovery dispatch was ACCEPTED by a target EN: create-or-refresh the
+    /// extent's RUNNING entry. Recovery is auto-dispatched and retried, so one
+    /// entry per extent carries the whole repair rather than spawning an entry
+    /// per try.
+    pub(crate) fn note_recovery_dispatch(
+        &mut self,
+        extent_id: u64,
+        slot: u32,
+        node_id: u64,
+        now_s: i64,
+        now_ms: i64,
+    ) {
+        let msg = format!("rebuilding slot {slot} on node {node_id}");
+        if let Some(e) = self.entries.iter_mut().find(|e| {
+            e.kind == OP_KIND_RECOVERY && e.secondary_id == extent_id && Self::is_active(e.state)
+        }) {
+            e.message = msg;
+            e.state = OP_STATE_RUNNING;
+            if e.started_at == 0 {
+                e.started_at = now_s;
+            }
+            return;
+        }
+        let op_id = self.next_id(now_ms);
+        self.entries.push_front(OpRecord {
+            op_id,
+            kind: OP_KIND_RECOVERY,
+            secondary_id: extent_id,
+            state: OP_STATE_RUNNING,
+            message: msg,
+            requested_by: "auto-recovery".to_string(),
+            submitted_at: now_s,
+            started_at: now_s,
+            ..Default::default()
+        });
+        self.trim();
+    }
+
+    /// An EC conversion dispatch reached the coordinator: refresh the extent's
+    /// RUNNING entry.
+    ///
+    /// `create` is false when the manager no longer holds this extent's marker.
+    /// The response can arrive up to a minute after the send, and a fence in
+    /// that window closes the entry; recreating it would leave a RUNNING entry
+    /// with no marker behind it and nothing to ever close it — which silently
+    /// turns every later `force-ec-convert` of that extent into a no-op via
+    /// attach-dedup.
+    pub(crate) fn note_ec_dispatch(
+        &mut self,
+        extent_id: u64,
+        coord_node_id: u64,
+        create: bool,
+        now_s: i64,
+        now_ms: i64,
+    ) {
+        let msg = format!("converting on node {coord_node_id}");
+        if let Some(e) = self.entries.iter_mut().find(|e| {
+            e.kind == OP_KIND_EC_CONVERT && e.secondary_id == extent_id && Self::is_active(e.state)
+        }) {
+            e.message = msg;
+            e.state = OP_STATE_RUNNING;
+            if e.started_at == 0 {
+                e.started_at = now_s;
+            }
+            return;
+        }
+        if !create {
+            return;
+        }
+        let op_id = self.next_id(now_ms);
+        self.entries.push_front(OpRecord {
+            op_id,
+            kind: OP_KIND_EC_CONVERT,
+            secondary_id: extent_id,
+            state: OP_STATE_RUNNING,
+            message: msg,
+            requested_by: "auto-ec".to_string(),
+            submitted_at: now_s,
+            started_at: now_s,
+            ..Default::default()
+        });
+        self.trim();
+    }
+
+    /// A recovery dispatch attempt FAILED. The entry stays RUNNING (the loop
+    /// retries with exponential backoff — it never gives up), carrying the last
+    /// reason + code, so `ops status` shows "running, last error: …" instead of
+    /// hiding the churn.
+    pub(crate) fn record_recovery_failure(
+        &mut self,
+        extent_id: u64,
+        reason: String,
+        error_code: u8,
+        now_s: i64,
+        now_ms: i64,
+    ) {
+        if let Some(e) = self.entries.iter_mut().find(|e| {
+            e.kind == OP_KIND_RECOVERY && e.secondary_id == extent_id && Self::is_active(e.state)
+        }) {
+            e.error = reason;
+            e.error_code = error_code;
+            return;
+        }
+        // First observation of this extent is a FAILURE (never got as far as an
+        // accepted dispatch) — still worth listing: a repair that can't even
+        // start is exactly what an operator needs to see.
+        let op_id = self.next_id(now_ms);
+        self.entries.push_front(OpRecord {
+            op_id,
+            kind: OP_KIND_RECOVERY,
+            secondary_id: extent_id,
+            state: OP_STATE_RUNNING,
+            error: reason,
+            error_code,
+            requested_by: "auto-recovery".to_string(),
+            submitted_at: now_s,
+            started_at: now_s,
+            ..Default::default()
+        });
+        self.trim();
+    }
+
+    /// On leader promotion, seed a synthetic RUNNING entry per in-flight
+    /// extent-scoped marker replayed from etcd (`kind` = EC_CONVERT or RECOVERY).
+    /// Both are DURABLE (the etcd marker survived; the new leader keeps working
+    /// the task), so the work is genuinely still running and belongs in
+    /// `ops list` — even though the original op_id died with the previous
+    /// leader's in-memory ledger. Each closes normally via
+    /// `complete_ec` / `complete_recovery`. compact/gc/forcegc are PS-local (NOT
+    /// in etcd) and cannot be seeded — an unknown id honestly answers UNKNOWN.
+    /// Idempotent across re-promotions (skips an already-tracked extent).
+    ///
+    /// Takes each marker's OWN `started_at` rather than stamping the promotion
+    /// time. Stamping "now" reports an op that has been running for hours as
+    /// one that just began, and the age is the first thing an operator reads.
+    ///
+    /// Precisely: it is when the CURRENT marker was acquired, not when the
+    /// extent first needed repairing — a re-dispatch drains the marker and
+    /// acquires a fresh one. That is still the honest answer to "how long has
+    /// this attempt been running", which is what the ledger claims to show. `0`
+    /// (a marker written before the field existed) falls back to now.
+    pub(crate) fn seed_replay(
+        &mut self,
+        kind: u8,
+        extents: impl IntoIterator<Item = (u64, i64)>,
+        now_s: i64,
+        now_ms: i64,
+    ) {
+        for (extent_id, marker_started_at) in extents {
+            if self
+                .entries
+                .iter()
+                .any(|e| e.kind == kind && e.secondary_id == extent_id && Self::is_active(e.state))
+            {
+                continue;
+            }
+            let op_id = self.next_id(now_ms);
+            let started_at = if marker_started_at > 0 { marker_started_at } else { now_s };
+            self.entries.push_front(OpRecord {
+                op_id,
+                kind,
+                secondary_id: extent_id,
+                state: OP_STATE_RUNNING,
+                requested_by: "replay".to_string(),
+                submitted_at: started_at,
+                started_at,
+                ..Default::default()
+            });
+        }
+        self.trim();
+    }
+
+    /// A failure the EXECUTING NODE reported on its `df` heartbeat.
+    ///
+    /// Deliberately update-only. The manager records its own dispatch failures
+    /// (which can precede any node accepting the work); a node reporting about
+    /// an op this ledger does not have RUNNING is describing something already
+    /// closed or never tracked, and creating an entry from it would resurrect
+    /// ops that nothing will ever close. Same discipline as
+    /// `update_progress_by_extent`, and for the same reason.
+    pub(crate) fn record_node_op_failure(
+        &mut self,
+        kind: u8,
+        extent_id: u64,
+        reason: String,
+        error_code: u8,
+    ) {
+        if let Some(e) = self
+            .entries
+            .iter_mut()
+            .find(|e| e.kind == kind && e.secondary_id == extent_id && Self::is_active(e.state))
+        {
+            e.error = reason;
+            e.error_code = error_code;
+        }
+    }
+
+    /// Record the latest progress sample for a RUNNING op. Ignores unknown ids
+    /// and terminal entries: a sample that arrives after the outcome (the PS
+    /// keeps resending its ring) must not reopen a closed op or resurrect one
+    /// the cap already evicted.
+    pub(crate) fn update_progress(&mut self, op_id: u64, done: u64, total: u64) {
+        if op_id == 0 {
+            return;
+        }
+        if let Some(e) = self
+            .entries
+            .iter_mut()
+            .find(|e| e.op_id == op_id && e.state == OP_STATE_RUNNING)
+        {
+            e.progress_done = done;
+            e.progress_total = total;
+        }
+    }
+
+    /// Apply a progress sample the EXTENT NODE reported for an extent-scoped
+    /// op (EC conversion / recovery).
+    ///
+    /// Keyed by extent because the node never learns the manager's op id, while
+    /// both kinds carry their extent in `secondary_id` here. Only a RUNNING
+    /// entry is touched: a sample that arrives after the op closed must not
+    /// re-animate a terminal record.
+    pub(crate) fn update_progress_by_extent(&mut self, kind: u8, extent_id: u64, done: u64, total: u64) {
+        if let Some(e) = self.entries.iter_mut().find(|e| {
+            e.kind == kind && e.secondary_id == extent_id && e.state == OP_STATE_RUNNING
+        }) {
+            e.progress_done = done;
+            e.progress_total = total;
+        }
+    }
+
+    /// Apply a progress sample for a PARTITION-scoped op the PS is executing
+    /// (split / merge).
+    ///
+    /// Keyed by partition for an executor that does not know the op id: a
+    /// split sent with `op_id: 0`, and the merge the leader orchestrates. The
+    /// partition is known from the `PartitionLoad` or the orchestrator.
+    ///
+    /// Only a RUNNING entry is touched, so a sample that overtakes the op's
+    /// completion cannot re-animate a terminal record.
+    /// `secondary_id` narrows the match where the kind has one — a merge is
+    /// identified by (survivor, victim), and `submit` dedups on all three, so
+    /// two merges sharing a survivor can be RUNNING at once. Matching the
+    /// survivor alone would let the second one's phase 1 land on the first and
+    /// walk it backwards. Split passes 0, which is what its entry holds.
+    pub(crate) fn update_progress_by_part(
+        &mut self,
+        kind: u8,
+        part_id: u64,
+        secondary_id: u64,
+        done: u64,
+        total: u64,
+    ) {
+        if let Some(e) = self.entries.iter_mut().find(|e| {
+            e.kind == kind
+                && e.part_id == part_id
+                && e.secondary_id == secondary_id
+                && e.state == OP_STATE_RUNNING
+        }) {
+            e.progress_done = done;
+            e.progress_total = total;
+        }
+    }
+
+    /// TTL backstop: a RUNNING PS-executed op (compact/gc/forcegc) whose terminal
+    /// outcome never came back (PS restarted, load report missed) becomes
+    /// UNKNOWN after `ttl_s`, keeping `ops status` honest.
+    pub(crate) fn sweep_running_ttl(&mut self, now_s: i64, ttl_s: i64) {
+        let mut ended = Vec::new();
+        for e in self.entries.iter_mut() {
+            if e.state == OP_STATE_RUNNING
+                && matches!(e.kind, OP_KIND_COMPACT | OP_KIND_GC | OP_KIND_FORCE_GC)
+                && now_s - e.started_at > ttl_s
+            {
+                e.state = OP_STATE_UNKNOWN;
+                e.message = "outcome lost — PS restarted or load report missed".to_string();
+                e.finished_at = now_s;
+                ended.push(e.op_id);
+            }
+        }
+        for op_id in ended {
+            self.queue_terminal(op_id);
+        }
+    }
+
+    /// A compact/gc/forcegc op was handed to its PS while the partition's
+    /// owner epoch was `owner_epoch`.
+    pub(crate) fn note_ps_dispatch(&mut self, op_id: u64, owner_epoch: Option<i64>) {
+        if self.is_active_op(op_id) {
+            self.ps_dispatch_epochs.insert(op_id, owner_epoch);
+        }
+    }
+
+    /// End every dispatched compact/gc/forcegc whose partition has been
+    /// opened again since (PS restart, move, merge): the reopen started with an
+    /// empty queue, so the task will not run or report. UNKNOWN, not FAILED —
+    /// it may have finished just before, with the report lost. A late real
+    /// outcome still overwrites it (`accepts_terminal_report`). Returns the
+    /// ops ended, with the reason.
+    pub(crate) fn sweep_reopened(
+        &mut self,
+        epoch_of: impl Fn(u64) -> Option<i64>,
+        now_s: i64,
+    ) -> Vec<(u64, String)> {
+        let mut ended = Vec::new();
+        let entries = &mut self.entries;
+        self.ps_dispatch_epochs.retain(|&op_id, &mut dispatched| {
+            let Some(e) = entries
+                .iter_mut()
+                .find(|e| e.op_id == op_id && e.state == OP_STATE_RUNNING)
+            else {
+                return false;
+            };
+            let now_epoch = epoch_of(e.part_id);
+            if now_epoch == dispatched {
+                return true;
+            }
+            let show = |x: Option<i64>| x.map_or_else(|| "none".to_string(), |v| v.to_string());
+            let why = format!(
+                "partition {} was reopened (owner epoch {} -> {}); the op did not survive \
+                 it and its outcome was not reported",
+                e.part_id,
+                show(dispatched),
+                show(now_epoch)
+            );
+            e.state = OP_STATE_UNKNOWN;
+            e.message = why.clone();
+            e.finished_at = now_s;
+            ended.push((op_id, why));
+            false
+        });
+        for (op_id, _) in &ended {
+            self.queue_terminal(*op_id);
+        }
+        ended
+    }
+
+    /// Answer a query. `op_id != 0` → one record, synthesizing `UNKNOWN` when it
+    /// isn't in this leader's ledger (never a false RUNNING). `op_id == 0` → a
+    /// filtered list (active-only / kind / limit), newest-first.
+    pub(crate) fn query(&self, req: &OpQueryReq) -> Vec<OpRecord> {
+        if req.op_id != 0 {
+            return match self.entries.iter().find(|e| e.op_id == req.op_id) {
+                Some(e) => vec![e.clone()],
+                None => vec![OpRecord {
+                    op_id: req.op_id,
+                    state: OP_STATE_UNKNOWN,
+                    message: "op not in this leader's ledger (leader changed?); \
+                              terminal outcomes are in audit-log"
+                        .to_string(),
+                    ..Default::default()
+                }],
+            };
+        }
+        let mut out: Vec<OpRecord> = self
+            .entries
+            .iter()
+            .filter(|e| !req.active_only || Self::is_active(e.state))
+            .filter(|e| req.kind_filter == 0 || e.kind == req.kind_filter)
+            .cloned()
+            .collect();
+        if req.limit != 0 && out.len() > req.limit as usize {
+            out.truncate(req.limit as usize);
+        }
+        out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    const OP_LEDGER_CAP: usize = 256;
+    const OP_RUNNING_TTL_SECS: i64 = 30 * 60;
+    use super::*;
+    use autumn_rpc::manager_rpc::{
+        OP_KIND_EC_CONVERT, OP_KIND_GC, OP_KIND_SCRUB, OP_KIND_SPLIT, OP_STATE_FAILED, OP_STATE_SUCCEEDED,
+    };
+
+    fn q_one(led: &OpLedger, op_id: u64) -> OpRecord {
+        led.query(&OpQueryReq { op_id, ..Default::default() }).remove(0)
+    }
+
+    #[test]
+    fn submit_then_running_then_terminal() {
+        let mut led = OpLedger::new(OP_LEDGER_CAP);
+        let (id, attached) = led.submit(OP_KIND_SPLIT, 7, 0, vec![], "cli".into(), 100, 100_000);
+        assert!(!attached);
+        assert_eq!(q_one(&led, id).state, OP_STATE_PENDING);
+        led.set_running(id, 101);
+        assert_eq!(q_one(&led, id).state, OP_STATE_RUNNING);
+        led.finish(id, OP_STATE_SUCCEEDED, String::new(), "split part 7 dispatched".into(), 105);
+        let r = q_one(&led, id);
+        assert_eq!(r.state, OP_STATE_SUCCEEDED);
+        assert_eq!(r.message, "split part 7 dispatched");
+        assert_eq!(r.finished_at, 105);
+        // finish is idempotent — a late heartbeat retransmit can't reopen it.
+        led.finish(id, OP_STATE_FAILED, "boom".into(), String::new(), 200);
+        assert_eq!(q_one(&led, id).state, OP_STATE_SUCCEEDED);
+    }
+
+    /// A marker can die five ways; only two of them used to close the ledger.
+    /// For EC a leaked RUNNING entry is not cosmetic: `submit` attach-dedups on
+    /// any ACTIVE (kind, target) and the caller returns WITHOUT actuating, so
+    /// every future convert of that extent silently does nothing.
+    #[test]
+    fn an_abandoned_ec_op_stops_blocking_future_submits() {
+        let mut led = OpLedger::new(OP_LEDGER_CAP);
+        let (first, attached) =
+            led.submit(OP_KIND_EC_CONVERT, 0, 55, vec![55], "cli".into(), 100, 100_000);
+        assert!(!attached);
+        led.set_running(first, 100);
+
+        // While it is RUNNING, a resubmit attaches and actuates nothing.
+        let (again, attached) =
+            led.submit(OP_KIND_EC_CONVERT, 0, 55, vec![55], "cli".into(), 101, 101_000);
+        assert!(attached, "a live op should dedup");
+        assert_eq!(again, first);
+
+        // The marker is dropped for any reason — the entry must close.
+        led.complete_ec(
+            55,
+            OP_STATE_FAILED,
+            String::new(),
+            "conversion abandoned: its pinned executor is no longer online".into(),
+            110,
+        );
+
+        let (fresh, attached) =
+            led.submit(OP_KIND_EC_CONVERT, 0, 55, vec![55], "cli".into(), 120, 120_000);
+        assert!(
+            !attached,
+            "an abandoned conversion must not block the operator's retry forever"
+        );
+        assert_ne!(fresh, first);
+    }
+
+    #[test]
+    fn attach_dedup_returns_same_id() {
+        let mut led = OpLedger::new(OP_LEDGER_CAP);
+        let (id1, a1) = led.submit(OP_KIND_GC, 3, 0, vec![], "cli".into(), 1, 1000);
+        let (id2, a2) = led.submit(OP_KIND_GC, 3, 0, vec![], "cli".into(), 2, 2000);
+        assert!(!a1 && a2);
+        assert_eq!(id1, id2);
+        // a DIFFERENT target is a fresh op.
+        let (id3, a3) = led.submit(OP_KIND_GC, 4, 0, vec![], "cli".into(), 3, 3000);
+        assert!(!a3 && id3 != id1);
+        // once terminal, a resubmit is fresh again.
+        led.finish(id1, OP_STATE_SUCCEEDED, String::new(), String::new(), 4);
+        let (id4, a4) = led.submit(OP_KIND_GC, 3, 0, vec![], "cli".into(), 5, 5000);
+        assert!(!a4 && id4 != id1);
+    }
+
+    #[test]
+    fn unknown_id_is_unknown_never_running() {
+        let led = OpLedger::new(OP_LEDGER_CAP);
+        let r = q_one(&led, 424242);
+        assert_eq!(r.state, OP_STATE_UNKNOWN);
+        assert_eq!(r.op_id, 424242);
+    }
+
+    #[test]
+    fn cap_evicts_oldest() {
+        let mut led = OpLedger::new(OP_LEDGER_CAP);
+        let mut first = 0;
+        for i in 0..(OP_LEDGER_CAP as u64 + 10) {
+            let (id, _) = led.submit(OP_KIND_GC, i, 0, vec![], "cli".into(), i as i64, i as i64 * 10);
+            if i == 0 {
+                first = id;
+            }
+        }
+        // the oldest fell out → now UNKNOWN; the ring holds exactly CAP.
+        assert_eq!(q_one(&led, first).state, OP_STATE_UNKNOWN);
+        assert_eq!(led.query(&OpQueryReq::default()).len(), OP_LEDGER_CAP);
+    }
+
+    /// A long op (a scrub, a split waiting at the gate) outlives a ring's worth
+    /// of short ones: they go, it stays, and its end still reaches history.
+    #[test]
+    fn cap_keeps_an_active_op_over_ended_ones() {
+        let mut led = OpLedger::new(OP_LEDGER_CAP);
+        let (long, _) = led.submit(OP_KIND_SCRUB, 0, 0, vec![], "auto-policy".into(), 0, 0);
+        led.set_running(long, 0);
+        for i in 1..=(OP_LEDGER_CAP as u64 + 10) {
+            let (id, _) = led.submit(OP_KIND_GC, i, 0, vec![], "auto-policy".into(), i as i64, i as i64 * 10);
+            led.finish(id, OP_STATE_SUCCEEDED, String::new(), String::new(), i as i64);
+        }
+        assert_eq!(led.query(&OpQueryReq::default()).len(), OP_LEDGER_CAP);
+        assert_eq!(q_one(&led, long).state, OP_STATE_RUNNING);
+        led.drain_pending_log();
+        let end = OP_LEDGER_CAP as i64 + 10;
+        assert!(led.finish(long, OP_STATE_SUCCEEDED, String::new(), String::new(), end));
+        assert_eq!(led.drain_pending_log().len(), 1, "its end goes to history");
+        // Ended last, it is dropped last: half a ring of later ops later, it
+        // is still there for `ops status`.
+        for i in 1..=(OP_LEDGER_CAP as u64 / 2) {
+            let (id, _) = led.submit(OP_KIND_GC, 1000 + i, 0, vec![], "cli".into(), end, end * 10 + i as i64);
+            led.finish(id, OP_STATE_SUCCEEDED, String::new(), String::new(), end + i as i64);
+        }
+        assert_eq!(q_one(&led, long).state, OP_STATE_SUCCEEDED);
+    }
+
+    #[test]
+    fn ttl_flips_stale_running_maintenance_to_unknown() {
+        let mut led = OpLedger::new(OP_LEDGER_CAP);
+        let (id, _) = led.submit(OP_KIND_GC, 1, 0, vec![], "cli".into(), 0, 0);
+        led.set_running(id, 0);
+        led.sweep_running_ttl(OP_RUNNING_TTL_SECS - 1, OP_RUNNING_TTL_SECS); // not yet
+        assert_eq!(q_one(&led, id).state, OP_STATE_RUNNING);
+        led.sweep_running_ttl(OP_RUNNING_TTL_SECS + 1, OP_RUNNING_TTL_SECS); // past TTL
+        assert_eq!(q_one(&led, id).state, OP_STATE_UNKNOWN);
+        let queued = led.drain_pending_log();
+        assert_eq!(queued.len(), 1, "the UNKNOWN end goes to history");
+        assert_eq!(queued[0].op_id, id);
+    }
+
+    #[test]
+    fn terminal_records_are_queued_for_history_exactly_once() {
+        let mut led = OpLedger::new(OP_LEDGER_CAP);
+        let (id, _) = led.submit(OP_KIND_GC, 1, 0, vec![], "cli".into(), 0, 0);
+        led.set_running(id, 0);
+        assert!(
+            led.drain_pending_log().is_empty(),
+            "a RUNNING op has no history to write yet"
+        );
+
+        assert!(led.reconcile_outcome(id, OP_STATE_FAILED, "boom".into(), String::new(), 5));
+        let queued = led.drain_pending_log();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].op_id, id);
+        assert_eq!(
+            queued[0].error, "boom",
+            "history must carry the error text the ledger ring would later evict"
+        );
+
+        // Draining is destructive, so a second flush writes nothing again.
+        assert!(led.drain_pending_log().is_empty());
+
+        // A heartbeat retransmit of the same outcome is a no-op and must not
+        // queue a duplicate history record.
+        assert!(!led.reconcile_outcome(id, OP_STATE_FAILED, "boom".into(), String::new(), 6));
+        assert!(led.drain_pending_log().is_empty());
+    }
+
+    #[test]
+    fn extent_keyed_completions_are_queued_too() {
+        let mut led = OpLedger::new(OP_LEDGER_CAP);
+        let (id, _) = led.submit(OP_KIND_RECOVERY, 0, 77, vec![], "auto".into(), 0, 0);
+        led.set_running(id, 0);
+        led.complete_recovery(77, "rebuilt".into(), 9);
+        let queued = led.drain_pending_log();
+        assert_eq!(queued.len(), 1, "recovery closes by extent id, not op id");
+        assert_eq!(queued[0].state, OP_STATE_SUCCEEDED);
+    }
+
+    #[test]
+    fn progress_tracks_a_running_op_and_ignores_late_or_unknown_samples() {
+        let mut led = OpLedger::new(OP_LEDGER_CAP);
+        let (id, _) = led.submit(OP_KIND_GC, 1, 0, vec![], "cli".into(), 0, 0);
+        led.set_running(id, 0);
+
+        led.update_progress(id, 3 * 1024, 8 * 1024);
+        let r = q_one(&led, id);
+        assert_eq!((r.progress_done, r.progress_total), (3 * 1024, 8 * 1024));
+
+        // Later sample wins — progress is a sample, not an accumulator.
+        led.update_progress(id, 7 * 1024, 8 * 1024);
+        assert_eq!(q_one(&led, id).progress_done, 7 * 1024);
+
+        // The PS keeps resending its outcome ring, so a progress sample can
+        // arrive AFTER the op went terminal. It must not reopen it or move the
+        // counters on a closed op.
+        assert!(led.reconcile_outcome(id, OP_STATE_SUCCEEDED, String::new(), String::new(), 5));
+        led.update_progress(id, 8 * 1024, 8 * 1024);
+        let done = q_one(&led, id);
+        assert_eq!(done.state, OP_STATE_SUCCEEDED);
+        assert_eq!(
+            done.progress_done,
+            7 * 1024,
+            "a sample arriving after the outcome must not touch a terminal entry"
+        );
+
+        // Unknown / untracked ids are ignored rather than synthesizing entries.
+        led.update_progress(999, 1, 2);
+        led.update_progress(0, 1, 2);
+        assert_eq!(q_one(&led, 999).state, OP_STATE_UNKNOWN);
+    }
+
+    #[test]
+    fn split_progress_is_matched_by_partition_because_the_executor_has_no_op_id() {
+        // `SplitPartReq` carries no op id — adding one would be an rkyv wire
+        // bump for a progress sample — so the PS reports `op_id: 0` and the
+        // manager finds the entry by (kind, part_id). Same reason
+        // `update_progress_by_extent` exists for extent nodes.
+        let mut led = OpLedger::new(OP_LEDGER_CAP);
+        let (id, _) = led.submit(OP_KIND_SPLIT, 44, 0, vec![], "cli".into(), 0, 0);
+        led.set_running(id, 0);
+
+        led.update_progress_by_part(OP_KIND_SPLIT, 44, 0, 2, 6);
+        let r = q_one(&led, id);
+        assert_eq!((r.progress_done, r.progress_total), (2, 6));
+
+        // A later phase wins; phases only move forward in practice, but the
+        // rule is the same as every other sample: latest wins.
+        led.update_progress_by_part(OP_KIND_SPLIT, 44, 0, 4, 6);
+        assert_eq!(q_one(&led, id).progress_done, 4);
+
+        // Another partition's split must not be written here, and neither must
+        // a different kind on the same partition.
+        led.update_progress_by_part(OP_KIND_SPLIT, 45, 0, 1, 6);
+        led.update_progress_by_part(OP_KIND_GC, 44, 0, 1, 6);
+        assert_eq!(q_one(&led, id).progress_done, 4);
+
+        // The split's terminal state arrives as the RPC reply, and the PS may
+        // still have one sample in flight behind it. It must not reopen the op
+        // or move the counters — the same hazard `update_progress` guards.
+        assert!(led.reconcile_outcome(id, OP_STATE_SUCCEEDED, String::new(), String::new(), 5));
+        led.update_progress_by_part(OP_KIND_SPLIT, 44, 0, 6, 6);
+        let done = q_one(&led, id);
+        assert_eq!(done.state, OP_STATE_SUCCEEDED);
+        assert_eq!(
+            done.progress_done, 4,
+            "a phase arriving after the outcome must not touch a terminal entry"
+        );
+    }
+
+    /// The 30-min TTL flip to UNKNOWN must not be terminal. The PS keeps
+    /// retransmitting the true outcome on every load report; refusing it would
+    /// discard the real SUCCEEDED/FAILED and its reason, and the audit log —
+    /// which this module promises holds terminal outcomes — would never see it.
+    /// Reachable without any fault: `autumn-op compact` fanned over many
+    /// partitions of one PS queues behind its concurrency permits, and the
+    /// queue wait counts against the TTL because RUNNING is set at submit.
+    /// EC conversion and recovery are executed by the extent node, which knows
+    /// only the extent id — the manager resolves that to its own op. A sample
+    /// must land on the RUNNING entry of the MATCHING kind, and must never
+    /// re-animate one that already closed.
+    #[test]
+    fn extent_keyed_progress_lands_on_the_right_running_op() {
+        let mut led = OpLedger::new(OP_LEDGER_CAP);
+        let (ec, _) = led.submit(OP_KIND_EC_CONVERT, 0, 55, vec![55], "cli".into(), 0, 100_000);
+        led.set_running(ec, 0);
+        let (rec, _) = led.submit(OP_KIND_RECOVERY, 0, 55, vec![55], "auto".into(), 0, 100_001);
+        led.set_running(rec, 0);
+
+        led.update_progress_by_extent(OP_KIND_EC_CONVERT, 55, 3, 8);
+        assert_eq!(
+            (q_one(&led, ec).progress_done, q_one(&led, ec).progress_total),
+            (3, 8)
+        );
+        assert_eq!(
+            (q_one(&led, rec).progress_done, q_one(&led, rec).progress_total),
+            (0, 0),
+            "the same extent has two ops; kind is what tells them apart"
+        );
+
+        // An extent nobody is running: dropped, not mis-filed.
+        led.update_progress_by_extent(OP_KIND_EC_CONVERT, 999, 1, 2);
+        assert_eq!(q_one(&led, ec).progress_done, 3);
+
+        // A sample racing the completion must not touch a closed entry — but a
+        // SUCCEEDED op reads as complete, not as whatever sample landed last.
+        // (Without this a finished conversion could keep showing 75%.)
+        led.complete_ec(55, OP_STATE_SUCCEEDED, String::new(), String::new(), 9);
+        led.update_progress_by_extent(OP_KIND_EC_CONVERT, 55, 7, 8);
+        let r = q_one(&led, ec);
+        assert_eq!(r.state, OP_STATE_SUCCEEDED);
+        assert_eq!(
+            (r.progress_done, r.progress_total),
+            (8, 8),
+            "a succeeded op is complete; the racing sample must not re-open it either"
+        );
+
+        // A FAILED op keeps its last real sample — "died at 3/8" is information.
+        let (ec2, _) = led.submit(OP_KIND_EC_CONVERT, 0, 56, vec![56], "cli".into(), 0, 100_002);
+        led.set_running(ec2, 0);
+        led.update_progress_by_extent(OP_KIND_EC_CONVERT, 56, 3, 8);
+        led.complete_ec(56, OP_STATE_FAILED, "boom".into(), String::new(), 9);
+        let r = q_one(&led, ec2);
+        assert_eq!(r.state, OP_STATE_FAILED);
+        assert_eq!((r.progress_done, r.progress_total), (3, 8));
+    }
+
+    #[test]
+    fn a_late_authoritative_outcome_supersedes_unknown() {
+        let mut led = OpLedger::new(OP_LEDGER_CAP);
+        let (id, _) = led.submit(OP_KIND_COMPACT, 7, 0, vec![], "cli".into(), 0, 100_000);
+        led.set_running(id, 0);
+        led.sweep_running_ttl(OP_RUNNING_TTL_SECS + 10, OP_RUNNING_TTL_SECS);
+        assert_eq!(q_one(&led, id).state, OP_STATE_UNKNOWN, "precondition: TTL flip");
+
+        assert!(
+            led.reconcile_outcome(
+                id,
+                OP_STATE_FAILED,
+                "disk full".to_string(),
+                String::new(),
+                OP_RUNNING_TTL_SECS + 20,
+            ),
+            "a late PS-reported outcome must be accepted onto an UNKNOWN entry"
+        );
+        let r = q_one(&led, id);
+        assert_eq!(r.state, OP_STATE_FAILED);
+        assert_eq!(r.error, "disk full", "the failure reason must survive");
+        let rows: Vec<u8> = led.drain_pending_log().iter().map(|r| r.state).collect();
+        assert_eq!(rows, [OP_STATE_UNKNOWN, OP_STATE_FAILED], "history keeps both ends");
+
+        assert!(
+            !led.reconcile_outcome(
+                id,
+                OP_STATE_SUCCEEDED,
+                String::new(),
+                String::new(),
+                OP_RUNNING_TTL_SECS + 30,
+            ),
+            "a genuine terminal state is NOT superseded by a later retransmit"
+        );
+        assert_eq!(q_one(&led, id).state, OP_STATE_FAILED);
+    }
+
+    /// A compaction queued on a PS dies with the partition's open. Left
+    /// RUNNING, every resubmit attached to the dead op until the 30 min TTL.
+    #[test]
+    fn a_reopened_partition_ends_its_dispatched_op() {
+        let mut led = OpLedger::new(OP_LEDGER_CAP);
+        let (id, _) = led.submit(OP_KIND_COMPACT, 7, 0, vec![], "cli".into(), 100, 100_000);
+        led.set_running(id, 100);
+        led.note_ps_dispatch(id, Some(40));
+        let (other, _) = led.submit(OP_KIND_GC, 8, 0, vec![], "cli".into(), 100, 100_001);
+        led.set_running(other, 100);
+        led.note_ps_dispatch(other, Some(41));
+        led.update_progress(id, 21, 100);
+
+        // Same epoch: still running.
+        assert!(led.sweep_reopened(|p| Some(if p == 7 { 40 } else { 41 }), 101).is_empty());
+        assert_eq!(q_one(&led, id).state, OP_STATE_RUNNING);
+
+        // Partition 7 reopened; 8 did not.
+        let ended = led.sweep_reopened(|p| Some(if p == 7 { 50 } else { 41 }), 102);
+        assert_eq!(ended.len(), 1);
+        assert_eq!(ended[0].0, id);
+        assert_eq!(q_one(&led, id).state, OP_STATE_UNKNOWN);
+        assert_eq!(q_one(&led, other).state, OP_STATE_RUNNING);
+        assert_eq!(led.drain_pending_log().len(), 1, "the end goes to history");
+
+        let (fresh, attached) =
+            led.submit(OP_KIND_COMPACT, 7, 0, vec![], "cli".into(), 103, 103_000);
+        assert!(!attached, "a resubmit must start a new op");
+        assert_ne!(fresh, id);
+
+        // A real outcome that does arrive still wins.
+        assert!(led.reconcile_outcome(id, OP_STATE_SUCCEEDED, String::new(), String::new(), 104));
+        // Ended ops leave the epoch map.
+        assert!(led.sweep_reopened(|_| Some(99), 105).len() == 1, "only `other` is left");
+        assert!(led.ps_dispatch_epochs.is_empty());
+    }
+
+    #[test]
+    fn reconcile_outcome_transitions_once() {
+        let mut led = OpLedger::new(OP_LEDGER_CAP);
+        let (id, _) = led.submit(OP_KIND_GC, 1, 0, vec![], "cli".into(), 1, 1_000_000);
+        led.set_running(id, 1);
+        assert!(led.reconcile_outcome(id, OP_STATE_FAILED, "boom".into(), String::new(), 5));
+        assert_eq!(q_one(&led, id).state, OP_STATE_FAILED);
+        assert_eq!(q_one(&led, id).error, "boom");
+        // heartbeat retransmit → false (already terminal), state unchanged.
+        assert!(!led.reconcile_outcome(id, OP_STATE_SUCCEEDED, String::new(), String::new(), 6));
+        assert_eq!(q_one(&led, id).state, OP_STATE_FAILED);
+        // unknown op_id → false.
+        assert!(!led.reconcile_outcome(999, OP_STATE_SUCCEEDED, String::new(), String::new(), 7));
+    }
+
+    /// EC conversion must carry what recovery carries. A conversion failing on
+    /// every try used to read as no error at all, which is indistinguishable
+    /// from one that just started — while the extent's GC stayed blocked behind
+    /// it. One entry per extent is what makes the reason findable.
+    #[test]
+    fn ec_dispatch_keeps_one_entry_and_the_coordinators_reason() {
+        let mut led = OpLedger::new(OP_LEDGER_CAP);
+
+        led.note_ec_dispatch(12, 7, true, 100, 100_000);
+        let recs = led.query(&OpQueryReq::default());
+        let r = recs.iter().find(|r| r.secondary_id == 12).expect("entry");
+        assert_eq!(r.kind, OP_KIND_EC_CONVERT);
+        assert_eq!(r.state, OP_STATE_RUNNING);
+
+        // Re-dispatches land on ONE entry rather than spawning one each. The
+        // EC loop re-sends every few seconds for the whole life of the marker,
+        // so an entry per response would bury the extent in its own history.
+        for t in 1..20 {
+            led.note_ec_dispatch(12, 7, true, 100 + t, 100_000 + t * 1000);
+        }
+        let recs = led.query(&OpQueryReq::default());
+        let ec: Vec<_> = recs.iter().filter(|r| r.secondary_id == 12).collect();
+        assert_eq!(ec.len(), 1, "one entry per extent, not one per try");
+    }
+
+    /// A dispatch response can arrive a minute after the send, and a fence in
+    /// that window closes the entry. Recreating it then would leave a RUNNING
+    /// entry with no marker behind it — and nothing ever closes those, so every
+    /// later force-ec-convert of the extent attach-dedups into a silent no-op.
+    #[test]
+    fn a_response_arriving_after_the_marker_is_gone_creates_no_phantom_entry() {
+        let mut led = OpLedger::new(OP_LEDGER_CAP);
+        led.note_ec_dispatch(31, 4, /*create=*/ false, 100, 100_000);
+        assert!(
+            led.query(&OpQueryReq::default())
+                .iter()
+                .all(|r| r.secondary_id != 31),
+            "no entry may be resurrected once the marker is gone"
+        );
+
+        // With the marker still held it does create, and a later marker-less
+        // response still refreshes that live entry.
+        led.note_ec_dispatch(31, 4, true, 101, 101_000);
+        led.note_ec_dispatch(31, 4, false, 102, 102_000);
+        let recs = led.query(&OpQueryReq::default());
+        assert_eq!(
+            recs.iter().filter(|r| r.secondary_id == 31).count(),
+            1,
+            "the marker-less response refreshes the live entry, it does not add one"
+        );
+    }
+
+    /// The executing node's own reason, arriving on the `df` heartbeat. It may
+    /// only UPDATE: a node reporting about an op this ledger does not have
+    /// RUNNING is describing something already closed or never tracked, and an
+    /// entry conjured from a node report has no marker behind it, so nothing
+    /// would ever close it.
+    #[test]
+    fn a_node_reported_failure_updates_a_running_entry_and_creates_none() {
+        use autumn_rpc::manager_rpc::CODE_ERROR;
+        let mut led = OpLedger::new(OP_LEDGER_CAP);
+
+        // Nothing tracked yet — the report is dropped, not turned into an entry.
+        led.record_node_op_failure(OP_KIND_RECOVERY, 42, "peer 83 answered short".into(), CODE_ERROR);
+        assert!(
+            led.query(&OpQueryReq::default()).is_empty(),
+            "a node report must never create an entry"
+        );
+
+        led.note_recovery_dispatch(42, 2, 7, 100, 1_000_000);
+        led.record_node_op_failure(OP_KIND_RECOVERY, 42, "peer 83 answered short".into(), CODE_ERROR);
+        let r = led
+            .query(&OpQueryReq { kind_filter: OP_KIND_RECOVERY, ..Default::default() })
+            .remove(0);
+        assert_eq!(r.error, "peer 83 answered short");
+        assert_eq!(r.error_code, CODE_ERROR);
+        assert_eq!(r.state, OP_STATE_RUNNING, "a failed attempt is not a terminal state");
+
+        // Same extent, other kind: the two ops are separate entries and a
+        // report for one must not stamp the other.
+        led.record_node_op_failure(OP_KIND_EC_CONVERT, 42, "not this op".into(), CODE_ERROR);
+        let r = led
+            .query(&OpQueryReq { kind_filter: OP_KIND_RECOVERY, ..Default::default() })
+            .remove(0);
+        assert_eq!(r.error, "peer 83 answered short", "kind must gate the match");
+
+        // A report that loses the race with the completion must not stamp an
+        // error onto a closed entry — the same hazard `update_progress_by_extent`
+        // guards against, arriving through the same heartbeat.
+        led.complete_recovery(42, "rebuilt".into(), 200);
+        led.record_node_op_failure(OP_KIND_RECOVERY, 42, "late report".into(), CODE_ERROR);
+        let r = led
+            .query(&OpQueryReq { kind_filter: OP_KIND_RECOVERY, ..Default::default() })
+            .remove(0);
+        assert_eq!(r.state, OP_STATE_SUCCEEDED);
+        assert_ne!(r.error, "late report", "a closed op must not be restamped");
+    }
+
+    #[test]
+    fn recovery_lifecycle_keeps_one_entry_and_the_last_error() {
+        let mut led = OpLedger::new(OP_LEDGER_CAP);
+        // dispatch accepted → RUNNING
+        led.note_recovery_dispatch(42, 2, 7, 100, 1_000_000);
+        let recs = led.query(&OpQueryReq { kind_filter: OP_KIND_RECOVERY, ..Default::default() });
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].state, OP_STATE_RUNNING);
+        assert_eq!(recs[0].secondary_id, 42);
+        assert_eq!(recs[0].requested_by, "auto-recovery");
+        // a failed attempt keeps it RUNNING (the loop retries) but records the
+        // reason + code — the operator-actionable state.
+        led.record_recovery_failure(42, "no healthy target".into(), 3, 110, 1_100_000);
+        let r = led.query(&OpQueryReq { kind_filter: OP_KIND_RECOVERY, ..Default::default() })
+            .remove(0);
+        assert_eq!(r.state, OP_STATE_RUNNING, "recovery retries; never terminal on one failure");
+        assert_eq!(r.error, "no healthy target");
+        assert_eq!(r.error_code, 3);
+        // a re-dispatch lands on the SAME entry (one op per extent, not one per
+        // try).
+        led.note_recovery_dispatch(42, 2, 9, 120, 1_200_000);
+        assert_eq!(
+            led.query(&OpQueryReq { kind_filter: OP_KIND_RECOVERY, ..Default::default() }).len(),
+            1
+        );
+        // apply_recovery_done → SUCCEEDED, and the stale error code is cleared.
+        led.complete_recovery(42, "recovered slot onto node 9".into(), 130);
+        let r = led.query(&OpQueryReq { kind_filter: OP_KIND_RECOVERY, ..Default::default() })
+            .remove(0);
+        assert_eq!(r.state, OP_STATE_SUCCEEDED);
+        assert_eq!(r.error_code, 0);
+    }
+
+    #[test]
+    fn recovery_failure_before_any_dispatch_still_listed() {
+        let mut led = OpLedger::new(OP_LEDGER_CAP);
+        // a repair that can't even start (no candidate) must still be visible.
+        led.record_recovery_failure(9, "all recovery candidates rejected".into(), 3, 5, 5_000);
+        let r = led.query(&OpQueryReq { kind_filter: OP_KIND_RECOVERY, ..Default::default() })
+            .remove(0);
+        assert_eq!(r.state, OP_STATE_RUNNING);
+        assert_eq!(r.secondary_id, 9);
+        assert_eq!(r.error, "all recovery candidates rejected");
+    }
+
+    #[test]
+    fn seed_ec_replay_makes_inflight_ec_listable_and_closable() {
+        let mut led = OpLedger::new(OP_LEDGER_CAP);
+        led.seed_replay(OP_KIND_EC_CONVERT, [(55u64, 40), (77, 0)], 100, 1_000_000);
+        let ecs = led.query(&OpQueryReq { kind_filter: OP_KIND_EC_CONVERT, ..Default::default() });
+        assert_eq!(ecs.len(), 2);
+        assert!(ecs
+            .iter()
+            .all(|e| e.state == OP_STATE_RUNNING && e.requested_by == "replay"));
+        // The marker's OWN start time survives the leader change: 55's work
+        // began at 40, long before this promotion at 100. Stamping the
+        // promotion time would show an op that has run for an hour as one that
+        // just began, which is the first thing an operator reads. A marker with
+        // no recorded start falls back to now.
+        let e55 = ecs.iter().find(|e| e.secondary_id == 55).expect("55");
+        let e77 = ecs.iter().find(|e| e.secondary_id == 77).expect("77");
+        assert_eq!(e55.started_at, 40, "a replayed op must not look freshly started");
+        assert_eq!(e77.started_at, 100, "no recorded start falls back to now");
+        // idempotent: re-seeding an already-tracked extent doesn't duplicate.
+        led.seed_replay(OP_KIND_EC_CONVERT, [(55u64, 40)], 101, 1_100_000);
+        assert_eq!(
+            led.query(&OpQueryReq { kind_filter: OP_KIND_EC_CONVERT, ..Default::default() }).len(),
+            2
+        );
+        // a replayed entry closes normally when the conversion applies.
+        led.complete_ec(55, OP_STATE_SUCCEEDED, "done".into(), String::new(), 200);
+        let active = led.query(&OpQueryReq {
+            active_only: true,
+            kind_filter: OP_KIND_EC_CONVERT,
+            ..Default::default()
+        });
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].secondary_id, 77);
+    }
+
+    #[test]
+    fn query_filters_active_kind_limit() {
+        let mut led = OpLedger::new(OP_LEDGER_CAP);
+        let (g, _) = led.submit(OP_KIND_GC, 1, 0, vec![], "cli".into(), 0, 0);
+        let (s, _) = led.submit(OP_KIND_SPLIT, 2, 0, vec![], "cli".into(), 0, 1);
+        led.finish(g, OP_STATE_SUCCEEDED, String::new(), String::new(), 1);
+        // active-only drops the finished gc.
+        let active = led.query(&OpQueryReq { active_only: true, ..Default::default() });
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].op_id, s);
+        // kind filter.
+        let gcs = led.query(&OpQueryReq { kind_filter: OP_KIND_GC, ..Default::default() });
+        assert_eq!(gcs.len(), 1);
+        assert_eq!(gcs[0].op_id, g);
+        // limit.
+        assert_eq!(led.query(&OpQueryReq { limit: 1, ..Default::default() }).len(), 1);
+    }
+}

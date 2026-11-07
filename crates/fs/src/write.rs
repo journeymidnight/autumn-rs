@@ -1,0 +1,790 @@
+//! Write path: write buffering + flush into variable-length extents.
+//!
+//! Mirrors the 3FS InodeWriteBuf pattern, but the flush unit is a variable-
+//! length extent (≤ `MAX_EXTENT` = 8 MiB) keyed by logical offset, not a fixed
+//! 256 KiB chunk:
+//! - Sequential writes accumulate in the buffer (cap [`write_buf_cap`] =
+//!   `write_buf_extents * MAX_EXTENT` = 64 MiB).
+//! - Gap detection: a non-sequential offset flushes the buffer first.
+//! - A full buffer flushes the WHOLE buffer at once via `extent::write_region`,
+//!   which splits it into `write_buf_extents` ≤ `MAX_EXTENT` extents and
+//!   dispatches the puts via `put_many` (SDK groups by partition + one
+//!   MSG_BATCH_PUT/MSG_PUT per group). Pre-pipelining the buffer was exactly
+//!   `MAX_EXTENT` and the flush was a single serial `put` — the cp ceiling
+//!   was `MAX_EXTENT / RPC_RTT` (~270 MB/s). Now `flush ≈ write_buf_extents *
+//!   MAX_EXTENT / RPC_RTT` until disk + replica fanout saturates.
+//! - fsync/close flushes whatever remains (≤ write_buf_cap) as the same
+//!   pipelined batch (1 to `write_buf_extents` extents, last may be shorter).
+//!
+//! All extent placement / read-modify-write / non-overlap maintenance lives in
+//! `crate::extent`; this module only manages the in-memory buffer + inode meta.
+
+use anyhow::Result;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use crate::extent;
+use crate::meta::{get_inode, now_ts, put_inode};
+use crate::schema::*;
+use crate::state::FsState;
+
+// Where the write path's wall clock goes, logged once per FLUSH_LOG_EVERY
+// flushes (1 GiB written). Guessing this has been wrong three times in a row —
+// a bigger `max_write` and a deeper write buffer both looked obviously right
+// and both measured SLOWER — so the split is kept rather than re-derived. On a
+// 4 GiB write it reads roughly: fill 0.7 s, write_region 12 s, and ~4 s that is
+// in neither, i.e. outside this function entirely (the FUSE bridge, the
+// dispatcher, dd's own read of the source).
+//
+// Reading the line: the counters are PROCESS-GLOBAL — every inode, every mount
+// and every PyO3 `Fs` worker in this process sum into them — so it describes a
+// single-stream copy well and a mixed workload not at all. `total_in_write_ms`
+// is added after each call returns while the sub-timers are added inside it, so
+// the parts can exceed the total by up to one in-flight call; and a FAILED
+// flush adds to the time but not to `flushes`/`mib`, which skews the ratios
+// after an error. Everything is CUMULATIVE for the life of the process and
+// never reset, so a second copy through the same daemon reads as double — take
+// the numbers from a fresh mount, or subtract.
+static FILL_NS: AtomicU64 = AtomicU64::new(0);
+static FLUSH_NS: AtomicU64 = AtomicU64::new(0);
+/// Time spent MOVING the filled buffer out at flush. Near zero by construction
+/// now; kept because it was 12% of a 4 GiB write when it was a copy, and the
+/// number is what proves it is gone.
+static COPY_NS: AtomicU64 = AtomicU64::new(0);
+static FLUSHES: AtomicU64 = AtomicU64::new(0);
+static FLUSH_BYTES: AtomicU64 = AtomicU64::new(0);
+static TOTAL_NS: AtomicU64 = AtomicU64::new(0);
+static WRITE_CALLS: AtomicU64 = AtomicU64::new(0);
+const FLUSH_LOG_EVERY: u64 = 16;
+
+/// Await the OLDEST in-flight flush and apply its consequences. `None` when
+/// the inode has nothing in flight.
+///
+/// Split out so the write path can free ONE slot without waiting for the whole
+/// queue — that distinction is the entire point of the queue. The obligation to
+/// leave NOTHING in flight belongs to `drain_pending`, not here.
+///
+/// A failed flush is recorded on the inode as well as returned, because the
+/// caller is often the dispatcher's blanket drain, which only logs. The record
+/// is RETIRED at exactly the three places a writeback error is retired on
+/// Linux — FUSE_FLUSH (which the kernel sends on every `close()`), FSYNC, and
+/// the PyO3 binding's explicit flush — and they consume it BEFORE persisting a
+/// size that would cover bytes which never landed. Every other caller passes
+/// `BestEffort`; see [`FlushReport`] for why "this caller returns an error to
+/// somebody" is NOT the test. It cannot surface at the `write()` that started
+/// it either — that call returned before the puts ran.
+async fn settle_oldest(state: &mut FsState, ino: u64) -> Option<Result<()>> {
+    let pending = state
+        .inodes
+        .get_mut(&ino)
+        .and_then(|is| is.pending_flushes.pop_front())?;
+    let res = pending
+        .task
+        .await
+        .unwrap_or_else(|e| Err(anyhow::anyhow!("append flush task: {e:?}")));
+    match &res {
+        // Apply the map updates only on success: a failed put wrote nothing,
+        // and recording the extent would make a later read believe in bytes
+        // that are not there.
+        Ok(()) => {
+            if let Some(is) = state.inodes.get_mut(&ino) {
+                if let Some(ext) = is.extents.as_mut() {
+                    for &(start, len) in &pending.upserts {
+                        crate::extent::upsert(ext, start, len);
+                    }
+                }
+            }
+        }
+        // STICK the failure to the inode as well as returning it. Returning
+        // alone is not enough: the dispatcher drains ahead of every non-write
+        // handler and only logs, so the fsync that must report this would find
+        // nothing pending and acknowledge success over the missing bytes.
+        Err(e) => {
+            if let Some(is) = state.inodes.get_mut(&ino) {
+                if is.flush_error.is_none() {
+                    is.flush_error = Some(format!("{e:#}"));
+                }
+            }
+        }
+    }
+    Some(res)
+}
+
+/// Free one slot so another flush can be planned — awaits the oldest in-flight
+/// flush ONLY when the queue is already at [`append_inflight_depth`].
+///
+/// This replaced the unconditional drain the writer used to do before planning,
+/// which is precisely why only one batch was ever in flight.
+async fn make_room(state: &mut FsState, ino: u64) -> Result<()> {
+    let full = state
+        .inodes
+        .get(&ino)
+        .is_some_and(|is| is.pending_flushes.len() >= crate::schema::append_inflight_depth());
+    if !full {
+        return Ok(());
+    }
+    settle_oldest(state, ino).await.unwrap_or(Ok(()))
+}
+
+/// Await EVERY in-flight flush for this inode and apply what lands.
+///
+/// EVERY path that reads the extent map, publishes the inode's size, or writes
+/// anywhere but contiguously past the buffer MUST come through here first —
+/// while a flush is queued the map is missing its extents and the bytes are not
+/// durable. The dispatcher does it for every request that is not a write
+/// (`dispatch::handle_request`), so the obligation here is only the write
+/// path's own non-contiguous shapes.
+///
+/// `drain_all_pending` and `flush_inode` both rely on this leaving NOTHING in
+/// flight: a surviving slot means the extent map is still incomplete, and fsync
+/// would then publish a size covering bytes that never landed. That is also why
+/// it keeps draining after a failure instead of returning early — the
+/// postcondition is "queue empty", and an early return leaves slots behind
+/// while the caller concludes the inode is quiesced.
+///
+/// Do NOT "simplify" that into clearing the queue on error. Compio 0.19's
+/// `JoinHandle::drop` cancels its task — dropping a
+/// `PendingFlush` CANCELS its flush, so puts it had not yet issued never go out
+/// and replies to those already in flight are never read. (`compio::runtime`'s
+/// "the task will not be cancelled even if the future is dropped" is
+/// `spawn_blocking`'s contract, not `spawn`'s — an easy sentence to misread.)
+pub async fn drain_pending(state: &mut FsState, ino: u64) -> Result<()> {
+    let mut first_err = None;
+    while let Some(res) = settle_oldest(state, ino).await {
+        if let Err(e) = res {
+            first_err.get_or_insert(e);
+        }
+    }
+    match first_err {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
+/// Whether the caller of [`flush_inode`] will hand a failure to the
+/// application, and therefore whether it may CONSUME the sticky record.
+///
+/// `flush_error` is errseq_t-shaped: one report per failure. That only works
+/// if the report reaches someone who acts on it, and three callers cannot
+/// make it reach anyone. `periodic_sync` and `Destroy` take a failure and only
+/// `tracing::warn!` it. RELEASE is the one that reads like it reports and does
+/// not: it may answer the kernel with an error, but fuser's contract is that
+/// "error values are not returned to close() or munmap() which triggered the
+/// release", so the kernel drops it — which is why EVERY release passes
+/// `BestEffort`, not just a revoked one. If any of the three consumes the
+/// record, the application's next fsync finds nothing pending, persists a size
+/// covering the missing bytes, and answers SUCCESS over a hole. That is
+/// precisely what the record exists to prevent.
+///
+/// THE PRICE, stated here because it is easy to meet and hard to diagnose:
+/// while a record stands, `flush_inode` returns from the check before it does
+/// anything — before `write_region`, before `put_inode`, before
+/// `dirty_inodes.remove`. So until a retiring caller clears it, the inode stays
+/// dirty, `periodic_sync` re-fails and re-warns every 30 s, the buffered tail
+/// is not written even after the cluster recovers, AND every operation that
+/// routes through `flush_inode` keeps failing: each read overlapping the dirty
+/// buffer, each non-contiguous write, and each truncate — which includes every
+/// `open(O_TRUNC)`, because no `ATOMIC_O_TRUNC` is negotiated so the kernel
+/// turns it into SETATTR(size=0). So the obvious recovery gesture, reopen the
+/// file and rewrite it, is blocked on exactly the inode that is stuck. That is
+/// the most likely way anyone meets this. Pre-change the first of those calls
+/// consumed the record and the second succeeded — which is precisely the
+/// silent-hole path.
+///
+/// It is retired by the next FLUSH or FSYNC, and NEITHER IS GUARANTEED: the
+/// kernel sends FUSE_FLUSH on `close()` in practice, but fuser explicitly
+/// disclaims it ("shouldn't assume that flush will always be called ... or that
+/// it will be called at all"), which is the same sentence that denies RELEASE
+/// the right to consume. Do not write that the price is bounded by the fd's
+/// life — leaning on that guarantee here while refusing it there is exactly the
+/// inconsistency this classification exists to avoid. An application that never
+/// closes and never fsyncs keeps the inode stuck for the life of the mount.
+/// That is the deliberate trade — a stuck, loud inode instead of a silent hole.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FlushReport {
+    /// Retire the record here. Exactly three callers qualify, and they are
+    /// Linux's writeback-error retirement points: FUSE_FLUSH (which the kernel
+    /// sends on every `close()`), FSYNC, and the PyO3 binding's explicit
+    /// flush. errseq_t semantics — one report per failure.
+    ///
+    /// One of the three is inert today, and saying so costs nothing: a record
+    /// can only be SET by `settle_oldest`, which only runs on
+    /// `pending_flushes`, which are only pushed when `FsState::pipelined_writes`
+    /// is on — and that is the fuse MOUNT alone. So the PyO3 binding (and
+    /// `autumnfs`, and `autumn-s3`) can never hold a standing record, and its
+    /// `ToApplication` never has anything to consume. It is classified for when
+    /// that changes, not because it fires now. The useful corollary: a
+    /// front-end with no FUSE_FLUSH cannot wedge on this, because it cannot
+    /// reach the state.
+    ToApplication,
+    /// MUST NOT consume. "Does this caller return an error to somebody" is NOT
+    /// the test, and reaching for it is how three separate sites got this
+    /// wrong. Either nobody is told at all (`periodic_sync` and `Destroy` only
+    /// log; a RELEASE reply is discarded by the kernel before it reaches
+    /// `close()`), or somebody IS told at a point that does not retire a
+    /// writeback error: the read-after-write barrier, a buffered `write()`
+    /// whose gap flush fails, and `ftruncate`. Linux retires only at
+    /// fsync/close/msync, because an application that hits EIO on a read or a
+    /// write, retries it successfully, and then closes must STILL have that
+    /// close fail.
+    BestEffort,
+}
+
+/// Read this inode's recorded flush failure WITHOUT consuming it.
+fn peek_flush_error(state: &FsState, ino: u64) -> Option<String> {
+    state.inodes.get(&ino).and_then(|is| is.flush_error.clone())
+}
+
+/// Take this inode's recorded flush failure, if any. Reporting CONSUMES it —
+/// one report per failure, like `errseq_t`: the caller has been told, and a
+/// later unrelated fsync should not fail again for it.
+fn take_flush_error(state: &mut FsState, ino: u64) -> Option<String> {
+    state
+        .inodes
+        .get_mut(&ino)
+        .and_then(|is| is.flush_error.take())
+}
+
+/// Drain every inode's pending flush. The dispatcher calls this ahead of any
+/// request that is not a write, so no other operation can observe a half-
+/// applied extent map — one place instead of an audit of every call site.
+pub async fn drain_all_pending(state: &mut FsState) -> Result<()> {
+    let inos: Vec<u64> = state
+        .inodes
+        .iter()
+        .filter(|(_, is)| !is.pending_flushes.is_empty())
+        .map(|(ino, _)| *ino)
+        .collect();
+    let mut first_err = None;
+    for ino in inos {
+        if let Err(e) = drain_pending(state, ino).await {
+            tracing::warn!(ino, error = %e, "pending append flush failed");
+            first_err.get_or_insert(e);
+        }
+    }
+    match first_err {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
+/// Hand a flushed buffer's allocation back to the inode so the next fill reuses
+/// it.
+///
+/// The buffer is installed AS-IS, length included. Clearing it would look
+/// tidier and would cost a 64 MiB memset per flush: `mem::take` leaves a len-0
+/// `Vec` behind, so a cleared buffer makes the fill loop's
+/// `resize(wb.len + to_copy, 0)` run on every iteration, zero-writing exactly
+/// the bytes `copy_from_slice` overwrites on the next line. Keeping the length
+/// restores the steady state the copying version happened to have. Stale bytes
+/// past `wb.len` are never read: `wb.len` is the length of record and all three
+/// consumers — the fill, the flush, and `flush_inode` — slice `[..wb.len]`.
+///
+/// The two early returns and the capacity test remain unreachable: this is
+/// called synchronously, before anything is spawned and while `&mut FsState` is
+/// still held, so no other operation can drop the inode or grow a new buffer in
+/// between. That is a property of the CALL SITE, not of this function — the
+/// capacity test looks only at capacity, so against a genuinely concurrent
+/// refill it could install over live buffered bytes.
+fn reclaim_buffer(state: &mut FsState, ino: u64, buf: Vec<u8>) {
+    let Some(is) = state.inodes.get_mut(&ino) else {
+        return;
+    };
+    let Some(wb) = is.write_buf.as_mut() else {
+        return;
+    };
+    if wb.buf.capacity() < buf.capacity() {
+        wb.buf = buf;
+    }
+}
+
+/// Write data to a file. Returns bytes written.
+pub async fn write(state: &mut FsState, ino: u64, offset: i64, data: &[u8]) -> Result<u32> {
+    let t_total = std::time::Instant::now();
+    WRITE_CALLS.fetch_add(1, Ordering::Relaxed);
+    let r = write_inner(state, ino, offset, data).await;
+    TOTAL_NS.fetch_add(t_total.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    r
+}
+
+async fn write_inner(state: &mut FsState, ino: u64, offset: i64, data: &[u8]) -> Result<u32> {
+    // Reject a negative offset (symmetric with `read::prepare`). The kernel FUSE
+    // path never sends one, but a direct core caller (the PyO3 `autumn.Fs`
+    // binding, M2) could — and `offset as u64` would wrap to a huge
+    // logical offset, poisoning size/extent-key math on flush.
+    if offset < 0 {
+        return Err(anyhow::anyhow!("negative offset"));
+    }
+    if data.is_empty() {
+        return Ok(0);
+    }
+
+    ensure_inode_cached(state, ino).await?;
+
+    // fuse cannot yet MODIFY a striped file — writing here
+    // would emit LEGACY-layout `[0x03][ino][off]` extents into an inode whose data
+    // lives under `[0x03][lane][ino][off]`, mixing layouts + corrupting the file.
+    // fuse READS striped files fine; deferred fuse write-striping (B2) will lift
+    // this. Until then, refuse (use autumnfs to (re)write large striped files).
+    if state.inodes.get(&ino).and_then(|is| is.meta.stripe.as_ref()).is_some() {
+        return Err(anyhow::anyhow!(
+            "fuse write to a striped file (ino {ino}) is not supported yet; use autumnfs"
+        ));
+    }
+
+    // A write that GROWS the file past the current
+    // EOF must reap crashed-shrink leftovers BEFORE the in-memory size
+    // bumps below — the bump erases the pre-grow EOF, so by flush time
+    // `write_region` sees the grown size and a stale straddler tail looks
+    // like legitimate in-file data (its RMW would merge the write into
+    // the stale value and expose pre-shrink bytes in the sparse hole).
+    // Cold path: only fires on a beyond-EOF write (offset > size).
+    // A segmented file has no extents beyond its map for a grow to expose.
+    let segmented = state.inodes.get(&ino).is_some_and(|is| is.meta.segments.is_some());
+    if !segmented {
+        let cur_size = state.inodes.get(&ino).map(|is| is.meta.size).unwrap_or(0);
+        if offset as u64 > cur_size {
+            // Reads and rewrites the extent map, so nothing may be in flight.
+            drain_pending(state, ino).await?;
+            extent::clean_beyond_eof(state, ino, cur_size).await?;
+        }
+    }
+
+    // Gap detection: if buffer has data and the write is not contiguous, flush first.
+    let needs_flush = {
+        let is = state.inodes.get(&ino).unwrap();
+        if let Some(ref wb) = is.write_buf {
+            wb.len > 0 && offset != wb.offset + wb.len as i64
+        } else {
+            false
+        }
+    };
+    if needs_flush {
+        // `flush_inode` drains for us. Do NOT drain unconditionally here: the
+        // contiguous case only copies into the buffer and touches no extent
+        // map, and waiting on the in-flight flush at every 1 MiB write is
+        // exactly the serialization the pipelining exists to remove (measured:
+        // it put the whole gain back, 242 vs the 244 it started from).
+        //
+        // BestEffort: this `?` does hand the caller EIO, but a buffered
+        // `write()` is not where a writeback error retires — same argument as
+        // the read-after-write barrier. Consuming here would let the app retry
+        // the write (the buffer is untouched, since `flush_inode` returns
+        // before extracting it), succeed, and then have `close()` find nothing
+        // pending and publish a size over the hole.
+        flush_inode(state, ino, FlushReport::BestEffort).await?;
+    }
+
+    // Ensure write buffer exists
+    {
+        let is = state.inodes.get_mut(&ino).unwrap();
+        if is.write_buf.is_none() {
+            is.write_buf = Some(WriteBuffer::new());
+        }
+        let wb = is.write_buf.as_mut().unwrap();
+        if wb.len == 0 {
+            wb.offset = offset;
+        }
+    }
+
+    let mut written = 0usize;
+    let mut remaining = data;
+
+    while !remaining.is_empty() {
+        // Copy as much as fits into the buffer.
+        let t_fill = std::time::Instant::now();
+        let (flush_needed, copied) = {
+            let is = state.inodes.get_mut(&ino).unwrap();
+            let wb = is.write_buf.as_mut().unwrap();
+            let space = write_buf_cap() - wb.len;
+            let to_copy = std::cmp::min(space, remaining.len());
+            if wb.buf.len() < wb.len + to_copy {
+                wb.buf.resize(wb.len + to_copy, 0);
+            }
+            wb.buf[wb.len..wb.len + to_copy].copy_from_slice(&remaining[..to_copy]);
+            wb.len += to_copy;
+            (wb.len >= write_buf_cap(), to_copy)
+        };
+        FILL_NS.fetch_add(t_fill.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        written += copied;
+        remaining = &remaining[copied..];
+
+        if flush_needed {
+            // Drain the WHOLE buffer (≤ write_buf_cap) in one shot —
+            // `write_region` splits into `≤ write_buf_extents` extents and
+            // pipelines the puts via `put_many` (server-batched per partition).
+            // Pre-pipelining we drained one MAX_EXTENT at a time → single
+            // serial put → `cp` ceiling was `MAX_EXTENT / RPC_RTT`.
+            // MOVE the buffer out rather than copying it. `write_region` needs
+            // `&mut FsState`, which owns the buffer, so the data cannot simply
+            // be borrowed across the call — the previous answer was
+            // `wb.buf[..wb.len].to_vec()`, a fresh 64 MiB allocation and copy
+            // per flush that measured 2.5 s of a 20 s 4 GiB write (12%), on top
+            // of the copy the kernel's bytes already paid getting INTO the
+            // buffer. `mem::take` is O(1); the `Vec` is handed back below so
+            // the next fill reuses the allocation instead of growing a new
+            // 64 MiB one.
+            let t_copy = std::time::Instant::now();
+            let (flush_offset, flush_len, flush_buf) = {
+                let is = state.inodes.get_mut(&ino).unwrap();
+                let wb = is.write_buf.as_mut().unwrap();
+                let fo = wb.offset;
+                let n = wb.len;
+                let buf = std::mem::take(&mut wb.buf);
+                wb.offset = fo + n as i64;
+                wb.len = 0;
+                (fo, n, buf)
+            };
+            COPY_NS.fetch_add(t_copy.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            let file_size = state.inodes.get(&ino).map(|is| is.meta.size).unwrap_or(0);
+            let t_flush = std::time::Instant::now();
+            let n = flush_len as u64;
+            // Free a slot if the queue is full. This USED to be an
+            // unconditional `drain_pending`, which is why only one batch was
+            // ever on the wire: the writer could not even PLAN batch N+1 until
+            // batch N had landed.
+            //
+            // That drain gave two reasons for itself. Neither survives.
+            //
+            // (1) "the previous flush's extents are not in the map yet" — true,
+            // but it cannot matter HERE. `plan_append_only` consults the map
+            // for exactly one question: does any extent reach past `offset`.
+            // Consecutive append batches cover DISJOINT, increasing ranges
+            // (`wb.offset` advances by precisely what it flushed), so every
+            // extent still missing from the map lies strictly BELOW this
+            // batch's offset and could not change that answer. A stale map here
+            // can only omit extents that are already behind us.
+            //
+            // (2) "two in flight make a failure impossible to attribute" — fuse
+            // does not need the attribution. `flush_error` is per-inode and
+            // errseq_t-shaped: fsync must report THAT this file had a failed
+            // writeback, not which 64 MiB of it. Disjoint ranges mean a failed
+            // batch leaves a hole and the others stay valid on their own.
+            make_room(state, ino).await?;
+            let plan = extent::plan_append_only(
+                state,
+                ino,
+                flush_offset as u64,
+                &flush_buf[..flush_len],
+                file_size,
+            )
+            .await?;
+            let plan = if state.pipelined_writes { plan } else { None };
+            let res = match plan {
+                // Pure append: hand the puts to a spawned task and go back to
+                // the kernel. The plan owns copies of the bytes, so the buffer
+                // is free the moment it exists — no second buffer, and the fill
+                // of the NEXT 64 MiB overlaps these puts instead of waiting.
+                Some(plan) => {
+                    reclaim_buffer(state, ino, flush_buf);
+                    let client = state.client.clone();
+                    let upserts = plan.upserts().to_vec();
+                    let task = compio::runtime::spawn(async move {
+                        extent::execute_append(client, &plan).await
+                    });
+                    if let Some(is) = state.inodes.get_mut(&ino) {
+                        is.pending_flushes
+                            .push_back(crate::schema::PendingFlush { task, upserts });
+                    }
+                    Ok(())
+                }
+                // Anything else — read-modify-write, a hole, beyond-EOF residue
+                // — stays inline, because those read the extent map and it is
+                // only complete while nothing is in flight.
+                None => {
+                    let r = extent::write_region(
+                        state,
+                        ino,
+                        flush_offset as u64,
+                        &flush_buf[..flush_len],
+                        file_size,
+                    )
+                    .await;
+                    reclaim_buffer(state, ino, flush_buf);
+                    r
+                }
+            };
+            FLUSH_NS.fetch_add(t_flush.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            res?;
+            FLUSH_BYTES.fetch_add(n, Ordering::Relaxed);
+            let f = FLUSHES.fetch_add(1, Ordering::Relaxed) + 1;
+            if f % FLUSH_LOG_EVERY == 0 {
+                let fill = FILL_NS.load(Ordering::Relaxed) / 1_000_000;
+                let cp = COPY_NS.load(Ordering::Relaxed) / 1_000_000;
+                let fl = FLUSH_NS.load(Ordering::Relaxed) / 1_000_000;
+                let mb = FLUSH_BYTES.load(Ordering::Relaxed) / 1_048_576;
+                tracing::info!(
+                    flushes = f,
+                    mib = mb,
+                    fill_ms = fill,
+                    buf_handoff_ms = cp,
+                    write_region_ms = fl,
+                    total_in_write_ms = TOTAL_NS.load(Ordering::Relaxed) / 1_000_000,
+                    write_calls = WRITE_CALLS.load(Ordering::Relaxed),
+                    "fuse write breakdown"
+                );
+            }
+        }
+    }
+
+    // Update file size and timestamps
+    let epoch = state.write_lease_for(ino).lease_epoch;
+    {
+        let is = state.inodes.get_mut(&ino).unwrap();
+        is.write_epoch = is.write_epoch.max(epoch);
+        let new_end = offset as u64 + written as u64;
+        if new_end > is.meta.size {
+            is.meta.size = new_end;
+        }
+        let (s, ns) = now_ts();
+        is.meta.mtime_secs = s;
+        is.meta.mtime_nsecs = ns;
+        // A new content version, persisted with the size at the next flush.
+        is.meta.generation += 1;
+        is.dirty = true;
+    }
+    state.dirty_inodes.insert(ino);
+
+    Ok(written as u32)
+}
+
+/// Flush all buffered writes for an inode.
+///
+/// `report` says whether this caller hands a failure to the application, and
+/// so whether it may consume the sticky `flush_error` — see [`FlushReport`].
+pub async fn flush_inode(state: &mut FsState, ino: u64, report: FlushReport) -> Result<()> {
+    // Drain first: this publishes the inode's size and reads the extent map,
+    // and the crash-consistency rule is that extent puts ACK before a size
+    // that covers them is persisted.
+    let drained = drain_pending(state, ino).await;
+    // Report a failure from ANY earlier flush of this inode, including one the
+    // dispatcher's drain already consumed, and do it BEFORE persisting a size
+    // that would cover the bytes that never landed. This is the whole point of
+    // `flush_error`: fsync must not answer success over a hole.
+    let earlier = match report {
+        FlushReport::ToApplication => take_flush_error(state, ino),
+        FlushReport::BestEffort => peek_flush_error(state, ino),
+    };
+    if let Some(msg) = earlier {
+        return Err(anyhow::anyhow!("earlier write flush failed: {msg}"));
+    }
+    drained?;
+
+    // Extract buffered chunk data (if any) to drain before persisting meta.
+    let (buf_data, buf_offset, buf_len) = {
+        let is = match state.inodes.get_mut(&ino) {
+            Some(is) => is,
+            None => return Ok(()),
+        };
+        match is.write_buf.as_mut() {
+            Some(wb) if wb.len > 0 => {
+                let data = wb.buf[..wb.len].to_vec();
+                let offset = wb.offset;
+                let len = wb.len;
+                wb.len = 0;
+                (data, offset, len)
+            }
+            _ => (Vec::new(), 0i64, 0usize),
+        }
+    };
+
+    // Persist buffered data as variable-length extents (no-op when buf_len == 0).
+    // `write_region` splits into MAX_EXTENT-capped, non-overlapping extents.
+    if buf_len > 0 {
+        let file_size = state.inodes.get(&ino).map(|is| is.meta.size).unwrap_or(0);
+        if let Err(e) =
+            extent::write_region(state, ino, buf_offset as u64, &buf_data[..buf_len], file_size).await
+        {
+            return Err(settle_refused_flush(state, ino, e));
+        }
+    }
+
+    // Persist the current InodeMeta if dirty — captures size/mtime updates from
+    // writes whose chunk data was already flushed incrementally during write().
+    // `dirty` clears only once the put landed: cleared first, a refused put
+    // left nothing for the next flush to retry and an fsync nothing to report.
+    let meta = match state.inodes.get(&ino) {
+        Some(is) if is.dirty => is.meta.clone(),
+        _ => return Ok(()),
+    };
+    if let Err(e) = put_inode(state, ino, &meta).await {
+        return Err(settle_refused_flush(state, ino, e));
+    }
+    if let Some(is) = state.inodes.get_mut(&ino) {
+        is.dirty = false;
+        is.write_epoch = 0;
+    }
+    state.dirty_inodes.remove(&ino);
+
+    Ok(())
+}
+
+/// A put of this inode's unpublished state failed. The failure sticks to the
+/// inode until a `FlushReport::ToApplication` flush reports it (the write that
+/// made the state returned long ago; while it stands, flushes return it instead
+/// of putting). A FENCE refusal is final — the lease moved to another writer,
+/// so these bytes can never land — and the state is dropped; anything else
+/// stays dirty, and the flush after the report retries it.
+fn settle_refused_flush(state: &mut FsState, ino: u64, e: anyhow::Error) -> anyhow::Error {
+    let fenced = e.chain().any(|c| {
+        c.downcast_ref::<autumn_client::AutumnError>()
+            .is_some_and(|a| matches!(a, autumn_client::AutumnError::Fenced(_)))
+    });
+    if let Some(is) = state.inodes.get_mut(&ino) {
+        if is.flush_error.is_none() {
+            is.flush_error = Some(format!("{e:#}"));
+        }
+        if fenced {
+            tracing::warn!(ino, error = format!("{e:#}"), "flush fenced: the lease is gone; dropping the unpublished state");
+            is.write_buf = None;
+            is.dirty = false;
+            is.write_epoch = 0;
+        }
+    }
+    if fenced {
+        state.dirty_inodes.remove(&ino);
+    }
+    e
+}
+
+/// Ensure the inode is loaded in the cache.
+pub(crate) async fn ensure_inode_cached(state: &mut FsState, ino: u64) -> Result<()> {
+    if state.inodes.contains_key(&ino) {
+        return Ok(());
+    }
+    let meta = get_inode(state, ino).await?;
+    state.inodes.insert(
+        ino,
+        InodeState {
+            meta,
+            write_epoch: 0,
+            write_buf: None,
+            pending_flushes: std::collections::VecDeque::new(),
+            flush_error: None,
+            dirty: false,
+            open_count: 0,
+            extents: None,
+            cached_version: 0,
+        },
+    );
+    Ok(())
+}
+
+/// Truncate a file to the given size.
+///
+/// A segmented file is changed only under a WRITE lease. `open(O_TRUNC)` and
+/// path `truncate(2)` reach here before (or without) any open, so when this
+/// session holds nothing on the file the lease is taken for this one change.
+pub async fn truncate(state: &mut FsState, ino: u64, new_size: u64) -> Result<()> {
+    if !crate::segment::needs_transient_write(state, ino).await? {
+        return truncate_held(state, ino, new_size).await;
+    }
+    crate::segment::hold_transient_write(state, ino).await?;
+    let res = truncate_held(state, ino, new_size).await;
+    if res.is_err() {
+        // The cached map may name pages the failed put never published, and
+        // which the reclaim below is about to delete.
+        state.inodes.remove(&ino);
+        state.dirty_inodes.remove(&ino);
+    }
+    crate::segment::drop_transient_write(state, ino).await;
+    res
+}
+
+async fn truncate_held(state: &mut FsState, ino: u64, new_size: u64) -> Result<()> {
+    ensure_inode_cached(state, ino).await?;
+    // fuse truncate of a striped file would run the legacy
+    // range-scan extent cleanup, which finds no `[0x03][lane]…` keys → leaks the
+    // striped extents (and a grow would emit legacy-layout ones). Refuse until
+    // fuse write-striping (B2); reads work. Use autumnfs to manage striped files.
+    if state.inodes.get(&ino).and_then(|is| is.meta.stripe.as_ref()).is_some() {
+        return Err(anyhow::anyhow!(
+            "fuse truncate of a striped file (ino {ino}) is not supported yet; use autumnfs"
+        ));
+    }
+    // BestEffort: `ftruncate` is not one of Linux's writeback-error retirement
+    // points either, and this one is the most tempting to get wrong because
+    // truncate is about to rewrite the size anyway — but it returns before it
+    // does, so consuming here loses the record and leaves the later `close()`
+    // to answer success over the hole.
+    flush_inode(state, ino, FlushReport::BestEffort).await?;
+
+    // Extract old_size and inline info
+    let (old_size, has_inline) = {
+        let is = state.inodes.get(&ino).unwrap();
+        (is.meta.size, is.meta.inline_data.is_some())
+    };
+
+    if new_size == old_size {
+        return Ok(());
+    }
+
+    // Shrink ordering: the inode-meta put is the COMMIT
+    // POINT and must land BEFORE any extent destruction. Pre-fix the
+    // shrink deleted/shortened extent KVs first and persisted the new
+    // size after — a crash in between left durable size = old_size with
+    // the data already destroyed, so reads in [new_size, old_size)
+    // returned zeros INSIDE the file (silent corruption; the one
+    // crash-window in this layer that fabricated data rather than just
+    // losing a recent un-fsynced write). Meta-first inverts the leftover:
+    // a crash after the put leaves extents beyond the new size — they are
+    // invisible to reads (bounded by size) and self-heal via the
+    // prefix-scan deletes (unlink / later truncate) or same-key rewrites
+    // (a regrowing append re-derives the same [ino][off] keys).
+    if new_size < old_size && has_inline {
+        let is = state.inodes.get_mut(&ino).unwrap();
+        if let Some(ref mut data) = is.meta.inline_data {
+            data.truncate(new_size as usize);
+            if data.is_empty() {
+                is.meta.inline_data = None;
+            }
+        }
+    }
+
+    let segmented = state.inodes.get(&ino).is_some_and(|is| is.meta.segments.is_some());
+    if segmented {
+        // Clip the map; a later extension is a hole. The data the clip drops
+        // stays until reclaim, which waits for readers of the older map.
+        crate::segment::truncate_file(state, ino, new_size).await?;
+    } else if new_size > old_size {
+        // GROW: reap any leftover extents beyond the old EOF
+        // BEFORE the size expands over them — the residue of a crashed
+        // shrink's cleanup window would otherwise re-enter the readable
+        // range as resurrected old data where POSIX requires zeros.
+        // Runs while the leftovers are still invisible (size = old), so
+        // a crash mid-sweep is safe and the next grow retries.
+        extent::clean_beyond_eof(state, ino, old_size).await?;
+    }
+
+    // Update + persist metadata (the commit point).
+    let meta = {
+        let is = state.inodes.get_mut(&ino).unwrap();
+        is.meta.size = new_size;
+        let (s, ns) = now_ts();
+        is.meta.mtime_secs = s;
+        is.meta.mtime_nsecs = ns;
+        is.meta.ctime_secs = s;
+        is.meta.ctime_nsecs = ns;
+        if !segmented {
+            is.meta.generation += 1;
+        }
+        is.meta.clone()
+    };
+    put_inode(state, ino, &meta).await?;
+
+    if new_size < old_size && !segmented {
+        // Cleanup AFTER the commit: delete extents past the new EOF +
+        // shorten the straddling one (variable-length extents
+        // keyed by logical offset). The truncate is already COMMITTED
+        // (meta landed), so a cleanup error must NOT surface as failure
+        // (the caller would retry, hit the `new_size ==
+        // old_size` early-return no-op, and never re-clean) — leftovers
+        // are benign while size stays put and every grow path sweeps
+        // them via `clean_beyond_eof` before exposure.
+        if let Err(e) = extent::truncate_extents(state, ino, new_size, old_size).await {
+            tracing::warn!(ino, new_size, old_size, "post-commit truncate cleanup failed (leftovers reaped on next grow/unlink): {e}");
+            extent::invalidate(state, ino);
+        }
+    }
+
+    Ok(())
+}

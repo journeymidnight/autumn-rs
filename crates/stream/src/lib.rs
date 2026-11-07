@@ -1,0 +1,21 @@
+pub mod client;
+pub mod conn_pool;
+pub mod erasure;
+pub mod extent_node;
+#[cfg(target_os = "linux")]
+mod direct_io;
+mod extent_cksum;
+mod extent_scrub;
+/// extent_rpc relocated to autumn-rpc (joins manager_rpc /
+/// partition_rpc as the single wire-schema home). Re-exported here so all
+/// existing `autumn_stream::extent_rpc::*` / `crate::extent_rpc::*` paths
+/// keep resolving unchanged.
+pub use autumn_rpc::extent_rpc;
+
+pub use client::{
+    is_append_outcome_unknown, read_extent_shard_direct, read_extent_value_direct, read_extent_value_landed, Landed,
+    set_read_hedge_ms, AppendResult, CopySource, RangeCopies, RangeCopy, StaleVpOffset,
+    StreamClient, APPEND_OUTCOME_UNKNOWN,
+};
+pub use conn_pool::{normalize_endpoint, shard_addr_for_extent, ConnPool};
+pub use extent_node::{en_params, render_en_metrics, ExtentNode, ExtentNodeConfig, SharedAuthz};

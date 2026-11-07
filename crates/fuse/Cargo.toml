@@ -1,0 +1,54 @@
+[package]
+name = "autumn-fuse"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# The kernel mount: the `fuser::Filesystem` impl, the fuser<->compio bridge,
+# the dispatch loop and the read I/O pool, over the `fs/` tree implemented in
+# `autumn-fs`. This is the only crate that needs libfuse.
+
+[[bin]]
+name = "autumn-fuse"
+path = "src/main.rs"
+
+[features]
+# Build the mount binary with UCX so `--transport ucx` works against a UCX cluster.
+ucx = ["autumn-transport/ucx", "autumn-client/ucx"]
+
+[dependencies]
+autumn-rpc = { path = "../rpc" }
+autumn-params = { path = "../params" }
+autumn-client = { path = "../client" }
+autumn-transport = { path = "../transport" }
+autumn-fs = { path = "../fs" }
+
+anyhow.workspace = true
+bytes.workspace = true
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+rkyv = { version = "0.8", features = ["alloc"] }
+crc32c.workspace = true
+# Two floors, both load-bearing:
+#   abi-7-12 — `Notifier::inval_inode` / `inval_entry`, so the per-mount
+#     invalidation poll loop can drop the kernel's attribute + page cache on a
+#     per-ino `WriterClosed` event. That is what carries close-to-open
+#     coherence all the way to the kernel boundary.
+#   abi-7-28 — `FUSE_MAX_PAGES` and the INIT reply's `max_pages` field, both of
+#     which are `#[cfg]`-compiled-out below it. Without them the kernel clamps
+#     EVERY request to its 32-page default of 128 KiB, which made
+#     `set_max_write` in `ops.rs::init` inert and cost the read path 45%
+#     (898 -> 1621 MiB/s on a 4 GiB file when it was enabled).
+# Raising this floor makes new opcodes reachable: check what lands on a method
+# we already implement, not just what gets ENOSYS. `FUSE_RENAME2` is the one
+# that did — see the flags guard in `ops.rs::rename`.
+fuser = { version = "0.15", features = ["abi-7-28"] }
+libc = "0.2"
+futures = "0.3"
+compio = { workspace = true, features = ["runtime", "time", "io", "net"] }
+rand = "0.8"
+
+[lints]
+workspace = true

@@ -1,0 +1,21 @@
+name: Feature request or question
+description: An idea, a missing piece, or a question about using autumn-rs.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to do
+      description: The workload or task, and where autumn-rs gets in the way today.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What would help
+      description: The behaviour or interface you have in mind, if any.
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What you tried
+      description: Workarounds, or other systems you use for this.

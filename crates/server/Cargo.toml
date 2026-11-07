@@ -1,0 +1,120 @@
+[package]
+name = "autumn-server"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bench]]
+name = "core_path"
+harness = false
+
+[[bench]]
+name = "controlled_path"
+harness = false
+
+[[bin]]
+name = "autumn-manager-server"
+path = "src/bin/manager.rs"
+
+[[bin]]
+name = "autumn-extent-node"
+path = "src/bin/extent_node.rs"
+
+[[bin]]
+name = "autumn-ps"
+path = "src/bin/partition_server.rs"
+
+[[bin]]
+name = "autumn-client"
+path = "src/bin/autumn_client/main.rs"
+
+[[bin]]
+name = "autumn-dashboard"
+path = "src/bin/autumn_dashboard/main.rs"
+
+[[bin]]
+name = "autumn-op"
+path = "src/bin/autumn_op/main.rs"
+
+[[bin]]
+name = "autumnfs"
+path = "src/bin/autumnfs.rs"
+
+# Read-only S3 gateway over the `fs/` tree. It exists so inference engines with
+# no loader plugin seam (e.g. SGLang) can stream weights through their
+# built-in `--load-format runai_streamer`, which speaks S3 and nothing else.
+# Its own process, deployed as a per-node sidecar — hosting it inside the
+# partition server was tried and reverted (with `panic = "abort"` a gateway panic would abort the partition server, the
+# transport is a process-wide OnceLock the PS initialises, and `--cpuset` does
+# not confine threads that pin nothing).
+[[bin]]
+name = "autumn-s3"
+path = "src/bin/autumn_s3/main.rs"
+
+# One-shot converter for the tenant removal; delete with `autumn-etcd` below
+# after the conversion has run.
+[[bin]]
+name = "migratev1_v2"
+path = "src/bin/migratev1_v2.rs"
+
+[dependencies]
+# The `fs/` tree (the same layer the fuse mount and the PyO3 `autumn.Fs`
+# binding use): `autumnfs`, `autumn-s3` and `autumn-op`'s
+# stripe-geometry declaration. No kernel-mount code comes with it.
+autumn-fs = { path = "../fs" }
+# `autumn-s3`: Content-MD5 checks, only when a client sends one.
+md-5 = "0.10"
+base64 = "0.22"
+# `autumn-s3` only. rustc never links an `--extern` crate a binary does not
+# reference, so the other six binaries in this package pay build time, not size
+# — measured on debug builds, where there is no LTO to credit for it.
+axum = "0.8"
+cyper-axum = "0.9"
+send_wrapper = { version = "0.6", features = ["futures"] }
+socket2 = { version = "0.5", features = ["all"] }
+anyhow.workspace = true
+bytes.workspace = true
+crc32c.workspace = true
+tracing.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+autumn-common = { path = "../common" }
+autumn-manager = { path = "../manager" }
+autumn-params = { path = "../params" }
+# Used only by the one-shot `migratev1_v2` converter bin; remove both together.
+autumn-etcd = { path = "../etcd" }
+autumn-stream = { path = "../stream" }
+autumn-partition-server = { path = "../partition-server" }
+autumn-rpc = { path = "../rpc" }
+autumn-transport = { path = "../transport" }
+autumn-client = { path = "../client" }
+rkyv = { version = "0.8.15", features = ["alloc"] }
+serde = { workspace = true }
+serde_json = "1"
+rand = "0.8"
+uuid.workspace = true
+libc = "0.2"
+compio = { workspace = true, features = ["macros", "time", "net"] }
+futures = "0.3"
+pprof = { version = "0.14", features = ["flamegraph"], optional = true }
+# Allocator hygiene: tikv-jemallocator returns dirty pages to the
+# OS within `dirty_decay_ms` (default 10 s in upstream jemalloc; we
+# tune to 1 s via the MALLOC_CONF in the binary main.rs files).
+# Without this, peak RSS observed during EC convert / recovery
+# sits at the high-water mark indefinitely after the spike subsides
+# because glibc's malloc doesn't aggressively MADV_FREE.
+# Linux-only — falls back to the default allocator on non-Linux targets
+# (the production target is Linux only).
+[target.'cfg(target_os = "linux")'.dependencies]
+tikv-jemallocator = "0.6"
+
+[features]
+default = []
+profiling = ["dep:pprof"]
+ucx = ["autumn-transport/ucx"]
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+autumn-test-ports = { path = "../test-ports" }

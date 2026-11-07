@@ -1,0 +1,3114 @@
+//! Wire codec for Manager RPCs over autumn-rpc.
+//!
+//! All 16 manager RPCs are control-plane and use rkyv zero-copy serialization.
+//! Message type constants are in the 0x20–0x3F range to avoid collision with
+//! ExtentService RPCs (0x01–0x0A).
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  ⚠️  WIRE SCHEMA. Edit an `Archive` type here — add, remove, reorder or
+//  retype a field, or change what one MEANS — and you MUST bump
+//  `WIRE_VERSION` in `crates/rpc/src/lib.rs` — and raise
+//  `MIN_CLIENT_WIRE_VERSION` too if the change breaks the CLIENT surface.
+//
+//  NOTHING CHECKS THIS FOR YOU. The schema fingerprint that used to catch a
+//  forgotten bump was removed; the version integer is the only guard left,
+//  and it is maintained by hand. Forget it and two binaries claiming the same
+//  version will handshake, then decode each other's bytes as garbage — no
+//  error, no log, just wrong data. That has happened here before.
+// ═══════════════════════════════════════════════════════════════════════════
+
+use bytes::{Buf, BufMut, Bytes, BytesMut};
+use rkyv::api::high::{HighDeserializer, HighSerializer};
+use rkyv::rancor::Error as RkyvError;
+use rkyv::ser::allocator::ArenaHandle;
+use rkyv::{Archive, Deserialize, Serialize};
+
+// ── msg_type constants ───────────────────────────────────────────────────────
+
+// StreamManagerService (12 RPCs)
+pub const MSG_STATUS: u8 = 0x20;
+pub const MSG_ACQUIRE_OWNER_LOCK: u8 = 0x21;
+pub const MSG_REGISTER_NODE: u8 = 0x22;
+pub const MSG_CREATE_STREAM: u8 = 0x23;
+pub const MSG_STREAM_INFO: u8 = 0x24;
+pub const MSG_EXTENT_INFO: u8 = 0x25;
+pub const MSG_NODES_INFO: u8 = 0x26;
+pub const MSG_CHECK_COMMIT_LENGTH: u8 = 0x27;
+pub const MSG_STREAM_ALLOC_EXTENT: u8 = 0x28;
+pub const MSG_STREAM_PUNCH_HOLES: u8 = 0x29;
+pub const MSG_TRUNCATE: u8 = 0x2A;
+pub const MSG_MULTI_MODIFY_SPLIT: u8 = 0x2B;
+
+// PartitionManagerService (4 RPCs)
+pub const MSG_REGISTER_PS: u8 = 0x2C;
+pub const MSG_UPSERT_PARTITION: u8 = 0x2D;
+pub const MSG_GET_REGIONS: u8 = 0x2E;
+
+// Routing for an embedded CLIENT. Same question `MSG_GET_REGIONS` answers, but
+// the reply carries only what routing needs — see `ClientRegion`. A SEPARATE
+// opcode rather than a second shape behind the old one, because the client
+// surface's rule is that a new version of a message takes a NEW msg_type and
+// the old form keeps its own until the floor passes it (docs/client_wire_
+// compat_design.md §7): msg_type is settled in the frame header before any
+// decode, so both directions are self-describing, whereas branching one opcode
+// on a connection's negotiated version would make a frame's meaning depend on
+// connection state — and an rkyv mis-decode is silent.
+pub const MSG_GET_CLIENT_REGIONS: u8 = 0x60;
+/// EN verifies a recovery instruction against the current leader before reuse.
+pub const MSG_VALIDATE_RECOVERY: u8 = 0x61;
+// pub const MSG_STREAM_REPLAY_INFO: u8 = 0x62;  // RESERVED (was the internal
+//   covered-prefix replay query; removed with the marker). Never reuse.
+pub const MSG_HEARTBEAT_PS: u8 = 0x2F;
+
+// per-partition listener address registration (PS reports the
+// `host:port` of each partition's TcpListener to the manager so clients
+// can target the owning partition's CPU shard directly).
+pub const MSG_REGISTER_PARTITION_ADDR: u8 = 0x30;
+
+// extent-node startup orphan reconcile. The node sends every
+// `extent_id` it loaded from disk; the manager replies with the subset
+// no longer present in `s.extents` so the node can unlink them.
+pub const MSG_RECONCILE_EXTENTS: u8 = 0x31;
+
+// FOPS-03: mutate an existing stream's EC configuration.
+// After this call the manager's ec_conversion_dispatch_loop will pick up
+// any sealed extents in that stream and convert them on the next tick (~5s).
+pub const MSG_UPDATE_STREAM_EC: u8 = 0x32;
+
+// 0x33 retired with the vp_table_refs removal (was
+// MSG_SYNC_PARTITION_VP_REFS, partition→manager VP-dependency sync).
+
+// 0x34 retired: was MSG_MULTI_MODIFY_MERGE, the raw merge txn. It has no
+// freeze drain, so a source's unflushed writes were lost; merges go through
+// MSG_MERGE_PARTITIONS only.
+// advisory engine — query split/merge candidates.
+pub const MSG_GET_POLICY_CANDIDATES: u8 = 0x35;
+// per-partition load metrics report (PS → manager, 5 s cadence).
+pub const MSG_REPORT_PARTITION_LOAD: u8 = 0x36;
+// orchestrated partition merge — inputs are just (survivor, victim).
+// The manager (which is leader-fenced + persistent) acquires its own
+// admin owner lock, freezes both PSes via MSG_MERGE_FREEZE, captures the
+// 6 commit_lengths under the freeze, then runs the merge txn
+// (`handle_multi_modify_merge`, in-process) atomically. CLI is a thin wrapper
+// so a CLI crash mid-merge is benign — the manager either commits the
+// txn (region_sync_loop on the survivor's PS picks up the wider rg and
+// drops the frozen PartitionData on next tick) or it doesn't (PSes
+// auto-unfreeze after FREEZE_TTL seconds).
+pub const MSG_MERGE_PARTITIONS: u8 = 0x37;
+// PS → manager push-based disk failure signal. Fire-and-forget
+// (req_id = 0); manager deduplicates by reporter_part_id, applies a
+// 60 s sliding window + 3-distinct-reporter quorum before flipping
+// `node.disks[*].online = false`. Previously the manager's disk online
+// view was purely pull-based via the df loop (`node_health_loop`, 2 s;
+// was `disk_status_update_loop`, 10 s), so between the per-stream
+// alloc route-around and the next DF poll the global view
+// lagged the per-stream truth.
+pub const MSG_REPORT_DISK_FAILURE: u8 = 0x38;
+
+// per-extent EC convert trigger. Replaces the deleted
+// ec_conversion_dispatch_loop fresh-candidate scan. Persists a rich
+// `pending_ec_dispatch` marker for `extent_id`; the next dispatch_loop
+// tick drains it via the replay path.
+pub const MSG_FORCE_EC_CONVERT: u8 = 0x39;
+
+// external policy controller helper — query the manager's
+// latest cached `PartitionLoad` for a given partition. Lets `client
+// info --part PID --detail` surface SST tombstone / expired /
+// out-of-range / minor pending byte counts without a separate PS RPC.
+pub const MSG_GET_PARTITION_DETAIL: u8 = 0x3A;
+
+// const-dump of the `POLICY_KIND_*` enum so external
+// controllers (Python, ops scripts) can introspect the wire values
+// without hardcoding them. The values themselves are wire-stable
+// (frozen — a docstring drift once made the docs say `1..7`
+// while the code said `0..6`, which produced an off-by-one bug in
+// every Python controller that trusted the docs). Now the
+// names + values come from the manager binary as the single source
+// of truth; any future addition appends a new `(name, value)` pair.
+pub const MSG_GET_POLICY_KIND_NAMES: u8 = 0x3B;
+
+// ── operator-driven node lifecycle ──────────────────────────────────────────
+//
+// read-only health reporting — the operator policy script reads
+// these to decide whether to `mgr_fence_node` / `mgr_set_node_maintenance`.
+pub const MSG_LIST_NODE_STATES: u8 = 0x3C;
+pub const MSG_EXTENT_HEALTH_REPORT: u8 = 0x3D;
+pub const MSG_LIST_EC_INFLIGHT_MARKERS: u8 = 0x3E;
+
+// admin RPCs that mutate `node_override/<node_id>` (etcd-persisted)
+// — operator explicitly fences / maintains / clears / removes nodes.
+pub const MSG_FENCE_NODE: u8 = 0x3F;
+pub const MSG_SET_NODE_MAINTENANCE: u8 = 0x40;
+pub const MSG_CLEAR_NODE_OVERRIDE: u8 = 0x41;
+pub const MSG_REMOVE_NODE: u8 = 0x42;
+
+// monitoring of the recovery throttle / queue depth.
+pub const MSG_RECOVERY_STATS: u8 = 0x43;
+
+// append-only operator audit log query.
+pub const MSG_QUERY_AUDIT_LOG: u8 = 0x44;
+
+// read-only cluster identity. The manager CAS-writes a UUID to
+// etcd `autumn-rs/cluster_id` on first leader promotion; this RPC exposes
+// it to `autumn-op format` (stamps cluster_id into each formatted disk)
+// and to `autumn-extent-node` (verifies the disk's stamped cluster_id
+// matches the manager's before serving). Followers can answer from
+// replayed state — no leader check.
+pub const MSG_GET_CLUSTER_ID: u8 = 0x45;
+
+// ── inode-level lease + close-to-open coherence ─────────────────────────────
+//
+// JuiceFS-style single-writer / many-reader leases on each fuse inode,
+// served by the manager (same etcd backing as owner locks). The lease
+// service is consumed by autumn-fuse (the io_uring daemon, the original
+// second consumer, has been removed). Clients appear as
+// `MgrClientId` to the manager, so the protocol stays daemon-kind-
+// agnostic for any future consumer. See docs/fs_lease_design.md.
+pub const MSG_ACQUIRE_LEASE: u8 = 0x46;
+pub const MSG_RELEASE_LEASE: u8 = 0x47;
+pub const MSG_HEARTBEAT_LEASE: u8 = 0x48;
+pub const MSG_POLL_INVALIDATIONS: u8 = 0x49;
+
+// 0x4A / 0x4B reserved: retired cluster-version query and bump.
+
+// ── WAL self-heal A5: report a corrupt replica (docs/wal_selfheal_design.md) ──
+//
+// A PS that detected a bit-rotted log_stream replica during replay
+// (per-record CRC mismatch, WAL-FAILSTOP) reports it so the manager can
+// ISOLATE that replica from the serving set (clear its `avali` bit + bump
+// eversion, etcd-first) before the partition serves (I1). Fenced: the report
+// carries the partition `owner_epoch` + extent `eversion`; the manager CAS-
+// validates both so a stale PS can't mutate the layout (I4).
+pub const MSG_REPORT_CORRUPT_REPLICA: u8 = 0x4C;
+
+// ── cluster-df: aggregate capacity summary (Ceph-`ceph df` style) ─────────────
+//
+// Leader-only read of a manager-maintained in-memory snapshot. RAW + autumn
+// physical-used come from summing each EN's `df` report (the EN is the data
+// owner; physical_used = Σ real extent file bytes, no amplification formula);
+// logical_stored is the manager's read-only Σ distinct sealed_length. The wire
+// carries only raw u64 facts — raw-used amplification / writable range / EC
+// shape are computed by the consumer (autumn-op df, fuse statfs), never sent
+// as floats. See docs / plan: cluster capacity is a RANGE under EC, so the
+// single point-estimate is left to the display layer.
+pub const MSG_CLUSTER_DF: u8 = 0x4D;
+
+/// Dashboard-oriented compact cluster overview (observability batch 2).
+/// Returns a per-partition rollup (range / ps / live_size / extent count) and a
+/// per-node extent count WITHOUT the giant per-extent array that `MSG_STREAM_INFO`
+/// (full dump) ships — so a web dashboard scales to 数千 partition / 数万 extent
+/// (browser payload + refresh cost bounded by PARTITION count, not extent count).
+/// Per-partition extents are fetched lazily via scoped `MSG_STREAM_INFO`.
+pub const MSG_GET_CLUSTER_OVERVIEW: u8 = 0x4E;
+
+// ── manager-as-KDC (data-plane authz) ─────────────────────────────────────────
+//
+// The manager (leader) is a KDC: it holds an Ed25519 signing private key + a
+// principal account DB, mints short-TTL capability tokens, and publishes its
+// PUBLIC keys so the PS (KV layer) can verify locally without ever calling
+// back. See docs/data_plane_authz_design.md.
+//
+// Client → manager: authenticate with a permanent principal credential, get a
+// short-TTL signed token (renewed in the background before exp).
+pub const MSG_MINT_TOKEN: u8 = 0x4F;
+// PS / EN → manager (poll, cached): fetch the public keys + registered
+// namespaces so the PS and the EN can verify tokens.
+pub const MSG_GET_AUTHZ_CONFIG: u8 = 0x50;
+// admin → manager (low-frequency, Admin connection only): create/delete a
+// principal account (credential_hash + allowed_prefixes) in the KDC's account DB.
+pub const MSG_PRINCIPAL_CREATE: u8 = 0x51;
+pub const MSG_PRINCIPAL_DELETE: u8 = 0x52;
+// Fuse-fs inode-number allocation moved into the manager
+// (leader-fenced etcd CAS). The old scheme — every allocator doing a
+// non-CAS read-modify-write on the `[0x04]next_inode` fs KV key — hands
+// out DUPLICATE inode batches under concurrent allocators (two mounts,
+// or a mount + the Python `autumn.Fs` client). The manager is already
+// the grantor of every other monotonic token (owner_epoch, lease_epoch),
+// so inode ranges follow the same pattern.
+pub const MSG_ALLOC_INODES: u8 = 0x53;
+
+// ── rkyv helpers ────────────────────────────────────────────────────────────
+
+/// Serialize a value to Bytes using rkyv.
+pub fn rkyv_encode<T>(val: &T) -> Bytes
+where
+    T: for<'a> Serialize<HighSerializer<rkyv::util::AlignedVec, ArenaHandle<'a>, RkyvError>>,
+{
+    let buf = rkyv::to_bytes::<RkyvError>(val).expect("rkyv encode");
+    Bytes::copy_from_slice(&buf)
+}
+
+/// Deserialize a value from bytes using rkyv with archive-bytes validation.
+///
+/// switched from `from_bytes_unchecked` to the checked `from_bytes`.
+/// Previously a malformed payload (corrupted by a flipped bit that escaped TCP
+/// CRC, a peer running an incompatible struct layout from a partial rolling
+/// upgrade, or — in a future where the wire crosses an untrusted boundary —
+/// a hostile sender) caused undefined behaviour: out-of-bounds reads, pointer
+/// dereferences into arbitrary memory, or silent partial decoding into a
+/// corrupt struct that downstream code then trusted. The checked path runs
+/// `bytecheck`'s validation pass on the archived bytes (size, alignment,
+/// pointer relativity, sum-type discriminants, container length bounds) and
+/// returns a clean `Err` on any inconsistency. The validation cost is small
+/// and bounded by the payload size — a few percent on the hot path at most;
+/// negligible against rkyv's existing per-archive zero-copy work.
+pub fn rkyv_decode<T>(data: &[u8]) -> Result<T, String>
+where
+    T: Archive,
+    T::Archived: Deserialize<T, HighDeserializer<RkyvError>>
+        + for<'a> rkyv::bytecheck::CheckBytes<rkyv::api::high::HighValidator<'a, RkyvError>>,
+{
+    let mut v = rkyv::util::AlignedVec::<16>::with_capacity(data.len());
+    v.extend_from_slice(data);
+    rkyv::from_bytes::<T, RkyvError>(&v).map_err(|e| format!("rkyv decode: {e}"))
+}
+
+// ── Shared domain types ─────────────────────────────────────────────────────
+
+/// Range of keys [start_key, end_key). Empty end_key means unbounded.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct MgrRange {
+    pub start_key: Vec<u8>,
+    pub end_key: Vec<u8>,
+}
+
+/// Node metadata.
+///
+/// `shard_ports` lists the per-shard TCP listener ports on the
+/// extent-node process. Clients route hot-path RPCs (append, read_bytes,
+/// commit_length) by `extent_id % shard_ports.len()`. When `shard_ports`
+/// is empty, clients fall back to `address` (legacy single-thread mode).
+///
+/// `control_address` is the extent-node's *separate* control-plane
+/// listener — by convention `host:port + 1000`. Manager DF / future
+/// heartbeat / disk-failure-report RPCs travel on this address via a
+/// dedicated `control_pool`, so a sustained data-plane RPC (CONVERT_TO_EC,
+/// RECOVERY) cannot starve the manager's liveness probe and
+/// trigger a spurious `disk online → offline` flap. Empty = legacy node
+/// that hasn't been re-registered yet; manager falls back to `address` so
+/// upgrades are zero-downtime.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct MgrNodeInfo {
+    pub node_id: u64,
+    pub address: String,
+    pub disks: Vec<u64>,
+    /// Optional per-shard ports. Empty = legacy single-thread extent-node.
+    pub shard_ports: Vec<u16>,
+    /// optional control-plane address. Empty = legacy node;
+    /// manager falls back to `address` for DF.
+    pub control_address: String,
+    /// Stable node identity (UUID v4), decoupled from the
+    /// network address so an EN can change IP / shard-port layout across
+    /// restarts and still be recognised as the SAME node (mirrors the PS's
+    /// `ps_id`-vs-address split). Persisted WITH the node; the manager matches a
+    /// registration by this first (scanning `nodes`), falling back to address
+    /// for uuid-less legacy rows until they adopt. Empty = legacy node.
+    pub node_uuid: String,
+}
+
+/// Disk metadata.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct MgrDiskInfo {
+    pub disk_id: u64,
+    pub online: bool,
+    pub uuid: String,
+}
+
+/// rkyv-encoded value of the `ecConversionInflight/<extent_id>` etcd
+/// marker. This originally persisted only the existence of the marker
+/// (empty value); on leader failover or process restart the new leader
+/// could not safely re-dispatch because it didn't know which `target_nodes`
+/// the deposed leader had selected (a fresh `shuffle().take(extra)` would
+/// pick different parity-node IDs, and `alloc_extent_on_node` against a
+/// node that already received shard data resets that node's in-memory
+/// state — silently corrupting EC layout). A later change widens the marker so
+/// re-dispatch can reuse the original assignment.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct MgrEcDispatchInflight {
+    pub extent_id: u64,
+    /// Full data+parity node id list, in shard-index order (data shards
+    /// first, then parity shards). `replicates ++ parity` after a
+    /// successful `apply_ec_conversion_done`.
+    pub target_nodes: Vec<u64>,
+    /// Disk-id-per-extra-parity-node returned by `alloc_extent_on_node`
+    /// during the original dispatch. Used to rebuild `replicate_disks /
+    /// parity_disks` in `apply_ec_conversion_done` on re-dispatch.
+    pub extra_disk_ids: Vec<u64>,
+    pub data_shards: u32,
+    pub new_eversion: u64,
+    /// Owner-lock owner_epoch the manager held when this
+    /// dispatch was authorised. Threaded into `ConvertToEcReq.owner_epoch`
+    /// → `WriteShardReq.owner_epoch` / `CommitEcShardReq.owner_epoch` so a
+    /// fenced ex-coord whose in-flight 2PC continues with the OLD owner_epoch
+    /// is rejected by remote ENs via the existing `req.owner_epoch <
+    /// entry.owner_epoch → CODE_LOCKED_BY_OTHER` check, once a partition
+    /// reopen raised the floor on the targets.
+    ///
+    /// `0` keeps the earlier no-fence behaviour for tests /
+    /// memory-only mode where no owner_lock has been acquired.
+    pub owner_epoch: i64,
+}
+
+/// Extent metadata — mirrors proto ExtentInfo.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct MgrExtentInfo {
+    pub extent_id: u64,
+    pub replicates: Vec<u64>,
+    pub parity: Vec<u64>,
+    pub eversion: u64,
+    pub refs: u64,
+    /// Count of live SSTables whose ValuePointers referenced this extent — an
+    /// indirect-retention "net" on top of `refs`.
+    ///
+    /// vp_table_refs-removal STAGING (Stage 1): the *maintenance* machinery
+    /// that bumped/decremented this (the PS sync/pull RPCs + manager
+    /// aggregation) is gone, so the field is now WRITE-FROZEN — every extent
+    /// allocated under this build leaves it 0. It is still READ by
+    /// `extent_can_delete` (which keeps `refs == 0 && vp_table_refs == 0`) as an
+    /// UPGRADE-SAFETY GUARD: a cluster upgraded from a pre-removal build may
+    /// hold legacy extents legitimately retained at `refs == 0 && vp_table_refs
+    /// > 0`, and reaping them would lose live data (see manager
+    /// `extent_can_delete`). Kept in the persisted `extents/<id>` rkyv layout so
+    /// existing records decode unchanged. Stage 2's migration clears it and
+    /// removes the field (collapsing the gate to `refs == 0`).
+    pub vp_table_refs: u64,
+    pub sealed_length: u64,
+    /// True once this extent has been SEALED (immutable; no more appends).
+    /// The explicit flag — NOT `sealed_length > 0` — is the authoritative
+    /// "is sealed" signal, because an authoritative failover seal can seal an
+    /// EMPTY tail (`sealed = true, sealed_length = 0`: nothing was ever
+    /// all-replica-acked, so the writer's commit is 0). `sealed_length` remains
+    /// the LENGTH (used for "is empty" / EC-min-size / read-bound checks);
+    /// `sealed` is the STATE. Invariant: `sealed_length > 0 ⇒ sealed`. A fresh
+    /// open extent is `sealed = false`.
+    pub sealed: bool,
+    pub avali: u32,
+    pub replicate_disks: Vec<u64>,
+    pub parity_disks: Vec<u64>,
+    /// True iff `apply_ec_conversion_done` has rewritten this extent's
+    /// shards into RS-encoded form. False for (a) freshly allocated
+    /// open extents — even on EC streams where `parity` is pre-filled
+    /// at allocation time — and (b) sealed extents still waiting for
+    /// the manager's `ec_conversion_dispatch_loop` to fire. Read paths
+    /// branch on this, NOT on `parity.is_empty()` — see programming
+    /// note in `crates/stream/CLAUDE.md`.
+    pub ec_converted: bool,
+}
+
+/// Stream metadata — mirrors proto StreamInfo.
+///
+/// The triple `(replicates, ec_data_shard, ec_parity_shard)` fully
+/// describes the stream's data layout:
+///
+/// - `replicates`: open-extent replica count. While an extent is open
+///   (not yet sealed), the data is fully replicated across this many
+///   nodes (typically 3). Independent of `ec_data_shard` — a 3-replica
+///   open stream can be encoded to 4+1, 7+1, etc. on seal.
+/// - `ec_data_shard` (K): data-shard count of the post-seal EC encoding.
+///   For a replication-only stream, equals `replicates` and `ec_parity_shard`
+///   is 0.
+/// - `ec_parity_shard` (M): parity-shard count of the post-seal EC encoding.
+///   `0` means pure replication (no EC conversion will fire).
+///
+/// Legacy values (schema without `replicates`): streams persisted before this
+/// field was introduced deserialise with `replicates = 0`. Callers must
+/// treat `replicates == 0` as "unknown — derive from one of the stream's
+/// open extents' `replicates.len()`".
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct MgrStreamInfo {
+    pub stream_id: u64,
+    pub extent_ids: Vec<u64>,
+    pub ec_data_shard: u32,
+    pub ec_parity_shard: u32,
+    pub replicates: u32,
+}
+
+/// Partition metadata.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct MgrPartitionMeta {
+    pub part_id: u64,
+    pub log_stream: u64,
+    pub row_stream: u64,
+    pub meta_stream: u64,
+    pub rg: Option<MgrRange>,
+}
+
+/// Region (partition→PS assignment).
+///
+/// `region_epoch` is a monotonic counter bumped by the manager whenever
+/// `rg` is rewritten — split (both children get a new epoch), merge
+/// (survivor gets a new epoch). Modeled after TiKV's `region_epoch`:
+/// clients stamp their cached epoch on every PS request so the PS can
+/// reject stale routing without a manager round-trip. Bootstrap value
+/// is 1; `0` is reserved as "unknown / skip check" so legacy callers
+/// and tests that don't populate it stay backward-compatible.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct MgrRegionInfo {
+    pub rg: Option<MgrRange>,
+    pub part_id: u64,
+    pub ps_id: u64,
+    pub log_stream: u64,
+    pub row_stream: u64,
+    pub meta_stream: u64,
+    pub region_epoch: u64,
+}
+
+/// Partition server detail.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct MgrPsDetail {
+    pub ps_id: u64,
+    pub address: String,
+}
+
+// ── Extent-service messages ─────────────────────────────────────────────────
+//
+// The manager is a CLIENT of the extent service, so these are re-exported from
+// `extent_rpc` — the one definition both sides use — rather than redefined
+// here. They used to be mirrored (`ExtDfReq`, `MgrRecoveryTask`, …), with the
+// manager encoding through this file's copy while the node decoded through
+// `extent_rpc`'s: a field added to one side only was then a silent rkyv
+// mis-decode, and no fingerprint could catch it because BOTH files hash into
+// the same one. `extent_rpc`'s `one_definition_only` turns that into a build
+// error now.
+//
+// `CodeResp` is deliberately NOT re-exported: this module has its own, for the
+// manager service's own RPCs, so extent-service call sites name
+// `extent_rpc::CodeResp` explicitly rather than shadowing it.
+pub use crate::extent_rpc::{
+    AllocExtentReq, AllocExtentResp, ConvertToEcReq, DeleteExtentReq, DfReq, DfResp, ReAvaliReq,
+    RecoveryTask, RecoveryTaskDone, RequireRecoveryReq,
+};
+
+// ── Generic response ────────────────────────────────────────────────────────
+
+/// Generic code + message response shared across many RPCs.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct CodeResp {
+    pub code: u8,
+    pub message: String,
+}
+
+pub const CODE_OK: u8 = 0;
+pub const CODE_NOT_FOUND: u8 = 1;
+pub const CODE_INVALID_ARGUMENT: u8 = 2;
+pub const CODE_PRECONDITION: u8 = 3;
+pub const CODE_ERROR: u8 = 4;
+pub const CODE_NOT_LEADER: u8 = 5;
+/// Lease preemption: `AcquireLease(force=true)` against a held writer
+/// surfaces this; the response's `lease.ttl_secs` is repurposed to
+/// carry the grace milliseconds REMAINING in the current revoke
+/// window. Client retries the acquire after that delay (or sooner
+/// if it sees a `WriterClosed` invalidation).
+pub const CODE_REVOKE_PENDING: u8 = 6;
+/// D7 Layer-A: a put-class write whose key falls in NO registered
+/// namespace prefix. Semantics = NotFound-class (the target namespace does not
+/// exist). **Defined in SD-1, RETURNED by the PS Layer-A gate in SD-2.** 7/8/9
+/// are already taken by `partition_rpc` (Unavailable / RegionEpochStale /
+/// Fenced), so this is 10 to stay collision-free across both wire modules.
+pub const CODE_NAMESPACE_UNKNOWN: u8 = 10;
+
+// ── StreamManagerService request/response types ────────────────────────────
+
+// --- Status ---
+// Request: empty payload (0 bytes)
+// Response: CodeResp
+
+// --- AcquireOwnerLock ---
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct AcquireOwnerLockReq {
+    pub owner_key: String,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct AcquireOwnerLockResp {
+    pub code: u8,
+    pub message: String,
+    pub owner_epoch: i64,
+}
+
+// --- RegisterNode ---
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct RegisterNodeReq {
+    pub addr: String,
+    pub disk_uuids: Vec<String>,
+    /// per-shard ports the extent-node listens on. Empty = legacy
+    /// single-thread mode (clients route all extents to `addr`).
+    pub shard_ports: Vec<u16>,
+    /// extent-node's control-plane listener address (typically
+    /// `host:port + 1000`). Empty = caller wants the manager to fall back
+    /// to the data-plane `addr` for DF (legacy / mid-upgrade behaviour).
+    pub control_address: String,
+    /// Stable node identity (UUID v4), decoupled from the
+    /// network address so a node can change IP / shard-port layout across
+    /// restarts and still be recognised as the SAME node (mirrors the PS's
+    /// `ps_id`-vs-address split). Empty = legacy uuid-less caller (matched by
+    /// address, then adopted). The manager scans `MgrNodeInfo.node_uuid`
+    /// (the identity rides INSIDE the persisted node record — no sidecar
+    /// index); the layout change is a same-commit stop-world deploy requiring
+    /// an etcd reset (repo convention — no rolling upgrade).
+    pub node_uuid: String,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct RegisterNodeResp {
+    pub code: u8,
+    pub message: String,
+    pub node_id: u64,
+    /// uuid -> disk_id mapping
+    pub disk_uuids: Vec<(String, u64)>,
+}
+
+// --- CreateStream ---
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct CreateStreamReq {
+    pub replicates: u32,
+    pub ec_data_shard: u32,
+    pub ec_parity_shard: u32,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct CreateStreamResp {
+    pub code: u8,
+    pub message: String,
+    pub stream: Option<MgrStreamInfo>,
+    pub extent: Option<MgrExtentInfo>,
+}
+
+// --- StreamInfo ---
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct StreamInfoReq {
+    pub stream_ids: Vec<u64>,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct StreamInfoResp {
+    pub code: u8,
+    pub message: String,
+    /// (stream_id, MgrStreamInfo) pairs
+    pub streams: Vec<(u64, MgrStreamInfo)>,
+    /// (extent_id, MgrExtentInfo) pairs
+    pub extents: Vec<(u64, MgrExtentInfo)>,
+}
+
+// --- ExtentInfo ---
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct ExtentInfoReq {
+    pub extent_id: u64,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct ExtentInfoResp {
+    pub code: u8,
+    pub message: String,
+    pub extent: Option<MgrExtentInfo>,
+    /// Which payload file each member holds this extent's bytes in
+    /// (`extent_rpc::PayloadLocation`). It rides BESIDE `extent` rather than
+    /// inside `MgrExtentInfo` because that struct is the persisted
+    /// `extents/<id>` value: widening it would make an existing cluster's
+    /// stored extents fail rkyv validation on replay, which blocks leadership.
+    /// The manager keeps this in a sibling etcd key, absent ⇒ `InDat`, so every
+    /// pre-existing extent reads correctly with no backfill.
+    pub payload_location: u8,
+    /// Slots the manager has marked CORRUPT (a partition owner or the node's
+    /// own scrub proved the bytes wrong), as a bitmap over `replicates ++
+    /// parity`. A whole-extent copy never reads from one: its copy is full
+    /// length, and a source is accepted on length alone. Rides beside `extent`
+    /// for the same reason as `payload_location` (sibling etcd key
+    /// `extentCorrupt/<id>`). Wire 53.
+    pub corrupt_slots: u32,
+}
+
+// --- NodesInfo ---
+// Request: empty payload (0 bytes)
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct NodesInfoResp {
+    pub code: u8,
+    pub message: String,
+    /// (node_id, MgrNodeInfo) pairs
+    pub nodes: Vec<(u64, MgrNodeInfo)>,
+    /// (disk_id, MgrDiskInfo) pairs
+    pub disks_info: Vec<(u64, MgrDiskInfo)>,
+}
+
+// --- CheckCommitLength ---
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct CheckCommitLengthReq {
+    pub stream_id: u64,
+    pub owner_key: String,
+    pub owner_epoch: i64,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct CheckCommitLengthResp {
+    pub code: u8,
+    pub message: String,
+    pub stream_info: Option<MgrStreamInfo>,
+    pub end: u64,
+    pub last_ex_info: Option<MgrExtentInfo>,
+}
+
+// --- StreamAllocExtent ---
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct StreamAllocExtentReq {
+    pub stream_id: u64,
+    pub owner_key: String,
+    pub owner_epoch: i64,
+    /// How to seal the CURRENT tail before allocating the new extent:
+    /// - `Some(c)` — AUTHORITATIVE: seal at EXACTLY `c`, do NOT probe. `c` is
+    ///   the writer's own all-replica-acked commit (`state.commit`) captured at
+    ///   a QUIESCED point via the `SealCommit` worker handshake (in-flight
+    ///   drained first), or a known exact end (preemptive roll). Honoured even
+    ///   for `Some(0)` (an empty tail where nothing was ever all-acked → sealed
+    ///   empty, `sealed = true, sealed_length = 0`). This prevents the
+    ///   phantom seal: a probe over reachable members can capture a
+    ///   speculative/un-acked byte that only one (soon-dead) member holds,
+    ///   sealing at a length no replica durably retains (the seed=13 stuck-
+    ///   recovery bug).
+    /// - `None` — PROBE: the writer has no commit cursor of its own (new-owner
+    ///   takeover / sealed-tail init); the manager derives the seal via
+    ///   `compute_commit_seal` (seal-over-reachable). Moot when the tail is
+    ///   already sealed (the existing seal is preserved untouched).
+    pub seal_commit: Option<u64>,
+    /// per-stream "recently failed" node ids the writer wants the
+    /// manager to skip when picking nodes for the new extent. Empty Vec
+    /// means "no exclusions" (legacy / cold-start clients). The manager
+    /// filters candidate nodes by this set before scoring; if the filter
+    /// empties the pool, it falls back to the full set rather than
+    /// blocking allocation on stale excludes.
+    pub exclude_node_ids: Vec<u64>,
+    /// BUG2-IDEMPOTENT-ROLL: the extent id the writer captured `seal_commit`
+    /// for (the tail at SealCommit-handshake time). `0` = no specific target
+    /// (legacy / probe / `None` seal — seal the current tail as before).
+    ///
+    /// Makes seal-and-roll IDEMPOTENT on retry. A retried alloc (first attempt
+    /// succeeded on the manager — sealed the tail + rolled a fresh one — but its
+    /// response was lost) re-sends the SAME `seal_commit` for the SAME old tail.
+    /// Without this the manager would seal the now-current FRESH tail at the
+    /// stale `seal_commit`, over-sealing an extent that does not durably hold
+    /// that many bytes → unrecoverable extent → any partition replaying it
+    /// WAL-FAILSTOPs and never opens (chaos seed=603 split-child wedge). With
+    /// it, the manager seals ONLY when the current tail still equals
+    /// `seal_extent_id`; otherwise the requested target was already sealed/rolled
+    /// → idempotent no-op (return the current tail untouched).
+    pub seal_extent_id: u64,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct StreamAllocExtentResp {
+    pub code: u8,
+    pub message: String,
+    pub stream_info: Option<MgrStreamInfo>,
+    pub last_ex_info: Option<MgrExtentInfo>,
+}
+
+// --- PunchHoles ---
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct PunchHolesReq {
+    pub stream_id: u64,
+    pub owner_key: String,
+    pub owner_epoch: i64,
+    pub extent_ids: Vec<u64>,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct PunchHolesResp {
+    pub code: u8,
+    pub message: String,
+    pub stream: Option<MgrStreamInfo>,
+}
+
+// --- Truncate ---
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct TruncateReq {
+    pub stream_id: u64,
+    pub owner_key: String,
+    pub owner_epoch: i64,
+    pub extent_id: u64,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct TruncateResp {
+    pub code: u8,
+    pub message: String,
+    pub updated_stream_info: Option<MgrStreamInfo>,
+}
+
+// --- MultiModifySplit ---
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct MultiModifySplitReq {
+    pub part_id: u64,
+    pub owner_key: String,
+    pub owner_epoch: i64,
+    pub mid_key: Vec<u8>,
+    pub log_stream_sealed_length: u64,
+    pub row_stream_sealed_length: u64,
+    pub meta_stream_sealed_length: u64,
+    /// The tail extent ids the three sealed lengths were CAPTURED FOR. The
+    /// manager seals whatever extent is the CURRENT tail at commit time, so it
+    /// MUST refuse (Precondition, caller re-captures and retries) when a tail
+    /// moved between the PS's capture and the commit — e.g. a fence-drain roll
+    /// already in flight when the split froze the partition. Without the check
+    /// the captured length gets stamped onto the roll's fresh EMPTY tail,
+    /// which is then "sealed" longer than any replica holds and permanently
+    /// wedges the CoW child's replay. `0` = no capture claim (legacy callers /
+    /// tests) — the check is skipped for that stream.
+    pub log_tail_extent_id: u64,
+    pub row_tail_extent_id: u64,
+    pub meta_tail_extent_id: u64,
+    /// The ledger op the split serves (`SplitPartReq.op_id`); 0 = untracked.
+    /// The manager closes it on commit and refuses to commit one it has
+    /// already ended.
+    pub op_id: u64,
+}
+
+// Response: CodeResp
+
+// ── PartitionManagerService request/response types ─────────────────────────
+
+// --- RegisterPs ---
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct RegisterPsReq {
+    pub ps_id: u64,
+    pub address: String,
+    /// Partitions this PS can give a core each: `cpuset_len` under an explicit
+    /// `--cpuset`, `0` when it was started without one (capacity unknown).
+    /// Past it, partitions share the cores.
+    pub slot_cap: u32,
+}
+// Response: CodeResp
+
+// --- UpsertPartition ---
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct UpsertPartitionReq {
+    pub meta: MgrPartitionMeta,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct UpsertPartitionResp {
+    pub code: u8,
+    pub message: String,
+    pub part_id: u64,
+}
+
+// --- GetRegions ---
+// Request: empty payload (0 bytes)
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct GetRegionsResp {
+    pub code: u8,
+    pub message: String,
+    /// (part_id, MgrRegionInfo) pairs
+    pub regions: Vec<(u64, MgrRegionInfo)>,
+    /// (ps_id, MgrPsDetail) pairs
+    pub ps_details: Vec<(u64, MgrPsDetail)>,
+    /// per-partition listener addresses (`host:port`). Populated
+    /// by `RegisterPartitionAddr` calls from the PS; one entry per open
+    /// partition. Clients prefer this over `ps_details[ps_id].address`
+    /// when present, so traffic is routed to the specific partition's
+    /// listener thread (Seastar-style thread-per-shard).
+    pub part_addrs: Vec<(u64, String)>,
+}
+
+/// One partition's routing, as an embedded CLIENT sees it.
+///
+/// Four fields, and the three `*_stream` ids of `MgrRegionInfo` are gone. That
+/// is not tidying: a stream id is a STREAM-LAYER identity, the SDK has never
+/// read one (its production path uses `rg`, `part_id`, `ps_id` and
+/// `region_epoch` and nothing else), and shipping them anyway leaked a lower
+/// layer's identifiers across the boundary into every embedded image. A field
+/// nobody reads is also a field nobody notices changing.
+///
+/// The PS still needs all seven — `sync_regions_once` opens a partition from
+/// its stream ids — so `MgrRegionInfo` on `MSG_GET_REGIONS` is unchanged and
+/// keeps serving the partition server and `autumn-op`, both of which ship at
+/// the cluster's own commit.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct ClientRegion {
+    /// `[start_key, end_key)`; `None` = not yet assigned a range.
+    pub rg: Option<MgrRange>,
+    pub part_id: u64,
+    pub ps_id: u64,
+    /// Stamped on every data-plane request; the PS refuses a mismatch with
+    /// `FailedPrecondition` and the SDK refreshes and retries. `0` is reserved
+    /// on the wire and means "skip the check".
+    pub region_epoch: u64,
+}
+
+/// Narrow the PARTITION SERVER's form to the client's.
+///
+/// This is what a client built for the narrow form does when it finds itself
+/// talking to a cluster too old to serve it: ask with the old opcode, then drop
+/// the fields it is not allowed to look at. Keeping the discard HERE rather
+/// than at the call site means there is exactly one place where a stream id
+/// reaches a client and is thrown away, and the destructure is exhaustive, so
+/// a new field on `MgrRegionInfo` has to be classified rather than silently
+/// inherited.
+impl From<&MgrRegionInfo> for ClientRegion {
+    fn from(r: &MgrRegionInfo) -> Self {
+        let MgrRegionInfo {
+            rg,
+            part_id,
+            ps_id,
+            log_stream: _,
+            row_stream: _,
+            meta_stream: _,
+            region_epoch,
+        } = r;
+        Self {
+            rg: rg.clone(),
+            part_id: *part_id,
+            ps_id: *ps_id,
+            region_epoch: *region_epoch,
+        }
+    }
+}
+
+// --- GetClientRegions ---
+// Request: empty payload (0 bytes), same as GetRegions.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct ClientRegionsResp {
+    pub code: u8,
+    pub message: String,
+    /// (part_id, ClientRegion) pairs.
+    pub regions: Vec<(u64, ClientRegion)>,
+    /// (ps_id, MgrPsDetail) pairs — id and address, nothing else.
+    pub ps_details: Vec<(u64, MgrPsDetail)>,
+    /// per-partition listener addresses (`host:port`), preferred over
+    /// `ps_details[ps_id].address` so traffic reaches the owning partition's
+    /// listener thread.
+    pub part_addrs: Vec<(u64, String)>,
+}
+
+// --- HeartbeatPs ---
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct HeartbeatPsReq {
+    pub ps_id: u64,
+    /// Same as `RegisterPsReq::slot_cap`. Repeated on every beat because the
+    /// manager keeps it in memory only: a new leader learns it from here.
+    pub slot_cap: u32,
+    /// `(part_id, region_epoch)` of every partition this PS has open and
+    /// serving right now. The manager compares it with the regions it assigned
+    /// to judge the PS ready; like `slot_cap` it is kept in memory only.
+    pub open_parts: Vec<(u64, u64)>,
+    /// `host:port` of this PS's Prometheus `/metrics`; empty without
+    /// `--metrics-port`. In memory only, like `slot_cap`.
+    pub metrics_addr: String,
+}
+// Response: CodeResp
+
+// --- RegisterPartitionAddr ---
+// PS calls this once per partition after binding that partition's
+// dedicated TcpListener. Manager records `(part_id -> address)` in memory
+// and returns it via `GetRegionsResp.part_addrs`. Clients use it to
+// target the exact CPU-shard listener that owns the partition.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct RegisterPartitionAddrReq {
+    pub ps_id: u64,
+    pub part_id: u64,
+    pub address: String,
+}
+// Response: CodeResp
+
+// --- ReconcileExtents ---
+// Extent node calls this on startup (after `load_extents`) with every
+// `extent_id` it found on disk. Manager checks each id against
+// `s.extents` and returns the subset that no longer exists — those are
+// orphans that the node should unlink (their refcount went to 0 while
+// the node was offline or while the manager's in-memory pending-delete
+// queue was lost to a manager restart).
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct ReconcileExtentsReq {
+    /// The reporter's numeric id, or `0` when it does not know it — the EN is
+    /// told its UUID at format time, not its id.
+    pub node_id: u64,
+    /// The reporter's STABLE identity, which the manager resolves to a node_id.
+    ///
+    /// This is load-bearing, not diagnostic: every verdict in the response is
+    /// relative to "what should THIS node hold", so a reporter the manager
+    /// cannot identify gets NO verdict at all. Empty only from a node that was
+    /// started without `--advertise` (test/pre-registration).
+    pub node_uuid: String,
+    /// Which shard of that node is reporting.
+    ///
+    /// Every shard runs its own reconcile over a DISJOINT set of extents, and
+    /// they all share one `node_id`. Without this the manager cannot tell one
+    /// shard's silence about an extent from the others', and its grace counters
+    /// — pruned to "what the reporter still holds" — would be wiped by every
+    /// sibling's report.
+    pub shard_idx: u32,
+    pub extent_ids: Vec<u64>,
+}
+
+/// Where ONE node should keep ONE extent's payload — the manager's answer to
+/// "what am I supposed to be holding?".
+///
+/// This is what makes the reconcile file-granular. An extent-granular answer
+/// can only say "you should not have this extent at all"; it cannot say **keep
+/// the extent, drop the `.dat`**, which is exactly the post-conversion cleanup.
+/// From `(payload_location, shard_index)` the node derives the ONE payload file
+/// it should hold, and anything else it holds for that extent is residue —
+/// covering both a redundant pre-conversion `.dat` and the shards of an
+/// abandoned attempt, with no second mechanism.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct ExtentPlacement {
+    pub extent_id: u64,
+    /// `extent_rpc::PayloadLocation` as a byte.
+    pub payload_location: u8,
+    /// This node's position in `replicates ++ parity`, which IS its shard index
+    /// when the location is `InShardFile`. Meaningless (and 0) for `InDat`.
+    pub shard_index: u32,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct ReconcileExtentsResp {
+    pub code: u8,
+    pub message: String,
+    /// Subset of `req.extent_ids` this node is not a member of. Delete
+    /// everything: `.dat`, `.meta`, and every shard file.
+    pub garbage: Vec<u64>,
+    /// Placement for each reported extent this node IS a member of. An extent
+    /// reported by the node but absent from BOTH lists has no verdict this
+    /// round (the manager is unsure) and must be left strictly alone.
+    pub placements: Vec<ExtentPlacement>,
+}
+
+// ── Extent node RPC types needed by the manager ────────────────────────────
+// The manager calls extent nodes for alloc/commit_length/re_avali/df/recovery/ec.
+// These duplicate the minimal subset from extent_rpc.rs to avoid manager→stream dep.
+
+// --- UpdateStreamEc (FOPS-03) ---
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct UpdateStreamEcReq {
+    pub stream_id: u64,
+    pub ec_data_shard: u32,
+    pub ec_parity_shard: u32,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct UpdateStreamEcResp {
+    pub code: u8,
+    pub message: String,
+    pub stream: Option<MgrStreamInfo>,
+}
+
+// ── CommitLength binary codec (hot path, duplicated from extent_rpc) ───────
+
+/// CommitLengthRequest: 16 bytes. [extent_id: u64 LE][owner_epoch: i64 LE]
+///
+/// Wire contract on `owner_epoch`: see `extent_rpc::CommitLengthReq` docstring.
+/// Manager-side construction MUST pass a strictly-positive owner_epoch
+/// (the caller's validated owner-lock claim). For fence-free probes
+/// without an owner context, use `ExtProbeExtentReq` instead.
+pub struct ExtCommitLengthReq {
+    pub extent_id: u64,
+    pub owner_epoch: i64,
+}
+
+impl ExtCommitLengthReq {
+    pub fn encode(&self) -> Bytes {
+        let mut buf = BytesMut::with_capacity(16);
+        buf.put_u64_le(self.extent_id);
+        buf.put_i64_le(self.owner_epoch);
+        buf.freeze()
+    }
+}
+
+/// CommitLengthResponse: 9 bytes. [code: u8][length: u64 LE]
+pub struct ExtCommitLengthResp {
+    pub code: u8,
+    pub length: u64,
+}
+
+impl ExtCommitLengthResp {
+    pub fn decode(mut data: Bytes) -> Result<Self, &'static str> {
+        if data.len() < 9 {
+            return Err("commit_length response too short");
+        }
+        Ok(Self {
+            code: data.get_u8(),
+            length: data.get_u64_le(),
+        })
+    }
+}
+
+// ── ProbeExtent binary codec (manager-only, duplicated from extent_rpc) ────
+
+/// `MSG_PROBE_EXTENT` request: 8 bytes. `[extent_id: u64 LE]`
+///
+/// See `extent_rpc::ProbeExtentReq` for full semantics. Built by the
+/// `autumn-op info` open-extent display; nothing in the manager sends it.
+pub struct ExtProbeExtentReq {
+    pub extent_id: u64,
+}
+
+impl ExtProbeExtentReq {
+    pub fn encode(&self) -> Bytes {
+        let mut buf = BytesMut::with_capacity(8);
+        buf.put_u64_le(self.extent_id);
+        buf.freeze()
+    }
+}
+
+/// `MSG_PROBE_EXTENT` response: 9 bytes (same shape as
+/// `ExtCommitLengthResp`). `code` is `CODE_OK` / `CODE_NOT_FOUND`.
+pub type ExtProbeExtentResp = ExtCommitLengthResp;
+
+// ── partition merge + policy advisory ──────────────────────────────────────
+
+// --- MultiModifyMerge --- (in-process only: the manager's merge txn input)
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct MultiModifyMergeReq {
+    pub survivor_part_id: u64,
+    pub victim_part_id: u64,
+    pub owner_key: String,
+    pub owner_epoch: i64,
+    /// commit_length per stream type, indexed [0]=survivor, [1]=victim
+    pub log_sealed_lengths: [u64; 2],
+    pub row_sealed_lengths: [u64; 2],
+    pub meta_sealed_lengths: [u64; 2],
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct MultiModifyMergeResp {
+    pub code: u8,
+    pub message: String,
+    /// extent_id of the freshly allocated empty tail for survivor's
+    /// log_stream; used as vp_head when writing the merged
+    /// TableLocations checkpoint on the PS.
+    pub new_log_tail_extent_id: u64,
+}
+
+// --- MergePartitions (manager-orchestrated merge) ---
+//
+// Drop-in replacement for the client-orchestrated merge sequence.
+// Caller passes only the two partition ids; the manager handles owner-
+// lock acquisition, PS freeze, commit_length capture, and the multi-
+// modify-merge txn internally. This relocates the orchestration's
+// failure boundary onto the leader-fenced + etcd-replayable manager.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct MergePartitionsReq {
+    pub survivor_part_id: u64,
+    pub victim_part_id: u64,
+    /// step 4: override the sacred-boundary refusal. Merging
+    /// two partitions destroys the boundary between them; when that boundary is
+    /// a recorded presplit point, the merge silently undoes an operator's
+    /// declared layout (for fs lane boundaries the symptom is that every
+    /// SUBSEQUENT large file stripes narrower, with no error anywhere). Refused
+    /// by default, allowed with this flag.
+    pub force: bool,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct MergePartitionsResp {
+    pub code: u8,
+    pub message: String,
+    pub new_log_tail_extent_id: u64,
+}
+
+// --- active region→PS load rebalance ---
+//
+// `rebalance_regions` (the eviction path) is STICKY — it keeps a region on its
+// currently-registered PS and only reassigns regions whose PS is unregistered.
+// So after a rolling restart every partition can pile onto whichever PS
+// registered first, and nothing ever re-spreads them (a restart doesn't move a
+// registered PS's regions). This RPC is the active balancer (WAS PM /
+// Bigtable-master / TiKV-PD `balance-region` equivalent): it reassigns
+// partitions from the most-loaded PS to the least-loaded until balanced,
+// bounded by `max_moves` so the partition-reopen storm on the targets is
+// throttled. `max_moves == 0` = as many as needed to balance.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct RebalanceRegionsReq {
+    pub max_moves: u32,
+}
+
+/// One reassignment the manager performed: `part_id` moved `from_ps`→`to_ps`.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct RebalanceMove {
+    pub part_id: u64,
+    pub from_ps: u64,
+    pub to_ps: u64,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct RebalanceRegionsResp {
+    pub code: u8,
+    pub message: String,
+    /// The moves applied (empty when already balanced). `moved == moves.len()`.
+    pub moves: Vec<RebalanceMove>,
+    pub moved: u32,
+}
+
+// --- ReportPartitionLoad (PS → manager periodic metrics) ---
+//
+// wire change (backward-incompatible): adds 5 new fields
+// surfacing per-partition SST dead-data breakdown and minor-compact
+// debt. Same-commit upgrade required (cluster.sh stops all roles
+// before restart).
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct PartitionLoad {
+    pub part_id: u64,
+    pub size_bytes: u64,
+    pub req_per_sec: u32,
+    /// Real write throughput: value bytes/sec ingested by Put (the bytes/sec
+    /// companion to req_per_sec's IOPS).
+    pub write_bytes_per_sec: u64,
+    /// Real read throughput: value bytes/sec served by GET (resolved-value path;
+    /// large-VP client-direct reads from the EN are not counted here).
+    pub read_bytes_per_sec: u64,
+    pub imm_full_per_sec: u32,
+    pub p99_us: u32,
+    /// Σ reclaimable bytes on sealed log_stream extents before the replay
+    /// floor — what GC may take now. "GC debt" — rises with deletes/overwrites,
+    /// drops on `punch_holes`; dead bytes at/after the floor are
+    /// `open_tail_dead_bytes`.
+    pub gc_debt_bytes: u64,
+    /// bytes that the next compact tick would feed into `do_compact`
+    /// (overlap-tagged tables when has_overlap == 1, else the PS's
+    /// current minor window). "Major-compaction debt".
+    pub pending_compaction_bytes: u64,
+    /// 1 while `background_gc_loop` is inside `run_gc`, else 0.
+    pub gc_inflight: u32,
+    /// 1 while `background_compact_loop` is inside `do_compact`,
+    /// else 0.
+    pub compact_inflight: u32,
+    /// unix-epoch seconds of the last successful GC `punch_holes`.
+    /// 0 = never since process start.
+    pub last_gc_at: i64,
+    /// unix-epoch seconds of the last successful `do_compact`.
+    /// 0 = never since process start.
+    pub last_compact_at: i64,
+    /// total bytes occupied by tombstone (op==2) records inside
+    /// the partition's live SSTs. Drives external controllers'
+    /// "should-major-compact" decisions; advisory-only here.
+    pub sst_tombstone_bytes: u64,
+    /// total bytes occupied by SST records with `expires_at <= now`.
+    /// Dead-data driver alongside tombstones.
+    pub sst_expired_bytes: u64,
+    /// total bytes of SST records whose keys fall outside the
+    /// partition's current `rg` range (only > 0 when `has_overlap == 1`,
+    /// i.e. post-split CoW-shared SSTables haven't been compacted yet).
+    pub sst_out_of_range_bytes: u64,
+    /// total bytes of the minor window the PS's exploring policy picks now
+    /// (0 with `has_overlap == 1`).
+    pub minor_compact_pending_bytes: u64,
+    /// number of sealed log_stream extents currently in
+    /// `extent_ids[..len-1]` (informational; helps OP correlate
+    /// `gc_debt_bytes` against the extent population).
+    pub sealed_log_extent_count: u32,
+    /// Σ committed bytes on this partition's three
+    /// stream OPEN-TAIL extents (log + row + meta), as the PS knows them
+    /// locally. An open extent's manager-side `sealed_length` is 0, so the
+    /// manager's authoritative sealed-length sum (the cluster-overview
+    /// `live_size`) excludes exactly these bytes — a fully-compacted or
+    /// log-heavy partition whose data lives entirely in open tails renders
+    /// 0 B without this. The manager adds it to its sealed sum:
+    /// `live_size = Σ sealed_length + open_tail_bytes`, matching what
+    /// `autumn-op info --part` gets by probing the EN. Refreshed on the PS
+    /// maintenance loop (throttled, non-blocking); 0 until first refresh.
+    pub open_tail_bytes: u64,
+    /// dead WAL bytes GC cannot take yet: those in the log extents at or
+    /// after the replay floor, the open tail included (the name predates the
+    /// replay window joining it). `gc_debt_bytes` counts only the extents
+    /// before the floor, so a log-heavy / all-open-tail partition, or one whose
+    /// garbage sits in its replay window, reports `gc_debt_bytes = 0` while
+    /// holding real dead bytes here. Together `gc_debt_bytes +
+    /// open_tail_dead_bytes` is the partition's full WAL debt. Refreshed on
+    /// the PS GC tick from the persisted SST discard maps; 0 until the first
+    /// tick.
+    pub open_tail_dead_bytes: u64,
+    /// Mirror of the PS's `PartitionData.has_overlap`: 1 while this partition's
+    /// SSTs still carry keys outside its own range (a CoW split's children
+    /// share the parent's tables until a MAJOR compaction rewrites them), else
+    /// 0.
+    ///
+    /// On the wire because it is a PRECONDITION the manager cannot otherwise
+    /// see: `handle_split_part` refuses with `cannot split: partition has
+    /// overlapping keys` while this is 1, so a policy that advises a split
+    /// against such a partition advises an action that is certain to be
+    /// refused. `sst_out_of_range_bytes` is NOT a substitute — it is the size
+    /// of the out-of-range records, and it reads 0 for an overlapping
+    /// partition whose shared tables happen to hold no out-of-range key, which
+    /// is exactly the case a byte-count inference would wave through.
+    pub has_overlap: u32,
+    /// Deletes this partition took that no MAJOR compaction has seen yet
+    /// (`PartitionMetrics::unsettled_deletes`). A delete's freed bytes reach
+    /// GC only through a compaction's discard, and for large values the LSM
+    /// that the size-driven compaction advisories measure stays a few KB no
+    /// matter how many GiB were deleted — this is the only signal that a
+    /// major compaction would free anything. Not persisted: deletes already
+    /// flushed to an SST before a reopen (PS restart, split, merge) are not
+    /// counted again.
+    pub unsettled_deletes: u64,
+    /// Terminal outcomes (≤ the PS's small ring) of manager-submitted
+    /// maintenance ops (compact / gc / forcegc carrying a non-zero `op_id`).
+    /// Piggybacked on the 5 s heartbeat so the manager's op-ledger learns the
+    /// state + error string that would otherwise die in a PS `tracing::error!`.
+    /// Idempotent-retransmit: the manager reconciles by `op_id` and ignores
+    /// ones it doesn't know. Empty in the common (untracked / no recent op) case.
+    pub maintenance_outcomes: Vec<MaintenanceOutcome>,
+    /// Latest progress sample for whatever maintenance op this partition is
+    /// running now. Empty when idle. At most two: the merged GC/compaction
+    /// loop runs one at a time, and a split waiting for it reports its own.
+    pub active_maintenance: Vec<MaintenanceProgress>,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct ReportPartitionLoadReq {
+    pub ps_id: u64,
+    pub partitions: Vec<PartitionLoad>,
+}
+
+// --- GetPolicyCandidates (advisory) ---
+//
+// **WIRE-STABILITY CONTRACT** — the numeric values below are
+// frozen. New advisory kinds must be APPENDED with the next unused
+// value (POLICY_KIND_EC = 6 → next would be 7). Renumbering breaks
+// every external controller, dashboard, and historical log analysis.
+// Operators discovered this when an off-by-one between this code
+// (SPLIT=0..EC=6) and a stale CLAUDE.md note (which said "1..7")
+// caused every Python `cluster/policy_controller.py` decision to
+// fire on the wrong kind. Treat docs + this file + the const-dump
+// (`MSG_GET_POLICY_KIND_NAMES`) as a CI-checkable triad — drift on
+// any one is a wire-breaking event.
+pub const POLICY_KIND_SPLIT: u8 = 0;
+pub const POLICY_KIND_MERGE: u8 = 1;
+/// GC debt advisory — partition's `gc_debt_bytes` exceeds the
+/// configured high-water threshold for `policy.required_buckets`
+/// consecutive sliding-window buckets and the partition is outside the
+/// gc cooldown window. Stage 1 is advisory-only — no auto-trigger.
+pub const POLICY_KIND_GC: u8 = 2;
+/// major-compaction debt advisory — partition's
+/// `pending_compaction_bytes` exceeds the configured high-water
+/// threshold for `policy.required_buckets` consecutive buckets and
+/// outside the compact cooldown. Renamed from `POLICY_KIND_COMPACT`
+/// to disambiguate against the new minor-compact advisory.
+pub const POLICY_KIND_MAJOR_COMPACT: u8 = 3;
+/// compatibility alias: older callers used `POLICY_KIND_COMPACT`.
+/// Same wire value (3). Marked `#[deprecated]` so new code prefers the
+/// `_MAJOR_COMPACT` name.
+#[deprecated(note = "use POLICY_KIND_MAJOR_COMPACT (rename, same wire value)")]
+pub const POLICY_KIND_COMPACT: u8 = POLICY_KIND_MAJOR_COMPACT;
+/// Stage D: hot/cold imbalance advisory. Emitted once per PS
+/// when sustained `max(req_per_sec) / min(req_per_sec) ≥ HOT_COLD_RATIO`
+/// AND hottest > `--hot-cold-min-hot-qps`, OR the same imbalance on
+/// `size_bytes`. `primary_part_id` = hottest partition, `secondary_part_id`
+/// = coldest partition; `reason` carries `ps_id=N qps_ratio=N qps_hot=[…]
+/// qps_cold=[…] size_ratio=N size_hot=[…] size_cold=[…]`.
+/// `same_ps = true` always (the advisory is by definition per-PS).
+pub const POLICY_KIND_HOT_COLD: u8 = 4;
+/// Retired: minor compaction is the PS's own (after every flush). The value
+/// stays reserved; no manager emits it.
+pub const POLICY_KIND_MINOR_COMPACT: u8 = 5;
+/// EC-conversion advisory. A sealed log/row stream extent has
+/// not been EC-converted yet AND its `sealed_length` exceeds the
+/// minimum-payoff threshold (default 64 MiB — below that, EC
+/// overhead outweighs the space savings, so we don't even suggest
+/// it). `primary_part_id = 0` (EC is per-extent, not per-partition);
+/// `secondary_part_id` carries the extent_id; `size_bytes` carries
+/// `sealed_length`. Manager emits these from a direct scan of
+/// `s.streams`, NOT from PartitionLoad.
+pub const POLICY_KIND_EC: u8 = 6;
+/// Phase B: CLUSTER-level region→PS load-balance advisory.
+/// Emitted (at most one per tick) when the per-PS partition-count spread exceeds
+/// the configured threshold. `primary_part_id = 0` / `secondary_part_id = 0`
+/// (cluster-scoped, not a single partition/extent); `reason` carries the per-PS
+/// counts + gap. Manager sources it from `regions` + `ps_nodes` directly, NOT
+/// from PartitionLoad. The armed auto-policy controller actuates it via
+/// `MSG_REBALANCE_REGIONS` with a bounded per-tick `max_moves`.
+pub const POLICY_KIND_REBALANCE: u8 = 7;
+/// Extent repair advisory: a NODE whose slots have stayed degraded (behind or
+/// unreachable — not fenced, corrupt or on a faulted disk, which rebuild on
+/// their own, and not in maintenance) for at least the manager's
+/// `--repair-grace-secs`. `primary_part_id = 0`; `secondary_part_id` = the node
+/// id; `size_bytes` = Σ `sealed_length` of the extents involved; `reason`
+/// names the count, the longest wait and how many have no redundancy left.
+/// Actuation records a repair request for each of those slots, which the
+/// recovery loop then rebuilds on another node — without fencing the node.
+pub const POLICY_KIND_REPAIR: u8 = 8;
+/// Scrub every sealed payload file in the cluster (`autumn-op scrub --all`),
+/// at most once per manager `--scrub-policy-interval-secs` (weekly by
+/// default). Cluster-scoped: no target id.
+pub const POLICY_KIND_SCRUB: u8 = 9;
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct PolicyCandidate {
+    pub kind: u8,               // POLICY_KIND_SPLIT or POLICY_KIND_MERGE
+    pub primary_part_id: u64,   // split: target; merge: survivor
+    pub secondary_part_id: u64, // split: 0; merge: victim
+    pub reason: String,
+    pub size_bytes: u64,
+    pub req_per_sec: u32,
+    pub imm_full_per_sec: u32,
+    pub same_ps: bool,
+    pub last_op_at: i64,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct GetPolicyCandidatesReq {}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct GetPolicyCandidatesResp {
+    pub code: u8,
+    pub message: String,
+    pub candidates: Vec<PolicyCandidate>,
+}
+
+// --- GetPolicyKindNames (const-dump) ---
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct GetPolicyKindNamesReq {}
+
+/// `(name, value)` pairs for every defined `POLICY_KIND_*` constant in
+/// THIS binary. External controllers should pull this at startup and
+/// resolve string names locally rather than hardcoding numeric values
+/// — the numeric values are wire-stable by contract (see freeze
+/// docstring above the `POLICY_KIND_*` block), but new kinds may be
+/// added at any binary release.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct GetPolicyKindNamesResp {
+    pub code: u8,
+    pub message: String,
+    pub kinds: Vec<(String, u8)>,
+}
+
+/// Returns the canonical name → wire-value mapping for every
+/// currently-defined `POLICY_KIND_*` constant. Update this list when
+/// a new kind is added (the binary is the source of truth for what
+/// it serves; external tooling reads via `MSG_GET_POLICY_KIND_NAMES`).
+pub fn policy_kind_names() -> Vec<(String, u8)> {
+    vec![
+        ("POLICY_KIND_SPLIT".to_string(), POLICY_KIND_SPLIT),
+        ("POLICY_KIND_MERGE".to_string(), POLICY_KIND_MERGE),
+        ("POLICY_KIND_GC".to_string(), POLICY_KIND_GC),
+        (
+            "POLICY_KIND_MAJOR_COMPACT".to_string(),
+            POLICY_KIND_MAJOR_COMPACT,
+        ),
+        ("POLICY_KIND_HOT_COLD".to_string(), POLICY_KIND_HOT_COLD),
+        (
+            "POLICY_KIND_MINOR_COMPACT".to_string(),
+            POLICY_KIND_MINOR_COMPACT,
+        ),
+        ("POLICY_KIND_EC".to_string(), POLICY_KIND_EC),
+        ("POLICY_KIND_REBALANCE".to_string(), POLICY_KIND_REBALANCE),
+        ("POLICY_KIND_REPAIR".to_string(), POLICY_KIND_REPAIR),
+        ("POLICY_KIND_SCRUB".to_string(), POLICY_KIND_SCRUB),
+    ]
+}
+
+// --- ReportDiskFailure ---
+/// Generic transport/append failure on a known replica. The manager
+/// does not act on `error_kind` directly today; it's surfaced for
+/// future per-kind policy tuning (e.g. demote vs. trigger immediate
+/// recovery) and for operator log readability.
+pub const REPORT_DISK_FAILURE_KIND_GENERIC: u8 = 0;
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct ReportDiskFailureReq {
+    /// Replica node_id that produced the failure.
+    pub node_id: u64,
+    /// The extent the append/operation was targeting; carried so the
+    /// manager log makes the failure attributable end-to-end.
+    pub extent_id: u64,
+    /// One of the `REPORT_DISK_FAILURE_KIND_*` constants.
+    pub error_kind: u8,
+    /// Reporter partition id (used by the manager's debounce / quorum
+    /// — 3 distinct reporter_part_id within the eviction window).
+    pub reporter_part_id: u64,
+    /// Wall-clock ms when the failure was observed; informational
+    /// only — manager uses its own Instant for the sliding window.
+    pub ts_ms: i64,
+}
+
+// Response: fire-and-forget (req_id = 0). No reply needed; manager
+// logs are the operator-facing surface.
+
+// --- ForceEcConvert ---
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct ForceEcConvertReq {
+    /// Sealed-but-unconverted extent the OP wants to EC-encode now.
+    pub extent_id: u64,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct ForceEcConvertResp {
+    pub code: u8,
+    pub message: String,
+}
+
+// --- GetPartitionDetail ---
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct GetPartitionDetailReq {
+    pub part_id: u64,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct GetPartitionDetailResp {
+    pub code: u8,
+    pub message: String,
+    /// Latest cached PartitionLoad in the manager's policy window.
+    /// `part_id == 0` if the partition has no metrics history (PS
+    /// hasn't sent a `MSG_REPORT_PARTITION_LOAD` for it yet).
+    pub load: PartitionLoad,
+    /// Unix-epoch seconds of the bucket this load was stamped at.
+    pub bucket_ts: i64,
+}
+
+// ── Dashboard cluster overview (MSG_GET_CLUSTER_OVERVIEW) ──────────────────
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct GetClusterOverviewReq {}
+
+/// One compact partition row (no per-extent detail; that is lazy).
+/// `live_size` sums the partition's distinct extents' `sealed_length`
+/// (manager-authoritative, NO extent-node probe) — open-tail bytes are
+/// excluded, so it is an overview estimate; the per-partition detail
+/// (`info --part P`) probes for the exact figure.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct PartitionOverview {
+    pub part_id: u64,
+    /// The serving PS INSTANCE id. Distinct from `ps_addr`, which
+    /// is the partition's OWN listener (`base_port + ord`) — many partitions on
+    /// ONE PS each get a different `ps_addr`, so PS-count must group by `ps_id`.
+    pub ps_id: u64,
+    pub ps_addr: String,
+    pub range_start: Vec<u8>,
+    pub range_end: Vec<u8>,
+    pub live_size: u64,
+    pub total_extents: u32,
+    pub log_stream: u64,
+    pub row_stream: u64,
+    pub meta_stream: u64,
+    /// Latest reported IOPS (PartitionLoad.req_per_sec) from the manager's
+    /// policy window; 0 if the PS hasn't reported load yet. Cheap (already in
+    /// memory) so the overview can show per-partition IOPS + a cluster sum
+    /// without per-partition detail RPCs.
+    pub req_per_sec: u64,
+    /// Latest reported write / read throughput (bytes/sec) from the policy window.
+    pub write_bytes_per_sec: u64,
+    pub read_bytes_per_sec: u64,
+}
+
+/// Per-node rollup — the one thing a client can't compute without the full
+/// extent array: how many extent shards this node hosts (replicates ∪ parity).
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct NodeOverview {
+    pub node_id: u64,
+    pub address: String,
+    pub extent_count: u32,
+}
+
+/// One partition server, from the manager's registry — NOT derived from the
+/// partition list.
+///
+/// The partition list can only show a PS that currently owns something, so the
+/// two states an operator most needs to see are exactly the two it cannot
+/// express: a PS that is registered and serving NOTHING, and a PS that has
+/// stopped heartbeating while its partitions still appear assigned to it.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct PsOverview {
+    pub ps_id: u64,
+    /// The PS-level address it registered with (`ps_nodes`). Individual
+    /// partitions listen on their own ports; see `PartitionOverview.ps_addr`.
+    pub address: String,
+    /// Seconds since this PS's last heartbeat, or `u64::MAX` when the manager
+    /// holds no heartbeat entry for it — defensive only: `replay_from_etcd` and
+    /// `register_ps` both seed one. The flip side of the replay seed: right
+    /// after a leader change, every replayed PS reads as freshly heard from
+    /// until the 10 s eviction window has had a chance to judge it.
+    pub last_heartbeat_secs_ago: u64,
+    /// Regions currently assigned to this PS.
+    pub partition_count: u32,
+    /// Core-pinned partition slots this PS reported; `0` = no `--cpuset`, or
+    /// not yet heard from since this manager became leader.
+    pub slot_cap: u32,
+    /// `host:port` of its `/metrics` from its latest heartbeat; empty = no
+    /// endpoint, or not heard from since this manager became leader.
+    pub metrics_addr: String,
+    /// How many of the `partition_count` assigned partitions the PS's latest
+    /// heartbeat reported open at their current region epoch; `None` = no
+    /// heartbeat with that report since the PS registered or this manager
+    /// became leader.
+    pub open_count: Option<u32>,
+    /// Unix ms this PS id first registered; `0` = it is in the live registry
+    /// but has no member record (registered before members existed).
+    pub joined_at_ms: i64,
+    /// Unix ms the manager evicted it for a silent heartbeat; `0` = it is in
+    /// the live registry. A member stays listed after eviction until an
+    /// operator removes it, so the fleet's size does not shrink to whatever
+    /// happens to be alive.
+    pub evicted_at_ms: i64,
+}
+
+impl PsOverview {
+    /// A heartbeat older than this no longer vouches for the open set it
+    /// carried (the PS beats every 2 s; the manager evicts at 10 s).
+    pub const READY_MAX_HEARTBEAT_AGE_SECS: u64 = 6;
+
+    /// Ready = serving everything the manager assigned it: a recent heartbeat
+    /// reported every assigned partition open at its current epoch. A live
+    /// heartbeat alone says nothing about the partitions — they open after
+    /// registration, one recovery each.
+    pub fn ready(&self) -> bool {
+        self.last_heartbeat_secs_ago < Self::READY_MAX_HEARTBEAT_AGE_SECS
+            && self.open_count == Some(self.partition_count)
+    }
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct GetClusterOverviewResp {
+    pub code: u8,
+    pub message: String,
+    pub partitions: Vec<PartitionOverview>,
+    pub nodes: Vec<NodeOverview>,
+    /// Cluster-aggregate IOPS = Σ partitions' latest req_per_sec.
+    pub total_req_per_sec: u64,
+    /// Cluster-aggregate write / read throughput (bytes/sec).
+    pub total_write_bytes_per_sec: u64,
+    pub total_read_bytes_per_sec: u64,
+    /// Distinct serving PS instances (by `ps_id`, NOT `ps_addr`).
+    pub ps_count: u32,
+    /// Every REGISTERED partition server, including ones owning no partition.
+    pub ps_servers: Vec<PsOverview>,
+}
+
+// ── Extent msg_type constants (needed by manager for node calls) ──────────
+
+pub const EXT_MSG_COMMIT_LENGTH: u8 = 3;
+pub const EXT_MSG_ALLOC_EXTENT: u8 = 4;
+pub const EXT_MSG_DF: u8 = 5;
+pub const EXT_MSG_REQUIRE_RECOVERY: u8 = 6;
+pub const EXT_MSG_RE_AVALI: u8 = 7;
+pub const EXT_MSG_CONVERT_TO_EC: u8 = 9;
+pub const EXT_MSG_DELETE_EXTENT: u8 = 11;
+pub const EXT_MSG_COMMIT_EC_SHARD: u8 = 12;
+pub const EXT_MSG_PROBE_EXTENT: u8 = 14;
+
+// ── node-lifecycle wire types ────────────────────────────────────────────────
+//
+// These message payloads use the same rkyv encode/decode helpers as the
+// rest of this file. New `MgrNode*` types are append-only; existing wire
+// shapes (MgrNodeInfo, MgrExtentInfo, etc.) are unchanged.
+
+/// Auto-tracked state byte. Wire-stable; APPEND-only.
+pub const NODE_AUTO_STATE_ONLINE: u8 = 0;
+pub const NODE_AUTO_STATE_SUSPECTED: u8 = 1;
+/// registered, never verified alive (no successful df yet).
+/// Initial state for any node freshly added via `MSG_REGISTER_NODE`.
+pub const NODE_AUTO_STATE_SUSPEND: u8 = 2;
+
+/// operator override kind. Wire-stable; new kinds APPEND-only.
+pub const NODE_OVERRIDE_NONE: u8 = 0;
+pub const NODE_OVERRIDE_FENCED: u8 = 1;
+pub const NODE_OVERRIDE_MAINTENANCE: u8 = 2;
+
+/// rkyv'd value at etcd prefix `node_override/<node_id>`. Replayed
+/// on leader failover; cleared by `mgr_clear_node_override` or by the
+/// `NodeStateTracker.tick()` Maintenance-TTL sweep.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct MgrNodeOverride {
+    pub node_id: u64,
+    /// `NODE_OVERRIDE_FENCED` or `NODE_OVERRIDE_MAINTENANCE`. `NONE` is
+    /// never serialised (caller deletes the etcd key instead).
+    pub kind: u8,
+    pub set_at: i64,
+    pub set_by: String,
+    pub reason: String,
+    /// Optional Maintenance TTL — unix-epoch seconds at which the
+    /// `NodeStateTracker.tick()` automatically clears the override.
+    /// `0` = no TTL (Fenced is permanent until explicit clear).
+    pub expire_at: u64,
+    /// The fenced/decommissioned node's stable `node_uuid`,
+    /// captured at override time. Load-bearing for the `decommissioned/`
+    /// tombstone: `remove_node` deletes `nodes/<id>`, so after removal the
+    /// node_id→uuid mapping only survives HERE — the re-register zombie check
+    /// scans tombstones by this uuid so a removed node returning under its own
+    /// identity is refused even though its `MgrNodeInfo` is gone. Empty for
+    /// legacy/replayed overrides written before node uuids existed (matches no uuid).
+    pub node_uuid: String,
+}
+
+// --- ListNodeStates ---
+
+/// An operator override on an extent node: `autumn-op fence-node` (Fenced,
+/// until `unfence`) or `autumn-op maintenance` (Maintenance, optionally timed).
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct NodeOverride {
+    /// `NODE_OVERRIDE_FENCED` or `NODE_OVERRIDE_MAINTENANCE` (`Default` gives
+    /// `NODE_OVERRIDE_NONE`: "no override" for display, never on the wire).
+    pub kind: u8,
+    pub reason: String,
+    pub set_by: String,
+    /// Unix seconds.
+    pub set_at: i64,
+    /// Unix seconds at which a Maintenance override clears itself; 0 = never.
+    pub expire_at: u64,
+}
+
+impl NodeStateEntry {
+    /// The override's kind, `NODE_OVERRIDE_NONE` when there is none.
+    pub fn override_kind(&self) -> u8 {
+        self.operator_override.as_ref().map_or(NODE_OVERRIDE_NONE, |o| o.kind)
+    }
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct ListNodeStatesReq {}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct NodeStateEntry {
+    pub node_id: u64,
+    pub address: String,
+    /// `NODE_AUTO_STATE_*`.
+    pub auto_state: u8,
+    /// Seconds since the most recent successful df, or `u64::MAX` if
+    /// the manager has never observed one (e.g. node registered but no
+    /// df probe completed yet).
+    pub last_heartbeat_secs_ago: u64,
+    /// Seconds since auto_state flipped to Suspected, or 0 when Online.
+    pub suspected_age_secs: u64,
+    /// The operator override on the node, if any.
+    pub operator_override: Option<NodeOverride>,
+    /// The node's stable identity + the shard ports it last
+    /// registered (`shard_ports.len()` = its shard count). Lets `list-nodes`
+    /// show the identity and verify a reshard took effect. Empty for a node registered
+    /// before node uuids existed (impossible on a reset cluster) / legacy single-shard registration.
+    pub node_uuid: String,
+    pub shard_ports: Vec<u16>,
+    /// Where the node serves `/metrics`, from its latest df answer (empty:
+    /// none reported, or not heard from since this manager became leader).
+    pub metrics_addr: String,
+    /// Disks the node's latest df answer reported out of space (they serve
+    /// reads and existing extents but take no new ones until free space
+    /// returns). Here, not in `DiskCapWire`: that struct is client surface.
+    pub full_disks: Vec<u64>,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct ListNodeStatesResp {
+    pub code: u8,
+    pub message: String,
+    pub nodes: Vec<NodeStateEntry>,
+}
+
+// --- ExtentHealthReport ---
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct ExtentHealthReq {
+    /// Empty Vec = "every unhealthy extent". Non-empty = "every extent
+    /// whose any-slot's node_id appears in this filter, healthy or not".
+    pub node_id_filter: Vec<u64>,
+    /// If true and `node_id_filter` is empty, return ALL extents
+    /// regardless of health (used by `inspect-extent` paths). Default
+    /// false (only unhealthy) keeps the typical OP poll cheap.
+    pub include_healthy: bool,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct ExtentSlotHealth {
+    /// 0..(K+M-1). Layered: data shards first, then parity shards.
+    pub slot_index: u32,
+    pub node_id: u64,
+    /// Mirror of `MgrExtentInfo.avali bit & (1<<slot)`.
+    pub avali: bool,
+    /// Node's `NODE_AUTO_STATE_*` at report time.
+    pub auto_state: u8,
+    /// `NODE_OVERRIDE_*` at report time.
+    pub override_kind: u8,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct ExtentHealth {
+    pub extent_id: u64,
+    pub eversion: u64,
+    pub sealed_length: u64,
+    pub ec_converted: bool,
+    pub slots: Vec<ExtentSlotHealth>,
+    /// True iff any slot has `avali == false` OR any slot's node is
+    /// Suspected / Fenced / Maintenance.
+    pub unhealthy: bool,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct ExtentHealthResp {
+    pub code: u8,
+    pub message: String,
+    pub extents: Vec<ExtentHealth>,
+}
+
+// --- ExtentHealthSummary ---
+
+/// How many sealed extents are in each health state, and the worst ones by
+/// name — the extent counterpart of Ceph's placement-group summary.
+///
+/// A message of its own rather than fields on `ExtentHealthReport`: that one
+/// lists every unhealthy extent with all its slots, which is what an operator
+/// wants about ONE node, and not what a status line polled every few seconds
+/// can afford on a large cluster.
+pub const MSG_EXTENT_HEALTH_SUMMARY: u8 = 0x63;
+
+/// Drop a member from the cluster's membership: the set the fleet counts are
+/// measured against. Refused while the member is live; only an operator's
+/// say-so shrinks it. Response: `CodeResp`.
+pub const MSG_REMOVE_MEMBER: u8 = 0x64;
+
+pub const MEMBER_ROLE_PS: u8 = 1;
+pub const MEMBER_ROLE_MANAGER: u8 = 2;
+
+/// The fleet at a glance: every EXPECTED manager, partition server and extent
+/// node with its state, plus the extent and recovery counts. Each list's
+/// length is the denominator; the leader computes it all at one instant
+/// (`sampled_at_ms`). Request: empty. Leader-gated.
+pub const MSG_GET_CLUSTER_STATUS: u8 = 0x65;
+
+/// Which of these extents have a stream-layer op in flight (Recovery, EC
+/// conversion, Delete). Nothing preempts such an op, a punch included, so the
+/// PS's GC asks before relocating an extent's live values rather than relocate
+/// them and then have the punch refused. Request: `ExtentsInFlightReq`;
+/// response: `ExtentsInFlightResp`. Leader-gated; a peer call.
+pub const MSG_EXTENTS_IN_FLIGHT: u8 = 0x66;
+
+/// The runtime parameter overrides an operator set (`autumn-op config set`).
+/// The PS and the EN poll it next to the authz config and apply the entries of
+/// their role. Request: empty; response: `GetRuntimeConfigResp`. Leader-gated;
+/// a peer or admin call.
+pub const MSG_GET_RUNTIME_CONFIG: u8 = 0x67;
+/// Set (`value: Some`) or drop (`None`) one runtime override. The manager
+/// refuses a key that is not a runtime parameter of its role and a value out of
+/// its range. Request: `SetRuntimeConfigReq`; response: `CodeResp`.
+/// Leader-gated; admin only.
+pub const MSG_SET_RUNTIME_CONFIG: u8 = 0x68;
+
+/// Seal the stream's open tail where the replicas that answer agree (the
+/// probe seal), without allocating a new tail. A partition opening seals its
+/// tails before replaying them, so what it replays is what every later reader
+/// sees. A tail already sealed is returned as it is. Request:
+/// `CheckCommitLengthReq`; response: `CheckCommitLengthResp` (`end` = the
+/// sealed length, `last_ex_info` = the sealed tail). Leader-gated; a peer call.
+pub const MSG_SEAL_TAIL: u8 = 0x69;
+
+/// One runtime override. `key` = `<role>.<flag>` (`ps.gc-rate-bytes-per-sec`).
+#[derive(Archive, Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+pub struct RuntimeConfigEntry {
+    pub key: String,
+    pub value: String,
+    pub set_by: String,
+    /// Unix seconds.
+    pub set_at: i64,
+}
+
+#[derive(Archive, Serialize, Deserialize, Debug, Clone, Default)]
+pub struct GetRuntimeConfigResp {
+    pub code: u8,
+    pub message: String,
+    pub entries: Vec<RuntimeConfigEntry>,
+}
+
+#[derive(Archive, Serialize, Deserialize, Debug, Clone, Default)]
+pub struct SetRuntimeConfigReq {
+    pub key: String,
+    /// `None` drops the override (the process goes back to its flag value).
+    pub value: Option<String>,
+    pub set_by: String,
+}
+
+#[derive(Archive, Serialize, Deserialize, Debug, Clone, Default)]
+pub struct ExtentsInFlightReq {
+    pub extent_ids: Vec<u64>,
+}
+
+#[derive(Archive, Serialize, Deserialize, Debug, Clone, Default)]
+pub struct ExtentsInFlightResp {
+    pub code: u8,
+    pub message: String,
+    /// The requested extents with an op in flight.
+    pub in_flight: Vec<u64>,
+}
+
+/// `FleetMember.state`. Managers: `age_secs` is unused (0) except for ABSENT,
+/// where it is the time since the leader saw it go (`u64::MAX` = unknown).
+pub const FLEET_MANAGER_LEADER: u8 = 1;
+pub const FLEET_MANAGER_STANDBY: u8 = 2;
+pub const FLEET_MANAGER_ABSENT: u8 = 3;
+/// Partition servers: `age_secs` is the heartbeat age, or for EVICTED the
+/// time since eviction. OPENING = heartbeating but not every assigned
+/// partition open; SILENT = still registered, heartbeat too old to vouch.
+pub const FLEET_PS_READY: u8 = 4;
+pub const FLEET_PS_OPENING: u8 = 5;
+pub const FLEET_PS_SILENT: u8 = 6;
+pub const FLEET_PS_EVICTED: u8 = 7;
+/// Extent nodes: `age_secs` is the time since the node last answered `df`
+/// (`u64::MAX` = not this leader term). An operator override wins over the
+/// automatic state. UNKNOWN = this leader has had no `df` answer from it yet
+/// (right after a leader change), so nothing vouches for it.
+pub const FLEET_EN_ONLINE: u8 = 8;
+pub const FLEET_EN_SUSPECTED: u8 = 9;
+pub const FLEET_EN_SUSPEND: u8 = 10;
+pub const FLEET_EN_FENCED: u8 = 11;
+pub const FLEET_EN_MAINTENANCE: u8 = 12;
+pub const FLEET_EN_UNKNOWN: u8 = 13;
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct FleetMember {
+    pub id: u64,
+    pub address: String,
+    /// `FLEET_*`.
+    pub state: u8,
+    pub age_secs: u64,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct ClusterStatusResp {
+    pub code: u8,
+    pub message: String,
+    /// Leader wall clock, unix ms.
+    pub sampled_at_ms: i64,
+    pub managers: Vec<FleetMember>,
+    pub partition_servers: Vec<FleetMember>,
+    pub extent_nodes: Vec<FleetMember>,
+    /// Sealed extents by health (`MSG_EXTENT_HEALTH_SUMMARY`'s counts).
+    pub sealed_extents: u64,
+    pub clean: u64,
+    pub degraded: u64,
+    pub unavailable: u64,
+    /// Rebuilds in flight: Recovery markers in the extent op ledger.
+    pub recovery_inflight: u64,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct RemoveMemberReq {
+    /// `MEMBER_ROLE_*`.
+    pub role: u8,
+    pub id: u64,
+    pub set_by: String,
+}
+
+/// What one slot of a SEALED extent is doing. Append-only; the numeric values
+/// are frozen. Evaluated in this order, first match wins: a corrupt mark, a
+/// fenced node and a faulted disk say the copy is going away whatever else is
+/// true of it; then a copy that serves is SERVING; a maintenance node's copy
+/// that does not serve is MAINTENANCE (expected back); a node that does not
+/// answer, or a disk marked offline, is UNREACHABLE; what remains has a node
+/// that answers but an `avali` bit that is clear, which is BEHIND.
+pub const SLOT_STATE_SERVING: u8 = 0;
+pub const SLOT_STATE_BEHIND: u8 = 1;
+pub const SLOT_STATE_UNREACHABLE: u8 = 2;
+pub const SLOT_STATE_MAINTENANCE: u8 = 3;
+pub const SLOT_STATE_FENCED: u8 = 4;
+pub const SLOT_STATE_CORRUPT: u8 = 5;
+pub const SLOT_STATE_DISK_FAULTED: u8 = 6;
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct ExtentHealthSummaryReq {
+    /// At most this many problem extents, worst first. 0 = counts only.
+    pub max_problems: u32,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct ProblemSlot {
+    pub slot_index: u32,
+    pub node_id: u64,
+    /// `SLOT_STATE_*`, never SERVING.
+    pub state: u8,
+    /// How long this leader has seen the slot not serving, in seconds. The
+    /// clock is the leader's own and restarts at a leader change.
+    pub degraded_secs: u64,
+    /// A repair request stands for this slot (`autumn-op repair`, or the
+    /// repair policy): it is to be rebuilt on another node. Wire 54.
+    pub repair_requested: bool,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct ProblemExtent {
+    pub extent_id: u64,
+    pub sealed_length: u64,
+    pub ec_converted: bool,
+    /// Slots in `SLOT_STATE_SERVING`.
+    pub serving: u32,
+    /// Every slot: replicas, or data + parity shards.
+    pub total: u32,
+    /// Serving copies a read needs: 1 for a replicated extent, the data-shard
+    /// count for an EC one.
+    pub needed: u32,
+    /// A rebuild of one of its slots is in flight.
+    pub recovering: bool,
+    /// Only the slots that are not serving.
+    pub slots: Vec<ProblemSlot>,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct ExtentHealthSummaryResp {
+    pub code: u8,
+    pub message: String,
+    pub sealed_extents: u64,
+    /// Open tails are not classified: an open extent carries no `avali` bits,
+    /// and a writer rolls off a replica it cannot reach.
+    pub open_extents: u64,
+    /// Every copy serving.
+    pub clean: u64,
+    /// Some copy not serving, still readable (includes `no_redundancy`).
+    pub degraded: u64,
+    /// Degraded with exactly `needed` copies serving: one more loss and it
+    /// cannot be read.
+    pub no_redundancy: u64,
+    /// Fewer serving copies than a read needs.
+    pub unavailable: u64,
+    /// Extents with a rebuild in flight, whatever their state.
+    pub recovering: u64,
+    /// Σ `sealed_length` over degraded and unavailable extents.
+    pub degraded_bytes: u64,
+    /// Slots with a standing repair request, cluster-wide. Wire 54.
+    pub repair_requested_slots: u64,
+    /// Non-serving slots of sealed extents, indexed by `SLOT_STATE_*`
+    /// (index 0, SERVING, is always 0). A reader must accept a longer vector.
+    pub slot_counts: Vec<u64>,
+    /// Worst first: unavailable, then fewest copies above `needed`, then
+    /// longest degraded.
+    pub problems: Vec<ProblemExtent>,
+}
+
+// --- ListEcInflightMarkers ---
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct ListEcInflightMarkersReq {}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct InflightWithCoordState {
+    pub extent_id: u64,
+    pub coord_node_id: u64,
+    pub coord_auto_state: u8,
+    pub coord_override_kind: u8,
+    pub target_nodes: Vec<u64>,
+    pub data_shards: u32,
+    pub new_eversion: u64,
+    /// Marker `started_at` from `MgrExtentInflightRecord` (unix-epoch s).
+    pub started_at: i64,
+    /// Convenience: now - started_at, in seconds.
+    pub age_secs: i64,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct ListEcInflightMarkersResp {
+    pub code: u8,
+    pub message: String,
+    pub markers: Vec<InflightWithCoordState>,
+}
+
+// --- FenceNode / SetNodeMaintenance / ClearNodeOverride / RemoveNode ---
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct FenceNodeReq {
+    pub node_id: u64,
+    pub reason: String,
+    pub set_by: String,
+    /// If true, skip the capacity precheck (operator accepts risk).
+    pub force: bool,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct SetNodeMaintenanceReq {
+    pub node_id: u64,
+    pub reason: String,
+    pub set_by: String,
+    /// `0` = no TTL.
+    pub expire_at: u64,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct ClearNodeOverrideReq {
+    pub node_id: u64,
+    pub set_by: String,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct RemoveNodeReq {
+    pub node_id: u64,
+    pub set_by: String,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct RemoveNodeResp {
+    pub code: u8,
+    pub message: String,
+    /// Populated on `CODE_PRECONDITION` so the OP sees exactly which
+    /// extents / markers still reference the node.
+    pub blocking_extent_ids: Vec<u64>,
+    pub blocking_marker_extent_ids: Vec<u64>,
+}
+
+// --- RecoveryStats ---
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct RecoveryStatsReq {}
+
+/// Per-(extent, slot) backoff detail so `recovery-stats` can show WHY a
+/// recovery is backing off (the last dispatch error), since when, and
+/// until when — not just a count.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct RecoveryBackoffEntry {
+    pub extent_id: u64,
+    pub slot: u32,
+    pub consecutive_failures: u32,
+    /// Unix epoch seconds of the last failed dispatch attempt.
+    pub last_attempt_at: i64,
+    /// Unix epoch seconds when the dispatch loop will next retry this
+    /// (extent, slot): `last_attempt_at + 2^consecutive_failures` capped
+    /// at 300 s.
+    pub next_retry_at: i64,
+    /// The most recent dispatch error string.
+    pub reason: String,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct RecoveryStatsResp {
+    pub code: u8,
+    pub message: String,
+    pub global_inflight: u32,
+    pub max_global: u32,
+    pub max_per_source: u32,
+    pub max_per_target: u32,
+    /// `(node_id, inflight_count)` snapshot of per-source counters.
+    pub per_source: Vec<(u64, u32)>,
+    pub per_target: Vec<(u64, u32)>,
+    /// Number of (extent, slot) entries currently in exponential
+    /// backoff (consecutive_failures > 0).
+    pub backoff_entries: u32,
+    /// Per-entry backoff detail (one per `backoff_entries`): which
+    /// (extent, slot), how many consecutive failures, since when, next
+    /// retry time, and the last failure reason.
+    pub backoff: Vec<RecoveryBackoffEntry>,
+}
+
+// --- Audit log ---
+
+pub const AUDIT_OP_FENCE_NODE: u8 = 1;
+pub const AUDIT_OP_SET_NODE_MAINTENANCE: u8 = 2;
+pub const AUDIT_OP_CLEAR_NODE_OVERRIDE: u8 = 3;
+pub const AUDIT_OP_REMOVE_NODE: u8 = 4;
+pub const AUDIT_OP_FORCE_EC_CONVERT: u8 = 5;
+pub const AUDIT_OP_FORCE_ABANDON_EC_MARKER: u8 = 6;
+// Terminal outcomes of the async op-ledger triggers (durable history; the live
+// ledger is leader-local, these persist to etcd for post-failover forensics).
+// EC-convert reuses AUDIT_OP_FORCE_EC_CONVERT (5).
+pub const AUDIT_OP_SPLIT: u8 = 7;
+pub const AUDIT_OP_MERGE: u8 = 8;
+pub const AUDIT_OP_REBALANCE: u8 = 9;
+pub const AUDIT_OP_COMPACT: u8 = 10;
+pub const AUDIT_OP_GC: u8 = 11;
+pub const AUDIT_OP_FORCE_GC: u8 = 12;
+pub const AUDIT_OP_REPAIR: u8 = 13;
+pub const AUDIT_OP_REPAIR_CANCEL: u8 = 14;
+pub const AUDIT_OP_SCRUB: u8 = 15;
+/// `node_id` of the entry carries the removed member's id.
+pub const AUDIT_OP_REMOVE_PS: u8 = 16;
+pub const AUDIT_OP_REMOVE_MANAGER: u8 = 17;
+/// `reason` carries `<key> = <value>` or `unset <key>`.
+pub const AUDIT_OP_RUNTIME_CONFIG: u8 = 18;
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct MgrAuditEntry {
+    /// `AUDIT_OP_*`.
+    pub op: u8,
+    pub node_id: u64,
+    pub extent_id: u64,
+    pub by: String,
+    pub reason: String,
+    /// 0 = OK; non-zero = `CODE_*` failure.
+    pub result_code: u8,
+    pub result_message: String,
+    /// Unix-epoch nanoseconds for unique key suffix.
+    pub ts_ns: u64,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct QueryAuditLogReq {
+    /// `0` = no filter; otherwise only entries with matching `op` byte.
+    pub op_filter: u8,
+    /// `0` = no filter.
+    pub node_id_filter: u64,
+    /// Unix-epoch seconds; `0` = no lower bound.
+    pub since_ts_s: i64,
+    /// Unix-epoch seconds; `0` = no upper bound.
+    pub until_ts_s: i64,
+    /// `0` = unlimited (caller should cap).
+    pub limit: u32,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct QueryAuditLogResp {
+    pub code: u8,
+    pub message: String,
+    pub entries: Vec<MgrAuditEntry>,
+}
+
+// --- GetClusterId ---
+// read-only cluster identity exposed via MSG_GET_CLUSTER_ID.
+//
+// ⚠️ R1 FREEZE: GetClusterIdReq/Resp ARE the version-negotiation
+// channel — every long-lived process decodes this resp BEFORE any compat
+// decision can run. If this struct's rkyv layout ever changes again, a
+// newer peer fails the decode against an older manager and the interval
+// handshake becomes unreachable (the refusal is still LOUD, but rolling
+// upgrades regress to same-commit). From R1 on these two structs are
+// FROZEN; additions go in NEW msg_types, never here.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct GetClusterIdReq {}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct GetClusterIdResp {
+    pub code: u8,
+    pub message: String,
+    /// UUID string. Empty when `code` != `CODE_OK`.
+    pub cluster_id: String,
+    /// ⚠️ These FIELD names outlive the constants they carry. This struct is
+    /// FROZEN — it is the negotiation channel, decoded before any compat
+    /// decision can be made — so already-deployed clients read these names
+    /// with code that cannot be changed.
+    ///
+    /// `wire_version_min` carries `MIN_CLIENT_WIRE_VERSION`, the oldest CLIENT
+    /// the cluster serves; `wire_version_max` carries `WIRE_VERSION`, the
+    /// version its binaries speak. They are NOT an interval anyone overlaps:
+    /// a client checks `min <= own <= max` (`client_compat_check`), and a
+    /// cluster peer ignores `min` entirely and requires `max == WIRE_VERSION`
+    /// (`cluster_peer_compat_check`). Reporting a floor is exactly why the
+    /// peer check cannot be interval-shaped — it would admit a stale PS or EN
+    /// sitting anywhere inside the client window.
+    pub wire_version_min: u32,
+    pub wire_version_max: u32,
+    /// Reserved historical field in the frozen identity response; always zero.
+    pub cluster_version: u32,
+}
+
+// --- ReportCorruptReplica (WAL self-heal A5) ---------------------------------
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct ReportCorruptReplicaReq {
+    /// Partition whose replay found the corruption — used to CAS-validate the
+    /// reporter is the current owner (`owner_epochs["partition/<id>"]`).
+    pub partition_id: u64,
+    /// The reporting PS's partition owner_epoch (fencing — a stale PS whose
+    /// epoch no longer matches is rejected).
+    pub owner_epoch: i64,
+    /// The partition's stream holding the extent: its log stream (a WAL
+    /// replay) or its row stream (an SST block read). The manager verifies it
+    /// is one of those two of `partition_id`'s streams and that `extent_id` is
+    /// a member of it (scoping: an owner can only isolate replicas of an
+    /// extent in a stream it reads — mirrors punch_holes/truncate operating
+    /// only on their named stream's extents).
+    pub stream_id: u64,
+    pub extent_id: u64,
+    /// The extent eversion the PS saw; the manager rejects the report if it
+    /// has since changed (a concurrent recovery / EC bump).
+    pub eversion: u64,
+    /// Node ids whose copy of `extent_id` failed the reader's CRC (per WAL
+    /// record, or per SST block) while at least one OTHER replica's copy of
+    /// the same bytes passed it.
+    pub corrupt_node_ids: Vec<u64>,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct ReportCorruptReplicaResp {
+    pub code: u8,
+    pub message: String,
+}
+
+// ── cluster-df wire types (MSG_CLUSTER_DF) ───────────────────────────────────
+
+/// `MSG_CLUSTER_DF` request — empty (the whole cluster summary; no params).
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct ClusterDfReq {}
+
+/// One disk of one node, as its owning node last described it on `df`.
+///
+/// The node-level rollup above SUMS these, and a sum cannot answer the
+/// questions a disk raises: which disk is full, which one its own node calls
+/// faulted, whether the bytes are spread or piled on one spindle. A node with
+/// disks `[empty, full, full, full]` rolls up as half-free.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct DiskCapWire {
+    pub disk_id: u64,
+    /// The disk's stable uuid as recorded at `autumn-op format` time (empty if
+    /// the manager has no registry row for this disk id).
+    pub uuid: String,
+    /// statvfs truth for the filesystem this disk's data dir lives on.
+    pub total: u64,
+    pub free: u64,
+    /// Σ this disk's live extent file lengths — the real autumn footprint on it.
+    pub extent_bytes: u64,
+    /// Did the node describe this disk on its last `df`?
+    ///
+    /// `false` = the node ANSWERED df and the manager's registry assigns this
+    /// disk to it, but the answer did not mention it — typically the EN was
+    /// started without that `--data` directory. Every other field is then
+    /// meaningless (zero). A node that did not answer df at all produces NO
+    /// rows (see `NodeCapWire.disks`), not one of these per disk: "the node is
+    /// unreachable" and "this disk is missing" call for different actions. A
+    /// disk that fails to OPEN cannot produce this either — `DiskFS::open` is
+    /// fallible at EN startup, so the node does not come up.
+    pub reported: bool,
+    /// What the OWNING NODE said about this disk on its last `df`.
+    pub online: bool,
+    /// The node reported this disk faulted. TODAY this is the same fact as
+    /// `!online` — `faulted_disks` is written from this very `DiskStatus.online`
+    /// (`apply_df_disk_health`) — and it is carried separately because it is
+    /// the one RECOVERY keys on: `!online` at the NODE level also means "the
+    /// node did not answer df", which is not evidence about any disk, while
+    /// this is always the node's own verdict on its own disk.
+    pub faulted: bool,
+}
+
+/// Per-node capacity rollup (sum over the node's online disks).
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct NodeCapWire {
+    pub node_id: u64,
+    pub total: u64,
+    pub free: u64,
+    /// Σ this node's per-disk `DiskStatus.extent_bytes` (real autumn footprint).
+    pub extent_bytes: u64,
+    /// false = the node's df probe failed this cycle (unknown != truly offline).
+    pub online: bool,
+    /// Per-disk rows for this node. EMPTY when the node did not answer df
+    /// this cycle (it described nothing, so nothing is fabricated) or has never
+    /// answered. Otherwise: every disk it described that the registry assigns
+    /// to it, plus one `reported: false` row per assigned disk it omitted.
+    pub disks: Vec<DiskCapWire>,
+}
+
+/// `MSG_CLUSTER_DF` response — raw u64 facts only; the consumer computes the
+/// amplification factor (`(raw_total - raw_free) / logical extent size`) and
+/// the writable RANGE (`[raw_free/3, raw_free/best_ec_factor]`). No floats on
+/// the wire.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct ClusterDfResp {
+    pub code: u8,
+    pub message: String,
+    /// Σ all online disks' raw capacity / free (statvfs truth).
+    pub raw_total: u64,
+    pub raw_free: u64,
+    /// Σ all nodes' `extent_bytes` — extent file lengths
+    /// (replicas + EC shards + open tails). Diagnostic only: sparse/punched
+    /// files may differ from statvfs capacity consumption.
+    pub physical_used: u64,
+    /// Manager's read-only Σ distinct sealed_length (de-amplified, sealed-only).
+    pub logical_stored: u64,
+    /// Σ PS-reported open-tail committed bytes across all
+    /// partitions (log + row + meta OPEN tails, one copy — open tails are
+    /// refs=1 partition-private, so no CoW dedup needed). Together with
+    /// `logical_stored`, this is the logical-size denominator for raw-capacity
+    /// amplification. 0 until the PS reports (falls back to sealed-only).
+    pub logical_open_tail: u64,
+    /// Σ reclaimable DEAD bytes across all partitions — collectable now
+    /// (`PartitionLoad.gc_debt_bytes`) + in the replay window and open tail
+    /// (`PartitionLoad.open_tail_dead_bytes`). The dead fraction of the logical
+    /// footprint; `physical_used` carries these bytes (they occupy replicas
+    /// until GC punches them). Lets `df` print a dead-vs-live breakdown. 0
+    /// until the PS reports.
+    pub logical_wal_debt: u64,
+    /// Online EN count — bounds the best achievable EC shape for the writable
+    /// range upper bound (K = min(4, node_count-1)).
+    pub node_count: u64,
+    /// Snapshot freshness (ms since unix epoch) — RAW/physical refreshed by
+    /// node_health_loop; `logical_last_update_ms` by the read-only scan.
+    pub last_update_ms: u64,
+    pub logical_last_update_ms: u64,
+    pub per_node: Vec<NodeCapWire>,
+}
+
+// ── inode-lease wire types ──────────────────────────────────────────────────
+
+/// Daemon kind discriminant for `MgrClientId`. Manager treats both kinds
+/// identically — this is purely diagnostic so `autumn-op` can tell which
+/// daemon owns a lease. Wire-stable; new variants APPEND only.
+pub const LEASE_CLIENT_KIND_FUSE: u8 = 1;
+pub const LEASE_CLIENT_KIND_IORING: u8 = 2;
+
+/// Lease mode (Read or Write). Wire-stable; APPEND-only.
+pub const LEASE_MODE_READ: u8 = 1;
+pub const LEASE_MODE_WRITE: u8 = 2;
+/// Pin the content (an S3 GET): refused while another client holds the slot
+/// as WRITE or EXCLUSIVE, and refuses their WRITE/EXCLUSIVE while held.
+/// Memory-only like READ. Wire 48.
+pub const LEASE_MODE_STABLE: u8 = 3;
+/// The writer slot, for swapping the inode out of its name (an S3 overwrite):
+/// excludes other writers only, so readers and stable readers keep going.
+/// Memory-only. Wire 48.
+pub const LEASE_MODE_REPLACE: u8 = 4;
+/// The writer slot, for reclaiming the inode's data: granted only when no
+/// other client holds any lease on it, and refuses every new one while held.
+/// Memory-only. Wire 48.
+pub const LEASE_MODE_EXCLUSIVE: u8 = 5;
+
+/// Invalidation kind (push reason). Wire-stable; APPEND-only.
+pub const LEASE_INVAL_WRITER_CLOSED: u8 = 1;
+pub const LEASE_INVAL_LEASE_REVOKED: u8 = 2;
+pub const LEASE_INVAL_META_CHANGED: u8 = 3;
+/// Lease preemption: pre-revocation grace notification pushed to a
+/// writer that another client has tried to force-acquire. The
+/// `MgrInvalidation.version` field carries the grace period in
+/// milliseconds — writer should flush + release within that
+/// window or the manager will force-revoke after the deadline
+/// (which then pushes a `LEASE_INVAL_LEASE_REVOKED`).
+pub const LEASE_INVAL_WILL_REVOKE_IN: u8 = 4;
+
+/// Stable client identity. `uuid` is the 16-byte UUID generated by the
+/// daemon at process start; `kind` is the daemon family. The triple
+/// `(kind, uuid)` is the lease key — `host` is purely diagnostic and is
+/// NOT compared by the manager.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct MgrClientId {
+    pub kind: u8,
+    pub uuid: [u8; 16],
+    pub host: String,
+}
+
+/// Snapshot of an inode lease returned to the client on Acquire / Heartbeat.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct MgrInodeLeaseInfo {
+    pub ino: u64,
+    /// Monotonic generation. Bumps on every writer-close and on every
+    /// manager-revoke. Clients tag every cached `(ino, version)` entry
+    /// with this value and discard on mismatch (close-to-open coherence).
+    pub version: u64,
+    /// `true` while a writer holds the lease (informational; readers
+    /// don't need to act on this — they only need to honour invalidations).
+    pub writer_present: bool,
+    /// TTL the manager assigned. Clients must heartbeat within this
+    /// window or the lease is revoked (writers) / dropped (readers).
+    pub ttl_secs: u32,
+}
+
+// --- AcquireLease (msg_type = MSG_ACQUIRE_LEASE = 0x46) -----------------
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct AcquireLeaseReq {
+    pub client: MgrClientId,
+    pub ino: u64,
+    /// One of `LEASE_MODE_READ`, `_WRITE`, and from wire 48 `_STABLE`,
+    /// `_REPLACE`, `_EXCLUSIVE`.
+    pub mode: u8,
+    /// Lease preemption: when true, the manager starts a revocation
+    /// of any current writer (pushes `LEASE_INVAL_WILL_REVOKE_IN`
+    /// with a grace period) instead of returning a conflict
+    /// immediately. The first force-acquire call on a held writer
+    /// returns `CODE_REVOKE_PENDING` (= 6) with `lease.ttl_secs`
+    /// repurposed to carry the milliseconds-remaining; the
+    /// caller retries until granted or until the wait budget
+    /// is exhausted. On voluntary release within the grace
+    /// window: the next non-force or force acquire is granted
+    /// cleanly. On grace expiry: the next force-acquire
+    /// force-revokes (bumps version, pushes
+    /// `LEASE_INVAL_LEASE_REVOKED`) and is granted.
+    pub force: bool,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct AcquireLeaseResp {
+    pub code: u8,
+    pub message: String,
+    /// Populated iff `code == CODE_OK`.
+    pub lease: Option<MgrInodeLeaseInfo>,
+}
+
+// --- ReleaseLease (msg_type = MSG_RELEASE_LEASE = 0x47) -----------------
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct ReleaseLeaseReq {
+    pub client: MgrClientId,
+    pub ino: u64,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct ReleaseLeaseResp {
+    pub code: u8,
+    pub message: String,
+    /// New `version` after the release (writer-close bumps it; reader-
+    /// release leaves it unchanged). `None` if the lease was already
+    /// absent (idempotent release).
+    pub new_version: Option<u64>,
+}
+
+// --- HeartbeatLease (msg_type = MSG_HEARTBEAT_LEASE = 0x48) -------------
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct HeartbeatLeaseReq {
+    pub client: MgrClientId,
+    pub ino: u64,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct HeartbeatLeaseResp {
+    pub code: u8,
+    pub message: String,
+    /// Populated iff `code == CODE_OK`. `CODE_NOT_FOUND` here means the
+    /// lease was revoked / expired — the client must drop its cache and
+    /// re-acquire.
+    pub lease: Option<MgrInodeLeaseInfo>,
+}
+
+/// One invalidation event pushed from manager → client.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct MgrInvalidation {
+    pub ino: u64,
+    pub version: u64,
+    /// One of `LEASE_INVAL_*`.
+    pub kind: u8,
+}
+
+// --- PollInvalidations (msg_type = MSG_POLL_INVALIDATIONS = 0x49) -------
+//
+// This ships the simple synchronous "drain my queue"
+// semantics — returns the queued events immediately (or an empty list).
+// A later phase will wrap this in a long-poll loop on the client and
+// add a server-side wait-for-event hook so the round-trip rate stays low.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct PollInvalidationsReq {
+    pub client: MgrClientId,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct PollInvalidationsResp {
+    pub code: u8,
+    pub message: String,
+    pub events: Vec<MgrInvalidation>,
+}
+
+// --- AllocInodes (msg_type = MSG_ALLOC_INODES = 0x53) --------------------
+//
+// Grant a contiguous batch of fuse-fs inode numbers
+// `[base, base + count)`. The manager owns the counter (etcd key
+// `autumn-rs/fs/next_inode`, big-endian u64) and every grant is a
+// leader-fenced etcd CAS txn — concurrent allocators can never receive
+// overlapping ranges, even across a leader transition.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct AllocInodesReq {
+    /// How many inode numbers to allocate (fuse uses --inode-alloc-batch =
+    /// 1000; a short-lived client may ask for fewer). Must be ≥ 1.
+    pub count: u32,
+    /// Migration floor: the allocator's counter is raised to at least this
+    /// before granting. Older filesystems kept the cursor in the fs KV
+    /// superblock key (`[0x04]next_inode`, client-side non-CAS RMW); the
+    /// fuse mount passes that legacy value here on its first batch so an
+    /// existing filesystem migrates without duplicate inodes. 0 = none.
+    pub floor: u64,
+    /// Always empty: there is one inode counter. The field stays because this
+    /// struct is on the frozen client surface; the manager refuses a non-empty
+    /// value.
+    pub volume: Vec<u8>,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct AllocInodesResp {
+    pub code: u8,
+    pub message: String,
+    /// First inode number of the granted range; the caller owns
+    /// `[base, base + count)`. Meaningful iff `code == CODE_OK`.
+    pub base: u64,
+}
+
+// --- auto-policy controller (msg_types 0x54/0x55) -----------
+//
+// The in-manager auto-policy controller, folded in from the retired Python
+// `python/dashboard/`. Config is leader-owned and persisted to etcd
+// (`autoPolicy/config` + `autoPolicy/cooldowns`) so the active policy survives
+// leader failover — the crash-safety win over a killable Python webserver.
+// The controller loop runs ONLY on the leader and is DEFAULT-OFF (a fresh
+// cluster stays pure-mechanism). Built-in presets are compiled-in (never
+// persisted); only custom entries + the (mode, active) selection go to etcd.
+pub const MSG_AUTOPOLICY_GET: u8 = 0x54;
+pub const MSG_AUTOPOLICY_SET: u8 = 0x55;
+
+/// active region→PS load rebalance (leader-only mutation).
+pub const MSG_REBALANCE_REGIONS: u8 = 0x56;
+
+// ── namespace registry (admin → manager, low-frequency) ──────────────────────
+// admin creates/deletes a `namespace/<name>` etcd registry row (leader-fenced,
+// Admin connection only — same posture as MSG_PRINCIPAL_CREATE/DELETE). The registry is
+// the authoritative source for D7 Layer-A (writes must fall in a registered
+// namespace). See docs/key_namespace_split_design.md.
+pub const MSG_NAMESPACE_CREATE: u8 = 0x57;
+pub const MSG_NAMESPACE_DELETE: u8 = 0x58;
+// admin → manager (leader-gated): list the full registry (rich rows). The 5 s
+// `MSG_GET_AUTHZ_CONFIG` poll stays LEAN (prefixes only, for Layer-A); the rich
+// data (presplit/created_at) rides this dedicated low-frequency RPC.
+pub const MSG_NAMESPACE_LIST: u8 = 0x59;
+// admin → manager (leader-gated): list every registered principal with its
+// grants. The symmetric counterpart of NAMESPACE_LIST:
+// `principal-create`/`principal-delete` shipped without a way to SEE what
+// exists, leaving `ls $DATA_ROOT/authz/*.cred` (only what turnkey happened to
+// write) or an etcd key scan (names only — the value is rkyv, so grants are
+// invisible) as the only options.
+pub const MSG_PRINCIPAL_LIST: u8 = 0x5A;
+// admin → manager (leader-gated): record the split points a presplit actually
+// applied, so merge can refuse to undo them. Step 4 — the
+// namespace registry's `presplit` field was frozen and empty since SD-1 waiting
+// for exactly this consumer. `namespace-create <rule>` and `presplit` both
+// record through it after cutting.
+pub const MSG_NAMESPACE_SET_PRESPLIT: u8 = 0x5B;
+
+// ── Async op ledger ──────────────────────────────────────────────────────────
+//
+// Every long-running/mutating op (split/merge/rebalance/compact/gc/forcegc/
+// ec-convert) is submitted through the leader; the manager assigns an `op_id`,
+// actuates it in the background (reusing the auto-policy controller's actuation
+// path), and answers status queries. This recovers the failure reason that the
+// fire-and-forget maintenance ops used to drop, while keeping every trigger
+// non-blocking. The ledger is leader-local + in-memory (terminal history rides
+// the audit log); a query for an unknown/old id answers UNKNOWN, never a false
+// RUNNING.
+pub const MSG_OP_SUBMIT: u8 = 0x5C;
+pub const MSG_OP_QUERY: u8 = 0x5D;
+/// Durable terminal history from etcd (`opLog/`), as opposed to `MSG_OP_QUERY`'s
+/// live in-memory ledger. Deliberately a separate message rather than a flag on
+/// the query: the two answer different questions ("what is running" vs "how did
+/// past runs turn out") off different data sources (a leader-local ring vs
+/// etcd), so folding them together would blur both the leader-gating and the
+/// paging semantics.
+pub const MSG_OP_HISTORY: u8 = 0x5E;
+
+/// Op kinds. Distinct from `POLICY_KIND_*` (forcegc is not a policy kind, and
+/// the policy enum is a separate frozen wire surface). Append-only.
+pub const OP_KIND_SPLIT: u8 = 1;
+pub const OP_KIND_MERGE: u8 = 2;
+pub const OP_KIND_REBALANCE: u8 = 3;
+pub const OP_KIND_COMPACT: u8 = 4;
+pub const OP_KIND_GC: u8 = 5;
+pub const OP_KIND_FORCE_GC: u8 = 6;
+pub const OP_KIND_EC_CONVERT: u8 = 7;
+/// Extent replica recovery. AUTO-dispatched (the recovery loop), never submitted
+/// by an operator — `MSG_OP_SUBMIT` refuses it. Tracked because it is the op an
+/// operator most needs to see: it runs unattended, retries with backoff, and its
+/// failure reason (`error` + `error_code`) was previously visible only in
+/// aggregate via `recovery-stats`.
+pub const OP_KIND_RECOVERY: u8 = 8;
+/// A request to rebuild degraded slots on other nodes NOW, without fencing
+/// their nodes (`autumn-op repair`): every degraded slot of the extents in
+/// `extent_ids` (`secondary_id` = the first), or — with `extent_ids` empty —
+/// every degraded slot on node `part_id`. Terminal as soon as the requests are
+/// recorded; the rebuilds themselves then appear as `OP_KIND_RECOVERY` entries.
+pub const OP_KIND_REPAIR: u8 = 9;
+/// Withdraw standing repair requests (`autumn-op repair --cancel`): those of
+/// the extents in `extent_ids`, or — with `extent_ids` empty — every one on
+/// node `part_id`. Their degraded clocks restart, so the repair policy waits a
+/// full grace period before proposing them again. A rebuild already dispatched
+/// runs to completion.
+pub const OP_KIND_REPAIR_CANCEL: u8 = 10;
+/// Scrub sealed payload files on the nodes that hold them (`autumn-op scrub`):
+/// the extents in `extent_ids`, else every extent of partition `part_id`,
+/// else (both empty) every sealed extent in the cluster. Each node reads and
+/// hashes its own files and reports per file on `df`; the op finishes when
+/// every file dispatched has reported. A file whose content differs from its
+/// recorded checksums is isolated and rebuilt like any other rotted copy.
+pub const OP_KIND_SCRUB: u8 = 11;
+
+/// Display name for an `OP_KIND_*`, next to the constants so the mapping has
+/// ONE definition — the manager logs it and the CLI renders it, and a label
+/// that drifts between them is a needless way to confuse an operator.
+pub fn op_kind_name(kind: u8) -> &'static str {
+    match kind {
+        OP_KIND_SPLIT => "split",
+        OP_KIND_MERGE => "merge",
+        OP_KIND_REBALANCE => "rebalance",
+        OP_KIND_COMPACT => "compact",
+        OP_KIND_GC => "gc",
+        OP_KIND_FORCE_GC => "forcegc",
+        OP_KIND_EC_CONVERT => "ec-convert",
+        OP_KIND_RECOVERY => "recovery",
+        OP_KIND_REPAIR => "repair",
+        OP_KIND_REPAIR_CANCEL => "repair-cancel",
+        OP_KIND_SCRUB => "scrub",
+        _ => "?",
+    }
+}
+
+/// Op lifecycle — a state machine, not bools. `UNKNOWN` is never an initial
+/// state; it is the honest answer when the ledger cannot know (post-failover
+/// unknown id, or a PS-executed op whose outcome went missing past its TTL).
+pub const OP_STATE_PENDING: u8 = 0;
+pub const OP_STATE_RUNNING: u8 = 1;
+pub const OP_STATE_SUCCEEDED: u8 = 2;
+pub const OP_STATE_FAILED: u8 = 3;
+pub const OP_STATE_UNKNOWN: u8 = 4;
+
+/// One ledger entry — the queryable state of a submitted op.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct OpRecord {
+    pub op_id: u64,
+    /// `OP_KIND_*`.
+    pub kind: u8,
+    /// primary target (part id); `0` = N/A (rebalance).
+    pub part_id: u64,
+    /// merge victim / ec extent id; `0` = N/A.
+    pub secondary_id: u64,
+    /// forcegc target extents.
+    pub extent_ids: Vec<u64>,
+    /// `OP_STATE_*`.
+    pub state: u8,
+    /// failure reason; empty unless `state == FAILED`.
+    ///
+    /// EXCEPTION — auto-retrying kinds (recovery): populated WHILE still
+    /// `RUNNING` to carry the LAST attempt's failure, since the op keeps
+    /// retrying with backoff rather than going terminal. "running, last error:
+    /// …" is the operator-actionable state.
+    ///
+    /// Both the manager's own dispatch failures and the executing NODE's
+    /// failures land here — the latter arriving on the `df` heartbeat
+    /// (`DfResp.op_failures`) rather than waiting for the next re-dispatch.
+    pub error: String,
+    /// Machine-readable failure class for `error` (`CODE_*`; `0` = none).
+    pub error_code: u8,
+    /// human outcome ("moved 3", forcegc advisory, "no eligible extents", …).
+    pub message: String,
+    /// Live progress of a RUNNING op, as raw counts — bytes for gc/recovery,
+    /// tables for compact, stripes for ec. `total == 0` means "not reported"
+    /// (either the kind has no natural denominator, or none has arrived yet).
+    ///
+    /// Raw counts, NOT a percentage: the wire carries facts and the consumer
+    /// derives the ratio, the same rule cluster-df follows. A percentage alone
+    /// cannot distinguish "2 of 4 tables" from "50 GB of 100 GB", and an
+    /// operator deciding whether to wait needs the magnitude.
+    pub progress_done: u64,
+    pub progress_total: u64,
+    /// "cli" / "dashboard" / "auto-policy" / "replay".
+    pub requested_by: String,
+    /// epoch seconds; `0` = not yet.
+    pub submitted_at: i64,
+    pub started_at: i64,
+    pub finished_at: i64,
+}
+
+/// Live progress of a maintenance op currently running on a PS, piggybacked on
+/// the load heartbeat beside the terminal `MaintenanceOutcome` ring.
+///
+/// Separate from the outcome ring because the two answer different questions
+/// and have different lifetimes: an outcome is terminal and must survive until
+/// the manager claims it, while progress is a sample that is worthless once
+/// superseded. Sending the latest sample every heartbeat means a dropped report
+/// costs nothing.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct MaintenanceProgress {
+    pub op_id: u64,
+    /// `OP_KIND_COMPACT` / `OP_KIND_GC` / `OP_KIND_FORCE_GC`.
+    pub kind: u8,
+    /// Units consumed and the denominator, in whatever unit fits the kind
+    /// (bytes scanned for gc, tables merged for compact).
+    pub done: u64,
+    pub total: u64,
+}
+
+/// A PS-executed maintenance op's terminal outcome, reported back to the
+/// manager's ledger on the load heartbeat (compact / gc / forcegc only — the
+/// manager-orchestrated kinds close their own ledger entry in-process).
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct MaintenanceOutcome {
+    pub op_id: u64,
+    /// `OP_KIND_COMPACT` / `OP_KIND_GC` / `OP_KIND_FORCE_GC`.
+    pub kind: u8,
+    /// terminal `OP_STATE_SUCCEEDED` / `OP_STATE_FAILED`.
+    pub state: u8,
+    /// failure reason; empty on success.
+    pub error: String,
+    /// human outcome (e.g. the forcegc replay-floor advisory).
+    pub message: String,
+    /// epoch seconds the op finished.
+    pub finished_at: i64,
+}
+
+/// `MSG_OP_SUBMIT` — a typed op spec (not a CLI string). Only the fields the
+/// `kind` needs are read; the rest are ignored. Leader-gated + admin-gated.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct OpSubmitReq {
+    /// `OP_KIND_*`.
+    pub kind: u8,
+    /// primary target (part id for split/compact/gc/forcegc; survivor for merge).
+    pub part_id: u64,
+    /// merge victim / ec extent id.
+    pub secondary_id: u64,
+    /// forcegc target extents.
+    pub extent_ids: Vec<u64>,
+    /// explicit split point (raw key bytes); `None` = median / declared-boundary.
+    pub at_key: Option<Vec<u8>>,
+    pub gc_ratio: Option<f64>,
+    pub gc_max_size: Option<u64>,
+    pub gc_stream_debt: Option<u64>,
+    /// Per-extent ABSOLUTE dead-byte floor, forwarded to the PS. Lets an
+    /// operator say "collect a 3 GiB pile even though it is only 19% of its
+    /// extent", which no ratio this cluster runs would ever select.
+    pub gc_dead_bytes_high: Option<u64>,
+    pub gc_empty_only: bool,
+    /// rebalance move cap; `0` = manager default.
+    pub max_moves: u32,
+    /// merge --force (cross a declared boundary).
+    pub force: bool,
+    /// caller tag for the ledger ("cli" / "dashboard").
+    pub requested_by: String,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct OpSubmitResp {
+    pub code: u8,
+    pub message: String,
+    /// the assigned (or, on attach-dedup, the existing) op id.
+    pub op_id: u64,
+}
+
+/// `MSG_OP_QUERY` — `op_id != 0` → one record (`ops status`); `op_id == 0` →
+/// list (`ops list`), filtered by `active_only` / `kind_filter` (`0` = any) /
+/// `limit` (`0` = all).
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct OpQueryReq {
+    pub op_id: u64,
+    pub active_only: bool,
+    pub kind_filter: u8,
+    pub limit: u32,
+}
+
+/// `MSG_OP_HISTORY` — read terminal records from durable history, newest first.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct OpHistoryReq {
+    /// `OP_KIND_*`, or `0` for every kind.
+    pub kind_filter: u8,
+    /// Only records that finished at or after this unix second. `0` = no bound.
+    pub since_unix: i64,
+    /// Cap on returned records. `0` → a server-side default.
+    pub limit: u32,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct OpHistoryResp {
+    pub code: u8,
+    pub message: String,
+    /// Newest first.
+    pub ops: Vec<OpRecord>,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct OpQueryResp {
+    pub code: u8,
+    pub message: String,
+    pub ops: Vec<OpRecord>,
+}
+
+// ── operator-only manager ops ────────────────────────────────────────────────
+//
+// The ops that change the cluster on an operator's say-so are served only on an
+// Admin connection (`version_hello::Negotiated::check_opcode` refuses them on a
+// Peer one). An Admin connection is one that proved the cluster secret
+// (`peer_auth`), so this list is the whole gate: there is no separate admin
+// token. Not the read/observability ops (info/df/list-nodes/…), except the
+// auto-policy pair: its GET reads only what its SET writes, and both are the
+// operator's (autumn-op, the dashboard through it); no PS or EN sends them.
+
+/// True for the manager ops only an Admin connection may send.
+#[inline]
+pub fn is_admin_mgr_msg(msg_type: u8) -> bool {
+    matches!(
+        msg_type,
+        MSG_FENCE_NODE
+            | MSG_REMOVE_NODE
+            | MSG_REMOVE_MEMBER
+            | MSG_SET_NODE_MAINTENANCE
+            | MSG_CLEAR_NODE_OVERRIDE
+            | MSG_UPDATE_STREAM_EC
+            | MSG_FORCE_EC_CONVERT
+            | MSG_CREATE_STREAM
+            | MSG_UPSERT_PARTITION
+            | MSG_MERGE_PARTITIONS
+            | MSG_OP_SUBMIT
+            | MSG_PRINCIPAL_CREATE
+            | MSG_PRINCIPAL_DELETE
+            | MSG_NAMESPACE_CREATE
+            | MSG_NAMESPACE_DELETE
+            | MSG_NAMESPACE_SET_PRESPLIT
+            | MSG_AUTOPOLICY_GET
+            | MSG_AUTOPOLICY_SET
+            | MSG_SET_RUNTIME_CONFIG
+    )
+    // MSG_REGISTER_NODE is NOT listed: the EXTENT NODE self-registers with it
+    // over its Peer connection at startup and after a manager restart
+    // (extent_node.rs `register_with_manager`). CREATE_STREAM /
+    // UPSERT_PARTITION are listed — only `autumn-op bootstrap` sends them.
+}
+
+/// `AutoPolicySetReq.op` values.
+pub const AUTOPOLICY_OP_SET_MODE: u8 = 0;
+pub const AUTOPOLICY_OP_SET_ACTIVE: u8 = 1;
+pub const AUTOPOLICY_OP_UPSERT: u8 = 2;
+pub const AUTOPOLICY_OP_DELETE: u8 = 3;
+/// Select `name` and arm it, persisted as one config (wire 73).
+pub const AUTOPOLICY_OP_START: u8 = 4;
+
+/// One named policy (preset or custom). `switches` is [split, ec, compact, gc,
+/// merge] — a `Vec<bool>` (not a fixed array) for forward-compat; the controller
+/// reads the first 5, absent = false.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct MgrAutoPolicyEntry {
+    pub name: String,
+    pub desc: String,
+    pub switches: Vec<bool>,
+    pub interval_sec: u64,
+    pub cooldown_sec: u64,
+    pub max_actions: u32,
+    pub builtin: bool,
+}
+
+/// Persisted controller config (etcd `autoPolicy/config`). Only CUSTOM policies
+/// are stored; presets are compiled-in constants.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct MgrAutoPolicyConfig {
+    pub ver: u32,
+    /// 0=Off 2=Armed (`auto_policy::AutoPolicyMode`). 1 was the removed
+    /// observe mode: a persisted 1 refuses leadership until `migratev1_v2`
+    /// converts it to 0.
+    pub mode: u8,
+    /// Active policy name ("" = none selected).
+    pub active: String,
+    pub policies: Vec<MgrAutoPolicyEntry>,
+}
+
+/// Persisted per-target cooldown stamps (etcd `autoPolicy/cooldowns`).
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct MgrAutoPolicyCooldowns {
+    pub entries: Vec<(String, i64)>,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct AutoPolicyGetReq {}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct AutoPolicyGetResp {
+    pub code: u8,
+    pub message: String,
+    pub mode: u8,
+    pub active: String,
+    /// Whether the process was started with `--dashboard-allow-mutations`
+    /// (Armed is honored only when true).
+    pub allow_mutations: bool,
+    /// Presets + custom (full list, for display).
+    pub policies: Vec<MgrAutoPolicyEntry>,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct AutoPolicySetReq {
+    /// One of `AUTOPOLICY_OP_*`.
+    pub op: u8,
+    /// For SET_MODE.
+    pub mode: u8,
+    /// For SET_ACTIVE / START / DELETE (and the name of an UPSERT entry).
+    pub name: String,
+    /// For UPSERT.
+    pub entry: Option<MgrAutoPolicyEntry>,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct AutoPolicySetResp {
+    pub code: u8,
+    pub message: String,
+    /// Resulting state echoed back so callers re-render without a follow-up GET.
+    pub mode: u8,
+    pub active: String,
+    pub policies: Vec<MgrAutoPolicyEntry>,
+}
+
+/// Persisted shape of a writer lease in etcd (`inode_leases/<ino>`).
+/// Reader leases are NOT persisted — they're ephemeral; a manager
+/// failover invalidates all reader caches via the
+/// "subscribe-reconnect drops every cached version" rule (plan §6.4).
+#[derive(Archive, Serialize, Deserialize, Clone, Debug)]
+pub struct MgrInodeLeaseRecord {
+    pub ino: u64,
+    pub writer: MgrClientId,
+    pub version: u64,
+    /// Unix seconds. The persisted deadline survives leader failover so
+    /// the new leader's TTL revoke loop fires on the correct schedule.
+    pub expires_at: i64,
+}
+
+// ── authz wire + persisted types (manager-as-KDC) ────────────────────────────
+
+// The persisted principal account (`principal/<name>`) is
+// `persist::records::PrincipalAccountRecord`, manager-private. No message
+// carries it: `PrincipalListResp` uses `PrincipalRow` so an inspection RPC
+// cannot hand out a `credential_hash`.
+
+/// `MSG_PRINCIPAL_CREATE` — admin creates/rotates a principal account (Admin
+/// connection only, `is_admin_mgr_msg`). Returns the freshly-generated permanent
+/// credential (shown once; the manager stores only its hash).
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct PrincipalCreateReq {
+    pub principal: String,
+    pub allowed_prefixes: Vec<Vec<u8>>,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct PrincipalCreateResp {
+    pub code: u8,
+    pub message: String,
+    /// The generated permanent credential (raw bytes). Empty on error.
+    pub credential: Vec<u8>,
+}
+
+/// `MSG_PRINCIPAL_DELETE` — admin removes a principal account (stops renewal;
+/// the principal's current token still works until it expires). Resp = `CodeResp`.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct PrincipalDeleteReq {
+    pub principal: String,
+}
+
+// ── namespace registry types (SD-1) ──────────────────────────────────────────
+
+/// Namespace registry row, as carried on the WIRE (`NamespaceListResp`).
+///
+/// **Not the persisted form.** `namespace/<name>` stores
+/// `persist::records::NamespaceRecord`, which has its own format version, and
+/// the manager converts to this type at the one point a namespace crosses to a
+/// client. Changing THIS struct is a wire change; changing what is stored is
+/// not. Registry granularity = top-level family (`fs/` is
+/// ONE row, not one per volume — the app owns the sub-structure; Layer-A only
+/// checks top-level membership). See docs/key_namespace_split_design.md.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct MgrNamespace {
+    /// Namespace name (`[a-z0-9._-]+`, single path segment). The etcd key is
+    /// `namespace/<name>`; the stored `prefix` is `name + "/"`.
+    pub name: String,
+    /// The registered key prefix = `name + "/"`. This is the byte prefix
+    /// Layer-A / authz / presplit match against (all namespaces are disjoint).
+    pub prefix: Vec<u8>,
+    /// D8 presplit points (raw split keys inside `[prefix, prefix-successor)`).
+    /// SD-1 FREEZES this field + stores it verbatim; CONSUMPTION (looping
+    /// `split --at` at namespace-create) is D8. Empty = no presplit.
+    pub presplit: Vec<Vec<u8>>,
+    /// Unix seconds at creation (diagnostic).
+    pub created_at: i64,
+}
+
+/// `MSG_NAMESPACE_CREATE` — admin registers a new namespace. Leader-only,
+/// Admin connection only (same posture as `PrincipalCreateReq`). Rejects an invalid
+/// name + any name whose `name/` prefix is a `starts_with` relation with an
+/// existing namespace prefix (disjointness). Nothing is registered by default.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct NamespaceCreateReq {
+    pub name: String,
+    /// Split points (raw keys) recorded on the row, not cut. `autumn-op`
+    /// sends none: it cuts after creating and records through
+    /// `MSG_NAMESPACE_SET_PRESPLIT`.
+    pub presplit: Vec<Vec<u8>>,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct NamespaceCreateResp {
+    pub code: u8,
+    pub message: String,
+}
+
+/// `MSG_NAMESPACE_DELETE` — admin removes a namespace registry row. Leader-only,
+/// Admin connection only. The NON-EMPTY guard
+/// (refuse deleting a namespace whose prefix still holds data unless `--force`)
+/// is enforced CLIENT-SIDE in `autumn-op` (the manager has no KV data-plane
+/// client); this handler only removes the etcd registry row. Resp = `CodeResp`.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct NamespaceDeleteReq {
+    pub name: String,
+}
+
+/// `MSG_NAMESPACE_LIST` — admin lists the full registry (rich rows: name,
+/// prefix, presplit, created_at). Leader-only (the registry is
+/// leader-maintained; a follower's shadow is empty/stale). Request payload is
+/// empty. Not Admin-only — listing is read-only inspection.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct NamespaceListResp {
+    pub code: u8,
+    pub message: String,
+    pub namespaces: Vec<MgrNamespace>,
+}
+
+/// `MSG_NAMESPACE_SET_PRESPLIT` — record split points that a presplit actually
+/// applied, onto an EXISTING namespace registry row. Leader-only, Admin
+/// connection only (it changes what merge will refuse). Points are UNIONed with whatever
+/// the row already carries, never replaced: widening a namespace's presplit
+/// (e.g. fs 6 lanes → 24) is a superset, and dropping a sacred boundary must be
+/// a deliberate separate act, not a side effect of re-running presplit.
+/// Resp = `CodeResp`.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct NamespaceSetPresplitReq {
+    pub name: String,
+    /// Raw split keys (absolute, as passed to `split --at`).
+    pub points: Vec<Vec<u8>>,
+}
+
+/// One row of `MSG_PRINCIPAL_LIST`. Deliberately NOT the persisted account:
+/// that carries `credential_hash`, and an inspection RPC must not hand
+/// out the verifier for a credential — offline-guessing a weak credential
+/// against a leaked hash is exactly the attack the KDC design avoids by never
+/// storing the credential itself. Name + grants are all an operator needs.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct PrincipalRow {
+    /// The principal (credential owner) name — the key under `principal/`.
+    pub name: String,
+    /// The key prefixes this principal may access (`allowed_prefixes`), each
+    /// ending in `b'/'`. Rendered as `{ns}/…` under Option 3.
+    pub grants: Vec<Vec<u8>>,
+}
+
+/// `MSG_PRINCIPAL_LIST` — admin lists every registered principal + its grants.
+/// Leader-only (the account map is leader-maintained; a follower's shadow is
+/// empty/stale until it replays on promotion). Request payload is empty.
+/// Not Admin-only — read-only inspection, same posture as
+/// `MSG_NAMESPACE_LIST`; the secret-bearing field is omitted from the row type
+/// instead (see `PrincipalRow`).
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct PrincipalListResp {
+    pub code: u8,
+    pub message: String,
+    pub principals: Vec<PrincipalRow>,
+}
+
+/// `MSG_MINT_TOKEN` — client authenticates with its permanent credential and
+/// receives a short-TTL signed capability token.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct MintTokenReq {
+    /// the principal NAME (credential owner) to mint for.
+    /// The manager looks up the account under this name (`principal/<name>`).
+    pub principal: String,
+    pub credential: Vec<u8>,
+}
+
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct MintTokenResp {
+    pub code: u8,
+    pub message: String,
+    /// The signed capability token (`cap_token` wire bytes). Empty on error.
+    pub token: Vec<u8>,
+    /// Token expiry (unix seconds) — lets the client schedule background renew
+    /// without parsing the opaque token.
+    pub exp: u64,
+}
+
+/// One published verification key. The PS builds its verify-keyring from these.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct AuthzPublicKey {
+    pub kid: u32,
+    /// 32-byte Ed25519 public key.
+    pub ed25519_pub: Vec<u8>,
+    /// Disabled keys are published (so the PS learns to reject their `kid`) but
+    /// never used to sign new tokens — this is emergency bulk revocation.
+    pub disabled: bool,
+}
+
+/// `MSG_GET_AUTHZ_CONFIG` — the PS and the EN poll this (cached). Request payload
+/// is empty.
+#[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
+pub struct GetAuthzConfigResp {
+    pub code: u8,
+    pub message: String,
+    /// Authz turned on at the manager (a signing key was configured)? When
+    /// false neither the PS nor the EN enforces (opt-in; fuse/kvcache/dev
+    /// unaffected).
+    pub enabled: bool,
+    pub public_keys: Vec<AuthzPublicKey>,
+    /// ALL registered namespace prefixes — Layer-A's data source (a put-class
+    /// write must fall in one of these).
+    pub namespaces: Vec<Vec<u8>>,
+    /// The TTL the manager mints tokens with (seconds) — advisory, lets the PS
+    /// size its clock-skew leeway / the client its renew cadence.
+    pub token_ttl_secs: u64,
+    /// Clock-skew leeway (seconds) the PS should apply to `nbf`/`exp`.
+    pub clock_skew_secs: u64,
+    /// This cluster's `cluster_id` = the token `aud` the manager mints with. The
+    /// PS and the EN enforce `token.aud == cluster_id` at CLIENT_AUTH so a token minted for
+    /// another cluster (that happens to share signing keys) can't be replayed
+    /// here. Empty = unknown (manager not yet bootstrapped) → PS skips the check.
+    pub cluster_id: String,
+}

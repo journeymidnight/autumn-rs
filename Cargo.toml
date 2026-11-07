@@ -1,0 +1,119 @@
+[workspace]
+members = [
+  "crates/common",
+  "crates/params",
+  "crates/rpc",
+  "crates/etcd",
+  "crates/stream",
+  "crates/manager",
+  "crates/partition-server",
+  "crates/server",
+  "crates/client",
+  "crates/transport",
+  "crates/transport/ucx-sys-mini",
+  "crates/fs",
+  "crates/fuse",
+  "crates/test-ports",
+  "examples/gallery",
+]
+default-members = [
+  "crates/common",
+  "crates/params",
+  "crates/rpc",
+  "crates/etcd",
+  "crates/stream",
+  "crates/manager",
+  "crates/partition-server",
+  "crates/server",
+  "crates/client",
+  "crates/fs",
+  "crates/fuse",
+  "crates/test-ports",
+]
+exclude = ["python"]
+resolver = "2"
+
+[workspace.package]
+rust-version = "1.95"
+edition = "2021"
+license = "Apache-2.0"
+
+# Workspace-wide clippy lint policy. We gate CI on `-D warnings`, so a
+# handful of lints that are cosmetic or design-preference (rather than bugs) are
+# allowed here instead of churning the code to satisfy them:
+#   - type_complexity / too_many_arguments: this is a compio/futures systems
+#     codebase; complex future types and wide hot-path fns are deliberate. The
+#     "fix" (type aliases / arg structs) adds indirection without clarity.
+#   - doc_lazy_continuation / doc_overindented_list_items: CommonMark nitpicks on
+#     human-readable `///` docs (aligned tables, wrapped arithmetic). rustfmt
+#     doesn't manage doc markdown; the docs read fine.
+# Everything else stays a hard error so CI catches real issues.
+[workspace.lints.clippy]
+type_complexity = "allow"
+too_many_arguments = "allow"
+doc_lazy_continuation = "allow"
+doc_overindented_list_items = "allow"
+
+[workspace.dependencies]
+# `polling` is not a second driver, it is what makes the driver a CHOICE.
+# compio-driver's build.rs only defines `cfg(fusion)` when io-uring AND polling
+# are both on, and only the fusion driver runs `DriverType::suggest()`, which
+# probes the running kernel for the opcodes it needs and falls back to Poll when
+# they are missing. With the default features (io-uring alone) there is no probe
+# and no fallback: 0.19 submits `IORING_OP_SOCKET` (kernel 5.19+), `BIND` and
+# `LISTEN` (6.11+) unconditionally, and kernels before 5.19 (e.g. 5.4, 5.15)
+# lack them — the socket comes back as `Bad file descriptor (os error 9)` from
+# `TcpStream::connect`, which wedges the manager against etcd on such a
+# kernel. 0.18 was safe by accident: its opcode
+# set predates all three.
+compio = { version = "0.19.2", features = ["polling"] }
+anyhow = "1"
+bytes = "1"
+dashmap = "6"
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+tracing = "0.1"
+uuid = { version = "1", features = ["v4"] }
+crc32c = "0.6"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+parking_lot = "0.12"
+
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+debug = 1
+panic = "abort"
+
+# compio closes the socket its own fallback just made.
+#
+# `CreateSocket::call` — the path taken whenever `IORING_OP_SOCKET` is missing,
+# which is every kernel before 5.19 — stores the new
+# socket in `opened_fd` AND returns its raw fd as the op result. `set_result`
+# then wrapped that same fd in a second owner and overwrote the first, whose
+# drop closed it. The descriptor was dead before `connect` ever saw it, and the
+# only symptom was `Bad file descriptor (os error 9)` one call later. `Accept`
+# and `OpenFile` have the same shape; their opcodes are old enough (5.5, 5.6)
+# that we never take those fallbacks, so they were only latent.
+#
+# The fix is one early return per op, on a branch off the v0.19.2 tag. Every
+# compio crate used by this workspace is redirected, not just the driver: a
+# lone patch leaves the rest of the family resolving `compio-buf` from crates.io
+# while the driver takes it from git, and the two copies are different types.
+#
+# Drop this whole section once the fix is released upstream (compio-rs/compio).
+[patch.crates-io]
+compio = { git = "https://github.com/thesues/compio.git", branch = "fix/createsocket-blocking-fallback-double-own" }
+compio-buf = { git = "https://github.com/thesues/compio.git", branch = "fix/createsocket-blocking-fallback-double-own" }
+compio-dispatcher = { git = "https://github.com/thesues/compio.git", branch = "fix/createsocket-blocking-fallback-double-own" }
+compio-driver = { git = "https://github.com/thesues/compio.git", branch = "fix/createsocket-blocking-fallback-double-own" }
+compio-executor = { git = "https://github.com/thesues/compio.git", branch = "fix/createsocket-blocking-fallback-double-own" }
+compio-fs = { git = "https://github.com/thesues/compio.git", branch = "fix/createsocket-blocking-fallback-double-own" }
+compio-io = { git = "https://github.com/thesues/compio.git", branch = "fix/createsocket-blocking-fallback-double-own" }
+compio-log = { git = "https://github.com/thesues/compio.git", branch = "fix/createsocket-blocking-fallback-double-own" }
+compio-macros = { git = "https://github.com/thesues/compio.git", branch = "fix/createsocket-blocking-fallback-double-own" }
+compio-net = { git = "https://github.com/thesues/compio.git", branch = "fix/createsocket-blocking-fallback-double-own" }
+compio-quic = { git = "https://github.com/thesues/compio.git", branch = "fix/createsocket-blocking-fallback-double-own" }
+compio-runtime = { git = "https://github.com/thesues/compio.git", branch = "fix/createsocket-blocking-fallback-double-own" }
+compio-tls = { git = "https://github.com/thesues/compio.git", branch = "fix/createsocket-blocking-fallback-double-own" }

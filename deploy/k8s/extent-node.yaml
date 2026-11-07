@@ -1,0 +1,49 @@
+# Data plane. The manager keys each EN's identity on a stable node_uuid
+# (persisted on the PVC), NOT the address, and the EN self-registers its live
+# address + shard ports at EVERY startup. So the EN advertises its OWN pod IP
+# (Downward-API status.podIP): a fresh pod IP on reschedule just updates the
+# same node_uuid's location and routing follows. The manager and PS dial the
+# registered pod_ip:shard_port directly — pod IPs are routable cluster-wide
+# under every standard CNI, so NO per-pod ClusterIP Service is involved in the
+# data or control path.
+#
+# THE EXTENT NODES THEMSELVES ARE NOT IN THIS FILE, AND NOT IN KUSTOMIZE AT ALL.
+# They are created and retired by `scripts/en-workload.sh` and
+# `scripts/en-decommission.sh` — one Deployment per EN, mounting
+# `data-autumn-en-<ordinal>` by name.
+#
+# Why membership cannot be a manifest here: an EN's identity is the node_uuid on
+# its PVC, and the live set of ENs is whatever set of PVCs the cluster has
+# accumulated — it is NOT `0..N-1`. A long-lived cluster's ENs can be 0,3,4,
+# because ordinals 1-2 were retired. A manifest that says "3 extent
+# nodes" cannot describe that, and the two obvious encodings both destroy data:
+# a StatefulSet with `replicas: 3` deletes the two live ENs above ordinal 2 and
+# keeps two empty ones, and a rendered list of Deployments for `0..2` silently
+# resurrects the two retired ordinals on top of their leftover PVCs.
+#
+# So membership is an operation, not a declaration. Adding an EN is
+# `en-workload.sh apply <ordinal>`; retiring one is `en-decommission.sh
+# <ordinal>`, which fences it, waits for the drain, removes it from the cluster
+# and only then deletes the workload. `deploy.sh` calls the renderer for the
+# ordinals the cluster already has (or AUTUMN_EN_COUNT of them), so a fresh
+# install still comes up in one command. See docs/ops.md, "Node decommission runbook".
+#
+# The headless Service below is a stable name for the EN set; its ports are
+# vestigial under pod-IP routing.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: autumn-en            # headless — a name for the set (ports vestigial)
+  namespace: autumn
+  labels:
+    app.kubernetes.io/name: autumn
+    app.kubernetes.io/component: extent-node
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: autumn
+    app.kubernetes.io/component: extent-node
+  ports:
+    - { name: data, port: 9101, targetPort: 9101 }
+    - { name: control, port: 10101, targetPort: 10101 }

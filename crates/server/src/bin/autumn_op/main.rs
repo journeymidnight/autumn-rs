@@ -1,0 +1,4702 @@
+//! companion CLI for manager control plane.
+//!
+//! `autumn-op` is the canonical operator interface. It speaks rkyv over
+//! the manager RPC framing and prints either human-readable or
+//! `--json` output (the Python ops tooling in `python/` consumes the
+//! JSON form).
+//!
+//! Two command families:
+//!   * node-lifecycle: list-nodes / extent-health / list-ec-markers
+//!     / recovery-stats / audit-log + fence-node / maintenance / unfence
+//!     / remove.
+//!   * cluster / partition admin (moved from autumn-client): bootstrap / set-stream-ec /
+//!     force-ec-convert / split / merge / policy-candidates / compact /
+//!     gc / forcegc / register-node / format / info.
+//!
+//! The data-plane CLI `autumn-client` MUST NOT regrow direct manager
+//! admin RPCs — if it needs op data in the future, route through this
+//! binary.
+
+use std::collections::{HashMap, HashSet};
+use std::io::Write;
+use std::time::Duration;
+
+use anyhow::{anyhow, bail, Context, Result};
+use autumn_client::{decode_err, default_rpc_timeout, ClusterClient};
+use autumn_manager::dashboard_compose::{
+    fleet_state_str, health_json, slot_state_str, status_json,
+};
+use autumn_rpc::manager_rpc::*;
+use autumn_rpc::partition_rpc::{
+    DiagPartitionVpReq, DiagPartitionVpResp, GetDiscardsReq, GetDiscardsResp,
+    MSG_DIAG_PARTITION_VP, MSG_GET_DISCARDS,
+};
+use bytes::Bytes;
+use serde::Serialize;
+
+
+mod args;
+use args::{
+    parse, parse_replication, Args, Command,
+    ConfigCmd,
+    PresplitRule, SplitPoint,
+};
+
+fn format_disk(dir: &str) -> Result<String> {
+    for byte in 0u8..=255 {
+        let subdir = format!("{}/{:02x}", dir, byte);
+        std::fs::create_dir_all(&subdir).with_context(|| format!("create hash subdir {subdir}"))?;
+    }
+    let disk_uuid = uuid::Uuid::new_v4().to_string();
+    let marker_path = format!("{}/{}", dir, disk_uuid);
+    std::fs::File::create(&marker_path)
+        .with_context(|| format!("create UUID marker {marker_path}"))?;
+    Ok(disk_uuid)
+}
+
+/// fetch the manager's cluster_id. Retries on `CODE_NOT_LEADER`
+/// (same pattern as other admin RPCs in this binary). Returns an error
+/// if the cluster has never been imprinted (manager replied with
+/// `CODE_ERROR` "not yet bootstrapped"), which only happens before the
+/// first leader election against a fresh etcd.
+async fn fetch_cluster_id(client: &ClusterClient) -> Result<String> {
+    let req_bytes = rkyv_encode(&GetClusterIdReq {});
+    let mut attempt = 0u32;
+    loop {
+        let resp_bytes = client
+            .mgr_call(MSG_GET_CLUSTER_ID, req_bytes.clone())
+            .await
+            .context("get cluster_id")?;
+        let resp: GetClusterIdResp = rkyv_decode(&resp_bytes).map_err(decode_err)?;
+        if resp.code == CODE_OK {
+            if resp.cluster_id.is_empty() {
+                bail!("manager replied OK with empty cluster_id");
+            }
+            return Ok(resp.cluster_id);
+        }
+        if resp.code == CODE_NOT_LEADER && attempt < 60 {
+            attempt += 1;
+            compio::time::sleep(Duration::from_millis(500)).await;
+            continue;
+        }
+        bail!("get cluster_id failed: code={} {}", resp.code, resp.message);
+    }
+}
+
+/// probe a data dir for prior `format` state. The dedicated
+/// `cluster_id` + `disk_uuid` sentinel files are the
+/// canonical "already formatted" signal. Returns `(cluster_id, disk_uuid)`
+/// when both files are present and readable; `None` for a fresh dir.
+fn read_existing_format(dir: &str) -> Result<Option<(String, String)>> {
+    let cluster_path = format!("{dir}/cluster_id");
+    if !std::path::Path::new(&cluster_path).exists() {
+        return Ok(None);
+    }
+    let cid = std::fs::read_to_string(&cluster_path)
+        .with_context(|| format!("read cluster_id in {dir}"))?
+        .trim()
+        .to_string();
+    let uuid_path = format!("{dir}/disk_uuid");
+    if !std::path::Path::new(&uuid_path).exists() {
+        // Defensive: cluster_id present but disk_uuid missing means a
+        // partially-formatted dir (interrupted previous run, or a
+        // older-format dir that's been hand-patched). Treat as fresh and
+        // let the new format overwrite — the operator hit this path
+        // intentionally by running format on this dir.
+        return Ok(None);
+    }
+    let did = std::fs::read_to_string(&uuid_path)
+        .with_context(|| format!("read disk_uuid in {dir}"))?
+        .trim()
+        .to_string();
+    Ok(Some((cid, did)))
+}
+
+/// Atomically write a sentinel file: write a temp sibling then rename over the
+/// target, so a concurrent / crash-interrupted reader never observes a torn
+/// value. Used for the `node_uuid` identity sentinel, which is
+/// read back verbatim to keep a node's `node_id` stable across re-formats — a
+/// half-written value there would mint a duplicate identity.
+fn write_sentinel_atomic(path: &str, content: &str) -> std::io::Result<()> {
+    let tmp = format!("{path}.tmp");
+    std::fs::write(&tmp, content)?;
+    std::fs::rename(&tmp, path)
+}
+
+fn human_size(bytes: u64) -> String {
+    if bytes >= 1 << 30 {
+        format!("{:.1} GB", bytes as f64 / (1u64 << 30) as f64)
+    } else if bytes >= 1 << 20 {
+        format!("{:.1} MB", bytes as f64 / (1u64 << 20) as f64)
+    } else if bytes >= 1 << 10 {
+        format!("{:.1} KB", bytes as f64 / (1u64 << 10) as f64)
+    } else {
+        format!("{} B", bytes)
+    }
+}
+
+fn stream_total(s: &MgrStreamInfo, extent_map: &HashMap<u64, MgrExtentInfo>) -> u64 {
+    s.extent_ids
+        .iter()
+        .filter_map(|eid| extent_map.get(eid))
+        .map(|e| e.sealed_length)
+        .sum()
+}
+
+// ---------------------------------------------------------------------------
+// JSON view types
+// ---------------------------------------------------------------------------
+
+fn auto_state_str(b: u8) -> &'static str {
+    match b {
+        NODE_AUTO_STATE_ONLINE => "Online",
+        NODE_AUTO_STATE_SUSPECTED => "Suspected",
+        // registered, never verified alive. Distinct from
+        // Suspected — Suspended means "was alive, now flaky".
+        NODE_AUTO_STATE_SUSPEND => "Suspend",
+        _ => "Unknown",
+    }
+}
+
+fn override_str(b: u8) -> &'static str {
+    match b {
+        NODE_OVERRIDE_NONE => "-",
+        NODE_OVERRIDE_FENCED => "Fenced",
+        NODE_OVERRIDE_MAINTENANCE => "Maintenance",
+        _ => "Unknown",
+    }
+}
+
+fn op_name(b: u8) -> &'static str {
+    match b {
+        AUDIT_OP_FENCE_NODE => "fence_node",
+        AUDIT_OP_SET_NODE_MAINTENANCE => "maintenance",
+        AUDIT_OP_CLEAR_NODE_OVERRIDE => "clear_override",
+        AUDIT_OP_REMOVE_NODE => "remove_node",
+        AUDIT_OP_REMOVE_PS => "remove_ps",
+        AUDIT_OP_REMOVE_MANAGER => "remove_manager",
+        AUDIT_OP_RUNTIME_CONFIG => "runtime_config",
+        AUDIT_OP_FORCE_EC_CONVERT => "force_ec_convert",
+        AUDIT_OP_FORCE_ABANDON_EC_MARKER => "force_abandon_ec_marker",
+        AUDIT_OP_REPAIR => "repair",
+        AUDIT_OP_REPAIR_CANCEL => "repair_cancel",
+        AUDIT_OP_SCRUB => "scrub",
+        _ => "unknown",
+    }
+}
+
+#[derive(Serialize)]
+struct JsonNode {
+    node_id: u64,
+    address: String,
+    auto_state: String,
+    last_heartbeat_secs_ago: u64,
+    suspected_age_secs: u64,
+    override_kind: String,
+    override_reason: String,
+    override_set_by: String,
+    override_set_at: i64,
+    override_expire_at: u64,
+    node_uuid: String,
+    shard_count: usize,
+    shard_ports: Vec<u16>,
+    /// Disks the node reports out of space.
+    full_disks: Vec<u64>,
+}
+
+#[derive(Serialize)]
+struct JsonAudit {
+    op: String,
+    node_id: u64,
+    extent_id: u64,
+    by: String,
+    reason: String,
+    result_code: u8,
+    result_message: String,
+    ts_ns: u64,
+}
+
+// ---------------------------------------------------------------------------
+// `info` JSON output types (migrated from autumn_client.rs)
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+struct InfoDiskView {
+    disk_id: u64,
+    uuid: String,
+    online: bool,
+}
+
+#[derive(Serialize)]
+struct InfoNodeView {
+    node_id: u64,
+    address: String,
+    disks: Vec<InfoDiskView>,
+}
+
+#[derive(Serialize)]
+struct InfoExtentView {
+    extent_id: u64,
+    size: u64,
+    open: bool,
+    replicas: Vec<u64>,
+    parity: Vec<u64>,
+    refs: u64,
+    /// vp_table_refs-removal note: the maintenance machinery is gone, so for
+    /// extents managed under this build this is always 0. A non-zero value is a
+    /// LEGACY extent carried over from a pre-removal build — retained by the
+    /// upgrade-safety guard (`refs==0 && vp_table_refs>0` is NOT reclaimed) and
+    /// a Stage-2 migration target. Removed from the schema in Stage 2.
+    vp_table_refs: u64,
+    eversion: u64,
+    /// How many live streams list this extent in `extent_ids`. 0 = orphan
+    /// (not in any stream): either retained-by-vp_table_refs legacy live data,
+    /// or a both-zero reclaimable extent (the EXTENT10-AUTORECLAIM sweep reaps
+    /// it). `refs` should equal this; a gap is a refcount leak (MERGE-REFS-LEAK).
+    in_streams: usize,
+    /// The partitions holding a reference, ascending. More than one means a CoW
+    /// split left them sharing this extent: the file is unlinked at `refs == 0`,
+    /// so every sharer must drop its own reference before any space returns.
+    ///
+    /// For a LOG extent each sharer also counts this extent's dead bytes in its
+    /// own `gc_debt`, so summing debt across partitions over-states physical
+    /// bytes — by design, since the rewrite really is owed by each. The two
+    /// sides' counts start equal and DIVERGE after either one major-compacts,
+    /// which drops range-excluded VPs into that side's discards alone.
+    ///
+    /// May hold FEWER entries than `refs` when a stream referencing the extent
+    /// belongs to no live region (an orphaned stream, or the refcount gap
+    /// `in_streams` flags as a leak); the view still prints `refs` beside it.
+    shared_by_parts: Vec<u64>,
+}
+
+/// extent id -> the PARTITIONS holding a reference, ascending.
+///
+/// `refs=2` says a second holder exists; it does not say WHO, and "who" is the
+/// actionable half. A CoW split leaves parent and child referencing every
+/// extent they were cut from, the file is unlinked only at `refs == 0`, and so
+/// BOTH sides must collect their own reference before a byte comes back.
+///
+/// The same structure explains a number operators do misread: each sharer
+/// counts this extent's dead bytes in its own `gc_debt`, so summing debt across
+/// partitions over-states physical bytes. That per-partition over-count is
+/// CORRECT — each really does owe that rewrite — and de-duplicating it would be
+/// the worse bug, since one advisory for the group leaves the other reference
+/// dangling and the extent never reaches zero. The fix belongs here, in what
+/// the view says, not in the accounting.
+fn extent_sharers(
+    regions: &HashMap<u64, MgrRegionInfo>,
+    stream_map: &HashMap<u64, MgrStreamInfo>,
+) -> HashMap<u64, Vec<u64>> {
+    // Walk the partitions in id order so each holder list comes out ascending
+    // BY CONSTRUCTION. `regions` is a HashMap, so iterating it directly would
+    // order the holders by whatever the hasher gives and shuffle them between
+    // two runs of `info` against an unchanged cluster. Sorting each list
+    // afterwards would fix the output too, but this way the ordering cannot be
+    // dropped by accident — there is no second step to forget.
+    let mut part_ids: Vec<&u64> = regions.keys().collect();
+    part_ids.sort_unstable();
+
+    let mut sharers: HashMap<u64, Vec<u64>> = HashMap::new();
+    for pid in part_ids {
+        let Some(r) = regions.get(pid) else { continue };
+        for sid in [r.log_stream, r.row_stream, r.meta_stream] {
+            let Some(s) = stream_map.get(&sid) else {
+                continue;
+            };
+            for eid in &s.extent_ids {
+                let holders = sharers.entry(*eid).or_default();
+                // One partition, one entry. A partition that reaches the same
+                // extent through two of its OWN streams is still a single
+                // holder to act on, and listing it twice would read as a
+                // second partition that does not exist — implying a reference
+                // that someone has to collect before the file is freed.
+                if holders.last() != Some(pid) {
+                    holders.push(*pid);
+                }
+            }
+        }
+    }
+    sharers
+}
+
+#[derive(Serialize)]
+struct InfoStreamView {
+    stream_id: u64,
+    replicates: u32,
+    ec_data: u32,
+    ec_parity: u32,
+    extent_ids: Vec<u64>,
+    total_size: u64,
+}
+
+#[derive(Serialize)]
+struct InfoDiscardEntry {
+    extent_id: u64,
+    bytes: i64,
+}
+
+#[derive(Serialize)]
+struct InfoPartitionView {
+    part_id: u64,
+    ps_addr: String,
+    range_start: String,
+    range_end: String,
+    live_size: u64,
+    total_extents: usize,
+    log_stream_id: u64,
+    row_stream_id: u64,
+    meta_stream_id: u64,
+    discards: Vec<InfoDiscardEntry>,
+}
+
+#[derive(Serialize)]
+struct InfoSnapshot {
+    nodes: Vec<InfoNodeView>,
+    extents: Vec<InfoExtentView>,
+    streams: Vec<InfoStreamView>,
+    partitions: Vec<InfoPartitionView>,
+}
+
+// ---------------------------------------------------------------------------
+// run()
+// ---------------------------------------------------------------------------
+
+async fn run(args: Args) -> Result<()> {
+    // the register-node migration stub must print BEFORE we
+    // try to connect to the manager — otherwise users hit "manager
+    // unreachable" instead of the actionable migration message.
+    if matches!(args.cmd, Command::RegisterNode) {
+        eprintln!(
+            "register-node has merged into 'autumn-op format'.\n\
+             Run: autumn-op --manager <ADDR> format <DIR> [<DIR>...]\n\
+             'format' fetches the cluster_id, registers the node IDENTITY \
+             (no location), and stamps every data dir. \
+             Start `autumn-extent-node --manager <ADDR> --data <DIR>... \
+             --advertise <HOST:PORT>` to self-register the live location."
+        );
+        std::process::exit(1);
+    }
+    // gen-signing-key is LOCAL (no manager) — handle it BEFORE
+    // connecting so key generation works offline (and never needs a cluster).
+    if let Command::GenSigningKey { kid } = &args.cmd {
+        return cmd_gen_signing_key(*kid);
+    }
+    if matches!(args.cmd, Command::GenClusterSecret) {
+        println!("{}", autumn_rpc::peer_auth::ClusterSecret::generate());
+        return Ok(());
+    }
+    if matches!(args.cmd, Command::Config(ConfigCmd::Keys)) {
+        return print_runtime_keys(args.json);
+    }
+    // Every connection below declares the Admin role, which every server
+    // refuses unless it proves the cluster secret. Without the flag nothing is
+    // installed, and the first connect says which flag is missing.
+    if let Some(path) = &args.cluster_secret_file {
+        autumn_rpc::peer_auth::ClusterSecret::from_file(path)
+            .and_then(autumn_rpc::peer_auth::install)
+            .map_err(|e| anyhow::anyhow!("--cluster-secret-file: {e}"))?;
+    }
+    // Select the process-global transport before connecting. Without this an
+    // autumn-op invoked against a UCX manager would default to TCP and hang.
+    if !autumn_transport::set_regpool_cap_bytes(autumn_client::params().ucx_regpool_cap_bytes.get()) {
+        eprintln!("warning: regpool cap already set (ignored — first-call-wins)");
+    }
+    let _ = autumn_transport::init_with(args.transport);
+    let client = ClusterClient::connect_admin(&args.manager).await?;
+    // The cluster secret authorizes CONTROL-plane RPCs; it does not satisfy a
+    // partition server's key checks. Subcommands that touch partition keys need a data-plane capability
+    // too — `presplit --namespace fs` reads the declared stripe geometry before
+    // overwriting it, and under PROTECT-EVERYTHING that read is denied on a
+    // connection that never sent CLIENT_AUTH. The binding stays Raw (autumn-op
+    // spans namespaces and passes whole keys); `validate_credential_scope` is a
+    // no-op for Raw, so this only arms the token, it does not clamp anything.
+    if let Some((principal, secret)) = &args.credential {
+        client.set_principal_credential(principal.clone(), secret.clone());
+    }
+    match args.cmd {
+        // ---------------- node-lifecycle read ----------------
+        Command::ListNodes => cmd_list_nodes(&client, args.json).await?,
+        Command::Df => cmd_df(&client, args.json).await?,
+        Command::ExtentHealth {
+            node_filter,
+            include_healthy,
+        } => cmd_extent_health(&client, args.json, node_filter, include_healthy).await?,
+        Command::Health { max_problems } => cmd_health(&client, args.json, max_problems).await?,
+        Command::Status => cmd_status(&client, args.json).await?,
+        Command::ListEcMarkers => cmd_list_ec_markers(&client, args.json).await?,
+        Command::RecoveryStats => cmd_recovery_stats(&client, args.json).await?,
+        Command::AuditLog {
+            op,
+            node_id,
+            since,
+            until,
+            limit,
+        } => cmd_audit_log(&client, args.json, op, node_id, since, until, limit).await?,
+        // ---------------- node-lifecycle admin ----------------
+        Command::Fence {
+            node_id,
+            reason,
+            by,
+            force,
+        } => cmd_fence(&client, args.json, node_id, reason, by, force).await?,
+        Command::Maintenance {
+            node_id,
+            reason,
+            by,
+            expire,
+        } => cmd_maintenance(&client, args.json, node_id, reason, by, expire).await?,
+        Command::Unfence { node_id, by } => cmd_unfence(&client, args.json, node_id, by).await?,
+        Command::Remove { node_id, by } => cmd_remove(&client, args.json, node_id, by).await?,
+        Command::Config(cmd) => cmd_config(&client, args.json, cmd).await?,
+        Command::PsRemove { ps_id, by } => {
+            cmd_remove_member(&client, args.json, MEMBER_ROLE_PS, ps_id, by).await?
+        }
+        Command::ManagerRemove { manager_id, by } => {
+            cmd_remove_member(&client, args.json, MEMBER_ROLE_MANAGER, manager_id, by).await?
+        }
+        // ---------------- cluster / partition read ----------------
+        Command::PolicyCandidates => cmd_policy_candidates(&client, args.json).await?,
+        Command::Overview => cmd_overview(&client).await?,
+        Command::AutoPolicy {
+            action,
+            name,
+            switches,
+            interval,
+            cooldown,
+            max_actions,
+            desc,
+        } => {
+            cmd_auto_policy(
+                &client,
+                args.json,
+                &action,
+                &name,
+                &switches,
+                interval,
+                cooldown,
+                max_actions,
+                desc.as_deref(),
+            )
+            .await?
+        }
+        Command::Info { file_sd: true, .. } => run_file_sd(&client).await?,
+        Command::Info { part, detail, full, file_sd: false } => {
+            run_info(&client, args.json, part, detail, full).await?;
+        }
+        // ---------------- cluster / partition admin ----------------
+        Command::Bootstrap {
+            replication,
+            log_ec,
+            row_ec,
+        } => {
+            run_bootstrap(&client, args.json, &replication, log_ec, row_ec).await?;
+        }
+        Command::SetStreamEc {
+            stream_id,
+            ec_data,
+            ec_parity,
+        } => cmd_set_stream_ec(&client, args.json, stream_id, ec_data, ec_parity).await?,
+        Command::Repair {
+            extents,
+            node,
+            cancel,
+        } => {
+            submit_op_cli(
+                &client,
+                args.json,
+                args.wait,
+                args.wait_timeout,
+                OpSubmitReq {
+                    kind: if cancel {
+                        OP_KIND_REPAIR_CANCEL
+                    } else {
+                        OP_KIND_REPAIR
+                    },
+                    part_id: node.unwrap_or(0),
+                    secondary_id: extents.first().copied().unwrap_or(0),
+                    extent_ids: extents,
+                    requested_by: "cli".to_string(),
+                    ..Default::default()
+                },
+            )
+            .await?
+        }
+        // Naming neither extents nor a partition is `--all`, the scope the
+        // manager reads from that; the parser already insisted on exactly one.
+        Command::Scrub { extents, part } => {
+            submit_op_cli(
+                &client,
+                args.json,
+                args.wait,
+                args.wait_timeout,
+                OpSubmitReq {
+                    kind: OP_KIND_SCRUB,
+                    part_id: part.unwrap_or(0),
+                    secondary_id: extents.first().copied().unwrap_or(0),
+                    extent_ids: extents,
+                    requested_by: "cli".to_string(),
+                    ..Default::default()
+                },
+            )
+            .await?
+        }
+        Command::ForceEcConvert { extent_id } => {
+            cmd_force_ec_convert(&client, args.json, args.wait, args.wait_timeout, extent_id)
+                .await?
+        }
+        Command::Split { part_id, point } => {
+            cmd_split(
+                &client,
+                args.json,
+                args.wait,
+                args.wait_timeout,
+                part_id,
+                point,
+            )
+            .await?
+        }
+        Command::Ops {
+            op_id,
+            active,
+            kind,
+            limit,
+        } => cmd_ops(&client, args.json, op_id, active, &kind, limit).await?,
+        Command::OpsHistory {
+            kind,
+            since_unix,
+            limit,
+        } => cmd_ops_history(&client, args.json, &kind, since_unix, limit).await?,
+        Command::Presplit { scope, rule, force } => {
+            cmd_presplit(&client, args.json, &scope, false, Some(&rule), force).await?
+        }
+        Command::Merge {
+            survivor_part_id,
+            victim_part_id,
+            force,
+        } => {
+            cmd_merge(
+                &client,
+                args.json,
+                args.wait,
+                args.wait_timeout,
+                survivor_part_id,
+                victim_part_id,
+                force,
+            )
+            .await?
+        }
+        Command::Rebalance { max_moves } => {
+            cmd_rebalance(&client, args.json, args.wait, args.wait_timeout, max_moves).await?
+        }
+        Command::Compact { part_id } => {
+            cmd_compact(&client, args.json, args.wait, args.wait_timeout, part_id).await?
+        }
+        Command::Gc {
+            part_id,
+            ratio,
+            max_size,
+            stream_debt,
+            dead_bytes,
+            empty_only,
+        } => {
+            cmd_gc(
+                &client,
+                args.json,
+                args.wait,
+                args.wait_timeout,
+                part_id,
+                ratio,
+                max_size,
+                stream_debt,
+                dead_bytes,
+                empty_only,
+            )
+            .await?
+        }
+        Command::ForceGc {
+            part_id,
+            extent_ids,
+        } => {
+            cmd_force_gc(
+                &client,
+                args.json,
+                args.wait,
+                args.wait_timeout,
+                part_id,
+                extent_ids,
+            )
+            .await?
+        }
+        Command::RegisterNode => {
+            // Already handled by the pre-connect stub above.
+            unreachable!("Command::RegisterNode handled before connect");
+        }
+        Command::Format { dirs } => cmd_format(&client, args.json, dirs, &args.manager).await?,
+        // ---------------- authz tooling ----------------
+        Command::GenSigningKey { .. } => unreachable!("gen-signing-key handled before connect"),
+        Command::GenClusterSecret => unreachable!("gen-cluster-secret handled before connect"),
+        Command::PrincipalCreate { principal, grants } => {
+            cmd_principal_create(&client, args.json, principal, grants).await?
+        }
+        Command::PrincipalDelete { principal } => {
+            cmd_principal_delete(&client, args.json, principal).await?
+        }
+        Command::MintToken {
+            principal,
+            credential,
+        } => cmd_mint_token(&client, args.json, principal, credential).await?,
+        // ---------------- namespace registry ----------------
+        Command::NamespaceCreate { name, rule, force } => {
+            cmd_namespace_create(&client, args.json, name, rule, force).await?
+        }
+        Command::NamespaceDelete { name, force } => {
+            cmd_namespace_delete(&client, args.json, name, force).await?
+        }
+        Command::NamespaceList => cmd_namespace_list(&client, args.json).await?,
+        Command::PrincipalList => cmd_principal_list(&client, args.json).await?,
+    }
+    let _ = std::io::stdout().flush();
+    Ok(())
+}
+
+/// Lowercase hex encode.
+fn hex_encode(b: &[u8]) -> String {
+    let mut s = String::with_capacity(b.len() * 2);
+    for byte in b {
+        s.push_str(&format!("{byte:02x}"));
+    }
+    s
+}
+
+/// Decode an ASCII hex string into bytes.
+fn hex_decode(s: &str) -> Result<Vec<u8>> {
+    if !s.is_ascii() || !s.len().is_multiple_of(2) {
+        bail!("expected an even-length ASCII hex string");
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(|e| anyhow!("bad hex: {e}")))
+        .collect()
+}
+
+/// generate an Ed25519 signing key locally. Prints the keyfile line
+/// (`<kid> <hex-seed>`) to STDOUT (redirect into `--auth-signing-key-file`); the
+/// derived public key + guidance go to STDERR so they don't pollute the file.
+fn cmd_gen_signing_key(kid: u32) -> Result<()> {
+    use rand::RngCore;
+    let mut seed = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut seed);
+    let public = autumn_rpc::cap_token::public_key_from_seed(&seed);
+    println!("{} {}", kid, hex_encode(&seed));
+    eprintln!("# signing key kid={kid}");
+    eprintln!("# public_key = {}", hex_encode(&public));
+    eprintln!("# The stdout line (kid + hex seed) is the SECRET keyfile line — give");
+    eprintln!("# it to the manager via --auth-signing-key-file and keep it protected.");
+    let _ = std::io::stdout().flush();
+    Ok(())
+}
+
+/// create/rotate a principal account. Returns the
+/// permanent credential in the `principal:`/`credential:` two-line form, so
+/// `autumn-op principal-create ... > loader.cred` produces a ready credential file
+/// (the SDK's `read_credential_file` parses that form, carrying the name).
+async fn cmd_principal_create(
+    client: &ClusterClient,
+    json: bool,
+    principal: String,
+    grants: Vec<String>,
+) -> Result<()> {
+    let allowed_prefixes: Vec<Vec<u8>> = grants.iter().map(|p| p.as_bytes().to_vec()).collect();
+    // Leader-only RPC with manager rotation on CODE_NOT_LEADER lives in the SDK.
+    let credential = client
+        .principal_create(&principal, allowed_prefixes)
+        .await?;
+    let cred = hex_encode(&credential);
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "principal": principal,
+                "credential": cred,
+            }))?
+        );
+    } else {
+        // Two-line credential-file form (principal name travels with the secret).
+        println!("principal: {principal}");
+        println!("credential: {cred}");
+        eprintln!("# ^ save both lines as the principal's credential file; shown ONCE (manager stores only the SHA-256 hash).");
+    }
+    Ok(())
+}
+
+/// remove a principal account (stops renewal; current
+/// token still works until it expires).
+async fn cmd_principal_delete(
+    client: &ClusterClient,
+    json: bool,
+    principal: String,
+) -> Result<()> {
+    client.principal_delete(&principal).await?;
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({ "principal": principal, "deleted": true })
+        );
+    } else {
+        println!("principal '{principal}' deleted");
+    }
+    Ok(())
+}
+
+/// mint a short-TTL capability token from a principal
+/// credential.
+async fn cmd_mint_token(
+    client: &ClusterClient,
+    json: bool,
+    principal: String,
+    credential: Vec<u8>,
+) -> Result<()> {
+    let (token_bytes, exp) = client.mint_token(&principal, credential).await?;
+    let token = hex_encode(&token_bytes);
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "principal": principal,
+                "token": token,
+                "exp": exp,
+            }))?
+        );
+    } else {
+        println!("{token}");
+        eprintln!("# token for '{principal}', exp={exp} (unix seconds)");
+    }
+    Ok(())
+}
+
+/// D2: register a namespace, then cut it at its head `{name}/` and by `rule`
+/// (what `presplit` does).
+async fn cmd_namespace_create(
+    client: &ClusterClient,
+    json: bool,
+    name: String,
+    rule: Option<PresplitRule>,
+    force: bool,
+) -> Result<()> {
+    client.namespace_create(&name, Vec::new()).await?;
+    if !json {
+        println!("namespace '{name}' created");
+    }
+    cmd_presplit(client, json, &name, true, rule.as_ref(), force).await.with_context(|| {
+        format!(
+            "namespace '{name}' is registered but namespace-create did not finish; unless \
+             something wrote to it meanwhile (namespace-delete refuses one holding data), \
+             delete it (`namespace-delete --name {name}`) and create it again once the cause \
+             is fixed"
+        )
+    })
+}
+
+/// D2: delete a namespace registry row. The non-empty guard is enforced
+/// HERE (client-side): scan the `<name>/` prefix and refuse unless `--force`, since
+/// the manager has no KV data-plane client. `--force` only skips the guard — it
+/// does NOT batch-delete data (deploy is cluster-reset, §7.4; batch-delete tooling
+/// is a later delivery).
+async fn cmd_namespace_delete(
+    client: &ClusterClient,
+    json: bool,
+    name: String,
+    force: bool,
+) -> Result<()> {
+    let prefix = format!("{name}/").into_bytes();
+    if !force {
+        // One key is enough to prove the namespace is non-empty.
+        let scan = client
+            .range(&prefix, &prefix, 1)
+            .await
+            .with_context(|| format!("scanning namespace '{name}/' for emptiness"))?;
+        if !scan.entries.is_empty() {
+            bail!(
+                "namespace '{name}' is not empty (holds data under '{name}/'); \
+                 re-run with --force to remove the registry row anyway \
+                 (this does NOT delete the data)"
+            );
+        }
+    }
+    client.namespace_delete(&name).await?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "namespace": name,
+                "deleted": true,
+                "forced": force,
+            }))?
+        );
+    } else {
+        println!("namespace '{name}' deleted (registry row removed)");
+        if force {
+            eprintln!("# --force: emptiness check skipped; any data under '{name}/' is untouched.");
+        }
+    }
+    Ok(())
+}
+
+/// D2: list the registered namespaces (rich rows). Read-only.
+/// Every runtime parameter of the three server roles, from the declarations.
+fn runtime_keys() -> Vec<(String, &'static autumn_params::Spec)> {
+    use autumn_params::Params;
+    fn of<P: Params>() -> Vec<(String, &'static autumn_params::Spec)> {
+        P::specs()
+            .iter()
+            .filter(|s| s.runtime)
+            .map(|s| (format!("{}.{}", P::ROLE, s.flag()), s))
+            .collect()
+    }
+    let mut out = of::<autumn_params::manager::ManagerParams>();
+    out.extend(of::<autumn_params::ps::PsParams>());
+    out.extend(of::<autumn_params::en::EnParams>());
+    out
+}
+
+/// `config keys`: local, needs no manager.
+fn print_runtime_keys(json: bool) -> Result<()> {
+    let keys = runtime_keys();
+    if json {
+        let rows: Vec<_> = keys
+            .iter()
+            .map(|(k, s)| {
+                serde_json::json!({
+                    "key": k, "default": (s.default)(), "range": (s.range)(),
+                    "help": s.help.trim(),
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&rows)?);
+    } else {
+        for (k, s) in &keys {
+            println!("{k}  (default {}, range {})", (s.default)(), (s.range)());
+            for line in s.help.lines() {
+                println!("    {}", line.trim());
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn cmd_config(client: &ClusterClient, json: bool, cmd: ConfigCmd) -> Result<()> {
+    let entry_json = |e: &RuntimeConfigEntry| {
+        serde_json::json!({
+            "key": e.key, "value": e.value, "set_by": e.set_by, "set_at": e.set_at,
+        })
+    };
+    match cmd {
+        ConfigCmd::Keys => unreachable!("config keys handled before connect"),
+        ConfigCmd::List => {
+            let entries = client.runtime_config_get().await?;
+            if json {
+                let rows: Vec<_> = entries.iter().map(entry_json).collect();
+                println!("{}", serde_json::to_string_pretty(&rows)?);
+            } else if entries.is_empty() {
+                println!("no overrides");
+            } else {
+                println!("{:<44} {:<16} {:<12} {:>12}", "KEY", "VALUE", "SET_BY", "SET_AT");
+                for e in &entries {
+                    println!("{:<44} {:<16} {:<12} {:>12}", e.key, e.value, e.set_by, e.set_at);
+                }
+            }
+        }
+        ConfigCmd::Get { key } => {
+            let entries = client.runtime_config_get().await?;
+            let found = entries.iter().find(|e| e.key == key);
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&found.map(entry_json))?
+                );
+            } else {
+                match found {
+                    Some(e) => println!("{} = {} (set by {} at {})", e.key, e.value, e.set_by, e.set_at),
+                    None => println!("{key}: no override (each process uses its flag)"),
+                }
+            }
+        }
+        ConfigCmd::Set { key, value, by } => {
+            if by.is_empty() {
+                bail!("--by is required");
+            }
+            client.runtime_config_set(&key, Some(value), &by).await?;
+            println!("config set: ok");
+        }
+        ConfigCmd::Unset { key, by } => {
+            if by.is_empty() {
+                bail!("--by is required");
+            }
+            client.runtime_config_set(&key, None, &by).await?;
+            println!("config unset: ok");
+        }
+    }
+    Ok(())
+}
+
+async fn cmd_namespace_list(client: &ClusterClient, json: bool) -> Result<()> {
+    let namespaces = client.namespace_list().await?;
+    if json {
+        let rows: Vec<_> = namespaces
+            .iter()
+            .map(|n| {
+                serde_json::json!({
+                    "name": n.name,
+                    "prefix": String::from_utf8_lossy(&n.prefix),
+                    "presplit_points": n.presplit.len(),
+                    "created_at": n.created_at,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&rows)?);
+    } else {
+        println!(
+            "{:<14} {:<16} {:>8} {:>12}",
+            "NAME", "PREFIX", "PRESPLIT", "CREATED_AT"
+        );
+        for n in &namespaces {
+            println!(
+                "{:<14} {:<16} {:>8} {:>12}",
+                n.name,
+                String::from_utf8_lossy(&n.prefix),
+                n.presplit.len(),
+                n.created_at,
+            );
+        }
+    }
+    Ok(())
+}
+
+/// `principal-list [--json]`. Read-only inspection —
+/// answers "who exists and what may they touch", which until now needed either
+/// `ls $DATA_ROOT/authz/*.cred` (only what turnkey wrote) or an etcd key scan
+/// (names only; grants live inside an rkyv value). Never prints credentials.
+async fn cmd_principal_list(client: &ClusterClient, json: bool) -> Result<()> {
+    let principals = client.principal_list().await?;
+    let grants_of = |p: &autumn_rpc::manager_rpc::PrincipalRow| -> Vec<String> {
+        p.grants
+            .iter()
+            .map(|g| String::from_utf8_lossy(g).into_owned())
+            .collect()
+    };
+    if json {
+        let rows: Vec<_> = principals
+            .iter()
+            .map(|p| serde_json::json!({ "name": p.name, "grants": grants_of(p) }))
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&rows)?);
+    } else {
+        println!("{:<20} {}", "NAME", "GRANTS");
+        for p in &principals {
+            let g = grants_of(p);
+            println!(
+                "{:<20} {}",
+                p.name,
+                if g.is_empty() { "-".to_string() } else { g.join(",") }
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn cmd_list_nodes(client: &ClusterClient, json: bool) -> Result<()> {
+    let bytes = client
+        .mgr_call(MSG_LIST_NODE_STATES, rkyv_encode(&ListNodeStatesReq {}))
+        .await?;
+    let resp: ListNodeStatesResp = rkyv_decode(&bytes).map_err(|e| anyhow!(e))?;
+    if resp.code != CODE_OK {
+        bail!("list-nodes: {}", resp.message);
+    }
+    if json {
+        let out: Vec<JsonNode> = resp
+            .nodes
+            .into_iter()
+            .map(|n| {
+                // No override reads as kind NONE with empty details.
+                let ovr = n.operator_override.unwrap_or_default();
+                JsonNode {
+                    node_id: n.node_id,
+                    address: n.address,
+                    auto_state: auto_state_str(n.auto_state).to_string(),
+                    last_heartbeat_secs_ago: n.last_heartbeat_secs_ago,
+                    suspected_age_secs: n.suspected_age_secs,
+                    override_kind: override_str(ovr.kind).to_string(),
+                    override_reason: ovr.reason,
+                    override_set_by: ovr.set_by,
+                    override_set_at: ovr.set_at,
+                    override_expire_at: ovr.expire_at,
+                    node_uuid: n.node_uuid,
+                    shard_count: n.shard_ports.len(),
+                    shard_ports: n.shard_ports,
+                    full_disks: n.full_disks,
+                }
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&out)?);
+    } else {
+        println!(
+            "{:<6} {:<10} {:<24} {:<7} {:<10} {:<8} {:<8} {:<12} {:<10} REASON",
+            "ID", "UUID", "ADDRESS", "SHARDS", "AUTO", "HB_AGO", "SUSP_AGE", "OVERRIDE", "FULL"
+        );
+        for n in resp.nodes {
+            let hb = if n.last_heartbeat_secs_ago == u64::MAX {
+                "never".to_string()
+            } else {
+                format!("{}s", n.last_heartbeat_secs_ago)
+            };
+            // Short uuid + shard count (verify a reshard took).
+            let uuid_short = if n.node_uuid.is_empty() {
+                "-".to_string()
+            } else {
+                n.node_uuid.chars().take(8).collect::<String>()
+            };
+            let full = if n.full_disks.is_empty() {
+                "-".to_string()
+            } else {
+                n.full_disks.iter().map(u64::to_string).collect::<Vec<_>>().join(",")
+            };
+            println!(
+                "{:<6} {:<10} {:<24} {:<7} {:<10} {:<8} {:<8} {:<12} {:<10} {}",
+                n.node_id,
+                uuid_short,
+                n.address,
+                n.shard_ports.len(),
+                auto_state_str(n.auto_state),
+                hb,
+                n.suspected_age_secs,
+                override_str(n.override_kind()),
+                full,
+                n.operator_override.as_ref().map_or("", |o| o.reason.as_str()),
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn cmd_df(client: &ClusterClient, json: bool) -> Result<()> {
+    let r = client.cluster_df().await?;
+    let raw_used = r.raw_total.saturating_sub(r.raw_free);
+    // Logical size = distinct sealed extents + committed open extents (one
+    // copy). Amplification uses real raw filesystem capacity consumed, so a
+    // 4+1-only cluster is ~1.25x and RF3 is ~3x. `physical_used` remains a
+    // diagnostic sum of extent file lengths, not the capacity numerator.
+    let logical_size = r.logical_stored.saturating_add(r.logical_open_tail);
+    let amp = autumn_manager::dashboard_compose::raw_capacity_amplification(raw_used, logical_size);
+    // Writable logical estimate is a RANGE under EC: best EC shape is
+    // K = min(4, node_count-1) data shards + 1 parity → factor
+    // (K+1)/K; worst is 3-replica. Point estimate uses the empirical
+    // amplification (falls back to the conservative /3).
+    let k = if r.node_count >= 2 {
+        (r.node_count - 1).min(4)
+    } else {
+        0
+    };
+    let best_factor = if k >= 1 {
+        (k as f64 + 1.0) / k as f64
+    } else {
+        3.0
+    };
+    let writable_low = r.raw_free / 3; // conservative: 3-replica
+    let writable_high = (r.raw_free as f64 / best_factor) as u64;
+    let writable_est = if amp > 0.0 {
+        (r.raw_free as f64 / amp) as u64
+    } else {
+        writable_low
+    };
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let snap_age = now_ms.saturating_sub(r.last_update_ms) / 1000;
+    let logical_age = now_ms.saturating_sub(r.logical_last_update_ms) / 1000;
+    // dead (reclaimable) fraction of the footprint = gc_debt (before the
+    // replay floor) + open-tail dead (at/after it). physical_used carries
+    // these bytes until GC punches them.
+    let wal_debt_ratio = if logical_size > 0 {
+        r.logical_wal_debt as f64 / logical_size as f64
+    } else {
+        0.0
+    };
+
+    if json {
+        let per_node: Vec<serde_json::Value> = r
+            .per_node
+            .iter()
+            .map(|n| {
+                serde_json::json!({
+                    "node_id": n.node_id,
+                    "total": n.total,
+                    "free": n.free,
+                    "extent_bytes": n.extent_bytes,
+                    "online": n.online,
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "raw_total": r.raw_total,
+                "raw_used": raw_used,
+                "raw_free": r.raw_free,
+                "physical_used": r.physical_used,
+                "logical_stored_sealed": r.logical_stored,
+                "logical_open_tail": r.logical_open_tail,
+                "logical_size": logical_size,
+                "logical_footprint": logical_size,
+                "logical_wal_debt": r.logical_wal_debt,
+                "wal_debt_ratio": wal_debt_ratio,
+                "amplification": amp,
+                "writable_est": writable_est,
+                "writable_low_3x": writable_low,
+                "writable_high_ec": writable_high,
+                "best_ec_data_shards": k,
+                "node_count_online": r.node_count,
+                "snapshot_age_secs": snap_age,
+                "logical_scan_age_secs": logical_age,
+                "per_node": per_node,
+            }))?
+        );
+    } else {
+        let amp_str = if amp > 0.0 {
+            format!("{amp:.2}x")
+        } else {
+            "n/a".to_string()
+        };
+        println!("=== Cluster df ===");
+        println!(
+            "RAW:     total={:<10} used={:<10} avail={}",
+            human_size(r.raw_total),
+            human_size(raw_used),
+            human_size(r.raw_free),
+        );
+        println!(
+            "AUTUMN:  extent_files={:<10} logical_size={:<10} raw_amplification={}",
+            human_size(r.physical_used),
+            human_size(logical_size),
+            amp_str,
+        );
+        println!(
+            "         logical: sealed={} + open={} = size {}",
+            human_size(r.logical_stored),
+            human_size(r.logical_open_tail),
+            human_size(logical_size),
+        );
+        println!(
+            "         WAL debt: {} dead ({:.1}% of logical size, GC-reclaimable; incl. open)",
+            human_size(r.logical_wal_debt),
+            wal_debt_ratio * 100.0,
+        );
+        println!(
+            "WRITABLE(est): {}   range [{} .. {}]  (3-replica .. EC {}+1)",
+            human_size(writable_est),
+            human_size(writable_low),
+            human_size(writable_high),
+            k,
+        );
+        println!(
+            "NODES: {} online   (snapshot {}s ago; logical scan {}s ago)",
+            r.node_count, snap_age, logical_age,
+        );
+        println!(
+            "  {:<6} {:<10} {:<10} {:<10} ONLINE",
+            "ID", "TOTAL", "FREE", "PHYS_USED"
+        );
+        for n in &r.per_node {
+            println!(
+                "  {:<6} {:<10} {:<10} {:<10} {}",
+                n.node_id,
+                human_size(n.total),
+                human_size(n.free),
+                human_size(n.extent_bytes),
+                if n.online { "yes" } else { "no" },
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn cmd_extent_health(
+    client: &ClusterClient,
+    json: bool,
+    node_filter: Vec<u64>,
+    include_healthy: bool,
+) -> Result<()> {
+    let req = ExtentHealthReq {
+        node_id_filter: node_filter,
+        include_healthy,
+    };
+    let bytes = client
+        .mgr_call(MSG_EXTENT_HEALTH_REPORT, rkyv_encode(&req))
+        .await?;
+    let resp: ExtentHealthResp = rkyv_decode(&bytes).map_err(|e| anyhow!(e))?;
+    if resp.code != CODE_OK {
+        bail!("extent-health: {}", resp.message);
+    }
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(
+                &resp
+                    .extents
+                    .into_iter()
+                    .map(|e| {
+                        serde_json::json!({
+                            "extent_id": e.extent_id,
+                            "eversion": e.eversion,
+                            "sealed_length": e.sealed_length,
+                            "ec_converted": e.ec_converted,
+                            "unhealthy": e.unhealthy,
+                            "slots": e.slots.into_iter().map(|s| serde_json::json!({
+                                "slot": s.slot_index,
+                                "node_id": s.node_id,
+                                "avali": s.avali,
+                                "auto_state": auto_state_str(s.auto_state),
+                                "override": override_str(s.override_kind),
+                            })).collect::<Vec<_>>(),
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            )?
+        );
+    } else {
+        if resp.extents.is_empty() {
+            println!("(no extents match filter)");
+        }
+        for e in resp.extents {
+            println!(
+                // `sealed_len=`, not `sealed=`: this is the LENGTH, and a 0
+                // here is ambiguous between an open extent and an
+                // authoritatively sealed-empty one. Reading it as the state
+                // is what sent a diagnosis of 21 "unhealthy" extents into the
+                // source before the answer (they were open tails) turned up.
+                "extent {}  eversion={} sealed_len={} ec={} unhealthy={}",
+                e.extent_id, e.eversion, e.sealed_length, e.ec_converted, e.unhealthy
+            );
+            for s in e.slots {
+                println!(
+                    "  slot[{}] node={:<4} avali={:<5} auto={} override={}",
+                    s.slot_index,
+                    s.node_id,
+                    s.avali,
+                    auto_state_str(s.auto_state),
+                    override_str(s.override_kind),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn health_bytes(n: u64) -> String {
+    human_bytes_or_count(OP_KIND_RECOVERY, n)
+}
+
+/// The text form of `autumn-op health`, kept pure so a test can read it.
+fn render_health(r: &ExtentHealthSummaryResp) -> String {
+    let mut lines = vec![
+        format!(
+            "extents: {} sealed, {} open (open tails are not classified)",
+            r.sealed_extents, r.open_extents
+        ),
+        format!(
+            "{} clean, {} degraded ({}), {} with no redundancy left, {} unavailable, \
+             {} recovering",
+            r.clean,
+            r.degraded,
+            health_bytes(r.degraded_bytes),
+            r.no_redundancy,
+            r.unavailable,
+            r.recovering
+        ),
+    ];
+    if r.repair_requested_slots > 0 {
+        lines.push(format!(
+            "{} slot(s) with a standing repair request (`autumn-op repair --cancel` withdraws)",
+            r.repair_requested_slots
+        ));
+    }
+    let slots: Vec<String> = r
+        .slot_counts
+        .iter()
+        .enumerate()
+        .filter(|(state, n)| *state != SLOT_STATE_SERVING as usize && **n > 0)
+        .map(|(state, n)| format!("{n} {}", slot_state_str(state as u8)))
+        .collect();
+    if !slots.is_empty() {
+        lines.push(format!("slots not serving: {}", slots.join(", ")));
+    }
+    if !r.problems.is_empty() {
+        lines.push("worst extents:".to_string());
+    }
+    for p in &r.problems {
+        let slots: Vec<String> = p
+            .slots
+            .iter()
+            .map(|s| {
+                // 0 = not yet measured: the clock moves on the 60 s policy tick.
+                let since = if s.degraded_secs > 0 {
+                    format!(" {}s", s.degraded_secs)
+                } else {
+                    String::new()
+                };
+                format!(
+                    "slot{} node {} {}{since}{}",
+                    s.slot_index,
+                    s.node_id,
+                    slot_state_str(s.state),
+                    if s.repair_requested { " [repair requested]" } else { "" },
+                )
+            })
+            .collect();
+        lines.push(format!(
+            "  extent {}  {}/{} serving (needs {}){}{}  {}  {}",
+            p.extent_id,
+            p.serving,
+            p.total,
+            p.needed,
+            if p.ec_converted { "  ec" } else { "" },
+            if p.recovering { "  recovering" } else { "" },
+            health_bytes(p.sealed_length),
+            slots.join("; ")
+        ));
+    }
+    lines.join("\n") + "\n"
+}
+
+async fn cmd_status(client: &ClusterClient, json: bool) -> Result<()> {
+    let bytes = client
+        .mgr_call(MSG_GET_CLUSTER_STATUS, bytes::Bytes::new())
+        .await?;
+    let r: ClusterStatusResp = rkyv_decode(&bytes).map_err(|e| anyhow!(e))?;
+    if r.code != CODE_OK {
+        bail!("status: {}", r.message);
+    }
+    if json {
+        println!("{}", serde_json::to_string_pretty(&status_json(&r))?);
+    } else {
+        print!("{}", render_status(&r));
+    }
+    Ok(())
+}
+
+fn age_str(secs: u64) -> String {
+    match secs {
+        u64::MAX => "unknown".to_string(),
+        s if s < 120 => format!("{s}s"),
+        s if s < 7200 => format!("{}m", s / 60),
+        s => format!("{}h", s / 3600),
+    }
+}
+
+/// `YYYY-MM-DD HH:MM:SS UTC` from unix ms.
+fn utc_string(ms: i64) -> String {
+    let secs = ms.div_euclid(1000);
+    let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
+    // Days since 1970-01-01 to a civil date (Hinnant).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!(
+        "{y:04}-{m:02}-{d:02} {:02}:{:02}:{:02} UTC",
+        rem / 3600,
+        rem % 3600 / 60,
+        rem % 60
+    )
+}
+
+fn render_status(r: &ClusterStatusResp) -> String {
+    let count = |v: &[FleetMember], state: u8| v.iter().filter(|m| m.state == state).count();
+    let oldest = |v: &[FleetMember], state: u8| {
+        v.iter()
+            .filter(|m| m.state == state)
+            .map(|m| m.age_secs)
+            .max()
+    };
+    let mut lines = vec![
+        format!(
+            "Manager   leader {} / standby {}   ({} expected)",
+            count(&r.managers, FLEET_MANAGER_LEADER),
+            count(&r.managers, FLEET_MANAGER_STANDBY),
+            r.managers.len()
+        ),
+        format!(
+            "PS        Ready {}/{}",
+            count(&r.partition_servers, FLEET_PS_READY),
+            r.partition_servers.len()
+        ),
+        format!(
+            "EN        Online {}/{}",
+            count(&r.extent_nodes, FLEET_EN_ONLINE),
+            r.extent_nodes.len()
+        ),
+        format!(
+            "Extent    clean {} / degraded {} / unavailable {}   ({} sealed)",
+            r.clean, r.degraded, r.unavailable, r.sealed_extents
+        ),
+        format!("Recovery  inflight {}", r.recovery_inflight),
+    ];
+    let mut sampled = format!("sampled   {}", utc_string(r.sampled_at_ms));
+    if let Some(l) = r
+        .managers
+        .iter()
+        .find(|m| m.state == FLEET_MANAGER_LEADER && m.id != 0)
+    {
+        sampled += &format!(" by manager {} ({})", l.id, l.address);
+    }
+    if let Some(a) = oldest(&r.extent_nodes, FLEET_EN_ONLINE) {
+        sampled += &format!("; oldest EN df {}", age_str(a));
+    }
+    if let Some(a) = oldest(&r.partition_servers, FLEET_PS_READY) {
+        sampled += &format!("; oldest PS heartbeat {}", age_str(a));
+    }
+    lines.push(sampled);
+    let ok = [FLEET_MANAGER_LEADER, FLEET_MANAGER_STANDBY, FLEET_PS_READY, FLEET_EN_ONLINE];
+    for (role, list) in [
+        ("manager", &r.managers),
+        ("PS", &r.partition_servers),
+        ("EN", &r.extent_nodes),
+    ] {
+        for m in list.iter().filter(|m| !ok.contains(&m.state)) {
+            lines.push(format!(
+                "  {role} {} {}  {} {}",
+                m.id,
+                m.address,
+                fleet_state_str(m.state),
+                age_str(m.age_secs)
+            ));
+        }
+    }
+    lines.join("\n") + "\n"
+}
+
+async fn cmd_health(client: &ClusterClient, json: bool, max_problems: u32) -> Result<()> {
+    let bytes = client
+        .mgr_call(
+            MSG_EXTENT_HEALTH_SUMMARY,
+            rkyv_encode(&ExtentHealthSummaryReq { max_problems }),
+        )
+        .await?;
+    let r: ExtentHealthSummaryResp = rkyv_decode(&bytes).map_err(|e| anyhow!(e))?;
+    if r.code != CODE_OK {
+        bail!("health: {}", r.message);
+    }
+    if json {
+        println!("{}", serde_json::to_string_pretty(&health_json(&r))?);
+    } else {
+        print!("{}", render_health(&r));
+    }
+    Ok(())
+}
+
+async fn cmd_list_ec_markers(client: &ClusterClient, json: bool) -> Result<()> {
+    let bytes = client
+        .mgr_call(
+            MSG_LIST_EC_INFLIGHT_MARKERS,
+            rkyv_encode(&ListEcInflightMarkersReq {}),
+        )
+        .await?;
+    let resp: ListEcInflightMarkersResp = rkyv_decode(&bytes).map_err(|e| anyhow!(e))?;
+    if resp.code != CODE_OK {
+        bail!("list-ec-markers: {}", resp.message);
+    }
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(
+                &resp
+                    .markers
+                    .into_iter()
+                    .map(|m| {
+                        serde_json::json!({
+                            "extent_id": m.extent_id,
+                            "coord_node_id": m.coord_node_id,
+                            "coord_auto_state": auto_state_str(m.coord_auto_state),
+                            "coord_override": override_str(m.coord_override_kind),
+                            "target_nodes": m.target_nodes,
+                            "data_shards": m.data_shards,
+                            "new_eversion": m.new_eversion,
+                            "started_at": m.started_at,
+                            "age_secs": m.age_secs,
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            )?
+        );
+    } else {
+        if resp.markers.is_empty() {
+            println!("(no inflight EC markers)");
+        }
+        for m in resp.markers {
+            println!(
+                "ext={} coord={} ({}/{}) targets={:?} K={} new_ev={} age={}s",
+                m.extent_id,
+                m.coord_node_id,
+                auto_state_str(m.coord_auto_state),
+                override_str(m.coord_override_kind),
+                m.target_nodes,
+                m.data_shards,
+                m.new_eversion,
+                m.age_secs,
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn cmd_recovery_stats(client: &ClusterClient, json: bool) -> Result<()> {
+    let bytes = client
+        .mgr_call(MSG_RECOVERY_STATS, rkyv_encode(&RecoveryStatsReq {}))
+        .await?;
+    let resp: RecoveryStatsResp = rkyv_decode(&bytes).map_err(|e| anyhow!(e))?;
+    if resp.code != CODE_OK {
+        bail!("recovery-stats: {}", resp.message);
+    }
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "global_inflight": resp.global_inflight,
+                "max_global": resp.max_global,
+                "max_per_source": resp.max_per_source,
+                "max_per_target": resp.max_per_target,
+                "per_source": resp.per_source,
+                "per_target": resp.per_target,
+                "backoff_entries": resp.backoff_entries,
+                "backoff": resp.backoff.iter().map(|b| serde_json::json!({
+                    "extent_id": b.extent_id,
+                    "slot": b.slot,
+                    "consecutive_failures": b.consecutive_failures,
+                    "last_attempt_at": b.last_attempt_at,
+                    "next_retry_at": b.next_retry_at,
+                    "reason": b.reason,
+                })).collect::<Vec<_>>(),
+            }))?
+        );
+    } else {
+        println!(
+            "global: {}/{}  per_source<={}  per_target<={}  backoff_entries={}",
+            resp.global_inflight,
+            resp.max_global,
+            resp.max_per_source,
+            resp.max_per_target,
+            resp.backoff_entries,
+        );
+        if !resp.per_source.is_empty() {
+            println!("per-source:");
+            for (id, c) in resp.per_source {
+                println!("  node {:<4} {}", id, c);
+            }
+        }
+        if !resp.per_target.is_empty() {
+            println!("per-target:");
+            for (id, c) in resp.per_target {
+                println!("  node {:<4} {}", id, c);
+            }
+        }
+        if !resp.backoff.is_empty() {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            println!("backoff:");
+            println!(
+                "  {:<10} {:<4} {:<6} {:<10} reason",
+                "extent", "slot", "fails", "retry_in"
+            );
+            for b in &resp.backoff {
+                let retry_in = b.next_retry_at - now;
+                let retry_str = if retry_in <= 0 {
+                    "now".to_string()
+                } else {
+                    format!("{retry_in}s")
+                };
+                println!(
+                    "  {:<10} {:<4} {:<6} {:<10} {}",
+                    b.extent_id, b.slot, b.consecutive_failures, retry_str, b.reason
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn cmd_audit_log(
+    client: &ClusterClient,
+    json: bool,
+    op: u8,
+    node_id: u64,
+    since: i64,
+    until: i64,
+    limit: u32,
+) -> Result<()> {
+    let req = QueryAuditLogReq {
+        op_filter: op,
+        node_id_filter: node_id,
+        since_ts_s: since,
+        until_ts_s: until,
+        limit,
+    };
+    let bytes = client
+        .mgr_call(MSG_QUERY_AUDIT_LOG, rkyv_encode(&req))
+        .await?;
+    let resp: QueryAuditLogResp = rkyv_decode(&bytes).map_err(|e| anyhow!(e))?;
+    if resp.code != CODE_OK {
+        bail!("audit-log: {}", resp.message);
+    }
+    if json {
+        let out: Vec<JsonAudit> = resp
+            .entries
+            .into_iter()
+            .map(|e| JsonAudit {
+                op: op_name(e.op).to_string(),
+                node_id: e.node_id,
+                extent_id: e.extent_id,
+                by: e.by,
+                reason: e.reason,
+                result_code: e.result_code,
+                result_message: e.result_message,
+                ts_ns: e.ts_ns,
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&out)?);
+    } else {
+        if resp.entries.is_empty() {
+            println!("(no audit entries match filter)");
+        }
+        for e in resp.entries {
+            println!(
+                "{}  op={:<22} node={:<4} ext={:<8} by={:<12} code={} reason={}",
+                e.ts_ns,
+                op_name(e.op),
+                e.node_id,
+                e.extent_id,
+                e.by,
+                e.result_code,
+                e.reason,
+            );
+            if !e.result_message.is_empty() {
+                println!("    => {}", e.result_message);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Map a comma-separated switch list (`split,gc,ec`) to the fixed bool vector
+/// the controller stores, order `[split, ec, compact, gc, merge, rebalance,
+/// repair, scrub]`. Unknown names are a hard error (a typo must not silently drop a
+/// switch). An empty list = all off.
+fn parse_switch_csv(csv: &str) -> Result<Vec<bool>> {
+    let mut sw = vec![false; 8];
+    for tok in csv.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        let idx = match tok {
+            "split" => 0,
+            "ec" => 1,
+            "compact" => 2,
+            "gc" => 3,
+            "merge" => 4,
+            "rebalance" => 5,
+            "repair" => 6,
+            "scrub" => 7,
+            other => bail!(
+                "unknown switch '{other}' (split|ec|compact|gc|merge|rebalance|repair|scrub)"
+            ),
+        };
+        sw[idx] = true;
+    }
+    Ok(sw)
+}
+
+/// Headless control of the leader-fenced auto-policy controller.
+///   auto-policy status
+///   auto-policy start <name>              (select the policy and run it)
+///   auto-policy deactivate                (mode → Off)
+///   auto-policy upsert <name> --switches split,gc,… [--interval N --cooldown N
+///                              --max N --desc "…"]   (create/replace a custom policy)
+///   auto-policy delete <name>             (remove a custom policy)
+#[allow(clippy::too_many_arguments)]
+async fn cmd_auto_policy(
+    client: &ClusterClient,
+    json: bool,
+    action: &str,
+    name: &str,
+    switches: &str,
+    interval: Option<u64>,
+    cooldown: Option<u64>,
+    max_actions: Option<u32>,
+    desc: Option<&str>,
+) -> Result<()> {
+    match action {
+        "status" => {}
+        // `activate` used to observe without `--arm`; letting it run the
+        // policy now would turn an old observe command into an armed one.
+        "activate" => anyhow::bail!(
+            "auto-policy activate was removed with the observe mode: \
+             `auto-policy start <name>` runs a policy, `deactivate` stops it"
+        ),
+        "start" => {
+            if name.is_empty() {
+                anyhow::bail!("auto-policy start requires a policy name");
+            }
+            client.auto_policy_start(name).await?;
+        }
+        "deactivate" => {
+            client
+                .auto_policy_set(AutoPolicySetReq {
+                    op: AUTOPOLICY_OP_SET_MODE,
+                    mode: 0, // Off
+                    name: String::new(),
+                    entry: None,
+                })
+                .await?;
+        }
+        "upsert" => {
+            if name.is_empty() {
+                anyhow::bail!("auto-policy upsert requires a policy name");
+            }
+            // Clamp BEFORE the u32 cast so a huge value can't truncate to 0; the
+            // manager's sanitize_entry re-clamps as the authority.
+            let entry = MgrAutoPolicyEntry {
+                name: name.to_string(),
+                desc: desc.unwrap_or("custom policy").to_string(),
+                switches: parse_switch_csv(switches)?,
+                interval_sec: interval.unwrap_or(30).max(2),
+                cooldown_sec: cooldown.unwrap_or(180),
+                max_actions: max_actions.unwrap_or(2).clamp(1, 100),
+                builtin: false,
+            };
+            client
+                .auto_policy_set(AutoPolicySetReq {
+                    op: AUTOPOLICY_OP_UPSERT,
+                    mode: 0,
+                    name: name.to_string(),
+                    entry: Some(entry),
+                })
+                .await?;
+        }
+        "delete" => {
+            if name.is_empty() {
+                anyhow::bail!("auto-policy delete requires a policy name");
+            }
+            client
+                .auto_policy_set(AutoPolicySetReq {
+                    op: AUTOPOLICY_OP_DELETE,
+                    mode: 0,
+                    name: name.to_string(),
+                    entry: None,
+                })
+                .await?;
+        }
+        other => anyhow::bail!(
+            "unknown auto-policy action '{other}' \
+             (status|start|deactivate|upsert|delete)"
+        ),
+    }
+
+    // Always print the resulting state.
+    let st = client
+        .auto_policy_get()
+        .await
+        .map_err(|e| anyhow!("auto-policy status: {e}"))?;
+    let mode_str = match st.mode {
+        2 => "armed".to_string(),
+        0 => "off".to_string(),
+        other => format!("unknown({other})"),
+    };
+    if json {
+        let policies: Vec<_> = st
+            .policies
+            .iter()
+            .map(|p| {
+                serde_json::json!({
+                    "name": p.name,
+                    "desc": p.desc,
+                    "builtin": p.builtin,
+                    "switches": p.switches,
+                    "interval_sec": p.interval_sec,
+                    "cooldown_sec": p.cooldown_sec,
+                    "max_actions": p.max_actions,
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "mode": mode_str,
+                "active": st.active,
+                "allow_mutations": st.allow_mutations,
+                "policies": policies,
+            }))?
+        );
+    } else {
+        println!(
+            "auto-policy: mode={mode_str}  active={}  allow_mutations={}",
+            if st.active.is_empty() { "(none)" } else { &st.active },
+            st.allow_mutations
+        );
+        println!("  policies:");
+        for p in &st.policies {
+            println!(
+                "    {:<14} {} — {}",
+                p.name,
+                if p.builtin { "preset" } else { "custom" },
+                p.desc
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Full dashboard overview JSON: call the four data RPCs and hand them to the
+/// shared `dashboard_compose::build_overview_json` (identical shape the
+/// in-manager dashboard emitted). Consumed by the standalone dashboard app.
+async fn cmd_overview(client: &ClusterClient) -> Result<()> {
+    let df = client.cluster_df().await?;
+    let ov_bytes = client
+        .mgr_call(
+            MSG_GET_CLUSTER_OVERVIEW,
+            rkyv_encode(&GetClusterOverviewReq {}),
+        )
+        .await
+        .context("cluster overview")?;
+    let ov: GetClusterOverviewResp = rkyv_decode(&ov_bytes).map_err(decode_err)?;
+    let ns_bytes = client
+        .mgr_call(MSG_LIST_NODE_STATES, rkyv_encode(&ListNodeStatesReq {}))
+        .await?;
+    let node_states: ListNodeStatesResp = rkyv_decode(&ns_bytes).map_err(|e| anyhow!(e))?;
+    // Advisories are leader-only + best-effort — an empty list is fine off-leader.
+    let candidates = client.policy_candidates().await.unwrap_or_default();
+    // Extent health is leader-only too; `null` in the JSON when it is not
+    // available, which the page shows as unknown rather than as healthy.
+    let extent_health = match client
+        .mgr_call(
+            MSG_EXTENT_HEALTH_SUMMARY,
+            rkyv_encode(&ExtentHealthSummaryReq { max_problems: 10 }),
+        )
+        .await
+        .map_err(|e| anyhow!(e))
+        .and_then(|b| rkyv_decode::<ExtentHealthSummaryResp>(&b).map_err(|e| anyhow!(e)))
+    {
+        Ok(r) if r.code == CODE_OK => Some(r),
+        Ok(r) => {
+            eprintln!("extent health unavailable: {}", r.message);
+            None
+        }
+        Err(e) => {
+            eprintln!("extent health unavailable: {e:#}");
+            None
+        }
+    };
+    let status = match client
+        .mgr_call(MSG_GET_CLUSTER_STATUS, bytes::Bytes::new())
+        .await
+        .map_err(|e| anyhow!(e))
+        .and_then(|b| rkyv_decode::<ClusterStatusResp>(&b).map_err(|e| anyhow!(e)))
+    {
+        Ok(r) if r.code == CODE_OK => Some(r),
+        Ok(r) => {
+            eprintln!("cluster status unavailable: {}", r.message);
+            None
+        }
+        Err(e) => {
+            eprintln!("cluster status unavailable: {e:#}");
+            None
+        }
+    };
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let out = autumn_manager::dashboard_compose::build_overview_json(
+        &df,
+        ov,
+        &node_states,
+        &candidates,
+        extent_health.as_ref(),
+        status.as_ref(),
+        ts,
+    );
+    println!("{out}");
+    Ok(())
+}
+
+async fn cmd_policy_candidates(client: &ClusterClient, json: bool) -> Result<()> {
+    let cands = client
+        .policy_candidates()
+        .await
+        .map_err(|e| anyhow!("policy_candidates: {e}"))?;
+    if json {
+        let out: Vec<_> = cands
+            .iter()
+            .map(|c| {
+                let kind = match c.kind {
+                    POLICY_KIND_SPLIT => "split",
+                    POLICY_KIND_MERGE => "merge",
+                    POLICY_KIND_GC => "gc",
+                    POLICY_KIND_MAJOR_COMPACT => "major",
+                    POLICY_KIND_HOT_COLD => "hotcold",
+                    POLICY_KIND_MINOR_COMPACT => "minor",
+                    POLICY_KIND_EC => "ec",
+                    POLICY_KIND_REBALANCE => "rebalance",
+                    POLICY_KIND_REPAIR => "repair",
+                    POLICY_KIND_SCRUB => "scrub",
+                    _ => "?",
+                };
+                serde_json::json!({
+                    "kind": kind,
+                    "primary_part_id": c.primary_part_id,
+                    "secondary_part_id": c.secondary_part_id,
+                    "reason": c.reason,
+                    "size_bytes": c.size_bytes,
+                    "req_per_sec": c.req_per_sec,
+                    "imm_full_per_sec": c.imm_full_per_sec,
+                    "same_ps": c.same_ps,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&out)?);
+    } else if cands.is_empty() {
+        println!("(no candidates)");
+    } else {
+        println!(
+            "{:<7} {:<10} {:<10} {:<46} {:<10} {:<8} {:<6} {:<5}",
+            "KIND", "PRIMARY", "SECONDARY", "REASON", "SIZE", "QPS", "IMM/s", "FEAS"
+        );
+        for c in cands {
+            let kind = match c.kind {
+                POLICY_KIND_SPLIT => "split",
+                POLICY_KIND_MERGE => "merge",
+                POLICY_KIND_GC => "gc",
+                POLICY_KIND_MAJOR_COMPACT => "major",
+                POLICY_KIND_HOT_COLD => "hotcold",
+                POLICY_KIND_MINOR_COMPACT => "minor",
+                POLICY_KIND_EC => "ec",
+                POLICY_KIND_REBALANCE => "rebalance",
+                POLICY_KIND_REPAIR => "repair",
+                POLICY_KIND_SCRUB => "scrub",
+                _ => "?",
+            };
+            let feas = match c.kind {
+                POLICY_KIND_GC
+                | POLICY_KIND_MAJOR_COMPACT
+                | POLICY_KIND_MINOR_COMPACT
+                | POLICY_KIND_EC
+                | POLICY_KIND_HOT_COLD
+                | POLICY_KIND_REBALANCE => "n/a", // rebalance is cluster-scoped, no same-PS feasibility
+                _ if c.same_ps => "yes",
+                _ => "no",
+            };
+            let secondary = if c.secondary_part_id == 0 {
+                "-".to_string()
+            } else {
+                c.secondary_part_id.to_string()
+            };
+            println!(
+                "{:<7} {:<10} {:<10} {:<46} {:<10} {:<8} {:<6} {:<5}",
+                kind,
+                c.primary_part_id,
+                secondary,
+                c.reason,
+                format!("{} MB", c.size_bytes / (1024 * 1024)),
+                c.req_per_sec,
+                c.imm_full_per_sec,
+                feas,
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn cmd_fence(
+    client: &ClusterClient,
+    json: bool,
+    node_id: u64,
+    reason: String,
+    by: String,
+    force: bool,
+) -> Result<()> {
+    if reason.is_empty() || by.is_empty() {
+        bail!("--reason and --by are required");
+    }
+    let req = FenceNodeReq {
+        node_id,
+        reason,
+        set_by: by,
+        force,
+    };
+    let bytes = client.mgr_call(MSG_FENCE_NODE, rkyv_encode(&req)).await?;
+    let resp: CodeResp = rkyv_decode(&bytes).map_err(|e| anyhow!(e))?;
+    print_code(json, "fence-node", &resp);
+    Ok(())
+}
+
+async fn cmd_maintenance(
+    client: &ClusterClient,
+    json: bool,
+    node_id: u64,
+    reason: String,
+    by: String,
+    expire: u64,
+) -> Result<()> {
+    if by.is_empty() {
+        bail!("--by is required");
+    }
+    let req = SetNodeMaintenanceReq {
+        node_id,
+        reason,
+        set_by: by,
+        expire_at: expire,
+    };
+    let bytes = client
+        .mgr_call(MSG_SET_NODE_MAINTENANCE, rkyv_encode(&req))
+        .await?;
+    let resp: CodeResp = rkyv_decode(&bytes).map_err(|e| anyhow!(e))?;
+    print_code(json, "maintenance", &resp);
+    Ok(())
+}
+
+async fn cmd_unfence(client: &ClusterClient, json: bool, node_id: u64, by: String) -> Result<()> {
+    if by.is_empty() {
+        bail!("--by is required");
+    }
+    let req = ClearNodeOverrideReq {
+        node_id,
+        set_by: by,
+    };
+    let bytes = client
+        .mgr_call(MSG_CLEAR_NODE_OVERRIDE, rkyv_encode(&req))
+        .await?;
+    let resp: CodeResp = rkyv_decode(&bytes).map_err(|e| anyhow!(e))?;
+    print_code(json, "unfence", &resp);
+    Ok(())
+}
+
+async fn cmd_remove(client: &ClusterClient, json: bool, node_id: u64, by: String) -> Result<()> {
+    if by.is_empty() {
+        bail!("--by is required");
+    }
+    let req = RemoveNodeReq {
+        node_id,
+        set_by: by,
+    };
+    let bytes = client.mgr_call(MSG_REMOVE_NODE, rkyv_encode(&req)).await?;
+    let resp: RemoveNodeResp = rkyv_decode(&bytes).map_err(|e| anyhow!(e))?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "code": resp.code,
+                "message": resp.message,
+                "blocking_extent_ids": resp.blocking_extent_ids,
+                "blocking_marker_extent_ids": resp.blocking_marker_extent_ids,
+            }))?
+        );
+    } else if resp.code == CODE_OK {
+        println!("remove: ok");
+    } else {
+        println!("remove: code={} {}", resp.code, resp.message);
+        if !resp.blocking_extent_ids.is_empty() {
+            println!("  blocking extents: {:?}", resp.blocking_extent_ids);
+        }
+        if !resp.blocking_marker_extent_ids.is_empty() {
+            println!("  blocking markers: {:?}", resp.blocking_marker_extent_ids);
+        }
+    }
+    if resp.code != CODE_OK {
+        std::process::exit(2);
+    }
+    Ok(())
+}
+
+async fn cmd_remove_member(
+    client: &ClusterClient,
+    json: bool,
+    role: u8,
+    id: u64,
+    by: String,
+) -> Result<()> {
+    if by.is_empty() {
+        bail!("--by is required");
+    }
+    let req = RemoveMemberReq { role, id, set_by: by };
+    let bytes = client.mgr_call(MSG_REMOVE_MEMBER, rkyv_encode(&req)).await?;
+    let resp: CodeResp = rkyv_decode(&bytes).map_err(|e| anyhow!(e))?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "code": resp.code,
+                "message": resp.message,
+            }))?
+        );
+    } else if resp.code == CODE_OK {
+        println!("remove: ok");
+    } else {
+        println!("remove: code={} {}", resp.code, resp.message);
+    }
+    if resp.code != CODE_OK {
+        std::process::exit(2);
+    }
+    Ok(())
+}
+
+async fn cmd_set_stream_ec(
+    client: &ClusterClient,
+    json: bool,
+    stream_id: u64,
+    ec_data: u32,
+    ec_parity: u32,
+) -> Result<()> {
+    let req_bytes = rkyv_encode(&UpdateStreamEcReq {
+        stream_id,
+        ec_data_shard: ec_data,
+        ec_parity_shard: ec_parity,
+    });
+    let mut attempt = 0u32;
+    loop {
+        let resp_bytes = client
+            .mgr_call(MSG_UPDATE_STREAM_EC, req_bytes.clone())
+            .await
+            .context("update stream EC")?;
+        let resp: UpdateStreamEcResp = rkyv_decode(&resp_bytes).map_err(decode_err)?;
+        if resp.code == CODE_OK {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "code": resp.code,
+                        "stream_id": stream_id,
+                        "ec_data": ec_data,
+                        "ec_parity": ec_parity,
+                    }))?
+                );
+            } else {
+                println!(
+                    "stream {} EC updated to {}+{}; conversion will run on next manager tick (~5s)",
+                    stream_id, ec_data, ec_parity
+                );
+            }
+            break;
+        }
+        if resp.code == CODE_NOT_LEADER && attempt < 60 {
+            attempt += 1;
+            compio::time::sleep(Duration::from_millis(500)).await;
+            continue;
+        }
+        bail!("set-stream-ec failed: code={} {}", resp.code, resp.message);
+    }
+    Ok(())
+}
+
+async fn cmd_force_ec_convert(
+    client: &ClusterClient,
+    json: bool,
+    wait: bool,
+    timeout_s: u64,
+    extent_id: u64,
+) -> Result<()> {
+    submit_op_cli(
+        client,
+        json,
+        wait,
+        timeout_s,
+        OpSubmitReq {
+            kind: OP_KIND_EC_CONVERT,
+            secondary_id: extent_id,
+            requested_by: "cli".to_string(),
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+/// Human name for an `OP_STATE_*`.
+fn op_state_name(s: u8) -> &'static str {
+    match s {
+        OP_STATE_PENDING => "pending",
+        OP_STATE_RUNNING => "running",
+        OP_STATE_SUCCEEDED => "succeeded",
+        OP_STATE_FAILED => "failed",
+        _ => "unknown",
+    }
+}
+
+/// Render a progress count in the unit its kind actually measures.
+///
+/// FOUR kinds measure bytes, not two: gc and forcegc scan extent bytes,
+/// ec-convert counts shard bytes encoded, and recovery counts bytes copied.
+/// Leaving the last two out printed a 16 GiB rebuild as
+/// `11895046144 / 17179981824`, which is the exact shape this helper exists to
+/// prevent — nobody reads eleven digits. compact counts SST DATA BLOCKS (see
+/// `merge.block_progress()`), and split/merge count phases; rendering either as
+/// bytes would be wrong the other way.
+///
+/// The suffixes are IEC (KiB/MiB/GiB), because the divisor is 1024. They used
+/// to read KB/MB/GB, which names a different quantity.
+fn human_bytes_or_count(kind: u8, n: u64) -> String {
+    use autumn_rpc::manager_rpc::{
+        OP_KIND_EC_CONVERT, OP_KIND_FORCE_GC, OP_KIND_GC, OP_KIND_RECOVERY,
+    };
+    if !matches!(
+        kind,
+        OP_KIND_GC | OP_KIND_FORCE_GC | OP_KIND_EC_CONVERT | OP_KIND_RECOVERY
+    ) {
+        return n.to_string();
+    }
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut v = n as f64;
+    let mut i = 0;
+    while v >= 1024.0 && i < UNITS.len() - 1 {
+        v /= 1024.0;
+        i += 1;
+    }
+    if i == 0 {
+        format!("{n} B")
+    } else {
+        format!("{v:.1} {}", UNITS[i])
+    }
+}
+
+/// The unit word for a count-measured kind, appended after the total: " blocks"
+/// for compact, " phases" for split/merge, nothing for the byte kinds (their
+/// numbers already carry a suffix). The dashboard's `fmtProgress` applies the
+/// same table, so the CLI and the page cannot disagree about what "3/6" means.
+fn progress_count_unit(kind: u8) -> &'static str {
+    use autumn_rpc::manager_rpc::{OP_KIND_COMPACT, OP_KIND_MERGE, OP_KIND_SPLIT};
+    match kind {
+        OP_KIND_COMPACT => " blocks",
+        OP_KIND_SPLIT | OP_KIND_MERGE => " phases",
+        _ => "",
+    }
+}
+
+#[cfg(test)]
+mod progress_unit_tests {
+    use super::human_bytes_or_count;
+    use autumn_rpc::manager_rpc::{
+        OP_KIND_COMPACT, OP_KIND_EC_CONVERT, OP_KIND_GC, OP_KIND_RECOVERY, OP_KIND_SPLIT,
+    };
+
+    /// The live numbers that prompted this: a 16 GiB extent mid-rebuild.
+    #[test]
+    fn byte_measured_kinds_render_as_bytes() {
+        assert_eq!(human_bytes_or_count(OP_KIND_RECOVERY, 11_895_046_144), "11.1 GiB");
+        assert_eq!(human_bytes_or_count(OP_KIND_EC_CONVERT, 17_179_981_824), "16.0 GiB");
+        assert_eq!(human_bytes_or_count(OP_KIND_GC, 1024), "1.0 KiB");
+        assert_eq!(human_bytes_or_count(OP_KIND_GC, 512), "512 B");
+    }
+
+    /// …and the kinds that do NOT measure bytes stay raw counts: "3.0 KiB"
+    /// blocks or phases would be wrong in the opposite direction.
+    #[test]
+    fn count_kinds_name_their_unit() {
+        use super::progress_count_unit;
+        assert_eq!(progress_count_unit(OP_KIND_COMPACT), " blocks");
+        assert_eq!(progress_count_unit(OP_KIND_SPLIT), " phases");
+        assert_eq!(progress_count_unit(OP_KIND_RECOVERY), "", "byte kinds carry their own suffix");
+    }
+
+    #[test]
+    fn count_measured_kinds_stay_counts() {
+        assert_eq!(human_bytes_or_count(OP_KIND_COMPACT, 3072), "3072");
+        assert_eq!(human_bytes_or_count(OP_KIND_SPLIT, 2), "2");
+    }
+}
+
+/// Human name for an `OP_KIND_*`.
+/// `--kind` filter → `OP_KIND_*` (`0` = any / unrecognized).
+fn op_kind_from_str(s: &str) -> u8 {
+    match s {
+        "split" => OP_KIND_SPLIT,
+        "merge" => OP_KIND_MERGE,
+        "rebalance" => OP_KIND_REBALANCE,
+        "compact" => OP_KIND_COMPACT,
+        "gc" => OP_KIND_GC,
+        "forcegc" => OP_KIND_FORCE_GC,
+        "ec" | "ec-convert" => OP_KIND_EC_CONVERT,
+        "recovery" => OP_KIND_RECOVERY,
+        "repair" => OP_KIND_REPAIR,
+        "repair-cancel" => OP_KIND_REPAIR_CANCEL,
+        "scrub" => OP_KIND_SCRUB,
+        _ => 0,
+    }
+}
+
+/// Submit an op to the ledger and print its id (async, default), or — with
+/// `--wait` — poll to a terminal state and print/exit on the real outcome
+/// (non-zero exit on FAILED/UNKNOWN/timeout).
+async fn submit_op_cli(
+    client: &ClusterClient,
+    json: bool,
+    wait: bool,
+    timeout_s: u64,
+    req: OpSubmitReq,
+) -> Result<()> {
+    let kind = op_kind_name(req.kind).to_string();
+    let resp = client
+        .submit_op(req)
+        .await
+        .map_err(|e| anyhow!("submit {kind}: {e}"))?;
+    if resp.code != CODE_OK {
+        bail!("{kind}: {}", resp.message);
+    }
+    let op_id = resp.op_id;
+    if !wait {
+        if json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "op_id": op_id,
+                    "kind": kind,
+                    "message": resp.message,
+                }))?
+            );
+        } else {
+            let note = if resp.message.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", resp.message)
+            };
+            println!("submitted {kind} op {op_id}{note}");
+            println!("  → autumn-op ops status {op_id}");
+        }
+        return Ok(());
+    }
+    // --wait: poll to terminal.
+    let timeout_s = if timeout_s == 0 { 600 } else { timeout_s };
+    let deadline = std::time::Instant::now() + Duration::from_secs(timeout_s);
+    loop {
+        let q = client
+            .op_query(OpQueryReq {
+                op_id,
+                ..Default::default()
+            })
+            .await
+            .map_err(|e| anyhow!("query op {op_id}: {e}"))?;
+        let rec = q.ops.into_iter().next().unwrap_or_default();
+        match rec.state {
+            OP_STATE_SUCCEEDED => {
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "op_id": op_id, "kind": kind, "state": "succeeded", "message": rec.message,
+                        }))?
+                    );
+                } else {
+                    println!("{kind} op {op_id} succeeded: {}", rec.message);
+                }
+                return Ok(());
+            }
+            OP_STATE_FAILED => bail!("{kind} op {op_id} failed: {}", rec.error),
+            OP_STATE_UNKNOWN => bail!("{kind} op {op_id} unknown: {}", rec.message),
+            _ => {
+                if std::time::Instant::now() >= deadline {
+                    bail!(
+                        "{kind} op {op_id} still {} after {timeout_s}s — still running; \
+                         `autumn-op ops status {op_id}` to keep watching",
+                        op_state_name(rec.state)
+                    );
+                }
+                compio::time::sleep(Duration::from_millis(500)).await;
+            }
+        }
+    }
+}
+
+/// `ops list [--active] [--kind K] [--limit N]` / `ops status <id>`.
+async fn cmd_ops(
+    client: &ClusterClient,
+    json: bool,
+    op_id: u64,
+    active: bool,
+    kind: &str,
+    limit: u32,
+) -> Result<()> {
+    let resp = client
+        .op_query(OpQueryReq {
+            op_id,
+            active_only: active,
+            kind_filter: op_kind_from_str(kind),
+            limit,
+        })
+        .await
+        .map_err(|e| anyhow!("ops: {e}"))?;
+    render_ops(&resp.ops, json)
+}
+
+/// Durable terminal history from the leader. Same rendering as `cmd_ops` so an
+/// operator reads one format whether the record is live or historical.
+async fn cmd_ops_history(
+    client: &ClusterClient,
+    json: bool,
+    kind: &str,
+    since_unix: i64,
+    limit: u32,
+) -> Result<()> {
+    let resp = client
+        .op_history(autumn_rpc::manager_rpc::OpHistoryReq {
+            kind_filter: op_kind_from_str(kind),
+            since_unix,
+            limit,
+        })
+        .await
+        .map_err(|e| anyhow!("ops history: {e}"))?;
+    // An unreadable log is not an empty one. A memory-only manager persists no
+    // terminal outcomes at all, and printing "(no ops)" there would tell an
+    // operator that nothing failed.
+    if resp.code != autumn_rpc::manager_rpc::CODE_OK {
+        return Err(anyhow!("ops history: {}", resp.message));
+    }
+    render_ops(&resp.ops, json)
+}
+
+fn render_ops(ops: &[autumn_rpc::manager_rpc::OpRecord], json: bool) -> Result<()> {
+    if json {
+        let arr: Vec<_> = ops
+            .iter()
+            .map(|o| {
+                serde_json::json!({
+                    "op_id": o.op_id,
+                    "kind": op_kind_name(o.kind),
+                    "state": op_state_name(o.state),
+                    "part_id": o.part_id,
+                    "secondary_id": o.secondary_id,
+                    "error": o.error,
+                    "error_code": o.error_code,
+                    "message": o.message,
+                    "requested_by": o.requested_by,
+                    // Raw counts, like the wire carries them — the consumer
+                    // derives the ratio. `progress_total == 0` = not reported.
+                    // The text renderer below shows a percentage; JSON must
+                    // still hand over the magnitude, since that is what a
+                    // consumer needs to decide whether to wait.
+                    "progress_done": o.progress_done,
+                    "progress_total": o.progress_total,
+                    "submitted_at": o.submitted_at,
+                    "started_at": o.started_at,
+                    "finished_at": o.finished_at,
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({ "ops": arr }))?
+        );
+        return Ok(());
+    }
+    if ops.is_empty() {
+        println!("(no ops)");
+        return Ok(());
+    }
+    for o in ops {
+        let target = if o.secondary_id != 0 {
+            format!("{}->{}", o.part_id, o.secondary_id)
+        } else if o.part_id != 0 {
+            o.part_id.to_string()
+        } else {
+            "-".to_string()
+        };
+        // Progress arrives as raw counts; the percentage is derived here so the
+        // operator sees both the ratio and the magnitude — "50%" alone cannot
+        // distinguish two tables from fifty gigabytes.
+        let progress = if o.progress_total > 0 {
+            let pct = (o.progress_done.min(o.progress_total) as f64 / o.progress_total as f64)
+                * 100.0;
+            format!(
+                " {:.0}% ({}/{}{})",
+                pct,
+                human_bytes_or_count(o.kind, o.progress_done),
+                human_bytes_or_count(o.kind, o.progress_total),
+                progress_count_unit(o.kind)
+            )
+        } else {
+            String::new()
+        };
+        let tail = if !o.error.is_empty() {
+            format!("  ERROR[{}]: {}", o.error_code, o.error)
+        } else if !o.message.is_empty() {
+            format!("  {}", o.message)
+        } else {
+            String::new()
+        };
+        println!(
+            "op {:<20} {:<10} {:<9} target={}{}{}",
+            o.op_id,
+            op_kind_name(o.kind),
+            op_state_name(o.state),
+            target,
+            progress,
+            tail
+        );
+    }
+    Ok(())
+}
+
+
+async fn cmd_split(
+    client: &ClusterClient,
+    json: bool,
+    wait: bool,
+    timeout_s: u64,
+    part_id: u64,
+    point: SplitPoint,
+) -> Result<()> {
+    // Lower the CLI intent (ns/suffix or raw) to the raw wire key.
+    let at_key = point.resolve_at_key();
+
+    // Friendly CLI precheck (UX only — the PS is the authoritative validator).
+    // When an explicit point is given, verify it lands strictly inside the
+    // target partition's [start, end). This turns the PS's hex-only rejection
+    // into a message that names the namespace/suffix the operator typed.
+    if let Some(key) = &at_key {
+        if let Ok(parts) = client.all_partitions_with_range().await {
+            if let Some((_, _, start, end)) = parts.iter().find(|(pid, _, _, _)| *pid == part_id) {
+                let below_start = key.as_slice() <= start.as_slice();
+                let at_or_above_end = !end.is_empty() && key.as_slice() >= end.as_slice();
+                if below_start || at_or_above_end {
+                    bail!(
+                        "split point {} resolves to key 0x{} which is not strictly inside \
+                         partition {}'s range [0x{}, 0x{}); pick a namespace/suffix \
+                         that falls inside this partition",
+                        point.describe(),
+                        hex_encode(key),
+                        part_id,
+                        hex_encode(start),
+                        hex_encode(end),
+                    );
+                }
+            }
+            // Partition not found in the map → skip precheck; the PS call below
+            // surfaces the authoritative NotFound.
+        }
+        // GetRegions failed → skip precheck; let the authoritative PS call run.
+    }
+
+    submit_op_cli(
+        client,
+        json,
+        wait,
+        timeout_s,
+        OpSubmitReq {
+            kind: OP_KIND_SPLIT,
+            part_id,
+            at_key,
+            requested_by: "cli".to_string(),
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+/// Major-compact `part_id` through the op ledger and wait for it to finish.
+async fn compact_and_wait(client: &ClusterClient, part_id: u64) -> Result<()> {
+    let resp = client
+        .submit_op(OpSubmitReq {
+            kind: OP_KIND_COMPACT,
+            part_id,
+            requested_by: "presplit".to_string(),
+            ..Default::default()
+        })
+        .await
+        .map_err(|e| anyhow!("submit compact of part {part_id}: {e}"))?;
+    if resp.code != CODE_OK {
+        bail!("compact part {part_id}: {}", resp.message);
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(600);
+    loop {
+        let q = client
+            .op_query(OpQueryReq { op_id: resp.op_id, ..Default::default() })
+            .await
+            .map_err(|e| anyhow!("query compact op {}: {e}", resp.op_id))?;
+        if q.code != CODE_OK {
+            bail!("query compact op {}: {}", resp.op_id, q.message);
+        }
+        let rec = q.ops.into_iter().next().unwrap_or_default();
+        match rec.state {
+            OP_STATE_SUCCEEDED => return Ok(()),
+            OP_STATE_FAILED => bail!("compact op {} failed: {}", resp.op_id, rec.error),
+            OP_STATE_UNKNOWN => bail!("compact op {} unknown: {}", resp.op_id, rec.message),
+            _ if std::time::Instant::now() >= deadline => bail!("compact op {} still running after 600 s", resp.op_id),
+            _ => compio::time::sleep(Duration::from_millis(200)).await,
+        }
+    }
+}
+
+/// presplit a `{scope}/` keyspace (a namespace or an in-namespace sub-scope) —
+/// with `head` (namespace-create) at its namespace head first — by its natural
+/// dimension (fs = stripe lane, kvc = hash bucket, others = uniform hex). Splits the owning partition at each point,
+/// highest first, re-resolving the owner each time (see the loop).
+async fn cmd_presplit(
+    client: &ClusterClient,
+    json: bool,
+    scope: &str,
+    head: bool,
+    rule: Option<&PresplitRule>,
+    force: bool,
+) -> Result<()> {
+    // The registry row the declared points are recorded on.
+    let namespace = scope.split('/').next().unwrap_or(scope);
+    let (points, record_points) = args::presplit_plan(scope, head, rule)?;
+
+    // An fs `--parts` DECLARES the fs stripe geometry (24 lanes), in the same command that
+    // cuts the boundaries. Writers read this key; they no longer
+    // reverse-engineer the lane count from partition boundaries. It is written
+    // AFTER the cuts: the key sorts above every lane point, and a cut leaves the
+    // data above it out of the left partition's range, which then refuses
+    // every further split. A failed write fails the command (the cuts are then
+    // "already in place" on the re-run that declares it), so boundaries never
+    // stand undeclared unnoticed.
+    let stripe_geom = match rule {
+        Some(PresplitRule::FsLanes { lanes, .. }) => {
+            let layout = autumn_fs::schema::StripeLayout {
+                lanes: *lanes,
+                unit_bytes: autumn_fs::schema::MAX_EXTENT as u32,
+            };
+            // `client` here is connect_raw (no binding), so the wire key carries the
+            // `fs/` namespace prefix explicitly — same bytes a scoped fs client
+            // produces from the relative `[0x04]stripe_geom`.
+            let mut k = b"fs/".to_vec();
+            k.extend_from_slice(&autumn_fs::key::stripe_geom_key());
+            // UX-fix (M5): read-before-write guard. The declared geometry is
+            // the sole authority for every future file's stripe width, and the
+            // put OVERWRITES it. Declaring 24 lanes over an fs that declares
+            // more would silently narrow the width fs-wide. So NARROWING (fewer lanes than
+            // currently declared) requires `--force`; widening / same / first
+            // declaration is unguarded (additive). Checked before cutting.
+            if let Some(existing_bytes) = client
+                .get(&k)
+                .await
+                .map_err(|e| anyhow!("presplit: read existing stripe geometry: {e}"))?
+            {
+                if let Ok(existing) = autumn_fs::schema::decode_stripe_geom(&existing_bytes) {
+                    if *lanes < existing.lanes && !force {
+                        bail!(
+                            "fs declares {} stripe lanes and this would declare {lanes} — \
+                             narrowing the stripe width affects EVERY future file fs-wide. Re-run with \
+                             --force if that is intended (existing files keep their own stamped width).",
+                            existing.lanes
+                        );
+                    }
+                }
+            }
+            Some((k, layout))
+        }
+        _ => None,
+    };
+
+    let mut applied = 0usize;
+    let mut already = 0usize; // boundaries a prior run / presplit already put in place
+    let mut skipped: Vec<String> = Vec::new();
+    // Highest point first: every cut then lands in the partition that is
+    // already open (the left keeps its id) instead of a right child the PS
+    // opens only at its next region sync (~2 s a cut), and the data a cut
+    // leaves behind is what lies below the points — earlier namespaces, now
+    // that each namespace starts its own partition — which stays in the left
+    // partition's range, so it can be cut again. (The stripe geometry, above
+    // the lane points, is written after the cuts for this reason.)
+    for point in points.iter().rev() {
+        // Re-fetch the region map each iteration — a prior split created a new
+        // child that may own this point. `all_partitions_with_range` reads the
+        // client's REGION CACHE (it only auto-refreshes when empty), so force a
+        // refresh first: without it the 2nd+ cut of a multi-point presplit
+        // resolves against the PRE-split map and tries to split the wrong (now
+        // narrowed) partition → "at or above partition end" (hit live on
+        // an fs presplit, where all cuts land in one small
+        // range so every later cut needs the fresh child).
+        // Do NOT swallow the refresh error — a failed refresh falls back
+        // to the STALE cache and mis-resolves the owner, and since the run reports
+        // ok when applied>0 the operator could load into a partially-presplit
+        // keyspace. Fail the whole presplit instead.
+        client
+            .refresh_regions()
+            .await
+            .map_err(|e| anyhow!("presplit: refresh regions before cut: {e}"))?;
+        let parts = client
+            .all_partitions_with_range()
+            .await
+            .map_err(|e| anyhow!("presplit: list partitions: {e}"))?;
+        let owner = parts.iter().find(|(_, _, start, end)| {
+            point.as_slice() >= start.as_slice()
+                && (end.is_empty() || point.as_slice() < end.as_slice())
+        });
+        let Some((pid, _, start, _)) = owner else {
+            skipped.push(format!("0x{} (no owning partition)", hex_encode(point)));
+            continue;
+        };
+        // UX-fix (S2): a point that IS a partition's start_key is
+        // already a boundary (a prior presplit, or this being a re-run). That is
+        // success, not a skip — the old code let split_at reject it ("at or below
+        // partition start"), leaving `applied` low and (if all points were
+        // already cut) bailing with a misleading "0 applied, check the scope"
+        // exactly when the operator followed the "re-run to record" advice.
+        if start.as_slice() == point.as_slice() {
+            already += 1;
+            continue;
+        }
+        // A split child shares its parent's SSTs; while any of them reaches
+        // outside its range (has_overlap) the PS refuses to split it, and the
+        // policy compacts only partitions it wants to split or merge. Major-
+        // compact it here and cut again, as the policy's unblocking compaction
+        // does. (The PS answers other refusals with the same code; for them
+        // the second cut fails again and the point is skipped.)
+        let cut = match client.split_at(*pid, Some(point.clone())).await {
+            Err(first @ autumn_client::AutumnError::PreconditionFailed(_)) => match compact_and_wait(client, *pid).await {
+                Ok(()) => client.split_at(*pid, Some(point.clone())).await,
+                Err(e) => Err(autumn_client::AutumnError::ServerError(format!("{first}; compacting before a retry failed: {e}"))),
+            },
+            first => first,
+        };
+        match cut {
+            Ok(_) => applied += 1,
+            Err(e) => skipped.push(format!("part {pid} at 0x{}: {e}", hex_encode(point))),
+        }
+    }
+    // The stripe geometry is declared only over a complete set of cuts, so a
+    // run that stopped short leaves nothing in the namespace (a new one stays
+    // empty and can be deleted and created again).
+    let (mut geometry_err, mut geometry_declared) = (None, false);
+    if let (true, Some((k, layout))) = (skipped.is_empty(), &stripe_geom) {
+        match client.put(k, &autumn_fs::schema::encode_stripe_geom(layout), autumn_client::WriteOptions::default()).await {
+            Ok(()) => {
+                geometry_declared = true;
+                if !json {
+                    println!("declared fs stripe geometry: {} lanes × {} MiB units", layout.lanes, layout.unit_bytes / (1 << 20));
+                }
+            }
+            Err(e) => geometry_err = Some(format!("the fs stripe geometry ({} lanes) was not declared: {e}", layout.lanes)),
+        }
+    }
+
+    // Record the operator's INTENDED cut points — all of them, not just the
+    // ones that landed this run: an uncut point is nobody's partition start, so
+    // the merge guard (which compares against an actual start) never
+    // false-positives on it, and auto-split snaps to declared-but-uncut points.
+    // For FsLanes the FULL lane grid is recorded, not only the `parts` cuts.
+    // Best-effort: it runs after the cuts, whose outcome is reported below.
+    if let Err(e) = client.namespace_set_presplit(namespace, record_points.clone()).await {
+        eprintln!(
+            "warning: split {applied} point(s) but failed to record {} declared \
+             boundaries: {e}\n         the layout IS correct; merge just won't refuse to \
+             undo it, and auto-split won't snap to it.",
+            record_points.len()
+        );
+    }
+
+    // A skip is a real failure: refusals for out-of-range shared SSTs were
+    // compacted and retried above.
+    let ok = skipped.is_empty() && geometry_err.is_none();
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "ok": ok,
+                "namespace": scope,
+                "points": points.len(),
+                "applied": applied,
+                "already_in_place": already,
+                "skipped": skipped,
+                "geometry_declared": geometry_declared,
+                "geometry_error": geometry_err,
+            }))?
+        );
+    } else {
+        println!(
+            "presplit {scope}: {applied}/{} cut points applied{}",
+            points.len(),
+            if already > 0 { format!(" ({already} boundaries already in place)") } else { String::new() }
+        );
+        for s in &skipped {
+            println!("  skipped: {s}");
+        }
+    }
+    if !skipped.is_empty() {
+        bail!(
+            "presplit {scope}: {} of {} cut point(s) not made (see the skips above){}",
+            skipped.len(),
+            points.len(),
+            if stripe_geom.is_some() { "; the fs stripe geometry was not declared" } else { "" }
+        );
+    }
+    if let Some(e) = geometry_err {
+        bail!("presplit {scope}: {e}");
+    }
+    Ok(())
+}
+
+async fn cmd_merge(
+    client: &ClusterClient,
+    json: bool,
+    wait: bool,
+    timeout_s: u64,
+    survivor_part_id: u64,
+    victim_part_id: u64,
+    force: bool,
+) -> Result<()> {
+    eprintln!(
+        "Stop writes to partitions {survivor_part_id} and {victim_part_id} \
+         before continuing. The merge FLUSHes both, then the manager commits. \
+         The survivor's PS picks up the wider range on the next region_sync (~2 s)."
+    );
+    submit_op_cli(
+        client,
+        json,
+        wait,
+        timeout_s,
+        OpSubmitReq {
+            kind: OP_KIND_MERGE,
+            part_id: survivor_part_id,
+            secondary_id: victim_part_id,
+            force,
+            requested_by: "cli".to_string(),
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+async fn cmd_rebalance(
+    client: &ClusterClient,
+    json: bool,
+    wait: bool,
+    timeout_s: u64,
+    max_moves: u32,
+) -> Result<()> {
+    submit_op_cli(
+        client,
+        json,
+        wait,
+        timeout_s,
+        OpSubmitReq {
+            kind: OP_KIND_REBALANCE,
+            max_moves,
+            requested_by: "cli".to_string(),
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+async fn cmd_compact(
+    client: &ClusterClient,
+    json: bool,
+    wait: bool,
+    timeout_s: u64,
+    part_id: u64,
+) -> Result<()> {
+    submit_op_cli(
+        client,
+        json,
+        wait,
+        timeout_s,
+        OpSubmitReq {
+            kind: OP_KIND_COMPACT,
+            part_id,
+            requested_by: "cli".to_string(),
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn cmd_gc(
+    client: &ClusterClient,
+    json: bool,
+    wait: bool,
+    timeout_s: u64,
+    part_id: u64,
+    ratio: Option<f64>,
+    max_size: Option<u64>,
+    stream_debt: Option<u64>,
+    dead_bytes: Option<u64>,
+    empty_only: bool,
+) -> Result<()> {
+    submit_op_cli(
+        client,
+        json,
+        wait,
+        timeout_s,
+        OpSubmitReq {
+            kind: OP_KIND_GC,
+            part_id,
+            gc_ratio: ratio,
+            gc_max_size: max_size,
+            gc_stream_debt: stream_debt,
+            gc_dead_bytes_high: dead_bytes,
+            gc_empty_only: empty_only,
+            requested_by: "cli".to_string(),
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+async fn cmd_force_gc(
+    client: &ClusterClient,
+    json: bool,
+    wait: bool,
+    timeout_s: u64,
+    part_id: u64,
+    extent_ids: Vec<u64>,
+) -> Result<()> {
+    submit_op_cli(
+        client,
+        json,
+        wait,
+        timeout_s,
+        OpSubmitReq {
+            kind: OP_KIND_FORCE_GC,
+            part_id,
+            extent_ids,
+            requested_by: "cli".to_string(),
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+/// `format` mints/reuses IDENTITY only (`node_uuid` +
+/// per-dir `disk_uuid`) and registers with an EMPTY location — no
+/// `addr`/`shard_ports`/`control_address`. The EN binary's own `--advertise`
+/// self-registers the live address + shard ports at every startup,
+/// so format never needs `--listen`/`--advertise`/`--shard-ports` again.
+/// Mirrors Kafka `kafka-storage.sh format` (writes only clusterId/nodeId to
+/// meta.properties, zero network info) and Ceph `ceph-volume prepare` (writes
+/// only the OSD fsid) — mkfs mints identity offline; the daemon reports its
+/// own network location every boot, not the formatting step.
+async fn cmd_format(
+    client: &ClusterClient,
+    json: bool,
+    dirs: Vec<String>,
+    manager: &str,
+) -> Result<()> {
+    // fetch the manager's cluster_id BEFORE touching
+    // any disk. Failure here means the manager is not yet
+    // leader (retries internally) or has never bootstrapped
+    // (fatal — operator must start the manager first).
+    let cluster_id = fetch_cluster_id(client).await?;
+
+    // For each dir, decide whether to fresh-format or reuse
+    // existing. Refuse on cluster_id mismatch — that's the
+    // "wrong cluster" diagnostic.
+    let mut disk_uuids = Vec::new();
+    let mut freshly_formatted: Vec<bool> = Vec::with_capacity(dirs.len());
+    for dir in &dirs {
+        std::fs::create_dir_all(dir).with_context(|| format!("create dir {dir}"))?;
+        match read_existing_format(dir)? {
+            Some((existing_cid, existing_did)) if existing_cid == cluster_id => {
+                // Idempotent path — already formatted for this
+                // cluster. Reuse the disk_uuid so the manager's
+                // re-register branch returns the existing
+                // disk_id without allocating a fresh one.
+                if !json {
+                    println!(
+                        "{dir}: already formatted (cluster_id matches), reusing disk_uuid={existing_did}"
+                    );
+                }
+                disk_uuids.push(existing_did);
+                freshly_formatted.push(false);
+            }
+            Some((existing_cid, _)) => {
+                // Different cluster — refuse rather than risk
+                // joining a disk to the wrong cluster.
+                bail!(
+                    "{dir} is already formatted for cluster {existing_cid}, \
+                     but the manager at {} reports cluster {}. \
+                     Wipe the dir or point at the original cluster.",
+                    manager,
+                    cluster_id
+                );
+            }
+            None => {
+                // Fresh dir — full format: 256 hash subdirs +
+                // fresh disk_uuid.
+                let uuid = format_disk(dir)?;
+                if !json {
+                    println!("formatted {dir}: disk_uuid={uuid}");
+                }
+                disk_uuids.push(uuid);
+                freshly_formatted.push(true);
+            }
+        }
+    }
+
+    // M0: resolve the node's stable identity (one node_uuid per
+    // NODE, not per disk) BEFORE registering. Reuse an existing sentinel so a
+    // re-format keeps the same node_id; mint a fresh v4 only when NO dir carries
+    // one. The read is FAIL-LOUD: a NotFound means "to mint", but a
+    // permission/IO/corrupt read must NOT be swallowed as "absent" — that would
+    // mint a NEW identity and create a duplicate node at the same address on the
+    // next register. Disagreeing dirs (a cloned / mixed data set) are refused,
+    // never silently unified.
+    let mut seen_uuids: Vec<String> = Vec::new();
+    for dir in &dirs {
+        let path = format!("{dir}/node_uuid");
+        match std::fs::read_to_string(&path) {
+            Ok(s) => {
+                let s = s.trim().to_string();
+                if !s.is_empty() && !seen_uuids.contains(&s) {
+                    seen_uuids.push(s);
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(anyhow!(e)).with_context(|| {
+                    format!(
+                        "read node_uuid sentinel in {dir}; refusing to mint a new \
+                         identity over an unreadable one"
+                    )
+                });
+            }
+        }
+    }
+    if seen_uuids.len() > 1 {
+        bail!(
+            "conflicting node_uuid across --data dirs ({seen_uuids:?}); a mixed or \
+             cloned data set must not be formatted together"
+        );
+    }
+    let node_uuid = seen_uuids
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+    // Persist the identity to EVERY dir (atomic tmp+rename) BEFORE registering.
+    // A crash between a successful register and the sentinel write would
+    // otherwise lose it → the next format mints a fresh uuid → a duplicate node.
+    // Writing it first is safe even if registration then fails: the value is
+    // reused verbatim on the retry (idempotent identity).
+    for dir in &dirs {
+        write_sentinel_atomic(&format!("{dir}/node_uuid"), &node_uuid)
+            .with_context(|| format!("write node_uuid in {dir}"))?;
+    }
+
+    // Register against the manager, IDENTITY
+    // ONLY. `addr`/`shard_ports`/`control_address` are all empty — an
+    // identity-only registration is the M0 `handle_register_node`
+    // "identity-only" branch: the manager allocates node_id + disk_ids
+    // for a fresh node, or (re-format on an existing uuid) returns the
+    // existing node_id + disk map WITHOUT touching any live location the
+    // EN has already self-registered. A never-booted node therefore has
+    // NO location, so df can't reach it — it stays Suspend and
+    // is never selected for allocation until the EN actually starts and
+    // self-registers.
+    let resp_bytes = client
+        .mgr_call(
+            MSG_REGISTER_NODE,
+            rkyv_encode(&RegisterNodeReq {
+                addr: String::new(),
+                disk_uuids: disk_uuids.clone(),
+                shard_ports: vec![],
+                control_address: String::new(),
+                node_uuid: node_uuid.clone(),
+            }),
+        )
+        .await
+        .context("register node")?;
+    let resp: RegisterNodeResp = rkyv_decode(&resp_bytes).map_err(decode_err)?;
+    // A FAILED registration (follower / non-leader, fenced or
+    // decommissioned address, same-addr-different-disk) returns
+    // code != CODE_OK with node_id=0 and no/partial disk_uuids.
+    // Writing the local format sentinels on that response leaves a
+    // dir that LOOKS formatted (cluster_id present) but the manager
+    // never accepted — the EN then starts on a node/disk the manager
+    // doesn't know about.
+    if resp.code != CODE_OK {
+        bail!("register node failed: code={} {}", resp.code, resp.message);
+    }
+
+    let node_id = resp.node_id;
+    // Resolve every requested disk_uuid -> disk_id BEFORE writing any
+    // sentinel: a missing mapping (the manager returned only the
+    // disks it actually accepted) must FAIL, not silently write
+    // disk_id=0 (a pseudo-formatted dir the manager can't route to).
+    // Two passes so a partial failure leaves NO half-written dirs.
+    let uuid_to_id: HashMap<&str, u64> = resp
+        .disk_uuids
+        .iter()
+        .map(|(u, id)| (u.as_str(), *id))
+        .collect();
+    let mut disk_assignments: Vec<(String, String, u64)> = Vec::new();
+    for (dir, disk_uuid) in dirs.iter().zip(disk_uuids.iter()) {
+        let disk_id = *uuid_to_id.get(disk_uuid.as_str()).ok_or_else(|| {
+            anyhow!(
+                "manager did not assign a disk_id for {dir} (uuid {disk_uuid}); \
+                 not writing format sentinels"
+            )
+        })?;
+        disk_assignments.push((dir.clone(), disk_uuid.clone(), disk_id));
+    }
+    for (dir, disk_uuid, disk_id) in &disk_assignments {
+        // cluster_id + disk_uuid sentinel files. The
+        // extent-node binary's startup check reads cluster_id
+        // and cross-checks against the manager; disk_uuid is
+        // used by re-formats to preserve idempotency.
+        std::fs::write(format!("{dir}/cluster_id"), &cluster_id)
+            .with_context(|| format!("write cluster_id in {dir}"))?;
+        std::fs::write(format!("{dir}/disk_uuid"), disk_uuid)
+            .with_context(|| format!("write disk_uuid in {dir}"))?;
+        std::fs::write(format!("{dir}/node_id"), node_id.to_string())
+            .with_context(|| format!("write node_id in {dir}"))?;
+        std::fs::write(format!("{dir}/disk_id"), disk_id.to_string())
+            .with_context(|| format!("write disk_id in {dir}"))?;
+        // M0: the node_uuid sentinel was already persisted (atomic
+        // tmp+rename) to every dir BEFORE registration — nothing to write here.
+    }
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "node_id": node_id,
+                "node_uuid": node_uuid,
+                "cluster_id": cluster_id,
+                "disks": disk_assignments.iter()
+                    .map(|(d, u, id)| serde_json::json!({
+                        "dir": d, "uuid": u, "disk_id": id,
+                    }))
+                    .collect::<Vec<_>>(),
+            }))?
+        );
+    } else {
+        println!("node registered: node_id={node_id}, node_uuid={node_uuid}");
+        println!("cluster_id={cluster_id}");
+        for (dir, _u, disk_id) in &disk_assignments {
+            println!("  {dir}: node_id={node_id}, disk_id={disk_id}");
+        }
+        // Don't claim "Format complete" when every dir was just REUSED — the
+        // idempotent re-register path formats nothing. Report accurately.
+        let n_fresh = freshly_formatted.iter().filter(|&&f| f).count();
+        let n_reused = freshly_formatted.len() - n_fresh;
+        if n_fresh == 0 {
+            println!("\nReuse complete ({n_reused} dir(s) already formatted; nothing to format).");
+        } else if n_reused == 0 {
+            println!("\nFormat complete ({n_fresh} dir(s) formatted).");
+        } else {
+            println!("\nFormat complete ({n_fresh} formatted, {n_reused} reused).");
+        }
+        // Format registered IDENTITY ONLY — the node has
+        // NO location until the EN process itself self-registers via its own
+        // `--advertise` (required whenever `--manager` is given).
+        println!("Start the extent node with:");
+        println!(
+            "  autumn-extent-node --manager {} --data {} --advertise <HOST:PORT> [--cpuset <SPEC>]",
+            manager,
+            dirs.join(",")
+        );
+    }
+    Ok(())
+}
+
+fn print_code(json: bool, op: &str, resp: &CodeResp) {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "code": resp.code,
+                "message": resp.message,
+            }))
+            .unwrap()
+        );
+    } else if resp.code == CODE_OK {
+        println!("{}: ok", op);
+    } else {
+        println!("{}: code={} {}", op, resp.code, resp.message);
+    }
+    if resp.code != CODE_OK {
+        std::process::exit(2);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// bootstrap (migrated from autumn_client.rs)
+// ---------------------------------------------------------------------------
+
+async fn run_bootstrap(
+    client: &ClusterClient,
+    json_out: bool,
+    replication: &str,
+    log_ec: Option<(u32, u32)>,
+    row_ec: Option<(u32, u32)>,
+) -> Result<()> {
+    let meta_replicates = parse_replication(replication)?;
+
+    // Per-stream (replicates, ec_data, ec_parity):
+    //   - Replica streams: replicates=N, ec_data=N, ec_parity=0.
+    //   - EC streams: replicates is the open-extent replica count (=
+    //     meta_replicates), and (ec_data, ec_parity) describes the
+    //     post-seal EC encoding (e.g. 4+1, 7+1). The two are independent.
+    let log_params = log_ec.map(|(k, m)| (meta_replicates, k, m)).unwrap_or((
+        meta_replicates,
+        meta_replicates,
+        0,
+    ));
+    let row_params = row_ec.map(|(k, m)| (meta_replicates, k, m)).unwrap_or((
+        meta_replicates,
+        meta_replicates,
+        0,
+    ));
+    let meta_params = (meta_replicates, meta_replicates, 0u32);
+
+    // One partition over the whole keyspace; namespaces are created and cut
+    // afterwards (`namespace-create`).
+    let ranges: Vec<(Vec<u8>, Vec<u8>)> = vec![(vec![], vec![])];
+
+    let create_stream_once =
+        |label: &'static str, replicates: u32, ec_data: u32, ec_parity: u32| async move {
+            let req_bytes = rkyv_encode(&CreateStreamReq {
+                replicates,
+                ec_data_shard: ec_data,
+                ec_parity_shard: ec_parity,
+            });
+            let mut attempt = 0u32;
+            loop {
+                let resp_bytes = client
+                    .mgr_call(MSG_CREATE_STREAM, req_bytes.clone())
+                    .await
+                    .with_context(|| format!("create {label} stream"))?;
+                let resp: CreateStreamResp = rkyv_decode(&resp_bytes).map_err(decode_err)?;
+                if resp.code == CODE_OK {
+                    return Ok::<u64, anyhow::Error>(resp.stream.map(|s| s.stream_id).unwrap_or(0));
+                }
+                if resp.code == CODE_NOT_LEADER && attempt < 60 {
+                    attempt += 1;
+                    compio::time::sleep(Duration::from_millis(500)).await;
+                    continue;
+                }
+                bail!(
+                    "create {label} stream failed: code={} {}",
+                    resp.code,
+                    resp.message
+                );
+            }
+        };
+
+    let mut created: Vec<serde_json::Value> = Vec::new();
+    for (idx, (start_key, end_key)) in ranges.iter().enumerate() {
+        let (log_repl, log_k, log_m) = log_params;
+        let (row_repl, row_k, row_m) = row_params;
+        let (meta_repl, meta_k, meta_m) = meta_params;
+        let log_stream_id = create_stream_once("log", log_repl, log_k, log_m).await?;
+        let row_stream_id = create_stream_once("row", row_repl, row_k, row_m).await?;
+        let meta_stream_id = create_stream_once("meta", meta_repl, meta_k, meta_m).await?;
+
+        let meta = MgrPartitionMeta {
+            log_stream: log_stream_id,
+            row_stream: row_stream_id,
+            meta_stream: meta_stream_id,
+            part_id: 0,
+            rg: Some(MgrRange {
+                start_key: start_key.clone(),
+                end_key: end_key.clone(),
+            }),
+        };
+
+        let req_bytes = rkyv_encode(&UpsertPartitionReq { meta });
+        let mut attempt = 0u32;
+        let resp = loop {
+            let resp_bytes = client
+                .mgr_call(MSG_UPSERT_PARTITION, req_bytes.clone())
+                .await
+                .context("upsert partition")?;
+            let resp: UpsertPartitionResp = rkyv_decode(&resp_bytes).map_err(decode_err)?;
+            if resp.code == CODE_OK {
+                break resp;
+            }
+            if resp.code == CODE_NOT_LEADER && attempt < 60 {
+                attempt += 1;
+                compio::time::sleep(Duration::from_millis(500)).await;
+                continue;
+            }
+            bail!(
+                "bootstrap partition {} failed: code={} {}",
+                idx,
+                resp.code,
+                resp.message
+            );
+        };
+
+        let start_s = if start_key.is_empty() {
+            String::from("\"\"")
+        } else {
+            String::from_utf8_lossy(start_key).to_string()
+        };
+        let end_s = if end_key.is_empty() {
+            String::from("\"\"")
+        } else {
+            String::from_utf8_lossy(end_key).to_string()
+        };
+        if json_out {
+            created.push(serde_json::json!({
+                "index": idx,
+                "part_id": resp.part_id,
+                "log_stream_id": log_stream_id,
+                "row_stream_id": row_stream_id,
+                "meta_stream_id": meta_stream_id,
+                "log_ec": [log_k, log_m],
+                "row_ec": [row_k, row_m],
+                "meta_ec": [meta_k, meta_m],
+                "range_start": start_s,
+                "range_end": end_s,
+            }));
+        } else {
+            println!(
+                "partition {} created: id={} log={} ({}+{}) row={} ({}+{}) meta={} ({}+{}) range=[{}..{})",
+                idx,
+                resp.part_id,
+                log_stream_id,
+                log_k,
+                log_m,
+                row_stream_id,
+                row_k,
+                row_m,
+                meta_stream_id,
+                meta_k,
+                meta_m,
+                start_s,
+                end_s,
+            );
+        }
+    }
+    if json_out {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "partitions": created,
+            }))?
+        );
+    } else {
+        println!("bootstrap succeeded: {} partition(s)", ranges.len());
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// info (migrated from autumn_client.rs)
+// ---------------------------------------------------------------------------
+
+/// Scalable compact cluster overview (the DEFAULT `info`). One
+/// `MSG_GET_CLUSTER_OVERVIEW` RPC: per-partition rollup (range / ps /
+/// live_size / extent count, range-sorted) + per-node extent-shard count —
+/// NO per-extent array, NO per-PS discard probe. Bounded by partition + node
+/// count, so it scales to thousands of partitions / tens of thousands of extents. Per-partition extents
+/// are fetched lazily via `info --part P` (scoped).
+async fn run_overview(client: &ClusterClient, json_out: bool) -> Result<()> {
+    let bytes = client
+        .mgr_call(
+            MSG_GET_CLUSTER_OVERVIEW,
+            rkyv_encode(&GetClusterOverviewReq {}),
+        )
+        .await
+        .context("cluster overview")?;
+    let resp: GetClusterOverviewResp = rkyv_decode(&bytes).map_err(decode_err)?;
+    if resp.code != CODE_OK {
+        bail!("cluster overview: code={} {}", resp.code, resp.message);
+    }
+    let mut parts = resp.partitions;
+    // Global key-range order: "" (−∞) first, then by raw start bytes.
+    parts.sort_by(|a, b| {
+        (!a.range_start.is_empty(), &a.range_start).cmp(&(!b.range_start.is_empty(), &b.range_start))
+    });
+    // PS-instance count comes from the manager (distinct ps_id). NOT distinct
+    // ps_addr — each partition has its OWN listener (base_port+ord),
+    // so one PS process serving N partitions exposes N addresses.
+    let ps_count = resp.ps_count;
+    let key_s = |k: &[u8]| String::from_utf8_lossy(k).into_owned();
+
+    if json_out {
+        let pj: Vec<_> = parts
+            .iter()
+            .map(|p| {
+                serde_json::json!({
+                    "part_id": p.part_id,
+                    "ps_id": p.ps_id,
+                    "ps_addr": p.ps_addr,
+                    "range_start": key_s(&p.range_start),
+                    "range_end": key_s(&p.range_end),
+                    "live_size": p.live_size,
+                    "total_extents": p.total_extents,
+                    "req_per_sec": p.req_per_sec,
+                    "write_bytes_per_sec": p.write_bytes_per_sec,
+                    "read_bytes_per_sec": p.read_bytes_per_sec,
+                    "log_stream_id": p.log_stream,
+                    "row_stream_id": p.row_stream,
+                    "meta_stream_id": p.meta_stream,
+                })
+            })
+            .collect();
+        let nj: Vec<_> = resp
+            .nodes
+            .iter()
+            .map(|n| {
+                serde_json::json!({
+                    "node_id": n.node_id, "address": n.address, "extent_count": n.extent_count,
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "part_count": parts.len(),
+                "ps_count": ps_count,
+                "ps_servers": resp.ps_servers.iter().map(|p| serde_json::json!({
+                    "ps_id": p.ps_id,
+                    "address": p.address,
+                    "partition_count": p.partition_count,
+                    "slot_cap": (p.slot_cap > 0).then_some(p.slot_cap),
+                    "last_heartbeat_secs_ago": (p.last_heartbeat_secs_ago != u64::MAX)
+                        .then_some(p.last_heartbeat_secs_ago),
+                    "open_count": p.open_count,
+                    "ready": p.ready(),
+                    "joined_at_ms": p.joined_at_ms,
+                    "evicted_at_ms": (p.evicted_at_ms > 0).then_some(p.evicted_at_ms),
+                })).collect::<Vec<_>>(),
+                "total_req_per_sec": resp.total_req_per_sec,
+                "total_write_bytes_per_sec": resp.total_write_bytes_per_sec,
+                "total_read_bytes_per_sec": resp.total_read_bytes_per_sec,
+                "partitions": pj,
+                "nodes": nj,
+            }))?
+        );
+    } else {
+        println!("cluster overview: {} partitions across {} PS", parts.len(), ps_count);
+        for p in &parts {
+            println!(
+                "  part {:>6}  ps {:<20}  {:>10}  {:>3} ext  [{}, {})",
+                p.part_id,
+                p.ps_addr,
+                human_size(p.live_size),
+                p.total_extents,
+                key_s(&p.range_start),
+                if p.range_end.is_empty() { "+∞".into() } else { key_s(&p.range_end) },
+            );
+        }
+        // Node STATE is joined in client-side from `MSG_LIST_NODE_STATES`
+        // rather than read off `NodeOverview`, which carries only
+        // {node_id, address, extent_count}. Widening that struct is a wire
+        // layout change (a by-hand MIN=MAX bump, stop-the-world) and this
+        // is a display fix; one extra RPC from a CLI costs nothing.
+        //
+        // Showing the override is not cosmetic. During a fence-drain the
+        // node's `extent_count` does NOT fall as the rebuild progresses --
+        // the slot is swapped only when a whole extent finishes -- so a
+        // draining node is indistinguishable here from an idle one, and an
+        // operator watching a flat number reads it as a stall. The moving
+        // number is the TARGET's count.
+        let mut state_of: std::collections::HashMap<u64, (String, String)> =
+            std::collections::HashMap::new();
+        if let Ok(b) = client
+            .mgr_call(MSG_LIST_NODE_STATES, rkyv_encode(&ListNodeStatesReq {}))
+            .await
+        {
+            if let Ok(ns) = rkyv_decode::<ListNodeStatesResp>(&b) {
+                for n in ns.nodes {
+                    state_of.insert(
+                        n.node_id,
+                        (
+                            auto_state_str(n.auto_state).to_string(),
+                            override_str(n.override_kind()).to_string(),
+                        ),
+                    );
+                }
+            }
+        }
+        // `used/cap` core slots per PS; `cap` is `?` for a PS with no
+        // `--cpuset` (or one the manager has not heard since it became
+        // leader). Past its cap the PS still opens every partition; they share
+        // the cores. The state says whether it serves all of them: a PS answers heartbeats long
+        // before its partitions have recovered.
+        println!("partition servers:");
+        for p in &resp.ps_servers {
+            let cap = match p.slot_cap {
+                0 => "?".to_string(),
+                c => c.to_string(),
+            };
+            let over = if p.slot_cap > 0 && p.partition_count > p.slot_cap {
+                "  <- over its cpuset: partitions share cores (/metrics autumn_ps_plog_*)"
+            } else {
+                ""
+            };
+            println!(
+                "  ps {:>6} {:<20} {:>4}/{:<4} slots  {:<18}{}",
+                p.ps_id,
+                p.address,
+                p.partition_count,
+                cap,
+                ps_state(p),
+                over
+            );
+        }
+        println!("nodes:");
+        for n in &resp.nodes {
+            let (auto, ovr) = state_of
+                .get(&n.node_id)
+                .cloned()
+                .unwrap_or_else(|| ("?".into(), "-".into()));
+            let note = if ovr == "Fenced" {
+                "  <- draining; count falls only as whole extents finish"
+            } else {
+                ""
+            };
+            println!(
+                "  node {:>4} {:<20} {:>3} extent shards  {:<9} {}{}",
+                n.node_id, n.address, n.extent_count, auto, ovr, note
+            );
+        }
+    }
+    Ok(())
+}
+
+/// `info --file-sd`: every PS and EN `/metrics` endpoint as Prometheus
+/// `file_sd` JSON (always JSON). Evicted servers and those that reported no
+/// endpoint are left out. Both reads follow the leader, so `--manager` may
+/// name any manager (or list them all).
+async fn run_file_sd(client: &ClusterClient) -> Result<()> {
+    let ov = client.cluster_overview().await?;
+    let nodes = client.list_node_states().await?;
+    println!("{}", serde_json::to_string_pretty(&file_sd_groups(&ov.ps_servers, &nodes.nodes))?);
+    Ok(())
+}
+
+fn file_sd_groups(ps: &[PsOverview], nodes: &[NodeStateEntry]) -> serde_json::Value {
+    let ps = ps
+        .iter()
+        .filter(|p| p.evicted_at_ms == 0 && !p.metrics_addr.is_empty())
+        .map(|p| serde_json::json!({"targets": [p.metrics_addr], "labels": {"autumn_role": "ps", "ps_id": p.ps_id.to_string()}}));
+    let en = nodes
+        .iter()
+        .filter(|n| !n.metrics_addr.is_empty())
+        .map(|n| serde_json::json!({"targets": [n.metrics_addr], "labels": {"autumn_role": "en", "node_id": n.node_id.to_string()}}));
+    serde_json::Value::Array(ps.chain(en).collect())
+}
+
+/// One word on whether a PS serves what it was assigned; `ready` is the
+/// only state a start-up or readiness check should accept.
+fn ps_state(p: &PsOverview) -> String {
+    if p.evicted_at_ms > 0 {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis() as i64);
+        format!("evicted {}s ago", (now_ms - p.evicted_at_ms).max(0) / 1000)
+    } else if p.last_heartbeat_secs_ago == u64::MAX {
+        "no heartbeat".to_string()
+    } else if p.last_heartbeat_secs_ago >= PsOverview::READY_MAX_HEARTBEAT_AGE_SECS {
+        format!("silent {}s", p.last_heartbeat_secs_ago)
+    } else if p.ready() {
+        "ready".to_string()
+    } else {
+        match p.open_count {
+            None => "awaiting report".to_string(),
+            Some(n) => format!("opening {n}/{}", p.partition_count),
+        }
+    }
+}
+
+/// Live length of an open extent from its first replica, or `None` when the
+/// probe fails (the caller keeps the manager's value). An extent node is not a
+/// partition server: the SDK's PS connections declare the wrong service and the
+/// SDK's own EN connections are client-role, which may only read. The probe
+/// goes to the shard that owns the extent; any other shard refuses it.
+async fn probe_extent_len(pool: &autumn_stream::ConnPool, node: &MgrNodeInfo, extent_id: u64) -> Option<u64> {
+    let req = ExtProbeExtentReq { extent_id };
+    let addr = autumn_stream::shard_addr_for_extent(&node.address, &node.shard_ports, extent_id);
+    let resp = pool
+        .call_timeout(&addr, EXT_MSG_PROBE_EXTENT, req.encode(), default_rpc_timeout())
+        .await
+        .ok()?;
+    ExtProbeExtentResp::decode(resp)
+        .ok()
+        .filter(|r| r.code == CODE_OK)
+        .map(|r| r.length)
+}
+
+/// Scoped per-partition view (`info --part P`, no `--detail`): one
+/// `MSG_GET_REGIONS` (cheap) to resolve the partition's 3 streams + ps + range,
+/// then a SCOPED `MSG_STREAM_INFO` (only those streams) so the extent list is
+/// bounded by THIS partition. Emits the partition's `extents` array (the
+/// dashboard's lazy drawer source).
+///
+/// ONE exception to the scoping, and it is not a cheap one: if any of this
+/// partition's extents reports `refs > 1`, naming the other holders needs
+/// every other partition's stream membership, so a second `MSG_STREAM_INFO`
+/// asks for all `3N` streams — and that response carries a clone of every
+/// membered extent in the cluster, i.e. the full-cluster pull this view
+/// otherwise avoids. It is one such pull per drawer open, not per refresh, and
+/// `refs > 1` is NOT rare on a split-grown cluster: a split shares every
+/// pre-cut extent with its sibling and the references clear only once both
+/// sides have collected. Making it cheap needs a manager-side reverse lookup
+/// (a wire change); until then this is the trade, stated rather than hoped.
+async fn run_partition_info(client: &ClusterClient, json_out: bool, pid: u64) -> Result<()> {
+    let en_pool = autumn_stream::ConnPool::with_role(autumn_rpc::version_hello::Role::Admin);
+    let regions_bytes = client.mgr_call(MSG_GET_REGIONS, Bytes::new()).await.context("get regions")?;
+    let regions_resp: GetRegionsResp = rkyv_decode(&regions_bytes).map_err(decode_err)?;
+    if regions_resp.code != CODE_OK {
+        bail!("get regions: code={} {}", regions_resp.code, regions_resp.message);
+    }
+    let regions: std::collections::HashMap<u64, MgrRegionInfo> =
+        regions_resp.regions.into_iter().collect();
+    let part_addrs: std::collections::HashMap<u64, String> =
+        regions_resp.part_addrs.into_iter().collect();
+    let ps_details: std::collections::HashMap<u64, MgrPsDetail> =
+        regions_resp.ps_details.into_iter().collect();
+    let r = regions
+        .get(&pid)
+        .ok_or_else(|| anyhow!("partition {pid} not found"))?;
+
+    let si_bytes = client
+        .mgr_call(
+            MSG_STREAM_INFO,
+            rkyv_encode(&StreamInfoReq {
+                stream_ids: vec![r.log_stream, r.row_stream, r.meta_stream],
+            }),
+        )
+        .await
+        .context("stream info (scoped)")?;
+    let si: StreamInfoResp = rkyv_decode(&si_bytes).map_err(decode_err)?;
+    if si.code != CODE_OK {
+        bail!("stream info: code={} {}", si.code, si.message);
+    }
+    let extent_map: std::collections::HashMap<u64, MgrExtentInfo> = si.extents.into_iter().collect();
+    let stream_map: std::collections::HashMap<u64, MgrStreamInfo> = si.streams.into_iter().collect();
+
+    // Resolve EN node addresses (cheap, one RPC) so we can PROBE open extents
+    // for their live length. An OPEN (unsealed) extent's manager `sealed_length`
+    // is 0, so without a probe the tail log/row/meta extents render as 0B — which
+    // is wrong (the log tail holds the live WAL). Sealed/EC extents need no probe.
+    let node_map: std::collections::HashMap<u64, MgrNodeInfo> =
+        match client.mgr_call(MSG_NODES_INFO, Bytes::new()).await {
+            Ok(nb) => match rkyv_decode::<NodesInfoResp>(&nb) {
+                Ok(nr) => nr.nodes.into_iter().collect(),
+                Err(_) => Default::default(),
+            },
+            Err(_) => Default::default(),
+        };
+
+    // Who ELSE holds these extents. Skipped entirely while every extent here is
+    // privately held, which costs nothing to check — but see this function's
+    // doc comment before assuming that is the common case: on a split-grown
+    // cluster it is not, and the call this guard admits returns every membered
+    // extent in the cluster, because the manager has no "who holds extent E"
+    // query and the answer needs every other partition's stream membership.
+    let sharers_by_extent: std::collections::HashMap<u64, Vec<u64>> =
+        if extent_map.values().any(|e| e.refs > 1) {
+            let others: Vec<u64> = regions
+                .values()
+                .flat_map(|o| [o.log_stream, o.row_stream, o.meta_stream])
+                .collect();
+            match client
+                .mgr_call(
+                    MSG_STREAM_INFO,
+                    rkyv_encode(&StreamInfoReq { stream_ids: others }),
+                )
+                .await
+                .ok()
+                .and_then(|b| rkyv_decode::<StreamInfoResp>(&b).ok())
+                .filter(|resp| resp.code == CODE_OK)
+            {
+                Some(all) => extent_sharers(&regions, &all.streams.into_iter().collect()),
+                // Best-effort: the view still renders `refs`, just without the
+                // names. A missing list must not fail the whole panel.
+                None => Default::default(),
+            }
+        } else {
+            Default::default()
+        };
+
+    let ps_addr = part_addrs
+        .get(&pid)
+        .or_else(|| ps_details.get(&r.ps_id).map(|d| &d.address))
+        .cloned()
+        .unwrap_or_default();
+    let key_s = |k: &[u8]| String::from_utf8_lossy(k).into_owned();
+    let (rs, re) = r
+        .rg
+        .as_ref()
+        .map(|g| (key_s(&g.start_key), key_s(&g.end_key)))
+        .unwrap_or_default();
+
+    let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let mut extents_json = Vec::new();
+    let mut live_size = 0u64;
+    for (role, sid) in [
+        ("log", r.log_stream),
+        ("row", r.row_stream),
+        ("meta", r.meta_stream),
+    ] {
+        if let Some(st) = stream_map.get(&sid) {
+            for eid in &st.extent_ids {
+                if !seen.insert(*eid) {
+                    continue;
+                }
+                if let Some(e) = extent_map.get(eid) {
+                    // Sealed → authoritative sealed_length. Open → probe the EN
+                    // for the live length (else it shows 0B, see node_map note).
+                    let mut sz = e.sealed_length;
+                    if !e.sealed {
+                        if let Some(node) = e.replicates.first().and_then(|nid| node_map.get(nid)) {
+                            if let Some(len) = probe_extent_len(&en_pool, node, *eid).await {
+                                sz = len;
+                            }
+                        }
+                    }
+                    live_size = live_size.saturating_add(sz);
+                    let replicas: Vec<u64> = e.replicates.iter().chain(e.parity.iter()).copied().collect();
+                    extents_json.push(serde_json::json!({
+                        "extent_id": *eid,
+                        "role": role,
+                        "size": sz,
+                        "open": !e.sealed,
+                        "ec": e.ec_converted,
+                        "ec_shape": if e.ec_converted { Some(format!("{}+{}", e.replicates.len(), e.parity.len())) } else { None },
+                        "replicas": replicas,
+                        "refs": e.refs,
+                        "eversion": e.eversion,
+                        "shared_by_parts": sharers_by_extent.get(eid).cloned().unwrap_or_default(),
+                    }));
+                } else {
+                    extents_json.push(serde_json::json!({
+                        "extent_id": *eid, "role": role, "missing": true,
+                    }));
+                }
+            }
+        }
+    }
+
+    // #2: ask the PS for the GC replay floor + per-SST vp_heads,
+    // so the operator can see WHY a `forcegc P E` on a given extent is protected
+    // (extent E at/before the floor → correct, not a bug). Best-effort: a PS that
+    // predates this RPC, or is briefly unreachable, just omits the section.
+    let floor: Option<DiagPartitionVpResp> = if ps_addr.is_empty() {
+        None
+    } else {
+        match client.get_ps_client(&ps_addr).await {
+            Ok(psc) => match psc
+                .call_timeout(
+                    MSG_DIAG_PARTITION_VP,
+                    rkyv_encode(&DiagPartitionVpReq { part_id: pid }),
+                    default_rpc_timeout(),
+                )
+                .await
+            {
+                Ok(bytes) => rkyv_decode::<DiagPartitionVpResp>(&bytes)
+                    .ok()
+                    .filter(|d| d.code == CODE_OK),
+                Err(_) => None,
+            },
+            Err(_) => None,
+        }
+    };
+
+    if json_out {
+        let floor_json = floor.as_ref().map(|f| {
+            serde_json::json!({
+                "floor_extent_id": f.floor_extent_id,
+                "floor_pos": f.floor_pos,
+                "vp_seed_extent_id": f.vp_seed_extent_id,
+                "vp_seed_offset": f.vp_seed_offset,
+                "log_extent_ids": f.log_extent_ids,
+                "sst_vp_heads": f.sst_vp_heads
+                    .iter()
+                    .map(|(e, o)| serde_json::json!({"vp_extent_id": e, "vp_offset": o}))
+                    .collect::<Vec<_>>(),
+            })
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "part_id": pid,
+                "ps_addr": ps_addr,
+                "range_start": rs,
+                "range_end": re,
+                "live_size": live_size,
+                "total_extents": seen.len(),
+                "log_stream_id": r.log_stream,
+                "row_stream_id": r.row_stream,
+                "meta_stream_id": r.meta_stream,
+                "replay_floor": floor_json,
+                "extents": extents_json,
+            }))?
+        );
+    } else {
+        println!("partition {pid} on {ps_addr}  [{rs}, {re})  {} ({} ext)", human_size(live_size), seen.len());
+        if let Some(f) = &floor {
+            println!(
+                "  replay_floor = extent {} (pos {})   vp_seed(tail) = extent {} @ {}",
+                f.floor_extent_id, f.floor_pos, f.vp_seed_extent_id, f.vp_seed_offset
+            );
+            for (i, (eid, off)) in f.sst_vp_heads.iter().enumerate() {
+                let pin = if *eid == f.floor_extent_id && f.floor_extent_id != 0 {
+                    "  ← pins floor (forcegc at/before this extent is protected)"
+                } else {
+                    ""
+                };
+                println!("  sst[{i}] vp_head = extent {eid} @ {off}{pin}");
+            }
+        }
+        for e in &extents_json {
+            println!("  {}", e);
+        }
+    }
+    Ok(())
+}
+
+async fn run_info(
+    client: &ClusterClient,
+    json_out: bool,
+    part: Option<u64>,
+    detail: bool,
+    full: bool,
+) -> Result<()> {
+    // `--detail` prints PartitionLoad snapshot for `part`.
+    if detail {
+        let pid = part.expect("--detail requires --part PID; checked at parse time");
+        let req = rkyv_encode(&GetPartitionDetailReq { part_id: pid });
+        let resp_bytes = client
+            .mgr_call(MSG_GET_PARTITION_DETAIL, req)
+            .await
+            .context("get partition detail")?;
+        let resp: GetPartitionDetailResp = rkyv_decode(&resp_bytes).map_err(decode_err)?;
+        if resp.code != CODE_OK {
+            bail!("get_partition_detail: code={} {}", resp.code, resp.message);
+        }
+        let l = &resp.load;
+        if json_out {
+            let v = serde_json::json!({
+                "part_id": pid,
+                "bucket_ts": resp.bucket_ts,
+                "size_bytes": l.size_bytes,
+                "req_per_sec": l.req_per_sec,
+                "write_bytes_per_sec": l.write_bytes_per_sec,
+                "read_bytes_per_sec": l.read_bytes_per_sec,
+                "imm_full_per_sec": l.imm_full_per_sec,
+                "p99_us": l.p99_us,
+                "gc_debt_bytes": l.gc_debt_bytes,
+                "pending_compaction_bytes": l.pending_compaction_bytes,
+                "minor_compact_pending_bytes": l.minor_compact_pending_bytes,
+                "sst_tombstone_bytes": l.sst_tombstone_bytes,
+                "sst_expired_bytes": l.sst_expired_bytes,
+                "sst_out_of_range_bytes": l.sst_out_of_range_bytes,
+                "gc_inflight": l.gc_inflight,
+                "compact_inflight": l.compact_inflight,
+                "last_gc_at": l.last_gc_at,
+                "last_compact_at": l.last_compact_at,
+                "sealed_log_extent_count": l.sealed_log_extent_count,
+                "open_tail_bytes": l.open_tail_bytes,
+                "open_tail_dead_bytes": l.open_tail_dead_bytes,
+                // 1 = this partition's SSTs still carry keys outside its range
+                // (post-CoW-split). `split` is REFUSED while it is set, and
+                // only a major compaction clears it.
+                "has_overlap": l.has_overlap,
+                // Deletes no major compaction has covered yet; their freed
+                // bytes are invisible to GC until one does.
+                "unsettled_deletes": l.unsettled_deletes,
+            });
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&v).context("serialize detail")?
+            );
+        } else {
+            println!("=== Partition {pid} (bucket_ts={}) ===", resp.bucket_ts);
+            println!("  size_bytes={}", l.size_bytes);
+            println!(
+                "  req_per_sec={}  imm_full_per_sec={}",
+                l.req_per_sec, l.imm_full_per_sec
+            );
+            println!(
+                "  gc_debt_bytes={} ({} MiB)",
+                l.gc_debt_bytes,
+                l.gc_debt_bytes / (1024 * 1024)
+            );
+            println!(
+                "  pending_compaction_bytes={} ({} MiB)  [major]",
+                l.pending_compaction_bytes,
+                l.pending_compaction_bytes / (1024 * 1024)
+            );
+            println!(
+                "  minor_compact_pending_bytes={} ({} MiB)",
+                l.minor_compact_pending_bytes,
+                l.minor_compact_pending_bytes / (1024 * 1024)
+            );
+            println!(
+                "  sst_tombstone_bytes={}  sst_expired_bytes={}  sst_out_of_range_bytes={}",
+                l.sst_tombstone_bytes, l.sst_expired_bytes, l.sst_out_of_range_bytes
+            );
+            println!(
+                "  gc_inflight={}  compact_inflight={}",
+                l.gc_inflight, l.compact_inflight
+            );
+            println!(
+                "  last_gc_at={}  last_compact_at={}",
+                l.last_gc_at, l.last_compact_at
+            );
+            println!("  sealed_log_extent_count={}", l.sealed_log_extent_count);
+            println!(
+                "  unsettled_deletes={}{}",
+                l.unsettled_deletes,
+                if l.unsettled_deletes != 0 {
+                    "  (not yet reclaimable: needs a major compaction)"
+                } else {
+                    ""
+                }
+            );
+            println!(
+                "  has_overlap={}{}",
+                l.has_overlap,
+                if l.has_overlap != 0 {
+                    "  (split and merge refused until a major compaction separates the CoW-shared keys)"
+                } else {
+                    ""
+                }
+            );
+        }
+        return Ok(());
+    }
+
+    // Big-cluster routing: default `info` = scalable compact overview;
+    // `info --part P` = scoped single-partition view (+extents). Only the
+    // explicit `--full` falls through to the legacy complete dump below.
+    if !full {
+        if let Some(pid) = part {
+            return run_partition_info(client, json_out, pid).await;
+        }
+        return run_overview(client, json_out).await;
+    }
+
+    // === Fetch manager data (legacy full dump, `--full` only) ===
+    let stream_resp_bytes = client
+        .mgr_call(
+            MSG_STREAM_INFO,
+            rkyv_encode(&StreamInfoReq {
+                stream_ids: Vec::new(),
+            }),
+        )
+        .await
+        .context("stream info")?;
+    let stream_resp: StreamInfoResp = rkyv_decode(&stream_resp_bytes).map_err(decode_err)?;
+    // Check the manager's response code BEFORE building the snapshot: a
+    // follower / non-routable manager returns code != CODE_OK with EMPTY
+    // collections, which the renderer would otherwise present as a real,
+    // empty cluster (silent in `--json`, and the exit code stays 0).
+    if stream_resp.code != CODE_OK {
+        bail!("stream info: code={} {}", stream_resp.code, stream_resp.message);
+    }
+
+    let nodes_resp_bytes = client
+        .mgr_call(MSG_NODES_INFO, Bytes::new())
+        .await
+        .context("nodes info")?;
+    let nodes_resp: NodesInfoResp = rkyv_decode(&nodes_resp_bytes).map_err(decode_err)?;
+    if nodes_resp.code != CODE_OK {
+        bail!("nodes info: code={} {}", nodes_resp.code, nodes_resp.message);
+    }
+
+    let regions_resp_bytes = client
+        .mgr_call(MSG_GET_REGIONS, Bytes::new())
+        .await
+        .context("get regions")?;
+    let regions_resp: GetRegionsResp = rkyv_decode(&regions_resp_bytes).map_err(decode_err)?;
+    if regions_resp.code != CODE_OK {
+        bail!("get regions: code={} {}", regions_resp.code, regions_resp.message);
+    }
+
+    // === Build lookup maps ===
+    let mut extent_map: HashMap<u64, MgrExtentInfo> = stream_resp.extents.into_iter().collect();
+    let disk_map: HashMap<u64, MgrDiskInfo> = nodes_resp.disks_info.into_iter().collect();
+
+    let mut nodes_sorted: Vec<(u64, MgrNodeInfo)> = nodes_resp.nodes.into_iter().collect();
+    nodes_sorted.sort_by_key(|(id, _)| *id);
+    let node_map: HashMap<u64, &MgrNodeInfo> = nodes_sorted.iter().map(|(id, n)| (*id, n)).collect();
+
+    let mut streams_sorted: Vec<(u64, MgrStreamInfo)> = stream_resp.streams.into_iter().collect();
+    streams_sorted.sort_by_key(|(id, _)| *id);
+    let stream_map: HashMap<u64, MgrStreamInfo> = streams_sorted.iter().cloned().collect();
+
+    let regions: HashMap<u64, MgrRegionInfo> = regions_resp.regions.into_iter().collect();
+    let ps_details: HashMap<u64, MgrPsDetail> = regions_resp.ps_details.into_iter().collect();
+    let part_addr_map: HashMap<u64, String> = regions_resp.part_addrs.into_iter().collect();
+
+    let mut part_ids: Vec<u64> = regions.keys().copied().collect();
+    part_ids.sort();
+
+    // === Query commit_length for open extents ===
+    let probe_set: HashSet<u64> = if let Some(pid) = part {
+        regions
+            .get(&pid)
+            .into_iter()
+            .flat_map(|r| [r.log_stream, r.row_stream, r.meta_stream])
+            .flat_map(|sid| {
+                stream_map
+                    .get(&sid)
+                    .into_iter()
+                    .flat_map(|s| s.extent_ids.iter().copied())
+            })
+            .collect()
+    } else {
+        HashSet::new()
+    };
+
+    let en_pool = autumn_stream::ConnPool::with_role(autumn_rpc::version_hello::Role::Admin);
+    let mut open_extents: HashSet<u64> = HashSet::new();
+    for (eid, ext) in extent_map.iter_mut() {
+        // Authoritative seal STATE is the explicit `sealed` flag, NOT
+        // `sealed_length == 0` (manager note 32): a failover can seal an
+        // EMPTY tail (`sealed = true, sealed_length = 0`). Treating that as
+        // open mislabels it `(open)` and pointlessly probes a sealed extent.
+        if !ext.sealed {
+            open_extents.insert(*eid);
+            if part.is_some() && !probe_set.contains(eid) {
+                continue;
+            }
+            if let Some(node_id) = ext.replicates.first() {
+                if let Some(node) = node_map.get(node_id) {
+                    // The probe RPC has no PS-owner context;
+                    // must NOT use the fence-gated commit_length RPC.
+                    if let Some(len) = probe_extent_len(&en_pool, node, *eid).await {
+                        ext.sealed_length = len;
+                    }
+                }
+            }
+        }
+    }
+
+    // === Fetch pending discard snapshots from each PS ===
+    let pids_to_query: Vec<u64> = if let Some(pid) = part {
+        vec![pid]
+    } else {
+        part_ids.clone()
+    };
+    let mut part_discards: HashMap<u64, Vec<(u64, i64)>> = HashMap::new();
+    for pid in &pids_to_query {
+        let r = match regions.get(pid) {
+            Some(r) => r,
+            None => continue,
+        };
+        let ps_addr = part_addr_map
+            .get(pid)
+            .or_else(|| ps_details.get(&r.ps_id).map(|d| &d.address))
+            .map(|s| s.as_str())
+            .unwrap_or("");
+        if ps_addr.is_empty() {
+            continue;
+        }
+        let req_bytes = rkyv_encode(&GetDiscardsReq { part_id: *pid });
+        match client.get_ps_client(ps_addr).await {
+            Ok(ps_client) => match ps_client
+                .call_timeout(MSG_GET_DISCARDS, req_bytes, default_rpc_timeout())
+                .await
+            {
+                Ok(resp_bytes) => match rkyv_decode::<GetDiscardsResp>(&resp_bytes) {
+                    Ok(resp) if resp.code == autumn_rpc::partition_rpc::CODE_OK => {
+                        part_discards.insert(*pid, resp.discards);
+                    }
+                    Ok(resp) => eprintln!("[warning] discard fetch part {pid}: {}", resp.message),
+                    Err(e) => eprintln!("[warning] discard decode part {pid}: {e}"),
+                },
+                Err(e) => eprintln!("[warning] discard fetch failed for part {pid}: {e}"),
+            },
+            Err(e) => eprintln!("[warning] connect PS for part {pid}: {e}"),
+        }
+    }
+
+    // Per-extent live stream-membership count (how many streams list it in
+    // extent_ids, duplicates counted). 0 = orphan (not in any stream). `refs`
+    // should equal this; a gap is a leaked refcount (MERGE-REFS-LEAK). Computed
+    // before the json/text split so both renderings can flag orphans.
+    let mut stream_member_count: HashMap<u64, usize> = HashMap::new();
+    for (_sid, s) in &streams_sorted {
+        for eid in &s.extent_ids {
+            *stream_member_count.entry(*eid).or_insert(0) += 1;
+        }
+    }
+
+    let sharers_by_extent = extent_sharers(&regions, &stream_map);
+
+    if json_out {
+        let nodes_view: Vec<InfoNodeView> = nodes_sorted
+            .iter()
+            .map(|(nid, n)| InfoNodeView {
+                node_id: *nid,
+                address: n.address.clone(),
+                disks: n
+                    .disks
+                    .iter()
+                    .map(|did| InfoDiskView {
+                        disk_id: *did,
+                        uuid: disk_map
+                            .get(did)
+                            .map(|d| d.uuid.clone())
+                            .unwrap_or_default(),
+                        online: disk_map.get(did).map(|d| d.online).unwrap_or(false),
+                    })
+                    .collect(),
+            })
+            .collect();
+
+        let extents_view: Vec<InfoExtentView> = {
+            let mut v: Vec<_> = extent_map
+                .iter()
+                .map(|(eid, e)| InfoExtentView {
+                    extent_id: *eid,
+                    size: e.sealed_length,
+                    open: open_extents.contains(eid),
+                    replicas: e.replicates.clone(),
+                    parity: e.parity.clone(),
+                    refs: e.refs,
+                    vp_table_refs: e.vp_table_refs,
+                    eversion: e.eversion,
+                    in_streams: stream_member_count.get(eid).copied().unwrap_or(0),
+                    shared_by_parts: sharers_by_extent.get(eid).cloned().unwrap_or_default(),
+                })
+                .collect();
+            v.sort_by_key(|e| e.extent_id);
+            v
+        };
+
+        let streams_view: Vec<InfoStreamView> = streams_sorted
+            .iter()
+            .map(|(sid, s)| {
+                let r = if s.replicates > 0 {
+                    s.replicates
+                } else {
+                    s.extent_ids
+                        .iter()
+                        .find_map(|eid| {
+                            extent_map
+                                .get(eid)
+                                .filter(|e| !e.ec_converted)
+                                .map(|e| e.replicates.len() as u32)
+                        })
+                        .unwrap_or(0)
+                };
+                InfoStreamView {
+                    stream_id: *sid,
+                    replicates: r,
+                    ec_data: s.ec_data_shard,
+                    ec_parity: s.ec_parity_shard,
+                    extent_ids: s.extent_ids.clone(),
+                    total_size: stream_total(s, &extent_map),
+                }
+            })
+            .collect();
+
+        let mut partitions_view: Vec<InfoPartitionView> = part_ids
+            .iter()
+            .filter_map(|pid| {
+                let r = regions.get(pid)?;
+                let rg = r.rg.as_ref()?;
+                let ps_addr = part_addr_map
+                    .get(pid)
+                    .or_else(|| ps_details.get(&r.ps_id).map(|d| &d.address))
+                    .cloned()
+                    .unwrap_or_else(|| "unknown".to_string());
+                let mut live_size = 0u64;
+                let mut total_extents = 0usize;
+                for sid in [r.log_stream, r.row_stream, r.meta_stream] {
+                    if let Some(s) = stream_map.get(&sid) {
+                        live_size += stream_total(s, &extent_map);
+                        total_extents += s.extent_ids.len();
+                    }
+                }
+                let discards = part_discards
+                    .get(pid)
+                    .map(|v| {
+                        v.iter()
+                            .map(|&(eid, bytes)| InfoDiscardEntry {
+                                extent_id: eid,
+                                bytes,
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                Some(InfoPartitionView {
+                    part_id: *pid,
+                    ps_addr,
+                    range_start: String::from_utf8_lossy(&rg.start_key).into_owned(),
+                    range_end: if rg.end_key.is_empty() {
+                        String::new()
+                    } else {
+                        String::from_utf8_lossy(&rg.end_key).into_owned()
+                    },
+                    live_size,
+                    total_extents,
+                    log_stream_id: r.log_stream,
+                    row_stream_id: r.row_stream,
+                    meta_stream_id: r.meta_stream,
+                    discards,
+                })
+            })
+            .collect();
+
+        // keep sort_by live_size desc for consistent ordering.
+        partitions_view.sort_by_key(|p| std::cmp::Reverse(p.live_size));
+
+        if let Some(pid) = part {
+            match partitions_view.into_iter().find(|p| p.part_id == pid) {
+                Some(pv) => println!("{}", serde_json::to_string_pretty(&pv)?),
+                None => eprintln!("partition {pid} not found"),
+            }
+        } else {
+            let snapshot = InfoSnapshot {
+                nodes: nodes_view,
+                extents: extents_view,
+                streams: streams_view,
+                partitions: partitions_view,
+            };
+            println!("{}", serde_json::to_string_pretty(&snapshot)?);
+        }
+    } else {
+        // === Text output ===
+        let show_pids: Vec<u64> = if let Some(pid) = part {
+            vec![pid]
+        } else {
+            part_ids.clone()
+        };
+
+        if part.is_none() {
+            println!("=== Nodes ===");
+            for (nid, n) in &nodes_sorted {
+                if n.control_address.is_empty() {
+                    println!("  node {}: addr={}", nid, n.address);
+                } else {
+                    println!(
+                        "  node {}: addr={}, control_addr={}",
+                        nid, n.address, n.control_address
+                    );
+                }
+                for did in &n.disks {
+                    if let Some(d) = disk_map.get(did) {
+                        println!("    disk {}: uuid={}, online={}", did, d.uuid, d.online);
+                    } else {
+                        println!("    disk {}: (no info)", did);
+                    }
+                }
+            }
+
+            println!("\n=== Extents ===");
+            let mut extents: Vec<(&u64, &MgrExtentInfo)> = extent_map.iter().collect();
+            extents.sort_by_key(|(id, _)| **id);
+            for (eid, e) in &extents {
+                let in_streams = stream_member_count.get(*eid).copied().unwrap_or(0);
+                let mut tag = String::new();
+                if open_extents.contains(eid) {
+                    tag.push_str(" (open)");
+                }
+                // Orphan = in no live stream. Distinguish a LEGACY extent still
+                // retained by the upgrade-safety guard (vp_table_refs>0 — live
+                // VPs from a pre-removal build, a Stage-2 migration target) from
+                // a both-zero reclaimable extent (the EXTENT10-AUTORECLAIM sweep
+                // reaps it). Also flag a refs vs membership gap (MERGE-REFS-LEAK).
+                if in_streams == 0 {
+                    tag.push_str(if e.vp_table_refs > 0 {
+                        " (ORPHAN: no stream, retained by vp_table_refs — legacy live data, Stage-2 migrate)"
+                    } else {
+                        " (ORPHAN: no stream, vp_table_refs=0 — reclaimable, pending sweep)"
+                    });
+                } else if e.refs as usize != in_streams {
+                    tag.push_str(" (refs-leak)");
+                }
+                let layout = if e.ec_converted {
+                    format!(
+                        "EC({}+{}), data={:?}, parity={:?}",
+                        e.replicates.len(),
+                        e.parity.len(),
+                        e.replicates,
+                        e.parity
+                    )
+                } else if e.parity.is_empty() {
+                    format!("replicas={:?}", e.replicates)
+                } else {
+                    let mut all = e.replicates.clone();
+                    all.extend(e.parity.iter().copied());
+                    format!("replicas={:?}", all)
+                };
+                // Name the OTHER holders, not just how many there are: an
+                // extent a CoW split left shared is unlinked only at
+                // `refs == 0`, so one holder releasing it returns nothing
+                // until every holder does, and "who else" is the actionable
+                // half.
+                //
+                // "drops its reference" rather than "GCs it" on purpose — GC
+                // is the mechanism for a LOG extent, while a shared row or
+                // meta extent is released by compaction's head truncate. This
+                // line does not know the role, so it names the outcome both
+                // roles share.
+                let sharers = sharers_by_extent.get(*eid).map(Vec::as_slice).unwrap_or(&[]);
+                let shared = if sharers.len() > 1 {
+                    format!(
+                        ", shared by parts {:?} — freed only once ALL of them drop it",
+                        sharers
+                    )
+                } else {
+                    String::new()
+                };
+                println!(
+                    "  extent {}: size={}{}, {}, refs={} (streams={}), vp_table_refs={}, eversion={}{}",
+                    eid,
+                    human_size(e.sealed_length),
+                    tag,
+                    layout,
+                    e.refs,
+                    in_streams,
+                    e.vp_table_refs,
+                    e.eversion,
+                    shared
+                );
+            }
+
+            println!("\n=== Streams ===");
+            for (sid, s) in &streams_sorted {
+                let total = stream_total(s, &extent_map);
+                let r = if s.replicates > 0 {
+                    s.replicates
+                } else {
+                    s.extent_ids
+                        .iter()
+                        .find_map(|eid| {
+                            extent_map
+                                .get(eid)
+                                .filter(|e| !e.ec_converted)
+                                .map(|e| e.replicates.len() as u32)
+                        })
+                        .unwrap_or(0)
+                };
+                let layout = if s.ec_parity_shard == 0 {
+                    format!("repl={}", r)
+                } else {
+                    format!("repl={}, EC={}+{}", r, s.ec_data_shard, s.ec_parity_shard)
+                };
+                println!(
+                    "  stream {} ({}): extents={:?}, total={}",
+                    sid,
+                    layout,
+                    s.extent_ids,
+                    human_size(total)
+                );
+            }
+        }
+
+        let section_header = if let Some(pid) = part {
+            format!("\n=== Partition {pid} ===")
+        } else {
+            "\n=== Partitions ===".to_string()
+        };
+        println!("{section_header}");
+
+        for pid in &show_pids {
+            let r = match regions.get(pid) {
+                Some(r) => r,
+                None => {
+                    println!("  part {pid}: not found");
+                    continue;
+                }
+            };
+            let rg = match r.rg.as_ref() {
+                Some(r) => r,
+                None => continue,
+            };
+            let ps_addr = part_addr_map
+                .get(pid)
+                .or_else(|| ps_details.get(&r.ps_id).map(|d| &d.address))
+                .map(|s| s.as_str())
+                .unwrap_or("unknown");
+            println!(
+                "  part {}: ps={}, range=[{}..{})",
+                pid,
+                ps_addr,
+                String::from_utf8_lossy(&rg.start_key),
+                if rg.end_key.is_empty() {
+                    "\u{221e}".to_string()
+                } else {
+                    String::from_utf8_lossy(&rg.end_key).to_string()
+                }
+            );
+            let discards = part_discards.get(pid);
+            let mut part_total = 0u64;
+            let mut part_extents = 0usize;
+            for (label, sid) in [
+                ("log", r.log_stream),
+                ("row", r.row_stream),
+                ("meta", r.meta_stream),
+            ] {
+                if let Some(s) = stream_map.get(&sid) {
+                    let total = stream_total(s, &extent_map);
+                    part_total += total;
+                    part_extents += s.extent_ids.len();
+                    let mut line = format!(
+                        "    {}: stream {}, extents={:?}, size={}",
+                        label,
+                        sid,
+                        s.extent_ids,
+                        human_size(total)
+                    );
+                    if label == "log" {
+                        if let Some(d) = discards {
+                            if !d.is_empty() {
+                                let total_discard: i64 = d.iter().map(|(_, b)| b).sum();
+                                line.push_str(&format!(
+                                    ", discard: {} ext / {} pending",
+                                    d.len(),
+                                    human_size(total_discard as u64)
+                                ));
+                            }
+                        }
+                    }
+                    println!("{line}");
+                }
+            }
+            println!(
+                "    total: {} extents, {}",
+                part_extents,
+                human_size(part_total)
+            );
+        }
+    }
+    Ok(())
+}
+
+fn main() {
+    let args = parse();
+    let rt = compio::runtime::Runtime::new().expect("compio runtime");
+    if let Err(e) = rt.block_on(run(args)) {
+        eprintln!("error: {e:#}");
+        std::process::exit(1);
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn file_sd_lists_live_endpoints_only() {
+        let ps = |ps_id, addr: &str, evicted_at_ms| PsOverview {
+            ps_id,
+            metrics_addr: addr.to_string(),
+            evicted_at_ms,
+            ..Default::default()
+        };
+        let node = |node_id, addr: &str| NodeStateEntry {
+            node_id,
+            address: String::new(),
+            auto_state: 0,
+            last_heartbeat_secs_ago: 0,
+            suspected_age_secs: 0,
+            operator_override: None,
+            node_uuid: String::new(),
+            shard_ports: Vec::new(),
+            metrics_addr: addr.to_string(),
+            full_disks: Vec::new(),
+        };
+        let got = super::file_sd_groups(
+            &[ps(1, "10.0.0.1:9801", 0), ps(2, "", 0), ps(3, "10.0.0.3:9801", 1_700_000_000_000)],
+            &[node(7, "10.0.0.7:9601"), node(8, "")],
+        );
+        assert_eq!(
+            got,
+            serde_json::json!([
+                {"targets": ["10.0.0.1:9801"], "labels": {"autumn_role": "ps", "ps_id": "1"}},
+                {"targets": ["10.0.0.7:9601"], "labels": {"autumn_role": "en", "node_id": "7"}},
+            ])
+        );
+    }
+
+    #[test]
+    fn utc_string_is_the_civil_date() {
+        assert_eq!(utc_string(0), "1970-01-01 00:00:00 UTC");
+        assert_eq!(utc_string(1_791_352_181_498), "2026-10-07 05:49:41 UTC");
+        assert_eq!(utc_string(951_782_400_000), "2000-02-29 00:00:00 UTC");
+    }
+
+    #[test]
+    fn status_lists_counts_then_every_member_that_is_not_up() {
+        let m = |id, state, age_secs| FleetMember {
+            id,
+            address: format!("h{id}:1"),
+            state,
+            age_secs,
+        };
+        let r = ClusterStatusResp {
+            code: CODE_OK,
+            sampled_at_ms: 0,
+            managers: vec![m(1, FLEET_MANAGER_LEADER, 0), m(2, FLEET_MANAGER_ABSENT, 180)],
+            partition_servers: vec![m(1, FLEET_PS_READY, 1), m(7, FLEET_PS_EVICTED, 720)],
+            extent_nodes: vec![m(1, FLEET_EN_ONLINE, 2), m(2, FLEET_EN_SUSPEND, u64::MAX)],
+            sealed_extents: 10,
+            clean: 9,
+            degraded: 1,
+            unavailable: 0,
+            recovery_inflight: 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            render_status(&r),
+            "Manager   leader 1 / standby 0   (2 expected)\n\
+             PS        Ready 1/2\n\
+             EN        Online 1/2\n\
+             Extent    clean 9 / degraded 1 / unavailable 0   (10 sealed)\n\
+             Recovery  inflight 1\n\
+             sampled   1970-01-01 00:00:00 UTC by manager 1 (h1:1); oldest EN df 2s; oldest PS heartbeat 1s\n\
+             \x20 manager 2 h2:1  absent 3m\n\
+             \x20 PS 7 h7:1  evicted 12m\n\
+             \x20 EN 2 h2:1  suspend unknown\n"
+        );
+    }
+
+    #[test]
+    fn health_renders_counts_and_the_worst_extent() {
+        let mut slot_counts = vec![0u64; 7];
+        slot_counts[SLOT_STATE_UNREACHABLE as usize] = 2;
+        let r = ExtentHealthSummaryResp {
+            code: CODE_OK,
+            sealed_extents: 10,
+            open_extents: 3,
+            clean: 9,
+            degraded: 1,
+            no_redundancy: 1,
+            degraded_bytes: 64 << 20,
+            repair_requested_slots: 1,
+            slot_counts,
+            problems: vec![ProblemExtent {
+                extent_id: 77,
+                sealed_length: 64 << 20,
+                ec_converted: false,
+                serving: 1,
+                total: 3,
+                needed: 1,
+                recovering: true,
+                slots: vec![ProblemSlot {
+                    slot_index: 1,
+                    node_id: 5,
+                    state: SLOT_STATE_UNREACHABLE,
+                    degraded_secs: 812,
+                    repair_requested: true,
+                }],
+            }],
+            ..Default::default()
+        };
+        let text = render_health(&r);
+        assert!(text.starts_with("extents: 10 sealed, 3 open"), "{text}");
+        assert!(text.contains("9 clean, 1 degraded (64.0 MiB), 1 with no redundancy left"), "{text}");
+        assert!(text.contains("slots not serving: 2 unreachable"), "{text}");
+        assert!(
+            text.contains(
+                "extent 77  1/3 serving (needs 1)  recovering  64.0 MiB  slot1 node 5 unreachable \
+                 812s [repair requested]"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("1 slot(s) with a standing repair request"), "{text}");
+        let j = health_json(&r);
+        assert!(j.get("status").is_none(), "no single-word verdict: {j}");
+        assert_eq!(j["slots_not_serving"]["unreachable"], 2);
+        assert_eq!(j["problems"][0]["slots"][0]["state"], "unreachable");
+        assert_eq!(j["problems"][0]["slots"][0]["repair_requested"], true);
+        assert_eq!(j["repair_requested_slots"], 1);
+    }
+
+    fn region(part_id: u64, log: u64, row: u64, meta: u64) -> MgrRegionInfo {
+        MgrRegionInfo {
+            rg: None,
+            part_id,
+            ps_id: 1,
+            log_stream: log,
+            row_stream: row,
+            meta_stream: meta,
+            region_epoch: 1,
+        }
+    }
+
+    fn stream(stream_id: u64, extent_ids: Vec<u64>) -> MgrStreamInfo {
+        MgrStreamInfo {
+            stream_id,
+            extent_ids,
+            ..Default::default()
+        }
+    }
+
+    /// The shape a CoW split leaves behind, taken from a live 3-node cluster:
+    /// `split 13` produced child 19, and both partitions' log streams (7 and 16)
+    /// list extents 14 and 15. `refs=2` alone cannot tell an operator that 13
+    /// and 19 are the two holders, which is what they need to know to reason
+    /// about why the space has not come back.
+    #[test]
+    fn a_split_pair_names_both_holders() {
+        let regions: HashMap<u64, MgrRegionInfo> =
+            [(13, region(13, 7, 9, 11)), (19, region(19, 16, 17, 18))]
+                .into_iter()
+                .collect();
+        let streams: HashMap<u64, MgrStreamInfo> = [
+            (7, stream(7, vec![14, 15])),
+            (9, stream(9, vec![10])),
+            (11, stream(11, vec![12])),
+            (16, stream(16, vec![14, 15])),
+            (17, stream(17, vec![10])),
+            (18, stream(18, vec![12])),
+        ]
+        .into_iter()
+        .collect();
+
+        let sharers = extent_sharers(&regions, &streams);
+        // ascending and stable: `regions` is a HashMap, so an unsorted result
+        // would shuffle between two runs of `info` against the same cluster.
+        for eid in [14, 15, 10, 12] {
+            assert_eq!(sharers.get(&eid), Some(&vec![13, 19]), "extent {eid}");
+        }
+    }
+
+    /// A partition that reaches one extent through two of its OWN streams is
+    /// still a single holder. Listing it twice would read as a second partition
+    /// that does not exist — and would imply a second reference that has to be
+    /// collected before the file is freed.
+    #[test]
+    fn one_partition_reaching_an_extent_twice_is_one_holder() {
+        let regions: HashMap<u64, MgrRegionInfo> =
+            [(13, region(13, 7, 9, 11))].into_iter().collect();
+        let streams: HashMap<u64, MgrStreamInfo> = [
+            (7, stream(7, vec![5])),
+            (9, stream(9, vec![5])),
+            (11, stream(11, vec![5])),
+        ]
+        .into_iter()
+        .collect();
+
+        assert_eq!(extent_sharers(&regions, &streams).get(&5), Some(&vec![13]));
+    }
+
+    /// Repeated splits leave one extent held by many partitions, and the list
+    /// must read the same on every run. Eight holders is the point of this
+    /// test: with two, a hash order that happens to come out ascending hides a
+    /// missing sort half the time, so the ablation has to be able to fail.
+    #[test]
+    fn many_holders_are_listed_in_partition_id_order() {
+        let ids: Vec<u64> = vec![41, 7, 13, 96, 2, 58, 19, 33];
+        let regions: HashMap<u64, MgrRegionInfo> = ids
+            .iter()
+            .map(|&pid| (pid, region(pid, pid * 10, pid * 10 + 1, pid * 10 + 2)))
+            .collect();
+        // every one of them holds extent 14, the way a chain of CoW splits
+        // leaves the extent they were all cut from.
+        let streams: HashMap<u64, MgrStreamInfo> = ids
+            .iter()
+            .map(|&pid| (pid * 10, stream(pid * 10, vec![14])))
+            .collect();
+
+        let mut expected = ids.clone();
+        expected.sort_unstable();
+        assert_eq!(extent_sharers(&regions, &streams).get(&14), Some(&expected));
+    }
+}

@@ -1,0 +1,149 @@
+# A one-host autumn-rs cluster for trying it out: etcd, one manager, three
+# extent nodes, one partition server and the web dashboard. Not for production:
+# authz is off, there is one manager, and every node shares one disk.
+#
+#   docker compose -f deploy/compose/docker-compose.yml up -d
+#   docker compose -f deploy/compose/docker-compose.yml run --rm cli \
+#       autumn-client --manager manager:9001 --namespace kvc put hello /etc/hostname
+#   open http://127.0.0.1:8799                       # the dashboard
+#   docker compose -f deploy/compose/docker-compose.yml down -v   # stop and wipe
+#
+# Clients dial the partition server and extent nodes at their container
+# addresses, so run them inside this network (the `cli` service), not on the
+# host. AUTUMN_IMAGE picks the image; the default is the published one.
+
+x-autumn: &autumn
+  image: ${AUTUMN_IMAGE:-ghcr.io/journeymidnight/autumn-rs:latest}
+  volumes:
+    - secret:/secret
+  environment: &autumn-env
+    AUTUMN_CLUSTER_SECRET_FILE: /secret/cluster.secret
+    AUTUMN_MANAGER: manager:9001
+  # The servers run on io_uring, which Docker's default seccomp profile blocks.
+  security_opt:
+    - seccomp:unconfined
+  ulimits:
+    memlock: -1
+    nofile: 65536
+
+x-extent-node: &extent-node
+  <<: *autumn
+  command: ["extent-node"]
+  depends_on:
+    manager:
+      condition: service_started
+  restart: on-failure
+
+services:
+  secret:
+    image: ${AUTUMN_IMAGE:-ghcr.io/journeymidnight/autumn-rs:latest}
+    volumes:
+      - secret:/secret
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - '[ -s /secret/cluster.secret ] || { autumn-op gen-cluster-secret > /secret/cluster.secret && chmod 600 /secret/cluster.secret; }'
+
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.17
+    command:
+      - etcd
+      - --data-dir=/etcd-data
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --advertise-client-urls=http://etcd:2379
+    volumes:
+      - etcd:/etcd-data
+
+  manager:
+    <<: *autumn
+    command: ["manager"]
+    environment:
+      <<: *autumn-env
+      AUTUMN_MANAGER_ID: "1"
+      AUTUMN_ETCD_ENDPOINTS: etcd:2379
+    depends_on:
+      secret:
+        condition: service_completed_successfully
+      etcd:
+        condition: service_started
+    restart: on-failure
+
+  en1:
+    <<: *extent-node
+    hostname: en1
+    volumes: [secret:/secret, en1:/data/autumn]
+  en2:
+    <<: *extent-node
+    hostname: en2
+    volumes: [secret:/secret, en2:/data/autumn]
+  en3:
+    <<: *extent-node
+    hostname: en3
+    volumes: [secret:/secret, en3:/data/autumn]
+
+  # Creates the streams and the first partition once three nodes are online,
+  # then, once the PS has opened it, the namespaces a client writes under.
+  # A namespace counts as made once its cuts are recorded (PRESPLIT >= 1); one
+  # registered without them is deleted and made again on the restart. The PS
+  # must not wait for this service to finish: this waits for the PS.
+  bootstrap:
+    <<: *autumn
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -e
+        AUTUMN_EXPECT_NODES=3 /usr/local/bin/entrypoint.sh bootstrap
+        OP="autumn-op --cluster-secret-file /secret/cluster.secret --manager manager:9001"
+        for i in $$(seq 120); do
+          $$OP info 2>/dev/null | grep -Eq '^  ps .* [1-9][0-9]*/[^ ]* +slots  ready' && break
+          [ "$$i" = 120 ] && { echo "the PS did not open its partitions"; exit 1; }
+          sleep 1
+        done
+        for ns in kvc fs; do
+          $$OP namespace-list | awk -v n="$$ns" '$$1 == n && $$3 > 0 {f=1} END {exit !f}' && continue
+          $$OP namespace-create --name "$$ns" --parts 4 \
+            || { $$OP namespace-delete --name "$$ns" || true; exit 1; }
+        done
+    depends_on: [en1, en2, en3]
+    restart: on-failure
+
+  ps:
+    <<: *autumn
+    # The PS advertises its own container address.
+    entrypoint: ["/bin/sh", "-c", 'POD_IP=$$(getent hosts "$$HOSTNAME" | awk "{print \$$1}") exec /usr/local/bin/entrypoint.sh ps']
+    environment:
+      <<: *autumn-env
+      AUTUMN_PSID: "1"
+    depends_on: [bootstrap]
+    restart: on-failure
+
+  dashboard:
+    <<: *autumn
+    entrypoint: ["autumn-dashboard"]
+    command:
+      - --manager
+      - manager:9001
+      - --cluster-secret-file
+      - /secret/cluster.secret
+      - --listen
+      - 0.0.0.0
+      - --port
+      - "8799"
+    ports:
+      - "127.0.0.1:8799:8799"
+    depends_on: [manager]
+    restart: on-failure
+
+  # `docker compose run --rm cli <command>`: autumn-client, autumn-op (add
+  # --cluster-secret-file /secret/cluster.secret), autumnfs.
+  cli:
+    <<: *autumn
+    entrypoint: []
+    command: ["autumn-client", "--help"]
+    profiles: [tools]
+
+volumes:
+  secret:
+  etcd:
+  en1:
+  en2:
+  en3:

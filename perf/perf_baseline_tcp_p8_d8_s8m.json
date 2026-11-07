@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "write": {
+    "total_ops": 3332,
+    "total_bytes": 27950841856,
+    "ops_per_sec": 301.2180090285752,
+    "throughput_mb_per_sec": 2409.7440722286015,
+    "p50_ms": 393.37496500000003,
+    "p95_ms": 474.63368,
+    "p99_ms": 598.440659
+  },
+  "read": {
+    "total_ops": 10255,
+    "total_bytes": 86025175040,
+    "ops_per_sec": 932.1122832938288,
+    "throughput_mb_per_sec": 7456.89826635063,
+    "p50_ms": 105.768872,
+    "p95_ms": 265.288271,
+    "p99_ms": 451.18959600000005
+  },
+  "config": {
+    "threads": 16,
+    "duration_secs": 10,
+    "value_size": 8388608,
+    "report_interval_secs": 1,
+    "part_id": null,
+    "reuse_value": true,
+    "partition_count": 8,
+    "group_commit_cap": null
+  },
+  "recorded_at": 1790574638
+}

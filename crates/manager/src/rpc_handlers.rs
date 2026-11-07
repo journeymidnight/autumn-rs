@@ -1,0 +1,9462 @@
+//! RPC serve, dispatch, and handler methods for AutumnManager.
+
+use std::collections::{HashMap, HashSet};
+use std::net::SocketAddr;
+use std::time::{Duration, Instant};
+
+use anyhow::Result;
+use autumn_common::AppError;
+use autumn_rpc::manager_rpc::*;
+use autumn_rpc::{Frame, FrameDecoder, HandlerResult, StatusCode};
+use bytes::Bytes;
+use compio::io::{AsyncRead, AsyncWriteExt};
+use compio::BufResult;
+
+use std::rc::Rc;
+
+use crate::persist::records::ExtentRecord;
+use crate::persist::records::MemberRecord;
+use crate::persist::records::NodeRecord;
+use crate::persist::records::PartitionRecord;
+use crate::persist::records::StreamRecord;
+use crate::{AutumnManager, ConnPool, PendingDelete, PS_MEMBERS_PREFIX};
+
+/// #6: RAII removal of a partition from `AutumnManager.split_inflight` on every
+/// exit path of `handle_multi_modify_split` (success + all early-return errors).
+struct SplitInflightGuard {
+    set: Rc<std::cell::RefCell<HashSet<u64>>>,
+    part_id: u64,
+}
+impl Drop for SplitInflightGuard {
+    fn drop(&mut self) {
+        self.set.borrow_mut().remove(&self.part_id);
+    }
+}
+
+
+/// Test-only failpoint: sleep this many ms between the commit_length capture and
+/// the merge txn inside `handle_merge_partitions`, simulating a paused/slow
+/// coordinator (`tests/system_merge_freeze_races.rs`). Always compiled (the failpoints idiom) so an integration test can arm it —
+/// production always leaves it 0, making the hook a single relaxed load per
+/// (rare) merge. A process-global (not thread-local) so a test thread can arm it
+/// for the manager's own runtime thread. Re-exported from `lib.rs`.
+#[doc(hidden)]
+pub static MERGE_TEST_PAUSE_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Test-only failpoint: the next `stream_alloc_extent` sleeps this many ms
+/// after its entry checks, inside the window its awaits open (one-shot).
+#[doc(hidden)]
+pub static ALLOC_TEST_PAUSE_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Test-only failpoint like `MERGE_TEST_PAUSE_MS`, between the freezes and the
+/// takeover.
+#[doc(hidden)]
+pub static MERGE_TEST_TAKEOVER_PAUSE_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Test-only failpoint: the freeze OK of this partition id is discarded as if
+/// the reply were lost in transport (the PS stays frozen and believes it
+/// answered). 0 = off.
+#[doc(hidden)]
+pub static MERGE_TEST_DROP_FREEZE_REPLY: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Test-only failpoint: the next truncate of this stream id is refused as if
+/// an extent it removes had an op in flight (one-shot). 0 = off.
+#[doc(hidden)]
+pub static TRUNCATE_TEST_DEFER_STREAM: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// What a merge took from its two sources before measuring them.
+#[derive(Default)]
+pub(crate) struct MergeSources {
+    /// `(partition/<id>, epoch)` the merge acquired for each source; the
+    /// commit refuses once either was acquired again (a reopen).
+    owners: Vec<(String, i64)>,
+    /// `(stream_id, tail extent id)` fenced at its source's epoch; the commit
+    /// refuses once a stream's tail is another extent.
+    tails: Vec<(u64, u64)>,
+}
+
+impl MergeSources {
+    /// `(owner_key, epoch, fenced tail)` for one of the six source streams.
+    fn for_stream(&self, stream_id: u64) -> (String, i64, u64) {
+        let i = self
+            .tails
+            .iter()
+            .position(|(sid, _)| *sid == stream_id)
+            .expect("every source stream is fenced");
+        let (key, epoch) = &self.owners[i / 3];
+        (key.clone(), *epoch, self.tails[i].1)
+    }
+
+    /// Both checks against the manager's current state.
+    fn verify(&self, s: &crate::store::MetadataState) -> Result<(), AppError> {
+        for (key, epoch) in &self.owners {
+            s.ensure_owner_epoch(key, *epoch)
+                .map_err(|e| AppError::Precondition(format!("merge source reopened: {e}")))?;
+        }
+        for (sid, tail) in &self.tails {
+            let now = s.streams.get(sid).and_then(|st| st.extent_ids.last().copied());
+            if now != Some(*tail) {
+                return Err(AppError::Precondition(format!(
+                    "stream {sid} tail moved from fenced extent {tail} to {now:?}; retry merge"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl AutumnManager {
+    // ── Serve ──────────────────────────────────────────────────────────
+
+    pub async fn serve(&self, addr: SocketAddr) -> Result<()> {
+        self.start_runtime_tasks();
+        let mut listener = autumn_transport::current_or_init().bind(addr).await?;
+        tracing::info!(addr = %addr, "manager listening");
+        // the bind above may have retried through a killed
+        // predecessor's TIME_WAIT window (~60 s on ucx). No PS
+        // heartbeat could arrive before this point, so restart every
+        // PS's liveness clock and only now allow the eviction sweep
+        // (`ps_liveness_check_loop` gates on `serving`).
+        self.mark_serving();
+        loop {
+            // accept errors are CONNECTION-scoped, not process-scoped.
+            // This was previously `listener.accept().await?` — on UCX the
+            // accept path flushes the just-created ep, so a peer that dies
+            // mid-handshake (e.g. a mass client kill: 1024 conns RST at
+            // once) surfaced `ucp_ep_flush cb: Connection reset by remote
+            // peer` here, and the `?` took down the WHOLE manager process
+            // (and the PS fleet then heartbeat-suicided).
+            // One bad handshake must never kill the control plane: log +
+            // brief backoff (avoid a busy error loop on a persistent
+            // failure like EMFILE) + keep accepting. Mirrors the
+            // partition-server per-partition accept task.
+            let (conn, peer) = match listener.accept().await {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!(error = %e, "manager accept failed; continuing");
+                    compio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    continue;
+                }
+            };
+            if let Some(s) = conn.as_tcp() {
+                if let Err(e) = s.set_nodelay(true) {
+                    tracing::warn!(peer = %peer, error = %e, "set_nodelay failed");
+                }
+            }
+            let mgr = self.clone();
+            compio::runtime::spawn(async move {
+                tracing::debug!(peer = %peer, "new manager rpc connection");
+                if let Err(e) = Self::handle_connection(conn, mgr).await {
+                    tracing::debug!(peer = %peer, error = %e, "manager rpc connection ended");
+                }
+            })
+            .detach();
+        }
+    }
+
+    /// Pipeline frame dispatch.
+    ///
+    /// **Pre-fix** this loop was sequential: `read frame → await
+    /// dispatch → write response → read next frame`. The await on
+    /// dispatch held off the next read. With long-poll handlers
+    /// (`handle_poll_invalidations` parks for `LONG_POLL_WAIT = 10 s`),
+    /// **every subsequent request on the same TCP conn waited for the
+    /// parked poll to return** — head-of-line blocking.
+    ///
+    /// The ioring daemon multiplexes all 8 sessions' lease RPCs
+    /// (8 × poll_invalidations + 8 × heartbeats) onto the single
+    /// `ClusterClient.mgr_conn`. The first poll parked for 10 s; the
+    /// 7 follow-up polls + every AcquireLease behind them stalled.
+    /// Daemon's 30 s client `--rpc-timeout-ms` fired, evicted the conn,
+    /// reconnected — but the 16 in-flight `mgr_call` futures still
+    /// each held an `Rc<RpcClient>` for their own 30 s wait. Daemon
+    /// accumulated **stale RpcClient instances (TCP fds) at ~0.15 conn/s**
+    /// (487 ESTABLISHED to manager observed after 90 min).
+    ///
+    /// **Post-fix**: every frame's dispatch runs in a detached task;
+    /// completed responses are funneled through an unbounded
+    /// `futures::channel::mpsc` to a dedicated writer task. Reader,
+    /// writer, and dispatchers all run concurrently on the same
+    /// compio runtime (thread-per-core, !Send is fine — no atomics
+    /// needed). Mirrors `partition-server::handle_ps_connection`
+    /// (Section 13.1) and `stream::extent_node::handle_connection`.
+    /// Response order is best-effort completion order (not request
+    /// order), which is correct: every frame carries its own
+    /// `req_id` and the client's `pending` map dispatches by id.
+    ///
+    /// Drop semantics: dropping `resp_tx` after the reader loop
+    /// exits signals the writer task to flush + exit. Detached
+    /// dispatch tasks for in-flight requests will silently fail
+    /// when they try to `unbounded_send` into the closed channel —
+    /// that's correct (client already gave up).
+    async fn handle_connection(conn: autumn_transport::Conn, mgr: AutumnManager) -> Result<()> {
+        use futures::StreamExt;
+        let peer = conn
+            .peer_addr()
+            .map(|a| a.to_string())
+            .unwrap_or_else(|_| "?".to_string());
+        let (mut reader, mut writer) = conn.into_split();
+        let protocol = autumn_rpc::version_hello::accept(
+            &mut reader,
+            &mut writer,
+            autumn_rpc::version_hello::Service::Manager,
+            &peer,
+        )
+        .await?;
+        autumn_rpc::peer_auth::accept(
+            &mut reader,
+            &mut writer,
+            &protocol,
+            autumn_rpc::peer_auth::installed(),
+            &peer,
+        )
+        .await?;
+        let mut decoder = FrameDecoder::new();
+        // Nothing sent to the manager carries a value.
+        decoder.set_am_values(false);
+        // A client sends the manager only small control messages.
+        if protocol.role == autumn_rpc::version_hello::Role::Client {
+            decoder.set_max_payload(autumn_rpc::frame::CLIENT_CONTROL_MAX_PAYLOAD);
+        }
+        let mut buf = vec![0u8; 64 * 1024];
+        let (resp_tx, mut resp_rx) = futures::channel::mpsc::unbounded::<Bytes>();
+
+        // Writer task: drain encoded responses, write to socket
+        // in completion order. Single writer = no concurrent
+        // `write_all` interleaving.
+        let writer_task = compio::runtime::spawn(async move {
+            while let Some(data) = resp_rx.next().await {
+                let BufResult(result, _) = writer.write_all(data).await;
+                if let Err(e) = result {
+                    tracing::warn!(error = %e, "manager writer task exit");
+                    break;
+                }
+            }
+        });
+
+        let reader_result: Result<()> = async {
+            loop {
+                let BufResult(result, buf_back) = reader.read(buf).await;
+                buf = buf_back;
+                let n = result?;
+                if n == 0 {
+                    return Ok(());
+                }
+
+                decoder.feed(&buf[..n]);
+
+                loop {
+                    match decoder.try_decode().map_err(|e| anyhow::anyhow!(e))? {
+                        Some(frame) if frame.req_id != 0 => {
+                            let req_id = frame.req_id;
+                            let msg_type = frame.msg_type;
+                            let payload = frame.payload;
+                            if let Err(e) = protocol.check_opcode(msg_type) {
+                                let reply = Frame::error(
+                                    req_id,
+                                    msg_type,
+                                    autumn_rpc::RpcError::encode_status(
+                                        StatusCode::PermissionDenied,
+                                        &e.to_string(),
+                                    ),
+                                );
+                                let _ = resp_tx.unbounded_send(reply.encode());
+                                continue;
+                            }
+                            // Keepalive: answered in the decode loop, never
+                            // spawned, so it proves this loop is reading.
+                            if msg_type == autumn_rpc::MSG_TYPE_PING {
+                                let pong = Frame::response(req_id, msg_type, Bytes::new());
+                                // best-effort, like every reply here: a closed
+                                // `resp_rx` means the connection is gone.
+                                let _ = resp_tx.unbounded_send(pong.encode());
+                                continue;
+                            }
+                            let mgr_c = mgr.clone();
+                            let tx = resp_tx.clone();
+                            compio::runtime::spawn(async move {
+                                let resp_frame = match mgr_c.dispatch(msg_type, payload).await {
+                                    Ok(p) => Frame::response(req_id, msg_type, p),
+                                    Err((code, message)) => {
+                                        let p = autumn_rpc::RpcError::encode_status(code, &message);
+                                        Frame::error(req_id, msg_type, p)
+                                    }
+                                };
+                                // best-effort send: if resp_rx already
+                                // dropped (conn closed), the dispatch's
+                                // work is wasted but no error to
+                                // propagate.
+                                let _ = tx.unbounded_send(resp_frame.encode());
+                            })
+                            .detach();
+                        }
+                        Some(_) => continue,
+                        None => break,
+                    }
+                }
+            }
+        }
+        .await;
+
+        // Reader exited (EOF or err) → close resp_tx so writer drains
+        // remaining responses and exits.
+        drop(resp_tx);
+        let _ = writer_task.await;
+        reader_result
+    }
+
+    async fn dispatch(&self, msg_type: u8, payload: Bytes) -> HandlerResult {
+        match msg_type {
+            MSG_STATUS => self.handle_status().await,
+            MSG_ACQUIRE_OWNER_LOCK => self.handle_acquire_owner_lock(payload).await,
+            MSG_REGISTER_NODE => self.handle_register_node(payload).await,
+            MSG_CREATE_STREAM => self.handle_create_stream(payload).await,
+            MSG_STREAM_INFO => self.handle_stream_info(payload).await,
+            MSG_EXTENT_INFO => self.handle_extent_info(payload).await,
+            MSG_NODES_INFO => self.handle_nodes_info().await,
+            MSG_CHECK_COMMIT_LENGTH => self.handle_check_commit_length(payload).await,
+            MSG_SEAL_TAIL => self.handle_seal_tail(payload).await,
+            MSG_STREAM_ALLOC_EXTENT => self.handle_stream_alloc_extent(payload).await,
+            MSG_STREAM_PUNCH_HOLES => self.handle_stream_punch_holes(payload).await,
+            MSG_TRUNCATE => self.handle_truncate(payload).await,
+            MSG_MULTI_MODIFY_SPLIT => self.handle_multi_modify_split(payload).await,
+            MSG_MERGE_PARTITIONS => self.handle_merge_partitions(payload).await,
+            MSG_GET_POLICY_CANDIDATES => self.handle_get_policy_candidates(payload).await,
+            MSG_REPORT_PARTITION_LOAD => self.handle_report_partition_load(payload).await,
+            MSG_REPORT_DISK_FAILURE => self.handle_report_disk_failure(payload).await,
+            MSG_REGISTER_PS => self.handle_register_ps(payload).await,
+            MSG_UPSERT_PARTITION => self.handle_upsert_partition(payload).await,
+            MSG_GET_REGIONS => self.handle_get_regions().await,
+            MSG_VALIDATE_RECOVERY => self.handle_validate_recovery(payload).await,
+            MSG_GET_CLIENT_REGIONS => self.handle_get_client_regions().await,
+            MSG_HEARTBEAT_PS => self.handle_heartbeat_ps(payload).await,
+            MSG_REGISTER_PARTITION_ADDR => self.handle_register_partition_addr(payload).await,
+            MSG_RECONCILE_EXTENTS => self.handle_reconcile_extents(payload).await,
+            MSG_UPDATE_STREAM_EC => self.handle_update_stream_ec(payload).await,
+            MSG_FORCE_EC_CONVERT => self.handle_force_ec_convert(payload).await,
+            MSG_GET_PARTITION_DETAIL => self.handle_get_partition_detail(payload).await,
+            MSG_GET_POLICY_KIND_NAMES => self.handle_get_policy_kind_names(payload).await,
+            // ── operator-driven node lifecycle ──────────────────────
+            MSG_LIST_NODE_STATES => self.handle_list_node_states(payload).await,
+            MSG_EXTENT_HEALTH_REPORT => self.handle_extent_health_report(payload).await,
+            MSG_EXTENT_HEALTH_SUMMARY => self.handle_extent_health_summary(payload).await,
+            MSG_REMOVE_MEMBER => self.handle_remove_member(payload).await,
+            MSG_GET_CLUSTER_STATUS => self.handle_get_cluster_status().await,
+            MSG_EXTENTS_IN_FLIGHT => self.handle_extents_in_flight(payload),
+            MSG_LIST_EC_INFLIGHT_MARKERS => self.handle_list_ec_inflight_markers(payload).await,
+            MSG_FENCE_NODE => self.handle_fence_node(payload).await,
+            MSG_SET_NODE_MAINTENANCE => self.handle_set_node_maintenance(payload).await,
+            MSG_CLEAR_NODE_OVERRIDE => self.handle_clear_node_override(payload).await,
+            MSG_REMOVE_NODE => self.handle_remove_node(payload).await,
+            MSG_RECOVERY_STATS => self.handle_recovery_stats(payload).await,
+            MSG_QUERY_AUDIT_LOG => self.handle_query_audit_log(payload).await,
+            MSG_GET_CLUSTER_ID => self.handle_get_cluster_id().await,
+            // ── WAL self-heal A5: isolate a corrupt log_stream replica ──
+            MSG_REPORT_CORRUPT_REPLICA => self.handle_report_corrupt_replica(payload).await,
+            // ── cluster-df: aggregate capacity summary ──────────────────
+            MSG_CLUSTER_DF => self.handle_cluster_df().await,
+            // ── dashboard compact overview (no per-extent array) ────────
+            MSG_GET_CLUSTER_OVERVIEW => self.handle_get_cluster_overview().await,
+            // ── inode-level lease + close-to-open ──────────────────────
+            MSG_ACQUIRE_LEASE => self.handle_acquire_lease(payload).await,
+            MSG_RELEASE_LEASE => self.handle_release_lease(payload).await,
+            MSG_HEARTBEAT_LEASE => self.handle_heartbeat_lease(payload).await,
+            MSG_POLL_INVALIDATIONS => self.handle_poll_invalidations(payload).await,
+            // ── manager-as-KDC (data-plane authz) ────────────
+            MSG_MINT_TOKEN => self.handle_mint_token(payload).await,
+            MSG_GET_AUTHZ_CONFIG => self.handle_get_authz_config().await,
+            MSG_PRINCIPAL_CREATE => self.handle_principal_create(payload).await,
+            MSG_PRINCIPAL_DELETE => self.handle_principal_delete(payload).await,
+            // ── namespace registry ─────────────────────────
+            MSG_NAMESPACE_CREATE => self.handle_namespace_create(payload).await,
+            MSG_NAMESPACE_DELETE => self.handle_namespace_delete(payload).await,
+            MSG_NAMESPACE_LIST => self.handle_namespace_list().await,
+            MSG_PRINCIPAL_LIST => self.handle_principal_list().await,
+            MSG_NAMESPACE_SET_PRESPLIT => self.handle_namespace_set_presplit(payload).await,
+            // ── crash-safe fuse-fs inode allocation ──────
+            MSG_ALLOC_INODES => self.handle_alloc_inodes(payload).await,
+            MSG_AUTOPOLICY_GET => self.handle_autopolicy_get(payload).await,
+            MSG_AUTOPOLICY_SET => self.handle_autopolicy_set(payload).await,
+            MSG_REBALANCE_REGIONS => self.handle_rebalance_regions(payload).await,
+            MSG_OP_SUBMIT => self.handle_op_submit(payload).await,
+            MSG_OP_QUERY => self.handle_op_query(payload).await,
+            MSG_OP_HISTORY => self.handle_op_history(payload).await,
+            MSG_GET_RUNTIME_CONFIG => self.handle_get_runtime_config(),
+            MSG_SET_RUNTIME_CONFIG => self.handle_set_runtime_config(payload).await,
+            _ => Err((
+                StatusCode::InvalidArgument,
+                format!("unknown msg_type {msg_type}"),
+            )),
+        }
+    }
+
+    // ── RPC handlers ───────────────────────────────────────────────────
+
+    async fn handle_status(&self) -> HandlerResult {
+        Self::code_resp(CODE_OK, String::new())
+    }
+
+    /// read-only cluster identity. Servable from any replica
+    /// (followers answer from replayed state); no leader gate. The only
+    /// failure mode is "the manager has never run leader election yet
+    /// against a fresh etcd" — surfaced as `CODE_UNAVAILABLE` so the
+    /// caller (typically `autumn-op format`) knows to retry.
+    async fn handle_get_cluster_id(&self) -> HandlerResult {
+        let id = self.cluster_id.borrow().clone();
+        if id.is_empty() {
+            return Ok(rkyv_encode(&GetClusterIdResp {
+                code: CODE_ERROR,
+                message: "manager not yet bootstrapped".to_string(),
+                cluster_id: String::new(),
+                wire_version_min: autumn_rpc::client_hello::reported_wire_versions().min,
+                wire_version_max: autumn_rpc::client_hello::reported_wire_versions().max,
+                cluster_version: 0,
+            }));
+        }
+        Ok(rkyv_encode(&GetClusterIdResp {
+            code: CODE_OK,
+            message: String::new(),
+            cluster_id: id,
+            wire_version_min: autumn_rpc::client_hello::reported_wire_versions().min,
+            wire_version_max: autumn_rpc::client_hello::reported_wire_versions().max,
+            cluster_version: 0,
+        }))
+    }
+
+    // ── manager-as-KDC (data-plane authz) ─────────────────────────
+
+    /// `MSG_MINT_TOKEN` — a client authenticates with its permanent principal
+    /// credential and receives a short-TTL signed capability token. Leader-only:
+    /// the principal account DB is authoritative only on the leader (replayed on
+    /// promotion); a follower's copy may be stale/empty.
+    async fn handle_mint_token(&self, payload: Bytes) -> HandlerResult {
+        if let Err(err) = self.ensure_leader() {
+            return Ok(rkyv_encode(&MintTokenResp {
+                code: Self::err_to_code(&err),
+                message: err.to_string(),
+                token: Vec::new(),
+                exp: 0,
+            }));
+        }
+        let req: MintTokenReq =
+            rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+
+        // Authz must be enabled (a signing key was configured) and have an
+        // enabled signing key. No awaits below → the keyring borrow is safe.
+        let kr = self.authz_keyring.borrow();
+        let (kid, sk) = match kr.as_ref().and_then(|k| k.active()) {
+            Some(v) => v,
+            None => {
+                return Ok(rkyv_encode(&MintTokenResp {
+                    code: CODE_ERROR,
+                    message: "authz not enabled / no signing key on this manager".to_string(),
+                    token: Vec::new(),
+                    exp: 0,
+                }));
+            }
+        };
+
+        // Verify the credential (constant-time). A missing principal and a wrong
+        // credential return the SAME opaque error (don't reveal which).
+        let allowed_prefixes = {
+            let accts = self.principal_accounts.borrow();
+            match accts.get(&req.principal) {
+                Some(acct)
+                    if crate::authz::ct_eq_32(
+                        &crate::authz::credential_hash(&req.credential),
+                        &acct.credential_hash,
+                    ) =>
+                {
+                    acct.allowed_prefixes.clone()
+                }
+                _ => {
+                    return Ok(rkyv_encode(&MintTokenResp {
+                        code: CODE_PRECONDITION,
+                        message: "principal or credential invalid".to_string(),
+                        token: Vec::new(),
+                        exp: 0,
+                    }));
+                }
+            }
+        };
+
+        let now = Self::epoch_seconds().max(0) as u64;
+        // saturating_add so a (clamped, but defensively) large TTL can't wrap
+        // now+ttl into a past exp.
+        let exp = now.saturating_add(self.params().auth_token_ttl_secs.get());
+        let claims = autumn_rpc::cap_token::CapClaims {
+            ver: autumn_rpc::cap_token::CAP_VER,
+            typ: autumn_rpc::cap_token::CAP_TYP.to_string(),
+            kid,
+            iss: "autumn-mgr".to_string(),
+            aud: self.cluster_id.borrow().clone(),
+            iat: now,
+            nbf: now,
+            exp,
+            allowed_prefixes,
+        };
+        match autumn_rpc::cap_token::sign_claims(sk, &claims) {
+            Ok(token) => Ok(rkyv_encode(&MintTokenResp {
+                code: CODE_OK,
+                message: String::new(),
+                token,
+                exp,
+            })),
+            Err(e) => Ok(rkyv_encode(&MintTokenResp {
+                code: CODE_ERROR,
+                message: format!("sign failed: {e}"),
+                token: Vec::new(),
+                exp: 0,
+            })),
+        }
+    }
+
+    /// `MSG_GET_AUTHZ_CONFIG` — PS polls this (cached) to learn the public keys
+    /// + the registered namespace list.
+    ///
+    /// **LEADER-GATED (D2).** Pre-D2 this was intentionally
+    /// follower-answerable because the response was STATIC local config (the same
+    /// signing-key file on every manager via cluster.sh). D2 folded in DYNAMIC,
+    /// leader-maintained state — the `namespaces` list comes from the etcd
+    /// registry, which only the leader replays. A follower's shadow is
+    /// empty/stale, so answering from it would publish an EMPTY namespace list
+    /// (Layer-A would then reject every write). So we refuse from a follower with `CODE_NOT_LEADER`; the PS
+    /// `fetch_authz_config_once` rotates to the leader on that code AND keeps its
+    /// last-known cached config through the election window (it only `install`s
+    /// on `CODE_OK`), so enforcement never fail-opens on a transient follower hit.
+    async fn handle_get_authz_config(&self) -> HandlerResult {
+        if let Err(err) = self.ensure_leader() {
+            return Ok(rkyv_encode(&GetAuthzConfigResp {
+                code: Self::err_to_code(&err),
+                message: err.to_string(),
+                ..Default::default()
+            }));
+        }
+        let kr = self.authz_keyring.borrow();
+        let (enabled, public_keys) = match kr.as_ref() {
+            Some(k) => (true, k.published()),
+            None => (false, Vec::new()),
+        };
+        // Layer-A's data source: every registered namespace prefix.
+        let namespaces: Vec<Vec<u8>> = self
+            .namespaces
+            .borrow()
+            .values()
+            .map(|row| row.prefix.clone())
+            .collect();
+        Ok(rkyv_encode(&GetAuthzConfigResp {
+            code: CODE_OK,
+            message: String::new(),
+            enabled,
+            public_keys,
+            namespaces,
+            token_ttl_secs: self.params().auth_token_ttl_secs.get(),
+            clock_skew_secs: self.params().auth_clock_skew_secs.get(),
+            cluster_id: self.cluster_id.borrow().clone(),
+        }))
+    }
+
+    /// `MSG_PRINCIPAL_CREATE` — admin creates/rotates a principal account. Leader-only,
+    /// Admin connection only. Returns the freshly-generated permanent credential
+    /// (shown once; only its SHA-256 hash is stored).
+    async fn handle_principal_create(&self, payload: Bytes) -> HandlerResult {
+        if let Err(err) = self.ensure_leader() {
+            return Ok(rkyv_encode(&PrincipalCreateResp {
+                code: Self::err_to_code(&err),
+                message: err.to_string(),
+                credential: Vec::new(),
+            }));
+        }
+        let req: PrincipalCreateReq =
+            rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+
+
+        if req.principal.is_empty() {
+            return Ok(rkyv_encode(&PrincipalCreateResp {
+                code: CODE_INVALID_ARGUMENT,
+                message: "principal must be non-empty".to_string(),
+                credential: Vec::new(),
+            }));
+        }
+        if req.allowed_prefixes.is_empty() {
+            return Ok(rkyv_encode(&PrincipalCreateResp {
+                code: CODE_INVALID_ARGUMENT,
+                message: "at least one allowed_prefix required".to_string(),
+                credential: Vec::new(),
+            }));
+        }
+        // Normalize each prefix to end with '/' (unforgeable segment boundary).
+        let mut allowed_prefixes = req.allowed_prefixes.clone();
+        for p in &mut allowed_prefixes {
+            if p.is_empty() {
+                return Ok(rkyv_encode(&PrincipalCreateResp {
+                    code: CODE_INVALID_ARGUMENT,
+                    message: "empty allowed_prefix".to_string(),
+                    credential: Vec::new(),
+                }));
+            }
+            if p.last() != Some(&b'/') {
+                p.push(b'/');
+            }
+        }
+
+        // Fresh 32-byte credential from the OS CSPRNG (returned once).
+        let mut cred = [0u8; 32];
+        {
+            use rand::RngCore;
+            rand::rngs::OsRng.fill_bytes(&mut cred);
+        }
+        let acct = crate::persist::records::PrincipalAccountRecord {
+            principal: req.principal.clone(),
+            credential_hash: crate::authz::credential_hash(&cred),
+            allowed_prefixes,
+        };
+        // Serialize the whole write critical section (etcd → memory apply) so a
+        // concurrent same-principal op can't commit to etcd in one order but apply
+        // to memory in the other. etcd-first (Programming Note 1),
+        // fenced txn.
+        let _admin = self.principal_admin_lock.lock().await;
+        let key = format!("{}{}", crate::PRINCIPAL_PREFIX, req.principal);
+        if let Some(etcd) = &self.etcd {
+            if let Err(err) = etcd
+                .put_msgs_txn(vec![(key, crate::persist::encode(&acct))])
+                .await
+            {
+                return Ok(rkyv_encode(&PrincipalCreateResp {
+                    code: Self::err_to_code(&err),
+                    message: err.to_string(),
+                    credential: Vec::new(),
+                }));
+            }
+        }
+        self.principal_accounts
+            .borrow_mut()
+            .insert(req.principal.clone(), acct);
+        Ok(rkyv_encode(&PrincipalCreateResp {
+            code: CODE_OK,
+            message: String::new(),
+            credential: cred.to_vec(),
+        }))
+    }
+
+    /// `MSG_PRINCIPAL_DELETE` — admin removes a principal account (stops renewal;
+    /// the principal's current token still works until it expires). Leader-only,
+    /// Admin connection only.
+    async fn handle_principal_delete(&self, payload: Bytes) -> HandlerResult {
+        if let Err(err) = self.ensure_leader() {
+            return Self::code_resp(Self::err_to_code(&err), err.to_string());
+        }
+        let req: PrincipalDeleteReq =
+            rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+        // Same serialization as principal-create: create/delete of the
+        // same principal must not reorder between etcd and memory.
+        let _admin = self.principal_admin_lock.lock().await;
+        let key = format!("{}{}", crate::PRINCIPAL_PREFIX, req.principal);
+        if let Some(etcd) = &self.etcd {
+            if let Err(err) = etcd.put_and_delete_txn(Vec::new(), vec![key]).await {
+                return Self::code_resp(Self::err_to_code(&err), err.to_string());
+            }
+        }
+        self.principal_accounts.borrow_mut().remove(&req.principal);
+        Self::code_resp(CODE_OK, String::new())
+    }
+
+    /// `MSG_NAMESPACE_CREATE` (D2) — admin registers a namespace.
+    /// Leader-only, Admin connection only. Rejects reserved names + prefix-overlap;
+    /// etcd-first (Programming Note 1), leader-fenced, serialized on
+    /// `namespace_admin_lock`. Mirrors `handle_principal_create`.
+    async fn handle_namespace_create(&self, payload: Bytes) -> HandlerResult {
+        if let Err(err) = self.ensure_leader() {
+            return Ok(rkyv_encode(&NamespaceCreateResp {
+                code: Self::err_to_code(&err),
+                message: err.to_string(),
+            }));
+        }
+        let req: NamespaceCreateReq =
+            rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+
+
+        // Name charset validation (single path segment).
+        if let Err(msg) = crate::validate_namespace_name(&req.name) {
+            return Ok(rkyv_encode(&NamespaceCreateResp {
+                code: CODE_INVALID_ARGUMENT,
+                message: msg,
+            }));
+        }
+
+        let new_prefix = format!("{}/", req.name).into_bytes();
+
+        // Serialize the whole critical section (existence + disjointness check →
+        // etcd write → in-mem apply) so two concurrent creates can't both pass
+        // the checks and then commit in a conflicting order (mirrors the
+        // principal admin lock).
+        let _admin = self.namespace_admin_lock.lock().await;
+
+        // Already-exists + prefix-disjointness check (under the lock).
+        {
+            let ns = self.namespaces.borrow();
+            if ns.contains_key(&req.name) {
+                return Ok(rkyv_encode(&NamespaceCreateResp {
+                    code: CODE_PRECONDITION,
+                    message: format!("namespace '{}' already exists", req.name),
+                }));
+            }
+            let existing: Vec<&[u8]> = ns.values().map(|r| r.prefix.as_slice()).collect();
+            if crate::namespace_prefix_conflicts(&new_prefix, &existing) {
+                return Ok(rkyv_encode(&NamespaceCreateResp {
+                    code: CODE_INVALID_ARGUMENT,
+                    message: format!(
+                        "namespace '{}' prefix overlaps an existing namespace \
+                         (all namespace prefixes must be pairwise disjoint)",
+                        req.name
+                    ),
+                }));
+            }
+        }
+
+        let row = crate::persist::records::NamespaceRecord {
+            name: req.name.clone(),
+            prefix: new_prefix,
+            presplit: req.presplit.clone(),
+            created_at: Self::epoch_seconds(),
+        };
+        let key = format!("{}{}", crate::NAMESPACE_PREFIX, req.name);
+        if let Some(etcd) = &self.etcd {
+            if let Err(err) = etcd
+                .put_msgs_txn(vec![(key, crate::persist::encode(&row))])
+                .await
+            {
+                return Ok(rkyv_encode(&NamespaceCreateResp {
+                    code: Self::err_to_code(&err),
+                    message: err.to_string(),
+                }));
+            }
+        }
+        self.namespaces.borrow_mut().insert(req.name.clone(), row);
+        Ok(rkyv_encode(&NamespaceCreateResp {
+            code: CODE_OK,
+            message: String::new(),
+        }))
+    }
+
+    /// `MSG_NAMESPACE_DELETE` (D2) — admin removes a namespace registry
+    /// row. Leader-only, Admin connection only. The NON-EMPTY guard (`--force`) is enforced
+    /// CLIENT-SIDE in `autumn-op` (the manager has no KV data-plane client), so
+    /// this handler only drops the etcd registry row. Mirrors
+    /// `handle_principal_delete`.
+    async fn handle_namespace_delete(&self, payload: Bytes) -> HandlerResult {
+        if let Err(err) = self.ensure_leader() {
+            return Self::code_resp(Self::err_to_code(&err), err.to_string());
+        }
+        let req: NamespaceDeleteReq =
+            rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+        let _admin = self.namespace_admin_lock.lock().await;
+        if !self.namespaces.borrow().contains_key(&req.name) {
+            return Self::code_resp(
+                CODE_NOT_FOUND,
+                format!("namespace '{}' not found", req.name),
+            );
+        }
+        let key = format!("{}{}", crate::NAMESPACE_PREFIX, req.name);
+        if let Some(etcd) = &self.etcd {
+            if let Err(err) = etcd.put_and_delete_txn(Vec::new(), vec![key]).await {
+                return Self::code_resp(Self::err_to_code(&err), err.to_string());
+            }
+        }
+        self.namespaces.borrow_mut().remove(&req.name);
+        Self::code_resp(CODE_OK, String::new())
+    }
+
+    /// `MSG_NAMESPACE_LIST` (D2) — list the full registry (rich rows).
+    /// Leader-gated (the registry is leader-maintained; a follower's shadow is
+    /// empty/stale — same reason `GET_AUTHZ_CONFIG` is leader-gated). Read-only,
+    /// not Admin-only.
+    async fn handle_namespace_list(&self) -> HandlerResult {
+        if let Err(err) = self.ensure_leader() {
+            return Ok(rkyv_encode(&NamespaceListResp {
+                code: Self::err_to_code(&err),
+                message: err.to_string(),
+                namespaces: Vec::new(),
+            }));
+        }
+        // The one place a namespace crosses to the wire. The registry holds the
+        // PERSISTED record; the response carries its wire form, and the
+        // conversion between them is the only bridge — see `persist::records`.
+        let mut namespaces: Vec<MgrNamespace> = self
+            .namespaces
+            .borrow()
+            .values()
+            .map(MgrNamespace::from)
+            .collect();
+        // Stable order (by name) for deterministic CLI output.
+        namespaces.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(rkyv_encode(&NamespaceListResp {
+            code: CODE_OK,
+            message: String::new(),
+            namespaces,
+        }))
+    }
+
+    /// step 4: record split points an operator's presplit
+    /// actually applied, so `merge` can refuse to undo them.
+    ///
+    /// UNIONs rather than replaces — see `NamespaceSetPresplitReq`. Admin-gated
+    /// because it changes what merge refuses; leader-gated because the registry
+    /// is leader-maintained.
+    async fn handle_namespace_set_presplit(&self, payload: Bytes) -> HandlerResult {
+        if let Err(err) = self.ensure_leader() {
+            return Ok(rkyv_encode(&CodeResp {
+                code: Self::err_to_code(&err),
+                message: err.to_string(),
+            }));
+        }
+        let req: NamespaceSetPresplitReq =
+            rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+        // Build the updated row WITHOUT touching the live map: etcd is written
+        // first and memory only commits on success, same discipline as
+        // `handle_namespace_create`. Mutating in place and then failing to
+        // persist would leave memory claiming boundaries that a leader failover
+        // (which replays from etcd) would silently forget — merge would then
+        // start allowing what this leader refuses.
+        let mut updated = match self.namespaces.borrow().get(&req.name) {
+            Some(row) => row.clone(),
+            None => {
+                return Ok(rkyv_encode(&CodeResp {
+                    code: CODE_NOT_FOUND,
+                    message: format!("namespace {} is not registered", req.name),
+                }));
+            }
+        };
+        for p in &req.points {
+            if !updated.presplit.contains(p) {
+                updated.presplit.push(p.clone());
+            }
+        }
+        // Sorted so the persisted row is stable regardless of the order the
+        // operator's cuts happened to land in.
+        updated.presplit.sort();
+        if let Some(etcd) = &self.etcd {
+            let key = format!("{}{}", crate::NAMESPACE_PREFIX, req.name);
+            if let Err(err) = etcd
+                .put_msgs_txn(vec![(key, crate::persist::encode(&updated))])
+                .await
+            {
+                return Ok(rkyv_encode(&CodeResp {
+                    code: Self::err_to_code(&err),
+                    message: err.to_string(),
+                }));
+            }
+        }
+        self.namespaces.borrow_mut().insert(req.name.clone(), updated);
+        Ok(rkyv_encode(&CodeResp {
+            code: CODE_OK,
+            message: String::new(),
+        }))
+    }
+
+    /// step 4: is `key` a boundary an operator declared via
+    /// presplit? Returns the owning namespace name if so.
+    ///
+    /// Deliberately GENERIC — the manager never learns what a "lane" is. The
+    /// rule is "an operator-declared boundary is sacred", which is why fs lane
+    /// boundaries, kvc hash buckets and mem agent cuts all get the protection
+    /// from one predicate.
+    pub(crate) fn sacred_boundary_owner(&self, key: &[u8]) -> Option<String> {
+        if key.is_empty() {
+            return None; // the keyspace start is nobody's declared cut
+        }
+        self.namespaces
+            .borrow()
+            .values()
+            .find(|ns| ns.presplit.iter().any(|p| p.as_slice() == key))
+            .map(|ns| ns.name.clone())
+    }
+
+    /// the declared-but-uncut boundary a split of `part_id`
+    /// should snap to, or `None` to let the PS pick a median user key.
+    ///
+    /// Picks the declared point nearest the MIDDLE of the partition's range so a
+    /// split halves the lane span rather than shaving one lane off an end — the
+    /// same balance argument as median selection, applied to the declared grid
+    /// instead of to the data.
+    ///
+    /// "Strictly inside" matters: a point equal to `start_key` is already this
+    /// partition's boundary (splitting there produces an empty child, which the
+    /// PS rejects), and `end_key` belongs to the neighbour.
+    pub(crate) fn declared_split_point_within(&self, part_id: u64) -> Option<Vec<u8>> {
+        let (start, end) = {
+            let s = self.store.inner.borrow();
+            let rg = s.partitions.get(&part_id)?.rg.as_ref()?;
+            (rg.start_key.clone(), rg.end_key.clone())
+        };
+        let ns = self.namespaces.borrow();
+        let mut inside: Vec<&Vec<u8>> = ns
+            .values()
+            .flat_map(|n| n.presplit.iter())
+            .filter(|p| {
+                p.as_slice() > start.as_slice()
+                    && (end.is_empty() || p.as_slice() < end.as_slice())
+            })
+            .collect();
+        if inside.is_empty() {
+            return None;
+        }
+        inside.sort();
+        Some(inside[inside.len() / 2].clone())
+    }
+
+    /// Every declared boundary in the cluster — the policy engine's input for
+    /// skipping merge candidates before they are ever advertised.
+    pub(crate) fn sacred_boundaries(&self) -> std::collections::HashSet<Vec<u8>> {
+        self.namespaces
+            .borrow()
+            .values()
+            .flat_map(|ns| ns.presplit.iter().cloned())
+            .collect()
+    }
+
+    /// list every principal + its grants. Mirrors
+    /// `handle_namespace_list` — leader-gated, read-only, not Admin-only.
+    /// `credential_hash` is dropped on the way out (see `PrincipalRow`).
+    async fn handle_principal_list(&self) -> HandlerResult {
+        if let Err(err) = self.ensure_leader() {
+            return Ok(rkyv_encode(&PrincipalListResp {
+                code: Self::err_to_code(&err),
+                message: err.to_string(),
+                principals: Vec::new(),
+            }));
+        }
+        let mut principals: Vec<PrincipalRow> = self
+            .principal_accounts
+            .borrow()
+            .values()
+            .map(|a| PrincipalRow {
+                name: a.principal.clone(),
+                grants: a.allowed_prefixes.clone(),
+            })
+            .collect();
+        // Stable order (by name) for deterministic CLI output — the map is a
+        // HashMap, so without this the listing shuffles between calls.
+        principals.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(rkyv_encode(&PrincipalListResp {
+            code: CODE_OK,
+            message: String::new(),
+            principals,
+        }))
+    }
+
+    /// Isolate a bit-rotted replica reported by a PS: a WAL replay (log
+    /// stream, self-heal A5) or an SST block read (row stream) that found one
+    /// copy failing its CRC and another passing it. Fenced (owner_epoch + eversion CAS) + etcd-first. Clears the
+    /// corrupt slots' `avali` bits on a SEALED extent (so the A1 read filter
+    /// stops serving from them) and bumps eversion (invalidates client caches).
+    /// OPEN-extent corruption needs seal-and-roll (A4) — refused here with
+    /// CODE_PRECONDITION so the PS fails the open loud rather than self-heal
+    /// an extent whose length isn't yet frozen.
+    async fn handle_report_corrupt_replica(&self, payload: Bytes) -> HandlerResult {
+        let req: ReportCorruptReplicaReq =
+            rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+        if let Err(e) = self.ensure_leader() {
+            return Ok(rkyv_encode(&ReportCorruptReplicaResp {
+                code: Self::err_to_code(&e),
+                message: e.to_string(),
+            }));
+        }
+        // Read the ledger BEFORE the store borrow: it is a different RefCell,
+        // and the decision needs both.
+        let op_in_flight = self.extent_inflight_op(req.extent_id).is_some();
+        // Compute the etcd-first update under a read-only borrow (no mutation
+        // until the persist succeeds — I5).
+        // Either darken these bits, or (already dark) record the reason for
+        // these bits if it is missing.
+        enum Reported {
+            Isolate(ExtentRecord, u32),
+            AlreadyIsolated { unmarked: u32 },
+        }
+        let updated: Result<Reported, (u8, String)> = {
+            let s = self.store.inner.borrow();
+            // I4 fencing: the reporter must be the current partition owner.
+            let owner_key = format!("partition/{}", req.partition_id);
+            match s.owner_epochs.get(&owner_key) {
+                Some(&cur) if cur == req.owner_epoch => {}
+                other => {
+                    // Fencing CAS failed: the reporter is not the current owner
+                    // (stale PS). Manager-namespace code 5 = NOT_LEADER, so use
+                    // PRECONDITION (the report's precondition — being the owner
+                    // — does not hold). The PS treats any non-OK as "don't trust".
+                    return Ok(rkyv_encode(&ReportCorruptReplicaResp {
+                        code: CODE_PRECONDITION,
+                        message: format!(
+                            "stale corrupt-replica report: partition {} owner_epoch {} != current {:?}",
+                            req.partition_id, req.owner_epoch, other
+                        ),
+                    }));
+                }
+            }
+            // I4 scoping: the named stream must actually be
+            // the log or row stream of the partition whose owner_epoch
+            // authorized this report, AND the extent must be a member of that
+            // stream. Without the partition→stream binding, a PS owning
+            // partition A could name partition B's stream + a B extent and
+            // isolate B's replicas. Mirrors punch_holes/truncate operating only
+            // on their named stream's extents, plus the owner→stream ownership
+            // tie. Log: a WAL replay found the rot; row: an SST block read did.
+            match s.partitions.get(&req.partition_id) {
+                Some(pm) if pm.log_stream == req.stream_id || pm.row_stream == req.stream_id => {}
+                _ => {
+                    return Ok(rkyv_encode(&ReportCorruptReplicaResp {
+                        code: CODE_PRECONDITION,
+                        message: format!(
+                            "stream {} is not partition {}'s log or row stream — refusing \
+                             cross-partition corrupt-replica report",
+                            req.stream_id, req.partition_id
+                        ),
+                    }));
+                }
+            }
+            match s.streams.get(&req.stream_id) {
+                Some(si) if si.extent_ids.contains(&req.extent_id) => {}
+                _ => {
+                    return Ok(rkyv_encode(&ReportCorruptReplicaResp {
+                        code: CODE_PRECONDITION,
+                        message: format!(
+                            "extent {} is not a member of stream {} — refusing out-of-scope \
+                             corrupt-replica report",
+                            req.extent_id, req.stream_id
+                        ),
+                    }));
+                }
+            }
+            // The DECISION is shared with the scrub's heartbeat report: what
+            // may be darkened, and when refusing is mandatory, is a property of
+            // the extent, not of who is speaking. Only the AUTHORITY differs,
+            // and that is checked above — a partition server accusing another
+            // node must prove it owns the partition, whereas a node reporting
+            // its own rot needs no such proof.
+            match s.extents.get(&req.extent_id) {
+                None => Err((
+                    CODE_NOT_FOUND,
+                    format!("extent {} not found", req.extent_id),
+                )),
+                // This report rests on the reporter having read the same bytes
+                // from another copy and found them clean. An EC extent has no
+                // other copy of any byte, so that cannot have happened, and a
+                // failed read cannot say which shard is at fault. A shard's own
+                // checksum can; that finding arrives from its node's scrub.
+                Some(ex) if ex.ec_converted => Err((
+                    CODE_PRECONDITION,
+                    format!(
+                        "extent {} is EC-converted; there is no second copy to have \
+                         confirmed clean (a shard's own node reports its rot)",
+                        req.extent_id
+                    ),
+                )),
+                Some(ex) => match crate::extent_corrupt::compute_corrupt_isolation(
+                    ex,
+                    &req.corrupt_node_ids,
+                    req.eversion,
+                    op_in_flight,
+                ) {
+                    crate::extent_corrupt::IsolationOutcome::Isolate {
+                        updated,
+                        cleared_mask,
+                    } => Ok(Reported::Isolate(updated, cleared_mask)),
+                    // Reported replicas are already dark: a retried report after
+                    // the first isolation landed. They may be dark WITHOUT the
+                    // reason recorded (isolated before isolation and mark shared
+                    // a transaction); an unmarked dark slot reads as behind and
+                    // the loop would catch it up in place — a length check the
+                    // rotted copy passes. So the reason is recorded here.
+                    crate::extent_corrupt::IsolationOutcome::AlreadyIsolated => {
+                        let unmarked = Self::extent_nodes(ex)
+                            .iter()
+                            .enumerate()
+                            .filter(|(slot, node)| {
+                                *slot < 32
+                                    && req.corrupt_node_ids.contains(node)
+                                    && !self.slot_is_corrupt(ex.extent_id, *slot)
+                            })
+                            .fold(0u32, |bits, (slot, _)| bits | (1u32 << slot));
+                        Ok(Reported::AlreadyIsolated { unmarked })
+                    }
+                    crate::extent_corrupt::IsolationOutcome::Stale { message } => {
+                        Err((CODE_PRECONDITION, message))
+                    }
+                    crate::extent_corrupt::IsolationOutcome::Refused { code, message } => {
+                        Err((code, message))
+                    }
+                },
+            }
+        };
+        let (updated, cleared_bits) = match updated {
+            Ok(Reported::Isolate(u, bits)) => (u, bits),
+            // Idempotent success, distinguishable from a refusal — the PS
+            // treats any non-OK as "do not trust" and would fail its open. A
+            // mark that cannot be written is the one non-OK here: the PS
+            // retries, and until then the slot must not look merely behind.
+            Ok(Reported::AlreadyIsolated { unmarked }) => {
+                if let Err(err) = self.mark_slots_corrupt(req.extent_id, unmarked).await {
+                    return Ok(rkyv_encode(&ReportCorruptReplicaResp {
+                        code: Self::err_to_code(&err),
+                        message: format!(
+                            "extent {} already isolated, but recording why failed: {err}",
+                            req.extent_id
+                        ),
+                    }));
+                }
+                return Ok(rkyv_encode(&ReportCorruptReplicaResp {
+                    code: CODE_OK,
+                    message: "no-op (reported replica(s) already isolated)".into(),
+                }));
+            }
+            Err((code, message)) => {
+                return Ok(rkyv_encode(&ReportCorruptReplicaResp { code, message }))
+            }
+        };
+        // etcd-first: persist the avali change before touching in-memory.
+        // NOTE (deferred per manager CLAUDE.md note 33): this is a
+        // blind put on extents/<id>, not a value-CAS, so a concurrent extent-
+        // state mutator (recovery/EC/seal/split) landing during this await can
+        // be rolled back in etcd by our stale clone. A5 is in the SAME deferred
+        // class as apply_recovery_done / apply_ec_conversion_done / split-seal /
+        // sync_vp_refs — all blind-put + verify-at-apply (the pattern
+        // below), accepting the etcd-RTT residual that note 33's reproduce-first
+        // investigation found "not reproducible and structurally near-precluded"
+        // (recovery/EC serialize per extent via the inflight ledger; A5 only fires
+        // on actual bit-rot during a partition open). The generalized
+        // put_delete_txn_cas is kept ready to apply here IF an extent-state
+        // clobber is ever actually reproduced — do NOT add it speculatively.
+        //
+        // The isolation and WHY these slots went dark land together. A clear
+        // `avali` bit alone reads as "behind", which the dispatch loop heals
+        // in place with re_avali — a length comparison a full-length rotted
+        // replica passes.
+        let marked = match self
+            .persist_isolation_with_mark(&updated, cleared_bits)
+            .await
+        {
+            Ok(marked) => marked,
+            Err(err) => {
+                return Ok(rkyv_encode(&ReportCorruptReplicaResp {
+                    code: Self::err_to_code(&err),
+                    message: err.to_string(),
+                }));
+            }
+        };
+        // Verify-at-apply (the same pattern): a concurrent mutator
+        // (recovery_done / ec_convert_done / seal / split) could have bumped
+        // this extent's eversion during the persist await. We snapshotted the
+        // pre-bump baseline as `req.eversion`; if the live extent no longer
+        // matches it, another op ran — do NOT stomp it with our stale clone.
+        // Refuse (the orphan etcd revision is benign: failover replay reads the
+        // latest per key, and the PS retry re-detects + re-reports).
+        {
+            let mut s = self.store.inner.borrow_mut();
+            match s.extents.get(&updated.extent_id) {
+                Some(live) if live.eversion != req.eversion => {
+                    return Ok(rkyv_encode(&ReportCorruptReplicaResp {
+                        code: CODE_PRECONDITION,
+                        message: format!(
+                            "extent {} eversion changed during isolation ({} != snapshot {}); \
+                             concurrent op — PS should retry",
+                            updated.extent_id, live.eversion, req.eversion
+                        ),
+                    }));
+                }
+                _ => {}
+            }
+            s.extents.insert(updated.extent_id, updated.clone());
+            // OR, not overwrite: a concurrent report of another slot may
+            // have recorded its bit while this write was in flight.
+            *self
+                .extent_corrupt_slots
+                .borrow_mut()
+                .entry(updated.extent_id)
+                .or_insert(0) |= marked;
+        }
+        tracing::warn!(
+            extent_id = updated.extent_id,
+            avali = updated.avali,
+            corrupt = ?req.corrupt_node_ids,
+            "isolated corrupt replica(s) a PS reported (avali cleared, eversion bumped)"
+        );
+        Ok(rkyv_encode(&ReportCorruptReplicaResp {
+            code: CODE_OK,
+            message: String::new(),
+        }))
+    }
+
+    pub(crate) async fn handle_acquire_owner_lock(&self, payload: Bytes) -> HandlerResult {
+        let req: AcquireOwnerLockReq =
+            rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+        // Between winning the leader key and finishing replay the fence
+        // would let this commit, and replay would then overwrite the
+        // epoch in memory with the older snapshot it read.
+        if let Err(err) = self.ensure_leader() {
+            return Ok(rkyv_encode(&AcquireOwnerLockResp {
+                code: Self::err_to_code(&err),
+                message: err.to_string(),
+                owner_epoch: 0,
+            }));
+        }
+        match self.acquire_owner_epoch(&req.owner_key).await {
+            Ok(rev) => Ok(rkyv_encode(&AcquireOwnerLockResp {
+                code: CODE_OK,
+                message: String::new(),
+                owner_epoch: rev,
+            })),
+            Err(err) => Ok(rkyv_encode(&AcquireOwnerLockResp {
+                code: Self::err_to_code(&err),
+                message: err.to_string(),
+                owner_epoch: 0,
+            })),
+        }
+    }
+
+    pub async fn handle_register_node(&self, payload: Bytes) -> HandlerResult {
+        let _lifecycle = self.node_lifecycle_lock.lock().await;
+        if let Err(err) = self.ensure_leader() {
+            return Ok(rkyv_encode(&RegisterNodeResp {
+                code: Self::err_to_code(&err),
+                message: err.to_string(),
+                node_id: 0,
+                disk_uuids: vec![],
+            }));
+        }
+
+        let req: RegisterNodeReq =
+            rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+
+        // M0: resolve node identity BEFORE any decision. The
+        // `node_uuid` is the STABLE key (mirrors the PS `ps_id`); the address is
+        // just current location. Precedence:
+        //   - uuid in the index          → that node (uuid match, no adopt);
+        //   - new uuid + address matches a UUID-LESS (legacy) node
+        //                                → that node ADOPTS this uuid;
+        //   - new uuid + address matches a node that ALREADY has a (different)
+        //     uuid, or no address match  → a genuinely NEW node (create) — this
+        //     is what lets a fresh node take over a decommissioned node's IP;
+        //   - uuid-less caller           → legacy address match, no adopt.
+        // `addr_conflict` carries the `node_id` currently holding `req.addr`
+        // under a DIFFERENT non-empty uuid (see the create-refusal below).
+        let (matched, adopt, addr_conflict): (Option<u64>, bool, Option<u64>) = {
+            let s = self.store.inner.borrow();
+            if !req.node_uuid.is_empty() {
+                if let Some(nid) = s
+                    .nodes
+                    .values()
+                    .find(|n| n.node_uuid == req.node_uuid)
+                    .map(|n| n.node_id)
+                {
+                    (Some(nid), false, None)
+                } else if !req.addr.is_empty() {
+                    // New uuid: ADOPT an existing UUID-LESS (legacy) node at this
+                    // address; a node that already has a (different) uuid means
+                    // the address is claimed by a live node under another
+                    // identity → REFUSE (do not create a second record at one
+                    // address — see the conflict return below).
+                    match s.nodes.values().find(|n| n.address == req.addr) {
+                        Some(n) if n.node_uuid.is_empty() => (Some(n.node_id), true, None),
+                        Some(n) => (None, false, Some(n.node_id)),
+                        None => (None, false, None),
+                    }
+                } else {
+                    (None, false, None)
+                }
+            } else if !req.addr.is_empty() {
+                (
+                    s.nodes
+                        .values()
+                        .find(|n| n.address == req.addr)
+                        .map(|n| n.node_id),
+                    false,
+                    None,
+                )
+            } else {
+                (None, false, None)
+            }
+        };
+
+        // M0 (#1): tombstone-by-UUID. The decommission/fence
+        // tombstone travels with the stable identity even after `remove_node`
+        // deletes `nodes/<id>` (which is why `matched` would be None). Scan the
+        // tombstones by uuid so a removed/fenced node returning under its own
+        // identity — at ANY address — is refused, per the decommission
+        // runbook. Empty tombstone uuids (legacy/pre-M0) match nothing.
+        if !req.node_uuid.is_empty() {
+            let tombstoned = self
+                .decommissioned
+                .borrow()
+                .values()
+                .any(|o| o.node_uuid == req.node_uuid)
+                || self
+                    .node_overrides
+                    .borrow()
+                    .values()
+                    .any(|o| o.kind == NODE_OVERRIDE_FENCED && o.node_uuid == req.node_uuid);
+            if tombstoned {
+                return Ok(rkyv_encode(&RegisterNodeResp {
+                    code: CODE_PRECONDITION,
+                    message: format!(
+                        "node_uuid {} was fenced/decommissioned; clear it \
+                         (`autumn-op unfence <id>`) or wipe the data dirs for a \
+                         fresh identity before rejoining",
+                        req.node_uuid
+                    ),
+                    node_id: 0,
+                    disk_uuids: vec![],
+                }));
+            }
+        }
+
+        // M0 (#3): never create a SECOND node record at an address
+        // a live node already holds under a different uuid. Two records at one
+        // address make one physical EN look like two failure domains — RF
+        // double-placement — and the df loop (no identity echo until M1) would
+        // keep BOTH Online from the single EN's heartbeat. The recycled-pod-IP
+        // case is legitimate ONLY after the old node is fence+removed (gone from
+        // `s.nodes` → no conflict). Fail loud; the operator removes the old
+        // record first.
+        if let Some(holder) = addr_conflict {
+            return Ok(rkyv_encode(&RegisterNodeResp {
+                code: CODE_PRECONDITION,
+                message: format!(
+                    "address {} is held by node {} under a different uuid; \
+                     fence + remove it before reusing the address",
+                    req.addr, holder
+                ),
+                node_id: 0,
+                disk_uuids: vec![],
+            }));
+        }
+
+        // #2 zombie defense — UUID-KEYED via the matched node. The
+        // decommission/Fence tombstone travels with the NODE, not the IP: a
+        // recycled pod IP under a fresh uuid is not falsely refused, and a
+        // decommissioned node returning under its own uuid at any address IS.
+        if let Some(pid) = matched {
+            if self.decommissioned.borrow().contains_key(&pid) {
+                return Ok(rkyv_encode(&RegisterNodeResp {
+                    code: CODE_PRECONDITION,
+                    message: format!(
+                        "node {pid} was previously decommissioned; operator must clear tombstone"
+                    ),
+                    node_id: 0,
+                    disk_uuids: vec![],
+                }));
+            }
+            if let Some(o) = self.node_overrides.borrow().get(&pid) {
+                if o.kind == NODE_OVERRIDE_FENCED {
+                    return Ok(rkyv_encode(&RegisterNodeResp {
+                        code: CODE_PRECONDITION,
+                        message: format!(
+                            "node {pid} is Fenced; operator must clear override before re-registering"
+                        ),
+                        node_id: 0,
+                        disk_uuids: vec![],
+                    }));
+                }
+            }
+        }
+
+        // Re-registration / update path. Reuse the matched node_id + disk_ids
+        // rather than rejecting, so an EN recovers from a restart (possibly at a
+        // new address / shard layout) without a cluster wipe.
+        if let Some(node_id) = matched {
+            let (mut existing_node, existing_disks) = {
+                let s = self.store.inner.borrow();
+                match s.nodes.get(&node_id).cloned() {
+                    Some(n) => {
+                        let disks = n
+                            .disks
+                            .iter()
+                            .filter_map(|did| s.disks.get(did).cloned())
+                            .collect::<Vec<_>>();
+                        (n, disks)
+                    }
+                    None => {
+                        // uuid index points at a node that's gone — stale; the
+                        // caller retries and the create path takes over.
+                        return Ok(rkyv_encode(&RegisterNodeResp {
+                            code: CODE_PRECONDITION,
+                            message: format!("node {node_id} identity index stale; retry"),
+                            node_id: 0,
+                            disk_uuids: vec![],
+                        }));
+                    }
+                }
+            };
+
+            let uuid_map: Vec<(String, u64)> = req
+                .disk_uuids
+                .iter()
+                .filter_map(|uuid| {
+                    existing_disks
+                        .iter()
+                        .find(|d| &d.uuid == uuid)
+                        .map(|d| (uuid.clone(), d.disk_id))
+                })
+                .collect();
+
+            if uuid_map.is_empty() && !req.disk_uuids.is_empty() {
+                return Ok(rkyv_encode(&RegisterNodeResp {
+                    code: CODE_PRECONDITION,
+                    message: format!(
+                        "node {node_id} matched but no disk_uuid overlaps — cloned identity file?"
+                    ),
+                    node_id: 0,
+                    disk_uuids: vec![],
+                }));
+            }
+
+            // Update location if changed. An identity-only re-register (empty
+            // `addr` — the M1 `format` re-stamp shape) carries NO live location,
+            // so it must not touch address/shard_ports/control_address at all
+            // (an empty `shard_ports`/`control_address` there is "unspecified",
+            // NOT "clear them"). Only a real self-registration (non-empty addr,
+            // which always ships the live ports + ctrl) updates routing. A
+            // reshard rides this path: the EN re-registers with the SAME addr
+            // and NEW shard_ports → `ports_changed` fires.
+            // etcd-first — mirror (node + optional uuid adoption)
+            // BEFORE the in-memory apply; a crash mid-mirror leaves the new
+            // leader routing to the OLD layout, never a half-applied new one.
+            let has_location = !req.addr.is_empty();
+            let addr_changed = has_location && existing_node.address != req.addr;
+            let ports_changed = has_location && existing_node.shard_ports != req.shard_ports;
+            let ctrl_changed = has_location && existing_node.control_address != req.control_address;
+            if addr_changed || ports_changed || ctrl_changed || adopt {
+                if addr_changed {
+                    existing_node.address = req.addr.clone();
+                }
+                if ports_changed {
+                    existing_node.shard_ports = req.shard_ports.clone();
+                }
+                if ctrl_changed {
+                    existing_node.control_address = req.control_address.clone();
+                }
+                if adopt {
+                    existing_node.node_uuid = req.node_uuid.clone();
+                }
+                if let Err(err) = self.mirror_register_node(&existing_node, &[]).await {
+                    return Ok(rkyv_encode(&RegisterNodeResp {
+                        code: Self::err_to_code(&err),
+                        message: err.to_string(),
+                        node_id: 0,
+                        disk_uuids: vec![],
+                    }));
+                }
+                self.store
+                    .inner
+                    .borrow_mut()
+                    .nodes
+                    .insert(node_id, existing_node.clone());
+            }
+
+            // a LOCATED re-registration (the EN process itself
+            // self-registering, `req.addr` non-empty) counts as a heartbeat —
+            // flip Suspected → Online so the operator-facing health report
+            // reflects the recovery immediately, not on the next df tick.
+            // An IDENTITY-ONLY re-register (`req.addr`
+            // empty — an idempotent `autumn-op format` re-run) is NOT
+            // proof the EN is up (format runs BEFORE the EN starts), so it must
+            // NOT bump liveness — else a formatted-but-not-yet-booted node would
+            // flip Online with its stale location and get selected for
+            // allocation → a black-hole until the EN actually self-registers.
+            // It stays Suspend/Suspected until a real self-register or a
+            // successful df ("unbooted stays Suspend" property).
+            if !req.addr.is_empty() {
+                self.node_states.borrow_mut().on_heartbeat_ok(node_id);
+            }
+            return Ok(rkyv_encode(&RegisterNodeResp {
+                code: CODE_OK,
+                message: String::new(),
+                node_id,
+                disk_uuids: uuid_map,
+            }));
+        }
+
+        // etcd-first ordering (CLAUDE.md note 1). Compute node +
+        // disk_infos (and reserve their IDs via alloc_ids) under a single
+        // borrow_mut, mirror to etcd, then apply to memory in a fresh
+        // borrow_mut. alloc_ids is reserved upfront because IDs must be
+        // monotonic across the whole cluster — wasted IDs from a failed
+        // mirror are safe per note 5 (alloc_ids regeneration on replay
+        // takes max(all_entity_ids)+1, so the gap is harmless).
+        let (node, disk_infos, uuid_map, node_id) = {
+            let mut s = self.store.inner.borrow_mut();
+            let (start, _) = s.alloc_ids((req.disk_uuids.len() + 1) as u64);
+            let node_id = start;
+
+            let mut disk_ids = Vec::with_capacity(req.disk_uuids.len());
+            let mut disk_infos = Vec::with_capacity(req.disk_uuids.len());
+            let mut uuid_map = Vec::new();
+            for (idx, uuid) in req.disk_uuids.iter().enumerate() {
+                let disk_id = node_id + idx as u64 + 1;
+                disk_ids.push(disk_id);
+                let disk = crate::persist::records::DiskRecord {
+                    disk_id,
+                    online: true,
+                    uuid: uuid.clone(),
+                };
+                disk_infos.push(disk);
+                uuid_map.push((uuid.clone(), disk_id));
+            }
+
+            let node = NodeRecord {
+                node_id,
+                address: req.addr,
+                disks: disk_ids,
+                shard_ports: req.shard_ports,
+                control_address: req.control_address,
+                node_uuid: req.node_uuid,
+            };
+            (node, disk_infos, uuid_map, node_id)
+        };
+
+        if let Err(err) = self.mirror_register_node(&node, &disk_infos).await {
+            return Ok(rkyv_encode(&RegisterNodeResp {
+                code: Self::err_to_code(&err),
+                message: err.to_string(),
+                node_id: 0,
+                disk_uuids: vec![],
+            }));
+        }
+
+        {
+            let mut s = self.store.inner.borrow_mut();
+            for disk in &disk_infos {
+                s.disks.insert(disk.disk_id, disk.clone());
+            }
+            s.nodes.insert(node_id, node.clone());
+        }
+        // first-time register seeds `Suspend` — a registered
+        // but never-verified-alive state. The first successful df from
+        // `disk_status_update_loop` transitions to `Online` via
+        // `on_heartbeat_ok`. This previously seeded `Online` directly,
+        // which created a 10-20 s ghost window where a registered-but-
+        // not-yet-started EN was eligible for `select_nodes`.
+        self.node_states.borrow_mut().on_register_first(node_id);
+
+        Ok(rkyv_encode(&RegisterNodeResp {
+            code: CODE_OK,
+            message: String::new(),
+            node_id,
+            disk_uuids: uuid_map,
+        }))
+    }
+
+    async fn handle_create_stream(&self, payload: Bytes) -> HandlerResult {
+        if let Err(err) = self.ensure_leader() {
+            return Ok(rkyv_encode(&CreateStreamResp {
+                code: Self::err_to_code(&err),
+                message: err.to_string(),
+                stream: None,
+                extent: None,
+            }));
+        }
+
+        let req: CreateStreamReq =
+            rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+        let ec_data = req.ec_data_shard;
+        let ec_parity = req.ec_parity_shard;
+
+        // Validate encoding:
+        //   - Replication stream (ec_parity == 0): replicates == ec_data
+        //     (K data nodes, no parity).
+        //   - EC stream (ec_parity >= 1): K >= 2, M >= 1. `replicates`
+        //     and `ec_data` are INDEPENDENT here. `replicates` is the
+        //     open-extent replica count (typically 3), `ec_data` is the
+        //     post-seal data-shard count (e.g. 4, 7), and `ec_parity`
+        //     is the parity-shard count. The ec_conversion_dispatch_loop
+        //     reads the sealed payload from any one of the open
+        //     replicas, encodes into K+M shards, and allocates the
+        //     extra `(K + M − replicates)` host slots needed.
+        //
+        //     Concretely: a 3-replica stream can be converted to 4+1
+        //     EC (K=4 ≠ replicates=3) — `ec_conversion_dispatch_loop`
+        //     allocates 5 − 3 = 2 extra host slots and writes 5 shards
+        //     in total. This decouples the open-write topology from
+        //     the storage-encoded topology.
+        //
+        //     Pre-fix EC streams required `replicates == K+M`, which
+        //     pushed the open-extent allocation onto K+M nodes (each
+        //     holding a full replica). The M extra replicas got
+        //     overwritten with parity bytes on EC conversion anyway,
+        //     so the up-front fanout was pure waste — and any
+        //     seal/EC race had a wider blast radius across K+M nodes
+        //     instead of just the K_open replicas.
+        let total_replicas = req.replicates as usize;
+        let err_msg: Option<String> = if total_replicas == 0 {
+            Some("replicates must be >= 1".to_string())
+        } else if ec_data == 0 {
+            Some(
+                "ec_data_shard must be >= 1 (use ec_data=N, ec_parity=0 for replica streams)"
+                    .to_string(),
+            )
+        } else if ec_parity == 0 {
+            // Replica path: ec_data must equal replicates exactly.
+            if ec_data as usize != total_replicas {
+                Some("ec_data_shard must equal replicates for a replica stream".to_string())
+            } else {
+                None
+            }
+        } else {
+            // EC path: K >= 2, M >= 1. replicates and ec_data are
+            // independent — open extents go on `replicates` nodes;
+            // EC conversion expands to K+M total shards.
+            if ec_data < 2 {
+                Some("ec_data_shard >= 2 required for EC streams".to_string())
+            } else {
+                None
+            }
+        };
+        if let Some(msg) = err_msg {
+            let err = AppError::InvalidArgument(msg);
+            return Ok(rkyv_encode(&CreateStreamResp {
+                code: Self::err_to_code(&err),
+                message: err.to_string(),
+                stream: None,
+                extent: None,
+            }));
+        }
+
+        // capture the nodes that take new data BEFORE borrowing the
+        // store; select_nodes uses it as the primary allocation filter so a
+        // node not yet heard from this term doesn't get picked.
+        let ready_node_ids = self.ready_node_ids();
+        let space_low_node_ids = self.space_low_node_ids();
+        // Abnormal nodes (Suspected, Maintenance, Fence) are hard-excluded
+        // from allocation AND the fallback walk below.
+        let hard_excluded = self.placement_excluded_node_ids();
+        // Captured with the exclusion set, before the store borrow: both read
+        // RefCells disjoint from it, and taking them here keeps the borrow
+        // below purely about the mutation.
+        let placement_load = self.placement_load();
+        let (stream_id, extent_id, selected) = {
+            let mut s = self.store.inner.borrow_mut();
+            let selected =
+                match Self::select_nodes(
+                    &s.nodes,
+                    &ready_node_ids,
+                    &space_low_node_ids,
+                    &hard_excluded,
+                    &placement_load,
+                    total_replicas,
+                    &[],
+                )
+                {
+                    Ok(v) => v,
+                    Err(err) => {
+                        return Ok(rkyv_encode(&CreateStreamResp {
+                            code: Self::err_to_code(&err),
+                            message: err.to_string(),
+                            stream: None,
+                            extent: None,
+                        }))
+                    }
+                };
+            let (start, _) = s.alloc_ids(2);
+            (start, start + 1, selected)
+        };
+
+        // style fallback walk: if a selected node refuses
+        // alloc_extent (process dead, port closed, etc.), try another
+        // node from the remaining pool. Pre-this, handle_create_stream
+        // failed fast on the first replica's error, so a stream couldn't
+        // be created when ANY one of the picked nodes was unreachable —
+        // even though other healthy nodes existed. Mirrors the pattern
+        // in handle_stream_alloc_extent above.
+        let selected_ids: HashSet<u64> = selected.iter().map(|n| n.node_id).collect();
+        let mut fallback_nodes: Vec<NodeRecord> = {
+            let s = self.store.inner.borrow();
+            s.nodes
+                .values()
+                .filter(|n| !selected_ids.contains(&n.node_id))
+                .filter(|n| !hard_excluded.contains(&n.node_id))                .cloned()
+                .collect()
+        };
+        {
+            use rand::seq::SliceRandom;
+            fallback_nodes.shuffle(&mut rand::thread_rng());
+        }
+        let mut fallback_iter = fallback_nodes.into_iter();
+
+        // The files go onto the nodes BEFORE this allocation is published, so
+        // shield the id from the orphan reconcile until the guard drops at the
+        // end of this handler — by which point it has committed or failed.
+        let _allocating = self.mark_allocating(extent_id);
+        let Some((node_ids, disk_ids)) = self
+            .place_extents_with_fallback(&selected, &mut fallback_iter, extent_id)
+            .await
+        else {
+            let err = AppError::Precondition(format!(
+                "no healthy node available to allocate extent {extent_id} for new stream"
+            ));
+            return Ok(rkyv_encode(&CreateStreamResp {
+                code: Self::err_to_code(&err),
+                message: err.to_string(),
+                stream: None,
+                extent: None,
+            }));
+        };
+
+        let stream = StreamRecord {
+            stream_id,
+            extent_ids: vec![extent_id],
+            ec_data_shard: ec_data,
+            ec_parity_shard: ec_parity,
+            replicates: req.replicates,
+        };
+        let extent = ExtentRecord {
+            extent_id,
+            replicates: node_ids,
+            parity: vec![],
+            eversion: 1,
+            refs: 1,
+            vp_table_refs: 0,
+            sealed_length: 0,
+            sealed: false,
+            avali: 0,
+            replicate_disks: disk_ids,
+            parity_disks: vec![],
+            ec_converted: false,
+        };
+
+        // etcd-first ordering (CLAUDE.md note 1). Mirror to etcd
+        // BEFORE applying to in-memory store. The inserts at
+        // s.streams / s.extents previously happened first; a manager crash between
+        // memory-insert and etcd-write left the new leader (post-replay)
+        // without the stream record while the extent files existed on
+        // remote nodes as orphans. The same anti-pattern was fixed in
+        // handle_stream_alloc_extent; this handler was missed.
+        if let Err(err) = self.mirror_create_stream(&stream, &extent).await {
+            return Ok(rkyv_encode(&CreateStreamResp {
+                code: Self::err_to_code(&err),
+                message: err.to_string(),
+                stream: None,
+                extent: None,
+            }));
+        }
+
+        {
+            let mut s = self.store.inner.borrow_mut();
+            s.streams.insert(stream_id, stream.clone());
+            s.extents.insert(extent_id, extent.clone());
+        }
+
+        Ok(rkyv_encode(&CreateStreamResp {
+            code: CODE_OK,
+            message: String::new(),
+            stream: Some((&stream).into()),
+            extent: Some((&extent).into()),
+        }))
+    }
+
+    async fn handle_update_stream_ec(&self, payload: Bytes) -> HandlerResult {
+        if let Err(err) = self.ensure_leader() {
+            return Ok(rkyv_encode(&UpdateStreamEcResp {
+                code: Self::err_to_code(&err),
+                message: err.to_string(),
+                stream: None,
+            }));
+        }
+
+        let req: UpdateStreamEcReq =
+            rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+
+        if req.ec_data_shard < 2 || req.ec_parity_shard == 0 {
+            let err = AppError::InvalidArgument(
+                "ec_data_shard >= 2 and ec_parity_shard >= 1 required".to_string(),
+            );
+            return Ok(rkyv_encode(&UpdateStreamEcResp {
+                code: Self::err_to_code(&err),
+                message: err.to_string(),
+                stream: None,
+            }));
+        }
+
+        // etcd-first ordering (CLAUDE.md note 1). Compute the new
+        // stream snapshot under a read-only borrow, mirror to etcd, then
+        // apply to memory. The handler previously mutated the in-memory
+        // ec_data_shard / ec_parity_shard before the etcd mirror, so a
+        // crash between memory-mutate and etcd-write left the new leader
+        // dispatching the OLD EC shape via ec_conversion_dispatch_loop
+        // while the deposed leader thought it was already updated.
+        let (stream, baseline) = {
+            let s = self.store.inner.borrow();
+            match s.streams.get(&req.stream_id) {
+                Some(st) => {
+                    let mut updated = st.clone();
+                    updated.ec_data_shard = req.ec_data_shard;
+                    updated.ec_parity_shard = req.ec_parity_shard;
+                    (updated, Self::persist_kv_entry("streams", st.stream_id, st).1)
+                }
+                None => {
+                    let err = AppError::NotFound(format!("stream {} not found", req.stream_id));
+                    return Ok(rkyv_encode(&UpdateStreamEcResp {
+                        code: Self::err_to_code(&err),
+                        message: err.to_string(),
+                        stream: None,
+                    }));
+                }
+            }
+        };
+
+        // The write carries the whole record, membership included, so it is
+        // value-CAS'd against the record it was computed from: a tail
+        // allocated while this request was in flight must not be written
+        // over (the next leader replays what etcd holds).
+        if let Err(err) = self.mirror_stream_meta_update_cas(&stream, baseline).await {
+            return Ok(rkyv_encode(&UpdateStreamEcResp {
+                code: Self::err_to_code(&err),
+                message: err.to_string(),
+                stream: None,
+            }));
+        }
+
+        {
+            let mut s = self.store.inner.borrow_mut();
+            // Apply to memory only after etcd persistence succeeds. A stream
+            // a merge deleted meanwhile fails the CAS above (its key is
+            // gone), so this is reached only with the stream still present.
+            if let Some(st) = s.streams.get_mut(&req.stream_id) {
+                st.ec_data_shard = stream.ec_data_shard;
+                st.ec_parity_shard = stream.ec_parity_shard;
+            }
+        }
+
+        Ok(rkyv_encode(&UpdateStreamEcResp {
+            code: CODE_OK,
+            message: String::new(),
+            stream: Some((&stream).into()),
+        }))
+    }
+
+    /// `stream_info`, `extent_info` and `nodes_info` are routing-gated: a
+    /// standby's store is what it replayed when it started, and its callers act
+    /// on the answer (a stream's tail, an extent's layout, node addresses). A
+    /// standby answers NOT_LEADER and the caller moves on; an ex-leader still
+    /// answers while etcd is down (`ensure_routable`).
+    async fn handle_stream_info(&self, payload: Bytes) -> HandlerResult {
+        let req: StreamInfoReq =
+            rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+        if let Err(err) = self.ensure_routable() {
+            return Ok(rkyv_encode(&StreamInfoResp {
+                code: Self::err_to_code(&err),
+                message: err.to_string(),
+                streams: Vec::new(),
+                extents: Vec::new(),
+            }));
+        }
+        let s = self.store.inner.borrow();
+
+        let full_dump = req.stream_ids.is_empty();
+        let ids = if full_dump {
+            s.streams.keys().copied().collect::<Vec<_>>()
+        } else {
+            req.stream_ids
+        };
+
+        let mut streams = Vec::new();
+        let mut extents = Vec::new();
+        let mut member_ids: std::collections::HashSet<u64> = std::collections::HashSet::new();
+
+        for id in ids {
+            if let Some(st) = s.streams.get(&id) {
+                streams.push((id, st.into()));
+                for extent_id in &st.extent_ids {
+                    member_ids.insert(*extent_id);
+                    if let Some(e) = s.extents.get(extent_id) {
+                        extents.push((*extent_id, e.into()));
+                    }
+                }
+            }
+        }
+
+        // Observability: on a full cluster dump (`stream_ids` empty), also
+        // surface extents that exist in the store but are referenced by NO
+        // stream's `extent_ids` — orphan / non-member extents. The loop above
+        // only walks stream membership, so these are otherwise invisible. A
+        // non-member at `refs==0 && vp_table_refs==0` is reclaimable (the
+        // EXTENT10-AUTORECLAIM sweep reaps it); one with `vp_table_refs>0` is a
+        // legacy extent retained by the upgrade-safety guard (live VPs, Stage-2
+        // migration target). `vp_table_refs` is on the wire (ExtentRecord) so
+        // the CLI can show WHY a non-member is retained. Targeted stream_ids
+        // queries (hot path, client.rs) keep the membership-only behaviour.
+        if full_dump {
+            for (eid, e) in s.extents.iter() {
+                if !member_ids.contains(eid) {
+                    extents.push((*eid, e.into()));
+                }
+            }
+        }
+
+        Ok(rkyv_encode(&StreamInfoResp {
+            code: CODE_OK,
+            message: String::new(),
+            streams,
+            extents,
+        }))
+    }
+
+    async fn handle_extent_info(&self, payload: Bytes) -> HandlerResult {
+        let req: ExtentInfoReq =
+            rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+        if let Err(err) = self.ensure_routable() {
+            return Ok(rkyv_encode(&ExtentInfoResp {
+                code: Self::err_to_code(&err),
+                message: err.to_string(),
+                extent: None,
+                payload_location: 0,
+                corrupt_slots: 0,
+            }));
+        }
+        let payload_location = self.payload_location_of(req.extent_id).as_byte();
+        let corrupt_slots = self.corrupt_slots_of(req.extent_id);
+        let s = self.store.inner.borrow();
+        match s.extents.get(&req.extent_id) {
+            Some(e) => Ok(rkyv_encode(&ExtentInfoResp {
+                code: CODE_OK,
+                message: String::new(),
+                extent: Some(e.into()),
+                payload_location,
+                corrupt_slots,
+            })),
+            None => Ok(rkyv_encode(&ExtentInfoResp {
+                code: CODE_NOT_FOUND,
+                message: format!("extent {} not found", req.extent_id),
+                extent: None,
+                payload_location,
+                corrupt_slots: 0,
+            })),
+        }
+    }
+
+    async fn handle_nodes_info(&self) -> HandlerResult {
+        if let Err(err) = self.ensure_routable() {
+            return Ok(rkyv_encode(&NodesInfoResp {
+                code: Self::err_to_code(&err),
+                message: err.to_string(),
+                nodes: Vec::new(),
+                disks_info: Vec::new(),
+            }));
+        }
+        let s = self.store.inner.borrow();
+        // Both registries cross to the wire here, and only here.
+        let nodes = s.nodes.iter().map(|(&id, n)| (id, n.into())).collect();
+        // The registry crosses to the wire here; the stored form is the record.
+        let disks_info = s.disks.iter().map(|(&id, d)| (id, d.into())).collect();
+        Ok(rkyv_encode(&NodesInfoResp {
+            code: CODE_OK,
+            message: String::new(),
+            nodes,
+            disks_info,
+        }))
+    }
+
+    /// cluster-df (MSG_CLUSTER_DF): leader-only read of the in-memory capacity
+    /// snapshot `node_health_loop` maintains. Raw u64 facts only — the
+    /// consumer (autumn-op df / dashboard) computes raw-used/logical-size
+    /// amplification and the EC-dependent writable RANGE.
+    /// No scan / no compute here (done off the request path); O(per_node).
+    /// Pure builder for the cluster-df capacity snapshot (no encode). Shared by
+    /// the `MSG_CLUSTER_DF` handler and the in-process embedded dashboard
+    /// (`dashboard.rs::overview_json`) so both read the identical facts without
+    /// a self-RPC round-trip.
+    pub(crate) fn compute_cluster_df_resp(&self) -> ClusterDfResp {
+        if !self.leader.get() {
+            // A follower's snapshot is replay-stale + its node_health_loop
+            // doesn't run — answer NOT_LEADER so the caller rotates.
+            return ClusterDfResp {
+                code: CODE_NOT_LEADER,
+                message: "not leader".to_string(),
+                raw_total: 0,
+                raw_free: 0,
+                physical_used: 0,
+                logical_stored: 0,
+                logical_open_tail: 0,
+                logical_wal_debt: 0,
+                node_count: 0,
+                last_update_ms: 0,
+                logical_last_update_ms: 0,
+                per_node: Vec::new(),
+            };
+        }
+        let snap = self.cluster_cap.borrow();
+        // uuid comes from the manager's own disk registry, not from the node's
+        // df (which carries ids only); `faulted` from `faulted_disks`, which
+        // records what a node SAID about its disk and is therefore the only
+        // one of the two health bits that is evidence about the disk itself.
+        let store = self.store.inner.borrow();
+        let disks_reg = &store.disks;
+        let faulted = self.faulted_disks.borrow();
+        // Same node-ownership filter `apply_df_disk_health` applies: a stale
+        // `{dir}/disk_id` sentinel makes a node report a disk that belongs to
+        // another node, and rendering it under the reporter would put a fault
+        // on the wrong machine. Unreported registry disks are appended after,
+        // as their own state — but only for a node that ANSWERED df.
+        fn node_disks(
+            node_id: u64,
+            answered: bool,
+            reported: &[(u64, autumn_rpc::extent_rpc::DiskStatus)],
+            store: &crate::store::MetadataState,
+            disks_reg: &std::collections::HashMap<u64, crate::persist::records::DiskRecord>,
+            faulted: &std::collections::HashSet<u64>,
+        ) -> Vec<DiskCapWire> {
+            // A node that did not answer df described NOTHING. Backfilling its
+            // registry disks as "not reported" would turn one unreachable node
+            // into N missing disks, and send the operator to look for a
+            // dropped `--data` directory when the machine is simply down.
+            if !answered {
+                return Vec::new();
+            }
+            let owned: Vec<u64> = store
+                .nodes
+                .get(&node_id)
+                .map(|n| n.disks.clone())
+                .unwrap_or_default();
+            let uuid_of = |id: &u64| {
+                disks_reg
+                    .get(id)
+                    .map(|d| d.uuid.clone())
+                    .unwrap_or_default()
+            };
+            let mut out: Vec<DiskCapWire> = reported
+                .iter()
+                .filter(|(disk_id, _)| owned.contains(disk_id))
+                .map(|(disk_id, st)| DiskCapWire {
+                    disk_id: *disk_id,
+                    uuid: uuid_of(disk_id),
+                    total: st.total,
+                    free: st.free,
+                    extent_bytes: st.extent_bytes,
+                    reported: true,
+                    online: st.online,
+                    faulted: faulted.contains(disk_id),
+                })
+                .collect();
+            // A disk the registry still assigns to this node but the node did
+            // not describe. Without this row the view answering "which disk is
+            // bad" simply has one fewer disk than the node was formatted with,
+            // which is the one shape it must not render as healthy.
+            for disk_id in owned {
+                if reported.iter().any(|(d, _)| *d == disk_id) {
+                    continue;
+                }
+                out.push(DiskCapWire {
+                    disk_id,
+                    uuid: uuid_of(&disk_id),
+                    reported: false,
+                    ..Default::default()
+                });
+            }
+            out.sort_by_key(|d| d.disk_id);
+            out
+        }
+        let per_node = snap
+            .per_node
+            .iter()
+            .map(|(id, c)| NodeCapWire {
+                node_id: *id,
+                total: c.total,
+                free: c.free,
+                extent_bytes: c.extent_bytes,
+                online: c.online,
+                disks: node_disks(*id, c.online, &c.disks, &store, disks_reg, &faulted),
+            })
+            .collect();
+        ClusterDfResp {
+            code: CODE_OK,
+            message: String::new(),
+            raw_total: snap.raw_total,
+            raw_free: snap.raw_free,
+            physical_used: snap.physical_used,
+            logical_stored: snap.logical_stored,
+            logical_open_tail: snap.logical_open_tail,
+            logical_wal_debt: snap.logical_wal_debt,
+            node_count: snap.node_count,
+            last_update_ms: snap.last_update_ms,
+            logical_last_update_ms: snap.logical_last_update_ms,
+            per_node,
+        }
+    }
+
+    async fn handle_cluster_df(&self) -> HandlerResult {
+        Ok(rkyv_encode(&self.compute_cluster_df_resp()))
+    }
+
+    /// nodes with an in-flight Recovery targeting `extent_id`.
+    /// These are *catching-up* members — they hold only a partial replica
+    /// while their slot is being rebuilt — so they MUST be excluded from
+    /// any commit-length `min`. Including a catching-up replica's short
+    /// length would crater the seal below the all-replica-ACK'd commit
+    /// length and silently drop acked data. See the seal/commit sites for
+    /// the full rationale.
+    fn recovering_nodes_for_extent(&self, extent_id: u64) -> std::collections::HashSet<u64> {
+        let mut set = std::collections::HashSet::new();
+        for rec in self.inflight.borrow().values() {
+            if let Some((_, crate::extent_inflight::ExtentOpPayload::Recovery(t))) = rec.unpack() {
+                if t.extent_id == extent_id {
+                    set.insert(t.replace_id);
+                }
+            }
+        }
+        set
+    }
+
+    /// pure WAS-faithful commit/seal-length decision (unit-tested,
+    /// shared by `handle_stream_alloc_extent` seal + `handle_check_commit_length`).
+    ///
+    /// `members` = (slot_idx, node_id) over `replicates ++ parity` in slot
+    /// order. `recovering` = catching-up node_ids (in-flight Recovery) to
+    /// EXCLUDE. `responses` = node_id → reported commit_length for committed
+    /// members that answered the probe.
+    ///
+    /// Returns `(commit_len, avali_bits)` where `commit_len` is the `min`
+    /// over the **reachable** committed (non-catching-up) members.
+    ///
+    /// **WAS seal-over-reachable (the bug-#3 fix).** Earlier revisions required
+    /// EVERY committed member to respond (`reachable == committed`), else
+    /// `Err` — consistency-over-availability. But a node kill+restart leaves
+    /// a committed member unreachable/behind that is NOT in `recovering`
+    /// (recovery is fence-gated), so the seal blocked forever → the
+    /// write path wedged → reads starved (bug #3). WAS does NOT block on a
+    /// slow/dead replica: the Stream Manager seals at the committed length
+    /// over the REACHABLE members and re-replicates the laggard out of band.
+    /// We wish every committed member would answer, but one is enough.
+    ///
+    /// **Why this never drops acked data:** the append path is
+    /// all-replica-ACK, so the acked length is present on EVERY committed
+    /// member (reachable or not). Each reachable committed member therefore
+    /// holds ≥ the acked length, so `min` over the reachable ones is ALSO ≥
+    /// the acked length. The ONLY member that can sit BELOW acked is a
+    /// catching-up replica — and those are excluded via `recovering`. So
+    /// `min`-over-reachable-committed ≥ acked, always: any single committed
+    /// member that answers holds all the acked data (perhaps more, un-acked
+    /// bytes past it), and after the seal a committed member shorter than it
+    /// still holds all the acked data too. So the system recovers from a
+    /// single surviving replica of the WAL, and there is no knob to demand
+    /// more. An unreachable committed
+    /// member gets its `avali` bit left UNSET → the recovery/re_avali path
+    /// reconciles it to `sealed_length` later (the laggard may hold MORE —
+    /// un-acked speculation past the seal, which nothing reads, since every
+    /// read is bounded by `sealed_length`; or LESS — which is copied up).
+    /// Either way acked data is safe. Past the acked length a member's bytes
+    /// may also DIFFER from the others' — a length check cannot see that
+    /// (a divergent-unacked-bytes seal, unreproduced).
+    ///
+    /// `Err` only when no committed member answered (there is none, or none
+    /// was reachable): then nothing tells where the acked data ends.
+    pub(crate) fn compute_commit_seal(
+        members: &[(usize, u64)],
+        recovering: &std::collections::HashSet<u64>,
+        responses: &std::collections::HashMap<u64, u64>,
+    ) -> std::result::Result<(u64, u32), String> {
+        let mut min_len: Option<u64> = None;
+        let mut avali: u32 = 0;
+        let mut committed = 0usize;
+        let mut reachable = 0usize;
+        for &(idx, node_id) in members {
+            if recovering.contains(&node_id) {
+                continue;
+            }
+            committed += 1;
+            if let Some(&v) = responses.get(&node_id) {
+                reachable += 1;
+                avali |= 1u32 << idx;
+                min_len = Some(min_len.map_or(v, |c| c.min(v)));
+            }
+        }
+        // One answering committed member is enough (see doc): it holds all
+        // the acked data. Waiting for all of them blocked on a kill+restarted
+        // laggard (bug #3).
+        if reachable == 0 {
+            return Err(format!("0/{committed} committed members reachable"));
+        }
+        Ok((min_len.unwrap_or(0), avali))
+    }
+
+    pub(crate) async fn handle_check_commit_length(&self, payload: Bytes) -> HandlerResult {
+        let req: CheckCommitLengthReq =
+            rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+        // Strictly the leader's: a standby's or an ex-leader's owner locks are
+        // stale, and its owner-fence refusal does not send the caller on to the
+        // leader the way NOT_LEADER does (a partition open retried it forever).
+        if let Err(err) = self.ensure_leader() {
+            return Ok(rkyv_encode(&CheckCommitLengthResp {
+                code: Self::err_to_code(&err),
+                message: err.to_string(),
+                stream_info: None,
+                end: 0,
+                last_ex_info: None,
+            }));
+        }
+
+        let (stream, ex, nodes) = {
+            let s = self.store.inner.borrow();
+            if let Err(err) = Self::ensure_owner_epoch(&req.owner_key, req.owner_epoch, &s) {
+                return Ok(rkyv_encode(&CheckCommitLengthResp {
+                    code: Self::err_to_code(&err),
+                    message: err.to_string(),
+                    stream_info: None,
+                    end: 0,
+                    last_ex_info: None,
+                }));
+            }
+
+            let stream = match s.streams.get(&req.stream_id).cloned() {
+                Some(v) => v,
+                None => {
+                    return Ok(rkyv_encode(&CheckCommitLengthResp {
+                        code: CODE_NOT_FOUND,
+                        message: format!("stream {}", req.stream_id),
+                        stream_info: None,
+                        end: 0,
+                        last_ex_info: None,
+                    }))
+                }
+            };
+            let tail = match stream.extent_ids.last().copied() {
+                Some(v) => v,
+                None => {
+                    return Ok(rkyv_encode(&CheckCommitLengthResp {
+                        code: CODE_NOT_FOUND,
+                        message: format!("tail extent in stream {}", req.stream_id),
+                        stream_info: None,
+                        end: 0,
+                        last_ex_info: None,
+                    }))
+                }
+            };
+            let ex = match s.extents.get(&tail).cloned() {
+                Some(v) => v,
+                None => {
+                    return Ok(rkyv_encode(&CheckCommitLengthResp {
+                        code: CODE_NOT_FOUND,
+                        message: format!("extent {tail}"),
+                        stream_info: None,
+                        end: 0,
+                        last_ex_info: None,
+                    }))
+                }
+            };
+            (stream, ex, s.nodes.clone())
+        };
+
+        if ex.sealed {
+            // Sealed extent (possibly empty: sealed_length may be 0) → its
+            // committed length is fixed at sealed_length, no probe needed.
+            tracing::info!(
+                target: "ccl_trace",
+                stream_id = req.stream_id,
+                extent_id = ex.extent_id,
+                sealed_length = ex.sealed_length,
+                "check_commit_length: tail already SEALED (short-circuit)"
+            );
+            return Ok(rkyv_encode(&CheckCommitLengthResp {
+                code: CODE_OK,
+                message: String::new(),
+                stream_info: Some((&stream).into()),
+                end: ex.sealed_length,
+                last_ex_info: Some((&ex).into()),
+            }));
+        }
+
+        let end = match self
+            .probe_commit_seal(&ex, req.owner_epoch, &nodes, req.stream_id, "check_commit_length")
+            .await
+        {
+            Ok((len, _avali)) => len,
+            Err(reason) => {
+                let err = AppError::Precondition(format!(
+                    "commit-length extent {}: {}",
+                    ex.extent_id, reason
+                ));
+                return Ok(rkyv_encode(&CheckCommitLengthResp {
+                    code: Self::err_to_code(&err),
+                    message: err.to_string(),
+                    stream_info: None,
+                    end: 0,
+                    last_ex_info: None,
+                }));
+            }
+        };
+        Ok(rkyv_encode(&CheckCommitLengthResp {
+            code: CODE_OK,
+            message: String::new(),
+            stream_info: Some((&stream).into()),
+            end,
+            last_ex_info: Some((&ex).into()),
+        }))
+    }
+
+    /// Where a probe seal would put the OPEN extent `ex`: `(length, avali)`
+    /// from `compute_commit_seal` over the members that answer, or why not.
+    ///
+    /// The append path is all-replica-ACK, so every committed member holds
+    /// the acked prefix; one answer is enough, and the min over the answers
+    /// never drops acked data. Catching-up members (an in-flight Recovery's
+    /// partial replica) are not asked: they can sit below the acked length.
+    /// The members are probed concurrently, so one slow replica costs one
+    /// probe timeout (5 s), not one per member.
+    async fn probe_commit_seal(
+        &self,
+        ex: &ExtentRecord,
+        owner_epoch: i64,
+        nodes: &HashMap<u64, NodeRecord>,
+        stream_id: u64,
+        site: &'static str,
+    ) -> std::result::Result<(u64, u32), String> {
+        let recovering = self.recovering_nodes_for_extent(ex.extent_id);
+        let members: Vec<(usize, u64)> = ex
+            .replicates
+            .iter()
+            .copied()
+            .chain(ex.parity.iter().copied())
+            .enumerate()
+            .collect();
+        let to_probe: Vec<(u64, String)> = members
+            .iter()
+            .filter(|(_, node_id)| !recovering.contains(node_id))
+            .filter_map(|(_, node_id)| nodes.get(node_id).map(|n| (*node_id, n.address.clone())))
+            .collect();
+        let probe_results =
+            futures::future::join_all(to_probe.into_iter().map(|(node_id, addr)| async move {
+                let r = self.commit_length_on_node(&addr, ex.extent_id, owner_epoch).await;
+                (node_id, addr, r)
+            }))
+            .await;
+        let mut responses: HashMap<u64, u64> = HashMap::new();
+        for (node_id, addr, r) in probe_results {
+            match r {
+                Ok(v) => {
+                    responses.insert(node_id, v);
+                }
+                // At WARN: a probe routed to the wrong shard shows up here
+                // rather than only as "0/N members reachable".
+                Err(e) => tracing::warn!(
+                    extent_id = ex.extent_id,
+                    node_id,
+                    addr = %addr,
+                    error = %e,
+                    "{site}: commit_length_on_node failed"
+                ),
+            }
+        }
+        tracing::info!(
+            target: "ccl_trace",
+            stream_id,
+            extent_id = ex.extent_id,
+            responses = ?responses,
+            recovering = ?recovering,
+            members = ?members,
+            "{site}: probe responses"
+        );
+        Self::compute_commit_seal(&members, &recovering, &responses)
+    }
+
+    /// `MSG_SEAL_TAIL`: seal the stream's OPEN tail before a partition
+    /// replays it, at the probe-seal length (`probe_commit_seal`), without
+    /// allocating a new tail, so the length it replays is the length every
+    /// later reader and writer sees (docs/seal_length_design.md §2). A member
+    /// that did not answer keeps its `avali` bit unset and is caught up by
+    /// `re_avali` when it does. A sealed tail is returned as it is.
+    pub(crate) async fn handle_seal_tail(&self, payload: Bytes) -> HandlerResult {
+        let req: CheckCommitLengthReq =
+            rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+        let reply = |code: u8, message: String| -> HandlerResult {
+            Ok(rkyv_encode(&CheckCommitLengthResp {
+                code,
+                message,
+                stream_info: None,
+                end: 0,
+                last_ex_info: None,
+            }))
+        };
+        if let Err(err) = self.ensure_leader() {
+            return reply(Self::err_to_code(&err), err.to_string());
+        }
+        let (stream, ex, nodes) = {
+            let s = self.store.inner.borrow();
+            if let Err(err) = Self::ensure_owner_epoch(&req.owner_key, req.owner_epoch, &s) {
+                return reply(Self::err_to_code(&err), err.to_string());
+            }
+            let Some(stream) = s.streams.get(&req.stream_id).cloned() else {
+                return reply(CODE_NOT_FOUND, format!("stream {}", req.stream_id));
+            };
+            let Some(tail) = stream.extent_ids.last().copied() else {
+                return reply(CODE_NOT_FOUND, format!("tail extent in stream {}", req.stream_id));
+            };
+            let Some(ex) = s.extents.get(&tail).cloned() else {
+                return reply(CODE_NOT_FOUND, format!("extent {tail}"));
+            };
+            (stream, ex, s.nodes.clone())
+        };
+        if ex.sealed {
+            return Ok(rkyv_encode(&CheckCommitLengthResp {
+                code: CODE_OK,
+                message: String::new(),
+                stream_info: Some((&stream).into()),
+                end: ex.sealed_length,
+                last_ex_info: Some((&ex).into()),
+            }));
+        }
+        let (len, avali) = match self
+            .probe_commit_seal(&ex, req.owner_epoch, &nodes, req.stream_id, "seal_tail")
+            .await
+        {
+            Ok(v) => v,
+            Err(reason) => {
+                return reply(CODE_PRECONDITION, format!("seal extent {}: {reason}", ex.extent_id))
+            }
+        };
+        let baseline = crate::persist::encode(&ex);
+        let mut sealed = ex.clone();
+        sealed.sealed = true;
+        sealed.sealed_length = len;
+        sealed.eversion += 1;
+        sealed.avali = avali;
+        // Verify before the etcd write: the owner, that the extent is still the
+        // stream's tail and unchanged since the probe. A change landing during
+        // the etcd round trip itself is refused by the txn's compares.
+        {
+            let s = self.store.inner.borrow();
+            if let Err(err) = Self::ensure_owner_epoch(&req.owner_key, req.owner_epoch, &s) {
+                return reply(Self::err_to_code(&err), err.to_string());
+            }
+            let still_tail = s
+                .streams
+                .get(&req.stream_id)
+                .and_then(|st| st.extent_ids.last().copied())
+                == Some(ex.extent_id);
+            let unchanged = s
+                .extents
+                .get(&ex.extent_id)
+                .is_some_and(|live| crate::persist::encode(live) == baseline);
+            if !still_tail || !unchanged {
+                return reply(
+                    CODE_PRECONDITION,
+                    format!(
+                        "seal extent {}: the stream's tail changed while it was probed; retry",
+                        ex.extent_id
+                    ),
+                );
+            }
+        }
+        if let Some(etcd) = &self.etcd {
+            let kvs = vec![Self::persist_kv_entry("extents", sealed.extent_id, &sealed)];
+            let mut cmp = vec![autumn_etcd::Cmp::value(format!("extents/{}", ex.extent_id), baseline)];
+            if !req.owner_key.is_empty() {
+                cmp.push(autumn_etcd::Cmp::mod_revision(
+                    format!("ownerLocks/{}", req.owner_key),
+                    req.owner_epoch,
+                ));
+            }
+            if let Err(err) = etcd.put_delete_txn_compare(kvs, vec![], cmp).await {
+                return reply(Self::err_to_code(&err), err.to_string());
+            }
+        }
+        self.store.inner.borrow_mut().extents.insert(sealed.extent_id, sealed.clone());
+        tracing::info!(
+            stream_id = req.stream_id,
+            extent_id = sealed.extent_id,
+            sealed_length = len,
+            avali = format_args!("{avali:#b}"),
+            "seal_tail: sealed the open tail for replay"
+        );
+        Ok(rkyv_encode(&CheckCommitLengthResp {
+            code: CODE_OK,
+            message: String::new(),
+            stream_info: Some((&stream).into()),
+            end: len,
+            last_ex_info: Some((&sealed).into()),
+        }))
+    }
+
+    /// Build a generic `CodeResp { code, message }` reply — the manager's most
+    /// common response shape. Every handler that returns only a status + message
+    /// (success, not-found, precondition, leader/owner/routable rejects) goes
+    /// through here instead of repeating the `Ok(rkyv_encode(&CodeResp { .. }))`
+    /// boilerplate.
+    pub(crate) fn code_resp(code: u8, message: String) -> HandlerResult {
+        Ok(rkyv_encode(&CodeResp { code, message }))
+    }
+
+    /// Build a `ForceEcConvertResp { code, message }` reply — the only response
+    /// shape `handle_force_ec_convert` emits (idempotent-OK / out-of-policy
+    /// precondition / not-leader / error). Same role as `code_resp`, distinct
+    /// wire type.
+    fn force_ec_resp(code: u8, message: String) -> HandlerResult {
+        Ok(rkyv_encode(&ForceEcConvertResp { code, message }))
+    }
+
+    /// Build a `StreamAllocExtentResp` rejection (no stream/extent payload).
+    /// Every guard in `handle_stream_alloc_extent` (leader / owner-epoch /
+    /// not-found / in-flight / seal-probe / membership-CAS / mirror) returns one
+    /// of these — centralising the `stream_info: None, last_ex_info: None`
+    /// boilerplate keeps each guard a single line. The success + idempotent-no-op
+    /// returns carry `Some(..)` payloads and stay inline.
+    fn alloc_reject(code: u8, message: String) -> HandlerResult {
+        Ok(rkyv_encode(&StreamAllocExtentResp {
+            code,
+            message,
+            stream_info: None,
+            last_ex_info: None,
+        }))
+    }
+
+    /// style placement walk shared by `handle_create_stream` /
+    /// `handle_stream_alloc_extent` / `handle_multi_modify_merge`: try
+    /// `alloc_extent_on_node` on each selected node, walking the (shuffled)
+    /// fallback pool on failure. Returns the placed `(node_ids, disk_ids)`,
+    /// or `None` when the pool is exhausted — the caller emits its own typed
+    /// reject response. Fallback-pool CONSTRUCTION stays at each call site
+    /// (their filters differ, e.g. the exclude set).
+    async fn place_extents_with_fallback(
+        &self,
+        selected: &[NodeRecord],
+        fallback_iter: &mut std::vec::IntoIter<NodeRecord>,
+        extent_id: u64,
+    ) -> Option<(Vec<u64>, Vec<u64>)> {
+        let mut node_ids = Vec::with_capacity(selected.len());
+        let mut disk_ids = Vec::with_capacity(selected.len());
+        for n in selected {
+            let mut candidate = n.clone();
+            let (node_id, disk) = loop {
+                match self
+                    .alloc_extent_on_node(&candidate.address, extent_id)
+                    .await
+                {
+                    Ok(disk) => break (candidate.node_id, disk),
+                    Err(_) => match fallback_iter.next() {
+                        Some(alt) => candidate = alt,
+                        None => return None,
+                    },
+                }
+            };
+            node_ids.push(node_id);
+            disk_ids.push(disk);
+        }
+        Some((node_ids, disk_ids))
+    }
+
+    pub(crate) async fn handle_stream_alloc_extent(&self, payload: Bytes) -> HandlerResult {
+        if let Err(err) = self.ensure_leader() {
+            return Self::alloc_reject(Self::err_to_code(&err), err.to_string());
+        }
+
+        let req: StreamAllocExtentReq =
+            rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+
+        // capture the nodes that take new data before borrowing
+        // the store. See `handle_create_stream` for the same pattern.
+        let ready_node_ids = self.ready_node_ids();
+        let space_low_node_ids = self.space_low_node_ids();
+        let hard_excluded = self.placement_excluded_node_ids();
+        let placement_load = self.placement_load();
+        let (mut tail, selected, extent_id, data, nodes_map, entry_stream) = {
+            let mut s = self.store.inner.borrow_mut();
+            if let Err(err) = Self::ensure_owner_epoch(&req.owner_key, req.owner_epoch, &s) {
+                return Self::alloc_reject(Self::err_to_code(&err), err.to_string());
+            }
+
+            let stream = match s.streams.get(&req.stream_id).cloned() {
+                Some(v) => v,
+                None => {
+                    return Self::alloc_reject(CODE_NOT_FOUND, format!("stream {}", req.stream_id))
+                }
+            };
+            let tail_id = match stream.extent_ids.last().copied() {
+                Some(v) => v,
+                None => {
+                    return Self::alloc_reject(
+                        CODE_NOT_FOUND,
+                        format!("tail extent in stream {}", req.stream_id),
+                    )
+                }
+            };
+            let tail = match s.extents.get(&tail_id).cloned() {
+                Some(v) => v,
+                None => return Self::alloc_reject(CODE_NOT_FOUND, format!("extent {tail_id}")),
+            };
+
+            // Idempotent roll: the writer pinned `seal_extent_id` = the tail
+            // it captured `seal_commit` for. If that is NO LONGER the current
+            // tail, this is a STALE / RETRIED seal-and-roll: a prior attempt
+            // already sealed that extent + rolled a fresh tail, but its response
+            // was lost so the writer retried with the same `seal_commit`. Sealing
+            // the current FRESH tail at the stale `seal_commit` would over-seal an
+            // extent that does NOT durably hold that many bytes → the extent is
+            // unrecoverable → any partition replaying it WAL-FAILSTOPs and never
+            // opens (chaos seed=603 split-child wedge). Idempotent no-op: return
+            // the current tail untouched (it IS the OPEN extent the first attempt
+            // rolled) so the writer adopts it. `seal_extent_id == 0` = no pinned
+            // target (probe / `None` seal) → fall through to the normal path.
+            //
+            // Gate on `!tail.sealed`. If the current tail is itself
+            // SEALED (a later op rolled-and-sealed past the first attempt's fresh
+            // tail), returning it would hand the writer a sealed extent as a
+            // "fresh" tail → its appends fail → roll/retry wedge. In that case
+            // fall through to the existing `already_sealed` path, which preserves
+            // the seal AND allocates a NEW open tail to return.
+            if req.seal_extent_id != 0 && tail_id != req.seal_extent_id && !tail.sealed {
+                return Ok(rkyv_encode(&StreamAllocExtentResp {
+                    code: CODE_OK,
+                    message: String::new(),
+                    stream_info: Some((&stream).into()),
+                    last_ex_info: Some((&tail).into()),
+                }));
+            }
+
+            // refuse-at-start. Symmetric to the EC refuse-at-start guards
+            // (apply_recovery_done, mark_extent_available, handle_multi_modify_split)
+            // and the GC guards (handle_stream_punch_holes, handle_truncate).
+            // Without these guards, a concurrent EC conversion or recovery on the tail
+            // extent would have its eversion+replicates writeback silently
+            // overwritten by our verify-at-apply block below.
+            // collapse the EC + Recovery refuse-at-start
+            // checks into one ledger probe.
+            //
+            // Only refuse when this alloc will
+            // actually re-seal + re-write the tail — i.e. when the tail is
+            // still OPEN (`sealed_length == 0`). When the tail is ALREADY
+            // sealed, the seal block below is skipped and the apply path
+            // (below) no longer writes the tail back to etcd / memory at all,
+            // so a concurrent stream-layer op cannot be clobbered and the
+            // guard is unnecessary. Every ledger op (Recovery / ConvertToEc /
+            // Delete) acts ONLY on a sealed extent, so an in-flight op
+            // implies the tail is sealed; gating here is what lifts the wedge
+            // where a stuck Recovery on the sealed tail (no source replica for
+            // 60s+) blocked new-extent allocation indefinitely, freezing the
+            // write / flush / range paths even though the new extent lands on
+            // entirely different, healthy nodes.
+            if !tail.sealed {
+                if let Some(op) = self.extent_inflight_op(tail_id) {
+                    let msg = autumn_common::alloc_conflict::inflight_defer_message(
+                        tail_id,
+                        &format!("{op:?}"),
+                        "alloc_extent",
+                    );
+                    return Self::alloc_reject(CODE_PRECONDITION, msg);
+                }
+            }
+
+            // The new extent is allocated as an OPEN, REPLICATED extent
+            // on `stream.replicates` nodes. For legacy streams persisted
+            // before `replicates` was added to StreamRecord (default
+            // 0), fall back to `tail.replicates.len()`, which on a
+            // pre-EC-converted tail equals the open replica count.
+            let data = if stream.replicates > 0 {
+                stream.replicates as usize
+            } else {
+                tail.replicates.len()
+            };
+            let selected = match Self::select_nodes(
+                &s.nodes,
+                &ready_node_ids,
+                &space_low_node_ids,
+                &hard_excluded,
+                &placement_load,
+                data,
+                &req.exclude_node_ids,
+            ) {
+                Ok(v) => v,
+                Err(err) => return Self::alloc_reject(Self::err_to_code(&err), err.to_string()),
+            };
+            let (extent_id, _) = s.alloc_ids(1);
+            (tail, selected, extent_id, data, s.nodes.clone(), stream)
+        };
+
+        // capture the tail's eversion BEFORE any mutation so the
+        // verify-at-apply block below can detect concurrent bumps.
+        let expected_eversion = tail.eversion;
+
+        // Seal old extent.
+        //
+        // **Idempotency / EC-corruption guard**: if the tail is already
+        // sealed (some prior caller set `sealed_length > 0`), DO NOT
+        // re-query commit_length and DO NOT overwrite sealed_length.
+        //
+        // Why: after EC conversion of a sealed extent, each replica's
+        // local `entry.len` is rewritten to `shard_size` (the per-shard
+        // payload size, ~ original_sealed_length / data_shards) by
+        // `write_shard_local`. A naive re-seal would query
+        // commit_length, get `shard_size` back from every replica,
+        // take the min (= shard_size), and clobber the manager's
+        // `tail.sealed_length` from `original_payload_len` down to
+        // `shard_size`. Any VP at offset in `[shard_size,
+        // original_payload_len)` would then suddenly be "past
+        // sealed_length" — out-of-bounds on the read path even though
+        // the underlying EC shards still encode the full original
+        // payload. That triggered the production
+        // `range start index N out of range for slice of length L`
+        // panic in the partition server.
+        //
+        // A re-seal request typically arrives via the writer's
+        // soft-error retry path: it observes that the cached tail was
+        // sealed by another owner / split / EC dispatch and calls
+        // `alloc_new_extent(stream_id, 0)` to obtain a fresh tail. We
+        // honor the "allocate a new tail" intent while preserving the
+        // existing seal point.
+        let already_sealed = tail.sealed;
+        {
+            let pause = ALLOC_TEST_PAUSE_MS.swap(0, std::sync::atomic::Ordering::Relaxed);
+            if pause > 0 {
+                compio::time::sleep(Duration::from_millis(pause)).await;
+            }
+        }
+
+        // Assigned exactly once on every branch below (deferred init — no dead
+        // default, no `mut` needed).
+        let min_len: Option<u64>;
+        let avali: u32;
+        if already_sealed {
+            // Preserve the existing seal — do not touch sealed_length,
+            // eversion, or avali. The new-tail allocation below proceeds.
+            min_len = Some(tail.sealed_length);
+            avali = tail.avali;
+        } else if let Some(c) = req.seal_commit {
+            // AUTHORITATIVE: the writer supplied its OWN all-replica-acked
+            // commit on this tail (captured at a quiesced point via the
+            // SealCommit handshake), or a drained worker commit (preemptive roll, stream note 36).
+            // Seal at EXACTLY `c` and do NOT probe — even when `c == 0` (a tail
+            // where nothing was ever all-acked → sealed empty). Under
+            // all-replica-ACK every committed member holds >= the writer's
+            // commit, so sealing there never drops acked data; and because we
+            // do not probe, a speculative/un-acked byte that only one
+            // (soon-dead) reachable member holds is NEVER promoted into
+            // sealed_length — the root fix for the phantom seal (seed=13
+            // Mode A). The probe path below (`None`) is reserved for genuine
+            // new-owner takeover, where the writer has no commit cursor.
+            min_len = Some(c);
+            avali = Self::all_bits(tail.replicates.len() + tail.parity.len());
+        } else {
+            // PROBE (`req.seal_commit == None`): WAS-faithful failover seal (the
+            // writer did not supply a known commit, so this owner must derive it).
+            // commit length = `min` over COMMITTED members only. The append
+            // path is all-replica-ACK, so every committed member holds >=
+            // the acked length; min over the ones that answer is therefore
+            // >= acked and never drops acked data, as long as catching-up
+            // members are excluded. We wish every committed member would
+            // answer, but one is enough.
+            //
+            // This previously took `min` over a majority-quorum subset of
+            // responders: a catching-up replica (partial data from an
+            // in-flight recovery) included in the min cratered
+            // sealed_length below the acked length (silent data loss); a
+            // leading-only subset could also seal above the true commit
+            // (keeping un-acked data).
+            let recovering = self.recovering_nodes_for_extent(tail.extent_id);
+            let members: Vec<(usize, u64)> = tail
+                .replicates
+                .iter()
+                .copied()
+                .chain(tail.parity.iter().copied())
+                .enumerate()
+                .collect();
+            let mut responses: std::collections::HashMap<u64, u64> =
+                std::collections::HashMap::new();
+            // probe replicas CONCURRENTLY (same rationale as
+            // handle_check_commit_length) — a sequential 3-replica loop at 5 s
+            // each is a 15 s worst case on a cold/hiccupping EN. Fence
+            // side-effects are per-EN independent, so ordering doesn't matter.
+            let to_probe: Vec<(u64, String)> = members
+                .iter()
+                .filter(|(_, node_id)| !recovering.contains(node_id))
+                .filter_map(|(_, node_id)| {
+                    nodes_map.get(node_id).map(|n| (*node_id, n.address.clone()))
+                })
+                .collect();
+            for (node_id, r) in
+                futures::future::join_all(to_probe.into_iter().map(|(node_id, addr)| async move {
+                    let r = self
+                        .commit_length_on_node(&addr, tail.extent_id, req.owner_epoch)
+                        .await;
+                    (node_id, r)
+                }))
+                .await
+            {
+                if let Ok(v) = r {
+                    responses.insert(node_id, v);
+                }
+            }
+            // Opt-in trace (`bug2_trace` target): the per-member commit_length probe results
+            // that feed the seal min. A `responses` map of all-zero (or empty)
+            // while the extent holds acked data pins the under-seal to the
+            // probe path (vs the authoritative SealCommit path).
+            tracing::info!(
+                target: "bug2_trace",
+                extent_id = tail.extent_id,
+                stream_id = req.stream_id,
+                ?responses,
+                recovering = ?recovering,
+                "BUG2 probe commit_length responses"
+            );
+            // Shared pure decision: no quorum, exclude catching-up members,
+            // seal at min over the REACHABLE committed members (one is
+            // enough; WAS seal-over-reachable — a kill+restarted laggard no
+            // longer blocks). apply_recovery_done / re_avali set an unset slot's
+            // avali bit when its reconcile to sealed_length completes.
+            match Self::compute_commit_seal(
+                &members,
+                &recovering,
+                &responses,
+            ) {
+                Ok((len, av)) => {
+                    min_len = Some(len);
+                    avali = av;
+                }
+                Err(reason) => {
+                    let err = AppError::Precondition(format!(
+                        "seal extent {}: {}",
+                        tail.extent_id, reason
+                    ));
+                    return Self::alloc_reject(Self::err_to_code(&err), err.to_string());
+                }
+            }
+        }
+
+        let sealed_len = match min_len {
+            Some(v) => v,
+            None => {
+                let err = AppError::Precondition(format!(
+                    "no available commit length for extent {}",
+                    tail.extent_id
+                ));
+                return Self::alloc_reject(Self::err_to_code(&err), err.to_string());
+            }
+        };
+        if !already_sealed {
+            tail.sealed = true;
+            tail.sealed_length = sealed_len;
+            tail.eversion += 1;
+            tail.avali = avali;
+        }
+        // Opt-in trace (target `bug2_trace`): the decisive event. A
+        // `sealed_len == 0` here on a tail that physically held VP/SST-acked
+        // data at offset > 0 is the under-seal that makes a split child
+        // un-openable (`stale_vp_offset_past_sealed_length`). `seal_path`
+        // distinguishes the three causes: an `authoritative_seal_commit` of 0
+        // means the writer's SealCommit handshake returned a stale/reset
+        // worker's `state.commit=0`; a `probe`-path 0 means every reachable
+        // committed member reported commit_length 0 at seal time.
+        let seal_path = if already_sealed {
+            "already_sealed"
+        } else if req.seal_commit.is_some() {
+            "authoritative_seal_commit"
+        } else {
+            "probe"
+        };
+        tracing::info!(
+            target: "bug2_trace",
+            extent_id = tail.extent_id,
+            stream_id = req.stream_id,
+            seal_commit = ?req.seal_commit,
+            seal_path,
+            sealed_len,
+            eversion_old = expected_eversion,
+            eversion_new = tail.eversion,
+            owner_epoch = req.owner_epoch,
+            owner = %req.owner_key,
+            "BUG2 alloc-seal applied"
+        );
+        // Suppress unused warning when `already_sealed` skips the real seal.
+        let _ = sealed_len;
+
+        // Allocate new extent on nodes with fallback
+        let selected_ids: HashSet<u64> = selected.iter().map(|n| n.node_id).collect();
+        // prefer fallbacks not in the writer's recent-failure set; fall
+        // back to the unfiltered set if the exclusion would empty the iter.
+        let exclude_set: HashSet<u64> = req.exclude_node_ids.iter().copied().collect();
+        // hard-exclude fenced/maintenance/suspected at the source
+        // so the `after_exclude.is_empty() → unfiltered` fallback can't re-admit
+        // them either.
+        let unfiltered: Vec<NodeRecord> = nodes_map
+            .values()
+            .filter(|n| !selected_ids.contains(&n.node_id))
+            .filter(|n| !hard_excluded.contains(&n.node_id))
+            .cloned()
+            .collect();
+        let after_exclude: Vec<NodeRecord> = unfiltered
+            .iter()
+            .filter(|n| !exclude_set.contains(&n.node_id))
+            .cloned()
+            .collect();
+        let mut fallback_nodes = if after_exclude.is_empty() {
+            unfiltered
+        } else {
+            after_exclude
+        };
+        // walk fallbacks in random order — ID-sorted order
+        // re-introduces the same low-ID bias that `select_nodes` was
+        // changed to avoid.
+        {
+            use rand::seq::SliceRandom;
+            fallback_nodes.shuffle(&mut rand::thread_rng());
+        }
+        let mut fallback_iter = fallback_nodes.into_iter();
+
+        // The files go onto the nodes BEFORE this allocation is published, so
+        // shield the id from the orphan reconcile until the guard drops at the
+        // end of this handler — by which point it has committed or failed.
+        let _allocating = self.mark_allocating(extent_id);
+        let Some((node_ids, disk_ids)) = self
+            .place_extents_with_fallback(&selected, &mut fallback_iter, extent_id)
+            .await
+        else {
+            let err = AppError::Precondition(format!(
+                "no healthy node available to allocate extent {extent_id}"
+            ));
+            return Self::alloc_reject(Self::err_to_code(&err), err.to_string());
+        };
+
+        let new_extent = ExtentRecord {
+            extent_id,
+            replicates: node_ids[..data].to_vec(),
+            parity: node_ids[data..].to_vec(),
+            eversion: 1,
+            refs: 1,
+            vp_table_refs: 0,
+            sealed_length: 0,
+            sealed: false,
+            avali: 0,
+            replicate_disks: disk_ids[..data].to_vec(),
+            parity_disks: disk_ids[data..].to_vec(),
+            ec_converted: false,
+        };
+
+        // compute stream_after without modifying store, mirror to
+        // etcd FIRST, then apply to in-memory state on success.
+        //
+        // The commit stands on the stream as read at ENTRY, before the awaits
+        // above: the verify below and the etcd CAS compare it with the live
+        // record. A baseline read here, after the awaits, would always match —
+        // a punch / truncate / split / another alloc in the window would go
+        // through, and two allocations on a sealed tail would both append,
+        // leaving an open extent inside the stream (`tests/alloc_extent_races.rs`).
+        let alloc_stream_baseline = crate::persist::encode(&entry_stream);
+        let mut stream_after = entry_stream.clone();
+        stream_after.extent_ids.push(extent_id);
+
+        // verify-BEFORE-mirror (replaces the earlier
+        // verify-AFTER-mirror form). If a concurrent mutator
+        // (recovery_done, ec_conversion_done, punch_holes, truncate,
+        // split) bumped `tail.eversion` during our commit_length /
+        // alloc_extent_on_node await window above, the etcd write we
+        // would otherwise make is stale relative to live memory.
+        //
+        // The check previously ran AFTER the etcd mirror — when verify
+        // failed, the client got `Precondition` but etcd had already
+        // durable-committed the stale write. Failover replay then
+        // re-loaded the stale write as if successful, while the client
+        // believed the call failed. Linearization point unexplainable.
+        //
+        // Verify-BEFORE keeps both etcd and in-memory untouched on the
+        // failure path. A narrow residual window remains (concurrent
+        // mutation during the etcd mirror RTT itself); fully closing it
+        // requires acquiring an exclusive ledger marker for the
+        // alloc_extent op, which is filed as a follow-up (PS-layer
+        // ops currently don't enroll in the ledger by design).
+        //
+        // Stream-record verify (runs for BOTH paths). The etcd mirror +
+        // in-memory apply below write `stream_after` (= the entry snapshot plus
+        // our new extent). If anything changed the stream record during the
+        // awaits, overwriting it would resurrect a removed extent, drop an added
+        // one, or revert a record change: refuse (Precondition) and the client
+        // retries with a fresh snapshot. A change landing during the etcd mirror
+        // RTT itself is refused by the txn's value-CAS. The owner, checked at
+        // entry only, is checked again here: a deposed owner must not get a
+        // fresh tail, which no EN fence floor protects.
+        {
+            let s = self.store.inner.borrow();
+            if let Err(err) = Self::ensure_owner_epoch(&req.owner_key, req.owner_epoch, &s) {
+                return Self::alloc_reject(Self::err_to_code(&err), err.to_string());
+            }
+            match s.streams.get(&req.stream_id) {
+                // The exact bytes the etcd CAS compares, so both modes judge
+                // alike: the apply writes the whole entry snapshot back, and
+                // e.g. an `update_stream_ec` in the window must refuse this
+                // allocation rather than be reverted.
+                Some(live) => {
+                    if crate::persist::encode(live) != alloc_stream_baseline {
+                        let msg = autumn_common::alloc_conflict::membership_changed_message(
+                            req.stream_id,
+                        );
+                        return Self::alloc_reject(CODE_PRECONDITION, msg);
+                    }
+                }
+                None => {
+                    return Self::alloc_reject(CODE_NOT_FOUND, format!("stream {}", req.stream_id));
+                }
+            }
+        }
+
+        // The eversion verify (and the tail writeback below) are
+        // ONLY relevant when this alloc re-seals + re-writes the tail
+        // (`!already_sealed`). When the tail is already sealed we do not
+        // touch the tail at all — the sealer already persisted it and a
+        // concurrent Recovery / ConvertToEc owns its own writeback — so a
+        // tail-eversion bump during our await window is none of our business
+        // and must not abort the new-extent allocation (that abort, paired
+        // with a stuck recovery holding the inflight marker, was the wedge).
+        if !already_sealed {
+            let s = self.store.inner.borrow();
+            let live_eversion = match s.extents.get(&tail.extent_id) {
+                Some(ex) => ex.eversion,
+                None => {
+                    let msg = format!("extent {} was deleted during alloc_extent", tail.extent_id);
+                    return Self::alloc_reject(CODE_PRECONDITION, msg);
+                }
+            };
+            if live_eversion != expected_eversion {
+                let msg = autumn_common::alloc_conflict::eversion_changed_message(
+                    tail.extent_id,
+                    expected_eversion,
+                    live_eversion,
+                );
+                return Self::alloc_reject(CODE_PRECONDITION, msg);
+            }
+        }
+
+        // Pass the tail to the etcd mirror ONLY when we actually
+        // changed it (`!already_sealed`). An already-sealed tail is left
+        // untouched so a concurrent Recovery's `replicates` / `eversion`
+        // writeback (which can land during the mirror RTT) is never
+        // clobbered by our stale early snapshot.
+        let sealed_old = if already_sealed { None } else { Some(&tail) };
+        if let Err(err) = self
+            .mirror_stream_alloc_extent(
+                &stream_after,
+                sealed_old,
+                &new_extent,
+                Some(alloc_stream_baseline),
+                (!req.owner_key.is_empty()).then(|| (req.owner_key.as_str(), req.owner_epoch)),
+            )
+            .await
+        {
+            return Self::alloc_reject(Self::err_to_code(&err), err.to_string());
+        }
+
+        {
+            let mut s = self.store.inner.borrow_mut();
+            if let Some(st) = s.streams.get_mut(&req.stream_id) {
+                *st = stream_after.clone();
+            }
+            // Mirror the etcd decision: only re-insert the tail when we
+            // re-sealed it. An already-sealed tail's in-memory entry may have
+            // been advanced by a concurrent Recovery — leave it as the live
+            // store has it.
+            if !already_sealed {
+                s.extents.insert(tail.extent_id, tail.clone());
+            }
+            s.extents.insert(extent_id, new_extent.clone());
+        }
+
+        Ok(rkyv_encode(&StreamAllocExtentResp {
+            code: CODE_OK,
+            message: String::new(),
+            stream_info: Some((&stream_after).into()),
+            last_ex_info: Some((&new_extent).into()),
+        }))
+    }
+
+    /// Refuse a punch_holes / truncate while any to-be-removed extent has an op
+    /// in flight, whatever its `refs`: nothing preempts (`extent_arbiter.rs`).
+    /// Even a punch that only decrements a CoW-shared extent's refs bumps its
+    /// `eversion`, which voids an in-flight recovery's attempt as surely as
+    /// deleting the extent would. The refusal is a transient conflict
+    /// (`alloc_conflict::inflight_defer_message`): the PS retries on its next
+    /// GC dispatch or checkpoint.
+    fn refuse_if_removed_extent_inflight(
+        &self,
+        removed: &HashSet<u64>,
+        op: &str,
+    ) -> Result<(), AppError> {
+        for &eid in removed {
+            let facts = crate::extent_arbiter::ExtentFacts {
+                extent_id: eid,
+                in_flight: self.extent_inflight_op(eid),
+                ..Default::default()
+            };
+            if let Err(why) = crate::extent_arbiter::may_start(crate::extent_arbiter::ExtentOp::Removal, &facts) {
+                tracing::debug!(extent_id = eid, "{op} deferred: {why}");
+                let kind = facts.in_flight.map(|k| format!("{k:?}")).unwrap_or_default();
+                return Err(AppError::Precondition(
+                    autumn_common::alloc_conflict::inflight_defer_message(eid, &kind, op),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// For every extent in `removed`, compute its ref-drop effect and build
+    /// `(extent_puts, extent_deletes, pending_deletes)`. An extent dropping
+    /// to refs==0 that is physically deletable (`extent_can_delete`) goes to
+    /// `extent_deletes` + gets a `PendingDelete` snapshot; otherwise refs is
+    /// decremented (eversion bumped) into `extent_puts`. Pure read over `s`
+    /// (returns clones). Every caller has already refused an extent with an
+    /// op in flight. Shared by handle_stream_punch_holes + handle_truncate +
+    /// the sealed-empty sweep.
+    pub(crate) fn compute_extent_ref_drops(
+        s: &crate::store::MetadataState,
+        removed: &HashSet<u64>,
+    ) -> (
+        Vec<ExtentRecord>,
+        Vec<u64>,
+        Vec<PendingDelete>,
+        // Per-extent value-CAS baseline (`extents/<id>` == its value BEFORE this
+        // refs-drop). The refs RMW reads `extent`, decrements, and writes
+        // `extents/<id>` — but the txn historically value-CAS'd only
+        // `streams/<id>` (membership). When the SAME CoW-shared extent (refs>=2
+        // from a prior split) is punched/truncated CONCURRENTLY via two
+        // DIFFERENT streams, both read the same refs and the second
+        // `extents/<id>` write clobbered the first → a lost decrement leaves an
+        // orphan (refs>0, in no stream) — and the symmetric lost-INCREMENT (a
+        // racing split) would drop refs too low → premature delete → data loss.
+        // CASing `extents/<id>` against this baseline makes the losing op fail
+        // with Precondition and retry on a fresh read. Reproduced by
+        // system_chaos seed 769351064 (extent 14 orphan-leak).
+        Vec<(String, Vec<u8>)>,
+    ) {
+        let mut extent_puts = Vec::new();
+        let mut extent_deletes = Vec::new();
+        let mut pending_deletes = Vec::new();
+        let mut extent_cas: Vec<(String, Vec<u8>)> = Vec::new();
+
+        // Build pending_deletes snapshot for extents that would physically
+        // delete (refs would hit 0).
+        for &eid in removed {
+            if let Some(extent) = s.extents.get(&eid) {
+                if extent.refs == 1 && extent.vp_table_refs == 0 {
+                    let pending_targets = Self::snapshot_replica_targets(&s.nodes, eid, extent);
+                    pending_deletes.push(PendingDelete {
+                        extent_id: eid,
+                        pending_targets,
+                        attempts: 0,
+                    });
+                }
+            }
+        }
+
+        for extent_id in removed {
+            if let Some(extent) = s.extents.get(extent_id) {
+                // Capture the pre-drop value as the `extents/<id>` CAS baseline
+                // for BOTH the put (refs decremented) and delete (refs->0) paths
+                // — a delete must also fail if a concurrent split bumped refs.
+                extent_cas.push((
+                    format!("extents/{extent_id}"),
+                    crate::persist::encode(extent),
+                ));
+                let mut new_ext = extent.clone();
+                if new_ext.refs <= 1 {
+                    new_ext.refs = 0;
+                    if Self::extent_can_delete(&new_ext) {
+                        extent_deletes.push(*extent_id);
+                    } else {
+                        new_ext.eversion += 1;
+                        extent_puts.push(new_ext);
+                    }
+                } else {
+                    new_ext.refs -= 1;
+                    new_ext.eversion += 1;
+                    extent_puts.push(new_ext);
+                }
+            }
+        }
+
+        (extent_puts, extent_deletes, pending_deletes, extent_cas)
+    }
+
+    pub(crate) async fn handle_stream_punch_holes(&self, payload: Bytes) -> HandlerResult {
+        if let Err(err) = self.ensure_leader() {
+            return Ok(rkyv_encode(&PunchHolesResp {
+                code: Self::err_to_code(&err),
+                message: err.to_string(),
+                stream: None,
+            }));
+        }
+
+        let req: PunchHolesReq =
+            rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+
+
+        // Etcd-first: compute mutations on clones (no store mutation), persist
+        // to etcd, then apply — so a mirror failure (NotLeader / etcd
+        // transient) leaves in-memory state unchanged.
+        let out = {
+            let guard = self.store.inner.borrow();
+            let s: &crate::store::MetadataState = &guard;
+            (|| -> Result<
+                (
+                    StreamRecord,
+                    Vec<ExtentRecord>,
+                    Vec<u64>,
+                    Vec<PendingDelete>,
+                    // CAS baseline = the stream's value BEFORE this punch
+                    // (etcd currently holds it). The mirror value-CAS's
+                    // `streams/<id>` against it.
+                    Vec<u8>,
+                    // Per-extent `extents/<id>` CAS baselines (see
+                    // compute_extent_ref_drops) — guards the shared extent
+                    // write against a concurrent CoW-stream punch/split.
+                    Vec<(String, Vec<u8>)>,
+                ),
+                AppError,
+            > {
+                Self::ensure_owner_epoch(&req.owner_key, req.owner_epoch, s)?;
+                let requested: HashSet<u64> = req.extent_ids.into_iter().collect();
+                let stream = s
+                    .streams
+                    .get(&req.stream_id)
+                    .ok_or_else(|| AppError::NotFound(format!("stream {}", req.stream_id)))?
+                    .clone();
+                let stream_baseline = crate::persist::encode(&stream);
+
+                // Only operate on extents that actually belong to this
+                // stream. Without this, a malformed request could decrement
+                // refs on unrelated streams' extents.
+                let members: HashSet<u64> = stream.extent_ids.iter().copied().collect();
+                let removed: HashSet<u64> = requested
+                    .into_iter()
+                    .filter(|id| members.contains(id))
+                    .collect();
+
+                self.refuse_if_removed_extent_inflight(&removed, "punch_holes")?;
+                self.refuse_if_topology_holds(&removed, req.stream_id, "punch_holes")?;
+
+                let mut updated = stream;
+                updated.extent_ids.retain(|id| !removed.contains(id));
+                if updated.extent_ids.is_empty() {
+                    return Err(AppError::Precondition(
+                        "stream cannot be empty after punch holes".to_string(),
+                    ));
+                }
+                let (extent_puts, extent_deletes, pending_deletes, extent_cas) =
+                    Self::compute_extent_ref_drops(s, &removed);
+                Ok((
+                    updated,
+                    extent_puts,
+                    extent_deletes,
+                    pending_deletes,
+                    stream_baseline,
+                    extent_cas,
+                ))
+            })()
+        };
+
+        match out {
+            Ok((
+                stream,
+                extent_puts,
+                extent_deletes,
+                pending_deletes,
+                stream_baseline,
+                extent_cas,
+            )) => {
+                // Persist to etcd FIRST. Failure → in-memory zero changes
+                // (the closure above produced clones only).
+                if let Err(err) = self
+                    .mirror_stream_extent_mutation(
+                        &stream,
+                        &extent_puts,
+                        &extent_deletes,
+                        Some(stream_baseline),
+                        extent_cas,
+                    )
+                    .await
+                {
+                    return Ok(rkyv_encode(&PunchHolesResp {
+                        code: Self::err_to_code(&err),
+                        message: err.to_string(),
+                        stream: None,
+                    }));
+                }
+                // Step 3: apply pre-computed mutations to in-memory store.
+                // Etcd is authoritative; this just brings the cache forward.
+                {
+                    let mut s = self.store.inner.borrow_mut();
+                    if let Some(st) = s.streams.get_mut(&req.stream_id) {
+                        *st = stream.clone();
+                    }
+                    for ex in &extent_puts {
+                        s.extents.insert(ex.extent_id, ex.clone());
+                    }
+                    for &eid in &extent_deletes {
+                        s.extents.remove(&eid);
+                    }
+                }
+                for &eid in &extent_deletes {
+                    if let Err(e) = self.forget_payload_location(eid).await {
+                        tracing::warn!(
+                            extent_id = eid,
+                            error = %e,
+                            "could not drop the deleted extent's payload-location key"
+                        );
+                    }
+                    // Same lifetime as the payload location: the extent is gone, so the
+                    // mark describing its slots must not outlive it.
+                    if let Err(e) = self.forget_corrupt_slots(eid).await {
+                        tracing::warn!(extent_id = eid, error = %e, "could not drop the corrupt-slot mark");
+                    }
+                    if let Err(e) = self.forget_repair_slots(eid).await {
+                        tracing::warn!(
+                            extent_id = eid,
+                            error = %e,
+                            "could not drop the repair request of a deleted extent"
+                        );
+                    }
+                }
+                // Each enqueue is an etcd CAS via the inflight ledger; errors
+                // are downgraded inside enqueue (WARN-logged) so a single
+                // failed acquire doesn't fail the whole punch_holes call.
+                let _ = self.enqueue_pending_deletes(pending_deletes).await;
+                Ok(rkyv_encode(&PunchHolesResp {
+                    code: CODE_OK,
+                    message: String::new(),
+                    stream: Some((&stream).into()),
+                }))
+            }
+            Err(err) => Ok(rkyv_encode(&PunchHolesResp {
+                code: Self::err_to_code(&err),
+                message: err.to_string(),
+                stream: None,
+            })),
+        }
+    }
+
+    pub(crate) async fn handle_truncate(&self, payload: Bytes) -> HandlerResult {
+        if let Err(err) = self.ensure_leader() {
+            return Ok(rkyv_encode(&TruncateResp {
+                code: Self::err_to_code(&err),
+                message: err.to_string(),
+                updated_stream_info: None,
+            }));
+        }
+
+        let req: TruncateReq =
+            rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+
+        // Etcd-first (same shape as handle_stream_punch_holes).
+        let out = {
+            let guard = self.store.inner.borrow();
+            let s: &crate::store::MetadataState = &guard;
+            (|| -> Result<
+                (
+                    StreamRecord,
+                    Vec<ExtentRecord>,
+                    Vec<u64>,
+                    Vec<PendingDelete>,
+                    // CAS baseline (stream value before this truncate).
+                    Vec<u8>,
+                    // Per-extent `extents/<id>` CAS baselines (see
+                    // compute_extent_ref_drops).
+                    Vec<(String, Vec<u8>)>,
+                ),
+                AppError,
+            > {
+                Self::ensure_owner_epoch(&req.owner_key, req.owner_epoch, s)?;
+                let stream = s
+                    .streams
+                    .get(&req.stream_id)
+                    .cloned()
+                    .ok_or_else(|| AppError::NotFound(format!("stream {}", req.stream_id)))?;
+                let stream_baseline = crate::persist::encode(&stream);
+
+                let pos = stream
+                    .extent_ids
+                    .iter()
+                    .position(|id| *id == req.extent_id)
+                    .ok_or_else(|| {
+                        AppError::NotFound(format!("extent {} in stream", req.extent_id))
+                    })?;
+
+                if pos == 0 {
+                    return Err(AppError::Precondition(
+                        "truncate target is first extent, nothing to truncate".to_string(),
+                    ));
+                }
+
+                let removed: HashSet<u64> = stream.extent_ids[..pos].iter().copied().collect();
+
+                if TRUNCATE_TEST_DEFER_STREAM
+                    .compare_exchange(req.stream_id, 0, std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed)
+                    .is_ok()
+                {
+                    return Err(AppError::Precondition(autumn_common::alloc_conflict::inflight_defer_message(
+                        stream.extent_ids[0],
+                        "Recovery (test failpoint)",
+                        "truncate",
+                    )));
+                }
+                self.refuse_if_removed_extent_inflight(&removed, "truncate")?;
+                self.refuse_if_topology_holds(&removed, req.stream_id, "truncate")?;
+
+                let mut updated = stream;
+                updated.extent_ids.retain(|id| !removed.contains(id));
+                let (extent_puts, extent_deletes, pending_deletes, extent_cas) =
+                    Self::compute_extent_ref_drops(s, &removed);
+                Ok((
+                    updated,
+                    extent_puts,
+                    extent_deletes,
+                    pending_deletes,
+                    stream_baseline,
+                    extent_cas,
+                ))
+            })()
+        };
+
+        match out {
+            Ok((
+                stream,
+                extent_puts,
+                extent_deletes,
+                pending_deletes,
+                stream_baseline,
+                extent_cas,
+            )) => {
+                if let Err(err) = self
+                    .mirror_stream_extent_mutation(
+                        &stream,
+                        &extent_puts,
+                        &extent_deletes,
+                        Some(stream_baseline),
+                        extent_cas,
+                    )
+                    .await
+                {
+                    return Ok(rkyv_encode(&TruncateResp {
+                        code: Self::err_to_code(&err),
+                        message: err.to_string(),
+                        updated_stream_info: None,
+                    }));
+                }
+                // Step 3: apply pre-computed mutations to in-memory store.
+                {
+                    let mut s = self.store.inner.borrow_mut();
+                    if let Some(st) = s.streams.get_mut(&req.stream_id) {
+                        *st = stream.clone();
+                    }
+                    for ex in &extent_puts {
+                        s.extents.insert(ex.extent_id, ex.clone());
+                    }
+                    for &eid in &extent_deletes {
+                        s.extents.remove(&eid);
+                    }
+                }
+                for &eid in &extent_deletes {
+                    if let Err(e) = self.forget_payload_location(eid).await {
+                        tracing::warn!(
+                            extent_id = eid,
+                            error = %e,
+                            "could not drop the deleted extent's payload-location key"
+                        );
+                    }
+                    // Same lifetime as the payload location: the extent is gone, so the
+                    // mark describing its slots must not outlive it.
+                    if let Err(e) = self.forget_corrupt_slots(eid).await {
+                        tracing::warn!(extent_id = eid, error = %e, "could not drop the corrupt-slot mark");
+                    }
+                    if let Err(e) = self.forget_repair_slots(eid).await {
+                        tracing::warn!(
+                            extent_id = eid,
+                            error = %e,
+                            "could not drop the repair request of a deleted extent"
+                        );
+                    }
+                }
+                let _ = self.enqueue_pending_deletes(pending_deletes).await;
+                Ok(rkyv_encode(&TruncateResp {
+                    code: CODE_OK,
+                    message: String::new(),
+                    updated_stream_info: Some((&stream).into()),
+                }))
+            }
+            Err(err) => Ok(rkyv_encode(&TruncateResp {
+                code: Self::err_to_code(&err),
+                message: err.to_string(),
+                updated_stream_info: None,
+            })),
+        }
+    }
+
+    /// Snapshot `extent_id -> eversion` over every extent of `stream_ids`'
+    /// streams — the verify-at-apply BASELINE both split and merge capture
+    /// in Phase 1 (before the Phase-2 etcd await). `first_eversion_drift` is the
+    /// matching verify side: after the await it refuses if any of these
+    /// eversions moved (a concurrent recovery / EC / punch / truncate).
+    fn snapshot_stream_extent_eversions(
+        state: &crate::store::MetadataState,
+        stream_ids: &[u64],
+    ) -> HashMap<u64, u64> {
+        let mut m = HashMap::new();
+        for &sid in stream_ids {
+            if let Some(stream) = state.streams.get(&sid) {
+                for &eid in &stream.extent_ids {
+                    if let Some(ex) = state.extents.get(&eid) {
+                        m.insert(eid, ex.eversion);
+                    }
+                }
+            }
+        }
+        m
+    }
+
+    /// Verify-before-mirror drift check shared by split + merge: re-read the
+    /// live eversion of every source extent snapshotted in `pre_bump_eversion`
+    /// (captured before the Phase-1 awaits) and return the FIRST
+    /// `(extent_id, expected, live)` that drifted, or `None` if all still
+    /// match. The caller encodes its own handler-specific refusal response
+    /// (CodeResp vs MultiModifyMergeResp). Refusing here — before the etcd
+    /// txn — keeps a stale-base mutation from landing durably (committing
+    /// then returning Precondition would leave etcd holding a write that
+    /// replay loads as if successful).
+    fn first_eversion_drift(
+        &self,
+        pre_bump_eversion: &HashMap<u64, u64>,
+    ) -> Option<(u64, u64, u64)> {
+        let s = self.store.inner.borrow();
+        for (eid, expected) in pre_bump_eversion {
+            if let Some(live) = s.extents.get(eid).map(|ex| ex.eversion) {
+                if live != *expected {
+                    return Some((*eid, *expected, live));
+                }
+            }
+        }
+        None
+    }
+
+    pub(crate) async fn handle_multi_modify_split(&self, payload: Bytes) -> HandlerResult {
+        if let Err(err) = self.ensure_leader() {
+            return Self::code_resp(Self::err_to_code(&err), err.to_string());
+        }
+
+        let req: MultiModifySplitReq =
+            rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+        let mms_started = std::time::Instant::now();
+        tracing::info!(
+            target: "mms_trace",
+            part_id = req.part_id,
+            log_sealed = req.log_stream_sealed_length,
+            row_sealed = req.row_stream_sealed_length,
+            meta_sealed = req.meta_stream_sealed_length,
+            "multi_modify_split entered"
+        );
+
+        // #6: serialize splits per partition. A PS that retries
+        // multi_modify_split against a SLOW manager (each call timing out but
+        // the manager still committing later) used to commit a SEPARATE split
+        // per retry — a reproduced 1→6 partition cascade (scripts/split_repro6).
+        // Refuse a concurrent request for the same partition; the RAII guard
+        // clears it on every exit path. Only ONE split per partition can be
+        // in-flight, so retries can't multiply into extra splits.
+        let _split_guard = {
+            let mut inflight = self.split_inflight.borrow_mut();
+            if inflight.contains(&req.part_id) {
+                return Self::code_resp(
+                    CODE_PRECONDITION,
+                    format!(
+                        "split already in progress for partition {}; retry later",
+                        req.part_id
+                    ),
+                );
+            }
+            inflight.insert(req.part_id);
+            SplitInflightGuard {
+                set: self.split_inflight.clone(),
+                part_id: req.part_id,
+            }
+        };
+        // The ledger has already told its operator how this op ended; a
+        // commit now would contradict it.
+        if let Some(state) = self.ops.borrow().ended_state(req.op_id) {
+            return Self::code_resp(
+                CODE_PRECONDITION,
+                format!(
+                    "split op {} already ended ({}); refusing to commit it",
+                    req.op_id,
+                    match state {
+                        OP_STATE_SUCCEEDED => "succeeded",
+                        OP_STATE_FAILED => "failed",
+                        _ => "unknown",
+                    }
+                ),
+            );
+        }
+
+        // Phase 1: Compute all mutations without modifying store
+        // (only alloc_ids touches state.next_id, which is safe to waste on failure)
+        let out = {
+            let mut s = self.store.inner.borrow_mut();
+            (|| -> Result<(
+                Vec<StreamRecord>,
+                Vec<ExtentRecord>,
+                PartitionRecord,
+                PartitionRecord,
+                HashMap<u64, u64>,
+            ), AppError> {
+                Self::ensure_owner_epoch(&req.owner_key, req.owner_epoch, &s)?;
+
+                let src_meta = s
+                    .partitions
+                    .get(&req.part_id)
+                    .cloned()
+                    .ok_or_else(|| AppError::NotFound(format!("part {}", req.part_id)))?;
+
+                let rg = src_meta
+                    .rg
+                    .clone()
+                    .ok_or_else(|| AppError::Internal("partition range missing".to_string()))?;
+
+                let in_range = req.mid_key >= rg.start_key
+                    && (rg.end_key.is_empty() || req.mid_key < rg.end_key);
+                if !in_range {
+                    return Err(AppError::Precondition(
+                        "mid_key is not in partition range".to_string(),
+                    ));
+                }
+
+                // An EC conversion's or a recovery's apply bumps eversion and
+                // rewrites the extent; Phase-3's apply_split_mutations would
+                // overwrite it with the Phase-1 snapshot. `topology_ready`
+                // waited for these before the PS froze, so one here started
+                // after that wait; the PS aborts on it rather than retrying,
+                // and "retry split" is advice to resubmit.
+                if let Some(why) = self.topology_blocker(&s, &src_meta) {
+                    return Err(AppError::Precondition(format!("{why}; retry split")));
+                }
+
+                // The three sealed lengths were captured by the PS for
+                // SPECIFIC tail extents. compute_duplicate_stream seals
+                // whatever extent is the CURRENT tail, so if a tail moved
+                // between the capture and this commit (a fence-drain roll
+                // already in flight when the split froze — it sealed the
+                // captured tail itself and appended a fresh empty one), the
+                // captured length would be stamped onto the roll's fresh
+                // EMPTY tail: "sealed" longer than any replica holds, and the
+                // CoW child's replay can never read it. Refuse; the PS aborts
+                // and the client retries the split with a fresh capture.
+                // `0` = no capture claim (legacy caller / test) → skip.
+                for (label, sid, captured_tail) in [
+                    ("log", src_meta.log_stream, req.log_tail_extent_id),
+                    ("row", src_meta.row_stream, req.row_tail_extent_id),
+                    ("meta", src_meta.meta_stream, req.meta_tail_extent_id),
+                ] {
+                    if captured_tail == 0 {
+                        continue;
+                    }
+                    let cur_tail = s
+                        .streams
+                        .get(&sid)
+                        .and_then(|st| st.extent_ids.last().copied())
+                        .unwrap_or(0);
+                    if cur_tail != captured_tail {
+                        return Err(AppError::Precondition(format!(
+                            "split captured tail moved: {label} stream {sid} tail is now \
+                             {cur_tail}, commit length was captured for {captured_tail}; \
+                             retry split with a fresh capture"
+                        )));
+                    }
+                }
+
+                // snapshot pre-mutation eversions so Phase-3 can verify
+                // no concurrent mutator ran during Phase-2's etcd await.
+                let pre_bump_eversion = Self::snapshot_stream_extent_eversions(
+                    &s,
+                    &[src_meta.log_stream, src_meta.row_stream, src_meta.meta_stream],
+                );
+
+                let (start, end) = s.alloc_ids(4);
+                let new_log_stream = start;
+                let new_row_stream = start + 1;
+                let new_meta_stream = start + 2;
+                let new_part_id = end - 1;
+
+                // Compute stream duplications without modifying state
+                let (log_dup, log_exts) = Self::compute_duplicate_stream(
+                    &s, src_meta.log_stream, new_log_stream, req.log_stream_sealed_length,
+                )?;
+                let (row_dup, row_exts) = Self::compute_duplicate_stream(
+                    &s, src_meta.row_stream, new_row_stream, req.row_stream_sealed_length,
+                )?;
+                let (meta_dup, meta_exts) = Self::compute_duplicate_stream(
+                    &s, src_meta.meta_stream, new_meta_stream, req.meta_stream_sealed_length,
+                )?;
+
+                let new_streams = vec![log_dup, row_dup, meta_dup];
+                let mut all_extents = Vec::new();
+                all_extents.extend(log_exts);
+                all_extents.extend(row_exts);
+                all_extents.extend(meta_exts);
+
+                let mut left = src_meta.clone();
+                let mut right = src_meta;
+                left.rg = Some(crate::persist::records::RangeRecord {
+                    start_key: rg.start_key.clone(),
+                    end_key: req.mid_key.clone(),
+                });
+                right.part_id = new_part_id;
+                right.log_stream = new_log_stream;
+                right.row_stream = new_row_stream;
+                right.meta_stream = new_meta_stream;
+                right.rg = Some(crate::persist::records::RangeRecord {
+                    start_key: req.mid_key,
+                    end_key: rg.end_key,
+                });
+
+                Ok((new_streams, all_extents, left, right, pre_bump_eversion))
+            })()
+        };
+
+        match out {
+            Ok((new_streams, modified_extents, left, right, pre_bump_eversion)) => {
+                // Verify-BEFORE-mirror: if any source-stream extent's
+                // eversion drifted during the Phase-1 awaits, the etcd txn
+                // we'd otherwise send is computed from a stale base — refuse
+                // before committing to etcd.
+                if let Some((eid, expected, live)) = self.first_eversion_drift(&pre_bump_eversion) {
+                    return Self::code_resp(
+                        CODE_PRECONDITION,
+                        format!(
+                            "extent {eid} eversion drift during split \
+                             ({expected} -> {live}); retry split"
+                        ),
+                    );
+                }
+
+                // Phase 2: Persist ALL mutations to etcd in ONE atomic txn
+                // (partitions + regions are included here, not in a separate
+                // txn, to prevent orphan streams on crash.)
+                if let Some(etcd) = &self.etcd {
+                    let mut kvs =
+                        Vec::with_capacity(new_streams.len() + modified_extents.len() + 4);
+                    for st in &new_streams {
+                        kvs.push((
+                            format!("streams/{}", st.stream_id),
+                            crate::persist::encode(st),
+                        ));
+                    }
+                    for ex in &modified_extents {
+                        kvs.push((
+                            format!("extents/{}", ex.extent_id),
+                            crate::persist::encode(ex),
+                        ));
+                    }
+                    kvs.push((
+                        format!("partitions/{}", left.part_id),
+                        crate::persist::encode(&left),
+                    ));
+                    kvs.push((
+                        format!("partitions/{}", right.part_id),
+                        crate::persist::encode(&right),
+                    ));
+                    // Pre-compute region entries for left and right partitions
+                    // so they are included in the same atomic txn.
+                    {
+                        let s = self.store.inner.borrow();
+                        let left_region = Self::compute_region_for_partition(&s, &left);
+                        let right_region = Self::compute_region_for_partition(&s, &right);
+                        kvs.push((
+                            format!("regions/{}", left.part_id),
+                            crate::persist::encode(&left_region),
+                        ));
+                        kvs.push((
+                            format!("regions/{}", right.part_id),
+                            crate::persist::encode(&right_region),
+                        ));
+                    }
+                    // Stamp last_op_at on both children so the
+                    // policy engine's cooldown gate is correct.
+                    let now = Self::epoch_seconds();
+                    kvs.push((
+                        format!("partitionLastOp/{}", left.part_id),
+                        now.to_le_bytes().to_vec(),
+                    ));
+                    kvs.push((
+                        format!("partitionLastOp/{}", right.part_id),
+                        now.to_le_bytes().to_vec(),
+                    ));
+                    // Value-CAS each modified extent against its pre-split value.
+                    // Split increments refs on CoW-shared extents (and seals the
+                    // source tail); compute_duplicate_stream reads `state` and
+                    // returns clones, so the in-memory store still holds the
+                    // pre-mutation value here = the etcd baseline. Without this,
+                    // a concurrent cross-partition punch/truncate on a CoW-shared
+                    // extent could lose the refs increment -> refs too low ->
+                    // premature delete -> data loss. Same class as
+                    // compute_extent_ref_drops.
+                    //
+                    // No source streams/<id> CAS is needed even though split
+                    // READS the source membership to derive the right streams:
+                    // the source partition is frozen_for_split AND holds
+                    // gc_gate+compact_gate through this whole multi_modify_split
+                    // (PS-side gc/compact gates), so its streams cannot mutate
+                    // concurrently. The ONLY reachable race is a DIFFERENT
+                    // CoW-sharing partition (from a prior split) GC'ing a shared
+                    // extent — that partition isn't frozen — and this extent CAS
+                    // catches exactly that. (Split also has no Phase-1.5 await,
+                    // so capturing the baseline here, with no await since
+                    // modified_extents was computed, is consistent — unlike merge
+                    // which must capture in Phase-1 before its alloc await.)
+                    let extent_cas: Vec<(String, Vec<u8>)> = {
+                        let s = self.store.inner.borrow();
+                        modified_extents
+                            .iter()
+                            .filter_map(|ex| {
+                                s.extents.get(&ex.extent_id).map(|orig| {
+                                    (
+                                        format!("extents/{}", ex.extent_id),
+                                        crate::persist::encode(orig),
+                                    )
+                                })
+                            })
+                            .collect()
+                    };
+                    etcd.put_delete_txn_cas(kvs, Vec::new(), extent_cas)
+                        .await
+                        .map_err(|e| Self::err_to_status(&e))?;
+                }
+                tracing::info!(
+                    target: "mms_trace",
+                    part_id = left.part_id,
+                    right_part_id = right.part_id,
+                    elapsed_ms = mms_started.elapsed().as_millis() as u64,
+                    "multi_modify_split etcd txn COMMITTED"
+                );
+
+                // Phase 3: Apply to in-memory store AFTER etcd success.
+                // Verify moved up before the Phase-2 mirror; here we only
+                // apply (no verify).
+                {
+                    let mut s = self.store.inner.borrow_mut();
+                    let _ = pre_bump_eversion; // captured for the verify-BEFORE block above
+                    let left_id = left.part_id;
+                    let right_id = right.part_id;
+                    Self::apply_split_mutations(
+                        &mut s,
+                        &new_streams,
+                        &modified_extents,
+                        left,
+                        right,
+                    );
+                    drop(s);
+                    // in-memory last_op_at update (mirror of etcd write above)
+                    let now = Self::epoch_seconds();
+                    self.last_op_at.borrow_mut().insert(left_id, now);
+                    self.last_op_at.borrow_mut().insert(right_id, now);
+                    if req.op_id != 0 {
+                        self.end_split_op_committed(req.op_id, left_id, right_id, now);
+                    }
+                }
+
+                Self::code_resp(CODE_OK, String::new())
+            }
+            Err(err) => {
+                tracing::info!(
+                    target: "mms_trace",
+                    part_id = req.part_id,
+                    elapsed_ms = mms_started.elapsed().as_millis() as u64,
+                    error = %err,
+                    "multi_modify_split refused"
+                );
+                Self::code_resp(Self::err_to_code(&err), err.to_string())
+            }
+        }
+    }
+
+    // ── PartitionManagerService handlers ───────────────────────────────
+
+    // ── handle_multi_modify_merge ─────────────────────────────────────
+    // Inverse of handle_multi_modify_split. Atomically:
+    //   - Splices victim's three streams' extent_ids into survivor's
+    //   - Allocates a fresh log_stream tail extent (E_new) on K replicas
+    //   - Widens survivor.rg.end_key to victim.rg.end_key
+    //   - Deletes victim's partitions/streams/regions/partitionLastOp keys
+    //
+    // Single-txn etcd commit — crash mid-merge means no state
+    // change. Inflight checks + verify-at-apply on
+    // pre_bump_eversion. The leader fence is already applied via put_and_delete_txn.
+    /// The merge txn with no source fence, for unit tests of the txn itself.
+    #[cfg(test)]
+    pub(crate) async fn handle_multi_modify_merge(&self, payload: Bytes) -> HandlerResult {
+        let req: MultiModifyMergeReq =
+            rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+        self.multi_modify_merge(req, &MergeSources::default()).await
+    }
+
+    async fn multi_modify_merge(
+        &self,
+        req: MultiModifyMergeReq,
+        sources: &MergeSources,
+    ) -> HandlerResult {
+        if let Err(err) = self.ensure_leader() {
+            return Ok(rkyv_encode(&MultiModifyMergeResp {
+                code: Self::err_to_code(&err),
+                message: err.to_string(),
+                new_log_tail_extent_id: 0,
+            }));
+        }
+
+        // capture the nodes that take new data BEFORE borrowing the
+        // store. Passed into the Phase-1 select_nodes call.
+        let ready_node_ids = self.ready_node_ids();
+        let space_low_node_ids = self.space_low_node_ids();
+        let hard_excluded = self.placement_excluded_node_ids();
+        // Captured with the exclusion set, before the store borrow: both read
+        // RefCells disjoint from it, and taking them here keeps the borrow
+        // below purely about the mutation.
+        let placement_load = self.placement_load();
+        // Phase 1: compute under borrow_mut, NO awaits inside.
+        // Returns alloc-IDs reserved + selected nodes for Phase 1.5.
+        struct Phase1Result {
+            new_streams: Vec<StreamRecord>,
+            modified_extents: Vec<ExtentRecord>,
+            survivor_meta: PartitionRecord,
+            victim_part_id: u64,
+            victim_log: u64,
+            victim_row: u64,
+            victim_meta: u64,
+            new_tail_id: u64,
+            selected_nodes: Vec<NodeRecord>,
+            new_tail_replicas: u32,
+            pre_bump_eversion: HashMap<u64, u64>,
+            // Uniform CAS: value-CAS baseline for each of the six
+            // source streams — `(streams/<id>, pre-splice rkyv bytes)`. The
+            // Phase-2 txn CAS's these so a concurrent alloc/punch/truncate
+            // committing on a source stream during merge's etcd RTT makes the
+            // merge fail+retry instead of resurrecting a removed extent or
+            // dropping an added tail.
+            stream_baselines: Vec<(String, Vec<u8>)>,
+            // Value-CAS baseline for each EXISTING modified extent (the
+            // refs-spliced / tail-sealed ones), captured from the SAME Phase-1
+            // snapshot `modified_extents` was computed against — NOT re-read at
+            // Phase 2 (after the Phase-1.5 alloc await), which would capture a
+            // value a concurrent punch/truncate already mutated and let the
+            // merge clobber it. A concurrently-deleted extent has no
+            // etcd value here so its CAS fails -> merge retries (no resurrect).
+            // The freshly-created new_tail has no pre-existing baseline and is
+            // intentionally absent (it is a create, not a CAS'd update).
+            extent_baselines: Vec<(String, Vec<u8>)>,
+        }
+
+        let phase1: Result<Phase1Result, AppError> = {
+            let mut s = self.store.inner.borrow_mut();
+            (|| -> Result<Phase1Result, AppError> {
+                Self::ensure_owner_epoch(&req.owner_key, req.owner_epoch, &s)?;
+                sources.verify(&s)?;
+
+                if req.survivor_part_id == req.victim_part_id {
+                    return Err(AppError::Precondition(
+                        "survivor and victim are the same partition".to_string(),
+                    ));
+                }
+                let survivor_meta = s
+                    .partitions
+                    .get(&req.survivor_part_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        AppError::NotFound(format!("partition {}", req.survivor_part_id))
+                    })?;
+                let victim_meta =
+                    s.partitions
+                        .get(&req.victim_part_id)
+                        .cloned()
+                        .ok_or_else(|| {
+                            AppError::NotFound(format!("partition {}", req.victim_part_id))
+                        })?;
+                let s_rg = survivor_meta
+                    .rg
+                    .clone()
+                    .ok_or_else(|| AppError::Internal("survivor range missing".into()))?;
+                let v_rg = victim_meta
+                    .rg
+                    .clone()
+                    .ok_or_else(|| AppError::Internal("victim range missing".into()))?;
+                if s_rg.end_key != v_rg.start_key {
+                    return Err(AppError::Precondition(format!(
+                        "partitions are not adjacent (survivor.end={:?}, victim.start={:?})",
+                        s_rg.end_key, v_rg.start_key
+                    )));
+                }
+
+                let all_streams = [
+                    survivor_meta.log_stream,
+                    survivor_meta.row_stream,
+                    survivor_meta.meta_stream,
+                    victim_meta.log_stream,
+                    victim_meta.row_stream,
+                    victim_meta.meta_stream,
+                ];
+                {
+                    // collapse the EC + Recovery + Delete checks
+                    // into one ledger probe. This was previously three
+                    // separate Refs (ec_conversion_inflight,
+                    // recovery_tasks, pending_extent_deletes) each
+                    // queried per-extent. Now: one probe per extent
+                    // returning the typed op kind. The typed error
+                    // message preserves the operator-facing semantics
+                    // (caller can tell which class of op is blocking).
+                    for &sid in &all_streams {
+                        if let Some(stream) = s.streams.get(&sid) {
+                            for &eid in &stream.extent_ids {
+                                if let Some(op) = self.extent_inflight_op(eid) {
+                                    return Err(AppError::Precondition(format!(
+                                        "extent {eid} has in-flight {op:?}; retry merge"
+                                    )));
+                                }
+                            }
+                        }
+                    }
+                }
+
+                let pre_bump_eversion = Self::snapshot_stream_extent_eversions(&s, &all_streams);
+
+                let (new_tail_id, _) = s.alloc_ids(1);
+                // Pick K replica nodes for E_new (replication factor matches
+                // survivor's log_stream).
+                let log_stream_meta =
+                    s.streams.get(&survivor_meta.log_stream).ok_or_else(|| {
+                        AppError::Internal(format!("stream {}", survivor_meta.log_stream))
+                    })?;
+                let target_replicas = if log_stream_meta.replicates > 0 {
+                    log_stream_meta.replicates as usize
+                } else {
+                    3
+                };
+                let selected =
+                    Self::select_nodes(
+                    &s.nodes,
+                    &ready_node_ids,
+                    &space_low_node_ids,
+                    &hard_excluded,
+                    &placement_load,
+                    target_replicas,
+                    &[],
+                )?;
+                let new_tail = ExtentRecord {
+                    extent_id: new_tail_id,
+                    replicates: selected.iter().map(|n| n.node_id).collect(),
+                    parity: vec![],
+                    replicate_disks: vec![0u64; selected.len()],
+                    parity_disks: vec![],
+                    sealed_length: 0,
+                    sealed: false,
+                    avali: 0,
+                    eversion: 1,
+                    refs: 1,
+                    vp_table_refs: 0,
+                    ec_converted: false,
+                };
+
+                let (log_dup, log_exts) = Self::compute_merge_streams(
+                    &s,
+                    survivor_meta.log_stream,
+                    victim_meta.log_stream,
+                    req.log_sealed_lengths[0],
+                    req.log_sealed_lengths[1],
+                    new_tail.clone(),
+                )?;
+                let (row_dup, row_exts) = Self::splice_streams_without_new_tail(
+                    &s,
+                    survivor_meta.row_stream,
+                    victim_meta.row_stream,
+                    req.row_sealed_lengths[0],
+                    req.row_sealed_lengths[1],
+                )?;
+                let (meta_dup, meta_exts) = Self::splice_streams_without_new_tail(
+                    &s,
+                    survivor_meta.meta_stream,
+                    victim_meta.meta_stream,
+                    req.meta_sealed_lengths[0],
+                    req.meta_sealed_lengths[1],
+                )?;
+
+                // Uniform CAS: capture each source stream's
+                // PRE-splice value (what etcd currently holds) as the CAS
+                // baseline. `compute_*` returned clones, so `s.streams` still
+                // holds the pre-splice streams here.
+                let stream_baselines: Vec<(String, Vec<u8>)> = all_streams
+                    .into_iter()
+                .filter_map(|sid| {
+                    s.streams
+                        .get(&sid)
+                        .map(|st| (format!("streams/{sid}"), crate::persist::encode(st)))
+                })
+                .collect();
+
+                let new_streams = vec![log_dup, row_dup, meta_dup];
+                let mut all_extents = Vec::new();
+                all_extents.extend(log_exts);
+                all_extents.extend(row_exts);
+                all_extents.extend(meta_exts);
+
+                // Capture extent CAS baselines from THIS Phase-1 snapshot (the
+                // value `modified_extents` was computed against). compute_* read
+                // `s` and returned clones, so `s.extents` still holds the
+                // pre-mutation value. The new_tail (just-built, not yet in
+                // `s.extents`) has no baseline and is correctly skipped.
+                let extent_baselines: Vec<(String, Vec<u8>)> = all_extents
+                    .iter()
+                    .filter_map(|ex| {
+                        s.extents.get(&ex.extent_id).map(|orig| {
+                            (
+                                format!("extents/{}", ex.extent_id),
+                                crate::persist::encode(orig),
+                            )
+                        })
+                    })
+                    .collect();
+
+                let mut new_survivor_meta = survivor_meta.clone();
+                new_survivor_meta.rg = Some(crate::persist::records::RangeRecord {
+                    start_key: s_rg.start_key,
+                    end_key: v_rg.end_key,
+                });
+
+                Ok(Phase1Result {
+                    new_streams,
+                    modified_extents: all_extents,
+                    survivor_meta: new_survivor_meta,
+                    victim_part_id: req.victim_part_id,
+                    victim_log: victim_meta.log_stream,
+                    victim_row: victim_meta.row_stream,
+                    victim_meta: victim_meta.meta_stream,
+                    new_tail_id,
+                    selected_nodes: selected,
+                    new_tail_replicas: target_replicas as u32,
+                    pre_bump_eversion,
+                    stream_baselines,
+                    extent_baselines,
+                })
+            })()
+        };
+
+        let p1 = match phase1 {
+            Ok(t) => t,
+            Err(e) => {
+                return Ok(rkyv_encode(&MultiModifyMergeResp {
+                    code: Self::err_to_code(&e),
+                    message: e.to_string(),
+                    new_log_tail_extent_id: 0,
+                }))
+            }
+        };
+
+        // Phase 1.5: alloc_extent_on_node for E_new on each replica.
+        // On per-node failure, fall back to other healthy nodes (mirrors
+        // handle_stream_alloc_extent's fallback walk).
+        let p1_selected_ids: HashSet<u64> = p1.selected_nodes.iter().map(|n| n.node_id).collect();
+        let mut fallback_nodes: Vec<NodeRecord> = {
+            let s = self.store.inner.borrow();
+            s.nodes
+                .values()
+                .filter(|n| !p1_selected_ids.contains(&n.node_id))
+                .filter(|n| ready_node_ids.contains(&n.node_id))
+                .filter(|n| !space_low_node_ids.contains(&n.node_id))
+                .filter(|n| !hard_excluded.contains(&n.node_id))
+                .cloned()
+                .collect()
+        };
+        {
+            use rand::seq::SliceRandom;
+            fallback_nodes.shuffle(&mut rand::thread_rng());
+        }
+        let mut fallback_iter = fallback_nodes.into_iter();
+        // Same shield as the other two allocation paths: files first, publish
+        // after, so the new tail must not look like an orphan in between.
+        let _allocating = self.mark_allocating(p1.new_tail_id);
+        let Some((final_node_ids, final_disk_ids)) = self
+            .place_extents_with_fallback(&p1.selected_nodes, &mut fallback_iter, p1.new_tail_id)
+            .await
+        else {
+            return Ok(rkyv_encode(&MultiModifyMergeResp {
+                code: CODE_PRECONDITION,
+                message: format!(
+                    "no healthy node available to allocate E_new {}",
+                    p1.new_tail_id
+                ),
+                new_log_tail_extent_id: 0,
+            }));
+        };
+
+        // Patch E_new with the actual node/disk ids (Phase 1's selected_nodes
+        // may have been replaced via fallback walk).
+        let mut modified_extents = p1.modified_extents;
+        let _ = p1.new_tail_replicas; // reserved for diagnostics
+        if let Some(e_new) = modified_extents
+            .iter_mut()
+            .find(|e| e.extent_id == p1.new_tail_id)
+        {
+            e_new.replicates = final_node_ids;
+            e_new.replicate_disks = final_disk_ids;
+        }
+
+        // Verify-BEFORE-mirror: if any source-stream extent's eversion
+        // drifted during the Phase-1.5 awaits (alloc_extent_on_node for
+        // E_new across each replica node), the etcd txn we'd send is
+        // computed from a stale base. Refuse before committing.
+        if let Some((eid, expected, live)) = self.first_eversion_drift(&p1.pre_bump_eversion) {
+            return Ok(rkyv_encode(&MultiModifyMergeResp {
+                code: CODE_PRECONDITION,
+                message: format!(
+                    "extent {eid} eversion drift during merge \
+                     ({expected} -> {live}); retry merge"
+                ),
+                new_log_tail_extent_id: 0,
+            }));
+        }
+        // Without etcd this is the last check before the apply, with no await
+        // between them.
+        if let Err(e) = sources.verify(&self.store.inner.borrow()) {
+            return Ok(rkyv_encode(&MultiModifyMergeResp {
+                code: Self::err_to_code(&e),
+                message: e.to_string(),
+                new_log_tail_extent_id: 0,
+            }));
+        }
+
+        // Phase 2: single fenced etcd txn.
+        if let Some(etcd) = &self.etcd {
+            let now = Self::epoch_seconds();
+            let mut kvs = Vec::with_capacity(p1.new_streams.len() + modified_extents.len() + 5);
+            for st in &p1.new_streams {
+                kvs.push((
+                    format!("streams/{}", st.stream_id),
+                    crate::persist::encode(st),
+                ));
+            }
+            for ex in &modified_extents {
+                kvs.push((
+                    format!("extents/{}", ex.extent_id),
+                    crate::persist::encode(ex),
+                ));
+            }
+            kvs.push((
+                format!("partitions/{}", p1.survivor_meta.part_id),
+                crate::persist::encode(&p1.survivor_meta),
+            ));
+            {
+                let s = self.store.inner.borrow();
+                let region = Self::compute_region_for_partition(&s, &p1.survivor_meta);
+                kvs.push((
+                    format!("regions/{}", p1.survivor_meta.part_id),
+                    crate::persist::encode(&region),
+                ));
+            }
+            kvs.push((
+                format!("partitionLastOp/{}", p1.survivor_meta.part_id),
+                now.to_le_bytes().to_vec(),
+            ));
+
+            let deletes = vec![
+                format!("partitions/{}", p1.victim_part_id),
+                format!("streams/{}", p1.victim_log),
+                format!("streams/{}", p1.victim_row),
+                format!("streams/{}", p1.victim_meta),
+                format!("regions/{}", p1.victim_part_id),
+                format!("partitionLastOp/{}", p1.victim_part_id),
+            ];
+            // Uniform CAS: value-CAS each source stream against its
+            // pre-splice baseline so a concurrent alloc/punch/truncate that
+            // committed on it during this RTT makes the merge fail+retry
+            // (CODE_PRECONDITION) instead of overwriting it with the stale
+            // spliced membership. The victim streams are deleted, but a tail
+            // rolled by an alloc that passed its owner check before the merge
+            // took the sources over would otherwise vanish with its acked bytes.
+            // Each modified extent's baseline is CAS'd as well. Both were
+            // captured from the Phase-1 snapshot (NOT re-read here after the
+            // Phase-1.5 await), so a concurrent punch/truncate/split that
+            // mutated or deleted a CoW-shared extent during the await makes
+            // this txn fail+retry instead of clobbering it / resurrecting a
+            // deleted extent.
+            //
+            // `ownerLocks/partition/<id>` must still be at the epoch the merge
+            // acquired: a reopen in between (a PS restart, a poisoned partition)
+            // owns the source again and may have acked writes the captured
+            // lengths do not hold. The in-memory `sources.verify` above cannot
+            // see an acquire whose etcd write is still in flight.
+            let mut cmp: Vec<_> = p1
+                .stream_baselines
+                .iter()
+                .chain(p1.extent_baselines.iter())
+                .map(|(k, v)| autumn_etcd::Cmp::value(k.as_bytes(), v.as_slice()))
+                .collect();
+            cmp.extend(sources.owners.iter().map(|(key, epoch)| {
+                autumn_etcd::Cmp::mod_revision(format!("ownerLocks/{key}"), *epoch)
+            }));
+            etcd.put_delete_txn_compare(kvs, deletes, cmp)
+                .await
+                .map_err(|e| Self::err_to_status(&e))?;
+        }
+
+        // Phase 3: in-memory apply. Verify moved up before the
+        // Phase-2 mirror; here we only apply.
+        {
+            let mut s = self.store.inner.borrow_mut();
+            Self::apply_merge_mutations(
+                &mut s,
+                &p1.new_streams,
+                &modified_extents,
+                p1.survivor_meta.clone(),
+                p1.victim_part_id,
+                p1.victim_log,
+                p1.victim_row,
+                p1.victim_meta,
+            );
+        }
+        let now = Self::epoch_seconds();
+        self.last_op_at
+            .borrow_mut()
+            .insert(p1.survivor_meta.part_id, now);
+        self.last_op_at.borrow_mut().remove(&p1.victim_part_id);
+
+        Ok(rkyv_encode(&MultiModifyMergeResp {
+            code: CODE_OK,
+            message: String::new(),
+            new_log_tail_extent_id: p1.new_tail_id,
+        }))
+    }
+
+    // ── handle_merge_partitions (orchestrated merge) ─────────────
+    //
+    // Wraps the multi-modify-merge txn with a PrepareMerge-style
+    // freeze sequence, mirroring TiKV's pattern of letting the leader-
+    // fenced control plane drive the cross-PS choreography. The sequence:
+    //
+    //   1. ensure_leader (manager state belongs to one instance only)
+    //   2. resolve survivor + victim part_addr / stream ids in one borrow
+    //   3. acquire admin owner-lock (so the embedded MultiModifyMerge txn
+    //      has a fresh owner_epoch the leader fence can act on)
+    //   4. send MSG_MERGE_FREEZE to victim's PS, await OK
+    //      (drains pending+inflight + flushes imm; no new writes accepted)
+    //   5. send MSG_MERGE_FREEZE to survivor's PS, await OK
+    //   6. take both sources over: acquire `partition/<id>` for each and
+    //      fence the tail of all six streams at that epoch (see
+    //      `take_merge_sources`)
+    //   7. capture commit_length × 6 under those epochs — these are the
+    //      sealed_lengths that the manager merge txn will use
+    //   8. invoke multi_modify_merge synchronously (Phase-1 / 1.5 / 2 / 3;
+    //      the etcd txn is the atomic linearization point and refuses if a
+    //      source was acquired again or a tail moved)
+    //   9a. on success: do NOT explicitly unfreeze — region_sync_loop on
+    //       both PSes will, on its next ~2 s tick, observe the new region
+    //       state (survivor's rg widened, victim's region gone) and drop
+    //       the frozen `PartitionData` entirely. The reopened survivor
+    //       starts unfrozen.
+    //   9b. on failure: send freeze=false to every side a freeze was sent to
+    //       (a failed freeze may have frozen it: the OK can be lost).
+    //       Best-effort — if the unfreeze RPC also fails, the PS-side
+    //       FREEZE_TTL (30 s) is the final backstop. Once step 6 ran, the
+    //       old owners are fenced: their next append is refused and the
+    //       partition reopens under a fresh epoch.
+    //
+    // The freeze only stops a PS from taking writes while it remembers it;
+    // step 6 is what makes a write the merge did not capture impossible to
+    // acknowledge. Without it a PS restart, a stale freeze=false (a deposed
+    // leader's rollback) or FREEZE_TTL let the PS ack writes past the
+    // captured lengths, which the commit then sealed away
+    // (`tests/system_merge_freeze_races.rs`).
+    //
+    // Crash semantics:
+    //   - manager crash before step 8's etcd commit: no merge in etcd; the
+    //     sources reopen under fresh epochs once fenced, or unfreeze via
+    //     FREEZE_TTL.
+    //   - manager crash after step 8's etcd commit: merge is durable;
+    //     region_sync_loop on PSes drives the reload normally.
+    //   - PS crash mid-flow: its reopen acquires a newer `partition/<id>`
+    //     epoch, and the commit refuses.
+    pub(crate) async fn handle_merge_partitions(&self, payload: Bytes) -> HandlerResult {
+        let req: MergePartitionsReq =
+            rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+        self.merge_partitions(req, 0).await
+    }
+
+    /// Take write ownership of each `(part_id, [log, row, meta])` source the
+    /// way a partition takeover does: acquire `partition/<id>` (the manager
+    /// refuses the old owner's stream ops from here on) and fence each
+    /// stream's tail at that epoch (the ENs refuse its appends). Unlike the
+    /// freeze, neither can be undone by a restart, a stale unfreeze or a TTL.
+    async fn take_merge_sources(&self, parts: &[(u64, [u64; 3])]) -> Result<MergeSources, AppError> {
+        let mut sources = MergeSources::default();
+        for (part_id, streams) in parts {
+            let key = format!("partition/{part_id}");
+            let epoch = self.acquire_owner_epoch(&key).await?;
+            for &sid in streams {
+                let tail = self.fence_stream_tail(sid, epoch).await?;
+                sources.tails.push((sid, tail));
+            }
+            sources.owners.push((key, epoch));
+        }
+        Ok(sources)
+    }
+
+    /// `op_id` 0 (direct RPC, policy) refuses while an extent op blocks the
+    /// merge; a submitted op waits for it (`topology_gate.rs`).
+    pub(crate) async fn merge_partitions(&self, req: MergePartitionsReq, op_id: u64) -> HandlerResult {
+        // 1 = owner lock held, 2 = both partitions frozen, 3 = all six
+        // commit_lengths captured, 4 = metadata merge committed. Phases and not
+        // bytes, for the same reason split reports phases: the steps cost
+        // wildly different amounts and a stalled byte counter reads as a hang.
+        const MERGE_PHASES: u64 = 4;
+        if let Err(err) = self.ensure_leader() {
+            return Ok(rkyv_encode(&MergePartitionsResp {
+                code: Self::err_to_code(&err),
+                message: err.to_string(),
+                new_log_tail_extent_id: 0,
+            }));
+        }
+        // Before anything freezes: the takeover below would acquire the one
+        // partition twice and fence out its own first epoch.
+        if req.survivor_part_id == req.victim_part_id {
+            return Ok(rkyv_encode(&MergePartitionsResp {
+                code: CODE_PRECONDITION,
+                message: "survivor and victim are the same partition".to_string(),
+                new_log_tail_extent_id: 0,
+            }));
+        }
+        // Also before anything freezes: a merge refused after the takeover
+        // costs each side a failed write and a reopen. The commit checks
+        // adjacency again against the state it commits on.
+        let not_adjacent = {
+            let s = self.store.inner.borrow();
+            let rg = |pid: u64| s.partitions.get(&pid).and_then(|p| p.rg.clone());
+            match (rg(req.survivor_part_id), rg(req.victim_part_id)) {
+                (Some(sr), Some(vr)) if sr.end_key != vr.start_key => {
+                    Some((sr.end_key, vr.start_key))
+                }
+                _ => None,
+            }
+        };
+        if let Some((s_end, v_start)) = not_adjacent {
+            return Ok(rkyv_encode(&MergePartitionsResp {
+                code: CODE_PRECONDITION,
+                message: format!(
+                    "partitions are not adjacent (survivor.end={s_end:?}, victim.start={v_start:?})"
+                ),
+                new_log_tail_extent_id: 0,
+            }));
+        }
+
+        // step 4: merging destroys the boundary between the
+        // two partitions — which is the start_key of whichever one sits on the
+        // RIGHT. If an operator declared that boundary via presplit, undoing it
+        // is almost never what they meant, and the damage is silent: for fs lane
+        // boundaries every SUBSEQUENT large file stripes narrower, with no error
+        // and no log line, so it surfaces only as "throughput got worse at some
+        // point". Refuse by default; `--force` for the deliberate case.
+        if !req.force {
+            let boundary = {
+                let s = self.store.inner.borrow();
+                let start_of = |pid: u64| -> Option<Vec<u8>> {
+                    s.partitions
+                        .get(&pid)?
+                        .rg
+                        .as_ref()
+                        .map(|r| r.start_key.clone())
+                };
+                match (start_of(req.survivor_part_id), start_of(req.victim_part_id)) {
+                    // The vanishing boundary is the greater of the two starts.
+                    (Some(a), Some(b)) => Some(a.max(b)),
+                    _ => None,
+                }
+            };
+            if let Some(owner) = boundary.as_deref().and_then(|b| self.sacred_boundary_owner(b)) {
+                return Ok(rkyv_encode(&MergePartitionsResp {
+                    code: CODE_PRECONDITION,
+                    message: format!(
+                        "refusing to merge {} into {}: the boundary between them is a presplit \
+                         point declared for namespace '{}'. Merging it would silently undo that \
+                         layout (for fs lane boundaries: every later large file stripes \
+                         narrower, with no error). Re-run with --force if that is intended.",
+                        req.victim_part_id, req.survivor_part_id, owner
+                    ),
+                    new_log_tail_extent_id: 0,
+                }));
+            }
+        }
+
+        // Before the endpoints are resolved: a wait can outlast them.
+        let _hold = match self
+            .topology_ready(&[req.survivor_part_id, req.victim_part_id], op_id, "merge")
+            .await
+        {
+            Ok((hold, _)) => hold,
+            Err(e) => {
+                return Ok(rkyv_encode(&MergePartitionsResp {
+                    code: CODE_PRECONDITION,
+                    message: format!("{e:#}"),
+                    new_log_tail_extent_id: 0,
+                }));
+            }
+        };
+
+        // Resolve PS endpoints and stream ids in one borrow.
+        struct PartInfo {
+            part_addr: String,
+            log_stream: u64,
+            row_stream: u64,
+            meta_stream: u64,
+        }
+        let (s_info, v_info): (PartInfo, PartInfo) = {
+            let s = self.store.inner.borrow();
+            let resolve = |pid: u64| -> Result<PartInfo, AppError> {
+                let pm = s
+                    .partitions
+                    .get(&pid)
+                    .ok_or_else(|| AppError::NotFound(format!("partition {pid}")))?;
+                let addr = s.part_addrs.get(&pid).cloned().ok_or_else(|| {
+                    AppError::Precondition(format!("partition {pid} has no PS addr"))
+                })?;
+                Ok(PartInfo {
+                    part_addr: addr,
+                    log_stream: pm.log_stream,
+                    row_stream: pm.row_stream,
+                    meta_stream: pm.meta_stream,
+                })
+            };
+            match (resolve(req.survivor_part_id), resolve(req.victim_part_id)) {
+                (Ok(s), Ok(v)) => (s, v),
+                (Err(e), _) | (_, Err(e)) => {
+                    return Ok(rkyv_encode(&MergePartitionsResp {
+                        code: Self::err_to_code(&e),
+                        message: e.to_string(),
+                        new_log_tail_extent_id: 0,
+                    }));
+                }
+            }
+        };
+
+        // The txn's own owner lock. Concurrent merges of one pair are kept
+        // apart by the topology hold above, not by this lock.
+        let owner_key = format!(
+            "admin-merge:{}:{}",
+            req.survivor_part_id, req.victim_part_id
+        );
+        // Phase reporting, same purpose as split's: from the freeze below until
+        // the end, BOTH partitions stop serving writes, and one terminal row in
+        // the ops table cannot distinguish "merging" from "wedged". Merge is
+        // orchestrated here rather than on a PS, so it updates the ledger
+        // directly — but by (kind, part_id) like split, so both kinds read the
+        // same way.
+        let merge_phase = |n: u64| {
+            self.ops.borrow_mut().update_progress_by_part(
+                autumn_rpc::manager_rpc::OP_KIND_MERGE,
+                req.survivor_part_id,
+                req.victim_part_id,
+                n,
+                MERGE_PHASES,
+            );
+        };
+        let owner_epoch = match self.acquire_owner_epoch(&owner_key).await {
+            Ok(r) => {
+                merge_phase(1);
+                r
+            }
+            Err(e) => {
+                return Ok(rkyv_encode(&MergePartitionsResp {
+                    code: Self::err_to_code(&e),
+                    message: e.to_string(),
+                    new_log_tail_extent_id: 0,
+                }));
+            }
+        };
+
+        // Helper closures.
+        let send_freeze = |addr: String, part_id: u64, freeze: bool| {
+            let pool = self.conn_pool.clone();
+            let freeze_timeout = Duration::from_secs(self.params().merge_freeze_timeout_secs.get());
+            async move {
+                let req = autumn_rpc::partition_rpc::MergeFreezeReq { part_id, freeze };
+                let payload = autumn_rpc::partition_rpc::rkyv_encode(&req);
+                // 30 s — MERGE_FREEZE drains pending+inflight on PS,
+                // flushes every imm, halts new writes. Real work, but
+                // bounded to avoid manager wedging on a dead PS.
+                let resp_bytes = pool
+                    .call_timeout(
+                        &addr,
+                        autumn_rpc::partition_rpc::MSG_MERGE_FREEZE,
+                        payload,
+                        freeze_timeout,
+                    )
+                    .await
+                    .map_err(|e| AppError::Internal(format!("freeze rpc to {addr}: {e}")))?;
+                if freeze
+                    && MERGE_TEST_DROP_FREEZE_REPLY.load(std::sync::atomic::Ordering::Relaxed)
+                        == part_id
+                {
+                    return Err(AppError::Internal(format!(
+                        "freeze rpc to {addr}: reply dropped (test failpoint)"
+                    )));
+                }
+                let resp: autumn_rpc::partition_rpc::MergeFreezeResp =
+                    autumn_rpc::partition_rpc::rkyv_decode(&resp_bytes)
+                        .map_err(AppError::Internal)?;
+                if resp.code != autumn_rpc::partition_rpc::CODE_OK {
+                    return Err(AppError::Precondition(format!(
+                        "freeze({freeze}) on partition {part_id}: {}",
+                        resp.message
+                    )));
+                }
+                Ok((resp.log_tail_extent_id, resp.log_end))
+            }
+        };
+
+        // Every PS a freeze was sent to, unfrozen in reverse order on failure.
+        let mut to_unfreeze: Vec<(String, u64)> = Vec::new();
+        let rollback = |list: Vec<(String, u64)>, pool: Rc<ConnPool>| async move {
+            for (addr, pid) in list.into_iter().rev() {
+                let unfreeze = autumn_rpc::partition_rpc::MergeFreezeReq {
+                    part_id: pid,
+                    freeze: false,
+                };
+                let payload = autumn_rpc::partition_rpc::rkyv_encode(&unfreeze);
+                // 10 s — best-effort rollback unfreeze; PS may already
+                // be torn down. Don't wedge the rollback path either.
+                let _ = pool
+                    .call_timeout(
+                        &addr,
+                        autumn_rpc::partition_rpc::MSG_MERGE_FREEZE,
+                        payload,
+                        Duration::from_secs(10),
+                    )
+                    .await;
+            }
+        };
+
+        // Freeze victim first (matches the dual-gate ordering convention
+        // in `crates/partition-server/CLAUDE.md` — victim < survivor for
+        // deadlock-safe lock acquisition; here the freezes don't deadlock
+        // each other but we keep the order for consistency with future
+        // PS-side gate work).
+        // Each side joins the rollback BEFORE its freeze is sent: a failed
+        // freeze may still have frozen it (the OK lost on the way back), and
+        // an unfreeze of a side that is not frozen does nothing. Left out, a
+        // lost reply kept the side refusing writes until FREEZE_TTL (30 s).
+        to_unfreeze.push((v_info.part_addr.clone(), req.victim_part_id));
+        let v_drained = match send_freeze(v_info.part_addr.clone(), req.victim_part_id, true).await {
+            Ok(cursor) => cursor,
+            Err(e) => {
+                rollback(to_unfreeze.clone(), self.conn_pool.clone()).await;
+                return Ok(rkyv_encode(&MergePartitionsResp {
+                    code: Self::err_to_code(&e),
+                    message: e.to_string(),
+                    new_log_tail_extent_id: 0,
+                }));
+            }
+        };
+        to_unfreeze.push((s_info.part_addr.clone(), req.survivor_part_id));
+        let s_drained = match send_freeze(s_info.part_addr.clone(), req.survivor_part_id, true).await {
+            Ok(cursor) => cursor,
+            Err(e) => {
+                rollback(to_unfreeze.clone(), self.conn_pool.clone()).await;
+                return Ok(rkyv_encode(&MergePartitionsResp {
+                    code: Self::err_to_code(&e),
+                    message: e.to_string(),
+                    new_log_tail_extent_id: 0,
+                }));
+            }
+        };
+        merge_phase(2); // both sides frozen — writes are stopped from here
+
+        {
+            let pause = MERGE_TEST_TAKEOVER_PAUSE_MS.load(std::sync::atomic::Ordering::Relaxed);
+            if pause > 0 {
+                compio::time::sleep(Duration::from_millis(pause)).await;
+            }
+        }
+        let sources = match self
+            .take_merge_sources(&[
+                (req.survivor_part_id, [s_info.log_stream, s_info.row_stream, s_info.meta_stream]),
+                (req.victim_part_id, [v_info.log_stream, v_info.row_stream, v_info.meta_stream]),
+            ])
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                rollback(to_unfreeze.clone(), self.conn_pool.clone()).await;
+                return Ok(rkyv_encode(&MergePartitionsResp {
+                    code: Self::err_to_code(&e),
+                    message: e.to_string(),
+                    new_log_tail_extent_id: 0,
+                }));
+            }
+        };
+
+        // Capture commit_length on each of the 6 streams under the source's
+        // own epoch (the fenced floor refuses any older one), through the
+        // same sealed-vs-live + min-replica path the merge txn expects.
+        let read_commit_len = |stream_id: u64| {
+            let (owner_key, owner_epoch, fenced_tail) = sources.for_stream(stream_id);
+            async move {
+                let req = CheckCommitLengthReq {
+                    stream_id,
+                    owner_key,
+                    owner_epoch,
+                };
+                let resp_bytes = self.handle_check_commit_length(rkyv_encode(&req)).await?;
+                let resp: CheckCommitLengthResp =
+                    rkyv_decode(&resp_bytes).map_err(|e| (StatusCode::Internal, e))?;
+                if resp.code != CODE_OK {
+                    return Err((
+                        StatusCode::Internal,
+                        format!("commit_length stream {stream_id}: {}", resp.message),
+                    ));
+                }
+                // The fence covers one extent: a length measured on any other
+                // tail could still grow.
+                let measured = resp.last_ex_info.as_ref().map(|e| e.extent_id);
+                if measured != Some(fenced_tail) {
+                    return Err((
+                        StatusCode::FailedPrecondition,
+                        format!(
+                            "stream {stream_id} tail moved from fenced extent {fenced_tail} \
+                             to {measured:?}; retry merge"
+                        ),
+                    ));
+                }
+                // Pass the REAL committed length, INCLUDING 0. A frozen tail
+                // whose all-replica commit is 0 (empty — e.g. a freshly-rolled
+                // victim log tail that took no writes) MUST seal at
+                // `sealed_length = 0`, not 1. The old `.max(1)` over-sealed an
+                // empty spliced victim log tail at byte 1 and the merged
+                // survivor's replay then failed "got 0 of 1 expected bytes".
+                // `handle_check_commit_length` returns Err when no replica
+                // answers, so OK+0 is genuinely empty.
+                Ok::<u64, (StatusCode, String)>(resp.end as u64)
+            }
+        };
+
+        // Six commit_lengths in the order [survivor_log, victim_log,
+        // survivor_row, victim_row, survivor_meta, victim_meta]. Captured
+        // serially under the freeze; concurrency would not save much
+        // here and serial keeps the failure mode simpler.
+        let log_lens = match (
+            read_commit_len(s_info.log_stream).await,
+            read_commit_len(v_info.log_stream).await,
+        ) {
+            (Ok(s), Ok(v)) => [s, v],
+            (Err((code, msg)), _) | (_, Err((code, msg))) => {
+                rollback(to_unfreeze.clone(), self.conn_pool.clone()).await;
+                return Err((code, msg));
+            }
+        };
+        // The merged open replays nothing before the sources' freeze
+        // checkpoints (partition-server CLAUDE.md, "Recovery replay start"),
+        // so each log must still end where its drain left it. A write acked
+        // between the freeze and the takeover (a restart, a stale unfreeze)
+        // moved it; the capture includes such a write, but the merged
+        // partition would never replay it.
+        for ((part_id, log_stream, drained), measured_end) in [
+            (req.survivor_part_id, s_info.log_stream, s_drained),
+            (req.victim_part_id, v_info.log_stream, v_drained),
+        ]
+        .into_iter()
+        .zip(log_lens)
+        {
+            let measured = (sources.for_stream(log_stream).2, measured_end);
+            if measured != drained {
+                rollback(to_unfreeze.clone(), self.conn_pool.clone()).await;
+                return Ok(rkyv_encode(&MergePartitionsResp {
+                    code: CODE_PRECONDITION,
+                    message: format!(
+                        "partition {part_id} took writes after its freeze drain \
+                         (log drained at {drained:?}, now {measured:?}); retry merge"
+                    ),
+                    new_log_tail_extent_id: 0,
+                }));
+            }
+        }
+        let row_lens = match (
+            read_commit_len(s_info.row_stream).await,
+            read_commit_len(v_info.row_stream).await,
+        ) {
+            (Ok(s), Ok(v)) => [s, v],
+            (Err((code, msg)), _) | (_, Err((code, msg))) => {
+                rollback(to_unfreeze.clone(), self.conn_pool.clone()).await;
+                return Err((code, msg));
+            }
+        };
+        let meta_lens = match (
+            read_commit_len(s_info.meta_stream).await,
+            read_commit_len(v_info.meta_stream).await,
+        ) {
+            (Ok(s), Ok(v)) => [s, v],
+            (Err((code, msg)), _) | (_, Err((code, msg))) => {
+                rollback(to_unfreeze.clone(), self.conn_pool.clone()).await;
+                return Err((code, msg));
+            }
+        };
+
+        // Test failpoint (always 0 in production): a slow/paused coordinator
+        // between the capture and the txn.
+        {
+            let pause = MERGE_TEST_PAUSE_MS.load(std::sync::atomic::Ordering::Relaxed);
+            if pause > 0 {
+                compio::time::sleep(Duration::from_millis(pause)).await;
+            }
+        }
+
+        merge_phase(3); // all six commit_lengths captured under the freeze
+
+        // Run the existing merge txn under the same owner-lock.
+        let mmm_req = MultiModifyMergeReq {
+            survivor_part_id: req.survivor_part_id,
+            victim_part_id: req.victim_part_id,
+            owner_key: owner_key.clone(),
+            owner_epoch,
+            log_sealed_lengths: log_lens,
+            row_sealed_lengths: row_lens,
+            meta_sealed_lengths: meta_lens,
+        };
+        let mmm_resp_bytes = match self.multi_modify_merge(mmm_req, &sources).await {
+            Ok(b) => b,
+            Err((code, msg)) => {
+                rollback(to_unfreeze.clone(), self.conn_pool.clone()).await;
+                return Err((code, msg));
+            }
+        };
+        let mmm_resp: MultiModifyMergeResp =
+            rkyv_decode(&mmm_resp_bytes).map_err(|e| (StatusCode::Internal, e))?;
+
+        if mmm_resp.code != CODE_OK {
+            // Rollback freezes — txn refused, both PSes should resume.
+            rollback(to_unfreeze.clone(), self.conn_pool.clone()).await;
+            return Ok(rkyv_encode(&MergePartitionsResp {
+                code: mmm_resp.code,
+                message: mmm_resp.message,
+                new_log_tail_extent_id: 0,
+            }));
+        }
+
+        // Success path: leave both PSes frozen. Their region_sync_loop
+        // will, on its next ~2 s tick, observe the new region state and
+        // drop the frozen `PartitionData` entirely — natural unfreeze.
+        merge_phase(MERGE_PHASES); // committed; the PSs unfreeze on their next tick
+        Ok(rkyv_encode(&MergePartitionsResp {
+            code: CODE_OK,
+            message: String::new(),
+            new_log_tail_extent_id: mmm_resp.new_log_tail_extent_id,
+        }))
+    }
+
+    /// actively re-spread partitions across the registered
+    /// PS fleet (most-loaded → least-loaded, bounded by `max_moves`). Leader-
+    /// only. Each move rewrites a region's `ps_id`; the old PS's
+    /// `sync_regions_once` drops the partition and the new PS opens it (the same
+    /// mechanism eviction-driven reassignment already uses). `rg` is unchanged
+    /// so `region_epoch` is NOT bumped — the key RANGE didn't move, only which
+    /// PS serves it; clients re-resolve the partition's listener via the
+    /// refreshed `part_addr`.
+    ///
+    /// Persistence mirrors the eviction path (memory-first, then
+    /// `mirror_partition_snapshot` — the regions/ mirror re-reads the store so
+    /// it captures any concurrent change): apply in-memory, then persist. On a
+    /// mirror failure the in-memory reassignment stands for this leader's life
+    /// but a leader failover replays the (stale) etcd regions — idempotent, the
+    /// operator just re-runs `rebalance`.
+    ///
+    /// SAFETY of moving a partition off a still-LIVE PS (no freeze/drain needed):
+    /// the new PS's `open_partition` acquires the per-partition owner epoch
+    /// (`partition/<id>`) BEFORE it reads `commit_length` — so the old owner is
+    /// fenced (manager equality + EN floor) before the new owner snapshots the
+    /// tail. Any write the old PS durably ack'd happened before that fence and
+    /// is therefore ≤ the new owner's commit_length (no lost update); a write
+    /// the old PS accepted but couldn't ack (its append now fails
+    /// `LockedByOther` → self-eviction) is retried by the client onto the new
+    /// PS. This is exactly the failover/eviction handoff — a pure PS reassignment
+    /// needs no merge-style freeze (data isn't combined; the target reopens from
+    /// the durable streams). `region_epoch` is NOT bumped (the key range is
+    /// unchanged); routing follows the partition's `part_addr`, which we clear
+    /// below so clients stop resolving to the old PS immediately.
+    pub(crate) async fn handle_rebalance_regions(&self, payload: Bytes) -> HandlerResult {
+        if let Err(err) = self.ensure_leader() {
+            return Ok(rkyv_encode(&RebalanceRegionsResp {
+                code: Self::err_to_code(&err),
+                message: err.to_string(),
+                moves: vec![],
+                moved: 0,
+            }));
+        }
+        let req: RebalanceRegionsReq =
+            rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+
+        // Compute + apply in-memory under one borrow (no await inside).
+        let moves = {
+            let mut s = self.store.inner.borrow_mut();
+            let moves = Self::compute_rebalance_moves(&s, req.max_moves);
+            for m in &moves {
+                if let Some(r) = s.regions.get_mut(&m.part_id) {
+                    r.ps_id = m.to_ps;
+                }
+                // Drop the stale per-partition listener addr (registered by the
+                // OLD PS). `GetRegions` filters `part_addrs` only by "region
+                // still exists", and the client prefers `part_addrs[part_id]`
+                // over the PS base address — so without this a refreshed client
+                // keeps routing to the old PS's (soon-closed) listener until the
+                // new PS reopens + re-registers. Removing it makes the client
+                // fall back to the target PS immediately (self-heal then
+                // installs the new addr on the new PS's first sync).
+                s.part_addrs.remove(&m.part_id);
+            }
+            moves
+        };
+
+        if !moves.is_empty() {
+            if let Err(err) = self.mirror_partition_snapshot().await {
+                return Ok(rkyv_encode(&RebalanceRegionsResp {
+                    code: Self::err_to_code(&err),
+                    message: format!("rebalance persist failed: {err}"),
+                    moves: vec![],
+                    moved: 0,
+                }));
+            }
+            tracing::info!("rebalance: moved {} partition(s)", moves.len());
+        }
+
+        let moved = moves.len() as u32;
+        Ok(rkyv_encode(&RebalanceRegionsResp {
+            code: CODE_OK,
+            message: String::new(),
+            moves,
+            moved,
+        }))
+    }
+
+    /// `MSG_OP_SUBMIT` — record a long-running op in the ledger and actuate it in
+    /// the background, returning the assigned `op_id` immediately. Leader-gated +
+    /// admin-gated (the dispatch already stripped/verified the token prefix).
+    pub(crate) async fn handle_op_submit(&self, payload: Bytes) -> HandlerResult {
+        if let Err(err) = self.ensure_leader() {
+            return Ok(rkyv_encode(&OpSubmitResp {
+                code: Self::err_to_code(&err),
+                message: err.to_string(),
+                op_id: 0,
+            }));
+        }
+        let req: OpSubmitReq = rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+
+        // Validate kind + the target its actuation needs, up front — a malformed
+        // submit is a request error (no ledger entry), not a FAILED op.
+        let need_part = matches!(
+            req.kind,
+            OP_KIND_SPLIT | OP_KIND_COMPACT | OP_KIND_GC | OP_KIND_FORCE_GC
+        );
+        let bad = match req.kind {
+            // Recovery is AUTO-dispatched by the recovery loop (it repairs a
+            // degraded replica when one is detected); there is no meaningful
+            // operator "start a recovery" — it appears in the ledger on its own.
+            OP_KIND_RECOVERY => Some(
+                "recovery is auto-dispatched, not submittable — watch it with \
+                 `ops list --kind recovery`",
+            ),
+            // Any scope: extents, a partition, or (neither) the whole cluster.
+            OP_KIND_SCRUB => None,
+            OP_KIND_REPAIR | OP_KIND_REPAIR_CANCEL => {
+                if req.extent_ids.is_empty() == (req.part_id == 0) {
+                    Some("repair takes extent ids OR a node id in part_id, not both or neither")
+                } else {
+                    None
+                }
+            }
+            OP_KIND_SPLIT | OP_KIND_MERGE | OP_KIND_REBALANCE | OP_KIND_COMPACT | OP_KIND_GC
+            | OP_KIND_FORCE_GC | OP_KIND_EC_CONVERT => {
+                if need_part && req.part_id == 0 {
+                    Some("this op requires a part_id")
+                } else if req.kind == OP_KIND_MERGE
+                    && (req.part_id == 0 || req.secondary_id == 0)
+                {
+                    Some("merge requires survivor part_id + victim secondary_id")
+                } else if req.kind == OP_KIND_EC_CONVERT && req.secondary_id == 0 {
+                    Some("ec-convert requires an extent id (secondary_id)")
+                } else if req.kind == OP_KIND_FORCE_GC && req.extent_ids.is_empty() {
+                    Some("forcegc requires at least one extent id")
+                } else {
+                    None
+                }
+            }
+            _ => Some("unknown op kind"),
+        };
+        if let Some(msg) = bad {
+            return Ok(rkyv_encode(&OpSubmitResp {
+                code: CODE_INVALID_ARGUMENT,
+                message: msg.to_string(),
+                op_id: 0,
+            }));
+        }
+
+        let (now_s, now_ms) = Self::now_s_ms();
+        let requested_by = if req.requested_by.is_empty() {
+            "cli".to_string()
+        } else {
+            req.requested_by.clone()
+        };
+        let (op_id, attached) = self.ops.borrow_mut().submit(
+            req.kind,
+            req.part_id,
+            req.secondary_id,
+            req.extent_ids.clone(),
+            requested_by,
+            now_s,
+            now_ms,
+        );
+        if attached {
+            return Ok(rkyv_encode(&OpSubmitResp {
+                code: CODE_OK,
+                message: "attached to an in-flight op with the same target".to_string(),
+                op_id,
+            }));
+        }
+        // Actuate in the background; the caller polls `ops status`.
+        let mgr = self.clone();
+        compio::runtime::spawn(async move {
+            mgr.run_submitted_op(op_id, req, crate::OpOrigin::Operator).await
+        })
+        .detach();
+        Ok(rkyv_encode(&OpSubmitResp {
+            code: CODE_OK,
+            message: String::new(),
+            op_id,
+        }))
+    }
+
+    /// `MSG_OP_QUERY` — `ops status <id>` (one record, UNKNOWN if not in this
+    /// leader's ledger) or `ops list` (filtered). Leader-gated (a follower's
+    /// ledger is empty).
+    pub(crate) async fn handle_op_query(&self, payload: Bytes) -> HandlerResult {
+        if let Err(err) = self.ensure_leader() {
+            return Ok(rkyv_encode(&OpQueryResp {
+                code: Self::err_to_code(&err),
+                message: err.to_string(),
+                ops: vec![],
+            }));
+        }
+        let req: OpQueryReq = rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+        let ops = self.ops.borrow().query(&req);
+        Ok(rkyv_encode(&OpQueryResp {
+            code: CODE_OK,
+            message: String::new(),
+            ops,
+        }))
+    }
+
+    /// Read durable terminal history (`opLog/`), newest first.
+    ///
+    /// Leader-gated like `handle_op_query`, but for a different reason: the
+    /// ledger is leader-local state a follower simply does not have, whereas
+    /// this reads etcd, which any instance could reach. Gating anyway keeps one
+    /// answer to "where do I ask about ops" and avoids a follower serving a
+    /// view its own replay may lag.
+    pub(crate) async fn handle_op_history(&self, payload: Bytes) -> HandlerResult {
+        if let Err(err) = self.ensure_leader() {
+            return Ok(rkyv_encode(&OpHistoryResp {
+                code: Self::err_to_code(&err),
+                message: err.to_string(),
+                ops: vec![],
+            }));
+        }
+        let req: OpHistoryReq =
+            rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+        // A readable-but-empty log and an unreadable one are different answers.
+        match self.read_op_log(req.kind_filter, req.since_unix, req.limit).await {
+            Ok(ops) => Ok(rkyv_encode(&OpHistoryResp {
+                code: CODE_OK,
+                message: String::new(),
+                ops,
+            })),
+            Err(message) => Ok(rkyv_encode(&OpHistoryResp {
+                code: CODE_ERROR,
+                message,
+                ops: vec![],
+            })),
+        }
+    }
+
+    // ── handle_get_policy_candidates / handle_report_partition_load ──
+
+    pub(crate) async fn handle_get_policy_candidates(&self, _payload: Bytes) -> HandlerResult {
+        // leader gate. The handler previously returned
+        // `advisory_cache` on any node, but only the leader's
+        // `policy_tick_loop` populates the cache (follower's stays
+        // empty). An external controller polling `MSG_GET_POLICY_CANDIDATES`
+        // against a follower silently received an empty candidate list
+        // — indistinguishable from "nothing to do" — and would never
+        // notice it was asking the wrong node. Same fix pattern as
+        // the `handle_get_partition_detail` gate.
+        if !self.leader.get() {
+            return Ok(rkyv_encode(&GetPolicyCandidatesResp {
+                code: CODE_NOT_LEADER,
+                message: "not leader".to_string(),
+                candidates: Vec::new(),
+            }));
+        }
+        let p = self.policy.borrow();
+        let candidates = p.advisory_cache.clone();
+        Ok(rkyv_encode(&GetPolicyCandidatesResp {
+            code: CODE_OK,
+            message: String::new(),
+            candidates,
+        }))
+    }
+
+    // ── auto-policy controller RPCs (headless control) ────
+
+    pub(crate) async fn handle_autopolicy_get(&self, _payload: Bytes) -> HandlerResult {
+        // Leader-only: the live state is leader-local, and the
+        // controller loop only runs on the leader (a follower's replayed config
+        // is stale). Sister to the MSG_GET_POLICY_CANDIDATES gate.
+        if !self.leader.get() {
+            return Ok(rkyv_encode(&AutoPolicyGetResp {
+                code: CODE_NOT_LEADER,
+                message: "not leader".to_string(),
+                mode: 0,
+                active: String::new(),
+                allow_mutations: false,
+                policies: Vec::new(),
+            }));
+        }
+        Ok(rkyv_encode(&self.autopolicy_snapshot()))
+    }
+
+    pub(crate) async fn handle_autopolicy_set(&self, payload: Bytes) -> HandlerResult {
+        let req: AutoPolicySetReq =
+            rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+        // `autopolicy_set` gates on leader (its etcd write is leader-fenced) and
+        // returns the resulting state; map any AppError to a coded resp.
+        match self.autopolicy_set(req.op, req.mode, req.name, req.entry).await {
+            Ok(resp) => Ok(rkyv_encode(&resp)),
+            Err(e) => Ok(rkyv_encode(&AutoPolicySetResp {
+                code: Self::err_to_code(&e),
+                message: e.to_string(),
+                mode: 0,
+                active: String::new(),
+                policies: Vec::new(),
+            })),
+        }
+    }
+
+    /// const-dump of the `POLICY_KIND_*` enum so external
+    /// controllers can introspect the wire mapping at startup rather
+    /// than hardcoding numeric values that may have drifted across
+    /// docs/code (an earlier off-by-one was caused by exactly
+    /// that drift). No leader gate — the answer is a compile-time
+    /// constant of THIS binary; any node can serve it.
+    pub(crate) async fn handle_get_policy_kind_names(&self, _payload: Bytes) -> HandlerResult {
+        Ok(rkyv_encode(&GetPolicyKindNamesResp {
+            code: CODE_OK,
+            message: String::new(),
+            kinds: policy_kind_names(),
+        }))
+    }
+
+    pub(crate) async fn handle_report_partition_load(&self, payload: Bytes) -> HandlerResult {
+        let req: ReportPartitionLoadReq =
+            rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+        let now = Self::epoch_seconds();
+        // Collect PS-reported maintenance outcomes before the loop consumes
+        // `req.partitions`; reconciled into the op-ledger after the metrics
+        // borrow is released (append_audit is async).
+        let outcomes: Vec<(u64, autumn_rpc::manager_rpc::MaintenanceOutcome)> = req
+            .partitions
+            .iter()
+            .flat_map(|l| {
+                l.maintenance_outcomes
+                    .iter()
+                    .cloned()
+                    .map(move |o| (l.part_id, o))
+            })
+            .collect();
+        // Carry the partition with the sample: an untracked split reports
+        // `op_id: 0` and is matched by (kind, part_id).
+        let load_progress: Vec<(u64, autumn_rpc::manager_rpc::MaintenanceProgress)> = req
+            .partitions
+            .iter()
+            .flat_map(|l| {
+                l.active_maintenance
+                    .iter()
+                    .cloned()
+                    .map(move |m| (l.part_id, m))
+            })
+            .collect();
+        let mut p = self.policy.borrow_mut();
+        // The configured `window_buckets / bucket_sec` shape the history
+        // window (`set_policy_config` reshapes it).
+        let cap = p.config.window_buckets.max(1);
+        let bucket_sec = p.config.bucket_sec.max(1);
+        for load in req.partitions {
+            p.metrics
+                .entry(load.part_id)
+                .or_default()
+                .push_with_cap_and_bucket(now, load, cap, bucket_sec);
+        }
+        drop(p);
+        // Live progress for whatever this partition is running now. Applied
+        // BEFORE the terminal outcomes below so a sample and its own op's
+        // completion arriving in the same heartbeat cannot leave the entry
+        // showing progress on a closed op — `update_progress` only touches
+        // RUNNING entries, and the outcome flips it terminal afterwards.
+        for (part_id, p) in &load_progress {
+            if p.op_id != 0 {
+                self.note_split_heard(p.op_id, now);
+                self.ops
+                    .borrow_mut()
+                    .update_progress(p.op_id, p.done, p.total);
+            } else {
+                // Split's ledger entry carries `secondary_id == 0`, and an
+                // untracked split is the only report without an op id.
+                self.ops
+                    .borrow_mut()
+                    .update_progress_by_part(p.kind, *part_id, 0, p.done, p.total);
+            }
+        }
+        // Reconcile PS-executed op outcomes into the ledger (known op_id only,
+        // idempotent) and audit each terminal transition exactly once.
+        for (part_id, o) in outcomes {
+            self.note_split_heard(o.op_id, now);
+            // A split the PS gave up on while its commit is still in flight
+            // here may yet commit; the PS re-sends the outcome next report.
+            if o.kind == OP_KIND_SPLIT && self.split_inflight.borrow().contains(&part_id) {
+                continue;
+            }
+            let transitioned = self.ops.borrow_mut().reconcile_outcome(
+                o.op_id,
+                o.state,
+                o.error.clone(),
+                o.message.clone(),
+                now,
+            );
+            if transitioned {
+                // EVENT vs STATE: the ledger answers "how is this op doing"
+                // and is a bounded in-memory ring that dies with the leader;
+                // the audit entry records only a 0/1 result_code. Neither
+                // preserves WHY. Emit the reason to the leader log, where it
+                // is durable and can be scraped (the dashboard surfaces
+                // notifications by reading these lines). Fires once per op —
+                // `transitioned` is the idempotent first-claim.
+                if o.state != OP_STATE_SUCCEEDED {
+                    tracing::error!(
+                        target: "autumn::op_event",
+                        op_id = o.op_id,
+                        kind = o.kind,
+                        state = o.state,
+                        error = %o.error,
+                        message = %o.message,
+                        "maintenance op FAILED"
+                    );
+                } else {
+                    tracing::info!(
+                        target: "autumn::op_event",
+                        op_id = o.op_id,
+                        kind = o.kind,
+                        message = %o.message,
+                        "maintenance op succeeded"
+                    );
+                }
+                self.append_audit(MgrAuditEntry {
+                    op: crate::op_kind_audit_code(o.kind),
+                    node_id: 0,
+                    extent_id: 0,
+                    by: "cli".to_string(),
+                    reason: String::new(),
+                    result_code: if o.state == OP_STATE_SUCCEEDED { 0 } else { 1 },
+                    result_message: if o.error.is_empty() { o.message } else { o.error },
+                    ts_ns: 0,
+                })
+                .await;
+            }
+        }
+        self.reconcile_unknown_splits(now).await;
+        self.settle_reopened_maintenance(now);
+        // Write this heartbeat's own terminal records to durable history —
+        // after the loop above queued them, so a completion does not wait for
+        // the next heartbeat to become durable.
+        self.flush_op_log().await;
+        Self::code_resp(CODE_OK, String::new())
+    }
+
+    /// OP-driven per-extent EC convert trigger. Validates the
+    /// extent is sealed, not already converted, and references an
+    /// EC-policy stream. Persists a rich `pending_ec_dispatch` marker
+    /// to etcd + memory; the next `ec_conversion_dispatch_loop` tick
+    /// (within ~5 s) drains it via the replay path and runs the
+    /// existing 2PC encode + commit flow.
+    ///
+    /// Idempotent: re-invocation against an already-pending or
+    /// already-converted extent returns CODE_OK. Out-of-policy
+    /// requests (non-EC stream, sealed_length=0, missing extent)
+    /// return CODE_PRECONDITION with a descriptive message.
+    /// The requested extents the arbiter would not let a removal start on: an
+    /// op is in flight on them. A follower's ledger is empty, so it answers
+    /// NOT_LEADER rather than "none".
+    pub(crate) fn handle_extents_in_flight(&self, payload: Bytes) -> HandlerResult {
+        let req: ExtentsInFlightReq =
+            rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+        if let Err(err) = self.ensure_leader() {
+            return Ok(rkyv_encode(&ExtentsInFlightResp {
+                code: Self::err_to_code(&err),
+                message: err.to_string(),
+                in_flight: Vec::new(),
+            }));
+        }
+        let in_flight = req
+            .extent_ids
+            .into_iter()
+            .filter(|&eid| {
+                let facts = crate::extent_arbiter::ExtentFacts {
+                    extent_id: eid,
+                    in_flight: self.extent_inflight_op(eid),
+                    ..Default::default()
+                };
+                crate::extent_arbiter::may_start(crate::extent_arbiter::ExtentOp::Removal, &facts)
+                    .is_err()
+            })
+            .collect();
+        Ok(rkyv_encode(&ExtentsInFlightResp {
+            code: CODE_OK,
+            message: String::new(),
+            in_flight,
+        }))
+    }
+
+    pub(crate) async fn handle_force_ec_convert(&self, payload: Bytes) -> HandlerResult {
+        if !self.leader.get() {
+            return Self::force_ec_resp(CODE_NOT_LEADER, "not leader".to_string());
+        }
+        let req: ForceEcConvertReq =
+            rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+        let extent_id = req.extent_id;
+
+        // Already converting: idempotent OK (the caller's intent matches the op
+        // in flight). Any other op in flight is the arbiter's refusal below.
+        if self.extent_inflight_op(extent_id)
+            == Some(crate::extent_inflight::ExtentOpKind::ConvertToEc)
+        {
+            return Self::force_ec_resp(CODE_OK, "already pending dispatch".to_string());
+        }
+
+        // Look up current state + the owning stream's EC shape under
+        // a single borrow.
+        let (ex, stream) = {
+            let s = self.store.inner.borrow();
+            let ex = match s.extents.get(&extent_id) {
+                Some(e) => e.clone(),
+                None => {
+                    return Self::force_ec_resp(
+                        CODE_PRECONDITION,
+                        format!("extent {extent_id} not found"),
+                    );
+                }
+            };
+            if ex.sealed_length == 0 {
+                return Self::force_ec_resp(
+                    CODE_PRECONDITION,
+                    format!(
+                        "extent {extent_id} not sealed (sealed_length=0); use GC for empty slots"
+                    ),
+                );
+            }
+            if ex.ec_converted {
+                return Self::force_ec_resp(
+                    CODE_OK,
+                    format!("extent {extent_id} already ec_converted"),
+                );
+            }
+            let stream = s
+                .streams
+                .values()
+                .find(|st| st.ec_parity_shard > 0 && st.extent_ids.contains(&extent_id));
+            let stream = match stream {
+                Some(s) => s.clone(),
+                None => {
+                    return Self::force_ec_resp(
+                        CODE_PRECONDITION,
+                        format!(
+                            "extent {extent_id} is not on an EC-policy stream (set-stream-ec first)"
+                        ),
+                    );
+                }
+            };
+            (ex, stream)
+        };
+
+        let data_shards = stream.ec_data_shard as usize;
+        let parity_shards = stream.ec_parity_shard as usize;
+        let total_shards = data_shards + parity_shards;
+
+        // May a conversion start now (`extent_arbiter.rs`): nothing in flight,
+        // no split/merge hold, no rebuild or catch-up owed, a full copy to
+        // encode from and enough health nodes for K+M.
+        let view = self.arbiter_view();
+        if let Err(why) =
+            self.arbitrate(
+                &view,
+                extent_id,
+                crate::extent_arbiter::ExtentOp::EcConvert { shards: total_shards },
+            )
+        {
+            return Self::force_ec_resp(CODE_PRECONDITION, why);
+        }
+        // Targets (§5): the replicas that can keep their copy where it is, the
+        // coordinator first — it encodes from its own copy — then health
+        // non-members for the rest: substitutes for replicas on suspected or
+        // maintenance nodes, and the extras K+M needs. A substituted replica
+        // falls out of the layout at the flip; its node's reconcile drops it.
+        let mut target_nodes: Vec<u64> = view
+            .replicas(&ex, self.corrupt_slots_of(extent_id))
+            .iter()
+            .filter(|r| r.ec_usable())
+            .map(|r| r.node)
+            .take(total_shards)
+            .collect();
+        let mut extra_disk_ids: Vec<u64> = Vec::new();
+        let needed = total_shards - target_nodes.len();
+        if needed > 0 {
+            let placement_load = self.placement_load();
+            let candidates: Vec<NodeRecord> = {
+                let s = self.store.inner.borrow();
+                let members: HashSet<u64> =
+                    ex.replicates.iter().chain(ex.parity.iter()).copied().collect();
+                let ids: Vec<u64> = view
+                    .ready
+                    .iter()
+                    .copied()
+                    .filter(|n| !members.contains(n))
+                    .collect();
+                crate::placement::order_by_load(
+                    crate::placement::pool_for(ids, &placement_load),
+                    &mut rand::thread_rng(),
+                )
+                .into_iter()
+                .filter_map(|id| s.nodes.get(&id).cloned())
+                .take(needed)
+                .collect()
+            };
+            if candidates.len() < needed {
+                return Self::force_ec_resp(
+                    CODE_PRECONDITION,
+                    format!(
+                        "not enough health nodes for EC {data_shards}+{parity_shards} ({} of \
+                         {total_shards} available)",
+                        target_nodes.len() + candidates.len()
+                    ),
+                );
+            }
+            for node in &candidates {
+                match self.alloc_extent_on_node(&node.address, extent_id).await {
+                    Ok(disk_id) => {
+                        target_nodes.push(node.node_id);
+                        extra_disk_ids.push(disk_id);
+                    }
+                    Err(e) => {
+                        return Self::force_ec_resp(
+                            CODE_ERROR,
+                            format!("alloc_extent_on_node({}): {e}", node.address),
+                        );
+                    }
+                }
+            }
+        }
+
+        // verify-BEFORE-acquire, not after. The race we close:
+        // between the L2436 snapshot and our `acquire_extent_inflight`
+        // call below there are N `alloc_extent_on_node` awaits — during
+        // them an `apply_recovery_done` for this extent can complete
+        // (Recovery marker present at snapshot time would have been
+        // caught by L2416's `extent_inflight_op` probe; the race is for
+        // a Recovery that started after L2416 finished and completed
+        // during alloc await). Recovery bumps `ex.eversion` + rewrites
+        // `ex.replicates`. If we proceeded to acquire with our stale
+        // snapshot's `ex.eversion + 1`, the dispatch loop would later
+        // run `apply_ec_conversion_done` with that stale `new_eversion`
+        // and overwrite recovery's slot change.
+        //
+        // **Why verify-before, not verify-after:** an initial
+        // form did verify-after-acquire + drain-on-mismatch. A review
+        // found: if `drain_extent_inflight_marker` fails
+        // (NotLeader during the drain await, or transient etcd error),
+        // the stale marker stays in etcd. The dispatch loop's next
+        // 5 s tick (or a successor leader's replay) then runs
+        // `apply_ec_conversion_done` with the stale `new_eversion` —
+        // exactly the corruption the check was supposed to prevent.
+        //
+        // Verify-before sidesteps the problem entirely: no marker is
+        // ever written if the state has drifted, so no drain is needed.
+        // After our `acquire_extent_inflight` succeeds, `ex.eversion`
+        // is frozen until our `apply_ec_conversion_done` runs —
+        // every other mutator (apply_recovery_done, handle_*_punch_holes,
+        // handle_truncate, handle_multi_modify_split / merge,
+        // handle_sync_partition_vp_refs, handle_stream_alloc_extent)
+        // checks `extent_inflight_op` and refuses on ConvertToEc.
+        // Recovery cannot even start (its `acquire_extent_inflight` CAS
+        // would fail against our marker). So no verify-after is needed.
+        let pre_eversion = ex.eversion;
+        let live_eversion = self
+            .store
+            .inner
+            .borrow()
+            .extents
+            .get(&extent_id)
+            .map(|e| e.eversion);
+        let live_eversion = match live_eversion {
+            Some(v) => v,
+            None => {
+                return Self::force_ec_resp(
+                    CODE_PRECONDITION,
+                    format!(
+                        "extent {extent_id} removed during force-ec-convert (concurrent gc)"
+                    ),
+                );
+            }
+        };
+        if live_eversion != pre_eversion {
+            return Self::force_ec_resp(
+                CODE_PRECONDITION,
+                format!(
+                    "extent {extent_id} eversion changed during force-ec-convert \
+                     (pre={pre_eversion}, live={live_eversion}); retry to pick up new state"
+                ),
+            );
+        }
+
+        let new_eversion = live_eversion + 1;
+
+        // After the alloc awaits, so a split or merge that started waiting during them
+        // still holds this conversion back (`topology_gate.rs`).
+        if let Some(part_id) = self.topology_holding_extent(extent_id) {
+            return Self::force_ec_resp(
+                CODE_PRECONDITION,
+                format!(
+                    "extent {extent_id} belongs to partition {part_id}, which is being split \
+                     or merged; retry after it completes"
+                ),
+            );
+        }
+
+        // Capture the current owner_lock owner_epoch for the
+        // partition that owns this extent. Threaded through dispatch ->
+        // coord -> WriteShard/CommitEcShard so a fenced ex-coord's
+        // in-flight 2PC is rejected by remote ENs once
+        // a fence bumps their `entry.owner_epoch`
+        // via fence-handover. CoW-shared extents (refs >= 2) appear in
+        // multiple partitions' streams; any of them works because all
+        // sharing partitions hold the same owner_lock owner_epoch at any
+        // moment (revisions are bumped uniformly by the fence-handover).
+        // Seed only. The dispatch loop re-resolves this every tick
+        // (`dispatch_owner_epoch_for_extent`) because the epoch is bumped by any
+        // partition reopen; a frozen value fences the conversion out of its own
+        // participants forever.
+        let dispatch_revision: i64 = {
+            let s = self.store.inner.borrow();
+            crate::recovery::dispatch_owner_epoch_for_extent(&s, extent_id)
+        };
+
+        let dispatch_record = MgrEcDispatchInflight {
+            extent_id,
+            target_nodes,
+            extra_disk_ids,
+            data_shards: data_shards as u32,
+            new_eversion,
+            owner_epoch: dispatch_revision,
+        };
+
+        // acquire the unified inflight marker. CAS via
+        // create_revision==0 + leader fence in a single etcd txn —
+        // replaces the earlier `persist_ec_conversion_inflight + in-memory
+        // insert` pair (two operations, the in-memory write could observe
+        // an etcd failure post-facto). The CAS makes "already in-flight"
+        // a clean Precondition error path rather than a silent overwrite.
+        if let Err(e) = self
+            .acquire_extent_inflight(
+                extent_id,
+                crate::extent_inflight::ExtentOpPayload::ConvertToEc(dispatch_record),
+            )
+            .await
+        {
+            return Self::force_ec_resp(
+                match &e {
+                    AppError::Precondition(_) => CODE_PRECONDITION,
+                    AppError::NotLeader => CODE_NOT_LEADER,
+                    _ => CODE_ERROR,
+                },
+                format!("acquire marker: {e}"),
+            );
+        }
+
+        // Both forms coexist from staging until the reconcile reclaims the
+        // pre-conversion `.dat` (see `apply_placements`), so the window is
+        // bounded by the sweep interval rather than unbounded — but a stalled
+        // reconcile still holds it open, which is worth a line when a
+        // conversion begins.
+        tracing::info!(
+            extent_id,
+            "EC conversion started: both the shards and the pre-conversion .dat \
+             occupy disk until the reconcile reclaims the .dat"
+        );
+
+        Self::force_ec_resp(
+            CODE_OK,
+            format!(
+                "marker persisted for extent {extent_id}; next ec dispatch tick (~5s) will convert"
+            ),
+        )
+    }
+
+    /// external policy controller — return the manager's most
+    /// recent cached `PartitionLoad` for `part_id`. Sourced from the
+    /// last bucket of `PolicyEngine.metrics`, populated by
+    /// `MSG_REPORT_PARTITION_LOAD`. Lets `client info --detail`
+    /// surface per-partition metrics without a dedicated PS RPC.
+    /// Pure builder for one partition's latest cached load metrics. Shared by
+    /// the `MSG_GET_PARTITION_DETAIL` handler and the in-process dashboard
+    /// (`dashboard.rs::partition_detail_json`).
+    ///
+    /// followers' `policy.metrics` is empty (only the leader's
+    /// policy_tick_loop populates it from MSG_REPORT_PARTITION_LOAD). Without
+    /// this gate, querying a follower silently returned `CODE_OK` + all-zero
+    /// PartitionLoad — operators couldn't tell "no metrics yet" from "queried
+    /// the wrong node".
+    pub(crate) fn compute_partition_detail_resp(&self, part_id: u64) -> GetPartitionDetailResp {
+        if !self.leader.get() {
+            return GetPartitionDetailResp {
+                code: CODE_NOT_LEADER,
+                message: "not leader".to_string(),
+                load: PartitionLoad::default(),
+                bucket_ts: 0,
+            };
+        }
+        let p = self.policy.borrow();
+        let bucket = p.metrics.get(&part_id).and_then(|w| w.buckets.back());
+        let (load, bucket_ts) = match bucket {
+            Some((ts, l)) => (l.clone(), *ts),
+            None => (PartitionLoad::default(), 0),
+        };
+        GetPartitionDetailResp {
+            code: CODE_OK,
+            message: String::new(),
+            load,
+            bucket_ts,
+        }
+    }
+
+    pub(crate) async fn handle_get_partition_detail(&self, payload: Bytes) -> HandlerResult {
+        let req: GetPartitionDetailReq =
+            rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+        Ok(rkyv_encode(
+            &self.compute_partition_detail_resp(req.part_id),
+        ))
+    }
+
+    /// Every PS member plus the live registry, with its heartbeat and how many
+    /// of its assigned partitions it reports open — not derived from the
+    /// regions, which can only show a PS that owns something.
+    pub(crate) fn ps_servers_overview(&self, s: &crate::store::MetadataState) -> Vec<PsOverview> {
+        // Regions assigned to each PS.
+        let mut per_ps_parts: std::collections::HashMap<u64, u32> =
+            std::collections::HashMap::new();
+        // Of those, how many the PS last reported open at the current epoch.
+        let mut per_ps_open: std::collections::HashMap<u64, u32> =
+            std::collections::HashMap::new();
+        for r in s.regions.values() {
+            *per_ps_parts.entry(r.ps_id).or_insert(0) += 1;
+            if s
+                .ps_open_parts
+                .get(&r.ps_id)
+                .is_some_and(|open| open.contains(&(r.part_id, r.region_epoch)))
+            {
+                *per_ps_open.entry(r.ps_id).or_insert(0) += 1;
+            }
+        }
+        let hb = self.ps_last_heartbeat.borrow();
+        let now = Instant::now();
+        // Every member plus the live registry: an evicted member is listed
+        // (no heartbeat, `evicted_at_ms` set) until an operator removes it.
+        let ids: std::collections::BTreeSet<u64> =
+            s.ps_nodes.keys().chain(s.ps_members.keys()).copied().collect();
+        ids
+            .iter()
+            .map(|ps_id| (ps_id, s.ps_nodes.get(ps_id), s.ps_members.get(ps_id)))
+            .map(|(ps_id, live, member)| PsOverview {
+                ps_id: *ps_id,
+                address: live
+                    .or(member.map(|m| &m.address))
+                    .cloned()
+                    .unwrap_or_default(),
+                // u64::MAX = no heartbeat entry: an evicted member.
+                last_heartbeat_secs_ago: hb
+                    .get(ps_id)
+                    .map(|t| now.saturating_duration_since(*t).as_secs())
+                    .unwrap_or(u64::MAX),
+                partition_count: per_ps_parts.get(ps_id).copied().unwrap_or(0),
+                slot_cap: s.ps_slot_caps.get(ps_id).copied().unwrap_or(0),
+                metrics_addr: s.ps_metrics_addrs.get(ps_id).cloned().unwrap_or_default(),
+                open_count: s
+                    .ps_open_parts
+                    .contains_key(ps_id)
+                    .then(|| per_ps_open.get(ps_id).copied().unwrap_or(0)),
+                joined_at_ms: member.map_or(0, |m| m.joined_at_ms),
+                evicted_at_ms: if live.is_some() {
+                    0
+                } else {
+                    member.map_or(0, |m| m.left_at_ms)
+                },
+            })
+            .collect()
+    }
+
+    /// Dashboard compact overview: per-partition rollup (range / ps / live_size
+    /// / extent count) + per-node extent-shard count, computed entirely from
+    /// in-memory state with NO extent-node probe and NO per-extent array on the
+    /// wire. Bounded by partition + node count, so a web dashboard scales to
+    /// thousands of partitions / tens of thousands of extents. Leader-gated (a follower's `regions` /
+    /// `extents` are replay-stale; the dashboard should scrape the leader).
+    /// Pure builder for the cluster overview (no encode). Shared by the
+    /// `MSG_GET_CLUSTER_OVERVIEW` handler and the in-process embedded dashboard
+    /// (`dashboard.rs::overview_json`).
+    pub(crate) fn compute_cluster_overview_resp(&self) -> GetClusterOverviewResp {
+        if !self.leader.get() {
+            return GetClusterOverviewResp {
+                code: CODE_NOT_LEADER,
+                message: "not leader".to_string(),
+                partitions: Vec::new(),
+                nodes: Vec::new(),
+                total_req_per_sec: 0,
+                total_write_bytes_per_sec: 0,
+                total_read_bytes_per_sec: 0,
+                ps_count: 0,
+                ps_servers: Vec::new(),
+            };
+        }
+        let s = self.store.inner.borrow();
+        // Latest reported load per partition (policy window; defaults if no report).
+        let pol = self.policy.borrow();
+        // (req_per_sec, write_bytes_per_sec, read_bytes_per_sec)
+        let load_of = |pid: u64| -> (u64, u64, u64) {
+            pol.metrics
+                .get(&pid)
+                .and_then(|w| w.buckets.back())
+                .map(|(_, l)| {
+                    (
+                        l.req_per_sec as u64,
+                        l.write_bytes_per_sec,
+                        l.read_bytes_per_sec,
+                    )
+                })
+                .unwrap_or((0, 0, 0))
+        };
+
+        // Per-node extent-shard count = how many extents list the node in
+        // replicates ∪ parity (the one fact a client can't derive without the
+        // full extent array). One pass over all extents.
+        let mut node_ext: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
+        for e in s.extents.values() {
+            for nid in e.replicates.iter().chain(e.parity.iter()) {
+                *node_ext.entry(*nid).or_insert(0) += 1;
+            }
+        }
+        let mut nodes: Vec<NodeOverview> = s
+            .nodes
+            .values()
+            .map(|n| NodeOverview {
+                node_id: n.node_id,
+                address: n.address.clone(),
+                extent_count: node_ext.get(&n.node_id).copied().unwrap_or(0),
+            })
+            .collect();
+        nodes.sort_by_key(|n| n.node_id);
+
+        // latest PS-reported open-tail bytes (Σ committed
+        // length on the partition's log/row/meta OPEN tails). The manager's
+        // sealed-length sum below is authoritative for SEALED extents but an
+        // open tail's `sealed_length` is 0, so a compacted / log-heavy
+        // partition whose data lives entirely in open tails would render 0 B.
+        // Adding the PS-reported open-tail bytes makes the overview match what
+        // `autumn-op info --part` gets by probing the EN — without a
+        // per-partition EN probe here (stays one-RPC / scalable). 0 when the
+        // PS hasn't reported yet (falls back to the sealed sum alone).
+        let open_tail_of = |pid: u64| -> u64 {
+            pol.metrics
+                .get(&pid)
+                .and_then(|w| w.buckets.back())
+                .map(|(_, l)| l.open_tail_bytes)
+                .unwrap_or(0)
+        };
+
+        // Per-partition rollup. live_size = Σ distinct extents' sealed_length
+        // over the partition's 3 streams (manager-authoritative) + the
+        // PS-reported open-tail committed bytes.
+        let partitions: Vec<PartitionOverview> = s
+            .regions
+            .values()
+            .map(|r| {
+                let ps_addr = s
+                    .part_addrs
+                    .get(&r.part_id)
+                    .or_else(|| s.ps_nodes.get(&r.ps_id))
+                    .cloned()
+                    .unwrap_or_default();
+                let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+                let mut live_size = 0u64;
+                for sid in [r.log_stream, r.row_stream, r.meta_stream] {
+                    if let Some(st) = s.streams.get(&sid) {
+                        for eid in &st.extent_ids {
+                            if seen.insert(*eid) {
+                                if let Some(e) = s.extents.get(eid) {
+                                    live_size = live_size.saturating_add(e.sealed_length);
+                                }
+                            }
+                        }
+                    }
+                }
+                // add the PS-reported open-tail bytes to
+                // the authoritative sealed sum for the displayed size.
+                let live_size = live_size.saturating_add(open_tail_of(r.part_id));
+                let (range_start, range_end) = r
+                    .rg
+                    .as_ref()
+                    .map(|g| (g.start_key.clone(), g.end_key.clone()))
+                    .unwrap_or_default();
+                PartitionOverview {
+                    part_id: r.part_id,
+                    ps_addr,
+                    range_start,
+                    range_end,
+                    live_size,
+                    total_extents: seen.len() as u32,
+                    log_stream: r.log_stream,
+                    row_stream: r.row_stream,
+                    meta_stream: r.meta_stream,
+                    req_per_sec: load_of(r.part_id).0,
+                    write_bytes_per_sec: load_of(r.part_id).1,
+                    read_bytes_per_sec: load_of(r.part_id).2,
+                    ps_id: r.ps_id,
+                }
+            })
+            .collect();
+
+        let total_req_per_sec = partitions.iter().map(|p| p.req_per_sec).sum();
+        let total_write_bytes_per_sec = partitions.iter().map(|p| p.write_bytes_per_sec).sum();
+        let total_read_bytes_per_sec = partitions.iter().map(|p| p.read_bytes_per_sec).sum();
+        let ps_count = s
+            .regions
+            .values()
+            .map(|r| r.ps_id)
+            .collect::<std::collections::HashSet<_>>()
+            .len() as u32;
+
+        let ps_servers = self.ps_servers_overview(&s);
+
+        GetClusterOverviewResp {
+            code: CODE_OK,
+            message: String::new(),
+            partitions,
+            nodes,
+            total_req_per_sec,
+            total_write_bytes_per_sec,
+            total_read_bytes_per_sec,
+            ps_count,
+            ps_servers,
+        }
+    }
+
+    pub(crate) async fn handle_get_cluster_overview(&self) -> HandlerResult {
+        Ok(rkyv_encode(&self.compute_cluster_overview_resp()))
+    }
+
+    /// PS pushes a per-replica failure observation; manager
+    /// debounces with a 60 s sliding window and 3-distinct-reporter
+    /// quorum before flipping `node.disks[*].online = false`. The flip
+    /// is in-memory only and the call is fire-and-forget on the wire
+    /// — leader-fence isn't required for correctness because
+    /// `disk_status_update_loop` (every 10 s) is the authoritative
+    /// truth and will overwrite this purely-advisory state on the
+    /// next successful DF. We deliberately do NOT trigger
+    /// `require_recovery` from here — that's still owned by
+    /// `recovery_dispatch_loop` (5 s tick) so a transient regional
+    /// hiccup doesn't kick off a recovery storm.
+    pub(crate) async fn handle_report_disk_failure(&self, payload: Bytes) -> HandlerResult {
+        let req: ReportDiskFailureReq =
+            rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+        // Even on a follower (non-leader) we accept the report — the
+        // follower will replay manager state on promotion and the
+        // quorum is purely advisory. Skip the leader gate; the call
+        // is fire-and-forget so the client doesn't observe a refusal.
+        let now = Instant::now();
+        // read quorum config from `AutumnManager` fields
+        // populated at construction / binary-flag time. No env reads.
+        let window = Duration::from_secs(self.params().report_disk_failure_window_secs.get());
+        let quorum: usize = self.params().report_disk_failure_quorum.get();
+        let cutoff = now.checked_sub(window).unwrap_or(now);
+
+        let reached_quorum = {
+            let mut reports = self.recent_failure_reports.borrow_mut();
+            let entry = reports.entry(req.node_id).or_default();
+            // Evict expired first so the deduplicated-reporter count
+            // reflects only the current window.
+            while let Some(&(t, _)) = entry.front() {
+                if t < cutoff {
+                    entry.pop_front();
+                } else {
+                    break;
+                }
+            }
+            // Avoid double-counting the same reporter_part_id within the
+            // active window. The producer's per-stream bad_nodes TTL
+            // (30 s) bounds spam from the same writer; this dedup is
+            // belt-and-braces against multi-stream PSes that observe
+            // the same dead node from multiple streams in the same
+            // window — they should count as ONE reporter for quorum.
+            if !entry.iter().any(|(_, rp)| *rp == req.reporter_part_id) {
+                entry.push_back((now, req.reporter_part_id));
+            }
+            let distinct: HashSet<u64> = entry.iter().map(|(_, rp)| *rp).collect();
+            tracing::debug!(
+                node_id = req.node_id,
+                extent_id = req.extent_id,
+                error_kind = req.error_kind,
+                reporter = req.reporter_part_id,
+                ts_ms = req.ts_ms,
+                window_size = entry.len(),
+                distinct_reporters = distinct.len(),
+                quorum,
+                "f192 report_disk_failure"
+            );
+            distinct.len() >= quorum
+        };
+
+        if reached_quorum {
+            // Apply: mark every disk on the node offline. Same path
+            // taken by `node_health_loop` on a failed DF.
+            let nodes_clone = {
+                let s = self.store.inner.borrow();
+                s.nodes.clone()
+            };
+            if let Some(node) = nodes_clone.get(&req.node_id) {
+                Self::mark_node_disks_offline(&self.store, node);
+                tracing::warn!(
+                    node_id = req.node_id,
+                    quorum,
+                    "f192 quorum reached — node marked offline (advisory; \
+                     node_health_loop reconciles on next DF tick)"
+                );
+            }
+            // Defuse: clear so we don't re-flip on a stale residual
+            // burst after the next successful DF promotes the node
+            // back online.
+            self.recent_failure_reports
+                .borrow_mut()
+                .remove(&req.node_id);
+        }
+
+        // Fire-and-forget on the wire; reply is technically dropped
+        // by the client but we still return a CODE_OK frame so the
+        // RpcServer doesn't surface this as an error.
+        Self::code_resp(CODE_OK, String::new())
+    }
+
+    /// Keep a PS's reported core capacity; `0` (no `--cpuset`) is stored as
+    /// absence so `ps_placement` sees exactly the PS that have one.
+    fn record_slot_cap(s: &mut crate::store::MetadataState, ps_id: u64, slot_cap: u32) {
+        if slot_cap == 0 {
+            s.ps_slot_caps.remove(&ps_id);
+        } else {
+            s.ps_slot_caps.insert(ps_id, slot_cap);
+        }
+    }
+
+    /// Make `ps_id` a member, or mark an existing member present again at
+    /// `address`. Writes only when the record changes, so a PS re-registering
+    /// at the same address costs no etcd write. `psNodes/<id>` goes in the same
+    /// txn: a member written without it would replay as never registered and
+    /// so never be evicted. Caller holds `ps_member_lock`.
+    async fn record_ps_member(&self, ps_id: u64, address: &str) -> Result<(), AppError> {
+        let next = {
+            let s = self.store.inner.borrow();
+            match s.ps_members.get(&ps_id) {
+                Some(m) if m.address == address && m.left_at_ms == 0 => return Ok(()),
+                Some(m) => MemberRecord {
+                    address: address.to_string(),
+                    joined_at_ms: m.joined_at_ms,
+                    left_at_ms: 0,
+                },
+                None => MemberRecord {
+                    address: address.to_string(),
+                    joined_at_ms: Self::now_s_ms().1,
+                    left_at_ms: 0,
+                },
+            }
+        };
+        if let Some(etcd) = &self.etcd {
+            etcd.put_msgs_txn(vec![
+                (
+                    format!("{PS_MEMBERS_PREFIX}{ps_id}"),
+                    crate::persist::encode(&next),
+                ),
+                (format!("psNodes/{ps_id}"), address.as_bytes().to_vec()),
+            ])
+            .await?;
+        }
+        self.store.inner.borrow_mut().ps_members.insert(ps_id, next);
+        Ok(())
+    }
+
+    /// `MSG_REMOVE_MEMBER`: shrink the expected fleet. Refused while the
+    /// member is in the live registry — removing a running server would only
+    /// make the counts lie until it re-registered.
+    pub(crate) async fn handle_remove_member(&self, payload: Bytes) -> HandlerResult {
+        if let Err(err) = self.ensure_leader() {
+            return Self::code_resp(Self::err_to_code(&err), err.to_string());
+        }
+        let req: RemoveMemberReq =
+            rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+        let (result, op) = match req.role {
+            MEMBER_ROLE_PS => (self.remove_ps_member(req.id).await, AUDIT_OP_REMOVE_PS),
+            MEMBER_ROLE_MANAGER => (
+                self.remove_manager_member(req.id).await,
+                AUDIT_OP_REMOVE_MANAGER,
+            ),
+            other => {
+                let msg = format!("unknown member role {other}");
+                return Self::code_resp(CODE_INVALID_ARGUMENT, msg);
+            }
+        };
+        let (code, message) = match result {
+            Ok(()) => (CODE_OK, String::new()),
+            Err(err) => (Self::err_to_code(&err), err.to_string()),
+        };
+        self.append_audit(MgrAuditEntry {
+            op,
+            node_id: req.id,
+            extent_id: 0,
+            by: req.set_by,
+            reason: String::new(),
+            result_code: code,
+            result_message: message.clone(),
+            ts_ns: 0,
+        })
+        .await;
+        Self::code_resp(code, message)
+    }
+
+    async fn remove_ps_member(&self, ps_id: u64) -> Result<(), AppError> {
+        let _members = self.ps_member_lock.lock().await;
+        {
+            let s = self.store.inner.borrow();
+            if let Some(addr) = s.ps_nodes.get(&ps_id) {
+                return Err(AppError::Precondition(format!(
+                    "ps {ps_id} is registered at {addr}; stop it and wait for its \
+                     eviction before removing it"
+                )));
+            }
+            if !s.ps_members.contains_key(&ps_id) {
+                return Err(AppError::NotFound(format!("ps {ps_id} is not a member")));
+            }
+        }
+        if let Some(etcd) = &self.etcd {
+            etcd.put_and_delete_txn(Vec::new(), vec![format!("{PS_MEMBERS_PREFIX}{ps_id}")])
+                .await?;
+        }
+        self.store.inner.borrow_mut().ps_members.remove(&ps_id);
+        Ok(())
+    }
+
+    pub(crate) async fn handle_register_ps(&self, payload: Bytes) -> HandlerResult {
+        if let Err(err) = self.ensure_leader() {
+            return Self::code_resp(Self::err_to_code(&err), err.to_string());
+        }
+
+        let req: RegisterPsReq =
+            rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+        let ps_id = req.ps_id;
+        {
+            // Held until the PS is in the live registry, so a remove cannot
+            // land between the member write and the insert.
+            let _members = self.ps_member_lock.lock().await;
+            if let Err(err) = self.record_ps_member(ps_id, &req.address).await {
+                return Self::code_resp(Self::err_to_code(&err), err.to_string());
+            }
+            let mut s = self.store.inner.borrow_mut();
+            s.ps_nodes.insert(ps_id, req.address);
+            Self::record_slot_cap(&mut s, ps_id, req.slot_cap);
+            // A (re)registering PS has opened nothing this manager knows of;
+            // its first heartbeat says what it has.
+            s.ps_open_parts.remove(&ps_id);
+            Self::rebalance_regions(&mut s);
+            drop(s);
+            self.ps_last_heartbeat
+                .borrow_mut()
+                .insert(ps_id, Instant::now());
+        }
+        if let Err(err) = self.mirror_partition_snapshot().await {
+            return Self::code_resp(Self::err_to_code(&err), err.to_string());
+        }
+        Self::code_resp(CODE_OK, String::new())
+    }
+
+    pub(crate) async fn handle_upsert_partition(&self, payload: Bytes) -> HandlerResult {
+        if let Err(err) = self.ensure_leader() {
+            return Ok(rkyv_encode(&UpsertPartitionResp {
+                code: Self::err_to_code(&err),
+                message: err.to_string(),
+                part_id: 0,
+            }));
+        }
+
+        let req: UpsertPartitionReq =
+            rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+
+        let assigned_part_id = {
+            let mut s = self.store.inner.borrow_mut();
+            let mut meta = req.meta;
+            // Auto-assign part_id via alloc_ids when client sends 0
+            if meta.part_id == 0 {
+                let (id, _) = s.alloc_ids(1);
+                meta.part_id = id;
+            }
+            let pid = meta.part_id;
+            s.partitions.insert(pid, (&meta).into());
+            Self::rebalance_regions(&mut s);
+            pid
+        };
+        if let Err(err) = self.mirror_partition_snapshot().await {
+            return Ok(rkyv_encode(&UpsertPartitionResp {
+                code: Self::err_to_code(&err),
+                message: err.to_string(),
+                part_id: 0,
+            }));
+        }
+
+        Ok(rkyv_encode(&UpsertPartitionResp {
+            code: CODE_OK,
+            message: String::new(),
+            part_id: assigned_part_id,
+        }))
+    }
+
+    pub(crate) async fn handle_get_regions(&self) -> HandlerResult {
+        // routing comes from the LEADER only. A follower's replayed
+        // regions look plausible but its `part_addrs` (in-memory, healed
+        // by PSes against the LEADER) is empty/stale — serving them
+        // black-holed every client that connected to a freshly-rejoined
+        // follower first (manager-HA chaos H3). NOT_LEADER makes callers
+        // rotate (client `refresh_regions`, PS `sync_regions_once`).
+        // etcd-chaos D1 refinement: `ensure_routable` (not the strict
+        // leader gate) — an UN-DISPLACED ex-leader during an etcd outage
+        // holds the freshest routing in existence and nothing can
+        // supersede it while etcd is down; gating it black-holed every
+        // fresh client for the whole outage. The H3 case stays gated
+        // (a rejoined follower is `displaced`).
+        if let Err(err) = self.ensure_routable() {
+            return Ok(rkyv_encode(&GetRegionsResp {
+                code: Self::err_to_code(&err),
+                message: err.to_string(),
+                regions: Vec::new(),
+                ps_details: Vec::new(),
+                part_addrs: Vec::new(),
+            }));
+        }
+        let s = self.store.inner.borrow();
+        // The routing table crosses to the wire here, in the PARTITION SERVER's
+        // form — all seven fields, because `sync_regions_once` opens a
+        // partition from its stream ids. An embedded client gets the narrowed
+        // form from `handle_get_client_regions` instead.
+        let regions = s.regions.iter().map(|(&id, r)| (id, r.into())).collect();
+        let (ps_details, part_addrs) = Self::routing_addresses(&s);
+        Ok(rkyv_encode(&GetRegionsResp {
+            code: CODE_OK,
+            message: String::new(),
+            regions,
+            ps_details,
+            part_addrs,
+        }))
+    }
+
+    /// The half of a routing reply that is identical whichever form asked for
+    /// it: which PS is where, and which partition listens where.
+    ///
+    /// Shared so the two handlers cannot drift. A `part_addrs` filter applied
+    /// in one and not the other would route callers differently depending on
+    /// which opcode they used — the kind of split-brain that is invisible until
+    /// one client population behaves unlike another.
+    fn routing_addresses(
+        s: &crate::store::MetadataState,
+    ) -> (Vec<(u64, MgrPsDetail)>, Vec<(u64, String)>) {
+        let ps_details = s
+            .ps_nodes
+            .iter()
+            .map(|(&ps_id, addr)| {
+                (
+                    ps_id,
+                    MgrPsDetail {
+                        ps_id,
+                        address: addr.clone(),
+                    },
+                )
+            })
+            .collect();
+        // per-partition listener addresses. Only emit entries for
+        // partitions that actually have a region assignment — this keeps
+        // stale `part_addrs` entries (e.g. from a dropped partition whose
+        // registration entry wasn't cleared) from being returned to
+        // clients and confusing routing.
+        let part_addrs: Vec<(u64, String)> = s
+            .part_addrs
+            .iter()
+            .filter(|(pid, _)| s.regions.contains_key(*pid))
+            .map(|(&pid, addr)| (pid, addr.clone()))
+            .collect();
+        (ps_details, part_addrs)
+    }
+
+    /// Routing for an embedded CLIENT — the same answer as
+    /// `handle_get_regions`, with the three stream ids dropped.
+    ///
+    /// Gated exactly as its sibling is: routing comes from a manager that can
+    /// still speak for the cluster, and an un-displaced ex-leader during an
+    /// etcd outage holds the freshest table in existence. Anything stricter
+    /// black-holes fresh clients for the length of the outage.
+    pub(crate) async fn handle_get_client_regions(&self) -> HandlerResult {
+        if let Err(err) = self.ensure_routable() {
+            return Ok(rkyv_encode(&ClientRegionsResp {
+                code: Self::err_to_code(&err),
+                message: err.to_string(),
+                regions: Vec::new(),
+                ps_details: Vec::new(),
+                part_addrs: Vec::new(),
+            }));
+        }
+        let s = self.store.inner.borrow();
+        let regions = s.regions.iter().map(|(&id, r)| (id, r.into())).collect();
+        let (ps_details, part_addrs) = Self::routing_addresses(&s);
+        Ok(rkyv_encode(&ClientRegionsResp {
+            code: CODE_OK,
+            message: String::new(),
+            regions,
+            ps_details,
+            part_addrs,
+        }))
+    }
+
+    pub(crate) async fn handle_heartbeat_ps(&self, payload: Bytes) -> HandlerResult {
+        // a follower answering OK pins the PS's shared manager
+        // rotation to itself forever (the PS only rotates on failure) —
+        // while its region/part_addr serving is gated. NOT_LEADER tells
+        // the PS heartbeat loop to rotate (and burn the leaderless exit
+        // budget). etcd-chaos D1: `ensure_routable` — an un-displaced
+        // ex-leader answers OK through an etcd outage so the PS fleet
+        // never approaches its exit budget while reassignment is
+        // impossible anyway.
+        if let Err(err) = self.ensure_routable() {
+            return Self::code_resp(Self::err_to_code(&err), err.to_string());
+        }
+        let req: HeartbeatPsReq =
+            rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+        let known = {
+            let mut s = self.store.inner.borrow_mut();
+            let known = s.ps_nodes.contains_key(&req.ps_id);
+            if known {
+                Self::record_slot_cap(&mut s, req.ps_id, req.slot_cap);
+                s.ps_open_parts
+                    .insert(req.ps_id, req.open_parts.into_iter().collect());
+                if req.metrics_addr.is_empty() {
+                    s.ps_metrics_addrs.remove(&req.ps_id);
+                } else {
+                    s.ps_metrics_addrs.insert(req.ps_id, req.metrics_addr);
+                }
+            }
+            known
+        };
+        if known {
+            self.ps_last_heartbeat
+                .borrow_mut()
+                .insert(req.ps_id, Instant::now());
+            Self::code_resp(CODE_OK, String::new())
+        } else {
+            // Surface eviction so the PS can re-register instead of staying
+            // invisible to clients (`ps=unknown` in `info` output).
+            Self::code_resp(CODE_NOT_FOUND, format!("ps {} not registered", req.ps_id))
+        }
+    }
+
+    /// Tell a node what it should be holding. It sends every `extent_id` it
+    /// found on disk; the answer sorts them into `garbage` (not a member —
+    /// delete everything) and `placements` (a member — here is the ONE payload
+    /// file you should have). Anything the node holds beyond that is residue.
+    ///
+    /// Best-effort: failure is logged on the node side but doesn't block
+    /// startup. Read-only with respect to manager state.
+    pub(crate) async fn handle_reconcile_extents(&self, payload: Bytes) -> HandlerResult {
+        if let Err(err) = self.ensure_leader() {
+            return Ok(rkyv_encode(&ReconcileExtentsResp {
+                code: Self::err_to_code(&err),
+                message: err.to_string(),
+                garbage: Vec::new(),
+                placements: Vec::new(),
+            }));
+        }
+        let req: ReconcileExtentsReq =
+            rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+
+        // WHO IS ASKING? Every verdict below is relative to one node — "you are
+        // not a member of this", "your payload lives in that file" — so an
+        // unidentified reporter gets NO verdict. Answering with a node_id of 0
+        // would make the caller a member of nothing and mark its entire disk as
+        // garbage, and because the grace counter is keyed by (node, extent),
+        // several unidentified nodes would share one counter and burn the grace
+        // in a single round each. FAIL CLOSED: never tell a caller you cannot
+        // identify to delete anything.
+        let node_id = {
+            let s = self.store.inner.borrow();
+            if req.node_id != 0 && s.nodes.contains_key(&req.node_id) {
+                Some(req.node_id)
+            } else if !req.node_uuid.is_empty() {
+                s.nodes
+                    .iter()
+                    .find(|(_, n)| n.node_uuid == req.node_uuid)
+                    .map(|(id, _)| *id)
+            } else {
+                None
+            }
+        };
+        let Some(node_id) = node_id else {
+            tracing::warn!(
+                reported_node_id = req.node_id,
+                node_uuid = %req.node_uuid,
+                local_extents = req.extent_ids.len(),
+                "reconcile_extents: cannot identify the reporting node — returning no verdict \
+                 (nothing is deleted on behalf of an unidentified caller)"
+            );
+            return Ok(rkyv_encode(&ReconcileExtentsResp {
+                code: CODE_OK,
+                message: "reporter not identified; no verdict".to_string(),
+                garbage: Vec::new(),
+                placements: Vec::new(),
+            }));
+        };
+        let req = ReconcileExtentsReq { node_id, ..req };
+
+        // Two kinds of garbage, with deliberately different confidence:
+        //
+        //   1. the manager has FORGOTTEN the extent → collect immediately (it
+        //      cannot become a member of something that no longer exists);
+        //   2. the extent is alive but this node is NOT one of its members →
+        //      collect only after the verdict has held for several rounds.
+        //
+        // (2) is what reaps the residue of a recovery that died mid-copy: the
+        // partial file reloads as an ordinary extent, so the extent is very much
+        // alive and (1) can never see it — which is why such a stub used to
+        // survive forever. Membership is the right question because a non-member
+        // copy is referenced by no VP, no SST and no checkpoint.
+        //
+        // The grace period exists because the membership view is momentarily
+        // wrong in normal operation — `apply_recovery_done` swaps a slot, a
+        // freshly promoted leader is still settling — and deleting real data on a
+        // transient is far worse than holding residue for a few more minutes.
+        let rounds_before_gc = self.params().non_member_rounds_before_gc.get();
+        let mut placements: Vec<ExtentPlacement> = Vec::new();
+        let garbage: Vec<u64> = {
+            let s = self.store.inner.borrow();
+            let mut seen = self.reconcile_non_member.borrow_mut();
+            let allocating = self.allocating_extents.borrow();
+            // Only keep counters for extents this SHARD still reports, so the
+            // map cannot grow without bound. Scoping to the shard matters: its
+            // siblings share this node_id and report disjoint extents, so a
+            // node-wide prune would let each sibling erase the others' grace
+            // and no verdict would ever reach three rounds.
+            let reported: std::collections::HashSet<u64> = req.extent_ids.iter().copied().collect();
+            seen.retain(|(n, sh, eid), _| {
+                *n != req.node_id || *sh != req.shard_idx || reported.contains(eid)
+            });
+
+            req.extent_ids
+                .iter()
+                .copied()
+                .filter(|eid| {
+                    if allocating.contains(eid) {
+                        // Mid-allocation: its files are on the nodes but its
+                        // record is not published yet. No verdict — condemning
+                        // it here would order the deletion of an extent that was
+                        // just legitimately created.
+                        seen.remove(&(req.node_id, req.shard_idx, *eid));
+                        return false;
+                    }
+                    let Some(ex) = s.extents.get(eid) else {
+                        // (1) unknown extent — immediate. Safe now that the
+                        // mid-allocation case is filtered above: an id the store
+                        // has no record of AND no allocation in flight for really
+                        // is residue, and startup reconcile is expected to clear
+                        // it in ONE round
+                        // (`offline_reconcile::startup_reconcile_unlinks_orphans`).
+                        seen.remove(&(req.node_id, req.shard_idx, *eid));
+                        return true;
+                    };
+                    // An op in flight on this extent means the file set is
+                    // MID-CHANGE, so no verdict can be given: a participant
+                    // staging a shard for a not-yet-flipped conversion holds a
+                    // file the current layout does not name, and a recovery
+                    // target is writing the copy that will make it a member.
+                    // The node-side guards only see the ops that node itself
+                    // runs — the manager is the only party that knows about an
+                    // attempt driven from elsewhere.
+                    if self.extent_inflight_op(*eid).is_some() {
+                        seen.remove(&(req.node_id, req.shard_idx, *eid));
+                        return false;
+                    }
+                    if let Some(slot) = Self::extent_nodes(ex)
+                        .iter()
+                        .position(|n| *n == req.node_id)
+                    {
+                        seen.remove(&(req.node_id, req.shard_idx, *eid));
+                        // A member: tell it WHICH file it should be holding, so
+                        // it can drop the other one. The slot in
+                        // `replicates ++ parity` is this node's shard index.
+                        placements.push(ExtentPlacement {
+                            extent_id: *eid,
+                            payload_location: self.payload_location_of(*eid).as_byte(),
+                            shard_index: slot as u32,
+                        });
+                        return false;
+                    }
+                    // (2) non-member — count the rounds.
+                    let c = seen.entry((req.node_id, req.shard_idx, *eid)).or_insert(0);
+                    *c += 1;
+                    *c >= rounds_before_gc
+                })
+                .collect()
+        };
+        if !garbage.is_empty() {
+            tracing::info!(
+                node_id = req.node_id,
+                local_extents = req.extent_ids.len(),
+                garbage = garbage.len(),
+                "reconcile_extents: returning orphan list to node",
+            );
+        }
+        Ok(rkyv_encode(&ReconcileExtentsResp {
+            code: CODE_OK,
+            message: String::new(),
+            garbage,
+            placements,
+        }))
+    }
+
+    async fn handle_register_partition_addr(&self, payload: Bytes) -> HandlerResult {
+        // deliberately NOT leader-gated. `part_addrs` is an
+        // in-memory, etcd-less routing hint that is LOST on manager
+        // restart; the PS self-heal in `sync_regions_once` re-reports it
+        // every ~2 s when missing. Gating on leadership stretched the
+        // post-restart outage by the whole election wait, and a follower
+        // accepting the registration is harmless (idempotent overwrite,
+        // refreshed continuously by the same PS tick after any failover).
+        let req: RegisterPartitionAddrReq =
+            rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+        // record the per-partition listener address. We do NOT
+        // validate that `part_id` is owned by `ps_id` here: the manager's
+        // region table is the source of truth for ownership, and the
+        // mapping is re-validated on `GetRegions` (only partitions with
+        // an assigned region are returned). Overwrites are allowed —
+        // if a PS re-binds a partition on a new port (restart, split),
+        // the latest report wins.
+        let mut s = self.store.inner.borrow_mut();
+        let _ = req.ps_id; // reserved for future validation
+        s.part_addrs.insert(req.part_id, req.address);
+        Self::code_resp(CODE_OK, String::new())
+    }
+
+    // ── admin & health RPCs ──────────────
+    //
+    // All admin-mutating handlers (node overrides, force_ec_convert, future
+    // force_abandon_ec_marker) wrap their result in `append_audit`.
+    // The audit append is best-effort: a failed audit write
+    // logs WARN but doesn't surface to the caller (the primary
+    // operation already succeeded).
+
+    /// Pure builder for the per-node auto-state + override table. Shared by the
+    /// `MSG_LIST_NODE_STATES` handler and the in-process dashboard
+    /// (`dashboard.rs` node `auto_state` merge).
+    pub(crate) fn compute_list_node_states_resp(&self) -> ListNodeStatesResp {
+        if let Err(err) = self.ensure_leader() {
+            return ListNodeStatesResp {
+                code: Self::err_to_code(&err),
+                message: err.to_string(),
+                nodes: vec![],
+            };
+        }
+        let (nodes_meta, overrides, snapshot) = {
+            let s = self.store.inner.borrow();
+            let nodes: Vec<(u64, String, String, Vec<u16>, crate::store::EnDfReport)> = s
+                .nodes
+                .iter()
+                .map(|(id, n)| {
+                    (
+                        *id,
+                        n.address.clone(),
+                        n.node_uuid.clone(),
+                        n.shard_ports.clone(),
+                        s.en_reports.get(id).cloned().unwrap_or_default(),
+                    )
+                })
+                .collect();
+            let overrides = self.node_overrides.borrow().clone();
+            let snap = self.node_states.borrow().snapshot();
+            (nodes, overrides, snap)
+        };
+        // Merge: every registered node MUST appear (even if the tracker
+        // has no entry yet). Tracker-only entries (e.g. for a node
+        // dropped from `s.nodes` mid-failover) are dropped here.
+        let snap_map: HashMap<u64, (crate::node_state::NodeAutoState, Option<u64>)> = snapshot
+            .into_iter()
+            .map(|(id, st, secs)| (id, (st, secs)))
+            .collect();
+        let mut out: Vec<NodeStateEntry> = nodes_meta
+            .into_iter()
+            .map(|(node_id, address, node_uuid, shard_ports, report)| {
+                let (auto_state, last_secs) = snap_map
+                    .get(&node_id)
+                    .copied()
+                    .unwrap_or((crate::node_state::NodeAutoState::Online, None));
+                let auto_state_byte = match auto_state {
+                    crate::node_state::NodeAutoState::Online => NODE_AUTO_STATE_ONLINE,
+                    crate::node_state::NodeAutoState::Suspected { .. } => NODE_AUTO_STATE_SUSPECTED,
+                    crate::node_state::NodeAutoState::Suspend => NODE_AUTO_STATE_SUSPEND,
+                };
+                let suspected_age = match auto_state {
+                    crate::node_state::NodeAutoState::Suspected { since } => {
+                        since.elapsed().as_secs()
+                    }
+                    _ => 0,
+                };
+                let ovr = overrides.get(&node_id);
+                NodeStateEntry {
+                    node_id,
+                    address,
+                    auto_state: auto_state_byte,
+                    last_heartbeat_secs_ago: last_secs.unwrap_or(u64::MAX),
+                    suspected_age_secs: suspected_age,
+                    operator_override: ovr.map(|o| NodeOverride {
+                        kind: o.kind,
+                        reason: o.reason.clone(),
+                        set_by: o.set_by.clone(),
+                        set_at: o.set_at,
+                        expire_at: o.expire_at,
+                    }),
+                    node_uuid,
+                    shard_ports,
+                    metrics_addr: report.metrics_addr,
+                    full_disks: report.full_disks,
+                }
+            })
+            .collect();
+        out.sort_by_key(|e| e.node_id);
+        ListNodeStatesResp {
+            code: CODE_OK,
+            message: String::new(),
+            nodes: out,
+        }
+    }
+
+    pub async fn handle_list_node_states(&self, _payload: Bytes) -> HandlerResult {
+        Ok(rkyv_encode(&self.compute_list_node_states_resp()))
+    }
+
+    /// `MSG_EXTENT_HEALTH_SUMMARY` — counts by state and the worst extents
+    /// (`extent_health`). Leader-gated: the degraded clocks and the node
+    /// states it reads are the leader's.
+    pub async fn handle_extent_health_summary(&self, payload: Bytes) -> HandlerResult {
+        if let Err(err) = self.ensure_leader() {
+            return Ok(rkyv_encode(&ExtentHealthSummaryResp {
+                code: Self::err_to_code(&err),
+                message: err.to_string(),
+                ..Default::default()
+            }));
+        }
+        let req: ExtentHealthSummaryReq =
+            rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+        let scan = self.extent_health_scan(Self::epoch_seconds());
+        Ok(rkyv_encode(&crate::extent_health::summarize(
+            scan,
+            req.max_problems as usize,
+        )))
+    }
+
+    pub async fn handle_extent_health_report(&self, payload: Bytes) -> HandlerResult {
+        if let Err(err) = self.ensure_leader() {
+            return Ok(rkyv_encode(&ExtentHealthResp {
+                code: Self::err_to_code(&err),
+                message: err.to_string(),
+                extents: vec![],
+            }));
+        }
+        let req: ExtentHealthReq =
+            rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+        let filter: HashSet<u64> = req.node_id_filter.iter().copied().collect();
+        let (extents, overrides, snapshot) = {
+            let s = self.store.inner.borrow();
+            let extents: Vec<ExtentRecord> = s.extents.values().cloned().collect();
+            let overrides = self.node_overrides.borrow().clone();
+            let snap = self.node_states.borrow().snapshot();
+            (extents, overrides, snap)
+        };
+        let snap_map: HashMap<u64, crate::node_state::NodeAutoState> =
+            snapshot.into_iter().map(|(id, st, _)| (id, st)).collect();
+        let mut out: Vec<ExtentHealth> = Vec::new();
+        for ex in extents {
+            let copies = Self::extent_nodes(&ex);
+            let mut slots: Vec<ExtentSlotHealth> = Vec::with_capacity(copies.len());
+            let mut any_match = filter.is_empty();
+            let mut any_unhealthy = false;
+            for (idx, &node_id) in copies.iter().enumerate() {
+                if filter.contains(&node_id) {
+                    any_match = true;
+                }
+                let bit = 1u32 << idx;
+                let avali = (ex.avali & bit) != 0;
+                let auto = snap_map
+                    .get(&node_id)
+                    .copied()
+                    .unwrap_or(crate::node_state::NodeAutoState::Online);
+                let auto_byte = match auto {
+                    crate::node_state::NodeAutoState::Online => NODE_AUTO_STATE_ONLINE,
+                    crate::node_state::NodeAutoState::Suspected { .. } => NODE_AUTO_STATE_SUSPECTED,
+                    crate::node_state::NodeAutoState::Suspend => NODE_AUTO_STATE_SUSPEND,
+                };
+                let ovr = overrides
+                    .get(&node_id)
+                    .map(|o| o.kind)
+                    .unwrap_or(NODE_OVERRIDE_NONE);
+                // `avali` only means anything once the extent is SEALED: it is
+                // the per-slot "this replica holds the sealed content, serve
+                // reads from it" bit. An OPEN extent is `avali = 0` by
+                // construction, so `sealed` is the guard.
+                //
+                // The bitmask is set at SEAL — all bits on the known-commit,
+                // split/merge CoW and EC-conversion paths; one per responding
+                // member on the probe path, and `compute_commit_seal` needs
+                // at least one answering member, so never fewer than one.
+                // Bits are added back per slot afterwards as recovery / `re_avali` reconcile a laggard,
+                // and only ever CLEARED by corrupt-replica isolation, which
+                // refuses to clear the last one. So a sealed extent always
+                // carries at least one bit, and a missing bit is a real fault.
+                //
+                // (`extent_node.rs` notes a sealed-empty extent with `avali`
+                // possibly 0 — that is the EN's LOCAL meta, which derives the
+                // bit from `sealed_length > 0`. It is not the manager record
+                // this handler reads.)
+                //
+                // Without the guard every open tail reads as a fault. On the
+                // deployed cluster that was 21 of 21 reported extents — one open
+                // tail per stream, 7 partitions x 3 streams — so the command's
+                // entire output was false positives and a genuinely missing
+                // replica would have been invisible in the noise.
+                if (ex.sealed && !avali)
+                    || auto_byte != NODE_AUTO_STATE_ONLINE
+                    || ovr != NODE_OVERRIDE_NONE
+                {
+                    any_unhealthy = true;
+                }
+                slots.push(ExtentSlotHealth {
+                    slot_index: idx as u32,
+                    node_id,
+                    avali,
+                    auto_state: auto_byte,
+                    override_kind: ovr,
+                });
+            }
+            if !any_match {
+                continue;
+            }
+            if !req.include_healthy && !any_unhealthy && filter.is_empty() {
+                continue;
+            }
+            out.push(ExtentHealth {
+                extent_id: ex.extent_id,
+                eversion: ex.eversion,
+                sealed_length: ex.sealed_length,
+                ec_converted: ex.ec_converted,
+                slots,
+                unhealthy: any_unhealthy,
+            });
+        }
+        out.sort_by_key(|e| e.extent_id);
+        Ok(rkyv_encode(&ExtentHealthResp {
+            code: CODE_OK,
+            message: String::new(),
+            extents: out,
+        }))
+    }
+
+    pub async fn handle_list_ec_inflight_markers(&self, _payload: Bytes) -> HandlerResult {
+        if let Err(err) = self.ensure_leader() {
+            return Ok(rkyv_encode(&ListEcInflightMarkersResp {
+                code: Self::err_to_code(&err),
+                message: err.to_string(),
+                markers: vec![],
+            }));
+        }
+        let snapshot = self.node_states.borrow().snapshot();
+        let snap_map: HashMap<u64, crate::node_state::NodeAutoState> =
+            snapshot.into_iter().map(|(id, st, _)| (id, st)).collect();
+        let overrides = self.node_overrides.borrow().clone();
+        let now_s = Self::epoch_seconds();
+        let mut markers: Vec<InflightWithCoordState> = Vec::new();
+        for (eid, rec) in self.inflight.borrow().iter() {
+            let Some((kind, payload)) = rec.unpack() else {
+                continue;
+            };
+            if kind != crate::extent_inflight::ExtentOpKind::ConvertToEc {
+                continue;
+            }
+            let crate::extent_inflight::ExtentOpPayload::ConvertToEc(p) = payload else {
+                continue;
+            };
+            let coord = p.target_nodes.first().copied().unwrap_or(0);
+            let auto = snap_map
+                .get(&coord)
+                .copied()
+                .unwrap_or(crate::node_state::NodeAutoState::Online);
+            let auto_byte = match auto {
+                crate::node_state::NodeAutoState::Online => NODE_AUTO_STATE_ONLINE,
+                crate::node_state::NodeAutoState::Suspected { .. } => NODE_AUTO_STATE_SUSPECTED,
+                crate::node_state::NodeAutoState::Suspend => NODE_AUTO_STATE_SUSPEND,
+            };
+            let ovr = overrides
+                .get(&coord)
+                .map(|o| o.kind)
+                .unwrap_or(NODE_OVERRIDE_NONE);
+            markers.push(InflightWithCoordState {
+                extent_id: *eid,
+                coord_node_id: coord,
+                coord_auto_state: auto_byte,
+                coord_override_kind: ovr,
+                target_nodes: p.target_nodes.clone(),
+                data_shards: p.data_shards,
+                new_eversion: p.new_eversion,
+                started_at: rec.started_at,
+                age_secs: now_s.saturating_sub(rec.started_at),
+            });
+        }
+        markers.sort_by_key(|m| m.extent_id);
+        Ok(rkyv_encode(&ListEcInflightMarkersResp {
+            code: CODE_OK,
+            message: String::new(),
+            markers,
+        }))
+    }
+
+    // ── admin RPCs ────────────────────────────────────────────────
+
+    pub async fn handle_fence_node(&self, payload: Bytes) -> HandlerResult {
+        if let Err(err) = self.ensure_leader() {
+            return Self::code_resp(Self::err_to_code(&err), err.to_string());
+        }
+        let req: FenceNodeReq =
+            rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+        let result = self.fence_node_impl(&req).await;
+        let (code, message) = match &result {
+            Ok(()) => (CODE_OK, String::new()),
+            Err(e) => (Self::err_to_code(e), e.to_string()),
+        };
+        self.append_audit(MgrAuditEntry {
+            op: AUDIT_OP_FENCE_NODE,
+            node_id: req.node_id,
+            extent_id: 0,
+            by: req.set_by.clone(),
+            reason: req.reason.clone(),
+            result_code: code,
+            result_message: message.clone(),
+            ts_ns: 0,
+        })
+        .await;
+        Self::code_resp(code, message)
+    }
+
+    pub async fn handle_set_node_maintenance(&self, payload: Bytes) -> HandlerResult {
+        let _lifecycle = self.node_lifecycle_lock.lock().await;
+        if let Err(err) = self.ensure_leader() {
+            return Self::code_resp(Self::err_to_code(&err), err.to_string());
+        }
+        let req: SetNodeMaintenanceReq =
+            rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+        // zombie defense — refuse if node was decommissioned. A fenced node is
+        // refused too: a node carries one override, and writing Maintenance over
+        // Fenced would silently un-fence it.
+        let refusal = if self.decommissioned.borrow().contains_key(&req.node_id) {
+            Some(format!(
+                "node {} was previously decommissioned; cannot mark maintenance",
+                req.node_id
+            ))
+        } else if self
+            .node_overrides
+            .borrow()
+            .get(&req.node_id)
+            .is_some_and(|o| o.kind == NODE_OVERRIDE_FENCED)
+        {
+            Some(format!(
+                "node {} is fenced; clear the fence before marking maintenance",
+                req.node_id
+            ))
+        } else {
+            None
+        };
+        if let Some(msg) = refusal {
+            self.append_audit(MgrAuditEntry {
+                op: AUDIT_OP_SET_NODE_MAINTENANCE,
+                node_id: req.node_id,
+                extent_id: 0,
+                by: req.set_by.clone(),
+                reason: req.reason.clone(),
+                result_code: CODE_PRECONDITION,
+                result_message: msg.clone(),
+                ts_ns: 0,
+            })
+            .await;
+            return Self::code_resp(CODE_PRECONDITION, msg);
+        }
+        let node_uuid = self
+            .store
+            .inner
+            .borrow()
+            .nodes
+            .get(&req.node_id)
+            .map(|n| n.node_uuid.clone())
+            .unwrap_or_default();
+        let ovr = MgrNodeOverride {
+            node_id: req.node_id,
+            kind: NODE_OVERRIDE_MAINTENANCE,
+            set_at: Self::epoch_seconds(),
+            set_by: req.set_by.clone(),
+            reason: req.reason.clone(),
+            expire_at: req.expire_at,
+            node_uuid,
+        };
+        let key = format!("{}{}", crate::NODE_OVERRIDE_PREFIX, req.node_id);
+        let value = rkyv_encode(&ovr).to_vec();
+        if let Some(etcd) = &self.etcd {
+            if let Err(err) = etcd.put_msgs_txn(vec![(key, value)]).await {
+                self.append_audit(MgrAuditEntry {
+                    op: AUDIT_OP_SET_NODE_MAINTENANCE,
+                    node_id: req.node_id,
+                    extent_id: 0,
+                    by: req.set_by.clone(),
+                    reason: req.reason.clone(),
+                    result_code: Self::err_to_code(&err),
+                    result_message: err.to_string(),
+                    ts_ns: 0,
+                })
+                .await;
+                return Self::code_resp(Self::err_to_code(&err), err.to_string());
+            }
+        }
+        self.node_overrides.borrow_mut().insert(req.node_id, ovr);
+        self.append_audit(MgrAuditEntry {
+            op: AUDIT_OP_SET_NODE_MAINTENANCE,
+            node_id: req.node_id,
+            extent_id: 0,
+            by: req.set_by.clone(),
+            reason: req.reason.clone(),
+            result_code: CODE_OK,
+            result_message: String::new(),
+            ts_ns: 0,
+        })
+        .await;
+        Self::code_resp(CODE_OK, String::new())
+    }
+
+    pub async fn handle_clear_node_override(&self, payload: Bytes) -> HandlerResult {
+        let _lifecycle = self.node_lifecycle_lock.lock().await;
+        if let Err(err) = self.ensure_leader() {
+            return Self::code_resp(Self::err_to_code(&err), err.to_string());
+        }
+        let req: ClearNodeOverrideReq =
+            rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+        let key = format!("{}{}", crate::NODE_OVERRIDE_PREFIX, req.node_id);
+        // M0: also lift the `decommissioned/` tombstone so this is
+        // a REAL remedy for the re-register refusal message (the uuid-keyed
+        // zombie check scans that prefix; without clearing it, a removed node
+        // could never rejoin under its old identity).
+        let tomb_key = format!("{}{}", crate::DECOMMISSIONED_PREFIX, req.node_id);
+        if let Some(etcd) = &self.etcd {
+            if let Err(err) = etcd
+                .put_and_delete_txn(Vec::new(), vec![key, tomb_key])
+                .await
+            {
+                self.append_audit(MgrAuditEntry {
+                    op: AUDIT_OP_CLEAR_NODE_OVERRIDE,
+                    node_id: req.node_id,
+                    extent_id: 0,
+                    by: req.set_by.clone(),
+                    reason: String::new(),
+                    result_code: Self::err_to_code(&err),
+                    result_message: err.to_string(),
+                    ts_ns: 0,
+                })
+                .await;
+                return Self::code_resp(Self::err_to_code(&err), err.to_string());
+            }
+        }
+        self.node_overrides.borrow_mut().remove(&req.node_id);
+        self.decommissioned.borrow_mut().remove(&req.node_id);
+        self.append_audit(MgrAuditEntry {
+            op: AUDIT_OP_CLEAR_NODE_OVERRIDE,
+            node_id: req.node_id,
+            extent_id: 0,
+            by: req.set_by.clone(),
+            reason: String::new(),
+            result_code: CODE_OK,
+            result_message: String::new(),
+            ts_ns: 0,
+        })
+        .await;
+        Self::code_resp(CODE_OK, String::new())
+    }
+
+    pub async fn handle_remove_node(&self, payload: Bytes) -> HandlerResult {
+        if let Err(err) = self.ensure_leader() {
+            return Ok(rkyv_encode(&RemoveNodeResp {
+                code: Self::err_to_code(&err),
+                message: err.to_string(),
+                blocking_extent_ids: vec![],
+                blocking_marker_extent_ids: vec![],
+            }));
+        }
+        let req: RemoveNodeReq =
+            rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+        let result = self.remove_node_impl(&req).await;
+        let (code, message, ext_blockers, mark_blockers) = match result {
+            Ok(()) => (CODE_OK, String::new(), vec![], vec![]),
+            Err((c, m, e, k)) => (c, m, e, k),
+        };
+        self.append_audit(MgrAuditEntry {
+            op: AUDIT_OP_REMOVE_NODE,
+            node_id: req.node_id,
+            extent_id: 0,
+            by: req.set_by.clone(),
+            reason: String::new(),
+            result_code: code,
+            result_message: message.clone(),
+            ts_ns: 0,
+        })
+        .await;
+        Ok(rkyv_encode(&RemoveNodeResp {
+            code,
+            message,
+            blocking_extent_ids: ext_blockers,
+            blocking_marker_extent_ids: mark_blockers,
+        }))
+    }
+
+    // inner helpers — separated so the handlers' audit-wrap is
+    // tight + the unit-test surface is direct.
+
+    async fn fence_node_impl(&self, req: &FenceNodeReq) -> Result<(), AppError> {
+        let _lifecycle = self.node_lifecycle_lock.lock().await;
+        if !self.store.inner.borrow().nodes.contains_key(&req.node_id) {
+            return Err(AppError::NotFound(format!(
+                "node {} not registered",
+                req.node_id
+            )));
+        }
+        // Precheck unless --force, or unless this is a retry of a fence that
+        // already landed (a lost reply must not turn into a refusal because a
+        // spare's df happened to time out this tick). The rest still runs: its
+        // cancellations are the part a retry exists to finish.
+        let already_fenced = matches!(
+            self.node_overrides.borrow().get(&req.node_id).map(|o| o.kind),
+            Some(NODE_OVERRIDE_FENCED)
+        );
+        if !req.force && !already_fenced {
+            self.check_capacity_for_fence(req.node_id)?;
+        }
+        // Persist the override. Capture the node's stable
+        // uuid so the tombstone-by-uuid re-register check survives a later
+        // `remove_node` (which deletes `nodes/<id>`).
+        let node_uuid = self
+            .store
+            .inner
+            .borrow()
+            .nodes
+            .get(&req.node_id)
+            .map(|n| n.node_uuid.clone())
+            .unwrap_or_default();
+        let ovr = MgrNodeOverride {
+            node_id: req.node_id,
+            kind: NODE_OVERRIDE_FENCED,
+            set_at: Self::epoch_seconds(),
+            set_by: req.set_by.clone(),
+            reason: req.reason.clone(),
+            expire_at: 0,
+            node_uuid,
+        };
+        let key = format!("{}{}", crate::NODE_OVERRIDE_PREFIX, req.node_id);
+        let value = rkyv_encode(&ovr).to_vec();
+        if let Some(etcd) = &self.etcd {
+            etcd.put_msgs_txn(vec![(key, value)]).await?;
+        }
+        self.node_overrides.borrow_mut().insert(req.node_id, ovr);
+        // Do NOT bump partition owner-lock revisions when
+        // fencing an EN data node. The owner-lock owner_epoch is the PARTITION
+        // OWNER's (PS) token for split-brain prevention; an EN data node is
+        // never a partition owner. The old bump
+        // (`bump_owner_epochs_for_node`) walked every partition whose
+        // log/row/meta stream merely had a REPLICA on the fenced node and
+        // bumped THAT partition's owner owner_epoch — fencing out the legitimate
+        // PS owner (which holds its acquire-time owner_epoch and never
+        // re-acquires), so the PS's next append got CODE_LOCKED_BY_OTHER and
+        // `partition_loop` self-poisoned + reopen-thrashed (the chaos seed=6
+        // wedge after the Layer-A seal fix). It was also redundant: a fenced
+        // EN is handled by the normal append-fail → seal-over-reachable (Layer
+        // A) → alloc-new-extent path, and post-recovery topology changes are
+        // picked up via EVERSION refresh, not owner-owner_epoch. Real split-brain
+        // protection is the NEW PS's `acquire_owner_lock` on takeover (higher
+        // owner_epoch), unaffected by this removal — see
+        // `system_locked_by_other.rs::owner_lock_fencing_rejects_stale_revision`.
+        // Cancel the work the node is in now, rather than at the next recovery
+        // tick: a Recovery it executes, an EC conversion it is a target of.
+        // The same level-triggered cancel the tick runs; one that fails stays a
+        // Remove blocker and is retried there.
+        self.cancel_markers_on_abnormal_nodes().await;
+        Ok(())
+    }
+
+    /// Refuse a non-force fence that recovery could not carry out.
+    ///
+    /// Fencing hands every slot on the node to recovery, which rebuilds each
+    /// one on a node that is neither already a member of that extent
+    /// (`occupied`) nor fenced / maintenance / suspected — the same filters
+    /// `recovery_candidate_order` applies. So the check is per extent: each
+    /// must have such a target, and one of them must have room for its
+    /// shard; and the nodes that may receive them must together report
+    /// `FENCE_HEADROOM_*` (1.2x) the bytes to move. A node without a capacity signal this tick
+    /// (no df row, or its probe failed) counts as zero free — no signal is
+    /// not room. `--force` skips all of it.
+    fn check_capacity_for_fence(&self, node_id: u64) -> Result<(), AppError> {
+        let mut excluded = self.placement_excluded_node_ids();
+        excluded.insert(node_id);
+        let free: HashMap<u64, u64> = self
+            .cluster_cap
+            .borrow()
+            .per_node
+            .iter()
+            .filter(|(_, c)| c.online)
+            .map(|(id, c)| (*id, c.free))
+            .collect();
+        let s = self.store.inner.borrow();
+        let eligible: Vec<u64> = s
+            .nodes
+            .keys()
+            .copied()
+            .filter(|id| !excluded.contains(id))
+            .collect();
+        let free_of = |id: &u64| free.get(id).copied().unwrap_or(0);
+        let mut to_move: u64 = 0;
+        // Nodes that are a legal target for at least one of the slots: the
+        // only ones whose free space the rebuilds can use.
+        let mut receivers: HashSet<u64> = HashSet::new();
+        for ex in s.extents.values() {
+            let occupied = Self::extent_nodes(ex);
+            if !occupied.contains(&node_id) {
+                continue;
+            }
+            // Per-shard size for EC, full size for replication.
+            let shard_size =
+                if ex.ec_converted && !ex.replicates.is_empty() && !ex.parity.is_empty() {
+                    let k = ex.replicates.len() as u64;
+                    ex.sealed_length.div_ceil(k.max(1))
+                } else {
+                    ex.sealed_length
+                };
+            let targets: Vec<u64> = eligible
+                .iter()
+                .copied()
+                .filter(|id| !occupied.contains(id))
+                .collect();
+            if targets.is_empty() {
+                return Err(AppError::Precondition(format!(
+                    "extent {} has no recovery target: its other slots are on {:?}, and no \
+                     other node exists or every other one is fenced, in maintenance or \
+                     suspected (use --force to override)",
+                    ex.extent_id,
+                    occupied.iter().filter(|id| **id != node_id).collect::<Vec<_>>()
+                )));
+            }
+            if !targets.iter().any(|id| free_of(id) >= shard_size) {
+                // Say which it is: "no report yet" (a new leader before its
+                // first df, or a timed-out probe) reads nothing like "full".
+                let unreported: Vec<u64> =
+                    targets.iter().copied().filter(|id| !free.contains_key(id)).collect();
+                return Err(AppError::Precondition(if unreported.len() == targets.len() {
+                    format!(
+                        "extent {}: no capacity report yet from its recovery targets {:?} \
+                         (df not answered this tick); retry shortly or use --force",
+                        ex.extent_id, targets
+                    )
+                } else {
+                    format!(
+                        "extent {}: no recovery target {:?} reports {} free bytes for its \
+                         shard (no report from {:?}) (use --force to override)",
+                            ex.extent_id, targets, shard_size, unreported
+                        )
+                    },
+                ));
+            }
+            to_move = to_move.saturating_add(shard_size);
+            receivers.extend(targets);
+        }
+        let headroom: u64 = receivers.iter().map(free_of).sum();
+        // The receivers must report `--fence-headroom-percent` of the bytes
+        // moved off, so recovery does not fill them.
+        let needed = to_move.saturating_mul(self.params().fence_headroom_percent.get()) / 100;
+        if headroom < needed {
+            return Err(AppError::Precondition(format!(
+                "moving {to_move} bytes off node {node_id} needs {needed} free on the \
+                 nodes that may receive them; they report {headroom} (use --force to override)"
+            )));
+        }
+        Ok(())
+    }
+
+    // `bump_owner_epochs_for_node` was removed.
+    // It bumped the PARTITION owner-lock owner_epoch of every partition whose
+    // streams merely had a REPLICA on a fenced EN data node, fencing out the
+    // legitimate PS owner (→ CODE_LOCKED_BY_OTHER → partition self-poison +
+    // reopen-thrash). It was redundant (fenced-EN handling = append-fail →
+    // seal-over-reachable → realloc + eversion topology refresh) and harmful.
+    // Real split-brain protection is the new PS's acquire_owner_lock on
+    // takeover, not an EN fence. See the removal note in `fence_node_impl`.
+
+    async fn remove_node_impl(
+        &self,
+        req: &RemoveNodeReq,
+    ) -> Result<(), (u8, String, Vec<u64>, Vec<u64>)> {
+        let _lifecycle = self.node_lifecycle_lock.lock().await;
+        if self.decommissioned.borrow().contains_key(&req.node_id)
+            && !self.store.inner.borrow().nodes.contains_key(&req.node_id)
+        {
+            return Ok(());
+        }
+        let cur = self.node_overrides.borrow().get(&req.node_id).cloned();
+        let is_fenced = matches!(cur.as_ref().map(|o| o.kind), Some(NODE_OVERRIDE_FENCED));
+        if !is_fenced {
+            return Err((
+                CODE_PRECONDITION,
+                format!("node {} must be Fenced before remove", req.node_id),
+                vec![],
+                vec![],
+            ));
+        }
+        // Scan for residual references.
+        let (ext_refs, marker_refs) = {
+            let s = self.store.inner.borrow();
+            let mut ext_refs: Vec<u64> = Vec::new();
+            for ex in s.extents.values() {
+                if Self::extent_nodes(ex).contains(&req.node_id) {
+                    ext_refs.push(ex.extent_id);
+                }
+            }
+            let mut marker_refs: Vec<u64> = Vec::new();
+            for (eid, rec) in self.inflight.borrow().iter() {
+                if rec
+                    .recovery_payload
+                    .as_ref()
+                    .is_some_and(|p| p.node_id == req.node_id)
+                {
+                    marker_refs.push(*eid);
+                }
+                if let Some((
+                    crate::extent_inflight::ExtentOpKind::ConvertToEc,
+                    crate::extent_inflight::ExtentOpPayload::ConvertToEc(p),
+                )) = rec.unpack()
+                {
+                    if p.target_nodes.contains(&req.node_id) {
+                        marker_refs.push(*eid);
+                    }
+                }
+            }
+            ext_refs.sort();
+            marker_refs.sort();
+            (ext_refs, marker_refs)
+        };
+        if !ext_refs.is_empty() || !marker_refs.is_empty() {
+            return Err((
+                CODE_PRECONDITION,
+                format!(
+                    "node {} still referenced by {} extents and {} recovery/EC markers",
+                    req.node_id,
+                    ext_refs.len(),
+                    marker_refs.len()
+                ),
+                ext_refs,
+                marker_refs,
+            ));
+        }
+        // All clear — persist tombstone + delete override + delete
+        // nodes/<id> + delete disks/<id>. Single atomic txn.
+        let now = Self::epoch_seconds();
+        // M0: capture the uuid BEFORE the `s.nodes.remove` below —
+        // the tombstone is the only place the node_id→uuid mapping survives the
+        // node-record deletion, and the re-register zombie check scans it by uuid.
+        let removed_uuid = self
+            .store
+            .inner
+            .borrow()
+            .nodes
+            .get(&req.node_id)
+            .map(|n| n.node_uuid.clone())
+            .unwrap_or_default();
+        let tomb = MgrNodeOverride {
+            node_id: req.node_id,
+            kind: NODE_OVERRIDE_FENCED,
+            set_at: now,
+            set_by: req.set_by.clone(),
+            reason: "removed".to_string(),
+            expire_at: 0,
+            node_uuid: removed_uuid,
+        };
+        let tomb_key = format!("{}{}", crate::DECOMMISSIONED_PREFIX, req.node_id);
+        let tomb_val = rkyv_encode(&tomb).to_vec();
+        let override_key = format!("{}{}", crate::NODE_OVERRIDE_PREFIX, req.node_id);
+        let node_key = format!("nodes/{}", req.node_id);
+        let disk_ids: Vec<u64> = self
+            .store
+            .inner
+            .borrow()
+            .nodes
+            .get(&req.node_id)
+            .map(|n| n.disks.clone())
+            .unwrap_or_default();
+        let disk_keys: Vec<String> = disk_ids.iter().map(|d| format!("disks/{}", d)).collect();
+        if let Some(etcd) = &self.etcd {
+            let mut deletes = vec![override_key.clone(), node_key.clone()];
+            deletes.extend(disk_keys.iter().cloned());
+            if let Err(e) = etcd
+                .put_and_delete_txn(vec![(tomb_key, tomb_val)], deletes)
+                .await
+            {
+                return Err((Self::err_to_code(&e), e.to_string(), vec![], vec![]));
+            }
+        }
+        // Apply to in-memory.
+        {
+            let mut s = self.store.inner.borrow_mut();
+            s.nodes.remove(&req.node_id);
+            s.en_reports.remove(&req.node_id);
+            for did in &disk_ids {
+                s.disks.remove(did);
+            }
+        }
+        self.node_overrides.borrow_mut().remove(&req.node_id);
+        self.node_states.borrow_mut().drop_node(req.node_id);
+        self.decommissioned.borrow_mut().insert(req.node_id, tomb);
+        Ok(())
+    }
+
+    // ── recovery stats ────────────────────────────────────────────
+
+    pub async fn handle_recovery_stats(&self, _payload: Bytes) -> HandlerResult {
+        if let Err(err) = self.ensure_leader() {
+            return Ok(rkyv_encode(&RecoveryStatsResp {
+                code: Self::err_to_code(&err),
+                message: err.to_string(),
+                ..Default::default()
+            }));
+        }
+        let l = self.recovery_limiter.borrow();
+        let (src, tgt) = l.snapshot();
+        let backoff: Vec<RecoveryBackoffEntry> = l
+            .backoff_snapshot()
+            .into_iter()
+            .map(
+                |(
+                    extent_id,
+                    slot,
+                    consecutive_failures,
+                    last_attempt_at,
+                    next_retry_at,
+                    reason,
+                )| {
+                    RecoveryBackoffEntry {
+                        extent_id,
+                        slot,
+                        consecutive_failures,
+                        last_attempt_at,
+                        next_retry_at,
+                        reason,
+                    }
+                },
+            )
+            .collect();
+        Ok(rkyv_encode(&RecoveryStatsResp {
+            code: CODE_OK,
+            message: String::new(),
+            global_inflight: l.global_inflight,
+            max_global: l.max_global,
+            max_per_source: l.max_per_source,
+            max_per_target: l.max_per_target,
+            per_source: src,
+            per_target: tgt,
+            backoff_entries: l.backoff.len() as u32,
+            backoff,
+        }))
+    }
+
+    // ── audit log query ───────────────────────────────────────────
+
+    pub async fn handle_query_audit_log(&self, payload: Bytes) -> HandlerResult {
+        if let Err(err) = self.ensure_leader() {
+            return Ok(rkyv_encode(&QueryAuditLogResp {
+                code: Self::err_to_code(&err),
+                message: err.to_string(),
+                entries: vec![],
+            }));
+        }
+        let req: QueryAuditLogReq =
+            rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+        let entries = self
+            .query_audit(
+                req.op_filter,
+                req.node_id_filter,
+                req.since_ts_s,
+                req.until_ts_s,
+                req.limit,
+            )
+            .await;
+        Ok(rkyv_encode(&QueryAuditLogResp {
+            code: CODE_OK,
+            message: String::new(),
+            entries,
+        }))
+    }
+
+    // ── inode lease handlers ───────────────────────────────────────────────
+    //
+    // Design: `docs/fs_lease_design.md`. Manager is the single
+    // decision-maker; writer leases are persisted to etcd while reader
+    // leases stay in-memory only. Every etcd write routes through
+    // `put_msgs_txn` / `put_and_delete_txn` so the leader fence
+    // travels with it.
+
+    pub async fn handle_acquire_lease(&self, payload: Bytes) -> HandlerResult {
+        let req: AcquireLeaseReq = rkyv_decode(&payload)
+            .map_err(|e| (StatusCode::InvalidArgument, format!("decode: {e}")))?;
+        // Etcd write needs leader status; non-leader rejects with
+        // NOT_LEADER so the client retries against the new leader
+        // (matches MSG_GET_REGIONS / MSG_ACQUIRE_OWNER_LOCK pattern).
+        if self.etcd.is_some() && !self.leader.get() {
+            return Ok(rkyv_encode(&AcquireLeaseResp {
+                code: CODE_NOT_LEADER,
+                message: "not leader".to_string(),
+                lease: None,
+            }));
+        }
+
+        // A WRITE grant writes its record after changing memory: it holds
+        // the inode's turn until the write settles, so no other grant or
+        // release of the inode commits around it (`InodeTurns`). REPLACE and
+        // EXCLUSIVE share the writer slot and take it too: re-acquired by its
+        // holder, either moves the slot's deadline under the sweep.
+        let writer_slot = matches!(req.mode, LEASE_MODE_WRITE | LEASE_MODE_REPLACE | LEASE_MODE_EXCLUSIVE);
+        let _turn = if writer_slot && self.etcd.is_some() {
+            let Some(turn) = self.take_inode_turn(req.ino).await else {
+                return Ok(rkyv_encode(&AcquireLeaseResp {
+                    code: CODE_NOT_LEADER,
+                    message: "leader term changed".to_string(),
+                    lease: None,
+                }));
+            };
+            Some(turn)
+        } else {
+            None
+        };
+        let now = Instant::now();
+        // Snapshot
+        // the pre-acquire InodeLeaseState BEFORE mutating so an
+        // etcd-write failure can ROLL BACK precisely — restoring
+        // writer slot + version (the force-revoke version rewind) without
+        // touching readers that subscribed during the etcd await.
+        // ALSO collect the invalidation pushes the
+        // force-revoke arm of `acquire_with_force` would have queued,
+        // into a DeferredPushes bundle. The pushes are then flushed
+        // only AFTER etcd commit — so an etcd-fail leaves clients
+        // with NO phantom LeaseRevoked / WillRevokeIn events from a
+        // preemption that didn't actually persist.
+        let term = self.etcd.as_ref().map(|e| e.term());
+        let (pre_snapshot, outcome, mut deferred_pushes) = {
+            let mut reg = self.inode_leases.borrow_mut();
+            let snap = reg.inodes.get(&req.ino).cloned();
+            let mut pushes = crate::inode_lease::DeferredPushes::default();
+            let out = reg.acquire_with_force_deferred(
+                &req.client,
+                req.ino,
+                req.mode,
+                req.force,
+                now,
+                &mut pushes,
+            );
+            (snap, out, pushes)
+        };
+
+        match outcome {
+            crate::inode_lease::AcquireOutcome::Granted {
+                version,
+                writer_present,
+                ttl_secs,
+            } => {
+                // Etcd-first: WRITE leases persist; reader leases don't, and
+                // neither do REPLACE and EXCLUSIVE — they last one name swap
+                // or one reclaim, and persisting them put two etcd writes on
+                // every S3 overwrite and every unlink. What a failover loses
+                // is in the crate guide.
+                if req.mode == LEASE_MODE_WRITE {
+                    let record = self
+                        .inode_leases
+                        .borrow()
+                        .writer_record(req.ino)
+                        .expect("writer just acquired");
+                    let key = format!("{}{}", crate::INODE_LEASES_PREFIX, req.ino);
+                    let value = rkyv_encode(&record).to_vec();
+                    if let Some(etcd) = &self.etcd {
+                        if let Err(e) = etcd.put_msgs_txn(vec![(key, value)]).await {
+                            // Precise revert that
+                            // also rewinds the force-revoke
+                            // version bump + DROPS the deferred
+                            // pushes (clients never see the
+                            // phantom revoke). Not across a term:
+                            // replay replaced the registry, and the
+                            // snapshot would overwrite whoever holds
+                            // the inode now.
+                            if self.etcd.as_ref().map(|e| e.term()) == term {
+                                self.inode_leases
+                                    .borrow_mut()
+                                    .revert_writer_acquire(req.ino, pre_snapshot);
+                            }
+                            std::mem::take(&mut deferred_pushes); // drop without flush
+                            return Ok(rkyv_encode(&AcquireLeaseResp {
+                                code: Self::err_to_code(&e),
+                                message: e.to_string(),
+                                lease: None,
+                            }));
+                        }
+                    }
+                }
+                // etcd committed (or no etcd) → flush
+                // the staged LeaseRevoked / WillRevokeIn pushes so
+                // deposed writer + current readers see the revoke.
+                self.inode_leases
+                    .borrow_mut()
+                    .flush_deferred_pushes(deferred_pushes);
+                Ok(rkyv_encode(&AcquireLeaseResp {
+                    code: CODE_OK,
+                    message: String::new(),
+                    lease: Some(MgrInodeLeaseInfo {
+                        ino: req.ino,
+                        version,
+                        writer_present,
+                        ttl_secs,
+                    }),
+                }))
+            }
+            crate::inode_lease::AcquireOutcome::WriteConflict {
+                held_by_kind,
+                held_by_host,
+            } => {
+                // No pushes were staged for WriteConflict; the
+                // borrow is dropped + bundle is empty. Belt-and-
+                // braces explicit drop documents intent.
+                drop(deferred_pushes);
+                Ok(rkyv_encode(&AcquireLeaseResp {
+                    code: CODE_PRECONDITION,
+                    message: format!(
+                        "writer lease held by kind={held_by_kind} host={held_by_host}"
+                    ),
+                    lease: None,
+                }))
+            }
+            crate::inode_lease::AcquireOutcome::HolderConflict { what } => {
+                drop(deferred_pushes);
+                Ok(rkyv_encode(&AcquireLeaseResp {
+                    code: CODE_PRECONDITION,
+                    message: format!("lease refused: another client holds a {what} lease"),
+                    lease: None,
+                }))
+            }
+            crate::inode_lease::AcquireOutcome::InvalidMode => {
+                drop(deferred_pushes);
+                Ok(rkyv_encode(&AcquireLeaseResp {
+                    code: CODE_INVALID_ARGUMENT,
+                    message: format!("invalid lease mode {}", req.mode),
+                    lease: None,
+                }))
+            }
+            // Pre-revocation grace window in
+            // progress. Surface as `CODE_REVOKE_PENDING` with the
+            // remaining milliseconds in `lease.ttl_secs` (we
+            // repurpose this u32 field to carry the eta_ms so the
+            // SDK can sleep precisely; documented on the wire
+            // const). The lease itself is not yet granted —
+            // `writer_present` is true because someone ELSE
+            // holds it.
+            //
+            // This arm produced the WillRevokeIn push
+            // (the deferred bundle has 0 or 1 item). There is no
+            // etcd persist for this arm — `pending_revoke_at`
+            // lives in memory only — so we flush directly. (If
+            // we EVER persist `pending_revoke_at`, the flush
+            // moves below an etcd-write block and gets the same
+            // commit/revert treatment as Granted.)
+            crate::inode_lease::AcquireOutcome::RevokePending {
+                eta_ms,
+                held_by_kind,
+                held_by_host,
+            } => {
+                self.inode_leases
+                    .borrow_mut()
+                    .flush_deferred_pushes(deferred_pushes);
+                Ok(rkyv_encode(&AcquireLeaseResp {
+                    code: CODE_REVOKE_PENDING,
+                    message: format!(
+                        "revoke pending: writer held by kind={held_by_kind} host={held_by_host}; retry in {eta_ms}ms"
+                    ),
+                    lease: Some(MgrInodeLeaseInfo {
+                        ino: req.ino,
+                        version: 0,
+                        writer_present: true,
+                        ttl_secs: eta_ms,
+                    }),
+                }))
+            }
+        }
+    }
+
+    pub async fn handle_release_lease(&self, payload: Bytes) -> HandlerResult {
+        let req: ReleaseLeaseReq = rkyv_decode(&payload)
+            .map_err(|e| (StatusCode::InvalidArgument, format!("decode: {e}")))?;
+        if self.etcd.is_some() && !self.leader.get() {
+            return Ok(rkyv_encode(&ReleaseLeaseResp {
+                code: CODE_NOT_LEADER,
+                message: "not leader".to_string(),
+                new_version: None,
+            }));
+        }
+
+        // etcd-first ordering for the
+        // writer-close case. Pre-fix the in-memory release ran first
+        // (bumping version + pushing WriterClosed to readers); if
+        // the subsequent etcd delete failed the client saw CODE_OK
+        // but the persisted record stayed alive — a leader failover
+        // would re-install the released writer, blocking new
+        // acquires until the TTL revoke fires (≤ 30s). And the
+        // released-then-re-revoked sequence would push a SECOND
+        // WriterClosed at a higher version, forcing readers to
+        // reload again. The reordered shape: preview the release →
+        // delete etcd if it's a writer-close → only then commit the
+        // memory mutate.
+        let mut preview = self
+            .inode_leases
+            .borrow()
+            .preview_release(&req.client, req.ino);
+        // A writer close deletes the record: it waits for a grant of the
+        // inode still writing it, then looks again.
+        let _turn = match preview {
+            crate::inode_lease::ReleaseOutcome::WriterClosed { .. } if self.etcd.is_some() => {
+                let Some(turn) = self.take_inode_turn(req.ino).await else {
+                    return Ok(rkyv_encode(&ReleaseLeaseResp {
+                        code: CODE_NOT_LEADER,
+                        message: "leader term changed".to_string(),
+                        new_version: None,
+                    }));
+                };
+                preview = self.inode_leases.borrow().preview_release(&req.client, req.ino);
+                Some(turn)
+            }
+            _ => None,
+        };
+
+        if let crate::inode_lease::ReleaseOutcome::WriterClosed { .. } = preview {
+            let key = format!("{}{}", crate::INODE_LEASES_PREFIX, req.ino);
+            if let Some(etcd) = &self.etcd {
+                if let Err(e) = etcd.put_and_delete_txn(vec![], vec![key]).await {
+                    // Etcd failed; leave the in-memory writer in
+                    // place + surface the error so the client
+                    // retries. The TTL revoke loop is the eventual
+                    // backstop if the client gives up.
+                    return Ok(rkyv_encode(&ReleaseLeaseResp {
+                        code: Self::err_to_code(&e),
+                        message: e.to_string(),
+                        new_version: None,
+                    }));
+                }
+            }
+        }
+
+        // Either reader release / not-held (no etcd write), or
+        // writer-close whose etcd delete just succeeded. Commit the
+        // memory mutate now.
+        let outcome = {
+            let mut reg = self.inode_leases.borrow_mut();
+            reg.release(&req.client, req.ino)
+        };
+
+        match outcome {
+            crate::inode_lease::ReleaseOutcome::WriterClosed { new_version } => {
+                Ok(rkyv_encode(&ReleaseLeaseResp {
+                    code: CODE_OK,
+                    message: String::new(),
+                    new_version: Some(new_version),
+                }))
+            }
+            crate::inode_lease::ReleaseOutcome::ReaderReleased => {
+                Ok(rkyv_encode(&ReleaseLeaseResp {
+                    code: CODE_OK,
+                    message: String::new(),
+                    new_version: None,
+                }))
+            }
+            crate::inode_lease::ReleaseOutcome::NotHeld => Ok(rkyv_encode(&ReleaseLeaseResp {
+                code: CODE_OK,
+                message: "not held (idempotent)".to_string(),
+                new_version: None,
+            })),
+        }
+    }
+
+    pub async fn handle_heartbeat_lease(&self, payload: Bytes) -> HandlerResult {
+        let req: HeartbeatLeaseReq = rkyv_decode(&payload)
+            .map_err(|e| (StatusCode::InvalidArgument, format!("decode: {e}")))?;
+        // Heartbeat MUST
+        // refresh the persisted `MgrInodeLeaseRecord.expires_at`
+        // for WRITER leases. Pre-fix the in-memory `writer_expires_at`
+        // moved forward but etcd's record stayed at the original
+        // acquire-time deadline — a manager failover would then
+        // replay the stale deadline and a writer that had been
+        // heartbeating happily for minutes could be erroneously
+        // revoked the moment the new leader came up. Reader leases
+        // aren't persisted (plan §6.4: subscribe-disconnect =
+        // invalidate everything), so reader heartbeats don't write
+        // etcd.
+        if self.etcd.is_some() && !self.leader.get() {
+            return Ok(rkyv_encode(&HeartbeatLeaseResp {
+                code: CODE_NOT_LEADER,
+                message: "not leader".to_string(),
+                lease: None,
+            }));
+        }
+
+        let now = Instant::now();
+        let outcome = {
+            let mut reg = self.inode_leases.borrow_mut();
+            reg.heartbeat(&req.client, req.ino, now)
+        };
+        match outcome {
+            crate::inode_lease::HeartbeatOutcome::Renewed {
+                version,
+                writer_present,
+                ttl_secs,
+            } => {
+                // If THIS client is the writer
+                // (we are — heartbeat succeeded AND a writer holds
+                // the slot AND it's us), refresh the persisted
+                // record so failover replay sees the updated
+                // deadline. Other shapes (reader heartbeat,
+                // writer-not-me cases) leave etcd alone.
+                //
+                // The etcd write is awaited after the in-memory renewal, so
+                // a release or a force-preempt can land in between;
+                // `refresh_writer_record` writes only while the stored
+                // record is still this writer's at this version.
+                if writer_present {
+                    let is_writer = {
+                        let reg = self.inode_leases.borrow();
+                        let me = crate::inode_lease::ClientKey::from_wire(&req.client);
+                        // Only a WRITE holder has a record to refresh.
+                        reg.inodes
+                            .get(&req.ino)
+                            .filter(|s| s.writer_kind == crate::inode_lease::WriterKind::Write)
+                            .and_then(|s| s.writer.as_ref().map(|w| w == &me))
+                            .unwrap_or(false)
+                    };
+                    if is_writer {
+                        let record = self
+                            .inode_leases
+                            .borrow()
+                            .writer_record(req.ino)
+                            .expect("writer just heartbeated successfully");
+                        let key = format!("{}{}", crate::INODE_LEASES_PREFIX, req.ino);
+                        {
+                            use std::sync::atomic::Ordering::Relaxed;
+                            let hold = &crate::HEARTBEAT_REFRESH_TEST_HOLD;
+                            if hold.compare_exchange(1, 2, Relaxed, Relaxed).is_ok() {
+                                while hold.load(Relaxed) == 2 {
+                                    compio::time::sleep(Duration::from_millis(5)).await;
+                                }
+                            }
+                        }
+                        if let Some(etcd) = &self.etcd {
+                            match etcd.refresh_writer_record(&key, &record).await {
+                                Ok(true) => {
+                                    // Refresh landed; failover-safe.
+                                }
+                                Ok(false) => {
+                                    // Released or taken over since the
+                                    // renewal: the record belongs to
+                                    // whoever changed it.
+                                    tracing::debug!(
+                                        ino = req.ino,
+                                        "heartbeat lease refresh skipped: the record changed hands"
+                                    );
+                                }
+                                Err(e) => {
+                                    // Genuine etcd error. In-memory
+                                    // deadline is still good; the
+                                    // worst-case failover window is
+                                    // bounded by lease_ttl -
+                                    // heartbeat_interval = 25s, same
+                                    // as pre-R2 fix.
+                                    tracing::warn!(
+                                        ino = req.ino,
+                                        error = %e,
+                                        "BUG-LEASE-1: heartbeat etcd refresh failed; retry on next heartbeat"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(rkyv_encode(&HeartbeatLeaseResp {
+                    code: CODE_OK,
+                    message: String::new(),
+                    lease: Some(MgrInodeLeaseInfo {
+                        ino: req.ino,
+                        version,
+                        writer_present,
+                        ttl_secs,
+                    }),
+                }))
+            }
+            crate::inode_lease::HeartbeatOutcome::NotHeld => Ok(rkyv_encode(&HeartbeatLeaseResp {
+                code: CODE_NOT_FOUND,
+                message: "lease not held".to_string(),
+                lease: None,
+            })),
+        }
+    }
+
+    pub async fn handle_poll_invalidations(&self, payload: Bytes) -> HandlerResult {
+        let req: PollInvalidationsReq = rkyv_decode(&payload)
+            .map_err(|e| (StatusCode::InvalidArgument, format!("decode: {e}")))?;
+        // Followers carry no state; surface as NOT_LEADER so the
+        // client reconnects to the new leader (and per plan §6.4
+        // invalidates all cache on reconnect).
+        if self.etcd.is_some() && !self.leader.get() {
+            return Ok(rkyv_encode(&PollInvalidationsResp {
+                code: CODE_NOT_LEADER,
+                message: "not leader".to_string(),
+                events: Vec::new(),
+            }));
+        }
+
+        // Long-poll. Atomic drain-or-park: returns
+        // queued events immediately if any; else installs a waker
+        // and returns the matching receiver. We await it with a
+        // bounded timeout so an idle client still round-trips at
+        // most once per `LONG_POLL_WAIT` (keeps heartbeats alive
+        // even on connections that prefer to coalesce traffic).
+        let (events, overflowed, parked) = {
+            let mut reg = self.inode_leases.borrow_mut();
+            reg.drain_or_park(&req.client)
+        };
+        let (events, overflowed) = if let Some(rx) = parked {
+            // No events — wait up to LONG_POLL_WAIT for one to arrive
+            // or for the waker to fire.
+            const LONG_POLL_WAIT: Duration = Duration::from_secs(10);
+            let timer = compio::time::sleep(LONG_POLL_WAIT);
+            futures::pin_mut!(timer);
+            let _ = futures::future::select(rx, timer).await;
+            // Re-drain. Either branch is acceptable: the waker fires
+            // → events are queued; the timer fires → still empty (the
+            // poll-loop on the client side reissues immediately, no
+            // round-trip cost beyond the connection's keep-alive).
+            let mut reg = self.inode_leases.borrow_mut();
+            reg.drain_invalidations(&req.client)
+        } else {
+            (events, overflowed)
+        };
+
+        // Overflow ⇒ tell the client to wholesale-invalidate via a
+        // sentinel MetaChanged event with ino=0. The long-poll
+        // daemon poll-loop turns this into a session-wide cache drop
+        // (plan §6.4 "subscribe disconnect = invalidate everything").
+        let mut out_events = events;
+        if overflowed {
+            out_events.push(MgrInvalidation {
+                ino: 0,
+                version: 0,
+                kind: LEASE_INVAL_META_CHANGED,
+            });
+        }
+        Ok(rkyv_encode(&PollInvalidationsResp {
+            code: CODE_OK,
+            message: String::new(),
+            events: out_events,
+        }))
+    }
+
+    /// M0: grant a batch of fuse-fs inode numbers. See
+    /// `fs_alloc.rs` for the CAS grant loop + migration-floor semantics.
+    pub async fn handle_alloc_inodes(&self, payload: Bytes) -> HandlerResult {
+        let req: AllocInodesReq = rkyv_decode(&payload)
+            .map_err(|e| (StatusCode::InvalidArgument, format!("decode: {e}")))?;
+        if req.count == 0 {
+            return Ok(rkyv_encode(&AllocInodesResp {
+                code: CODE_INVALID_ARGUMENT,
+                message: "count must be >= 1".to_string(),
+                base: 0,
+            }));
+        }
+        // There is one inode counter; `volume` survives only on the frozen
+        // client surface.
+        if !req.volume.is_empty() {
+            return Ok(rkyv_encode(&AllocInodesResp {
+                code: CODE_INVALID_ARGUMENT,
+                message: "volume must be empty".to_string(),
+                base: 0,
+            }));
+        }
+        // Etcd write needs leader status; non-leader rejects with NOT_LEADER
+        // so the client retries against the new leader (same pattern as
+        // MSG_ACQUIRE_LEASE / MSG_ACQUIRE_OWNER_LOCK).
+        if self.etcd.is_some() && !self.leader.get() {
+            return Ok(rkyv_encode(&AllocInodesResp {
+                code: CODE_NOT_LEADER,
+                message: "not leader".to_string(),
+                base: 0,
+            }));
+        }
+        match self.alloc_fs_inodes(req.count as u64, req.floor).await {
+            Ok(base) => Ok(rkyv_encode(&AllocInodesResp {
+                code: CODE_OK,
+                message: String::new(),
+                base,
+            })),
+            Err(AppError::NotLeader) => Ok(rkyv_encode(&AllocInodesResp {
+                code: CODE_NOT_LEADER,
+                message: "deposed during grant".to_string(),
+                base: 0,
+            })),
+            Err(e) => Ok(rkyv_encode(&AllocInodesResp {
+                code: CODE_ERROR,
+                message: format!("alloc_fs_inodes: {e}"),
+                base: 0,
+            })),
+        }
+    }
+}
+
+#[cfg(test)]
+mod commit_seal_tests {
+    use crate::AutumnManager;
+    use std::collections::{HashMap, HashSet};
+
+    // Slots: idx 0 -> node 1, idx 1 -> node 3, idx 2 -> node 5.
+    fn members3() -> Vec<(usize, u64)> {
+        vec![(0, 1u64), (1, 3u64), (2, 5u64)]
+    }
+
+    #[test]
+    fn all_committed_respond_takes_min_all_avali() {
+        let m = members3();
+        let rec = HashSet::new();
+        let mut resp = HashMap::new();
+        resp.insert(1u64, 20_000_000u64);
+        resp.insert(3u64, 20_000_000u64);
+        resp.insert(5u64, 18_000_000u64);
+        let (len, avali) = AutumnManager::compute_commit_seal(&m, &rec, &resp).unwrap();
+        assert_eq!(len, 18_000_000, "seal = min over all committed members");
+        assert_eq!(avali, 0b111);
+    }
+
+    #[test]
+    fn excludes_catching_up_member_does_not_crater_min() {
+        // core invariant: slot 5 is catching-up (in-flight Recovery).
+        // It holds only a partial replica, so it must NOT contribute to the
+        // min. The seal = min over committed members {1,3} = 20 MB, NOT the
+        // short value a catching-up replica would report (the production bug
+        // cratered sealed_length to a recovery target's partial length).
+        let m = members3();
+        let rec: HashSet<u64> = [5u64].into_iter().collect();
+        let mut resp = HashMap::new();
+        resp.insert(1u64, 20_000_000u64);
+        resp.insert(3u64, 20_000_000u64);
+        // node 5 deliberately absent (would have reported a short length).
+        let (len, avali) = AutumnManager::compute_commit_seal(&m, &rec, &resp).unwrap();
+        assert_eq!(len, 20_000_000);
+        assert_eq!(avali, 0b011, "slot 2 (node 5) avali bit stays unset");
+    }
+
+    #[test]
+    fn seals_over_reachable_when_a_committed_member_is_silent() {
+        // WAS seal-over-reachable (bug #3 fix): a committed member that is
+        // unreachable (e.g. a kill+restarted laggard not yet in `recovering`)
+        // no longer blocks the seal. With {1,3} reachable, seal at
+        // min(1,3) = 20 MB (which is >= acked under all-replica-ACK), and
+        // node 5's avali bit stays UNSET so it is reconciled out of band.
+        let m = members3();
+        let rec = HashSet::new();
+        let mut resp = HashMap::new();
+        resp.insert(1u64, 20_000_000u64);
+        resp.insert(3u64, 20_000_000u64);
+        // node 5 committed but silent (unreachable).
+        let (len, avali) = AutumnManager::compute_commit_seal(&m, &rec, &resp).unwrap();
+        assert_eq!(
+            len, 20_000_000,
+            "seal = min over the REACHABLE committed members"
+        );
+        assert_eq!(
+            avali, 0b011,
+            "silent node 5's avali bit stays unset → reconcile later"
+        );
+    }
+
+    #[test]
+    fn one_reachable_member_is_enough() {
+        // Nodes 3 and 5 silent: node 1 alone holds all the acked data, so the
+        // seal goes ahead at its length.
+        let m = members3();
+        let rec = HashSet::new();
+        let mut resp = HashMap::new();
+        resp.insert(1u64, 20_000_000u64);
+        let (len, avali) = AutumnManager::compute_commit_seal(&m, &rec, &resp).unwrap();
+        assert_eq!(len, 20_000_000);
+        assert_eq!(avali, 0b001);
+    }
+
+    #[test]
+    fn refuses_when_no_committed_member_answers() {
+        // All members catching-up -> no committed member at all.
+        let m = members3();
+        let rec: HashSet<u64> = [1u64, 3, 5].into_iter().collect();
+        assert!(AutumnManager::compute_commit_seal(&m, &rec, &HashMap::new()).is_err());
+        // Committed members exist but none answered.
+        assert!(AutumnManager::compute_commit_seal(&m, &HashSet::new(), &HashMap::new()).is_err());
+        // A catching-up member answering does not count.
+        let rec5: HashSet<u64> = [5u64].into_iter().collect();
+        let mut resp = HashMap::new();
+        resp.insert(5u64, 20u64);
+        assert!(AutumnManager::compute_commit_seal(&m, &rec5, &resp).is_err());
+    }
+}
+
+#[cfg(test)]
+mod selfheal_a5_tests {
+    //! WAL self-heal A5: `handle_report_corrupt_replica` isolates a bit-rotted
+    //! log_stream replica. Borrows then awaits; every borrow is dropped before
+    //! the await (single-threaded test runtime).
+    #![allow(clippy::await_holding_refcell_ref)]
+    use crate::persist::records::ExtentRecord;
+    use crate::persist::records::PartitionRecord;
+    use crate::persist::records::StreamRecord;
+    use crate::AutumnManager;
+    use autumn_rpc::manager_rpc::*;
+    use bytes::Bytes;
+
+    fn run<F: std::future::Future<Output = T>, T>(f: F) -> T {
+        compio::runtime::Runtime::new().unwrap().block_on(f)
+    }
+
+    const LOG_STREAM_ID: u64 = 700;
+
+    /// A sealed 3-replica extent (slots 0/1/2 → nodes 1/3/5) with all avali
+    /// bits set, owned by partition `part_id` at `owner_epoch`, and a member of
+    /// log_stream `LOG_STREAM_ID`.
+    fn seed(m: &AutumnManager, part_id: u64, owner_epoch: i64, extent_id: u64) {
+        let mut s = m.store.inner.borrow_mut();
+        s.owner_epochs
+            .insert(format!("partition/{part_id}"), owner_epoch);
+        s.partitions.insert(
+            part_id,
+            PartitionRecord {
+                part_id,
+                log_stream: LOG_STREAM_ID,
+                row_stream: 0,
+                meta_stream: 0,
+                rg: None,
+            },
+        );
+        s.streams.insert(
+            LOG_STREAM_ID,
+            StreamRecord {
+                stream_id: LOG_STREAM_ID,
+                extent_ids: vec![extent_id],
+                ec_data_shard: 0,
+                ec_parity_shard: 0,
+                replicates: 3,
+            },
+        );
+        s.extents.insert(
+            extent_id,
+            ExtentRecord {
+                extent_id,
+                replicates: vec![1, 3, 5],
+                parity: vec![],
+                eversion: 7,
+                refs: 1,
+                vp_table_refs: 0,
+                sealed_length: 20_000_000,
+                sealed: true,
+                avali: 0b111,
+                replicate_disks: vec![],
+                parity_disks: vec![],
+                ec_converted: false,
+            },
+        );
+    }
+
+    /// An OPEN extent is not a fault. `avali` is the per-slot "this replica
+    /// holds the SEALED content" bit, so it is 0 on every open tail by
+    /// construction; reporting that as unhealthy made the command's output on
+    /// the deployed cluster 21 false positives out of 21, which is worse than
+    /// no signal — a genuinely missing replica would have been indistinguishable.
+    #[test]
+    fn open_extent_is_not_reported_unhealthy() {
+        let m = AutumnManager::new();
+        seed(&m, 100, 42, 9);
+        {
+            let mut s = m.store.inner.borrow_mut();
+            let ex = s.extents.get_mut(&9).unwrap();
+            ex.sealed = false;
+            ex.sealed_length = 0;
+            ex.avali = 0; // the normal state of an open extent
+        }
+        // `seed` places the slots on nodes 1/3/5, which are absent from
+        // `node_states` and carry no override — so they default to Online and
+        // the `avali` clause is the only thing under test here.
+        let req = ExtentHealthReq {
+            node_id_filter: vec![],
+            include_healthy: false,
+        };
+        let resp_bytes = run(m.handle_extent_health_report(rkyv_encode(&req))).expect("health");
+        let resp: ExtentHealthResp = rkyv_decode(&resp_bytes).expect("decode");
+        assert_eq!(resp.code, CODE_OK);
+        assert!(
+            resp.extents.is_empty(),
+            "open extent reported as unhealthy: {:?}",
+            resp.extents
+        );
+    }
+
+    /// A GUARD, not a regression test for the sealed check: it passes against
+    /// the old predicate too. What it pins is the over-fix — deleting the
+    /// `avali` clause outright — because a SEALED extent whose slot lost its
+    /// bit (a corrupt replica isolated by `MSG_REPORT_CORRUPT_REPLICA`) is
+    /// exactly what this command exists to surface.
+    #[test]
+    fn sealed_extent_missing_a_replica_is_still_reported() {
+        let m = AutumnManager::new();
+        seed(&m, 100, 42, 9);
+        {
+            let mut s = m.store.inner.borrow_mut();
+            let ex = s.extents.get_mut(&9).unwrap();
+            ex.sealed = true;
+            ex.avali = 0b011; // slot 2 isolated
+        }
+        let req = ExtentHealthReq {
+            node_id_filter: vec![],
+            include_healthy: false,
+        };
+        let resp_bytes = run(m.handle_extent_health_report(rkyv_encode(&req))).expect("health");
+        let resp: ExtentHealthResp = rkyv_decode(&resp_bytes).expect("decode");
+        assert_eq!(resp.extents.len(), 1, "a sealed extent short a replica must report");
+        assert!(resp.extents[0].unhealthy);
+        assert!(!resp.extents[0].slots[2].avali, "slot 2 is the isolated one");
+    }
+
+    fn fire(
+        m: &AutumnManager,
+        part_id: u64,
+        owner_epoch: i64,
+        extent_id: u64,
+        eversion: u64,
+        corrupt: Vec<u64>,
+    ) -> ReportCorruptReplicaResp {
+        let req = ReportCorruptReplicaReq {
+            partition_id: part_id,
+            owner_epoch,
+            stream_id: LOG_STREAM_ID,
+            extent_id,
+            eversion,
+            corrupt_node_ids: corrupt,
+        };
+        let payload: Bytes = rkyv_encode(&req);
+        let resp = run(async { m.handle_report_corrupt_replica(payload).await.unwrap() });
+        rkyv_decode::<ReportCorruptReplicaResp>(&resp).expect("decode resp")
+    }
+
+    #[test]
+    fn valid_report_clears_avali_bit_and_bumps_eversion() {
+        let m = AutumnManager::new();
+        seed(&m, 100, 42, 9);
+        // node 3 = slot 1 reported corrupt.
+        let r = fire(&m, 100, 42, 9, 7, vec![3]);
+        assert_eq!(r.code, CODE_OK, "{}", r.message);
+        let s = m.store.inner.borrow();
+        let ex = s.extents.get(&9).unwrap();
+        assert_eq!(ex.avali, 0b101, "slot 1 (node 3) bit cleared");
+        assert_eq!(ex.eversion, 8, "eversion bumped to invalidate caches");
+        drop(s);
+        assert!(m.slot_is_corrupt(9, 1), "the isolation lands with its reason");
+    }
+
+    #[test]
+    fn stale_owner_epoch_is_rejected() {
+        let m = AutumnManager::new();
+        seed(&m, 100, 42, 9);
+        // reporter claims a stale owner_epoch (41 != current 42).
+        let r = fire(&m, 100, 41, 9, 7, vec![3]);
+        assert_eq!(r.code, CODE_PRECONDITION);
+        let s = m.store.inner.borrow();
+        let ex = s.extents.get(&9).unwrap();
+        assert_eq!(ex.avali, 0b111, "no change on a fenced-out report");
+        assert_eq!(ex.eversion, 7);
+    }
+
+    #[test]
+    fn stale_eversion_is_rejected() {
+        let m = AutumnManager::new();
+        seed(&m, 100, 42, 9);
+        // reporter saw eversion 6, manager now has 7 (concurrent op) → retry.
+        let r = fire(&m, 100, 42, 9, 6, vec![3]);
+        assert_eq!(r.code, CODE_PRECONDITION);
+        let s = m.store.inner.borrow();
+        assert_eq!(s.extents.get(&9).unwrap().avali, 0b111);
+    }
+
+    #[test]
+    fn refuses_to_isolate_the_last_replicas() {
+        let m = AutumnManager::new();
+        seed(&m, 100, 42, 9);
+        // all 3 reported corrupt → would clear every avali bit → refuse.
+        let r = fire(&m, 100, 42, 9, 7, vec![1, 3, 5]);
+        assert_eq!(r.code, CODE_PRECONDITION);
+        let s = m.store.inner.borrow();
+        assert_eq!(
+            s.extents.get(&9).unwrap().avali,
+            0b111,
+            "unrecoverable: avali left intact so PS fails loud"
+        );
+    }
+
+    #[test]
+    fn open_extent_is_refused_pending_seal_and_roll() {
+        let m = AutumnManager::new();
+        seed(&m, 100, 42, 9);
+        {
+            let mut s = m.store.inner.borrow_mut();
+            let ex = s.extents.get_mut(&9).unwrap();
+            ex.sealed = false;
+            ex.sealed_length = 0;
+            ex.avali = 0; // open extents are avali=0 normally
+        }
+        let r = fire(&m, 100, 42, 9, 7, vec![3]);
+        assert_eq!(r.code, CODE_PRECONDITION, "open → A4 seal-and-roll, not A5");
+    }
+
+    #[test]
+    fn ec_converted_extent_is_refused() {
+        let m = AutumnManager::new();
+        seed(&m, 100, 42, 9);
+        {
+            let mut s = m.store.inner.borrow_mut();
+            s.extents.get_mut(&9).unwrap().ec_converted = true;
+        }
+        let r = fire(&m, 100, 42, 9, 7, vec![3]);
+        assert_eq!(r.code, CODE_PRECONDITION, "EC extent → replicated isolation N/A");
+        let s = m.store.inner.borrow();
+        assert_eq!(s.extents.get(&9).unwrap().avali, 0b111, "unchanged");
+    }
+
+    #[test]
+    fn out_of_scope_extent_is_refused() {
+        let m = AutumnManager::new();
+        seed(&m, 100, 42, 9);
+        // Report a DIFFERENT extent (8) that is not in the named log_stream.
+        let req = ReportCorruptReplicaReq {
+            partition_id: 100,
+            owner_epoch: 42,
+            stream_id: LOG_STREAM_ID,
+            extent_id: 8,
+            eversion: 7,
+            corrupt_node_ids: vec![3],
+        };
+        let payload: Bytes = rkyv_encode(&req);
+        let resp = run(async { m.handle_report_corrupt_replica(payload).await.unwrap() });
+        let r = rkyv_decode::<ReportCorruptReplicaResp>(&resp).unwrap();
+        assert_eq!(r.code, CODE_PRECONDITION, "extent not in log_stream → refused");
+    }
+
+    #[test]
+    fn report_node_not_in_layout_is_refused_not_false_ok() {
+        let m = AutumnManager::new();
+        seed(&m, 100, 42, 9);
+        // node 99 is not a replica (slots are 1/3/5) — stale/buggy report.
+        // Must refuse (not falsely claim "isolated").
+        let r = fire(&m, 100, 42, 9, 7, vec![99]);
+        assert_eq!(r.code, CODE_PRECONDITION, "{}", r.message);
+        let s = m.store.inner.borrow();
+        assert_eq!(s.extents.get(&9).unwrap().avali, 0b111, "unchanged");
+    }
+
+    #[test]
+    fn cross_partition_log_stream_is_refused() {
+        let m = AutumnManager::new();
+        seed(&m, 100, 42, 9);
+        // Partition 100 owns LOG_STREAM_ID; claim a DIFFERENT log_stream id the
+        // partition does not own → refused before any avali mutation.
+        let req = ReportCorruptReplicaReq {
+            partition_id: 100,
+            owner_epoch: 42,
+            stream_id: LOG_STREAM_ID + 1,
+            extent_id: 9,
+            eversion: 7,
+            corrupt_node_ids: vec![3],
+        };
+        let payload: Bytes = rkyv_encode(&req);
+        let resp = run(async { m.handle_report_corrupt_replica(payload).await.unwrap() });
+        let r = rkyv_decode::<ReportCorruptReplicaResp>(&resp).unwrap();
+        assert_eq!(r.code, CODE_PRECONDITION, "cross-partition stream → refused");
+    }
+
+    /// An SST block read names the partition's ROW stream, and is acted on
+    /// like a WAL replay's report; the meta stream holds no SST block and is
+    /// out of scope.
+    #[test]
+    fn a_row_stream_report_is_accepted_and_a_meta_stream_one_refused() {
+        for (stream_id, accepted) in [(LOG_STREAM_ID + 10, true), (LOG_STREAM_ID + 20, false)] {
+            let m = AutumnManager::new();
+            seed(&m, 100, 42, 9);
+            {
+                let mut s = m.store.inner.borrow_mut();
+                let pm = s.partitions.get_mut(&100).unwrap();
+                pm.row_stream = LOG_STREAM_ID + 10;
+                pm.meta_stream = LOG_STREAM_ID + 20;
+                let mut st = s.streams.remove(&LOG_STREAM_ID).unwrap();
+                st.stream_id = stream_id;
+                s.streams.insert(stream_id, st);
+            }
+            let req = ReportCorruptReplicaReq {
+                partition_id: 100,
+                owner_epoch: 42,
+                stream_id,
+                extent_id: 9,
+                eversion: 7,
+                corrupt_node_ids: vec![3],
+            };
+            let resp = run(async {
+                m.handle_report_corrupt_replica(rkyv_encode(&req)).await.unwrap()
+            });
+            let r = rkyv_decode::<ReportCorruptReplicaResp>(&resp).unwrap();
+            let avali = m.store.inner.borrow().extents.get(&9).unwrap().avali;
+            if accepted {
+                assert_eq!(r.code, CODE_OK, "row stream: {}", r.message);
+                assert_eq!(avali, 0b101);
+            } else {
+                assert_eq!(r.code, CODE_PRECONDITION, "meta stream: {}", r.message);
+                assert_eq!(avali, 0b111);
+            }
+        }
+    }
+
+    #[test]
+    fn idempotent_when_bit_already_cleared() {
+        let m = AutumnManager::new();
+        seed(&m, 100, 42, 9);
+        // node 3 already isolated (bit 1 clear).
+        {
+            let mut s = m.store.inner.borrow_mut();
+            s.extents.get_mut(&9).unwrap().avali = 0b101;
+        }
+        let r = fire(&m, 100, 42, 9, 7, vec![3]);
+        assert_eq!(r.code, CODE_OK, "{}", r.message);
+        let s = m.store.inner.borrow();
+        let ex = s.extents.get(&9).unwrap();
+        assert_eq!(ex.avali, 0b101, "no-op, no further clear");
+        assert_eq!(ex.eversion, 7, "no eversion bump on a no-op report");
+        drop(s);
+        // The dark slot had no reason recorded. Left that way it reads as
+        // BEHIND, and the dispatch loop would catch it up in place with a
+        // length check the rotted copy passes; the report records it.
+        assert!(
+            m.slot_is_corrupt(9, 1),
+            "a repeated report must record why an unmarked dark slot is dark"
+        );
+        assert!(!m.slot_is_corrupt(9, 0) && !m.slot_is_corrupt(9, 2));
+    }
+}
+
+#[cfg(test)]
+mod split_inflight_guard_tests {
+    //! #6: a concurrent split request for a partition already being split is
+    //! refused — so a PS retry storm against a slow manager can't commit a
+    //! separate split per retry (the reproduced 1→6 cascade).
+    use crate::AutumnManager;
+    use autumn_rpc::manager_rpc::*;
+    use bytes::Bytes;
+
+    fn run<F: std::future::Future<Output = T>, T>(f: F) -> T {
+        compio::runtime::Runtime::new().unwrap().block_on(f)
+    }
+
+    #[test]
+    fn concurrent_split_for_same_partition_is_refused() {
+        let m = AutumnManager::new(); // memory-mode = always leader
+        // Simulate a split already in flight for partition 99 (the RAII guard a
+        // first, slow handler invocation would hold).
+        m.split_inflight.borrow_mut().insert(99);
+
+        let req = MultiModifySplitReq {
+            part_id: 99,
+            owner_key: "partition/99".to_string(),
+            owner_epoch: 1,
+            mid_key: vec![0x80],
+            log_stream_sealed_length: 1,
+            row_stream_sealed_length: 1,
+            meta_stream_sealed_length: 1,
+            log_tail_extent_id: 0,
+            row_tail_extent_id: 0,
+            meta_tail_extent_id: 0,
+            op_id: 0,
+        };
+        let payload: Bytes = rkyv_encode(&req);
+        let resp = run(async { m.handle_multi_modify_split(payload).await.unwrap() });
+        let r: CodeResp = rkyv_decode(&resp).expect("decode");
+        assert_eq!(
+            r.code, CODE_PRECONDITION,
+            "a concurrent split for the same partition must be refused"
+        );
+        assert!(
+            r.message.contains("already in progress"),
+            "actionable message: {}",
+            r.message
+        );
+        // The guard set is untouched by the refused call (still just our entry).
+        assert!(m.split_inflight.borrow().contains(&99));
+    }
+}
+
+#[cfg(test)]
+mod authz_kdc_tests {
+    //! Stage 1 acceptance: drive the KDC handlers end-to-end in
+    //! memory mode (leader=true, no etcd) — principal-create → mint → publish
+    //! config → verify → expiry-fail → byte-flip-fail → delete-stops-renewal.
+    use super::*;
+    use crate::AutumnManager;
+    use autumn_rpc::cap_token::{public_key_from_seed, verify_token, AuthReject};
+    use ed25519_dalek::VerifyingKey;
+
+    /// A one-key signing file: kid=1, seed = 0x00..01.
+    fn keyfile() -> String {
+        "1 0000000000000000000000000000000000000000000000000000000000000001".to_string()
+    }
+
+    fn seed_1() -> [u8; 32] {
+        let mut s = [0u8; 32];
+        s[31] = 1;
+        s
+    }
+
+    /// Build a kid→VerifyingKey resolver from a published config (what a PS does).
+    fn resolver<'a>(cfg: &'a GetAuthzConfigResp) -> impl Fn(u32) -> Option<VerifyingKey> + 'a {
+        move |kid| {
+            cfg.public_keys
+                .iter()
+                .find(|k| k.kid == kid && !k.disabled)
+                .and_then(|k| {
+                    let arr: [u8; 32] = k.ed25519_pub.as_slice().try_into().ok()?;
+                    VerifyingKey::from_bytes(&arr).ok()
+                })
+        }
+    }
+
+    #[test]
+    fn kdc_mint_verify_expiry_byteflip() {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let mgr = AutumnManager::new(); // memory mode → leader = true
+            mgr.set_authz_keyring(
+                crate::authz::AuthzKeyring::from_file_contents(&keyfile()).unwrap(),
+            );
+            mgr.params().auth_token_ttl_secs.set(3600);
+            let cluster_id = mgr.cluster_id.borrow().clone();
+
+            // ── (1) principal-create (admin) ───────────────────────────
+            let ok_create = rkyv_encode(&PrincipalCreateReq {
+                principal: "acme".to_string(),
+                allowed_prefixes: vec![b"mem/acme/".to_vec()],
+            });
+            let resp: PrincipalCreateResp =
+                rkyv_decode(&mgr.handle_principal_create(ok_create).await.unwrap()).unwrap();
+            assert_eq!(resp.code, CODE_OK, "{}", resp.message);
+            let cred = resp.credential;
+            assert_eq!(cred.len(), 32);
+
+            // ── (2) mint a token with the credential ───────────────────
+            let mint = rkyv_encode(&MintTokenReq {
+                principal: "acme".to_string(),
+                credential: cred.clone(),
+            });
+            let mresp: MintTokenResp =
+                rkyv_decode(&mgr.handle_mint_token(mint).await.unwrap()).unwrap();
+            assert_eq!(mresp.code, CODE_OK, "{}", mresp.message);
+            assert!(!mresp.token.is_empty());
+            let exp = mresp.exp;
+
+            // wrong credential → refused (same opaque error as unknown principal)
+            let mint_bad = rkyv_encode(&MintTokenReq {
+                principal: "acme".to_string(),
+                credential: vec![9u8; 32],
+            });
+            let mr: MintTokenResp =
+                rkyv_decode(&mgr.handle_mint_token(mint_bad).await.unwrap()).unwrap();
+            assert_ne!(mr.code, CODE_OK);
+            let mint_unknown = rkyv_encode(&MintTokenReq {
+                principal: "ghost".to_string(),
+                credential: cred.clone(),
+            });
+            let mru: MintTokenResp =
+                rkyv_decode(&mgr.handle_mint_token(mint_unknown).await.unwrap()).unwrap();
+            assert_ne!(mru.code, CODE_OK);
+
+            // ── (3) publish config → verify token (what a PS does) ─────
+            let cfg: GetAuthzConfigResp =
+                rkyv_decode(&mgr.handle_get_authz_config().await.unwrap()).unwrap();
+            assert!(cfg.enabled);
+            assert_eq!(cfg.public_keys.len(), 1);
+            assert_eq!(
+                cfg.public_keys[0].ed25519_pub,
+                public_key_from_seed(&seed_1()).to_vec()
+            );
+
+            let rk = resolver(&cfg);
+            let claims = verify_token(&mresp.token, &rk, exp - 1, cfg.clock_skew_secs)
+                .expect("token should verify");
+            assert_eq!(claims.aud, cluster_id, "aud must equal cluster_id");
+            assert_eq!(claims.allowed_prefixes, vec![b"mem/acme/".to_vec()]);
+            assert_eq!(claims.kid, 1);
+            assert_eq!(claims.exp, exp);
+
+            // ── (4) expiry-fail: now past exp + skew leeway ────────────
+            let err = verify_token(
+                &mresp.token,
+                &rk,
+                exp + cfg.clock_skew_secs + 1,
+                cfg.clock_skew_secs,
+            )
+            .unwrap_err();
+            assert_eq!(err, AuthReject::Expired);
+
+            // ── (5) byte-flip-fail: tamper the signature ───────────────
+            let mut tampered = mresp.token.clone();
+            let last = tampered.len() - 1;
+            tampered[last] ^= 0x01;
+            let err = verify_token(&tampered, &rk, exp - 1, cfg.clock_skew_secs).unwrap_err();
+            assert_eq!(err, AuthReject::BadSignature);
+
+            // ── (6) principal-delete stops future renewal ──────────────
+            let del = rkyv_encode(&PrincipalDeleteReq {
+                principal: "acme".to_string(),
+            });
+            let dresp: CodeResp =
+                rkyv_decode(&mgr.handle_principal_delete(del).await.unwrap()).unwrap();
+            assert_eq!(dresp.code, CODE_OK);
+            let mint_after_del = rkyv_encode(&MintTokenReq {
+                principal: "acme".to_string(),
+                credential: cred,
+            });
+            let mr2: MintTokenResp =
+                rkyv_decode(&mgr.handle_mint_token(mint_after_del).await.unwrap()).unwrap();
+            assert_ne!(mr2.code, CODE_OK, "deleted principal must not renew");
+        });
+    }
+
+    #[test]
+    fn kdc_disabled_when_no_signing_key() {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let mgr = AutumnManager::new();
+            // No keyring set → authz disabled.
+            let cfg: GetAuthzConfigResp =
+                rkyv_decode(&mgr.handle_get_authz_config().await.unwrap()).unwrap();
+            assert!(!cfg.enabled);
+            assert!(cfg.public_keys.is_empty());
+            // mint refused (no signing key).
+            let mint = rkyv_encode(&MintTokenReq {
+                principal: "acme".to_string(),
+                credential: vec![1u8; 32],
+            });
+            let mr: MintTokenResp =
+                rkyv_decode(&mgr.handle_mint_token(mint).await.unwrap()).unwrap();
+            assert_ne!(mr.code, CODE_OK);
+        });
+    }
+}
+
+#[cfg(test)]
+mod namespace_registry_tests {
+    //! D2 (SD-1): namespace registry create/delete + bootstrap seed +
+    //! the GetAuthzConfig bridge. Memory-mode manager (leader==true, no etcd);
+    //! the etcd replay/persist path is covered by
+    //! `tests/namespace_registry_etcd.rs` (needs the etcd binary).
+    #![allow(clippy::await_holding_refcell_ref)]
+    use crate::AutumnManager;
+    use autumn_rpc::manager_rpc::*;
+    use bytes::Bytes;
+
+    fn run<F: std::future::Future<Output = T>, T>(f: F) -> T {
+        compio::runtime::Runtime::new().unwrap().block_on(f)
+    }
+
+    fn mgr() -> AutumnManager {
+        AutumnManager::new()
+    }
+
+    fn create(m: &AutumnManager, name: &str, presplit: Vec<Vec<u8>>) -> NamespaceCreateResp {
+        let req = NamespaceCreateReq {
+            name: name.to_string(),
+            presplit,
+        };
+        let payload: Bytes = rkyv_encode(&req);
+        let resp = run(async { m.handle_namespace_create(payload).await.unwrap() });
+        rkyv_decode::<NamespaceCreateResp>(&resp).expect("decode NamespaceCreateResp")
+    }
+
+    fn delete(m: &AutumnManager, name: &str) -> CodeResp {
+        let req = NamespaceDeleteReq {
+            name: name.to_string(),
+        };
+        let payload: Bytes = rkyv_encode(&req);
+        let resp = run(async { m.handle_namespace_delete(payload).await.unwrap() });
+        rkyv_decode::<CodeResp>(&resp).expect("decode CodeResp")
+    }
+
+    fn authz_config(m: &AutumnManager) -> GetAuthzConfigResp {
+        let resp = run(async { m.handle_get_authz_config().await.unwrap() });
+        rkyv_decode::<GetAuthzConfigResp>(&resp).expect("decode GetAuthzConfigResp")
+    }
+
+    /// Register `fs` and `kvc`, as an operator enabling those applications does.
+    fn create_fs_kvc(m: &AutumnManager) {
+        for name in ["fs", "kvc"] {
+            assert_eq!(create(m, name, Vec::new()).code, CODE_OK);
+        }
+    }
+
+    fn list(m: &AutumnManager) -> NamespaceListResp {
+        let resp = run(async { m.handle_namespace_list().await.unwrap() });
+        rkyv_decode::<NamespaceListResp>(&resp).expect("decode NamespaceListResp")
+    }
+
+    #[test]
+    fn namespace_list_returns_rich_registry_sorted() {
+        let m = mgr();
+        create_fs_kvc(&m);
+        assert_eq!(
+            create(&m, "bench", vec![vec![0x01u8, 0x02]]).code,
+            CODE_OK
+        );
+        let r = list(&m);
+        assert_eq!(r.code, CODE_OK);
+        let names: Vec<&str> = r.namespaces.iter().map(|n| n.name.as_str()).collect();
+        for want in ["fs", "kvc", "bench"] {
+            assert!(names.contains(&want), "missing {want}");
+        }
+        // Sorted by name (deterministic CLI output).
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(names, sorted);
+        // Rich fields carried through.
+        let bench = r.namespaces.iter().find(|n| n.name == "bench").unwrap();
+        assert_eq!(bench.prefix, b"bench/".to_vec());
+        assert_eq!(bench.presplit, vec![vec![0x01u8, 0x02]]);
+    }
+
+    // ── principal-list ──────────────────────────────────────────────
+
+    #[test]
+    fn namespace_list_is_leader_gated() {
+        let m = mgr();
+        create_fs_kvc(&m);
+        m.set_leader(false);
+        let r = list(&m);
+        assert_eq!(r.code, CODE_NOT_LEADER);
+        assert!(r.namespaces.is_empty());
+    }
+
+    fn principal_create(m: &AutumnManager, name: &str, grants: &[&[u8]]) -> PrincipalCreateResp {
+        let req = PrincipalCreateReq {
+            principal: name.to_string(),
+            allowed_prefixes: grants.iter().map(|g| g.to_vec()).collect(),
+        };
+        let payload: Bytes = rkyv_encode(&req);
+        let resp = run(async { m.handle_principal_create(payload).await.unwrap() });
+        rkyv_decode::<PrincipalCreateResp>(&resp).expect("decode PrincipalCreateResp")
+    }
+
+    fn principal_list(m: &AutumnManager) -> PrincipalListResp {
+        let resp = run(async { m.handle_principal_list().await.unwrap() });
+        rkyv_decode::<PrincipalListResp>(&resp).expect("decode PrincipalListResp")
+    }
+
+    #[test]
+    fn principal_list_returns_names_and_grants_sorted() {
+        let m = mgr();
+        assert_eq!(principal_create(&m, "fs", &[b"fs/"]).code, CODE_OK);
+        assert_eq!(
+            principal_create(&m, "agent7", &[b"mem/agent7/", b"kvc/"]).code,
+            CODE_OK
+        );
+        let r = principal_list(&m);
+        assert_eq!(r.code, CODE_OK);
+        let names: Vec<&str> = r.principals.iter().map(|p| p.name.as_str()).collect();
+        // sorted by name — the backing map is a HashMap, so without the sort
+        // the CLI output would shuffle between invocations
+        assert_eq!(names, vec!["agent7", "fs"]);
+        let a = r.principals.iter().find(|p| p.name == "agent7").unwrap();
+        assert_eq!(a.grants, vec![b"mem/agent7/".to_vec(), b"kvc/".to_vec()]);
+        let f = r.principals.iter().find(|p| p.name == "fs").unwrap();
+        assert_eq!(f.grants, vec![b"fs/".to_vec()]);
+    }
+
+    // ── sacred presplit boundaries ────────────
+
+    #[test]
+    fn principal_list_is_leader_gated() {
+        let m = mgr();
+        assert_eq!(principal_create(&m, "fs", &[b"fs/"]).code, CODE_OK);
+        m.set_leader(false);
+        let r = principal_list(&m);
+        assert_eq!(r.code, CODE_NOT_LEADER);
+        assert!(r.principals.is_empty());
+    }
+
+    fn set_presplit(m: &AutumnManager, name: &str, points: &[&[u8]]) -> CodeResp {
+        let req = NamespaceSetPresplitReq {
+            name: name.to_string(),
+            points: points.iter().map(|p| p.to_vec()).collect(),
+        };
+        let payload: Bytes = rkyv_encode(&req);
+        let resp = run(async { m.handle_namespace_set_presplit(payload).await.unwrap() });
+        rkyv_decode::<CodeResp>(&resp).expect("decode CodeResp")
+    }
+
+    #[test]
+    fn set_presplit_unions_and_marks_boundaries_sacred() {
+        let m = mgr();
+        create_fs_kvc(&m);
+        // fs lane boundaries: `fs/` ++ [0x03][lane]
+        assert_eq!(set_presplit(&m, "fs", &[b"fs/\x03\x01", b"fs/\x03\x02"]).code, CODE_OK);
+        assert_eq!(
+            m.sacred_boundary_owner(b"fs/\x03\x01").as_deref(),
+            Some("fs")
+        );
+        assert!(m.sacred_boundary_owner(b"fs/\x03\x09").is_none());
+
+        // Re-running presplit at a WIDER lane count unions rather than replaces:
+        // dropping a protected boundary must be a deliberate separate act, not a
+        // side effect of re-running presplit.
+        assert_eq!(set_presplit(&m, "fs", &[b"fs/\x03\x02", b"fs/\x03\x03"]).code, CODE_OK);
+        let row = m.namespaces.borrow().get("fs").unwrap().clone();
+        assert_eq!(
+            row.presplit,
+            vec![
+                b"fs/\x03\x01".to_vec(),
+                b"fs/\x03\x02".to_vec(),
+                b"fs/\x03\x03".to_vec()
+            ],
+            "points must union AND stay sorted"
+        );
+        assert_eq!(m.sacred_boundaries().len(), 3);
+    }
+
+    #[test]
+    fn set_presplit_is_leader_gated_and_needs_a_real_namespace() {
+        let m = mgr();
+        create_fs_kvc(&m);
+        // unknown namespace
+        assert_eq!(set_presplit(&m, "nope", &[b"nope/\x01"]).code, CODE_NOT_FOUND);
+        assert!(m.sacred_boundaries().is_empty(), "a rejected call must record nothing");
+
+        // follower
+        m.set_leader(false);
+        assert_eq!(set_presplit(&m, "fs", &[b"fs/\x03\x01"]).code, CODE_NOT_LEADER);
+    }
+
+    /// Put a partition with an explicit range into the store so the split-snap
+    /// helper has something to look at.
+    fn mk_range(m: &AutumnManager, id: u64, start: &[u8], end: &[u8]) {
+        let mut s = m.store.inner.borrow_mut();
+        s.partitions.insert(
+            id,
+            crate::persist::records::PartitionRecord {
+                part_id: id,
+                log_stream: 0,
+                row_stream: 0,
+                meta_stream: 0,
+                rg: Some(crate::persist::records::RangeRecord {
+                    start_key: start.to_vec(),
+                    end_key: end.to_vec(),
+                }),
+            },
+        );
+    }
+
+    #[test]
+    fn auto_split_snaps_to_the_middle_declared_boundary() {
+        let m = mgr();
+        create_fs_kvc(&m);
+        // 24 lanes over 1 partition: declare the boundaries for 4 parts.
+        assert_eq!(
+            set_presplit(
+                &m,
+                "fs",
+                &[b"fs/\x03\x06", b"fs/\x03\x0c", b"fs/\x03\x12"]
+            )
+            .code,
+            CODE_OK
+        );
+        mk_range(&m, 1, b"fs/", b"fs0");
+        // Nearest the middle → halves the lane span, rather than shaving one
+        // lane off an end the way "first declared point" would.
+        assert_eq!(
+            m.declared_split_point_within(1).as_deref(),
+            Some(&b"fs/\x03\x0c"[..])
+        );
+
+        // After that cut, each half snaps to its own remaining boundary.
+        mk_range(&m, 2, b"fs/", b"fs/\x03\x0c");
+        mk_range(&m, 3, b"fs/\x03\x0c", b"fs0");
+        assert_eq!(
+            m.declared_split_point_within(2).as_deref(),
+            Some(&b"fs/\x03\x06"[..])
+        );
+        assert_eq!(
+            m.declared_split_point_within(3).as_deref(),
+            Some(&b"fs/\x03\x12"[..])
+        );
+    }
+
+    #[test]
+    fn auto_split_falls_back_to_median_when_no_boundary_is_left() {
+        let m = mgr();
+        create_fs_kvc(&m);
+        assert_eq!(set_presplit(&m, "fs", &[b"fs/\x03\x06"]).code, CODE_OK);
+        // A partition already cut down to a single lane run holds no declared
+        // point → None → the PS picks a median, which is the RIGHT choice there
+        // (an intra-lane inode split is exactly what's wanted at that stage).
+        mk_range(&m, 7, b"fs/\x03\x06", b"fs/\x03\x07");
+        assert!(m.declared_split_point_within(7).is_none());
+
+        // A point EQUAL to start_key is this partition's own boundary, not an
+        // interior cut — splitting there would ask for an empty child.
+        mk_range(&m, 8, b"fs/\x03\x06", b"fs0");
+        assert!(
+            m.declared_split_point_within(8).is_none(),
+            "start_key must not be offered as an interior split point"
+        );
+
+        // A partition in another namespace is unaffected by fs's declarations.
+        mk_range(&m, 9, b"kvc/", b"kvc0");
+        assert!(m.declared_split_point_within(9).is_none());
+    }
+
+    #[test]
+    fn empty_key_is_never_a_sacred_boundary() {
+        // The keyspace start is not a declared cut — treating it as one would
+        // make the very first partition unmergeable forever.
+        let m = mgr();
+        create_fs_kvc(&m);
+        assert_eq!(set_presplit(&m, "fs", &[b""]).code, CODE_OK);
+        assert!(m.sacred_boundary_owner(b"").is_none());
+    }
+
+    #[test]
+    fn nothing_is_registered_by_default() {
+        let m = mgr();
+        assert!(m.namespaces.borrow().is_empty());
+        assert!(authz_config(&m).namespaces.is_empty());
+    }
+
+    #[test]
+    fn fs_kvc_mem_are_ordinary_names() {
+        let m = mgr();
+        for name in ["fs", "kvc", "mem"] {
+            assert_eq!(create(&m, name, Vec::new()).code, CODE_OK, "{name}");
+            assert_eq!(delete(&m, name).code, CODE_OK, "{name}");
+        }
+        assert!(m.namespaces.borrow().is_empty());
+    }
+
+    #[test]
+    fn create_delete_round_trip() {
+        let m = mgr();
+        let r = create(&m, "bench", Vec::new());
+        assert_eq!(r.code, CODE_OK, "{}", r.message);
+        assert!(m.namespaces.borrow().contains_key("bench"));
+
+        // Re-create is a precondition failure (already exists).
+        let dup = create(&m, "bench", Vec::new());
+        assert_eq!(dup.code, CODE_PRECONDITION);
+
+        let d = delete(&m, "bench");
+        assert_eq!(d.code, CODE_OK, "{}", d.message);
+        assert!(!m.namespaces.borrow().contains_key("bench"));
+
+        // Delete of a now-absent namespace = NOT_FOUND.
+        let gone = delete(&m, "bench");
+        assert_eq!(gone.code, CODE_NOT_FOUND);
+    }
+
+    #[test]
+    fn prefix_overlap_is_rejected() {
+        let m = mgr();
+        // Seed a namespace with a NESTED prefix (a/b/) directly into the shadow;
+        // a new `a/` would then be a `starts_with` ancestor of it → conflict.
+        m.namespaces.borrow_mut().insert(
+            "deep".to_string(),
+            crate::persist::records::NamespaceRecord {
+                name: "deep".to_string(),
+                prefix: b"a/b/".to_vec(),
+                presplit: Vec::new(),
+                created_at: 0,
+            },
+        );
+        let r = create(&m, "a", Vec::new());
+        assert_eq!(r.code, CODE_INVALID_ARGUMENT, "overlapping prefix must reject");
+        // A disjoint name is still accepted.
+        let ok = create(&m, "bench", Vec::new());
+        assert_eq!(ok.code, CODE_OK, "{}", ok.message);
+    }
+
+    #[test]
+    fn get_authz_config_bridges_registry() {
+        let m = mgr();
+        create_fs_kvc(&m);
+        assert_eq!(create(&m, "bench", Vec::new()).code, CODE_OK);
+        assert_eq!(create(&m, "scratch", Vec::new()).code, CODE_OK);
+
+        let cfg = authz_config(&m);
+        // `namespaces` carries EVERY registered prefix (Layer-A data source).
+        for p in [
+            b"fs/".to_vec(),
+            b"kvc/".to_vec(),
+            b"bench/".to_vec(),
+            b"scratch/".to_vec(),
+        ] {
+            assert!(cfg.namespaces.contains(&p), "namespaces missing {p:?}");
+        }
+        assert_eq!(cfg.namespaces.len(), 4);
+    }
+
+    #[test]
+    fn get_authz_config_is_leader_gated() {
+        // D2: the registry is leader-maintained, so a
+        // follower must refuse rather than publish an empty/stale namespace list.
+        let m = mgr();
+        create_fs_kvc(&m);
+        let ok = authz_config(&m);
+        assert_eq!(ok.code, CODE_OK);
+        assert!(!ok.namespaces.is_empty(), "leader must carry the registry");
+
+        m.set_leader(false);
+        let follower = authz_config(&m);
+        assert_eq!(follower.code, CODE_NOT_LEADER, "follower must refuse");
+        // A refused response carries NO registry data — a PS never installs an
+        // empty namespace list from a follower.
+        assert!(follower.namespaces.is_empty());
+        assert!(follower.public_keys.is_empty());
+    }
+}
+// end of rpc_handlers.rs
+
+#[cfg(test)]
+mod cluster_df_disk_tests {
+    //! The per-disk rows the dashboard's Nodes tab renders. Two shapes must stay
+    //! distinct: a node that ANSWERED df but omitted a disk the registry assigns
+    //! to it (one `reported: false` row), and a node that did NOT answer (no
+    //! rows — an unreachable machine is one fact, not N missing disks).
+    use crate::persist::records::NodeRecord;
+    use crate::{AutumnManager, NodeCap};
+    use autumn_rpc::extent_rpc::DiskStatus;
+
+    fn node(id: u64, disks: &[u64]) -> NodeRecord {
+        NodeRecord {
+            node_id: id,
+            address: format!("127.0.0.1:{}", 9100 + id),
+            disks: disks.to_vec(),
+            shard_ports: Vec::new(),
+            control_address: String::new(),
+            node_uuid: format!("node-{id}"),
+        }
+    }
+
+    fn up(total: u64, free: u64) -> DiskStatus {
+        DiskStatus {
+            total,
+            free,
+            online: true,
+            extent_bytes: 0,
+            ..Default::default()
+        }
+    }
+
+    fn mgr_with(nodes: &[NodeRecord], disk_ids: &[u64]) -> AutumnManager {
+        let m = AutumnManager::new();
+        m.leader.set(true);
+        {
+            let mut s = m.store.inner.borrow_mut();
+            for n in nodes {
+                s.nodes.insert(n.node_id, n.clone());
+            }
+            for d in disk_ids {
+                s.disks.insert(
+                    *d,
+                    crate::persist::records::DiskRecord {
+                        disk_id: *d,
+                        online: true,
+                        uuid: format!("uuid-{d}"),
+                    },
+                );
+            }
+        }
+        m
+    }
+
+    #[test]
+    fn answered_node_gets_a_row_for_the_disk_it_omitted() {
+        let m = mgr_with(&[node(1, &[10, 11])], &[10, 11]);
+        m.cluster_cap.borrow_mut().per_node = vec![(
+            1,
+            NodeCap {
+                total: 100,
+                free: 50,
+                extent_bytes: 0,
+                online: true,
+                disks: vec![(10, up(100, 50))], // disk 11 is not described
+            },
+        )];
+        let resp = m.compute_cluster_df_resp();
+        let d = &resp.per_node[0].disks;
+        assert_eq!(d.len(), 2, "{d:?}");
+        assert!(d.iter().any(|x| x.disk_id == 10 && x.reported && x.online));
+        let missing = d.iter().find(|x| x.disk_id == 11).expect("a row for the omitted disk");
+        assert!(!missing.reported, "the omitted disk is its own state: {missing:?}");
+        assert_eq!(missing.uuid, "uuid-11", "carries the identity `format` stamped");
+    }
+
+    /// ABLATION: remove the `!answered` early return in `node_disks` and this
+    /// yields two `reported: false` rows — which the page used to present as
+    /// "started without that data directory" for a machine that is simply down.
+    #[test]
+    fn unreachable_node_gets_no_rows_not_n_missing_disks() {
+        let m = mgr_with(&[node(1, &[10, 11])], &[10, 11]);
+        m.cluster_cap.borrow_mut().per_node = vec![(
+            1,
+            NodeCap {
+                online: false,
+                ..Default::default()
+            },
+        )];
+        let resp = m.compute_cluster_df_resp();
+        assert!(
+            resp.per_node[0].disks.is_empty(),
+            "a node that did not answer df described nothing: {:?}",
+            resp.per_node[0].disks
+        );
+    }
+
+    /// A stale `{dir}/disk_id` sentinel makes a node report a disk the registry
+    /// assigns to ANOTHER node; rendering it under the reporter would put a
+    /// fault on the wrong machine. Same filter `apply_df_disk_health` applies.
+    #[test]
+    fn a_disk_owned_by_another_node_is_not_rendered_under_the_reporter() {
+        let m = mgr_with(&[node(1, &[10]), node(2, &[20])], &[10, 20]);
+        m.cluster_cap.borrow_mut().per_node = vec![(
+            1,
+            NodeCap {
+                total: 200,
+                free: 100,
+                extent_bytes: 0,
+                online: true,
+                disks: vec![(10, up(100, 50)), (20, up(100, 50))],
+            },
+        )];
+        let resp = m.compute_cluster_df_resp();
+        let ids: Vec<u64> = resp.per_node[0].disks.iter().map(|d| d.disk_id).collect();
+        assert_eq!(ids, vec![10], "disk 20 belongs to node 2");
+    }
+}
+
+#[cfg(test)]
+mod fence_precheck_tests {
+    //! A non-force fence must be refused unless recovery could rebuild every
+    //! slot on the node: a legal target per extent (not a member, not
+    //! fenced / maintenance / suspected), room for its shard, and 1.2x the
+    //! bytes in total across the eligible nodes.
+    use super::*;
+    use crate::persist::records::{ExtentRecord, NodeRecord};
+    use crate::NodeCap;
+
+    /// Nodes `nodes`, one RF2 extent per `(id, [a, b], sealed_length)`, and a
+    /// df row with `free` bytes for each node listed in `free`.
+    fn cluster(
+        nodes: &[u64],
+        extents: &[(u64, [u64; 2], u64)],
+        free: &[(u64, u64)],
+    ) -> AutumnManager {
+        cluster_with(
+            nodes,
+            extents,
+            &free.iter().map(|(n, f)| (*n, *f, true)).collect::<Vec<_>>(),
+        )
+    }
+
+    /// As `cluster`, with each df row's `online` flag given: a probe that
+    /// failed this tick leaves `online: false`, not a missing row.
+    fn cluster_with(
+        nodes: &[u64],
+        extents: &[(u64, [u64; 2], u64)],
+        free: &[(u64, u64, bool)],
+    ) -> AutumnManager {
+        let m = AutumnManager::new();
+        {
+            let mut s = m.store.inner.borrow_mut();
+            for nid in nodes {
+                s.nodes.insert(
+                    *nid,
+                    NodeRecord {
+                        node_id: *nid,
+                        address: format!("127.0.0.1:{}", 9000 + nid),
+                        disks: vec![*nid],
+                        shard_ports: vec![],
+                        control_address: String::new(),
+                        node_uuid: format!("uuid-{nid}"),
+                    },
+                );
+            }
+            for (eid, reps, len) in extents {
+                s.extents.insert(
+                    *eid,
+                    ExtentRecord {
+                        extent_id: *eid,
+                        replicates: reps.to_vec(),
+                        eversion: 1,
+                        refs: 1,
+                        sealed_length: *len,
+                        sealed: true,
+                        avali: 0b11,
+                        ..Default::default()
+                    },
+                );
+            }
+        }
+        m.cluster_cap.borrow_mut().per_node = free
+            .iter()
+            .map(|(nid, f, online)| {
+                (
+                    *nid,
+                    NodeCap {
+                        total: 1 << 40,
+                        free: *f,
+                        extent_bytes: 0,
+                        online: *online,
+                        disks: Vec::new(),
+                    },
+                )
+            })
+            .collect();
+        m
+    }
+
+    fn set_override(m: &AutumnManager, node_id: u64, kind: u8) {
+        m.node_overrides.borrow_mut().insert(
+            node_id,
+            MgrNodeOverride {
+                node_id,
+                kind,
+                set_at: 0,
+                set_by: "test".into(),
+                reason: String::new(),
+                expire_at: 0,
+                node_uuid: String::new(),
+            },
+        );
+    }
+
+    fn refused(m: &AutumnManager, node_id: u64) -> String {
+        match m.check_capacity_for_fence(node_id) {
+            Err(AppError::Precondition(msg)) => msg,
+            other => panic!("fence of {node_id} must be refused, got {other:?}"),
+        }
+    }
+
+    const GIB: u64 = 1 << 30;
+
+    #[test]
+    fn a_legal_target_with_room_passes() {
+        let m = cluster(
+            &[1, 2, 3],
+            &[(7, [1, 2], GIB)],
+            &[(1, 10 * GIB), (2, 10 * GIB), (3, 10 * GIB)],
+        );
+        m.check_capacity_for_fence(1)
+            .expect("node 3 can take extent 7's slot");
+    }
+
+    /// The review's case: an RF2 extent already on the only two nodes.
+    #[test]
+    fn no_spare_is_refused() {
+        let m = cluster(
+            &[1, 2],
+            &[(7, [1, 2], GIB)],
+            &[(1, 10 * GIB), (2, 10 * GIB)],
+        );
+        assert!(refused(&m, 1).contains("extent 7 has no recovery target"));
+    }
+
+    #[test]
+    fn a_spare_that_is_fenced_in_maintenance_or_suspected_does_not_count() {
+        for how in ["fenced", "maintenance", "suspected"] {
+            let m = cluster(
+                &[1, 2, 3],
+                &[(7, [1, 2], GIB)],
+                &[(1, 10 * GIB), (2, 10 * GIB), (3, 10 * GIB)],
+            );
+            match how {
+                "fenced" => set_override(&m, 3, NODE_OVERRIDE_FENCED),
+                "maintenance" => set_override(&m, 3, NODE_OVERRIDE_MAINTENANCE),
+                _ => {
+                    // Zero soft timeout: one failure after a verified-alive
+                    // heartbeat makes the node Suspected at once.
+                    let mut st = m.node_states.borrow_mut();
+                    *st = crate::node_state::NodeStateTracker::new(std::time::Duration::ZERO);
+                    st.on_heartbeat_ok(3);
+                    st.on_heartbeat_fail(3);
+                    assert!(st.state_of(3).is_suspected());
+                }
+            }
+            assert!(
+                refused(&m, 1).contains("no recovery target"),
+                "a {how} spare was counted as a target"
+            );
+        }
+    }
+
+    #[test]
+    fn a_target_without_room_for_the_shard_is_refused() {
+        let m = cluster(
+            &[1, 2, 3],
+            &[(7, [1, 2], 4 * GIB)],
+            &[(1, 10 * GIB), (2, 10 * GIB), (3, GIB)],
+        );
+        assert!(refused(&m, 1).contains("free bytes for its shard"));
+    }
+
+    /// No df row for the only spare, or a row whose probe failed this tick:
+    /// unknown capacity is not room, and the message says it is unknown.
+    #[test]
+    fn a_target_without_a_capacity_signal_is_refused() {
+        let absent = cluster(
+            &[1, 2, 3],
+            &[(7, [1, 2], GIB)],
+            &[(1, 10 * GIB), (2, 10 * GIB)],
+        );
+        assert!(refused(&absent, 1).contains("no capacity report yet"));
+        let failed = cluster_with(
+            &[1, 2, 3],
+            &[(7, [1, 2], GIB)],
+            &[
+                (1, 10 * GIB, true),
+                (2, 10 * GIB, true),
+                (3, 10 * GIB, false),
+            ],
+        );
+        assert!(refused(&failed, 1).contains("no capacity report yet"));
+    }
+
+    /// An EC extent moves one shard (sealed_length / K), and its parity nodes
+    /// are members too, so they are not targets.
+    #[test]
+    fn an_ec_extent_needs_room_for_one_shard_off_its_members() {
+        let m = cluster(&[1, 2, 3, 4, 5], &[], &[(4, 3 * GIB), (5, GIB)]);
+        m.store.inner.borrow_mut().extents.insert(
+            9,
+            ExtentRecord {
+                extent_id: 9,
+                replicates: vec![1, 2],
+                parity: vec![3],
+                ec_converted: true,
+                eversion: 1,
+                refs: 1,
+                sealed_length: 4 * GIB,
+                sealed: true,
+                avali: 0b111,
+                ..Default::default()
+            },
+        );
+        // Shard = 2 GiB: node 4 has room, node 3 (parity) is a member.
+        m.check_capacity_for_fence(1).expect("node 4 takes the 2 GiB shard");
+        m.cluster_cap.borrow_mut().per_node.retain(|(id, _)| *id != 4);
+        let msg = refused(&m, 1);
+        assert!(msg.contains("free bytes for its shard"), "{msg}");
+    }
+
+    /// Each shard fits the spare on its own; together, with the 1.2x margin,
+    /// they do not.
+    #[test]
+    fn the_total_needs_the_headroom_margin() {
+        let m = cluster(
+            &[1, 2, 3],
+            &[(7, [1, 2], 5 * GIB), (8, [1, 2], 5 * GIB)],
+            &[(1, 100 * GIB), (2, 100 * GIB), (3, 11 * GIB)],
+        );
+        assert!(refused(&m, 1).contains("needs"), "10 GiB to move against 11 GiB free is under 1.2x");
+        let roomy = cluster(
+            &[1, 2, 3],
+            &[(7, [1, 2], 5 * GIB), (8, [1, 2], 5 * GIB)],
+            &[(1, 100 * GIB), (2, 100 * GIB), (3, 12 * GIB)],
+        );
+        roomy.check_capacity_for_fence(1).expect("12 GiB covers 10 GiB at 1.2x");
+    }
+
+    /// `--force` is the explicit override: the same no-spare cluster fences.
+    #[test]
+    fn force_skips_the_check() {
+        let m = cluster(
+            &[1, 2],
+            &[(7, [1, 2], GIB)],
+            &[(1, 10 * GIB), (2, 10 * GIB)],
+        );
+        let call = |force: bool| {
+            let req = FenceNodeReq {
+                node_id: 1,
+                reason: "t".into(),
+                set_by: "t".into(),
+                force,
+            };
+            let bytes = compio::runtime::Runtime::new()
+                .unwrap()
+                .block_on(m.handle_fence_node(rkyv_encode(&req)))
+                .expect("fence");
+            rkyv_decode::<CodeResp>(&bytes).expect("decode").code
+        };
+        assert_eq!(call(false), CODE_PRECONDITION);
+        assert_eq!(call(true), CODE_OK);
+        // A retry of a fence that landed does not re-run the precheck.
+        assert_eq!(call(false), CODE_OK, "re-fencing a fenced node must stay idempotent");
+    }
+}
+
+#[cfg(test)]
+mod force_ec_target_tests {
+    //! force-ec-convert's target set: usable replicas first, substitutes for
+    //! the rest; refused before any marker exists when it cannot be built.
+    use super::*;
+    use crate::persist::records::{ExtentRecord, NodeRecord, StreamRecord};
+
+    fn run<F: std::future::Future<Output = T>, T>(f: F) -> T {
+        compio::runtime::Runtime::new().unwrap().block_on(f)
+    }
+
+    /// Nodes 1..=3, extent 7 replicated on all three, in a 2+1 EC stream (so
+    /// the targets are exactly the replicas and no extra node is allocated).
+    fn cluster() -> AutumnManager {
+        let m = AutumnManager::new();
+        m.leader.set(true);
+        let mut s = m.store.inner.borrow_mut();
+        for nid in [1u64, 2, 3] {
+            s.nodes.insert(
+                nid,
+                NodeRecord {
+                    node_id: nid,
+                    address: format!("127.0.0.1:{}", 9000 + nid),
+                    disks: vec![nid * 10],
+                    shard_ports: vec![],
+                    control_address: String::new(),
+                    node_uuid: format!("uuid-{nid}"),
+                },
+            );
+        }
+        s.extents.insert(
+            7,
+            ExtentRecord {
+                extent_id: 7,
+                replicates: vec![1, 2, 3],
+                replicate_disks: vec![10, 20, 30],
+                eversion: 1,
+                refs: 1,
+                sealed_length: 4096,
+                sealed: true,
+                avali: 0b111,
+                ..Default::default()
+            },
+        );
+        s.streams.insert(
+            100,
+            StreamRecord {
+                stream_id: 100,
+                extent_ids: vec![7],
+                ec_data_shard: 2,
+                ec_parity_shard: 1,
+                replicates: 3,
+            },
+        );
+        drop(s);
+        m
+    }
+
+    fn force(m: &AutumnManager) -> ForceEcConvertResp {
+        let bytes = run(m.handle_force_ec_convert(rkyv_encode(&ForceEcConvertReq { extent_id: 7 })))
+            .expect("handler answers");
+        rkyv_decode(&bytes).unwrap()
+    }
+
+    #[test]
+    fn a_replica_on_an_excluded_node_is_substituted() {
+        for how in ["suspected", "maintenance"] {
+            let m = cluster();
+            match how {
+                "maintenance" => {
+                    m.node_overrides.borrow_mut().insert(
+                        2,
+                        MgrNodeOverride {
+                            node_id: 2,
+                            kind: NODE_OVERRIDE_MAINTENANCE,
+                            set_at: 0,
+                            set_by: "test".into(),
+                            reason: String::new(),
+                            expire_at: 0,
+                            node_uuid: String::new(),
+                        },
+                    );
+                }
+                _ => {
+                    let mut st = m.node_states.borrow_mut();
+                    *st = crate::node_state::NodeStateTracker::new(Duration::ZERO);
+                    st.on_heartbeat_ok(2);
+                    st.on_heartbeat_fail(2);
+                    assert!(st.state_of(2).is_suspected());
+                }
+            }
+            // No spare: node 2's replica cannot be substituted.
+            let resp = force(&m);
+            assert_eq!(resp.code, CODE_PRECONDITION, "{how}: {}", resp.message);
+            assert!(resp.message.contains("not enough health nodes"), "{how}: {}", resp.message);
+            assert!(
+                m.extent_inflight_payload_ec(7).is_none(),
+                "{how}: no marker may be written"
+            );
+            // A spare (node 4): the conversion goes on to allocate the
+            // substitute's shard there — no EN answers in this test, so that
+            // allocation is where it stops.
+            m.store.inner.borrow_mut().nodes.insert(
+                4,
+                NodeRecord {
+                    node_id: 4,
+                    address: "127.0.0.1:9004".into(),
+                    disks: vec![40],
+                    shard_ports: vec![],
+                    control_address: String::new(),
+                    node_uuid: "uuid-4".into(),
+                },
+            );
+            let resp = force(&m);
+            assert_eq!(resp.code, CODE_ERROR, "{how}: {}", resp.message);
+            assert!(resp.message.contains("127.0.0.1:9004"), "{how}: {}", resp.message);
+        }
+    }
+
+    /// A split being dispatched holds a conversion of its partition's extents
+    /// back; the conversion is accepted once the split is answered.
+    #[test]
+    fn a_split_being_dispatched_holds_the_conversion_back() {
+        let m = cluster();
+        m.store.inner.borrow_mut().partitions.insert(
+            5,
+            crate::persist::records::PartitionRecord {
+                part_id: 5,
+                log_stream: 100,
+                row_stream: 101,
+                meta_stream: 102,
+                rg: None,
+            },
+        );
+        let (hold, waited) = run(m.topology_ready(&[5], 0, "split")).expect("nothing blocks the split");
+        assert!(!waited);
+        let resp = force(&m);
+        assert_eq!(resp.code, CODE_PRECONDITION, "{}", resp.message);
+        assert!(resp.message.contains("partition 5"), "{}", resp.message);
+        assert!(m.extent_inflight_payload_ec(7).is_none(), "no marker may be written");
+
+        drop(hold);
+        let resp = force(&m);
+        assert_eq!(resp.code, CODE_OK, "{}", resp.message);
+    }
+
+    #[test]
+    fn healthy_replicas_get_a_marker_naming_them() {
+        let m = cluster();
+        let resp = force(&m);
+        assert_eq!(resp.code, CODE_OK, "{}", resp.message);
+        let p = m.extent_inflight_payload_ec(7).expect("marker written");
+        assert_eq!(p.target_nodes, vec![1, 2, 3]);
+    }
+}
+
+#[cfg(test)]
+mod merge_sources_tests {
+    use super::MergeSources;
+    use crate::persist::records::StreamRecord;
+    use crate::store::MetadataState;
+
+    fn state_with_tail(tail: u64) -> (MetadataState, MergeSources) {
+        let mut s = MetadataState::default();
+        let epoch = s.acquire_owner_lock("partition/1");
+        s.streams.insert(
+            10,
+            StreamRecord {
+                stream_id: 10,
+                extent_ids: vec![5, tail],
+                ec_data_shard: 0,
+                ec_parity_shard: 0,
+                replicates: 3,
+            },
+        );
+        let sources = MergeSources {
+            owners: vec![("partition/1".to_string(), epoch)],
+            tails: vec![(10, tail)],
+        };
+        (s, sources)
+    }
+
+    #[test]
+    fn an_untouched_source_verifies() {
+        let (s, sources) = state_with_tail(6);
+        sources.verify(&s).unwrap();
+    }
+
+    #[test]
+    fn a_reacquired_source_is_refused() {
+        let (mut s, sources) = state_with_tail(6);
+        s.acquire_owner_lock("partition/1");
+        let e = sources.verify(&s).unwrap_err().to_string();
+        assert!(e.contains("merge source reopened"), "{e}");
+    }
+
+    /// A roll whose alloc passed the old owner's check before the merge took
+    /// the source over lands an unfenced tail.
+    #[test]
+    fn a_tail_that_moved_after_the_fence_is_refused() {
+        let (mut s, sources) = state_with_tail(6);
+        s.streams.get_mut(&10).unwrap().extent_ids.push(7);
+        let e = sources.verify(&s).unwrap_err().to_string();
+        assert!(e.contains("tail moved from fenced extent 6"), "{e}");
+    }
+}

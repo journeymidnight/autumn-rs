@@ -1,0 +1,22 @@
+[package]
+name = "autumn-common"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+futures = "0.3"
+autumn-params = { path = "../params" }
+core_affinity = "0.8"
+compio = { workspace = true, features = ["net", "time"] }
+libc = "0.2"
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+autumn-test-ports = { path = "../test-ports" }
+compio = { workspace = true, features = ["fs"] }
+
+[lints]
+workspace = true

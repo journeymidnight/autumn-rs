@@ -1,0 +1,585 @@
+# autumn-server Crate Guide
+
+## Fixed-key core path benchmark
+
+`cargo bench -p autumn-server --features ucx --bench core_path -- <manager>
+<tcp|ucx> <bytes> <seconds> <depth> <load|write|read|direct>` uses 256 fixed keys
+under `bench/core-path`, warms each measured operation for two seconds, and fails
+on RPC errors or missing/short values. Load once before a comparison. Run both
+versions against the same data and layout: `perf-check` reads what its write phase
+wrote; `perf_check.sh` compacts every partition between the phases (`--before-read`)
+so those reads come from SSTs whatever the write phase left in the memtable.
+The benchmark is single-threaded and reports sampled operation latency (1/16).
+
+## Purpose
+
+Binary-only crate: the executable entry points that wire the library crates together, plus one-off repair tooling. No library logic lives here.
+
+**Flags.** Every flag a binary takes is declared in `crates/params`: its
+role struct (`PsParams`, `EnParams`, `OpParams`, ...) holds every flag, its
+ports, addresses, files, cpuset and switches as well as its tunables. `main`
+hands it (plus the shared `fs` / `client` structs it embeds) to
+`autumn_params::parse_or_exit`, one pass over argv. An unknown argument,
+a bad or out-of-range value, a missing required flag (`--psid`, the EN's
+`--data`, autumn-s3's `--manager`, the dashboard's `--cluster-secret-file`,
+autumn-fuse's `--mountpoint`, migratev1_v2's `--etcd`) or a
+removed flag exits 2; `--help` lists every flag with its default and range from
+the same declarations. No binary reads a tunable from the environment.
+
+## Binaries
+
+### `autumn-manager-server` (`src/bin/manager.rs`)
+
+**Default port**: 9001
+
+```
+autumn-manager-server --cluster-secret-file FILE [--port 9001] [--listen 0.0.0.0] [--transport tcp|ucx] [--etcd 127.0.0.1:2379,... --manager-id N]
+```
+
+- Without `--etcd`: in-memory only (metadata lost on restart, no leader election). With `--etcd`: persistent — holds `--manager-id` (required, non-zero, unique per manager; a second process with a held id waits), replays state, runs the leader-election loop. `autumn-op manager-remove <id> --by X` drops a stopped manager from the expected fleet.
+- Serves `StreamManagerService` + `PartitionManagerService` on the same port, plus gRPC reflection.
+- Prometheus `/metrics` on every PS and EN by default, at its `--port` + 500 (unauthenticated; `--metrics-listen <H>` pins it to 127.0.0.1 when the RPC plane is on 0.0.0.0): performance series only, process-level (no partition label — Prometheus sums servers). `--metrics-port <P>` moves it, 0 turns it off. It runs on its own thread and compio runtime, pinned to no core, reading the server's atomics. The manager serves none and refuses `--metrics-port` / `--metrics-listen`; `autumn-op info --file-sd` prints the PS and EN endpoints as Prometheus `file_sd` JSON.
+- The leader-fenced **auto-policy controller** runs in-process (leader only). `--auto-policy-default <NAME>` seeds an Armed policy on a fresh cluster; arming is per-policy (`autumn-op auto-policy start <NAME>`). The **web dashboard is no longer served by the manager** — it is a standalone app (`crates/server/src/bin/autumn_dashboard`) that talks to the manager only through `autumn-op` (it scrapes PS `/metrics` directly for its Metrics tab). Runbook: `docs/ops.md`.
+- `--cluster-secret-file <FILE>` (REQUIRED on the manager, PS and EN; exit 2 without it): the cluster secret every Peer/Admin connection proves (`autumn_rpc::peer_auth`, `docs/cluster_secret_design.md`). `--admin-token[-file]` were removed and are refused by name.
+- Authz (opt-in): `--auth-signing-key-file <FILE>` enables data-plane authz (keys from `autumn-op gen-signing-key`). With a key, every keyed op needs a token (no protected-prefix list). `--auth-token-ttl-secs` / `--auth-clock-skew-secs` tune minted tokens.
+- `--policy-fast-mode` sets short policy windows (1 bucket of 5 s, 5 s tick, 1 MiB / 4 MiB debt thresholds, 30 s cooldowns, 5 s sealed-empty sweep) for dev/test clusters; it is applied before the other flags, so an explicit flag still wins. Every other tunable: `autumn-manager-server --help` (`crates/params/src/manager.rs`).
+
+### `autumn-extent-node` (`src/bin/extent_node.rs`)
+
+**Default port**: 9101
+
+```
+autumn-extent-node --cluster-secret-file FILE --data DIR[,DIR2,...] [--port 9101] [--manager 127.0.0.1:9001] --advertise HOST:PORT
+```
+
+- `--data`: directory holding extent files (`extent-{id}.dat` + `extent-{id}.meta`); comma-separated or repeated for a multi-disk EN.
+- **Direct I/O is on by default on Linux** (append bursts >= 1 MiB go O_DIRECT; off elsewhere): the default lives here in the binary, not in `ExtentNodeConfig` (off there). `--no-direct-io` turns it off — needed on a data dir that refuses O_DIRECT (tmpfs before Linux 6.6), which otherwise stops the EN at startup. There is no flag to turn it on: it is the Linux default, and elsewhere there is no O_DIRECT path. Covered by `tests/direct_io_default.rs`; design in `crates/stream/CLAUDE.md`.
+- `--advertise HOST:PORT` is **REQUIRED whenever `--manager` is given** (`main()` bails otherwise) — a `--manager` run that self-registered nothing would sit at an empty location forever. HOST must be an IP (DNS-free); PORT normally equals `--port` (a difference is accepted with a WARN, for a proxy/NAT). `--manager`-less offline/test runs are exempt.
+- **Self-registration**: at startup (after cluster-id verification, before serving) the EN registers its live address + shard ports with the manager, keyed by its stable `node_uuid`. The manager updates the location IN PLACE, so a reshard or fresh pod IP is picked up on the next boot — the **EN, not `format`, is the sole source of location**. `handle_df` echoes the identity so `node_health_loop` self-heals drift.
+- **Pinning**: each shard thread (the main thread when there is one shard)
+  `sched_setaffinity`s to its `--cpuset` core before building its runtime, and a
+  core outside the process's cgroup/cpuset stops the EN at startup. It used to go
+  through compio's `thread_affinity`, which silently kept the launcher's mask
+  (`crates/common/CLAUDE.md`); `tests/cpuset_pinning.rs` covers EN and PS. The
+  runtime then registers the `--cpuset` for its io_uring worker threads
+  (`confine_io_workers`), which would otherwise run on the whole NUMA node.
+- **Readiness line**: `autumn-extent-node ready` is logged ONCE per process, after every shard has built its `ExtentNode` (disks opened, O_DIRECT check passed) and bound its listeners (`serve_with_control`'s `on_bound`; multi-shard collects one signal per shard over a channel). Launchers wait for this line, not a port: under UCX there is no TCP port to probe, and a shard-0 port says nothing about shards 1..N. Nothing logged before `ExtentNode::new` implies readiness (the per-listener "extent node listening" lines come after their bind) — a "listening" line that used to precede `ExtentNode::new` made `cluster.sh` report an EN up that then died on a data dir refusing O_DIRECT.
+- **PS readiness is the manager's view, not a log line**: a PS's listener or heartbeat comes before its partitions replay their logs, so launchers poll `autumn-op info` until the PS line reads `ready` (`PsOverview::ready()`: every assigned partition open at its current epoch; `crates/manager/CLAUDE.md`, "PS liveness"). `cluster.sh` (`wait_ps_ready`, after start / bootstrap / presplit / `start-ps`) and `autumn-deploy` (`wait_ps_ready`, every PS) match `slots  ready` in the human output.
+- **Static shard ports**: shard count = the `--cpuset` core count (the process's mask without one; `--cpu-start` was removed and exits 2); sibling shard *i* listens on `port + i * shard_stride` (`--shard-stride`, default 10). Control ports default to `port + 1000` (override `--control-port`). The control address registered with the manager (where its `df` health poll goes) is `advertise_host:` + `--control-port` when given, else advertise port + 1000 (`advertise_control_port`); registering port + 1000 regardless of the flag left a node started with an explicit control port unpolled, its disks marked offline while it ran. Test: `tests/en_control_port.rs`.
+- **Requires pre-formatting**: each `--data` dir MUST be formatted by `autumn-op format` first — the EN refuses to start without the sentinel files (`cluster_id`, `disk_uuid`, `node_id`, `disk_id`, `node_uuid`). It cross-checks each dir's `cluster_id`, then fetches the manager's via `MSG_GET_CLUSTER_ID` and refuses on mismatch. `disk_id` comes from the sentinel; `--disk-id` and `--shards` are migration-error stubs (exit 2).
+
+### `autumn-ps` (`src/bin/partition_server.rs`)
+
+**Default port**: 9201
+
+```
+autumn-ps --cluster-secret-file FILE --psid <ID> --manager 127.0.0.1:9001 [--port 9201] [--advertise <ADDR>]
+```
+
+- `--psid`: **required**, unique partition-server ID across the cluster. The PS keeps no local files (its WAL is the log stream). `--advertise`: address announced to the manager (when listening on 0.0.0.0 but the manager needs a routable address); an IP literal, a name exits 2 (the manager dials it literal-only, so a name would only fail at the first split or maintenance call).
+- Startup: connect to manager → `RegisterPs(ps_id, advertise_addr)` → `GetRegions()` for assigned partitions → `open_partition()` (replay from streams) each → serve `PartitionKv` gRPC.
+- `--cpuset <SPEC>` confines the whole process, like `taskset` (`--cpu-start` was removed and exits 2): the main thread takes the mask before anything is spawned, every thread inherits it, and no thread is pinned to a core (pinning P-logs measured no gain, and lost under uneven load). The `--cpuset` length is the `slot_cap` the manager places by (`0` without one). A core outside the cgroup exits 2.
+
+### `autumn-client` (`src/bin/autumn_client/`)
+
+Data-plane CLI: KV ops + benchmarks. Directory bin (Cargo target `src/bin/autumn_client/main.rs`). All admin / observability subcommands live in the sibling binary `autumn-op`; `autumn-client op <anything>` and legacy admin spellings print a hint and exit non-zero.
+
+```
+autumn-client --manager 127.0.0.1:9001 <COMMAND>
+```
+
+| Command | Description |
+|---------|-------------|
+| `put <KEY> <FILE>` | Write key with value from file |
+| `put-stream [--chunk-size N] <KEY> <FILE-or->>` | Client-side stripe-put for large values (4 MiB chunk default) |
+| `get-stream [--chunk-size N] [--out FILE] <KEY>` | Chunked stream get |
+| `get <KEY>` | Read value to stdout |
+| `del <KEY>` | Delete key |
+| `head <KEY>` | Show key metadata (length) |
+| `ls [--prefix P] [--start S] [--limit N]` | List/scan keys |
+| `perf-check [--threads N] [--size B] [--bulk N] [--baseline FILE] [--threshold T] [--update-baseline] [--partitions N] [--pipeline-depth K] [--group-commit-cap N] [--before-read CMD]` | Regression-gated bench: pure write phase then pure read phase vs a JSON baseline; fails if throughput < threshold. `--before-read CMD` runs `sh -c CMD` between the phases and fails the run unless it succeeds (`perf_check.sh` compacts the partitions with it; the client issues no admin RPC itself). `--size` accepts a byte suffix (`4k`/`8m`, same grammar as `gc --max-size`). `--bulk N` (>0) drives each round through one `put_many`/`get_many_into(N items)` — a live batch-size knob (replaces the removed `--batch-put`/`--batch-get`/`--put-many`). Each write thread's value lives in one registered pool buffer (`alloc_value_buf`), so a UCX put of 64 KiB or more goes out with its memh instead of a staged copy (`ucx am: staged_bytes=0`). |
+| `perf-clean [--dry-run] [--parallel N]` | Delete everything the benchmarks wrote (the `bench/perf` scope: perf-check and ycsb keys). Each bench partition's user range is paged with `range_until` (4096 keys; it never walks into the next partition, so a short page does not read another range's tombstones) and deleted with one `delete_many` per page, N ranges at a time (default 8); the next page starts after the last key. Data-plane only (no admin RPC). The space comes back when the partition's major compaction drops the tombstones: automatically once they are in SSTs (the PS's deletion rule counts SSTs, not the memtable), at once with `autumn-op compact`. `--dry-run` only counts |
+| `ycsb [--threads 32] [--duration 30] [--size 1024] [--partitions N] [--pipeline-depth 16] [--read-ratio 0.5] [--key-dist zipfian\|uniform] [--records 100000] [--rmw] [--before-run CMD]` | YCSB-equivalent MIXED workload: LOAD then one mixed R/W run; keys partition-local per thread; our driver, not reference Java YCSB. `--before-run CMD` runs `sh -c CMD` between LOAD and the run, untimed, like perf-check's `--before-read` (compacting there reads one fixed key set from SSTs instead of the memtable) |
+
+**Rule:** `autumn-client` MUST NOT call `mgr_call(MSG_*)` for admin / observability RPCs — that keeps data-plane CLI churn from dragging operator tooling along. Greppable invariant: `grep -rcE 'mgr_call\(MSG_' crates/server/src/bin/autumn_client/` must be 0. New op-data needs go through shared-library extraction or subprocess delegation, not direct manager calls.
+
+**Key routing**: `resolve_key(key)` calls `GetRegions()`, binary-searches sorted partitions by `start_key`, returns `(part_id, ps_addr)`, connects lazily via `PartitionKvClient`.
+
+### `autumn-dashboard` (`src/bin/autumn_dashboard/`)
+
+Formal server binary with embedded HTML, built by `cargo build -p autumn-server`.
+It remains a separate process: all cluster reads and writes invoke the sibling
+`autumn-op` CLI, while policy evaluation and actuation stay in the manager.
+No new dependency, wire format, or data-path work is added by this integration.
+
+- `--manager`, `--transport`, `--port` (8799), `--listen` (0.0.0.0),
+  `--autumn-op`, and required `--cluster-secret-file` (its path is forwarded to
+  every autumn-op call). The secret authorizes the **upstream manager**, not HTTP
+  callers. HTTP remains
+  unauthenticated; do not expose it through an Ingress without adding auth.
+- Policy write bodies are typed; invalid booleans, integers, switch names and
+  option-like policy names fail before spawning the CLI. HTML event arguments
+  encode both JS strings and HTML delimiters/entities.
+- Each policy row offers Start (`{active:name}` → `auto-policy start`); the
+  controller's Stop sends `{enabled:false}` (`deactivate`). Start's
+  confirmation names the clicked policy and needs no status prefetch or prior
+  selection. Running / Stopped are the Armed / Off modes.
+- The page checks HTTP errors and `{ok:false}` before success feedback, marks
+  failed policy status as unknown, and shares concurrent reads per URL. A stale
+  partition detail response cannot replace the selected partition's drawer.
+- Partition rows show the inclusive start and exclusive end on two lines, each
+  cut in the middle to the column's width (fixed row height). Neighbouring keys
+  share long prefixes and differ near the end, so a tail-only cut would make
+  ranges look repeated; the middle cut keeps both ends. The row title and the detail
+  drawer carry the full range.
+- The first Policy panel is named Operational advisories. Hot/cold is an
+  information-only diagnosis (never an action): the page decodes its compact
+  reason into the affected PS, dimension, ratio, large/busy side, small/quiet
+  side and the five-minute observation window.
+- Capacity `amp` is raw filesystem capacity consumed divided by logical extent
+  size (`distinct sealed_length + committed open length`). The same helper is
+  used by `autumn-op df`; `physical_used` is displayed only as diagnostic
+  extent-file length. A 4+1-only layout is about 1.25x and RF3 about 3x.
+- Each CLI invocation uses a blocking worker plus stdout/stderr reader threads;
+  its existing 30-second child deadline stays in place. This is control-plane
+  overhead, outside client/PS/EN data traffic. Multiple browsers still incur
+  separate requests.
+- **Metrics tab.** The one thing it does without `autumn-op`: a poller task
+  scrapes every PS's Prometheus `/metrics` itself, at the targets `autumn-op info
+  --file-sd` lists (`autumn_role` = `ps`; re-read every 15 s, so a new PS shows up
+  once its heartbeat carried its address). Scrapes run on
+  blocking threads (plain `std::net`, 3 s timeout), all PSes per round, every
+  `--metrics-interval-secs` (10). `metrics_store.rs` keeps
+  `--metrics-retention-secs` (3600) in memory: counters as per-second rates (a
+  counter that went down yields no point), gauges as read. Every series is a
+  column of one shared round axis, one `f32` per round (4 bytes a point — a
+  PS's ~40 series cost ~60 KB an hour), so series add up point for
+  point and a query indexes instead of matching times. A round in which a PS of
+  the scope failed its scrape is `null` in the scope's sums rather than a dip;
+  a PS with no endpoint, or evicted, is not listed and not scraped. A PS's series are PS-wide. `GET
+  /api/metrics?scope=cluster|ps&id=N` sums the scope (a `*_max` series takes the
+  largest); no subprocess, so it costs the page nothing to poll. Per-partition
+  history is not kept: the tab's "hottest partitions" table is the overview's
+  current per-partition load (the manager's load reports), top 10 by iops. The page
+  derives ratios and latency quantiles (interpolated in the histogram bucket)
+  and draws SVG charts: lines, except latency p99, which is one column per
+  round (a round with no requests has no p99 and would break a line). A
+  restart starts an empty history — nothing is persisted, by design.
+- Tests live alongside this binary: `tests/{render_check,tabs_smoke,policy_controls}.js`
+  and `tests/api_contract.sh` (Python harness, real etcd/manager/EN/PS, allocated
+  temporary data and ports, cleanup only of children it spawned). CI runs all.
+
+### `autumn-op` (`src/bin/autumn_op/`)
+
+Admin / observability CLI — the canonical interface to the manager control plane. Directory bin (Cargo target `src/bin/autumn_op/main.rs`). The Python ops tooling shells out to this binary for all RPC traffic, so the wire schema stays in exactly one place (`crates/rpc/src/manager_rpc.rs`).
+
+```
+autumn-op [--manager 127.0.0.1:9001] [--json] [--transport tcp|ucx] [--cluster-secret-file FILE] <COMMAND>
+```
+
+Global `--cluster-secret-file` (position-independent): autumn-op connects as an operator (Admin role), which every server refuses unless it proves the cluster secret, so every command that talks to a cluster needs it, read-only ones included. `gen-signing-key` / `gen-cluster-secret` never connect. `--admin-token[-file]` were removed and exit 2 by name. `--json` on every command (the `info` schema is top-level `nodes / extents / streams / partitions` arrays). Global `--wait [--timeout SECS]` (default 600) applies to the async op triggers below.
+
+**Async ops.** The seven long-running ops — `split` / `merge` / `rebalance` / `compact` / `gc` / `forcegc` / `force-ec-convert` — are **submitted through the leader's op-ledger** and return an `op_id` immediately (non-blocking). Query with `ops status <OP_ID>` or `ops list [--active] [--kind K] [--limit N]`; each op's state (pending/running/succeeded/failed/unknown) + the **failure reason** is retained (compact/gc/forcegc outcomes ride back on the PS load heartbeat). Pass global `--wait` to block until terminal and exit on the real outcome (non-zero on failure) — scripts/`presplit` that need the blocking error use it. A leader change answers an old id `unknown` (terminal history is in `audit-log`).
+
+| Category | Commands |
+|----------|----------|
+| Read / observability | `status` (fleet vs expected members, `--json`), `list-nodes` (incl. `FULL`: disks the node reports out of space), `df`, `extent-health [--node N] [--all]`, `list-ec-markers`, `recovery-stats`, `audit-log [--op N --node N --since/--until --limit L]`, `info [--part PID] [--detail]`, `info --file-sd` (every live PS / EN `/metrics` endpoint as Prometheus `file_sd` JSON, labelled `autumn_role` and `ps_id` / `node_id`), `policy-candidates` |
+| Node lifecycle | `fence-node <id> --reason ... --by ... [--force]`, `maintenance <id> --reason ... --by ... [--expire TS]`, `unfence <id> --by ...`, `remove <id> --by ...`, `ps-remove <ps_id> --by ...` (drop a stopped, evicted PS from the expected fleet; refused while it is registered) |
+| Cluster / partition admin | `bootstrap [--replication 3+0] [--log-ec K+M] [--row-ec K+M]`, `set-stream-ec --stream <ID> --ec K+M`, `force-ec-convert --extent <EXTID>`, `split <PARTID> [--namespace <NS[/SUB]> [--at S \| --at-hex H]] [--at-raw-hex H]`, `presplit --namespace <NS[/SUB]> --parts N [--force]`, `merge <SURVIVOR> <VICTIM> [--force]`, `rebalance`, `compact <PARTID>`, `gc [--ratio R --max-size B --stream-debt B --empty-only] <PARTID>`, `forcegc <PARTID> <EXTID>...`, `format <DIR>...` |
+| Auth / namespaces | `gen-cluster-secret`, `gen-signing-key [--kid K]`, `principal-create --principal P --grant P...`, `principal-delete --principal P`, `principal-list`, `mint-token [--principal P] (--credential HEX \| --credential-file F)` (the file, a global flag before or after the subcommand, is read once in a form that names its principal — what `principal-create` prints, or `<principal>\n<hex>`; that principal fills or must match `--principal`), `namespace-create --name N [--parts N]`, `namespace-delete --name N`, `namespace-list` |
+| Auto-policy controller | `auto-policy status`, `auto-policy start <NAME>` (select and run; `activate` / `--arm` were removed with the observe mode and are refused), `auto-policy deactivate`, `auto-policy upsert <NAME> --switches split,gc,… [--interval N --cooldown N --max N --desc "…"]` (create/replace a custom policy), `auto-policy delete <NAME>`. Leader-routed |
+| Async op-ledger | `ops status <OP_ID>` (one op, `unknown` if this leader doesn't know it), `ops list [--active] [--kind split\|merge\|rebalance\|compact\|gc\|forcegc\|ec\|recovery] [--limit N]`. The seven op triggers above submit here + print an `op_id`; global `--wait` blocks to terminal. **`recovery` is auto-dispatched** (never submitted — submit refuses it): it appears on its own and, while still `running`, carries the last failure as `ERROR[code]: reason` — including the executing node's own reason, which arrives on the `df` heartbeat rather than waiting for the next re-dispatch. Leader-routed |
+
+**Extent sharing (`info`).** Both extent views name the partitions holding a
+reference (`shared by parts [13, 19]`, JSON `shared_by_parts`), not just how
+many there are — `extent_sharers()` maps extent → holders by walking the
+regions in partition-id order, so each list is ascending BY CONSTRUCTION (no
+second sort step to forget) and does not shuffle between runs. A CoW split is
+what creates sharing, and the file is unlinked only at `refs == 0`, so the
+identities are the actionable half: one holder releasing returns no space until
+the others do. For a LOG extent it also explains a number operators misread —
+each holder counts the extent's dead bytes in its OWN `gc_debt`, so summed
+per-partition debt over-states physical bytes. That over-count is deliberate
+(de-duplicating it strands the extent below `refs == 0` forever); the fix is
+what the view SAYS. `df` is unaffected — it walks extents, not partitions.
+
+COST, because the guard is easy to misread as free: the unscoped view gets the
+mapping from data it already fetched. `run_partition_info` does not have other
+partitions' stream membership, so it spends a second `MSG_STREAM_INFO` naming
+all `3N` streams — whose response clones every membered extent in the cluster,
+the full-cluster pull that view otherwise avoids. It is guarded on some extent
+in THIS partition reporting `refs > 1`, and it is one pull per drawer open
+rather than per refresh, but `refs > 1` is common on a split-grown cluster, so
+budget for it rather than assuming the guard rarely fires. Cheap would require
+a manager-side reverse lookup, i.e. a wire change. A failed lookup degrades to
+`refs` alone rather than failing the panel.
+
+**Open extent lengths (`info --full`, `info --part`).** The manager only knows a
+sealed extent's length, so both views probe the first replica with
+`MSG_PROBE_EXTENT` (`probe_extent_len`), through an ADMIN-role `ConnPool`. Not
+through the SDK: its PS connections declare `Service::PartitionServer` and an
+extent node refuses that hello, and its own EN connections are client-role,
+which may only read. A shard refuses another shard's extent, so the probe is
+routed to the owner (`shard_addr_for_extent` with the node's `shard_ports`).
+A failed or `NOT_FOUND` probe keeps the manager's value, so a probe that can
+never succeed looks exactly like an empty open extent.
+
+`format` is IDENTITY-ONLY: no location flags — it stamps the sentinels and registers an EMPTY location; the EN self-registers its real location. `register-node` is a migration stub that hints and exits 1 before connecting.
+
+**CLI conventions (canonical + accepted aliases).** Every binary's flags are declared in `crates/params` (`params!`) and read by `autumn_params::parse_or_exit`; there is no clap. `autumn-op`'s global flags stand anywhere on the line (`Positional::Anywhere`), `autumn-client`'s and `autumnfs`'s before the command (`Positional::Stop`); the command and its own flags are hand-parsed (`autumn_op/args.rs`, `autumn_client/args.rs`, `autumnfs.rs`). Canonical subcommands are kebab-case; the old snake_case / no-separator spellings stay as accepted aliases (`policy-candidates`←`policy_candidates`/`policy`, `auto-policy`←`auto_policy`, `put-stream`←`putstream`, `get-stream`←`getstream`). Canonical flag names per concept, with the older spelling kept as an alias: `--namespace` (←`--scope`, client KV scope). `split`/`presplit --namespace` take the same scope form (`kvc` or `kvc/acme`; each segment `[a-z0-9._-]+`); both take one rule flag, `--parts N` (N partitions; `RuleFlags` / `presplit_rule`), and the first segment picks how they are cut (`fs`: over its 24 stripe lanes, N divides 24; `kvc`: at `kvc/<hex>`, N ≤ 16; others: uniform hex); no `--parts` or `--parts 1` is one partition, which only an auto-policy allowed to split (`aggressive`, not the default `balanced`) splits later — fs and kvc then still record their lane / bucket grid (`FsLanes{24,1}` / `Kvc{1}` cut nothing) so that split snaps to it; `namespace-create` cuts right after registering, `presplit` needs `--parts` ≥ 2. `namespace-create` also cuts at the namespace's head `{ns}/` first and records it (`presplit_plan(.., head: true, ..)`), so every namespace starts its own partition and merge never joins two; `presplit` requires a rule and never cuts the head (namespaces created before head cuts keep their layout, by design). A failed cut leaves the namespace registered and empty: delete and create it again. No tail cut at `{ns}0`: it would leave an always-empty gap partition between neighbours. A split child shares its parent's SSTs and is refused further splits while any reaches outside its range (has_overlap); the policy compacts only partitions it wants to split or merge, so a cut refused with `PreconditionFailed` is retried once after `compact_and_wait` (op-ledger major compaction, like the policy's unblocking compaction). Any point still not cut fails the command (after recording the points and printing the outcome). Points are cut highest first for speed: a new namespace's partition holds only the previous namespace's data, below every point, so each cut after the first lands in the already-open left partition with no compaction and no wait for a right child's region sync (the first may still need one compaction, when the partition is a right child still sharing SSTs from below) (fs `--parts` + kvc 16 + mem 4 in ~1–3.5 s vs 7–30 s ascending). fs's stripe geometry is written only after every cut landed, so a namespace-create that stopped short leaves the namespace empty (delete and create it again); a failed write fails the command. Regression: `op_bootstrap_e2e` (fs, kvc and mem with `--parts 4/16/4`; red without the compact-and-retry: mem 0/4). Byte-size flags accept an optional binary suffix (`4k`/`8m`/`1gib`) across both binaries (`gc --max-size`/`--stream-debt`, `perf-check`/`ycsb --size`). Three `autumn-client` subcommands are INTERNAL zero-copy verification paths, deliberately omitted from `usage()`: `put-bulk`, `direct-get`, `bulk-get` (they mirror `put`/`get` through the ZC codepaths). NOT YET unified (follow-ups): the verb-noun vs noun-verb split (`list-nodes`/`fence-node` vs `namespace-create`), and `split`'s three targeting flags (`--at`/`--at-hex`/`--at-raw-hex`).
+
+### `autumn-s3` (`src/bin/autumn_s3/`)
+
+Unauthenticated S3 endpoint over the `fs/` tree, in its own process. It began
+read-only, so inference engines with no loader plugin seam (e.g. SGLang)
+could stream weights through their built-in `--load-format runai_streamer`; it
+now also writes, so a stock S3 client (LanceDB's `object_store`) can create and
+update data on autumn. Serves `ListObjectsV2`, `HeadBucket`, ranged/whole and
+conditional `GetObject`/`HeadObject`, `PutObject` (`If-None-Match: *`,
+`If-Match`), `CopyObject`, `DeleteObject` (`If-Match`), `DeleteObjects`, and
+Create/UploadPart/Complete/AbortMultipartUpload. Everything else answers a
+parseable S3 `NotImplemented` (UploadPartCopy, ListParts, ListMultipartUploads,
+versioning, ACLs). Object metadata (`Content-Type`, `x-amz-meta-*`) is not
+stored. Requests are served whatever their `Authorization` header says,
+including none.
+
+- **Writes are `autumn-fs`, not a second implementation** (`write.rs`). A PUT
+  or Copy is a `publish::NewFile` published with one fenced compare-and-write
+  on its dirent, so `If-None-Match: *` and `If-Match` are decided by the
+  partition server; multipart is `autumn_fs::multipart` (Complete touches no
+  part body). An object written here is a file to the mount and to
+  `autumn.Fs`, and vice versa. The ETag is inode + content generation
+  (`publish::etag`), so it changes on a same-size same-second rewrite and an
+  `If-Match` names exactly one version; a tag this gateway did not issue names
+  no version (412, or 404 when there is no object).
+- **The worker's state lock is held only for metadata steps; bytes never
+  move under it.** Begin, the inode put, publish and namespace lookups take
+  it. A request body streams into its data object through the client alone
+  (`NewFile::start_object` + `write_streamed`, then `flush_streamed` for the
+  tail before the lock is taken; UploadPart needs the lock only for its
+  begin). Deleting data is handed to the reclaimer thread (below): a DELETE,
+  an overwrite, an Abort and a Complete's leftovers write their durable intent
+  (a tombstone, the terminal upload state) under the lock and return. A
+  cancelled request's own unpublished objects are deleted through the client.
+  Measured with `--workers 1` on a local 3-EN cluster: a 1000 MiB DELETE
+  answers in 4 ms and a 200-part Abort in 3 ms, and a small HEAD on the same
+  worker stays under 3 ms meanwhile (idle 1 ms). With the deletes under the
+  lock that HEAD waited out the whole delete, 30 ms and 58 ms, and it grows
+  with the object. A body of declared length at most the inline
+  threshold is written under the lock (no I/O: it is buffered into the
+  inode).
+- **PUT throughput.** A body's 8 MiB units go out as each fills, up to 8 in
+  flight, while the rest arrives. The object's record goes out in the
+  background, at most 64 MiB ahead of what was written; the declared length
+  (`Content-Length`, or `x-amz-decoded-content-length` for aws-chunked) can
+  only cap it, never enlarge it, because nothing here verifies a request and
+  reclaiming walks every key the record allows (`ObjectStream`,
+  `crates/fs/CLAUDE.md`). A single stream is
+  therefore bounded by receiving the body plus writing its LAST unit. Local
+  3-EN A/B, alternating binaries: 16 MiB 228 -> 259 MiB/s, 128 MiB 256 -> 408.
+  Concurrent PUTs are bounded by the partitions the lanes live on, not by the
+  gateway: 8 x 16 MiB is 291 MiB/s with `fs/` in one partition and 433 with
+  `presplit --namespace fs --parts 4`, same binary — so on a slow
+  cluster check `autumn-op info` for the `fs/` lane partitions first.
+  `RUST_LOG=autumn_s3::write=debug` logs a `PUT breakdown` line per PUT
+  (begin, body, flush, lock, finish, publish in ms); the metadata steps total
+  under 1 ms of a 16 MiB PUT.
+- **Nothing unfinished outlives its request.** An unpublished file and an
+  unfinished part sit in a guard whose `Drop` undoes them, which also covers a
+  client disconnect dropping the request future mid-await. Without it the
+  pending record would stay under the worker's session, which is alive, so no
+  recovery would ever look at it.
+- **A GET pins what it streams** (`objects::open_pinned`). It takes a STABLE
+  lease before reading the metadata, so the headers and every byte are one
+  version, and no other client can write it in place or reclaim its data
+  until the body is done or the client goes away. A delete or overwrite still
+  succeeds at once — only the data waits (verified: a 40 MiB GET survives a
+  delete and a replace mid-body, 4/4; with the manager lease released right
+  after the pin it broke at 17.5 MB). The pin lives in `held_leases`
+  (`reader_refs` counts this worker's requests), which gives it three things:
+  the shared heartbeat renews it; `remove_unreachable_inode` on the SAME worker
+  defers to `unlinked_open` instead of reclaiming under it, which matters
+  because a client's own EXCLUSIVE is never stopped by its own pin; and the
+  release reclaims those deferred inodes. The last request's release waits
+  2 s (`--pin-linger-ms`) so the sequential ranged GETs of the streamer and of Lance
+  scans share one manager acquire; a mount writer is refused EBUSY during that
+  linger. A writer holding the file makes the GET a 503 `SlowDown`, which SDKs
+  retry. A pin the heartbeat finds gone ends the body with an error rather than
+  risk a changed file.
+- **Conditional reads** follow RFC 9110 order (If-Match, else
+  If-Unmodified-Since; If-None-Match, else If-Modified-Since), which is what S3
+  does; `Last-Modified` is an IMF-fixdate (it was ISO 8601, which is not an
+  HTTP date).
+- **Bodies**: `aws-chunked` (current AWS SDKs' default, to carry a trailing
+  checksum) is decoded without copying; chunk signatures and trailing
+  checksums are not verified, like SigV4. `Content-MD5` is checked only when
+  sent, so an ordinary PUT pays no single-core MD5 over its bytes.
+- **Keys** map to paths: parent directories are created on write; a key
+  ending in `/` is a directory (an empty PUT of it creates the directory);
+  empty, `.` and `..` components are `InvalidArgument`. Deleting an object
+  leaves its directories (there is no multi-key transaction between removing
+  a directory and a concurrent create under it), so an emptied directory still
+  lists as a common prefix.
+- **The reclaimer thread** (`reclaim_worker`) has its own `FsState` and its
+  own client identity, and does two things. It takes what the workers hand it
+  over a channel (`FsState::reclaim_later`: files left unreachable, terminal
+  uploads) and reclaims it at once. Every `--sweep-interval-secs` (default 30;
+  0 turns off only the periodic sweeps) it takes over, fences and finishes or
+  undoes dead publishing sessions, and reclaims terminal multipart uploads,
+  unlinked files and segment garbage. A separate identity is the point: a
+  worker's own GET pin would not stop its own EXCLUSIVE, but it does stop the
+  reclaimer's. For the same reason a worker hands a file over only after
+  releasing its own REPLACE on it, and a file deleted while this worker streams
+  it is handed over when the pin is released (~2 s after the GET, measured).
+  A hand-off lost to a crash is found again by the sweeps, because the worker
+  made it durable first. All idempotent, safe in several gateways at once.
+  Every worker also runs the lease heartbeat. Without it the publishing
+  session lapses after 30 s, and a sweeper would then recover it and fence out
+  its writes. Verified by `kill -9` of the gateway mid-PUT and mid-UploadPart
+  with 29 data keys already written: after a restart the sweeper reclaimed
+  every one of them and the pending records, and the upload stayed usable.
+- **A Complete retried after it succeeded** (the SDK lost the reply) gets the
+  same 200 and ETag, as from S3, for an hour after the upload finished. The
+  answer holds even if the object has since been replaced or deleted
+  (`multipart::complete` keeps it in `[0x04]mpc/`, see `crates/fs/CLAUDE.md`).
+  The key is checked inside `complete`, so another key with the same upload id
+  is `NoSuchUpload`.
+- **Any gateway thread stopping ends the process** (`spawn_role`). A worker
+  returns only on error, and the reclaimer returns only when every worker is
+  gone. A dead reclaimer in a live process would go on deleting names while
+  nothing reclaimed their bytes.
+- **Known limits.** DeleteObjects deletes its keys one at a time (each is
+  metadata only). What a hand-off cannot reclaim yet waits for a periodic
+  sweep: a file another worker, gateway or mount still holds; an aborted or
+  completed upload with a part still in flight; a file parked for a pin that
+  the heartbeat found lost. With `--sweep-interval-secs 0` this gateway never
+  reclaims those; only another gateway that runs sweeps does. A publish whose outcome is unknown is settled only when the worker's
+  session is recovered, i.e. after a gateway restart; until then a retry of that
+  Complete on the same worker is `ConditionalRequestConflict`.
+- SDK check: `scripts/s3_write_check.py` (boto3; every API above, the error
+  codes the SDK parses, a racing-creators round that must leave exactly one
+  winner — ablated by ignoring `If-None-Match`, which made all eight win). See
+  `docs/ops.md`.
+
+- **Listing (`listing.rs`) walks in S3 key order and resumes at the token.**
+  Keys are raw-byte ordered and a directory `d` owns every `d/...` key, while
+  dirents are stored in NAME order; they disagree about names that extend `d`
+  with a byte below `/` (`d.txt` sorts before `d/`), so the walk holds a
+  directory back until the scan passes `d/`. A page starts from its
+  continuation token and skips subtrees that sort before it. Inside a
+  directory the scan starts at the token's own name, and the only earlier
+  names that can still sort after the token — directories named by a proper
+  prefix of it followed by a byte below `/` (`part` for `part-00500`) — are
+  fetched by name in one batched lookup. Starting the scan at that stem
+  instead made page k of a `part-NNNNN` directory scan about k pages. So a page
+  costs about a page of entries plus one scan and one lookup per token path
+  level. An earlier version walked the whole subtree on every page and then
+  sorted, and capped the walk at 100k entries, first silently truncating and
+  then failing with a retryable 500; neither remains. Objects and common
+  prefixes count together toward `max-keys`; the token is the last key on the
+  page. Scans resume from the last name SCANNED, so entries deleted between a
+  scan and its value fetch cannot end a directory early. Names that are not
+  UTF-8 are left out: they cannot be S3 keys, and a lossy token would stop
+  comparing with its own name and repeat a page forever. Stats for a page are
+  one batched get of the listed inodes.
+
+```
+autumn-s3 --manager <host:port> [--listen 0.0.0.0] [--port 9000] [--workers N]
+          [--host <daemon-identity>] [--credential-file <path>]
+          [--direct-read true|false] [--sweep-interval-secs 30]
+```
+
+- Reads go through `autumn-fs` — the same crate the fuse mount and the PyO3
+  `autumn.Fs` binding use — so lane striping, EN-direct reads and authz apply
+  unchanged. An adapter over the partition layer, not a second data plane.
+- Tunables come from `crates/params/src/s3.rs` plus the shared `fs` and `client`
+  sets (`autumn-s3 --help`): `--workers`, `--sweep-interval-secs`, `--pin-linger-ms`.
+- `--workers` (default 0 = `min(cores, 8)`) accept threads, each with its own compio
+  runtime, its own `FsState` and an SO_REUSEPORT listener on the same port. One
+  thread caps an AWS-CRT client at ~40% of the read path; the knee is at 4.
+- `--host` names the daemon identity each worker registers under (the entrypoint
+  passes `s3-$HOSTNAME`); workers append their index and the sweeper `-sweep`.
+- Being a binary of this package rather than an example also means a plain
+  `cargo build --release` produces it — examples were never in
+  `default-members`, so it used to be skipped, which is the shape of the
+  stale-release-binary trap the chaos and perf runbooks warn about.
+- **Its own process, on purpose.** Hosting it inside `autumn-ps` behind a flag
+  was implemented, verified end to end, and reverted: the release profile sets
+  `panic = "abort"` so a gateway panic would abort the partition server, the
+  transport is a process-wide `OnceLock` the PS initialises (a `--transport ucx`
+  server would hand the gateway UCX connections, which nothing has exercised),
+  and `--cpuset` cannot confine threads that pin nothing.
+
+### `autumnfs` (`src/bin/autumnfs.rs`)
+
+Offline POSIX-ish CLI over the fuse on-disk schema, **without** mounting — `ls / mkdir / cp` from any shell against a running cluster, for inspection, scripted setup, CI seeding.
+
+```
+autumnfs [--manager 127.0.0.1:9001] [--transport tcp|ucx] [--credential-file FILE] <SUBCMD>
+```
+
+| Subcommand | Description |
+|------------|-------------|
+| `ls <PATH> [--long]` | List directory entries (default `/`) |
+| `stat <PATH>` | Show inode metadata (size, ino, type, parent) |
+| `mkdir <PATH>` | Create a directory (parents must exist) |
+| `touch <PATH>` | Create empty file (no-op if it exists) |
+| `cat <PATH>` | Read file to stdout |
+| `put <LOCAL> <REMOTE>` | Upload local file |
+| `get <REMOTE> <LOCAL>` | Download to local file (`-` = stdout) |
+| `rm <PATH>` | Remove a file or empty directory |
+
+- **Built on an `FsState`** since v4: `ensure_root` is the core's, so the CLI
+  verifies the schema stamp (its own copy never did, and a v3 CLI misreads v4
+  inodes), and `rm` is the core's `unlink`/`rmdir` (tombstoned removal, segment
+  reclaim, deferral while another client holds the file) instead of a third copy
+  that deleted extents before the name. `cat`/`get` of a segmented file plan
+  from its map and fail on a missing data extent.
+- **Namespace-first binding**: connects via `ClusterClient::connect(mgr, "fs")`, so the binding prepends `fs/` to every relative fuse key (and strips it off range results) — the same single global keyspace a fuse mount uses, so writes here are visible to a mount. No scope flag; this CLI sees the whole `fs/` namespace.
+- **Authz**: `--credential-file` (`<principal>\n<hex>`, from `autumn-op principal-create`) is REQUIRED when the cluster protects `fs/` (connects via `connect_with_credential`, fails fast if the credential doesn't cover `fs/`); omit on an authz-off cluster.
+- **Inodes** come from the MANAGER's global counter (`alloc_inodes`) — the same crash-safe source the fuse mount and PyO3 `autumn.Fs` use, so no colliding inodes.
+- **ls / cat**: PS `handle_range` returns key-only entries, so both do a per-key `cluster.get` after the range scan (fine for one-shot CLI use). **Sizes**: files ≤4 KiB inline in the `InodeMeta`; larger go through the extent path (8 MiB chunks, `extent_key([0x03][ino BE][off BE])`).
+
+### Retired one-off format converters
+
+The fs schema v3 → v4 and SST MetaBlock v1 → v2 converters have been removed
+from this tree and the container image. Historical releases retain their
+conversion implementations; current servers retain strict format checks.
+
+### `migratev0_v1` — run and deleted
+
+The one-shot converter that wrapped the manager's persisted etcd records in
+their `persist` envelope. It was run once and then deleted with
+the `autumn-etcd` dependency it had added here, which is the whole point of a
+converter: it leaves no residue. It is no longer available.
+
+Two things from it are worth carrying forward, because the next converter will
+need them and will NOT get the first one for free:
+
+- **Naming is `migratev<from>_v<to>` over the PERSIST format generation**, not
+  the wire version. A persist change need not move `WIRE_VERSION` and usually
+  should not.
+- **That one decoded nothing.** Splitting a record out of the wire schema is a
+  rename, and rkyv's layout does not depend on the type name (measured:
+  `MgrExtentInfo` and an identically shaped `ExtentRecord` both encode to the
+  same 152 bytes), so it was a pure prefix insertion. A later conversion that
+  changes a record's FIELDS has to vendor the old definition itself, because by
+  then the tree only has the new one.
+
+The rule it served stands: a persisted-format change is delivered by a
+converter, never by compatibility code in the servers (`crates/manager/CLAUDE.md`,
+"Upgrade safety").
+
+### `migratev1_v2` (`src/bin/migratev1_v2.rs`)
+
+One-shot converter for the manager's etcd records, run against a STOPPED cluster
+(it refuses while any manager is up: the leader key or any `managerAlive/<id>`
+present, since a surviving follower could win the election mid-run). It moves
+each `tenantAccount/<name>` to `principal/<name>` byte for byte (the record was
+only renamed; envelope type 2 / version 1 checked, body not decoded), turns an
+`autoPolicy/config` in mode 1 (the removed observe mode) to mode 0 (off; a new
+manager refuses to lead on mode 1), then re-encodes every `namespace/<name>`
+from format 1 to 2 (drops `owner_tenant`, printing any owner it drops). Namespaces go last because a new manager refuses
+to lead while any namespace row is v1; every step skips finished work, so an
+interrupted run is simply re-run. `--dry-run` reports without writing. Delete
+this bin and the `autumn-etcd` dependency once the deployments that need it
+have run it.
+
+### `autumn-stream-cli` (`src/bin/stream_cli.rs`)
+
+Low-level stream-layer CLI for debugging; bypasses the partition layer entirely.
+
+```
+autumn-stream-cli --manager 127.0.0.1:9001 <COMMAND>
+```
+
+| Command | Description |
+|---------|-------------|
+| `register-node --addr <ADDR> --disk <UUID>` | Register an extent node |
+| `create-stream [--data-shard N] [--parity-shard M]` | Create a new stream |
+| `stream-info [--stream-id N]` | Show stream/extent metadata (omit for all) |
+| `append --stream-id <ID> --data <STR>` | Append string data to a stream |
+| `read --stream-id <ID> [--length N]` | Read from a stream |
+| `alloc-extent --node <ADDR> --extent-id N` | Pre-create an extent on a node |
+| `commit-length --node <ADDR> --extent-id N [--revision N]` | Query current write position |
+
+### `repair-metastream` (`src/bin/repair_metastream.rs`)
+
+One-off repair CLI for partition checkpoint corruption. Offline / preserved-data repair only; normal PS recovery does not rely on it.
+
+```
+repair-metastream --manager 127.0.0.1:9001 --meta-stream <ID> \
+  --vp-extent <ID> --vp-offset <OFF> --sst <extent:offset:len> [--sst ...]
+```
+
+Connects as a normal `StreamClient` owner, reads and prints the current last `TableLocations` record from the target `meta_stream`, prints the replacement, then appends the new checkpoint. `--dry-run` prints current + target without writing.
+
+## Startup Ordering
+
+For a fresh cluster:
+1. Start `autumn-manager-server` first — it CAS-imprints the cluster_id on first leader-promotion.
+2. For each EN, run `autumn-op format <DIR>...` BEFORE launching the EN. `format` is IDENTITY-ONLY: it fetches the cluster_id, allocates disk_uuid(s), mints (or reuses) a stable `node_uuid`, registers an EMPTY location, and stamps the sentinel files.
+3. Launch `autumn-extent-node` for each formatted EN with its own REQUIRED `--advertise`. It refuses to start without the sentinels, cross-checks its cluster_id against the manager's, then self-registers its live address + shard ports.
+4. Run `autumn-op bootstrap`: one partition over the whole keyspace, no namespace registered.
+5. Start `autumn-ps` with a unique `--psid`.
+6. Create the namespaces the cluster serves, PS up: `namespace-create --name fs --parts 6`, `namespace-create --name kvc --parts 16` (`docs/ops.md`, "Enabling fs / kvc"); each is cut at its head `{ns}/`. Until then every client write is refused (Layer-A admits nothing with an empty registry); admin and peer connections are not held to namespaces.
+
+Newly-registered nodes start `Suspend`; the manager's 2 s `node_health_loop` flips a node to `Online` on its first successful `df`. `select_nodes` gates allocation on `Online` but falls back to the full node set when none are Online (cold-leader / fresh-bootstrap path).
+
+## Common CLI Patterns
+
+```bash
+# Start a minimal 1-node cluster (no replication, testing only)
+autumn-op gen-cluster-secret > /tmp/cluster.secret
+S=(--cluster-secret-file /tmp/cluster.secret)
+autumn-manager-server "${S[@]}" --port 9001 &
+# format is identity-only; the EN self-registers its location
+autumn-op "${S[@]}" --manager 127.0.0.1:9001 format /tmp/extent0
+autumn-extent-node "${S[@]}" --data /tmp/extent0 --port 9101 --manager 127.0.0.1:9001 \
+    --advertise 127.0.0.1:9101 &
+autumn-op "${S[@]}" --manager 127.0.0.1:9001 bootstrap --replication 1+0
+autumn-ps "${S[@]}" --psid 1 --port 9201 --manager 127.0.0.1:9001 &
+autumn-op "${S[@]}" --manager 127.0.0.1:9001 namespace-create --name demo
+
+# Write and read (data plane = autumn-client)
+echo "hello world" > /tmp/val.txt
+autumn-client --manager 127.0.0.1:9001 --namespace demo put mykey /tmp/val.txt
+autumn-client --manager 127.0.0.1:9001 --namespace demo get mykey
+
+# Inspect cluster (op plane = autumn-op)
+autumn-op "${S[@]}" --manager 127.0.0.1:9001 info
+```
+
+## Runtime upgrade and experiments
+
+Build with Rust >=1.95 and compio 0.19.2; the Docker builder matches this minimum.
+autumn-ps --tcp-zerocopy-min-bytes N enables replica append TCP sends at that
+complete-frame size. Every star-replicated append is prepared, so N is the only
+size cut. Default 0 leaves ordinary sends active. UCX is unchanged.
+Measure on the deployment kernel/link before choosing a threshold. The optional
+AUTUMN_PERF_PIDS JSON file maps process names to PIDs for core_path: CPU snapshots
+are taken after warmup and after draining timed requests, around the same byte
+window. These are process counters, not independent kernel-worker accounting.
+
+
+## Controlled runtime performance validation
+
+The controlled_path bench runs a fixed operation count on 64 keys per partition,
+with 1 or 4 runtime threads pinned to consecutive fixed CPUs (the base core is a
+constant in the bench). Prefixes match the uniform
+hex presplit grid under bench/controlled. Load/warmup verifies bytes before timing.
+READY/go and DONE/go barriers let an external controller start/stop counters while
+workers retain their runtime and buffers. PR_GET_DUMPABLE markers carry only trace
+metadata and make no process-state changes. Panics fail the trial; the external
+controller enforces a deadline and retains failure diagnostics.
+
+The controlled-validation harness (`perf/controlled_validation/run.py`; since
+removed from the tree, `git log -- perf/` finds it) recreated RF3 on three
+NVMe directories for each trial. What follows describes how it measured. Counter
+snapshots for benchmark/server roles bracket the request window;
+the slower all-process snapshot is background audit only. Host perf uses disabled
+counters with acknowledged enable/disable. BPF separately counts kernel threads,
+softirqs, per-ring SQE/CQE, allocations and selected TCP copy call sites. These
+metrics overlap: never add softirq time to process time or double-count io-wq
+threads. Diagnose throughput with untraced runs; trace repetitions quantify probe
+overhead. matrix.py rotates version order across repetitions and stops on failure.

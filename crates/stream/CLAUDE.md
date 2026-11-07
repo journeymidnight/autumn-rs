@@ -1,0 +1,2223 @@
+# autumn-stream Crate Guide
+
+## Purpose
+
+The stream layer: append-only replicated extents on extent-nodes, the storage
+substrate under the partition layer. Four components (all exported from
+`src/lib.rs`):
+
+1. **`ExtentNode`** (`extent_node.rs`) — server-side storage daemon holding
+   extents on local disk; implements ExtentService over autumn-rpc (custom
+   binary protocol on compio).
+2. **`StreamClient`** (`client.rs`) — client library used by `PartitionServer`
+   to read/write streams.
+3. **`erasure`** (`erasure.rs`) — Reed-Solomon EC codec (`ec_encode`,
+   `ec_decode`, `ec_reconstruct_shard`, `ec_encode_stripe`) over the
+   `reed-solomon-erasure` crate.
+4. **`ConnPool`** (`conn_pool.rs`) — per-`SocketAddr` connection pool.
+
+`extent_rpc` (the wire codec for all ExtentService RPCs) lives in
+`autumn-rpc` (`crates/rpc/src/extent_rpc.rs`) so all three wire schemas share
+one home; re-exported here (`pub use autumn_rpc::extent_rpc`) so
+`crate::extent_rpc::*` / `autumn_stream::extent_rpc::*` paths resolve
+unchanged. There is no extent-node WAL — SSDs make sequential WAL fsync no
+faster than extent-file fsync; the data files are the journal.
+
+---
+
+## ExtentNode — Server Side
+
+### Data Model (multi-disk)
+
+An `ExtentNode` manages **multiple disk directories**, each a `DiskFS`
+(disk_id, base_dir, online flag). File I/O uses `compio::fs::File` directly.
+
+Extents use the hashed layout: `{data_dir}/{hash:02x}/extent-{id}.dat` +
+`.meta`, where `hash = crc32c(extent_id_le_bytes) & 0xFF`. Hash subdirs are
+created on-demand (matches the 256 subdirs `autumn-op format` creates).
+
+Each extent file pair:
+- `extent-{id}.dat` — raw data (append-only during active use)
+- `extent-{id}.meta` — 52-byte binary sidecar. V2 is what every write emits;
+  V0 (40 B, no CRC) and V1 (44 B) are still parsed for records written before
+  it, and derive `sealed` / `avali` from `sealed_length > 0`.
+
+| Bytes | Field |
+|-------|-------|
+| 0–7 | Magic: `EXTMETA\0` (V0), `EXTMETA\x01` (V1), `EXTMETA\x02` (V2) |
+| 8–15 | `extent_id` (le u64) |
+| 16–23 | `sealed_length` (le u64) |
+| 24–31 | `eversion` (le u64) |
+| 32–39 | `owner_epoch` (le i64) |
+| 40 | `sealed` flag (V2) |
+| 41 | `payload_location` — `PayloadLocation` as a byte (V2) |
+| 42–43 | reserved, zero |
+| 44–47 | `avali` (le u32) (V2) |
+| 48–51 | CRC32C of bytes 0–47 (V2; V1 puts a CRC of 0–39 at 40–43) |
+
+**`EXTMETA\x02` defines which bytes may appear at offset 41** — the byte's
+meaning is the sidecar's to version, exactly as `sealed` and `avali` are, and it
+is NOT inherited from `extent_rpc::PayloadLocation`. `parse_meta` refuses the
+whole record when the byte is outside that set, so the extent goes through
+META-FAILCLOSED like any other unreadable `.meta`: reads and appends refused,
+manager recovery rebuilds it. That is the rollback case — a newer binary
+committed a layout and was replaced by this one — and the alternative is reading
+it as `InDat`, which is a positive claim that `.dat` holds this node's payload on
+precisely the extents whose payload has moved somewhere this build cannot name.
+`LocalExtentMeta.payload_location` is therefore always a byte this build
+resolves, which is what makes the raw-byte comparisons downstream (the EC
+staging re-derive on load, the flip's already-committed check) safe.
+
+`payload_location` is the durable answer to "did an EC conversion COMMIT here",
+and it is the reason a restart cannot reopen the overwrite window: the manager's
+layout flip is the only commit point and there is no rename, so the staged shard
+file BECOMES the live one, after which no attempt may write it. That refusal
+runs off an in-memory seal (`EC_STAGING_SEALED`), which `discover_shard_files`
+re-derives from this byte on every boot. It rides in what was reserved padding —
+same size, same magic, same CRC coverage — so a record written before the field
+has a zero there, which IS `InDat`, the documented default: same layout, no
+migration. Written only on the InDat→InShardFile transition, never on a
+quarantined extent (`save_meta` would silently clear the quarantine).
+
+`ExtentEntry` stores `disk_id` for path resolution. `choose_disk()` ranks the
+**allocatable** disks and returns the best: emptiest band first (5 points of the
+disk), then fewest OPEN extents, then fewest held, then least recently picked.
+It used to return the first allocatable disk in `HashMap` order, which stuck to
+one disk until it filled — per shard, since the map is randomly seeded, so a
+multi-shard node was already spread by accident and a single-shard one was not.
+Free space cannot decide alone: at the default `--prealloc-bytes` of 0,
+creating an extent moves it by nothing, so the open count is the only signal a
+new extent changes. The least-recently-picked stamp is set synchronously inside
+the choice, before the first await, because several awaits separate it from the
+`extents` insert and overlapping creations would otherwise all see identical
+counts and pick the same disk. `df()` returns real `statvfs` stats per disk.
+
+**Usage** (production formats disks + registers node identity, then the node
+self-registers its live location via `--advertise`):
+```bash
+autumn-op --manager ... format /disk1 /disk2
+autumn-extent-node --data /disk1,/disk2 --manager ... --advertise host:9101 --port 9101
+```
+Single-disk (tests): `autumn-extent-node --data /tmp/data --disk-id 1 --manager ...`
+
+In-memory the node holds `Rc<DashMap<u64, Rc<ExtentEntry>>>` (single-threaded
+compio, no `Arc`/`Mutex`):
+
+```rust
+struct ExtentEntry {
+    file: RefCell<Option<Rc<CompioFile>>>, // None = fd evicted (SEALED only)
+    extent_id: u64,                // for re-open on cache miss
+    len: AtomicU64,                // current byte length
+    eversion: AtomicU64,           // bumped on seal or eversion change; defaults to 1 on alloc
+    sealed_length: AtomicU64,      // 0 = active; >0 = sealed at this length
+    avali: AtomicU32,              // availability flag (non-zero = sealed)
+    owner_epoch: AtomicI64,        // per-extent write fence, most recent owner revision seen
+    disk_id: u64,                  // immutable after creation
+    // + durable_owner_revision, corrupt_meta (AtomicBool), durability
+    //   watermarks (last_synced / pending_fsync), owner mailbox (per-extent
+    //   single-writer append task)
+}
+```
+
+Appends are serialized by the single-threaded compio runtime (sequential
+processing in `handle_connection`); there is no `write_lock`.
+
+**No `unsafe` in the file path.** All borrows go through `entry.file_rc()` /
+`resident_file()` / `extent_file()`, which clone the inner `Rc<CompioFile>`
+under a brief `RefCell::borrow()`; the clone is held by the I/O future across
+`.await`, and the borrow is released before the first `.await`. The file-replace
+path (the peer-copy's atomic rename over `.dat`) uses `entry.replace_file(new)` (safe
+`RefCell::borrow_mut()` + `Rc::replace`); the old `Rc` drops only when the last
+concurrent reader releases its clone, so the fd can't dangle. `ec_conversion_
+locks` remains only as higher-level serialisation against concurrent EC
+dispatches on the staging path (not for memory safety).
+
+### Shard files (`extent-{id}.shard{i}`) — the EN as a shard holder
+
+An EC shard can live in its own ADDITIVE file beside `.dat`, so a conversion
+never modifies or replaces the replica it is derived from. The index is in the
+NAME, so a shard staged for one index can never be *served* as another.
+
+- **On-disk shapes.** `.dat` only (a full replica); `.dat` + `.shard{i}`
+  (converted, cleanup pending); `.shard{i}` only (cleanup done); shard-in-`.dat`
+  (the pre-CoW scheme, which renamed over `.dat` — `payload_location = InDat`).
+- **`ExtentEntry` tracks what exists**: `has_dat` plus `shard_files: index ->
+  length`. Two indices at once is a LEGAL transient (two attempts, or a parity
+  slot plus a data slot after a reassignment) — the extent's PUBLISHED layout,
+  not this map, decides which is authoritative. Lengths live in the map so
+  "which files exist" and "what they cost" cannot drift.
+- **Startup discovery** (`discover_shard_files`, second pass of `load_extents`)
+  attaches shard files to their extent, and builds an entry from `.meta` alone
+  for a shard-only holder. **A file nothing scans survives every cleanup and
+  then vanishes from the system at the next restart** — and a shard-only extent
+  that looks absent to the manager is how a rebuilt copy becomes a blocking
+  orphan. A shard-only entry carries NO fd and must never create `.dat`
+  (`extent_file` opens without `create` for exactly this reason); its `len` is
+  0 (`len` is the `.dat` length — the shard's bytes live in `shard_files` so
+  `df` doesn't double-count), and neither is the extent's `sealed_length`. No
+  parseable `.meta` beside a real payload file is META-FAILCLOSED → quarantine.
+- **Dropping a shard file is ONE step, `ExtentEntry::discard_shard_file`.**
+  Unlink first, then forget — and only if the file is really gone (`NotFound`
+  counts as gone; any other unlink error keeps the record and is returned, so
+  the bytes and the accounting stay in agreement). It exists because the pair
+  used to be spelled out at each call site and the failed-rebuild path spelled
+  out only the first half: the record outlived the bytes, `holds_payload` stayed
+  true, and a read routed there cleared the ownership gate before failing inside
+  `payload_file` as `Internal` instead of refusing as `PayloadNotHere`. The
+  reverse break is just as bad — bytes on disk that nothing counts. Note the
+  forget is NOT atomic with the unlink (the unlink is awaited first), so a
+  writer recreating the same index during the await loses its record until the
+  next `note_shard_file` or restart discovery.
+- **A rebuilt shard is recorded only after it is durable, and a rebuild that
+  does not get there is discarded** (`land_rebuilt_shard`). `note_shard_file`
+  is the node claiming the shard, so it runs after the content `sync_data`
+  AND the directory fsync, never before. On any failure — the rebuild itself,
+  either fsync — the file is unlinked and its record dropped through
+  `discard_shard_file`. Stopping at "don't record it" is not enough: restart
+  discovery registers whatever is on disk at its length, with no memory that
+  its fsync failed, so an unsynced shard left behind is claimed at the next
+  boot. Test:
+  `a_shard_whose_fsync_failed_is_discarded_not_recorded` (a symlink to
+  `/dev/null` makes the real `fdatasync` fail with EINVAL; ablation-verified
+  red).
+  ⚠️ What cleans up a shard file the discard could NOT unlink is the next
+  attempt's `truncate(true)` open, or the manager reassigning the slot — **not**
+  the reconcile sweep, whose stale-shard loop filters out `want.shard_index`,
+  and for a rebuild that index is precisely the wanted one.
+- **`remove_extent_files` unlinks every `.shard{i}` found on disk**, and
+  **`df`'s `extent_bytes` adds `shard_bytes()` to `len`** — a node mid-conversion
+  legitimately holds both, and counting one under-reports the footprint that
+  cluster-df and the `--min-alloc-free-bytes` gate read.
+- Reads resolve their file through `payload_file(entry, PayloadRef)`: `.dat` via
+  the fd cache, a shard opened per use (read-only after staging, and keeping it
+  out of `FdLru` preserves that cache's one-fd-per-extent accounting).
+
+### At-rest integrity: scrub (`extent_node/scrub.rs`, `extent_cksum.rs`, `extent_scrub.rs`)
+
+**A `.dat` is described as it is written.** `decode_append` checks the
+payload crc in one pass that cuts the payload at the 1 MiB block boundaries of
+the file at `commit` (`extent_cksum::pieces_of_parts`, verified with
+`crc_of_pieces`); the pieces ride the append to the owner, and once the burst's
+fsync succeeds `append_burst_frames` extends the open block's crc
+(`ExtentEntry.write_ck`, `extent_cksum::WriteCk` — `crc32c_combine` here is
+zlib's GF(2) form, ~100 ns at 4 KiB where the crate's matrix form takes
+~10 us, with a table for every bit of a `u64` length: zlib's 32 entries read
+`k & 31` are right for CRC-32 only, and wrong for crc32c from 512 MiB on —
+`combine_holds_past_512_mib`) and queues each completed block. After the run's replies, the owner
+writes them to `extent-{id}.ck.open` (`write_open_ck`: header plus one
+self-checked 8-byte slot per block at a fixed position; no fsync — a lost slot
+leaves its block to the scrub). A failed burst records nothing; a restart or a
+truncate starts the record again at the next block boundary;
+`truncate_to_commit_ref` first cuts the slots from the block holding the cut,
+durably (or drops the file; refuses if it cannot), since that block will be
+written again and not recorded. `forget_description`, `remove_extent_files` and
+the post-flip `.dat` reclaim take `.ck.open` with them. The scrub checks a
+`.dat`'s whole blocks against these crcs (rot before the first scrub is found),
+writes `.ck` and drops `.ck.open`. Foreground reads and seals never touch a
+checksum; the sidecars are otherwise written by the scrub, which runs only
+when the manager asks (`MSG_SCRUB_EXTENTS`, from `autumn-op scrub` or the
+weekly policy), by replication recovery for the copy it builds, and by EC
+staging and rebuild (below). Tests: `tests/write_time_checksums.rs` (recorded
+before any scrub; rot found by the first scrub — red when the scrub ignores
+them; a truncated block keeps no stale crc — red without the cut; a burst
+whose fsync failed records nothing — red when recording precedes the fsync).
+Measured with `benches/extent_bench.rs` (single EN thread, 4 KiB appends,
+fsync on ext4): depth 32/64 level with the build before. Design:
+`docs/integrity_design.md`.
+
+**A background read's block crcs come from the `.ck` where it can.** A
+`with_crcs` read of a sealed file whose `.ck` describes its whole current
+length (`recorded_checksums`, read per batch) answers each piece that is a
+whole recorded block with that block's recorded crc, and computes the others
+(`served_block_crcs`, cut exactly as `read_block_crcs` cuts). So a block that
+rotted on disk since the scrub fails the reader's check — recovery, peer copy
+and EC rebuild then drop that source like any failed read — where a crc
+computed from the rotted bytes would pass; recorded blocks are also not hashed
+again. Open extents and unscrubbed files get computed crcs (the in-transit
+check only). Test: `served_block_crc_tests` (red when the `.ck` is ignored).
+
+**A recovered replica is described as it is built.** Replication recovery
+copies in 256 MiB chunks from offset 0, so the block crcs each chunk was
+checked against, concatenated, are the copy's block crcs
+(`stream_one_source` → `stream_extent_from_sources`). After the copy and its
+`.meta` are durable, `run_recovery_task` persists them as the new replica's
+`.ck` — only for a whole copy at the seal (a reconciled-down copy describes
+other content). The copy needs no scrub's first record, and a source whose
+`.ck` vouched for its blocks passes that description on. A failed persist only
+leaves the copy undescribed (a scrub records it later). The peer copy
+(`peer_copy_full_extent_to_dat`: re_avali, the EC coordinator's refill) does
+the same after its rename, from the same chunked reads. Tests:
+`system_extent_recovery.rs::lost_recovery_completion_redispatch_adopts_local_copy`
+and `re_avali_no_destroy.rs::re_avali_still_repairs_when_a_peer_has_the_data`
+check the copy's `.ck` (each red without its persist).
+
+**The EC coordinator checks the `.dat` it encodes.** After the layout flip
+every replica is dropped, so the encoded bytes become the only version. If the
+`.dat` has a `.ck` for exactly `sealed_length`, each stripe's read pieces are
+checksummed in the same `spawn_blocking` as the RS encode and fed to
+`extent_cksum::PieceCheck`, which combines them per block (`crc32c_combine`) in
+whatever order they arrive — the encoder reads shard by shard, so a block can
+span two shards. A mismatch logs `EC CONVERT FOUND CONTENT ROT` and fails the
+attempt (`EcConvertError::SourceRotted`) before any completion report; the
+re-dispatch of that attempt is answered `CODE_CONTENT_CORRUPT` without
+re-encoding, with a ROT `ScrubDone` (op 0) queued beside it — a backstop only
+when it reaches a `df` after the manager released the marker (before that,
+isolation answers Stale and an op-less finding is dropped, logged). An encode
+that did not cover every block (a short read) fails without a finding.
+
+**Sidecars** (`extent_cksum.rs`): `extent-{id}.ck` for a sealed `.dat`,
+`extent-{id}.shard{i}.ck` for a shard file — magic + extent_id + length +
+block_bytes + block_count + one CRC32C per 1 MiB block + a trailer CRC.
+Undecodable, another extent's, or describing another length all mean "no
+record" (the next scrub records one), never "corrupt" — a damaged 4 KiB
+sidecar must not condemn a healthy multi-GiB copy. `remove_extent_files`
+unlinks `.ck` and every `.shard{i}.ck` by its own name (`parse_shard_ck_file`,
+so one whose shard is already gone still goes); `discard_shard_file` unlinks
+the shard's sidecar first.
+
+**A request names the file and its length** (`ScrubTask`: extent, `.dat` or
+shard index, length, the manager's eversion, op id) — the manager knows the
+extent is sealed and which file is the payload here, so the node never asks.
+`handle_scrub_extents` forwards tasks to the shard that owns each extent,
+queues the rest and answers at once (a file already queued is not queued twice;
+an op asking for it again joins the waiting entry (`ScrubQueue.waiting`: file →
+its own op and the ops that joined it), and
+gets the same outcome — dropping it would leave that op waiting forever); ONE worker per shard drains the queue and exits when it is empty — not a
+standing loop. It is paced by `ScrubPacer` (`--scrub-bytes-per-sec`, default
+8 MiB/s per shard, `0` = unpaced; an idle stretch banks no burst).
+
+**Per file** (`scrub_task`): skipped while a recovery or EC conversion is in
+flight on the extent, if this node does not hold the file, if `.meta` is
+quarantined, or if it holds fewer bytes than named (`.dat`: min of `len` and
+the durable `last_synced` — a replica that missed the seal is caught up, not
+recorded; a shard: exactly the named length). Then checksums recorded for
+exactly this length are compared block by block — a differing block, or a
+described block that can no longer be read in full (a lost tail mismatches
+nothing), is ROT — else the content is hashed and recorded (trust-on-first-use).
+Every outcome — ROT among them, which the manager isolates on — goes on
+`DfResp.scrub_done` echoing the task's op id and eversion, drained by `df`
+through the node-wide `DoneQueues` (the manager dials only shard 0). `DfResp.scrub_queued` lists the
+ops with tasks still queued or running on ANY shard (sampled BEFORE the
+outcomes are drained: a worker pushes its outcome and only then drops its
+count, so a task is always in one or the other): it is how the
+manager tells a file waiting behind others from one a restart lost.
+
+**An EC rebuild never reads a dark slot** (`ec_rebuild_source_slots`): a dark
+EC slot was isolated as rotted or is awaiting its own rebuild, nothing on the
+read path checks content, and RS turns one wrong input into a wrong output for
+every byte it spans.
+
+**Content replaced under a scrub drops its result.** `ExtentEntry.content_gen`
+is bumped by every out-of-band replacement of a payload file — `note_durable_install`
+(recovery writeback, peer copy), a shard discard — and `forget_description`
+unlinks the file's sidecar and bumps it BEFORE a repair replaces content
+(recovery `.dat` writeback, peer copy's rename, shard rebuild's truncate): a
+sidecar left behind would condemn the repaired copy whenever the old content
+was the bad one. The scrub snapshots the generation and re-checks it (and the
+in-flight maps, and that the extent still exists) after every block read and
+after persisting, and on a change reports SKIPPED and removes what it wrote.
+
+### Bounded fd cache for SEALED extents (`FdLru`)
+
+Open/active extents keep their fd PINNED (`file = Some`). SEALED idle extents
+(the long tail) have their fds cached in a per-shard bounded LRU and evicted
+under cap. `load_extents` drops a sealed extent's fd after reading `len`, so
+startup fd peak is not O(all extents). `RLIMIT_NOFILE` is raised to 65535 at
+startup (same as PS).
+
+Two accessors:
+- **`resident_file() -> Option<Rc>`** (sync): the write/durability path
+  (`append_burst_frames` run by the per-extent owner, `truncate_to_commit`)
+  resolves its fd ONCE in the prologue (while the seal re-checks just proved the
+  extent open), HOLDS the `Rc` for the whole op, and treats `None` as
+  "concurrently sealed" → clean `CODE_PRECONDITION`. `append_burst_frames`
+  MOVES the `Rc` into the boxed I/O future (NOT lazily at first poll).
+- **`extent_file(entry) -> Result<Rc>`** (async): every read / sealed-extent
+  background op (read futures, copy, convert, re_avali, recovery, meta persist)
+  — resident fast-path (LRU-touch if sealed) or **re-open on miss**. The
+  returned `Rc` pins the fd across `.await`.
+
+**Eviction — `fd_evictable() = sealed && pending_fsync<=last_synced &&
+Rc::strong_count(fd)==1`.** The `strong_count==1` guard is load-bearing: the
+cache being the SOLE holder means an in-flight write/read/fsync that
+resolved-and-holds its `Rc` can never have its fd yanked mid-op. `FdLru` is
+`BTreeMap<seq,id>` + `HashMap<id,seq>` (O(log n)); `evict_over_cap` scans
+LRU→MRU evicting the first evictable victim and KEEPS non-evictable ones
+tracked (so their resident fd stays cap-accounted). Per-shard cap =
+`min(--fd-cache-cap, 60000/shard_count)` floored at 64 (`RLIMIT_NOFILE` is
+process-wide but each shard is a separate `ExtentNode`, so the clamp keeps
+N×cap under 65535). Default cap 4096; flag `--fd-cache-cap`.
+
+**Invariants:** (1) any file-access on a possibly-SEALED extent uses
+`extent_file()` (open-on-miss); (2) the write/durability path resolves once via
+`resident_file()`, HOLDS the `Rc` for the whole op, and rejects `None` — NEVER
+`.expect()`/panic on it.
+
+### Connection handling & batch optimization (true SQ/CQ)
+
+A Client connection (direct reads, CLIENT_AUTH) has its decoder capped at
+`CLIENT_CONTROL_MAX_PAYLOAD` (1 MiB): a header announcing more drops it before the
+announced body is reserved. Peer connections are not capped (appends and copies).
+
+`handle_connection` is ONE compio task per TCP connection running a **true
+SQ/CQ** loop: a persistent read future (SQ) and an inline `FuturesUnordered` of
+in-flight batch I/O futures (CQ) are polled concurrently via
+`futures::future::select`, so completions stream out to the client as soon as
+they happen — not gated on a burst boundary.
+
+```
+┌─ ConnTask (single task, true SQ/CQ) ────────────────────────────┐
+│  SQ — persistent read future (Option<LocalBoxFuture<ReadBurst>>) │
+│    owns OwnedReadHalf + the decoder's read window (≥512 KiB);    │
+│    NEVER dropped mid-flight (io_uring SQE stability)             │
+│  CQ — FuturesUnordered<Pin<Box<dyn Future<Vec<Bytes>>>>>         │
+│    cap = --inflight-cap (default 64)                             │
+│    holds in-flight append/read batch + control-rpc futures       │
+│  Loop:                                                           │
+│    1. drain ready completions via `.next().now_or_never()`       │
+│    2. flush tx_bufs with ONE `write_vectored_all` syscall        │
+│    3. branch on (n_inflight, at_cap):                            │
+│       n_inflight == 0 → await read alone                         │
+│       at_cap          → await completion alone (back-pressure)   │
+│       n_inflight >= 1 → select(read, inflight.next())            │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+1. **MSG_APPEND batch** — consecutive append frames grouped by extent_id →
+   ONE append future issuing ONE `write_vectored_at` (pwritev), returning N
+   already-encoded response frames.
+2. **MSG_READ batch** — same grouping (by extent and payload file); each slot
+   preads into a pool buffer, sequentially inside the batch. `MSG_READ_AM`
+   frames batch the same way (never mixed with `MSG_READ`): each slot's value
+   is sent as the reader's tagged active message (`AmOut::send_asked`, a task
+   per slot, so sends overlap the next pread), and its reply — the `MSG_READ`
+   ctrl with no value — is written once that send completed. A landed read
+   longer than the reader's `max_len`, or on a connection that is not UCX, is
+   refused before a buffer is taken for it. Test: `tests/landed_read.rs`.
+3. **Control RPCs** (ALLOC, DF, RECOVERY, …) — each becomes one future on the
+   same FU; responses fold into the same tx_bufs flush.
+4. **Cross-extent concurrency** — batches for N different extents sit in FU
+   simultaneously; the first completion's bytes flush immediately at the next
+   loop top, not waiting for the slowest in-flight op.
+
+**Append receive — one copy per replica.** An append's payload is the frame's
+value (checked against the crc32c in ctrl), and on the stream it takes no pooled
+bulk receive. The connection reads into the `FrameDecoder`'s own buffer
+(autumn-rpc "Receiving into the decoder"): the kernel copy (TCP) or UCX Stream
+unpack writes the bytes that `decode_append`, the owner mailbox and the pwritev
+then share by refcount,
+except the part of a large frame that arrived before its header was parsed
+(copied once when `try_decode` reserves the frame). The former 512 KiB scratch `Vec` + `FrameDecoder::feed` memcpy'd
+each payload a second time (1.0x on every replica, measured with a memcpy uprobe),
+plus jemalloc regrowth copies. The buffer of an in-flight append stays pinned
+until its pwritev + fsync complete, exactly as its decoder slice did before.
+
+**Frame values over UCX (wire 77).** From a peer at 77 or later over UCX, an
+append whose payload has a part of at least 64 KiB arrives as a frame value
+(autumn-rpc "Frame values"): the large parts come by rendezvous straight into a
+registered pool buffer (no unpack copy), and the ctrl carries the payload's
+crc32c in its `AppendHeader`. The buffer counts against the pool's `Receive`
+budget; with the budget full (or the value too large for it) it is an
+unbudgeted pool buffer, never a refusal: the PS
+bounds its appends in flight, and the stream client would take a refused append
+as a failed replica (mark the node, report it, seal and move on). `process_frames_backpressured` receives the
+values of every frame of a burst together (`am_frame::complete`, `join_all`)
+before it handles any of them, so frames keep their order; `decode_append`
+takes the frame-value form through `AppendReq::decode_checked`, which
+recomputes the crc over the received buffer — a mismatch is an error frame and
+nothing is appended (the stream client treats it as a failed replica). A frame
+value larger than a pool buffer (256 MiB: an SST, a WAL batch of large values)
+comes in pieces, each in its own pool buffer (`Frame::value_parts`); the append
+keeps them as `AppendPayload::Parts`, checks the crc across them and writes each
+as its own iovec, so no buffer holds the whole value and UCX registers nothing
+(transport "Large values in pieces";
+`prepared_append.rs::an_append_larger_than_a_pool_buffer_arrives_in_parts`). One
+read pass over the payload per replica replaces the unpack copy. A burst whose
+value is still on its way holds the connection loop, as a stream value did.
+`READ` replies of 64 KiB or more go the same way (`AmOut::frame_now`),
+to the PS and to a client reading directly; the reply value is the pool slab
+it was read into (`PooledBuf::freeze`), so the send hands UCX the slab's memh.
+That slab comes from the `Reply` budget, all of a batch's at once
+(`regpool_acquire_many_for`): the batch's future waits up to `READ_BUFFER_WAIT`
+(1 s, inside the reader's 3 s deadline) for room for every slot it will serve,
+holding none of them meanwhile, while the connection's other frames go on.
+Taken slot by slot, a batch waited for room its own earlier slots held, and a
+batch over a thread's share always waited the full second. Short of room for
+all (or over the share, at once), each slot takes a buffer only if one is free
+now, a slot over the share alone is read unbudgeted, and the rest are answered
+`Unavailable`. The PS's `read_value_into_pooled` takes that as it takes its own
+refusal — no cache eviction, no other replica — and reads through its copy
+path (unbudgeted); its EC shard read (`ec_shard_into_pooled`) does the same,
+and drops the cached layout only for other refusals. A direct-reading client tries
+the next replica, then the PS (an EC direct read goes to the PS at once).
+`tests/read_reply_budget.rs`: with `Reply` held process-wide the read is refused
+`Unavailable` after the wait, then served; red without the budget. The
+all-or-none take is covered in the pool (`transport/tests/regpool_batch.rs`),
+not at the node: a test cannot make reads arrive in one burst through the SDK
+(five concurrent reads on one connection were each served alone).
+Test: `tests/prepared_append.rs` over UCX (`AUTUMN_TEST_UCX_BIND`): appends and
+the read reply counted as rendezvous receives, the 65 read replies counted as
+sent with a memh, a payload that misses its crc refused.
+
+**Extent-len reservation**: `append_burst_frames` stores `extent.len =
+total_end` BEFORE returning the I/O future into FU, so overlapping same-extent
+submits compute non-overlapping `file_start` values.
+
+**Keep receiving below the cap:** a pending append may be waiting for fsync while
+the peer sends more. The connection must accept those requests into the extent
+owner's mailbox before the first response, allowing the next durable burst to
+coalesce them. A regression holds the mailbox busy and requires a later append to
+arrive; restoring the single-inflight pause fails it.
+
+### Who may talk to an EN
+
+`handle_connection` runs VERSION_HELLO, then PEER_AUTH for Peer/Admin
+connections (cluster secret, `autumn_rpc::peer_auth`): a process that cannot
+prove the secret never reaches `APPEND` / `DELETE_EXTENT` / `FENCE_EXTENT` or any
+other member opcode. A Client connection may send only `READ` and
+`CLIENT_AUTH` (`check_opcode`).
+
+**Direct reads under authz (`ClientAuthz`).** One config per process
+(`SharedAuthz`, handed to every shard by the binary; shard 0 fetches it):
+`MSG_GET_AUTHZ_CONFIG` every `--config-poll-secs` (30 s), every 5 s while there is
+none yet (`spawn_client_authz_poll_loop`; a failed poll keeps the last answer). A
+token whose kid the config does not know asks for an early fetch (at most once a
+second) and is answered `Unavailable` (the client falls back to the PS) until a
+config installed after that token's first refusal still lacks the key; then
+`PermissionDenied` (`SharedAuthz::on_unknown_kid`, `MissLedger`). `Unknown` until the first answer — reads and
+`CLIENT_AUTH` refused `Unavailable` (not a verdict on the token, so the SDK does
+not mistake it for one), never served unchecked; `Off` (authz off, or no manager) — no
+token needed; `On` — `client_gate` answers `CLIENT_AUTH` itself (verify with
+`cap_token::bind_principal`, bind the connection's `principal`) and refuses a
+read unless the bound principal is `still_valid` (kid enabled, not expired),
+`PermissionDenied` as a frame-level error, which a bulk read surfaces as its
+`RpcError::Status`. Identity only: the EN cannot check key ranges, since it does
+not know which key an extent holds. The per-burst cost is one `SystemTime::now`
+and a keyring lookup per read frame, only on Client connections with authz on.
+Tests: `client_direct_read_auth_tests` (anonymous / forged / expired / valid /
+revoked kid / Unknown / Off / member connection).
+
+**Refusals are not counted.** A refused frame or connection answers
+`PermissionDenied` (a failed PEER_AUTH is also logged with the peer); nothing
+tallies them. Tests: `a_client_connection_cannot_reach_a_mutating_op` (Client
+`DELETE_EXTENT` / `FENCE_EXTENT` / `APPEND` refused, extent untouched and
+unfenced), `an_unbound_read_and_a_forged_token_are_refused`, and the real-binary
+`cluster_secret.rs::members_and_operators_must_prove_the_secret`.
+
+**`ConnPool::set_auth_token`**: a pool that holds a token sends `CLIENT_AUTH` on
+every connection it opens, right after the handshake and before pooling it
+(`CLIENT_AUTH to <addr>` context, deliberately not `connect <addr>`: the address
+is fine, so `is_connect_failure` must not read it as a stale node). A refusal
+comes back as `RpcError::Status` with the EN's code, so the SDK can tell a
+refused credential (`PermissionDenied`) from an EN not ready (`Unavailable`). A changed
+token drops the pooled connections; a connection whose CLIENT_AUTH raced a
+change serves its one call and is not pooled.
+
+### Per-extent owner (write path) — appends serialized by one task
+
+All appends to an extent are MESSAGES (`ExtentMsg::Append`) to a single
+per-extent **owner task** (`send_to_owner` → `owner_loop`), lazily spawned on the
+first message and exiting when its mailbox drains (dropping its `Rc<ExtentEntry>`
+so a sealed/idle extent is never pinned past fd eviction; a later message
+respawns it — lost-wake-free by the single-thread enqueue/exit-recheck argument).
+This makes the write path single-writer BY CONSTRUCTION — the old fsync coalescer
++ its loop are DELETED (note 24). The ps-conn task stays the RPC engine: it builds
+the message + a `resp` oneshot, sends it to the owner, and batches the returned
+encoded frame into its existing vectored write.
+
+`owner_loop` drains its mailbox in bursts and runs each burst through
+`append_burst_frames` (the renamed `append_burst_frames`; still two-phase — a
+synchronous prologue reserves `extent.len`, the returned future does pwrite + one
+inline `sync_data`, a harmless vestige under the sole writer).
+
+INVARIANT (burst-splitter — load-bearing for the owner_epoch fence): the mailbox
+is a CROSS-CONNECTION aggregation point (a per-connection append batch never
+was), so ONE drain can merge appends from two writers — a fenced zombie at epoch
+E and the post-takeover owner at E+1, or a retry replayed on a fresh connection.
+`append_burst_frames` validates `owner_epoch` + `commit` from its FIRST slot ONLY.
+So `owner_loop` SPLITS each drain into homogeneous runs before group-committing: a
+new run starts whenever `owner_epoch` changes OR commit-contiguity breaks
+(`commit != prev.commit + prev.payload.len()`); each run's first slot then gets
+the full prologue fence/commit check against the LIVE `extent.len`/`owner_epoch`,
+and runs execute sequentially. Single-writer pipelining is single-epoch +
+contiguous ⇒ ONE run ⇒ zero hot-path cost. Without the split, `[new, zombie]`
+would ACK the zombie past the fence (acked-data loss) and `[zombie, new]` would
+reject the rightful owner. Tests: `owner_burst_splitter_tests`.
+
+### Append protocol (eversion → seal → fencing → commit truncation → write)
+
+```
+Append(AppendReq via autumn-rpc binary frame):
+  1. Decode (extent_id, eversion, commit, revision, payload).
+  2. Eversion check:
+       client eversion > local → fetch ExtentInfo from manager, apply if sealed
+       client eversion < local → reject (PRECONDITION_FAILED)
+  3. Sealed check: reject if sealed_length > 0 or avali > 0.
+  4. Revision fencing:
+       header.revision < owner_epoch → reject (CODE_LOCKED_BY_OTHER, stale owner)
+       header.revision > owner_epoch → update owner_epoch, persist meta durably (note 23)
+  5. Commit reconciliation:
+       local len < header.commit → reject (data loss on our side)
+       local len > header.commit:
+         - first confirm with manager the extent is NOT sealed (if sealed →
+           apply meta + reject CODE_PRECONDITION)
+         - TRUNCATE to header.commit via truncate_to_commit: set_len then
+           sync_data BEFORE updating extent.len. The fsync is load-bearing:
+           without it, post-crash the file size can be observed at the
+           pre-truncate length, letting the next commit_length probe report a
+           wrong consensus and diverge replicas at the same offset.
+         - RE-CHECK sealed_length/avali AFTER the truncate await (in
+           `append_burst_frames`, the one append path):
+           a concurrent apply_extent_meta_durable may have landed a fresh seal
+           DURING the truncate I/O; writing past the new sealed_length corrupts
+           subsequent reads. Fire CODE_PRECONDITION; client retries via the
+           standard soft-error path.
+  6. Write payload (Direct path, serialized by the per-extent OWNER — see
+     "Per-extent owner (write path)"). Appends are messages to ONE owner task
+     per extent, so the write is single-writer by construction:
+       - write_append_burst(start, payload)     (see note 25a: MUST be *_all;
+         buffered pwritev, or O_DIRECT for bursts >= 1 MiB — next section)
+       - ONE sync_data per drained burst: pending_fsync.store(end) BEFORE the
+         fsync, last_synced.store(end) AFTER — the two watermarks are all that
+         remains of the old Coalescer struct. Every burst fsyncs
+         unconditionally; there is no flag that can skip it.
+       - fsync error → fail the WHOLE burst (no len advance) + mark_disk_error.
+  7. Advance extent.len (AFTER the burst's fsync).
+  8. Return (offset=start, end=start+payload_len) per slot.
+```
+
+Returning `end=N` means all data in `0..N` is written. Step 5 (commit-based
+truncation) is the consistency key: the data files themselves are the journal,
+replacing a WAL.
+
+### Direct I/O for large bursts (`direct_io.rs`)
+
+On by default in the `autumn-extent-node` binary on Linux (`--no-direct-io`
+turns it off; `ExtentNodeConfig` itself defaults to off, so in-process tests and
+embedders opt in with `with_direct_io`). Step 6's write goes through `write_append_burst`, from
+the owner's `append_burst_frames`, the one append path: a burst of at least `DIRECT_IO_MIN_BYTES` (1 MiB) writes its
+4 KiB-aligned part with O_DIRECT, and everything else stays the buffered
+`pwritev`. The burst's single `sync_data` is unchanged and still the ACK gate.
+
+**The file is never padded.** An extent's length after a restart is the `.dat`
+size (`load_extents`), and that length is what the commit protocol takes as
+this replica's committed end; padding to a block boundary would be read back as
+data and silently diverge the replicas. So a burst `[start, end)` is written as
+`[a0, start)` read back from the page cache and copied in front of the payload,
+`[a0, floor(end))` O_DIRECT from a bounce buffer, then — only after that
+completes — the sub-block tail `[floor(end), end)` buffered. The two forbidden
+orders are a buffered head with a direct body (the direct write can reach the
+disk while the head is still dirty: zeros inside the file size after a crash)
+and the tail before the body (the file size covers bytes not yet written). The
+rewritten head bytes are already durable from the previous burst, so rewriting
+them with the same content is harmless.
+
+The O_DIRECT descriptor is reopened per burst through `/proc/self/fd/<fd>` of
+the resident buffered fd, so it names the same inode whatever was renamed over
+the path, stays out of `FdLru`'s one-fd-per-extent accounting, and needs no
+invalidation when the fd is evicted or replaced. The cost is one open/close per
+direct burst and one extra fd per extent while its burst is in flight. The bounce buffer is an
+over-allocated `Vec` offset to 4 KiB (no `unsafe`), filled and written in 8 MiB
+pieces, with a few pooled per shard thread; the copy that used to happen in the
+kernel (into the page cache) happens there instead.
+
+**A filesystem without O_DIRECT fails startup.** With direct I/O on, non-Linux
+fails `ExtentNode::new` (the binary is always off there, so only a library caller
+setting `with_direct_io(true)` gets this far), and so does a data dir whose `disk_id` sentinel (written by
+`autumn-op format`, read by every EN start anyway) cannot be opened read-only
+with O_DIRECT (`direct_io::check`) — EINVAL from a filesystem that has none,
+e.g. tmpfs before Linux 6.6; the error names `--no-direct-io`, the way to run
+on such a filesystem (`perf_check.sh --shm` passes it). Without the check, such a node would start, and every
+burst of 1 MiB or more would fail at the reopen while the disk's buffered
+self-check keeps passing, so the disk would stay allocatable and large writes
+would fail for good. The check writes nothing, so a full, failing or
+read-only disk can never be mistaken for a filesystem without O_DIRECT. What it
+does not check: the 4 KiB write alignment (only a device with logical blocks
+above 4 KiB refuses it, as an EINVAL on the first large append, never as bad
+bytes) and a filesystem that ACCEPTS O_DIRECT and quietly buffers it (ext4
+`data=journal`, inline-data inodes, tmpfs from 6.6): bytes are right, only the
+saving is gone — check with bpftrace (`kprobe:__iomap_dio_rw`, count by pid)
+while writing. Startup logs `direct-io on` per shard. A runtime direct-write
+error says `O_DIRECT append burst at <offset>: ...`, errno text kept for the
+disk-error classifier.
+
+Measured, same-period A/B, ext4 on NVMe with power-loss protection:
+- Single-disk microbenchmark: at 1 MiB and above the direct path is 2-3.5x
+  faster with one or two writers per disk (buffered single-stream tops out near
+  0.9 GiB/s on the copy-then-writeback chain), level to +27% on a saturated
+  disk, 4-9x less CPU per GiB. Below 1 MiB the tail's second serial write eats
+  the gain, hence the gate.
+- 3-node cluster (RF3, 3 NVMe, 8 partitions, 2 shards per EN, io_uring
+  workers confined to each EN's cores — see `crates/common/CLAUDE.md`):
+  16 x depth-8 8 MiB puts 1296/1317 -> 2000/2026 MB/s (+54%); low load
+  (depth 1) 1 MiB x1 client 308-323 -> 429-432 (+37%), x2 510-520 -> 748-763,
+  8 MiB x1 371-375 -> 514-520 (+39%), x2 647-653 -> 989-1017 (+54%); put p50
+  1 MiB 2.8 -> 2.0 ms, 8 MiB 19.5 -> 14 ms. EN CPU at full load 4.2 -> 3.7 cores
+  (buffered spends ~2.2 of its cores in io_uring workers copying into the page
+  cache and writing back). Smaller gains than the single-disk 2-3.5x because a
+  put also pays client, PS, network and three-replica fan-out, which neither
+  mode changes; the saving per 8 MiB write on the EN (~5.5 ms) matches it.
+- Reading values back right after writing them: 8.1 -> 6.3 GB/s (from disk,
+  not page cache).
+
+What it always costs is read-after-write: a just written range is no longer in
+the page cache, so an immediate read hits the disk (2.5 GB/s instead of
+~34 GB/s from cache in the microbenchmark). The gate is on the burst
+TOTAL, so a coalesced burst of many small WAL appends goes direct too — and
+the log stream is exactly where a GET reads a value shortly after its PUT.
+Other writers of `.dat` (recovery, re_avali, the peer copy) and EC shard
+staging stay buffered. It is the default anyway because the write gain holds at
+every load measured and a node that needs fresh data from memory can say
+`--no-direct-io`, while a buffered default makes every node pay the page-cache
+copy and writeback out of its own cores.
+
+Tests: `direct_io::tests` (every head/tail alignment, multi-chunk bursts,
+byte-exact content and exact size; removing the head read-back turns three of
+them red), `direct_io_appends_land_byte_exact` (single appends and a coalesced burst
+both route through O_DIRECT — a burst that silently went buffered fails it),
+`direct_io_on_tmpfs_follows_the_filesystem` (starts iff tmpfs itself takes
+O_DIRECT; red with the flag dropped from the check), `direct_io_default`
+in autumn-server (the real binary logs `direct-io on` with no flag and not with
+`--no-direct-io`; red with the binary default back to off),
+`check_opens_the_sentinel_with_o_direct`, `direct_write_error_keeps_the_disk_class`,
+and `disk_probe_survives_a_leftover_scratch_file` (the disk self-check, note
+25a: a scratch name left by a crash with the same pid — a container EN is often
+pid 1 — meant EEXIST, classified Media, a healthy disk faulted; the name is now
+cleared first). The tests
+write under the crate directory, not `/tmp`, because `/tmp` may be tmpfs.
+
+### Commit protocol — all-replica, NO quorum
+
+`StreamClient` computes `commit = min(commit_length on ALL replicas)` before
+each append. Any replica that got ahead (partially acknowledged data before a
+crash) is truncated back to the consensus point on the next append. Per-node
+durability comes from the per-extent owner's one-sync_data-per-burst (note 24).
+
+**This is a WAS stream layer: the append path is all-replica-ACK**
+(`apply_completion` acks only when every replica wrote), so committed length
+MUST be derived from ALL replicas, not a quorum subset. A subset `min` can sit
+BELOW the acked length (include a short/catching-up replica → the next append's
+`header.commit` truncates acked data on up-to-date replicas → silent loss) or
+ABOVE it (exclude a member → keep un-acked data). **There must be NO quorum on
+the commit path.**
+
+- `current_commit` requires ALL replicas to respond (else `Err`);
+  `ensure_tail_initialised` propagates that `Err` — seeding cursor 0 would make
+  the next append's `header.commit=0` truncate EVERY replica to 0. `Ok(0)`
+  (genuinely empty extent) still seeds nothing.
+- **Manager-side seal/commit** (`handle_stream_alloc_extent` /
+  `handle_check_commit_length`) take `min` over the REACHABLE COMMITTED members
+  only (catching-up = in-flight Recovery, excluded), requiring only `floor` of
+  them to respond — **lenient seal-over-reachable, NOT strict-all-committed** (an
+  EN can be down at seal time; the all-replica APPEND is the guarantee, not a
+  strict seal). Do NOT revert to strict. See `crates/manager/CLAUDE.md` note 28.
+- **Truncation of beyond-commit bytes stays correct** — those are un-acked and
+  must be removed; do not add a floor that keeps them.
+
+**Scope**: the all-replica rule targets the WRITE/SEAL/commit-truncation path
+(the silent-loss vector). `commit_length_for_extent` (the READ-path helper
+resolving a `length=0` "to-end" read on an *open* extent) is intentionally
+quorum-min: it neither seals nor truncates, so its worst case is a short read
+(surfaced as an error), and reads should tolerate a replica being down.
+
+**No flush-time durability barrier.** An append acks only after every replica
+fsynced it, and a replica's commit length (what replay reads up to) is its
+fsynced high-water, so a partition flush has nothing left to wait for. The
+barrier that polled every replica's fsynced length before an SST upload was
+removed, together with its RPC (extent msg_type 13, reserved): it re-asked for
+that same watermark and only ever failed, every 2 s, while one replica of the
+log extent was down.
+
+### Recovery (`require_recovery` RPC)
+
+Wire 46 binds each instruction and completion to the manager marker's creation
+revision plus its immutable source/target snapshot. Dedup accepts only the same
+attempt AND task. A different attempt cannot replace a running copy. Before
+adoption or rebuild (including after restart), the EN asks the leader to validate
+the instruction via MSG_VALIDATE_RECOVERY. It checks node identity, source
+layout and the actual destination disk, and echoes the unchanged snapshot in df.
+The per-extent mutating-op lock covers adoption and the entire background copy,
+serializing it with Delete, ReAvali and EC staging. Rebuilding/adopting committed
+shard-file data closes EC staging so a released coordinator cannot overwrite it.
+The existing immutable-copy adoption rules still apply to a valid new attempt.
+
+Triggered by the manager when a replica node fails. **The request is a STANDING
+INSTRUCTION, re-sent every tick from the manager's durable marker, so every
+answer must be idempotent — a permanent refusal is a permanent wedge:**
+1. Validate the manager endpoint is configured, then answer idempotently:
+   - **already recovering this exact attempt/task** → `CODE_OK` ("I am already doing exactly
+     this" is the request being satisfied — the same contract
+     `handle_convert_to_ec` uses). A `CODE_PRECONDITION` here would make the
+     manager drain the marker of a HEALTHY in-flight recovery and go hunting for
+     another target.
+   - **a local copy exists** → `try_adopt_completed_recovery` returns a THREE-state
+     `LocalCopyVerdict` (never two — the action for Incomplete is destructive, so
+     "cannot tell" must never collapse into it):
+     `Complete` (sealed, `eversion` equal, `len >= sealed_length` vs the
+     manager's authoritative view) → re-push `RecoveryTaskDone` and `CODE_OK`
+     (the completion report was lost, not the data);
+     `Incomplete` (authoritative view obtained and the copy falls short) →
+     **discard it and rebuild** — `run_recovery_task` persists `.meta` LAST, so a
+     crash mid-copy leaves a partial `.dat` that reloads as an ordinary open
+     extent, and refusing on it poisons that (node, extent) pair FOREVER (the
+     orphan reconcile won't reap it either — the extent is alive; only its
+     MEMBERSHIP says the copy is garbage). Safe because the manager dispatches
+     recovery only to a NON-member, so the stub is referenced by no VP, no SST
+     and no checkpoint;
+     `Unknown` (manager unreachable, or EC'd / still-open / quarantined — shapes
+     this comparison cannot judge) → refuse `CODE_PRECONDITION` and let the
+     manager retry. **Never destroy a copy of unknown completeness.**
+2. Spawn background `run_recovery_task` **with retry** (up to 10 attempts, 10 s
+   backoff): fetch `ExtentInfo` for replica addresses; stream the full extent
+   chunk-by-chunk from a healthy peer (`stream_extent_from_sources`); truncate
+   local to 0, write, sync; update atomics and persist `.meta` durably.
+3. On completion push `RecoveryTaskStatus` to the `recovery_done` channel; the
+   periodic `df` RPC drains it so the manager learns recovery finished.
+4. On max retries exhausted, remove from `recovery_inflight`; the manager
+   re-dispatches on its next loop.
+
+`run_recovery_task` performs a **verify-after-fetch**: after `sync_all` and
+before writeback it re-reads local `eversion` and errors (→ retry) if it
+advanced during the fetch; writeback is gated on the fetched length matching the
+manager-reported `sealed_length` (a mismatch means a concurrent seal landed).
+
+### Re-Avali (`re_avali` RPC)
+
+Brings a **sealed, replicated** extent's lagging replica up to date (e.g. after
+a node comes back):
+- If `ec_converted == true` → return OK immediately. RE_AVALI is a
+  replicated-extent-only repair primitive: on an EC'd extent the local shard
+  size = `sealed_length / K`, so the `local_len >= sealed_length` check never
+  short-circuits and the handler would fetch+overwrite raw bytes over the shard,
+  corrupting EC. Missing-shard repair on an EC'd extent routes through
+  `EXT_MSG_REQUIRE_RECOVERY` → `run_ec_recovery_payload`. The OK also auto-heals
+  buggy `avali` etcd values (the manager ORs in the parity-slot bit on OK).
+- If local data >= `sealed_length` → already up to date, return OK.
+- Otherwise **temp-then-publish** via `peer_copy_full_extent_to_dat` (acquires an
+  `acquire_recovery()` permit, same shared pool as recovery).
+
+  **Never `stream_extent_from_sources` here.** That helper truncates the
+  destination to 0 before each source attempt, which is correct when the
+  destination has nothing to lose (a fresh or provably-incomplete recovery
+  target) and DESTRUCTIVE here, where the destination is an existing copy: if
+  no source can deliver, the replica ends up holding less than it started with
+  (reproduced 4096 → 0 in `crates/manager/tests/re_avali_no_destroy.rs`).
+
+  Those bytes are worth protecting even though `avali == 0` is what aimed
+  repair at this replica. **`avali == 0` does not mean "lagging"** — a member
+  merely UNREACHABLE at seal time has its bit left unset (manager CLAUDE.md,
+  seal-over-reachable) while possibly holding the LONGEST copy in the cluster.
+  The absence of reconcile-down in `peer_copy_full_extent_to_dat` is
+  deliberate on this path: adopting a SHORTER peer copy over a longer local
+  one is the trade re_avali must not make.
+
+### Copy sources: never a corrupt-marked member; lit members first
+
+Every whole-extent copy — recovery (`stream_extent_from_sources`), re_avali
+and the EC-convert coordinator (`peer_copy_full_extent_to_dat`) — reads from
+`copy_sources(info, corrupt)`, where `corrupt` is the manager's corrupt-slot
+bitmap (`ExtentInfoResp.corrupt_slots`, wire 53, fetched with
+`extent_info_and_corrupt_from_manager`).
+
+- **Never a corrupt-marked slot.** Its copy is full length with wrong bytes,
+  and a source is accepted on length alone: taking it puts the rot into the
+  copy being built, which then gets its bit set and spreads to the next rebuild
+  that reads it. Its bytes are never COPIED, but for the reconcile-down it is
+  weighed like any member (`marked_member_holds_back`): unreachable, it counts
+  as unverified exactly as an unreachable unmarked member does; reachable, it
+  holds back only if a one-byte read at the best copy's length finds data —
+  proof that the seal's bytes exist, only on a copy known to be wrong. A marked
+  copy no longer than the best proves nothing and holds nothing back, so a
+  stale short mark cannot wedge a rebuild, and the slot being REPLACED never
+  holds back its own rebuild (only that rebuild clears its mark). A hold-back
+  on another reachable marked member is TERMINAL by construction — the extent
+  is sealed, so every retry reaches the same verdict — and its WARN says it
+  needs an operator (restore the bytes, or accept their loss by removing that
+  member) rather than copying rot or dropping committed bytes. (Counting every marked member unconditionally — tried and
+  rejected in review — deadlocked: the mark clears only when its own slot is
+  rebuilt, which cannot start while this rebuild holds the extent.)
+- **A dark member that is NOT marked stays a source.** It was down when the
+  extent was sealed, and every acked byte is on it (an append is acked only once
+  every replica has it). It is what the reconcile-down weighs when the lit
+  members are gone. Excluding every dark member — the first form of this rule —
+  left an extent whose only lit member was fenced or lost with no source at
+  all, its acked bytes sitting on the dark ones.
+- **Lit members (`avali` set) are tried first**: the manager vouches for them
+  at `sealed_length`.
+- **A rebuild reads the slot it REPLACES too, best-effort** — after the other
+  lit members, before any dark one if it is lit itself, last otherwise. A fenced
+  node is alive and its copy good (fencing means "move the data off"), and it
+  can hold the only full copy: the member that alone answered the seal. Left
+  out, the reconcile-down fired on the short dark copies and dropped bytes the
+  seal had made committed — a partition may already have replayed them.
+  Best-effort means its failure or absence counts toward neither `err_count`
+  nor `unverified`, so a node that is really gone does not block the
+  reconcile-down it needs. A corrupt-marked replaced slot is excluded as any
+  other.
+- **A peer copy reads the bitmap again before it publishes**
+  (`refuse_if_source_marked_corrupt`, before the rename): a re_avali is not an
+  extent op, so nothing holds the marks still while it copies, and the member
+  it read from may be marked — or marked, rebuilt and its mark cleared with the
+  slot — meanwhile. A source that is marked OR no longer a member voids the
+  copy; the manager retries with fresh sources (`source_still_trusted`). A
+  rebuild cannot lose a member mid-copy (it is an extent op, and every
+  isolation refuses while one is in flight), but a repeated report of an
+  already-dark slot records its missing mark without moving the eversion, so
+  `run_recovery_task` re-reads the bitmap too and voids the copy on any NEW
+  mark. Residual: the milliseconds between that re-read and
+  the manager lighting the slot — closing it would mean returning the source
+  in the re_avali reply.
+
+Regressions in `crates/manager/tests/single_wal_replica_survivor.rs`:
+`a_catch_up_never_copies_from_a_dark_replica` (a returning replica with the
+only lit copy away must stay behind rather than copy the corrupt one) and
+`a_fenced_sole_seal_member_is_rebuilt_from_its_own_copy` (every slot ends at
+the full seal with the record only the fenced member had).
+
+### Heartbeat & Df
+
+- `heartbeat`: streams a "beat" every second (keep-alive for the manager).
+- `df`: returns per-disk `statvfs` + `extent_bytes` (EN self-reported per-disk
+  extent footprint, summed by `disk_id`; the manager aggregates it into cluster
+  `physical_used`), and drains BOTH `recovery_done` (completed recoveries) and
+  `ec_done` (completed EC conversions). **`df` is the completion channel for
+  every long-running EN task** — both are at-most-once (`mem::take`), and both
+  converge after a lost report via manager re-dispatch + the EN's adopt guard.
+- `handle_df` **ECHOES the EN's own identity** (`DfResp.node_uuid` /
+  `advertise_addr` / `shard_ports`, from `self.registration`, empty when
+  unset). The manager's `node_health_loop` uses the echo to self-heal
+  stored-location drift and detect pod-IP reuse (a different process at a stored
+  address → uuid mismatch → refuse to heal + fail the df for liveness). Only
+  shard 0 is dialed by the manager df, so only shard 0 carries a non-empty
+  `registration`.
+
+### EN ports are FUNDAMENTALLY static — `serve_with_control` is fail-stop on bind conflict
+
+**Do NOT add dynamic port fallback.** The address (`addr` + `shard_ports[]`) is
+stamped into etcd once by `autumn-op format` and held for the node's lifetime;
+EN startup just opens the configured port, with no per-session re-register. A
+dynamic fallback would silently change the bound port while the manager still
+routes to the old one → every PS / sibling / manager RPC black-holes. (PS is the
+opposite — PS ports are dynamic, one per partition, broadcast every open, so PS
+DOES have monotonic-next fallback.)
+
+EN port conflicts are OPERATIONAL HYGIENE, not a runtime mechanism bug: another
+program squatting → operator picks a different `--port`; own old process not yet
+released → TCP binds with `SO_REUSEADDR` (compio), and UCX `UcxListener::bind`
+retries a busy device 30 × 3 s;
+port inside `ip_local_port_range` → operator picks a port below 32768.
+Fail-stop with `bind data listener <addr>: <io error>` is correct; the operator
+fixes the config and restarts.
+
+`serve_with_control(data, control, on_bound)` binds the listener(s) — both under
+TCP, the data one only under UCX (control shares it) — then calls `on_bound`
+before either accept loop starts. That is the node's readiness point: the binary
+logs `autumn-extent-node ready` from it once all shards got there.
+
+### Delete extent (`MSG_DELETE_EXTENT = 11`)
+
+Idempotent unlink of the physical `.dat` + `.meta` after the manager confirms
+`refs == 0`. Sent fire-and-forget once per replica by the manager's
+`extent_delete_loop`.
+
+```
+handle_delete_extent(extent_id, node_uuid):
+  1. identity: if both uuids are non-empty and differ → CODE_LOCKED_BY_OTHER.
+  2. shard ownership: if !owns_extent → forward to sibling shard.
+  3. if recovery_inflight.contains_key(id) → return CODE_PRECONDITION
+     (manager retries; once recovery clears, next retry succeeds).
+  4. extents.remove(id) — subsequent appends fail fast NotFound.
+  5. DiskFS::remove_extent_files(id): remove_file(.dat) + remove_file(.meta);
+     NotFound → Ok(()) (idempotent, retries are safe).
+  6. Returns CODE_OK | CODE_LOCKED_BY_OTHER | CODE_PRECONDITION | CODE_ERROR.
+```
+
+**Identity check** (step 1): the request names WHICH node must execute it, and
+a mismatch is refused before anything is touched. Extent ids are unique only
+within a cluster, while the manager's delete retries are persisted and retried
+for up to an hour — outliving the address's ownership. Cluster A torn down with
+retries outstanding, cluster B up on the same host and ports (shared-host port
+bases, pod-IP reuse), and A's retry unlinks B's live extent with the matching
+id. An empty uuid on either side means "unspecified" and skips the check, the
+same convention `classify_df_echo` uses for `df`. The manager carries the uuid
+in each `DeleteTarget` alongside the address, so a persisted retry keeps its
+target identity across a leader change.
+
+**Recovery-vs-delete mutual exclusion** (step 2) prevents two data-loss paths:
+(a) **resurrection** — `run_recovery_task`'s `ensure_extent(create:true)` after
+an unlink silently recreates an orphan; (b) **write-to-unlinked-inode** —
+recovery holding an `Rc<ExtentEntry>` whose fd survives the unlink writes to a
+doomed inode. The manager-side guards are primary; this EN check is
+belt-and-braces for leader-failover where `pending_extent_deletes` is lost but
+`recovery_inflight` survives on the EN.
+
+### Startup + periodic orphan reconcile
+
+`ExtentNode::new` spawns `spawn_reconcile_orphans_loop()` after
+`load_extents()`: runs immediately, then every `--reconcile-sweep-interval-secs`
+(5 min; tests derive their wait from `en_params()`). Each iteration ships
+every locally-loaded (shard-owned) `extent_id` to the manager via
+`MSG_RECONCILE_EXTENTS = 0x31`. The answer is **file-granular**: `garbage`
+(extents this node is not a member of — delete everything) plus `placements`
+(`extent_id, payload_location, shard_index` for each extent it IS a member of).
+From a placement the node derives the ONE payload file it should hold; anything
+else it holds for that extent is residue. That single rule covers both halves of
+CoW-conversion cleanup — dropping the redundant pre-conversion `.dat` after the
+flip, and dropping an abandoned attempt's shards when the layout still says
+`InDat` — with no second mechanism and no intent marker (a crash mid-cleanup is
+resolved by startup discovery re-deriving what is on disk).
+
+**It is the only thing that removes a copy recovery replaced.**
+`apply_recovery_done` moves the slot and sends the old holder nothing, and a
+later whole-extent delete goes only to the members of that moment. The old copy
+therefore stays until the holder's next round after the delete (or three rounds
+while the extent lives), up to one interval after the delete — bounded, not a
+leak.
+
+**An extent in NEITHER list has no verdict and is left strictly alone.** The
+manager omits any extent with an in-flight ledger op, because its file set is
+mid-change: a participant staging a shard for a not-yet-flipped conversion holds
+a file the current layout does not name, and the node-side `ec_convert_inflight`
+guard only sees conversions THIS node coordinates.
+
+**A verdict must also be newer than the staging it condemns.** The manager's
+silence covers a conversion whose marker was already held when it answered; the
+node's `ec_stage_tick` covers one that staged after. It is a node-wide monotone
+count of accepted staging claims, sampled BEFORE the reconcile request goes out
+and compared against each extent's `EcStageMark.tick`: a mark stamped above the
+sample belongs to an attempt the manager had not been asked about, so its answer
+cannot be describing it and cleanup is skipped until a later round. Below the
+sample, the staged shards are reclaimed like any other file the layout does not
+name. Every write to `ec_stage_nonce` goes through `stamp_stage_mark`, including
+the nonce-0 pass-through — which stays UNORDERED, carrying the existing floor
+forward, but must not be invisible to the tick — so a mark cannot keep a stale
+tick and read as "staged long ago".
+
+**What the bracket does NOT prove is that no attempt is writing**, and the
+difference matters. The repeated-failure abandon fires on the dispatch tick where
+the coordinator has just STARTED a fresh attempt — the tally counts only a
+dispatch that started one — so the marker is released while stripes are still
+streaming, and placements resume at once. A participant whose question went out
+after that attempt's first stripe will delete staging that is being written. Two
+mechanisms outside this sweep make that survivable, and this reclaim is now a
+reason they must keep holding: a later stripe whose staging file has vanished is
+REFUSED rather than recreated at its offset (`write_shard_stripe_local`), so no
+zero-holed shard can be built and published; and an attempt whose marker was
+abandoned can never commit anyway, because its `ec_done` report finds no marker
+and is ignored. The bytes deleted were already dead.
+
+Reclaiming them closes a gap no other sweep reaches while the node stays up:
+`remove_extent_files` waits for the whole extent to be deleted, and the orphan
+reconcile's second leg only fires once the `.dat` is already gone, while an
+abandoned attempt leaves the extent alive with BOTH files present. A RESTART
+already collected it — the mark is in memory only, so a rebooted node sees an
+unmarked shard file and the same `InDat` verdict drops it — which is exactly why
+the hold was easy to miss: it lasted for the remaining life of the EN process,
+which on a healthy cluster is months. A parity target that staged but is not yet
+a member gets no placement at all (placements are member-only); its residue goes
+through the non-member garbage leg's three-round grace instead.
+
+Tests, all ablation-verified red:
+`an_abandoned_attempts_real_staging_is_reclaimed` and
+`a_stale_placement_must_not_delete_a_shard_being_staged` pin the two directions
+of the tick guard; `a_reclaim_that_lands_mid_attempt_is_refused_by_the_next_stripe`
+pins the vanished-file backstop against the window above (stream, integration);
+`reconcile_withholds_the_placement_while_a_conversion_is_in_flight` (manager,
+unit) pins the manager half the node cannot check for itself; and
+`an_abandoned_conversions_staging_is_reclaimed_by_the_next_reconcile` (manager,
+integration) drives the whole splice, including where the tick is sampled.
+
+Deleting a payload file is destructive, so `apply_placements` gates it three
+ways: **the keeper must already be here** (`.dat` is dropped only once the named
+shard is actually held — otherwise a placement arriving before staging finishes
+would delete the only copy), **no in-flight op**, and **only the manager
+decides** (a node holding a complete shard beside a complete `.dat` cannot tell
+which one the cluster is pointed at). The `.dat` transition stops serving
+(`has_dat=false`, `len=0`, fd dropped, `FdLru::forget`) BEFORE the unlink, so no
+read resolves an fd to a file that is about to vanish.
+
+**The InShardFile placement application persists the extent's SEAL, not only
+the location byte.** Staging deliberately writes no `.meta` (an abandoned CoW
+attempt must cost only deleted files, and `new_eversion` is speculative until
+the flip — persisting it early would strand `EversionStale` on a node whose
+`.dat` still serves reads; a staging-time `sealed_length` stamp would also
+bypass the short-replica seal-persist guard). So the flip is the FIRST point a shard
+holder may durably learn the seal, and effectively the last: the seal healer
+(`apply_extent_meta_durable`) is otherwise reached only via append-refresh /
+re_avali, which a sealed EC extent's holders never see. `apply_placements`
+therefore fetches the manager's `ExtentInfo` on the InShardFile transition (or
+when the location byte is already persisted but the entry is unsealed — heals
+records written before this behavior existed) and runs
+`apply_extent_meta_durable`, whose single `save_meta` carries seal + location.
+Without this every holder except the coordinator kept `sealed=0 / eversion=1`
+under a live shard file forever and reloaded as an OPEN extent (observed:
+a 17 GiB EC extent with four of five holders all-zero). Manager unreachable →
+persist the location alone (restart-survival of the staging seal never waits on
+the manager) and retry the seal on a later sweep. `apply_extent_meta_durable`
+itself skips its pre-persist `.dat` fsync for an `ec_converted` holder with
+`has_dat=false` — a shard-only holder has no `.dat`, and its shard's durability
+was established by the staging/rebuild writer — instead of failing the heal on
+the `extent_file` open. Tests: `ec_flip_persists_seal_on_every_shard_holder`
+(manager crate, system), `ec_shard_only_holder_seal_persists_without_dat`
+(unit); both ablation-verified red on the pre-fix code.
+
+The rest of the sweep returns the subset **this node is not a MEMBER of** (`replicates ++ parity`), not merely the subset it has forgotten —
+crash residue from a died-mid-copy recovery belongs to an extent that is very
+much alive, so a "forgotten extent" predicate can never see it. The node unlinks
+those via `remove_extent_files`, **skipping any extent with a live
+`recovery_inflight` / `ec_convert_inflight`** — a recovery target is by
+construction not yet a member, so without that guard the sweep would delete a
+recovery out from under itself (`handle_delete_extent` has always refused for the
+same reason; this path used to bypass it safely only because the old list could
+never name a recovery target). The manager side counts
+`NON_MEMBER_ROUNDS_BEFORE_GC = 3` consecutive rounds before listing a non-member,
+because the membership view is momentarily wrong in normal operation (an
+`apply_recovery_done` slot swap, a settling leader) and deleting real data on a
+transient is far worse than holding residue for a few more minutes. A single
+iteration handles both cold-start (a failed first attempt recovers on the next
+tick) and steady-state. Per-sweep failures log at WARN; the loop continues. It
+is a backstop for: exhausted `MSG_DELETE_EXTENT` retries, manager restart losing
+`pending_extent_deletes`, EC-conversion leftovers, crashed-recovery residue, any
+path that drops refs to 0 unilaterally. Generous cadence is fine for a backstop; if a node scales to 10k+
+extents, switch to chunked rotation.
+
+### Concurrency control: `ConcurrencyController`
+
+Cross-extent concurrency cap for the two memory-heavy background paths on each
+shard: `handle_convert_to_ec` and `run_recovery_task`.
+
+```rust
+pub struct ConcurrencyController {
+    ec_convert_max: usize,
+    recovery_max: usize,
+    ec_convert_inflight: Cell<usize>,   // Cell, not Atomic: single-threaded shard
+    recovery_inflight:   Cell<usize>,
+}
+// acquire_ec_convert() -> EcConvertPermit ; acquire_recovery() -> RecoveryPermit
+// Permits decrement their counter on Drop; 50 ms backoff polling on contention.
+```
+
+One `Rc<ConcurrencyController>` per shard; both call sites acquire from it. The
+two counters are independent (saturating EC convert doesn't block recovery).
+
+**Why not the per-extent locks alone?** `ec_conversion_locks` and
+`recovery_inflight` only serialise the SAME `extent_id`; both allow unbounded
+cross-extent fanout (one manager tick finding 8 extents spawns 8 detached tasks,
+each holding ~`payload × 2` memory). The controller caps that.
+
+**Keep `recovery_max` aligned with the manager's
+`RecoveryRateLimiter.max_per_target`** (both default 2). Manager throttles
+DISPATCH (network fan-out); this caps EXECUTION (RAM). Defense-in-depth in
+different processes — cannot be merged. If the manager's per-target cap exceeds
+`recovery_max`, surplus dispatches just block in `acquire_recovery()`. See
+`crates/manager/CLAUDE.md` note 27.
+
+**No bytes/s rate cap on EN** (deliberate — different resource shape from PS):
+
+| Operation | Dominates | Why concurrency cap suffices |
+|-----------|-----------|------------------------------|
+| `handle_convert_to_ec` | CPU (`spawn_blocking(ec_encode)`) + network fanout | each stripe holds `(K+M) × stripe`; cap=1 keeps peak at one encode |
+| `run_recovery_task` | network (`MSG_READ` chunks) + disk write+sync | chunked I/O caps per-syscall at 256 MiB; cap=2 keeps peak at ~one chunk each |
+
+Both are bounded in time (seconds–minutes) and self-throttled by 3-replica
+fanout. PS is different (foreground writes thousands/sec at small batch), which
+is where bytes/s + iops limits matter.
+
+### Configuration
+
+Every extent-node tunable is declared in `crates/params/src/en.rs` (`EnParams`):
+one process-wide instance, `autumn_stream::en_params()`, shared by all shards;
+`autumn-extent-node --help` lists them. No EN tunable is read from the
+environment (deploy scripts map their own env vars to flags). `--recovery-parallelism`
+and `--scrub-bytes-per-sec` are runtime parameters: `ConcurrencyController::caps`
+reads the caps on every acquire (`from_params`; tests build fixed caps with
+`new`), and the scrub worker hands the rate to its `ScrubPacer` before each
+task (`set_rate` restarts the pacing run when it changed). Their overrides
+come from the manager: the shard that polls the authz config
+(`spawn_client_authz_poll_loop`) also fetches `MSG_GET_RUNTIME_CONFIG`
+(`poll_runtime_config`) and installs the `en.` entries process-wide through
+`autumn_params::Installed`; a failed fetch keeps what is installed. Every EN
+call to the manager (both polls, reconcile, extent info, nodes info, recovery
+validation) goes through `manager_call`: `--manager` is split on commas, each
+address is tried once from the one that answered last, and a transport error
+(a timeout included) or a NOT_LEADER answer moves on; the index is per shard
+and the timeout per address. The manager answers `stream_info`, `extent_info`
+and `nodes_info` NOT_LEADER from a standby, whose store is frozen at its
+replay, so a blip that moves the EN onto a standby does not get it stale
+metadata. Every seal is an etcd txn that compares the caller's `ownerLocks/`
+revision, so only the current owner seals, and on every replica its takeover
+fenced only it passes the epoch fence that precedes the commit-reconcile
+truncate; a replica the takeover could not reach is note 31's residual. Test: `crates/manager/tests/en_multi_manager_etcd.rs` (standby
+listed first, then the leader stopped; ablations: no move on NOT_LEADER, no
+move on a transport error, the raw list as one address — each red; a standby
+answering the three lookups — red without the gate). `--ec-stripe-bytes`
+sets the chunked EC-convert stripe: peak EC-convert RAM = `(K+M) × stripe`;
+bigger = fewer WriteShard RPCs / syncs at higher RAM, and the 1 GiB cap keeps a
+single stripe's WriteShard under the frame `payload_len: u32` ceiling.
+`--no-direct-io` stays a plain switch of the binary (O_DIRECT is on by default on
+Linux).
+
+---
+
+## StreamClient — Client Side
+
+Used by `PartitionServer` and tests. Holds autumn-rpc connections to extent
+nodes via `ConnPool`.
+
+### Connection & ownership
+
+```rust
+StreamClient::connect(manager_endpoint, owner_key, max_extent_size, pool)
+    -> Rc<StreamClient>           // Rc::new_cyclic
+```
+- `manager_endpoint` supports **comma-separated** addresses for multi-manager
+  HA (`"h1:9001,h2:9001,h3:9001"`). Tries each to `acquire_owner_lock`, skipping
+  `NotLeader`. `self.manager_addr()` returns the current leader.
+- **Retry classification** (`retry_manager_call`, code-classified via typed
+  `ManagerError{code, ctx, message}` — see note 30):
+  - transport error / `CODE_ERROR` → `rotate_manager()` + retry;
+  - `CODE_NOT_LEADER` → retry, rotated by `note_manager_code` (the loop must not
+    double-rotate);
+  - TRANSIENT `alloc_extent` conflict Preconditions (`is_transient_conflict`:
+    "retry with a fresh snapshot" / "defer … until it completes") → retry
+    WITHOUT rotating (leader-side self-heal, stay on the same leader);
+  - DETERMINISTIC codes (NotFound / InvalidArgument / owner-epoch fence /
+    deterministic business-rule Preconditions / unknown) → FAIL FAST, unwrapped.
+- `owner_key` should be unique per logical writer (`"ps/{ps_id}/partition/{part_id}"`).
+- Constructors return `Rc<Self>` so per-stream workers can hold
+  `Weak<StreamClient>` for the exit-removal guard without an Rc cycle. Public
+  API methods take `&self`.
+
+### Replication is star-only
+
+The writer sends every replica its own copy. Chained replication —
+one copy to replica[0], forwarded hop to hop, one aggregated ack — was
+implemented and removed. It is worth knowing why, because the bandwidth
+argument for it (writer egress RF× → 1×) is real and will be proposed again.
+
+Its ack carries one status for the whole chain, and that is the problem: the
+completion has ONE frame where star replication has one per replica, so there
+is no index that says WHICH hop failed. `apply_completion` resolves the faulty
+replica by that index, so every downstream failure resolved to index 0 and
+blamed the HEAD — `mark_bad_node` plus a disk-failure report filed against a
+healthy node, while the node that actually failed stayed eligible. Measured
+throughput did not pay for that, and it was default-off and untested for its
+whole life. Restoring it means designing the failure attribution FIRST — a
+per-hop status in the ack — not the fast path.
+
+The error-frame guard in `apply_completion` is NOT part of this and must not be
+removed with it: an error payload is `[status_code][message]`, and
+`StatusCode::Unavailable` and `CODE_LOCKED_BY_OTHER` are both 5, so decoding one
+as an `AppendResp` reads a transport fault as a fencing event and poisons the
+partition. The EN still emits `Unavailable` on plain `MSG_APPEND` (seal not
+durable, manager unreachable). Chaining is only where it was first observed.
+
+### Append data flow (public API drives retry)
+
+`launch_append` creates one `PreparedPayload` including the AppendReq header for
+every star-replicated append, at every size and replica count, and sends it to
+each replica with `send_prepared`. Its body is the caller's segments as
+`RegBytes` (`append_segments`): a PS's segment that is a value it received into
+a pool buffer keeps that buffer's memh, and a UCX frame-value send hands it to
+UCX instead of having UCX look the memory up. Submission order, the payload's
+transit CRC and all-replica ACK behavior are the same on both transports.
+
+The payload's crc32c is computed once in `PreparedPayload` — or handed in by
+the caller that encoded the payload (`append_segments_with_crc`: the PS's WAL
+batch, crc'd record by record as it is encoded, and its SSTs, crc'd by
+`SstBuilder::finish` in the blocking pool) — and rides every replica's ctrl; the extent node checks it (`decode_append` → `decode_checked`)
+on both transports.
+
+The other size threshold on this path is the RPC writer's zerocopy opt-in
+(`--tcp-zerocopy-min-bytes`, off by default), one layer down.
+A pooled ctrl receive candidate was tested and withdrawn
+for lack of stable CPU/throughput gain; see "Append receive" for what the EN
+receive does instead.
+
+```
+append*(stream_id, payload):
+  1. stream_worker_sender(stream_id): look up or lazily spawn the per-stream
+     compio task (returns cloned mpsc::Sender<StreamSubmitMsg>, cap=256).
+  2. ensure_tail_initialised(stream_id): first caller (under per-stream init
+     mutex) loads tail from manager + current_commit on ALL replicas, then sends
+     ResetTail + SeedCursor. If the manager-reported tail is already SEALED,
+     allocate a fresh extent immediately instead of seeding the sealed tail —
+     load-bearing after split/duplication (a child may inherit a sealed tail;
+     waiting for append-time failure wedges descendant compaction on
+     LockedByOther / overlap-clearing).
+  3. Retry loop (MAX_ALLOC_PER_APPEND=3):
+     a. Send Append (parks on the bounded channel under overload). Await ack_rx.
+     b. Ok → if result.end >= max_extent_size, alloc_new_extent + ResetTail
+        (preemptive roll). Return.
+     c. Err "not found on replica" → alloc_new_extent + ResetTail. Retry.
+     d. Err "LockedByOther" → propagate immediately (PS owner self-evicts).
+     e. Err soft (retry <= 2) → sleep 100ms, reload tail, ResetTail. Retry.
+     f. Err hard → alloc_new_extent + ResetTail. Retry.
+```
+
+### Per-stream worker (single-owner actor)
+
+```
+┌─ stream_worker_loop (ONE compio task per stream_id) ─────────────┐
+│  OWNS: StreamAppendState                                         │
+│     - tail: Option<StreamTail>                                   │
+│     - commit: u32            (contiguous all-replica-acked prefix)│
+│     - lease_cursor: u32                                          │
+│     - pending_acks: BTreeMap<offset, end>                        │
+│     - in_flight: u32                                             │
+│     - poisoned: bool ; sealing: bool ; failure_floor             │
+│  OWNS: inflight: FuturesUnordered<InflightFut>                   │
+│     cap = --stream-inflight-cap (default 32)                │
+│  RECV: submit_rx: mpsc::Receiver<StreamSubmitMsg>                │
+│                                                                 │
+│  SQ (launch_append):                                            │
+│     - lease offset range; header.commit = offset                │
+│     - fire pool.send_prepared to each replica IN PARALLEL via    │
+│       join_all over the 3 per-replica futures (each replica's    │
+│       writer_task is single-writer → per-replica TCP byte order  │
+│       = lease order; inter-replica fanout order is irrelevant)   │
+│     - push the 3-replica join future into inflight; no await     │
+│  CQ (apply_completion):                                         │
+│     - parse 3 frames: success / NotFound / LockedByOther / err   │
+│     - success → state.ack (caller ack fires as contiguous prefix │
+│       advances, note 25a); error → rewind_or_poison             │
+│  Loop:                                                          │
+│     1. opportunistic CQ drain via inflight.next().now_or_never() │
+│     2. n_inflight==0 → await submit_rx ; at_cap → await inflight │
+│        else → select(submit_rx, inflight.next())                │
+│  Messages: Append{payload_parts, revision, ack_tx} ;             │
+│     ResetTail{tail} ; SeedCursor{cursor} ;                       │
+│     SealCommit{resp} (note 20) ; Shutdown                        │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**Where an append's time goes** is logged once a second on both sides. The
+worker's "stream worker summary" gives the appends already in flight on the
+stream when one launched and launch -> first / last replica reply; the extent
+node's "extent append summary" gives bursts (one `pwrite` + `sync_data` each),
+appends per burst, the burst time and how long an append waited in the
+extent owner's mailbox. 4 KiB writes, 8 partitions, 3 NVMe: the first replica
+answers in 0.4–0.6 ms and the last in 3.4–6.6 ms, while a burst takes 0.6–1.3 ms
+and carries 1.0–1.4 appends, after 0.2–1.4 ms in the mailbox — every append
+pays its own fsync, and part of the gap to the last reply is still unplaced.
+
+**No external Mutex**: all state mutations happen inside the worker; the public
+API talks to it via bounded mpsc + per-op oneshot.
+
+**Retry is in the public API**, not the worker — the worker is a pure stateful
+single-op executor. **Tail invalidation is explicit**: after any
+`alloc_new_extent` the public API sends `ResetTail` BEFORE the next Append.
+
+**Every `ResetTail` sender that can MOVE THE WORKER TO A DIFFERENT EXTENT must QUIESCE it first** (`seal_commit_
+watermark` → the `SealCommit` handshake, which drains `inflight`), so that
+`in_flight` is 0 at the reset point. The old wording said that held because
+"the retry loop awaits the previous ack before resetting" — true PER CALLER,
+and silently false once the partition server began pipelining up to
+`ps_inflight_cap` Phase-2 appends on one stream: the caller that rolls is one
+of eight, and the other seven are mid-flight. The preemptive cap-hitting roll
+was the one sender that skipped the handshake, and it cost both halves of the
+race (see note 36).
+
+**SeedCursor** initialises `commit = lease_cursor` to the replica-min
+`commit_length` when a resumed stream's tail already has data (without it the
+first append would overwrite committed bytes).
+
+### Back-pressure, lifecycle, caching
+
+| Concern | Behaviour |
+|---------|-----------|
+| Submit mpsc cap | 256 per stream. Parked callers wake as the worker drains. |
+| Inflight cap | `--stream-inflight-cap` (default 32); `at_cap` → CQ-only. |
+| Worker lifecycle | Spawned lazily on first `append*`; exits on channel close / `Shutdown` after draining all inflight for a final ack. |
+| Worker removal | On exit a `WorkerRemovalGuard` (via `Weak<StreamClient>`) removes the Sender **only if the entry still carries its own generation**, and then also drops the stream's init flag; next `append*` spawns fresh AND re-initialises. See note 35. |
+| `LockedByOther` | Propagated immediately; PS owner self-evicts. |
+
+| Cache | Key | Value | Invalidated on |
+|-------|-----|-------|----------------|
+| `stream_workers` | stream_id | `(generation, mpsc::Sender<StreamSubmitMsg>)` | Worker exit (own generation only), `invalidate_stream`, drop |
+| `stream_init_locks` | stream_id | `Rc<futures::lock::Mutex<bool>>` | Worker exit (same generation gate), `invalidate_stream` — NEVER outlives the worker it initialised (note 35) |
+| `nodes_cache` | node_id | address | A node id missing from it, **or a cached address that could not be reached** — `forget_node_addr`, called from the retry loops AND from the sites that swallow a per-replica failure; rate-limited per node (note 34) |
+| `extent_info_cache` | extent_id | `ExtentInfo` | Replica lookup failure; the old tail on every roll (`alloc_new_extent`: the pinned `seal_extent_id`, or for a probe roll the new extent's predecessor) |
+
+`nodes_cache` + `extent_info_cache` use `DashMap`; `stream_workers` +
+`stream_init_locks` use `RefCell<HashMap>` (single compio thread per caller).
+
+A roll evicts the tail it sealed, never synthesizing its length (the manager
+may keep an earlier, longer seal): a pinned roll its `seal_extent_id`, an
+unpinned one (`seal_extent_id = 0`) the new extent's predecessor. A cached OPEN
+view of a sealed extent reads to the PS's `authoritative_sealed` as "not
+sealed": GC skips the extent and a compaction cannot move a checkpoint cursor
+off its end. A partition reopened with no write since caches its tail open
+during replay, and `MSG_ROLL_TAILS` then rolls unpinned (no worker yet)
+(`system_compact_advance_anchor`'s restart test, red without the eviction).
+
+### Other public methods
+
+| Method | Purpose |
+|--------|---------|
+| `append_batch(stream_id, blocks[])` | Concatenate blocks, single append |
+| `append_batch_repeated(stream_id, block, count)` | Repeat one block N times |
+| `read_bytes_from_extent(extent_id, offset, length)` | Read from extent (details below); the bytes are the reply's value as received (`Bytes`, no copy) whenever one reply covers the range — a caller that keeps them past the request (the SST block cache) copies them out, since a small reply can share its receive allocation with other frames |
+| `read_committed_bytes_from_extent(...)` | Like the plain read but `length` CLAMPED to the committed end (details below) |
+| `extent_read_descriptor(extent_id)` | `Direct{eversion, replica addrs}` (replicated — read any), `Ec{eversion, shard addrs, data_shards, sealed_length}` (shard `i` lives at entry `i`, read its own slice — no RS decode needed to SERVE, only to RECONSTRUCT), or `NotDirect(..)` — a DECLINE, not an `Err`, so a caller can log the routine ones quietly and the impossible one loudly (`NotDirect::log`); genuine faults stay `Err`. Replicated drops Suspected addresses; EC declines outright if any data-shard node is Suspected, because a shard has no second home |
+| `read_extent_value_direct(pool, addr, …)` (free fn) | One-shot exact `MSG_READ` for a client holding a value's position; short read = Err |
+| `read_extent_value_landed(pool, addr, …, ptr, region)` (unsafe free fn) | The same read as `MSG_READ_AM`: the value lands at `ptr` (in place inside `region`); `Landed::NotHere` when the memory cannot take an AM value; errors read as the plain read's |
+| `read_last_extent_data(stream_id)` | Read last non-empty extent |
+| `punch_holes(stream_id, extent_ids[])` | GC: remove extents from a stream |
+| `truncate(stream_id, extent_id)` | Remove all extents before extent_id |
+| `get_stream_info` / `get_extent_info` | Query manager metadata |
+| `multi_modify_split(mid, part, sealed_lengths, tail_extent_ids, timeout)` | Forward partition split to manager; `tail_extent_ids` = the tails the lengths were captured for (manager refuses `split captured tail moved` if any current tail differs) |
+| `commit_length_with_tail(stream_id)` | `commit_length` + the tail extent id it was measured on (split capture) |
+| `invalidate_stream(stream_id)` | Discard cached worker + init-lock; next append reloads the tail (used after split to prevent appending beyond a sealed tail) |
+
+**A read NAMES its payload file.** `ReadReq` carries a `PayloadRef`
+(`payload_location` + `shard_index`) saying WHICH file on the target node to
+serve — `extent-{id}.dat` or `extent-{id}.shard{i}`. The EN serves that file or
+answers `CODE_PAYLOAD_NOT_HERE`; it never falls back to the other one, because
+returning shard bytes where a whole value was asked for (or the reverse) is
+silent corruption. The client sources the location from `ExtentInfo` (delivered
+beside `MgrExtentInfo` on `ExtentInfoResp`, since that struct is the persisted
+etcd value and cannot be widened) and the index from the slot it is reading —
+`slot` in the replicated/failover/hedge paths, `shard_idx` in `ec_subrange_read`,
+the peer's own `i` in `ec_reconstruct_shard_subrange` / `ec_read_full` /
+`run_ec_recovery_payload`. **Every peer is asked for ITS OWN shard**; before the
+file was named, EC shard recovery asked each peer for "the extent" and relied on
+that peer's `.dat` happening to be its shard.
+
+**A location this build cannot read names no file, so every path that would name
+one refuses instead of guessing.** The client resolves it ONCE per read
+(`published_payload`) and carries the resolved value to each slot; the reconcile
+sweep leaves every file of such an extent alone rather than treating them all as
+residue; the EC rebuild refuses rather than writing a shard into `.dat`;
+`classify_ec_shard` answers `Unknown`, which is already its "cannot tell →
+refuse" verdict. None of this is reachable while only two locations exist — it
+is what makes adding a third a loud event instead of a silent one.
+
+The refusal is spelled out at seven sites rather than once, and that fan-out is
+TEMPORARY and structural: `ExtentInfo.payload_location` is still a `u8` because
+`ExtentInfo` is an rkyv struct on the client surface, so retyping it would be a
+client-facing break. Once the manager's persisted types are split from their
+wire forms the byte can be resolved once at that
+boundary and these collapse into it. Do not "tidy" them meanwhile by restoring a
+shared default — the shared default IS the bug.
+
+Two invariants make this safe rather than merely present:
+- **`InDat` is ONE identity whatever the slot** (`PayloadRef::for_extent`
+  normalises the index away). Otherwise replicated reads of one extent from
+  different slots would look like different files.
+- **The server's read batching groups by the FILE, not the extent.** One batch
+  resolves one fd for every slot in it, so two requests naming different files
+  must never share a batch. The one grouping site (`MSG_READ`) keys on
+  `(extent_id, payload_ref())`.
+
+`read_plan` returns a typed `ReadRefusal` (`EversionStale` | `PayloadNotHere` |
+`TooLargeForOneFrame`) rather than a bare `None`, so each refusal reaches the
+client as its own code and self-heals differently.
+
+**`TooLargeForOneFrame` is a SERVER-side bound, and it has to be.** `read_plan`
+bounds a read by the FILE, a log extent is 16 GiB, `ReadReq.length` is a
+u64 and `0` means to-end — so one remote request can ask for four times what
+the frame header's `payload_len: u32` can express. Most in-tree clients chunk at
+`--stream-read-chunk-bytes` (256 MiB), but not all — `ec_read_full` sends a
+whole-shard `length = 0` read and `stream_one_source` does the same with
+`total == 0`, so a 16 GiB EC extent at K=3 or K=4 is now REFUSED where it used
+to wrap. That is the same outcome, typed instead of silent; those callers have
+to chunk. And the server cannot depend on the client either way. Both other answers are worse: the length silently wrapped and the peer
+reported a CRC error on a frame that was never corrupt, and once the encoder
+asserts its ceiling (see `crates/rpc/CLAUDE.md`), an un-chunked request would
+take the extent node DOWN — trading a remotely-triggerable bad frame for a
+remotely-triggerable crash. Refusing names the fix ("chunk the read") and keeps
+the node serving; the encoder's assert is then the last resort for frames this
+node builds itself, not the thing a remote request trips. It reuses
+`CODE_PRECONDITION` rather than claiming a new code, because a new code is a
+coordinated wire rollout with transient RPC refusal.
+
+**A BULK read's refusal carries the same status its plain twin does.** The bulk
+arm used to answer every `get_extent` error with `bulk_read_head(CODE_ERROR,
+"extent unavailable")`, discarding both the code and the message; it now emits
+the typed error frame (`err_bytes`, preserving `(StatusCode, message)`). A wrong-shard read is the case that made this
+load-bearing: the plain path refuses `FailedPrecondition` and NAMES the owning
+shard, which is what lets a mis-routed caller refresh and retry, while on the
+bulk path that same refusal was indistinguishable from a genuinely unavailable
+extent — so the client's refresh-and-retry became dead code for every bulk
+consumer, with the whole unit suite and a byte-for-byte e2e run green. **Never
+collapse a refusal into a generic code on one path while its sibling keeps the
+type**: the upper layer branches on the type, and the flattening is invisible
+to any test that only checks that the read failed.
+
+One consumer-visible consequence, deliberate: these refusals used to reach
+`read_value_into_pooled` as `Ok(non-OK code)` and bail straight to the copy
+path; as typed errors they enter the `Err` arm, so the read walks the remaining
+replicas before falling back. That is the right order — a refusal from ONE node
+says nothing about the others — and the fallback is unchanged. Neither
+`is_connect_failure` nor `is_liveness_timeout` matches this text, so the
+note-29 damping and the note-34 address-forgetting are untouched.
+
+**Bulk read of an EC extent** (`read_value_into_pooled` → `ec_shard_into_pooled`):
+a range inside one data shard whose node is not Suspected is one
+exact `MSG_READ` to that shard's node, at the offset inside the shard (the
+layout `ec_subrange_read` plans with). A range across shards, past the data
+shards or on a Suspected node, and a refused read, return `Ok(None)` and the copy
+path splits it, reconstructs it or refreshes the layout, as it did for every EC
+read before. A read that failed (connection, timeout) is rebuilt right there
+from the other shards (`ec_subrange_read` with that shard distrusted) and copied
+into a pool buffer: handed to the copy path, it would read the same node again
+first and pay its timeout twice. SST
+blocks (<= ~64 KiB) cross a shard boundary about once per shard. In-process
+cluster over TCP, 60 KiB blocks of one 2+1 extent, sequential: 52–55 us per bulk
+read vs 81–83 us on the copy path. Test: `crates/manager/tests/ec_bulk_read.rs`
+(a range in shard 0 and one in shard 1 come back from the bulk read, one across
+them is `None` and the copy path reads it — red with EC sent to the copy path;
+shard 0's node moved to a dead address comes back rebuilt — red when a failed
+read returns `None`; with `Reply` held process-wide the read is `None`, the
+layout stays cached and the copy path reads it — red when `Unavailable`
+evicts. The pool is capped at 64 MiB and the suite runs one test at a time).
+
+**Read path** (`read_bytes_from_extent`): the start replica rotates by
+`(extent_id, offset)` hash so read IO spreads across all replicas; failover
+walks the rest in rotated order. **OPEN-tail extents rotate too** (an open
+tail's COMMITTED prefix is on every replica under all-replica-ACK, so a
+committed VP read starts from any replica; concentrating hot open-log-tail reads
+on replica[0] created a hotspot). Appends stay replica[0]-first
+(`launch_append`, unaffected — rotation is in the read-only
+`replicated_read_order`).
+
+- **`MSG_READ` and its modes.** One read message, `ReadReq` with a mode:
+  `READ_EXACT` (a value: the whole range or `CODE_PRECONDITION`), `READ_UP_TO`
+  (a scan: what this replica holds of the range), `READ_TO_END` (everything from
+  the offset). Length 0 under the first two, or an unknown mode, is malformed
+  (`CODE_ERROR`): only a to-end read leaves the length open. The reply ctrl is
+  `[code][rkyv ReadResp { end, message, block_crcs }]`, the value the bytes.
+  `ReadSlot::short` is the one exact check. Every read sends it: the PS's
+  pooled reads (`read_value_into_pooled`, `ec_shard_into_pooled`) and the
+  SDK's direct read without crcs, and every background read — the stream
+  client's chunked reads (`read_checked`: WAL replay, checkpoint and SST meta,
+  compaction / GC windows, EC reconstruct and full reads) and the extent
+  node's recovery / peer-copy / EC-rebuild source reads (`read_bytes_chunk`)
+  — with `with_crcs`. The value is the frame's tail, which no frame CRC
+  covers, so those readers ask for `block_crcs`: the crc32c of each piece of
+  the range cut at 1 MiB file offsets (`read_block_crcs`), computed by the
+  node over the pool buffer it sends (or, for a whole scrubbed block, taken
+  from the file's `.ck` — "At-rest integrity"), checked by the reader
+  (`check_read_block_crcs`) before the bytes are used; a mismatch fails that
+  source like any other read error. Background reads take the reply frame
+  whole (`ConnPool::call_frame_timeout`, decoded like any frame: on TCP no
+  pool budget, as the old `READ_BYTES` before it). They run on the stream
+  client's own connections (`bg_pool`, `ConnPool::separate`: same peers, same
+  role), so a 64–256 MiB reply never sits in front of an append or a pooled
+  value read. Every block-crc read goes there, the GET copy path included
+  (`read_shard_chunk_from_addr` serves both), so a GET that falls back to it
+  can wait behind a compaction window
+  (`stream_sqcq.rs::background_reads_do_not_use_the_shared_pool`, red when they
+  share the pool). The node serves them from a pool buffer outside the
+  `Reply` budget: the PS's copy path is what a foreground read falls back to
+  when that budget is full
+  (`ec_bulk_read.rs::a_read_with_no_reply_buffer_keeps_the_layout_and_uses_the_copy_path`).
+  Their bytes ride the stream on UCX too, never as a frame value, which the
+  reader's loop would take against its own `Reply` budget
+  (`background_read_budget.rs`, run with `AUTUMN_TEST_UCX_BIND`: red when
+  background replies go as frame values). A request bit chooses this, from any
+  connection a client direct reader included: the node's read budget only
+  bounds well-behaved readers. The value budget
+  (`READ_REPLY_MAX_VALUE_BYTES`) subtracts the largest OK ctrl, crcs
+  included (`READ_RESP_MAX_OK_CTRL_BYTES`). Test:
+  `extent_append_semantics.rs::read_serves_each_mode_as_it_says` (red when an
+  exact read is answered short).
+- **EXACT invariant**: an exact read REJECTS an unservable range with
+  `CODE_PRECONDITION`, NOT `CODE_OK` + a silently short payload (`read_plan`'s
+  clamp is only for up-to reads, whose callers handle short reads). So `CODE_OK`
+  on an exact read implies the FULL requested length; no consumer needs a
+  defensive length check. **Never re-introduce a clamped-OK on an exact read.**
+- Optional **hedged read** (`set_read_hedge_ms`, default 0=off): if the first
+  replica hasn't answered within the window, race the second and take the first
+  Ok (eversion-stale still fails fast; loser drop is cancel-safe).
+- **Chunked** at `--stream-read-chunk-bytes` (default 256 MiB) so reads
+  >2 GiB don't trip the per-syscall pread ceiling (macOS INT_MAX / Linux
+  0x7ffff000). EC = parallel per-shard reads with decode. `length=0` resolves
+  to-end via `sealed_length` (sealed) or `commit_length_for_extent` (open)
+  before chunking.
+
+**`read_committed_bytes_from_extent`**: `length` is CLAMPED to the COMMITTED end
+(sealed → `sealed_length`; open tail → min-replica commit probe per call) before
+issuing. For chunked scanners (PS WAL replay): a replica legitimately holds
+speculative bytes past the committed end (an ahead replica is never truncated
+back after seal), so the plain explicit-length read only short-reads at the
+SERVING replica's local length — a scanner stopping on `got < want` walks past
+the seal and trips `StaleVpOffset` on the next chunk. Sealed + `offset >
+sealed_length` still errors loudly (checkpoint-past-seal corruption is never
+masked as end-of-scan); `offset == committed end` returns empty = clean stop.
+
+---
+
+## Programming Notes
+
+Present-tense invariants. Numbers are stable identifiers (cross-referenced here
+and from other crates' CLAUDE.md); do not renumber.
+
+1. **Always pass the correct `revision`** — 0 or a stale revision → `CODE_LOCKED_BY_OTHER` from EN (propagated as an immediate non-retried error). Set at `connect` time.
+
+2. **Eversion changes on seal** — a manager seal (split, extent rolling) bumps eversion; the next append sees a mismatch, fetches updated `ExtentInfo`, and handles accordingly.
+
+3. **Parallel 3-replica fanout** — `launch_append` fires the 3 per-replica `pool.send_prepared` futures concurrently via `join_all`; one slow replica doesn't serialise the others. Per-replica TCP byte order is preserved because each `RpcClient` runs a single-writer `writer_task`; fanout order across replicas is irrelevant. `apply_completion` enforces that all replicas agree on the file-level `offset/end`.
+
+4. **Durability is not a knob** — the per-extent owner does ONE `sync_data` per drained burst (`pending_fsync` before, `last_synced` after), so every append is durable before it ACKs. `sync_data` is whole-file, so one burst's fsync covers every append in that burst. Every append follows the same durability path.
+
+5. **StreamClient is always `Rc<StreamClient>`** — constructors return `Rc<Self>` (via `Rc::new_cyclic`) so per-stream workers hold `Weak<StreamClient>` for the removal guard. Public API takes `&self`.
+
+6. **EC is a per-stream property; all three streams can be EC-converted on seal.** Replication factor is fixed at **3** while open; EC default keeps `M=1` parity and grows `K = N-1` capped at 4 (N=4→3+1, N=5→4+1, N≥6→4+1; the cap bounds RS decode cost). `log_stream`'s arbitrary VP `(extent, offset, length)` sub-range reads go through `ec_subrange_read`'s generalised N-shard parallel scatter — one `read_shard_from_addr` per touched data shard, stitched in order (1/2-shard cases fall out as special cases); out-of-range offset (`start_shard >= data_shards`) routes to `ec_read_full_and_slice`, whose `ec_slice_decoded` returns `Err` (not panic) on `offset > full_payload.len()`.
+
+    **`StaleVpOffset` wire contract** (load-bearing for Python operational tooling): an SST VP `(extent, offset, length)` whose `offset + length > manager.sealed_length` surfaces as the structured sentinel `StaleVpOffset` (`client.rs`), carried through the anyhow chain so the PS read path maps it to `FailedPrecondition`. Its Display string is a STABLE wire contract:
+    ```
+    stale_vp_offset_past_sealed_length: extent=<EID> offset=<OFF> length=<LEN> sealed_length=<SEAL>
+    ```
+    Regex consumers MUST treat the `stale_vp_offset_past_sealed_length:` prefix + the 4-field ordering as load-bearing; any format change is a wire-incompatible event. Such a VP means data past `sealed_length` is permanently gone (EC shards were physically truncated); remediation is `client del <key>` + major compact. There is no automated repair (the manager stores only the current sealed_length revision).
+
+7. **EC offset semantics** — in EC mode `AppendResult.offset/end` are shard-level byte offsets (each shard has `shard_size(payload_len, data_shards)` bytes). Upper layers treat them as opaque and pass them unchanged to `read_bytes_from_extent`; the EC read path decodes transparently.
+
+8. **EC shard index = position in `replicates ++ parity`** — `replica_addrs_from_cache` chains `replicates` then `parity`; shard `i` ↔ address `i` ↔ encode output shard `i`. Recovery's `replacing_index` uses the same ordering.
+
+9. **Commit tracking is local, not per-append RPC** — `state.commit` is a plain `u32`, starts at 0, updates to `appended.end` after each success, resets to 0 after a new-extent alloc. `current_commit()` (which RPCs all replicas) exists for partition load time only, never in the hot append path.
+
+10. **Extent allocation is capped per append** — at most 3 new-extent allocations per `append_payload` call (`MAX_ALLOC_PER_APPEND`), preventing runaway empty-extent creation if appends persistently fail.
+
+11. **ConnPool is single-kind** — keys by `SocketAddr` alone; each address owns one sequential `RpcConn` on `Rc<RefCell<Option<RpcConn>>>` (take/put; if taken, open a fresh connection on the fly). There is no `PoolKind`.
+
+12. **Chunked reads for >2 GiB extents** — `read_bytes_from_extent` splits requests larger than `--stream-read-chunk-bytes` (default 256 MiB) into per-replica RPCs. Without chunking a single `pread` of 3 GiB returns `EINVAL` (macOS INT_MAX, Linux 0x7ffff000). `length=0` resolves the byte count via `ExtentInfo.sealed_length` (sealed) or `commit_length_for_extent` (open), then chunks. EC dispatch goes straight to `ec_subrange_read`, so **`read_shard_from_addr` chunks internally at `read_chunk_bytes` (u64-offset)** — the single EC choke point that bounds each RPC ≤ 256 MiB (an EC shard is `sealed_length / data_shards`; a 16 GiB / K=3 extent has ~5.33 GiB shards, and a full-shard `MSG_READ` would overflow the response frame's `payload_len: u32`).
+
+13. **Chunked local-file I/O for >2 GiB extents** — server-side helpers in `extent_node.rs` (`FILE_IO_CHUNK_BYTES = 256 MiB`): `file_pread_chunked` (EC convert) and `file_pwrite_chunked` (recovery, re_avali, write_shard; splits via `Bytes::split_to`, O(1)). Both fast-path a single syscall when payload ≤ 256 MiB. **Any new full-extent local-file read/write MUST use these — never call `file_pread`/`file_pwrite` directly with a `sealed_length`-sized buffer.**
+
+14. **Sealed duplicated tails must allocate on init** — after `multi_modify_split` a child stream can inherit a tail extent the manager already sealed at the split point. `ensure_tail_initialised()` MUST treat this as "allocate fresh tail now", not "seed the worker and discover the seal on append" — the latter wedges descendant compaction (the first row_stream append hits the old tail, EN fencing surfaces `LockedByOther`, major compaction never clears `has_overlap`, the next split blocks forever).
+
+14. **Read-side eversion freshness after EC conversion** — `StreamClient` passes its cached `ex.eversion` in every `ReadReq`. A server reads reject `req.eversion < entry.eversion` with a `CODE_EVERSION_MISMATCH` **response** (not a frame-level error — the batched path must reach the client's `is_eversion_stale` detection), enforced in `build_read_future`, the one read path. The client surfaces `EversionStale` and runs a 2-attempt loop that `invalidate_extent_cache` + refetches `ExtentInfo` once; `read_replicated_with_failover` and `ec_subrange_read` fail-fast on it (every replica reports the same mismatch). **Invariant:** `entry.eversion` defaults to 1 on alloc (matches `MgrExtentInfo{eversion:1}`), so any `req.eversion = 0` is by construction stale (only bench/test fixtures pass 0). Never re-add a `> 0` "pass 0 to skip" clause — it silently let a stale-cached open-extent read scrape bytes from a shrunken post-EC shard.
+
+15. **CPU-bound work MUST run on the blocking pool** — RS `ec_encode`/`ec_decode`/`ec_reconstruct_shard` take 100–300 ms per 128 MiB. All callers (`handle_convert_to_ec`, `run_ec_recovery_payload`, `ec_read_full`) wrap the call in `compio::runtime::spawn_blocking`; otherwise the compio event loop stalls while user RPCs queue. **Any new CPU-bound work in this crate (RS math, large CRC, large compression, big sort) MUST be wrapped in `spawn_blocking`.** Error plumbing is double `.map_err`+`?` (join-time panic-Box, then the inner erasure `Result`). Out of scope: WAL CRC32C on small writes (bounded ≤ 2 MiB, amortised).
+
+16. **EC dispatch keys on `ExtentInfo.ec_converted`, NEVER on `parity.is_empty()`** — the manager pre-fills `parity` for every extent on an EC stream, so an open/pre-conversion extent has `parity != []` while still holding full replicated data on every K+M node. Only after `apply_ec_conversion_done` on a *sealed* extent does data physically split into K+M shards and `ec_converted` flip to `true`. Routing a pre-conversion extent through `ec_subrange_read` would compute `shard_size` from `sealed_length=0` and panic on the per-shard slice. Read dispatch (`read_with_layout`) and recovery dispatch (`run_recovery_task`) both branch on `ec_converted`. **Invariant:** `ec_converted == true` implies `sealed_length > 0`; never set `ec_converted` on an open extent.
+
+    **Conversion is COPY-ON-WRITE: it adds files, it never replaces one.**
+    `WriteShard` stages into `extent-{id}.shard{i}`; `.dat` is never renamed,
+    truncated or overwritten, so an abandoned attempt costs a delete of files no
+    reader is pointed at and a successor may pick a completely different
+    assignment. **There is no commit phase** — the manager's layout flip is the
+    single commit point. The old per-node rename left "some renamed, some not",
+    a middle state nobody could classify, which is what made a stuck marker
+    un-releasable. The commit phase is DELETED — `MSG_COMMIT_EC_SHARD` is a reserved
+    tombstone and `.ec.dat` / `.ec.commit` no longer exist anywhere in the
+    codebase. (They were retained briefly as repair code for a node upgraded
+    mid-rename; no deployment held such files, so there was nothing to
+    repair.) **`ec.prepared` remains**: it is the durable carrier of
+    the attempt nonce, which travels in the request while the shard file on
+    disk carries none — without it a coordinator cannot tell whether its
+    staging came from THIS attempt and must re-encode on every re-dispatch.
+
+    Consequences elsewhere: **EC shard recovery writes its rebuilt shard to the
+    file the layout NAMES** (`.shard{i}` when `InShardFile`) — writing it into
+    `.dat` would leave the node serving shard bytes to whoever still asks for
+    the whole value, and the shard the layout points at missing. And
+    **`read_plan` bounds a shard read by the SHARD file's length**, not the
+    extent's: a shard is `sealed_length / K` while the `.dat` beside it (awaiting
+    cleanup) holds the whole extent.
+
+    **EC conversion is ACCEPT-then-BACKGROUND (same shape as recovery).**
+    `handle_convert_to_ec` validates and answers a typed `ConvertToEcResp`. One
+    attempt (nonce) runs at most once: `ec_convert_inflight` maps the extent to the
+    RUNNING attempt's nonce, so a re-send of it answers RUNNING; a re-send of an
+    attempt that FAILED answers FAILED with `failed_target` (the participant index,
+    0 = the coordinator) and does not encode again — the manager cancels the
+    marker; a NEWER nonce supersedes: the map names it, the old attempt stops
+    before its next stripe (`superseded by a newer EC attempt`) — after the
+    stripe in flight, whose participant writes are each bounded by a 30 s
+    timeout — and the new one waits on the extent op lock; an older nonce is
+    refused. A started attempt spawns
+    `run_convert_to_ec_task` and answers STARTED — **not "done"**. The
+    completion is pushed to `ec_done` and drained by the next `df`
+    (`DfResp.ec_done`), which is the ONLY signal the manager applies the layout on
+    (from the etcd marker's PINNED assignment; a reported `new_eversion` that
+    disagrees is REFUSED fail-loud). Rationale: an encode of a multi-GiB extent can
+    outlive any RPC timeout, and a timeout is indistinguishable from a dead
+    coordinator — that ambiguity is what made a stuck marker un-releasable. The
+    idempotent-skip path ALSO reports done (the ADOPT case), so a completion lost
+    to `df`'s at-most-once delivery converges on the next re-dispatch.
+
+    **Attempt identity (`attempt_nonce`) rides the whole conversion.** The
+    manager stamps each attempt with the etcd revision that created its marker;
+    it flows `ConvertToEcReq` → `WriteShardReq` → `EcConvertDone`. Two EN-side
+    consequences: (a) the coordinator's `ec.prepared` marker records
+    `[new_eversion][attempt_nonce]` and the prepare-SKIP requires BOTH to match,
+    because `new_eversion` repeats across a reissued attempt (it is `live + 1`
+    and an abandoned attempt never bumped the extent) — a pre-nonce 8-byte
+    marker reads as short and simply re-prepares, which is always safe; (b)
+    `handle_write_shard` refuses a stripe whose nonce is LOWER than the attempt
+    already staging on this extent (`ec_stage_nonce`, compared under the op
+    lock). Nonces are etcd revisions, hence monotonic, which is what makes "this
+    writer is superseded" decidable. The `owner_epoch` fence does not cover
+    this: it only rises when the ex-coordinator was FENCED, whereas a routinely
+    RELEASED coordinator keeps its epoch and would otherwise interleave stripes
+    into its successor's staging file. `ec_stage_nonce` is in-memory (it
+    arbitrates two live writers); across a restart the stripe-0 truncate and the
+    epoch fence remain. `0` = pre-nonce peer, left unordered.
+
+    **EC conversion is idempotent AND serialised on the coordinator.** `run_convert_to_ec_task` acquires a per-extent `ec_conversion_locks` `Rc<Mutex<()>>` across the entire prepare+commit, and re-runs the idempotency guard under it: if the extent is already EC-converted at this eversion (`entry.eversion >= req.eversion && sealed_length > 0 && avali > 0`) it returns `CODE_OK` without re-encoding. Without this, a re-dispatched or leader-failover-racing convert re-encodes the ALREADY-shrunk local shard as if it were the original payload, producing sub-shards ≈ `original / K²` → silent short reads. The manager dedups convert candidates by `extent_id` (primary fix); the coordinator lock + idempotency is defense-in-depth.
+
+17. **Dead-replica recovery: closed-aware pool + append fanout timeout.** When an EN dies, autumn-rpc's `read_loop` sees EOF and clears `pending`, but the `Rc<RpcClient>` stays pooled. Three layers stop a caller hanging on a receiver that will never resolve: (a) `RpcClient::is_closed()` (set on `read_loop`/`writer_task` exit before `pending.clear()`); every `send_*` early-returns `ConnectionClosed`. (b) `ConnPool::get_client` skips + reconnects a closed entry; `send_vectored` evicts on submit error. (c) `launch_append` wraps each per-replica receiver in a bounded deadline (`StreamClientConfig.append_fanout_timeout`, default 5 s, clamped [200 ms, 60 s]; note 28 made this the BASE of a size-scaled deadline). `Elapsed` → soft error the retry loop escalates to `alloc_new_extent`. **Invariant:** any caller of `pool.send_vectored`/`call_vectored` against a peer that may go down MUST allow the surrounding logic to handle `Err` — never assume a returned receiver resolves. (d) the pipelined senders return a **`PinnedRecv`**, which carries the `Rc<RpcClient>` alongside the receiver. Dropping the last `Rc` now CLOSES the connection (autumn-rpc's task handles are its teardown), and eviction is something other tasks do — one worker's replica timeout evicts the address another worker is mid-append on. Without the pin, that append's frame is abandoned mid-`writev` and its caller reports a closed connection: an append about to succeed, failed by an unrelated caller's error. The pin scopes a connection to the work outstanding on it instead of to the pool entry — an evicted connection closes once its last in-flight response lands or times out (every caller bounds its own wait), while the pool already hands new callers a fresh one.
+
+18. **`read_with_layout` constructs `StaleVpOffset` upfront** when `ex.sealed_length > 0 && offset > ex.sealed_length`, BEFORE the `ec_converted` branch, so the `stale_vp_offset_past_sealed_length:` regex (note 6) fires on replicated VPs too and skips the wasted server round-trip + EC decode. EC's `ec_slice_decoded` keeps its own check as defense-in-depth. Open extents (sealed_length=0) are untouched (no authoritative bound).
+
+19. **Recovery source-fetch MUST be chunked** (`copy_bytes_from_source` loops 256 MiB `MSG_READ`s with block crcs via `read_bytes_chunk`; `fetch_full_extent_from_sources` passes `extent.sealed_length`). A single to-end `MSG_READ` on a multi-GB sealed extent trips the >2 GiB pread ceiling + oversized frame. The EC shard caller (`run_ec_recovery_payload`) keeps `total_len=0` (each shard ≈ `sealed/K`, under threshold). **Invariant:** any new full-extent fetch over `MSG_READ` must chunk.
+
+20. **Failover seal uses the SealCommit handshake — never a public-API-tracked commit.** On same-owner failover the writer seals the failed tail at its OWN all-replica-acked commit; letting the manager probe `commit_length` can capture a speculative/un-acked byte that only one soon-dead member holds → seals at a length no replica durably retains → recovery stuck forever (phantom seal). The only SAFE commit source is the worker's serialized `state.commit` at a QUIESCED point. Mechanism: `StreamSubmitMsg::SealCommit{resp}` → the worker `drain_inflight_for_seal` (awaits every in-flight append, bounded by each one's size-scaled deadline — note 28 — so it cannot hang) → replies the final contiguous `state.commit` → sets `sealing = true` (new appends on the doomed tail get a soft error → retry onto the fresh tail; cleared by ResetTail). The 3 failover sites call `seal_commit_watermark` then `alloc_new_extent(stream, Some(commit))`; preemptive roll passes the drained `Some(commit)` (it used to pass `Some(result.end)`, which is failure 1 of note 36); new-owner/sealed-tail init passes `None` (→ manager probes). `StreamAllocExtentReq.seal_commit: Option<u64>` (Some = authoritative seal at exactly c incl 0; None = probe). **Invariant: never reintroduce a public-API commit-watermark cache; the seal length must come from the worker via SealCommit.**
+
+    **Idempotent seal-and-roll pinned to `seal_extent_id`.** The SealCommit reply is `(commit, tail_extent_id)`; that extent id is threaded to the manager as `seal_extent_id`. `alloc_new_extent` runs under `retry_manager_call` (20×): if an attempt succeeds on the manager (seals tail T at `commit`, rolls fresh T') but its response is LOST, the retry re-sends the SAME `(commit, T)` (the worker's cached tail is still T — it never saw the lost ResetTail). The manager seals ONLY when its current tail still == `seal_extent_id` and is OPEN, else idempotent no-op — so it can NOT over-seal the now-current fresh tail T' at a stale `commit`. **Invariant: any authoritative (`Some(commit)`) alloc MUST pass the captured tail's `seal_extent_id`; only probe/`None` rolls may pass `0`.** Cross-ref: manager note 32a.
+
+21. **`ExtentInfo.sealed` is the authoritative "is sealed" flag — NOT `sealed_length > 0`.** An authoritative empty seal is `sealed = true, sealed_length = 0` (e.g. a CoW-shared empty tail frozen by split/merge). `sealed` = STATE; `sealed_length` = LENGTH. `ensure_tail_initialised` + the soft-error reload check `.sealed`; `read_with_layout` uses `.sealed` for the to-end bound + stale-VP check (a sealed-empty extent reads as empty, no commit_length probe). The stale-VP read-BOUND offset checks keep using `sealed_length`. **Invariant:** `sealed_length > 0 ⇒ sealed`.
+
+22. **`ResetTail` zeroes the worker's commit ONLY when it moves to a DIFFERENT extent.** `state.commit` is the contiguous all-replica-acked prefix — it advances ONLY on a full ACK, never speculatively, so it is ground truth and the value `seal_commit_watermark` reports. Two shapes (`apply_reset_tail`): a **DIFFERENT extent** (genuine roll to a fresh empty tail) → `reset_for_new_extent` (commit/lease_cursor=0, pending cleared, poisoned/sealing cleared); a **SAME extent** (a soft-error tail reload that did NOT change the tail, e.g. a transient replica refusal) → PRESERVE all append-progress state, refresh only cached replica metadata. Zeroing `commit` on a same-extent reload would make the next hard-path `seal_commit_watermark` report `commit=0` and `alloc_new_extent(Some(0))` seal the LIVE tail at `sealed_length=0`, orphaning every acked byte (a CoW child then never opens). `poisoned`/`sealing` MUST also be preserved (a poisoned hole excludes itself + everything after from the contiguous seal). **Invariant: never reset the worker's `commit`/`poisoned` when staying on the same tail extent.** Cross-ref: notes 20, 21, 9.
+
+23. **`owner_epoch` fence is made DURABLE before any append is ACKed under it.** `owner_epoch` (`.meta` bytes 32–40) is the per-extent write fence: `revision < owner_epoch` → `CODE_LOCKED_BY_OTHER`. It is RAISED ONLY by the APPEND path (commit_length is check-only), monotonically, to the request's revision; the value originates from the manager owner-lock. It is NOT `eversion` (bytes 24–32) — independent, checked separately. Two coupled pieces, on the append path (`append_burst_frames`):
+    - **In-memory bar raised SYNCHRONOUSLY** (`owner_epoch.fetch_max(R)`, before any await) so a stale lower owner is rejected immediately even while the new fence persists. `fetch_max` (not `store`) keeps it monotonic under two concurrent higher-revision appends.
+    - **Durable high-water gates the ACK.** `ExtentEntry.durable_owner_revision` = the revision known durable in `.meta`. `ensure_fence_durable(id, entry, R)` returns Ok iff `durable >= R`; else it persists under `meta_write_lock` and advances `durable`. An append ACKs only after `durable >= R`. Fail-closed: a persist failure rejects (`CODE_PRECONDITION`) + marks the disk offline. Fast path = one atomic load; lock+persist fires only on a revision change.
+    - After the durable step, **re-check** both `owner_epoch` (a higher owner may have taken over → LockedByOther) AND `sealed/sealed_length/avali` (a concurrent seal → CODE_PRECONDITION).
+
+    `.meta` durability: ALL `.meta` writers go through `meta_write_lock` (per-extent, DISTINCT from the EC op-lock to avoid self-deadlock). `write_meta_locked` reads the LIVE atomics under that lock (so a stale-snapshot fence persist can't clobber a concurrent seal's `.meta`) and writes ATOMICALLY: `.meta.tmp` → fsync → rename → **fsync parent dir** (else the ACKed fence can regress on a host crash). **Invariants: (1) never ACK an append whose fence isn't durable; (2) raise the in-memory bar synchronously, persist before publishing `durable`; (3) every `.meta` write holds `meta_write_lock` and reads live atomics.**
+
+24. **RESOLVED by the per-extent owner model — the old fsync-coalescer out-of-order-completion durability race is gone.** The deleted coalescer credited durability via a plain `pending_fsync.store` after the pwrite await; under out-of-order same-extent CQE completion a late low-offset write could `store` a SMALLER `pending_fsync` and be satisfied by a `pending <= synced` no-fsync branch, crediting durability to bytes the fsync did not cover. The owner rewrite deleted the coalescer + its loop entirely: appends to one extent are now serialized through ONE owner task (see "Per-extent owner") that drains a burst, issues ONE `write_vectored_all_at`, and does ONE `sync_data` covering exactly that burst's bytes (`pending_fsync` before, `last_synced` after), with bursts run SEQUENTIALLY. There is no concurrent same-extent completion to reorder, so `last_synced` can never advance past an unwritten prefix. The pre-owner analysis had judged the race near-unreachable under io_uring inline-FIFO + `i_rwsem` + single-writer SQE submission; the owner makes that single-writer property STRUCTURAL rather than incidental. **Any change that reintroduces concurrent same-extent writes (e.g. resurrecting a per-request FU on the SQ side) MUST re-validate this** — the load-bearing premise is now "one owner task, one fsync per sequential burst", not the incidental kernel ordering. Cross-ref: note 4, the Commit protocol section.
+
+25a. **ENOSPC: disk health is a 3-state machine (`DiskHealth`: Online / Full / Faulted), the batched-append pwritev MUST be the `_all` form, and caller-ack ⊆ contiguous commit.**
+    - **Every local file write MUST be a `*_all` form (or verify the count).** `append_burst_frames`'s batch path uses `write_vectored_all_at` (loops until done or a real error). POSIX pwritev on a nearly-full disk writes what fits and returns a SHORT count — `Ok(n)` from a raw positional write is NOT success; a partial append fsynced+ACKED reads its unwritten reserved tail back as zeros.
+    - **Classification.** `mark_disk_error_for_extent(id, msg)` at every write/persist error site, and `mark_disk_error(disk, id, msg)` where the extent's `.dat` could not even be created (`create_extent_file`, used by allocation and `ensure_extent`): `choose_disk` ranks disks by load alone, so a disk that takes no new files was chosen again and again, every allocation on the node failed over to another node, and nothing reported the disk (`a_failed_allocation_faults_its_disk`, red before the create path reported). Both go through `classify_disk_error` → `Capacity | Process | Media`. **`Process`** (EMFILE/ENFILE/ENOMEM) touches disk health NOT AT ALL: the write failed and the caller already rejected it fail-closed, but the device is fine, and condemning it costs a full-disk migration now that the manager rebuilds a faulted disk's replicas. Reachable, not hypothetical — `write_meta_locked` opens a temp file and returns `open meta tmp for extent N: Too many open files (os error 24)` straight into this. ENOSPC/EDQUOT ⇒ `Full`: the disk stops hosting NEW extents (`choose_disk` requires `allocatable()`) but keeps serving reads + existing extents, and the per-shard 2 s sweep SELF-HEALS it to Online once free ≥ 5%. Anything else is `Media` — a claim about the DEVICE, and the only class that can reach `Faulted` (permanent until restart). Manager: `select_nodes` soft-avoids nodes below `--min-alloc-free-bytes` (default 256 MiB, 0=off) with the note-17 fallback chain intact.
+    - **`Media` is a SUSPICION until a self-check confirms it** (`DiskFS::probe_write`): one small write + fsync into the failing extent's own hash directory, and only a FAILED probe sets `Faulted`. The verdict used to be the failing operation's own errno, which was right while its cost was local and reversible ("stop allocating here") and became wrong the moment a faulted disk triggers a cluster-wide migration of everything on it: a single transient EIO, or an ENOENT from a `.tmp` swept out from under a meta write, condemned a healthy multi-TB disk permanently. A probe that PASSES leaves the health alone and the caller's operation still fails — the write that failed is not retried here, only the accusation is dropped. It probes the hash directory rather than the disk root because that is where the failure happened, and it unlinks the scratch file before writing it, so no extent payload is touched and a crash leaves nothing behind. The whole probe — open, unlink, write, file fsync, directory fsync — is bounded at 2 s, and a timeout COUNTS AS A FAULT: a device that cannot answer in two seconds is exactly the case this is for, and an unbounded probe would park the caller's error handling behind a hung disk. There is no probe on the `Capacity` or `Process` paths: neither is a claim about the device, so neither has anything to confirm.
+    - **Health is SHARED per physical dir across shards** — `DiskFS.health` is an `Arc<AtomicU8>` from the process-global `shared_disk_health(base_dir)` registry (canonical-path keyed), so shard B can't keep allocating onto a disk shard A marked Full.
+    - **Caller-ack ⊆ contiguous commit (the seal-chop hole).** `apply_completion` fires the caller's oneshot Ok only as the contiguous prefix advances — NOT the moment a batch completes on all replicas when a LOWER lease on the same extent already failed (the mid-pipeline hole ENOSPC produces). Otherwise the writer's `commit` stays below the hole (correct) while the roll's SealCommit CHOPS an already-acked range. On poison, `failure_floor` = first failed offset; every pending/late completion at/above it resolves Err (its replica bytes become benign un-acked duplicates). **Invariant: a caller-visible append ack implies the range is inside the contiguous all-replica-acked prefix.**
+
+25. **No `.meta` persist failure is ever swallowed** — the `.meta` sidecar is the only state a restart trusts (note 23); any path mutating eversion/sealed/avali/sealed_length then ignoring a failed persist reports a state the disk does not hold. All such sites are fail-closed (`mark_disk_offline_for_extent` + error): `run_recovery_task` final persist (also REMOVES the partial `ExtentEntry` so local retries can't reuse the offline disk and block manager re-dispatch), and both `handle_convert_to_ec` seal persists. Corollary: the note-16 **idempotent-skip must ENSURE durability, not just check atomics** — a prior attempt may have published the in-memory atomics then failed its persist, so the skip re-runs `save_meta` (idempotent) and fail-closes if it still can't. **Invariant: returning OK from any seal/convert/recovery RPC asserts the sidecar is durable, not merely that memory agrees.**
+
+26. **/metrics.** Performance only: `render_en_metrics()` reads `EN_APPEND_TOTALS`, process-global monotonic batch/bytes/ns counters (3 relaxed fetch_adds per BATCH), and appends the buffer pool's (`autumn_en_regpool_*`, `autumn_transport::render_regpool_metrics`). Disk health is state and travels on the df answer instead (`DiskStatus.online`, and `DiskStatus.full` for an ENOSPC-full disk, which the manager passes on as `NodeStateEntry.full_disks` — `autumn-op list-nodes` / overview); extent counts are the manager's (`overview` `extent_count`). Each shard still runs its 2 s ENOSPC self-heal sweep (Full → Online once free space is back above 5%). The binary serves it on its own thread and compio runtime, pinned to no core (spawned before any shard thread pins itself), at `--port` + 500 unless `--metrics-port` (0 = none); shard 0's `handle_df` reports the address (`NodeRegistration.metrics_addr`, `DfResp.metrics_addr`) so `autumn-op info --file-sd` can list the EN for Prometheus (`NodeStateEntry.metrics_addr`).
+
+27. **Read-path Suspected avoidance (replicated route-around + EC proactive reconstruct).** `alloc_extent` already excludes manager-`Suspected` nodes; reads apply the SAME avoidance so rotation onto a flaky node does not cost a per-read timeout.
+    - **Client-side snapshot, not new wire.** `StreamClient.suspected: Rc<RefCell<SuspectedCache>>` refreshed by `maybe_refresh_suspected()` at `read_with_layout` entry: TTL-gated (2 s) + NON-BLOCKING (spawns a detached poll of `MSG_LIST_NODE_STATES`, filter `NODE_AUTO_STATE_SUSPECTED`, swaps the set in; the current read proceeds on the slightly-stale snapshot and NEVER awaits a manager RTT). A failed poll keeps the prior snapshot — a failed refresh must NEVER widen the avoidance set.
+    - **Replicated = soft deprioritize (never exclude).** `replicated_read_order(ex, offset, suspected)` folds rotated start + `avali` eligibility + Suspected-to-BACK; suspected slots are kept as a last-resort tail (suspected ≠ dead; a sealed extent's committed bytes are on EVERY replica). **Invariant: an empty Suspected snapshot reproduces the rotated walk byte-for-byte — the hot path is unchanged.**
+    - **EC = proactive reconstruct.** In `ec_subrange_read` a data shard whose node is Suspected goes straight into `needs_reconstruct`, so the direct-read `join_all` never blocks on a flaky node's timeout before `ec_reconstruct_shard_subrange` (read K healthy + parity, first-K-wins) rebuilds it.
+    - **ALL THREE VP read paths covered** (or a hot GET silently bypasses it): copy/chunked (`read_replicated_with_failover`), bulk value proxy (`read_value_into_pooled`, same `replicated_read_order`), client-direct descriptor (`extent_read_descriptor` uses `healthy_eligible_slots` to **DROP** Suspected addresses — the external SDK picks its own start, so ordering wouldn't help; keeps ALL when every one is Suspected → never strands).
+    - **Soft hint, correctness-independent.** A stale/over-broad snapshot only costs latency or parity traffic, never data. Cross-ref: rotation+hedge, `eligible_replica_slots` (avali I2), write-path `bad_nodes` (distinct: alloc-only, per-stream).
+
+28. **The append deadline is SIZE-SCALED, and a roll-away that sealed its tail EMPTY reclaims the abandoned extent.** A fixed 5 s `append_fanout_timeout` (sized for 4 KiB WAL) applied to a 256 MiB SST flush append times out while every EN durably wrote the bytes; those bytes are correctly EXCLUDED from `state.commit`, so the retry seals the tail at commit 0 and rolls, rewriting the same SST → a permanently unreclaimable `sealed_length=0` extent per iteration (invisible to all logical accounting, GC, and orphan-reconcile) → disk fill → death spiral.
+    - **FIX #1 — size-scaled deadline** (`effective_append_timeout`): `deadline = min(append_fanout_timeout + payload_len / append_floor_bytes_per_sec, 600 s cap)`; threaded into `launch_append` as `AppendDeadline::for_payload`. `append_fanout_timeout` (clamped [200 ms, 60 s]) is the BASE; floor default 8 MiB/s — ~1.5 orders below measured healthy bulk, so it distinguishes "dead replica" from "slow but progressing" (4 KiB→5 s, 8 MiB→6 s, 256 MiB→37 s, 512 MiB→69 s). The 600 s cap preserves the note-17 dead-replica bound (every `InflightFut` still resolves → SealCommit drain can't hang). Tunable `with_append_floor_bytes_per_sec` [64 KiB/s, 1 GiB/s]. **Invariant: never apply a fixed deadline to an append path whose payload can span 4 KiB–512 MiB; derive from size.**
+    - **FIX #2 — abandoned-tail reclaim** (`reclaim_abandoned_empty_tail`, from `alloc_new_extent` after a successful roll): when a failure-roll sealed its old tail at commit **0** (`seal_commit == Some(0)`, `seal_extent_id != 0`, and the manager did NOT hand that extent back as current tail — the idempotent-no-op branch), re-fetch the authoritative post-seal `ExtentInfo` (cache invalidated) and, ONLY if `sealed == true && sealed_length == 0`, best-effort `punch_holes` it out of the stream. SAFE because caller-ack ⊆ contiguous commit (note 25a): a sealed-AT-0 extent has NO acked byte ⇒ no VP/SST/checkpoint references it. **NEVER "fix" the leak by counting timed-out bytes as committed (silent-loss trap, notes 20/22/25a); never punch anything not authoritatively sealed-empty.** Residual (punch/extent_info failure on unreachable manager still leaks one extent) → backstop: a sealed-empty sweep. Cross-ref notes 17, 20, 22; manager note 32a.
+
+29. **Reads use the same size-scaled deadline (`IoDeadline`, generalized from `AppendDeadline`).** A fixed 3 s (5 s on EC) applied to an 8 MiB transfer stormed under load. `IoDeadline` (`effective_io_timeout`, `IO_TIMEOUT_CAP`) is shared; READS use a SEPARATE (base, floor): `read_base_timeout` 3 s (every read < ~4 MiB is byte-identical to before) and `read_floor_bytes_per_sec` 4 MiB/s (looser than the 8 MiB/s append floor — a read is one replica's pread+transfer, no RF=3 fsync barrier). 8 MiB read → 5 s; 256 MiB chunk → 67 s < the 600 s cap (the cap is never binding for reads because every read RPC is chunk-bounded ≤ `read_chunk_bytes`; do NOT lower the cap below 67 s). Applied at all SIX size-varying read sites (`read_extent_value_direct`, `read_extent_value_landed`, `read_value_into_pooled`, `read_shard_chunk_from_addr`, `ec_reconstruct_shard_subrange`, `ec_read_full`). **Retry damping on LIVENESS TIMEOUT** (`is_liveness_timeout`): the direct + bulk-proxy paths stop walking replicas after 2 timeouts and fall through to the authoritative proxy/copy path; FAST errors (eversion / GC'd / connect-refusal) keep the full rotation. **INVARIANT: any size-varying network I/O MUST derive its deadline from `IoDeadline::for_len(len)`, NEVER a fixed `Duration::from_secs(N)`.** Control-plane RPCs (commit_length, probe, stream/extent_info, alloc, punch, owner-lock) are fixed-size → a constant is correct there. Cross-ref note 28.
+
+30. **Manager-call failures are TYPED (`ManagerError{code, ctx, message}`); `retry_manager_call` is code-classified; owner-epoch fences self-heal via the poison path instead of burning retries.** A flattened anyhow string made `retry_manager_call` (20×) treat an etcd-backed deterministic verdict (a permanently stale `owner_epoch`) as transient → 10 s of futile retries per call (rotating is useless — every manager reads the SAME etcd state). Three parts:
+    - `check_manager_resp` returns `ManagerError` (code preserved for `downcast_ref`; Display keeps the legacy `"<ctx> failed: <message>"` shape for non-fence so log greps are unaffected).
+    - `retry_manager_call` classifies before retrying (see the retry-classification list under "Connection & ownership"). The transient-conflict marker (`is_transient_conflict`) is retryable WITHOUT rotating; the fence + deterministic Preconditions fail fast, unwrapped.
+    - **Owner-fence self-heal.** `ManagerError::is_owner_fence` (CODE_PRECONDITION + `autumn_common::is_owner_epoch_fence_message`, the matcher living next to its `ensure_owner_epoch` producer in `common/store.rs`) renders Display as `"<ctx> fenced (LockedByOther): …"`. The **"LockedByOther" token is LOAD-BEARING**: the PS's `is_locked_by_other` (`{e:#}` chain-wide so `.context` wraps can't hide it) poisons the partition → reopen re-acquires a fresh epoch (the SAME self-heal the EN's native `CODE_LOCKED_BY_OTHER` triggers). The PS also closes the liveness gap: a poisoned/crashed partition thread's dead handle is detected by `sync_regions_once` (`is_finished()`) and dropped, so the region map arbitrates the same tick (still-assigned → reopen with fresh epoch; moved-away → clean release). **Invariant: a stale `owner_epoch` must NEVER be silently re-acquired inside StreamClient** — auto-refresh would defeat fencing (a zombie writer could steal the lock back); recovery is always tear-down-and-reopen at the partition layer, arbitrated by the region map.
+
+31. **`fence_tail` EAGERLY raises the EN fence floor on TAKEOVER (the takeover "SIGSTOP zombie writer" fix).** The EN `owner_epoch` floor is raised ONLY by the APPEND path (note 23), so on an IDLE takeover (new owner acquires E_new but has not written yet) the floor stays at the OLD owner's epoch E_old. A paused-then-resumed previous owner (SIGSTOP > eviction window → reassign → SIGCONT) whose in-flight append still carries E_old then PASSES the fence (`E_old == stored`, neither `<` nor `>`), lands in the log extent, and is ACKed — a silent LOST UPDATE the new owner never sees. `fence_tail(stream_id, owner_epoch)` closes this: it resolves the stream's CURRENT tail extent + replica set (`get_stream_info` → `get_extent_info` → `replica_addrs_for_extent`) and sends `MSG_FENCE_EXTENT{tail, owner_epoch}` to every REACHABLE replica, raising the EN floor to E_new BEFORE the partition serves. The PS calls it in `partition_thread_main` for all three stream tails (log/row/meta) right after the initial `commit_length` loop and BEFORE `recover_partition` (fencing is a control op, not a row_stream append, so routing all three through `part_sc` is consistent with the row_stream single-writer rule). **Lenient + best-effort** (mirrors seal-over-reachable): append is all-replica-ACK, so fencing even ONE reachable replica already blocks the zombie (its append needs EVERY replica to accept). Returns Ok if ≥1 replica was fenced (`CODE_OK`) or already carries a higher epoch (`CODE_LOCKED_BY_OTHER`); an unreachable / fail-closed replica is logged + skipped; a total failure is logged and the open PROCEEDS (never wedge on a transient fence failure). **Invariant: the takeover fence must run before the partition accepts requests; it does NOT replace the append-path fence (note 23) — it makes it EAGER instead of first-append-lazy.** The read-side (`handle_get_bulk`) has no write fence, so a residual STALE READ from the old owner before it closes the reassigned partition is a documented SEPARATE follow-up (out of scope for this write-side fix). A second narrow residual: an extent allocated AFTER the fence is born at floor 0 (raised lazily by the first append), so a zombie that follows a tail ROLL into a fresh unfenced tail during the sub-second window before the new owner's first append could still slip through — far narrower than pre-fix (needs a sealed tail at takeover + tight timing); a born-fenced alloc (carry the allocator epoch in `AllocExtentReq`) is the hardening follow-up. The APPEND path also re-checks `owner_epoch` AFTER the commit-reconcile truncate await, so a fence landing DURING an in-flight append's widest awaits still rejects it — the fence op's "durable ⇒ stale appends rejected here" contract holds across the whole prologue.
+
+32. **`seal_and_roll_tail` is live-writer-aware — a LIVE stream's tail may only be sealed through its worker.** The manager learns a seal immediately, but the ENs learn it only LAZILY (nothing pushes seals; the append path detects them only via an eversion mismatch that a stale writer never triggers, since its cached eversion equals the ENs'). So a bare manager probe-seal (`alloc_new_extent(None, 0)`) behind a live per-stream worker freezes `sealed_length` while the worker keeps appending to the SAME extent and keeps ACKing clients — every post-seal acked byte sits above `sealed_length`, invisible to committed-clamped replay and to CoW split children (the chaos acked-write-loss family: `stale_vp_offset_past_sealed_length` child wedge / silent-stale reads; deterministic repro `crates/manager/tests/system_roll_tails_live_writer.rs`). `seal_and_roll_tail` therefore branches on `existing_stream_worker(stream_id)` (lookup-only, never spawns): worker present → SealCommit handshake (quiesce → the worker's exact all-replica-acked commit, freezes the doomed tail) → `alloc_new_extent(Some(commit), tail_id)` (notes 20/22 idempotent-roll rules) → `ResetTail` onto the fresh extent — identical mechanics to the append-failure roll; worker absent (the WAL self-heal runs before the worker spawns) → the original probe roll, race-free because there is no writer to race. **Invariant: never manager-seal a stream tail that a live worker may still be appending to without first quiescing THAT worker via SealCommit and redirecting it via ResetTail.** If the alloc fails after SealCommit, the worker is left `sealing = true` — self-healing: the next append soft-errors into the public-API retry path, which performs its own quiesced roll.
+
+33. **Client-side EC corruption reporting — considered and REJECTED (do not build).**
+    The proposal: when an EC shard read
+    fails, have the reader call `report_corrupt_replica` so the manager marks the
+    slot corrupt and force-dispatches a rebuild past the recovery gate. Rejected
+    because the signal does not exist at this layer, not because the plumbing is
+    expensive:
+    - **A failed shard read is not the reader's evidence to act on.** Rot has
+      a first-party reporter: the shard's own node, when a scrub compares the
+      shard with its `.shard{i}.ck`. No stream-layer read checks content, so
+      rot never fails a shard read at all. (A PS's SST block CRC does check
+      content, above this layer: on a failure it reads around the shard with
+      `read_range_copies` — reconstructing with each covering data shard left
+      out, `ec_subrange_read(.., distrust)`, the distrusted node not asked — and
+      logs the culprit; it still does not report it.) Everything that does fail a shard read is not corruption:
+      timeout/connect (congestion or a dead node —
+      Suspected avoidance, note 27, and operator fencing already handle both),
+      `CODE_PAYLOAD_NOT_HERE` (stale layout → the typed refresh; or a genuinely
+      missing shard file), or the META-FAILCLOSED quarantine — which
+      `build_read_future` deliberately DISGUISES as an `EversionStale` refusal so
+      clients fail over, meaning a client-side classifier cannot even tell
+      quarantine from ordinary staleness.
+    - **False-positive blast radius on 4+1 is metastable.** Isolating one slot
+      leaves K of K: every read of the extent degrades to
+      `ec_reconstruct_shard_subrange` (zero slack, K× wire traffic) and the
+      forced rebuild reads shard-size × K more — while the dominant real cause of
+      failed shard reads is LOAD, so the mechanism amplifies exactly the overload
+      that triggered it, across every extent that hiccuped in the same window. A
+      cross-request per-(extent,shard) failure counter does not repair this:
+      N timeouts is stronger congestion evidence, not corruption evidence.
+    - **The manager refuses it anyway**: `handle_report_corrupt_replica`
+      rejects EC-converted extents — its evidence is the same bytes read clean
+      from another copy, and an EC extent has no other copy of any byte. The
+      plumbing would have been cheap (`owner_epoch` and `reporter_part_id`
+      already live on `StreamClient`, `ReportCorruptReplicaReq` carries every
+      field), which is why THIS note records the evidential argument as the
+      reason.
+    - **What closes the real gaps instead.** (a) Rot needs EN-side first-party
+      evidence — the scrub ("At-rest integrity") supplies it for `.dat` AND for
+      shard files, reported as a ROT outcome on `DfResp.scrub_done`; the manager isolates an
+      EC slot on that report while K shards still serve. (b) A missing shard file / quarantined holder is
+      first-party EN knowledge too; today's repair is an operator fence of the
+      node (force-dispatches every slot → `run_ec_recovery_payload`).
+
+34. **A node that MOVED is not a node that is gone — forgetting its ADDRESS is an orthogonal side effect, not a retry class.**
+    A node keeps its id across a restart (identity is the `node_uuid` on its
+    data dir), so a moved EN leaves every cached layout naming it CORRECT and
+    only `nodes_cache` wrong. The three original retry classes all end in
+    `invalidate_extent_cache` + refetch `ExtentInfo`, which returns the same
+    ids, which resolve through the same dead host — forever. Observed: a PS
+    dialling an EN's previous pod IP for hours after every slot had
+    re-registered, every read degrading to `ec_reconstruct` and then failing
+    `0/K shards`, while `extent-health` reported all slots healthy. In Kubernetes
+    deployments pod IPs change on every rollout, so this is routine, not exotic.
+
+    Two halves, and the SECOND is the one that covers the common case:
+    - `ReadRetry::NodeAddrStale` classifies a read that FAILED OUTRIGHT, so the
+      retry re-resolves instead of returning the error. Applies when every
+      replica moved at once.
+    - `forget_node_addr(node_id)` is called at the THREE sites that SWALLOW a
+      per-replica failure: EC degrading to reconstruct, replicated failover
+      moving to the next slot, and the bulk-proxy GET path
+      (`read_value_into_pooled`). A rolling update moves ONE node at a time, so
+      the others cover for it, the read SUCCEEDS, and nothing ever reaches
+      `read_retry_action`; without this the dead address stays cached and every
+      later read to that slot pays a full connect timeout, silently, for the
+      life of the process. The GET path matters most: `replicated_read_order`
+      rotates the start by `(extent_id, offset)`, so one moved node fronts
+      roughly one read in K+M. Per node, never the whole map: `nodes_cache` is
+      shared by every stream on the client.
+
+    **A node that is DOWN must not buy a `nodes_info` per read.** Forgetting
+    heals a node that MOVED; a crashed-but-still-registered one is listed by the
+    manager at its old address, so the refresh re-inserts exactly what was
+    dropped and the cycle repeats — with `Connection refused` failing instantly,
+    a partition at thousands of GETs/s would aim thousands of manager calls/s at
+    the leader for the whole suspicion window. `forget_node_addr` is therefore
+    rate-limited per node (`NODE_ADDR_FORGET_COOLDOWN`, 30 s). This invariant
+    predates the rework and was lost in the first rewrite of this note; it is
+    load-bearing, not a nicety.
+
+    **The same sites tell the manager.** All three call `note_unreachable`
+    (forget + `report_unreachable`). `report_unreachable` sends
+    `MSG_REPORT_DISK_FAILURE` through the client's drainer, at most once per
+    node per `NODE_ADDR_FORGET_COOLDOWN` (a read path can meet a dead node
+    thousands of times a second; the manager counts one report per reporter
+    per window). Before, only a failed APPEND reported (`try_report_failure` in
+    the worker), so a node that only readers could not reach went unreported.
+    Only a connect failure (`is_connect_failure`, which also
+    covers a handshake that timed out) on a KNOWN slot reports:
+    `forget_unreachable_replicas`, which does not know which replica failed,
+    forgets but never reports, so a node not tied to the failure is never named.
+    A node that MOVED is named once per client per cooldown, on the first
+    refusal at its stale address, and reads touch every node, so one PS with
+    several partitions can reach the manager's quorum (distinct reporting
+    partitions in its window) by itself. Accepted: what the manager does with
+    a quorum is unchanged, it marks the node's disks offline
+    (`handle_report_disk_failure`), so allocation avoids the node until the
+    next successful df (2 s) puts them back online. That starts no rebuild:
+    recovery moves a copy only off a fenced node, a corrupt slot, or a disk its
+    own node reports faulted. Tests:
+    `unreachable_report_tests::an_unreachable_node_is_reported_once`.
+
+    **Why a side effect and not a variant**: `ec_gather_collect` keeps only the
+    LAST error, so a gather that hit both a dead address and a typed refusal is
+    classified by whichever landed last — and a connect timeout arrives seconds
+    after a refusal arrives in milliseconds. Worse, a REUSED pod IP answers
+    instantly with an untyped `not found`, which carries no class at all. The
+    cure has to be independent of that race.
+
+    `is_connect_failure` is deliberately NARROWER than note 29's
+    `is_liveness_timeout`: the latter matches any "timed out" and would put a
+    manager round trip in front of every congested read of a healthy node.
+    **Invariant: retrying at most once still holds.** Both retry loops go
+    through `forget_for_retry` — the first draft taught only the plain read and
+    left the committed read (WAL replay, on the longest-lived client there is)
+    with the pre-fix behaviour.
+
+
+35. **The per-stream worker's lifetime and its "tail initialised" flag are ONE
+    lifetime, and an exiting worker may only unregister ITSELF.**
+    Both halves were missing, and together they truncated 1.7 GiB on each of
+    three replicas of one extent, on a single append.
+
+    A worker is spawned lazily and owns all append state; `ensure_tail_
+    initialised` is what gives it a tail and — via `current_commit` +
+    `SeedCursor` — a lease cursor at the extent's committed length. That init
+    is gated on a per-stream `bool`. A worker that skips it keeps the
+    `lease_cursor = 0` it was born with, and `header.commit = offset` means
+    the first append it sends tells every replica to truncate to zero.
+
+    Two defects made that reachable, and they compose in the order a SPLIT
+    produces (split calls `invalidate_stream` on all three streams):
+    - `WorkerRemovalGuard::drop` removed by KEY, so a worker exiting after a
+      successor had been spawned deleted the LIVE successor's entry;
+    - the init flag was keyed by stream id and cleared only by
+      `invalidate_stream`, so it outlived the worker it described.
+
+    Split → invalidate (clears both) → append spawns worker #2, which
+    initialises → worker #1 finally drains and exits, deleting #2's entry →
+    the next append spawns #3, finds the flag still true, skips init, and
+    leases from zero.
+
+    The fix tags each worker with a generation and gates BOTH removals on it.
+    The order matters: clearing the flag ahead of the generation check passes
+    every obvious test while making a LIVE worker re-initialise underneath
+    itself — two workers leasing one extent from independent cursors, which is
+    worse than the bug. `an_exiting_worker_does_not_unregister_its_successor`
+    pins that order.
+
+    `"no tail set"` is fail-fast AND drops the stream's init flag on the way
+    out. Dropping the flag is what makes it fail-fast rather than fail-forever:
+    re-entry reaches the SAME worker, and `ensure_tail_initialised` would
+    return early on a still-set flag, so every later append on that stream
+    would fail too until a split or a restart.
+
+    **Nothing zeroes a commit on this path** — the zero is simply never
+    overwritten, which is why it left no trace. The symptom that DOES appear
+    is on the extent node: `truncating extent to the writer's commit` with
+    `commit=0`, followed by the manager sealing the extent far below what the
+    nodes hold (`BUG2 UNDER-SEAL`). Cross-ref notes 20, 21, 22, 25a.
+
+
+36. **The cap-hitting roll must QUIESCE like every other roller. Two failures,
+    opposite sides of one window.**
+    The preemptive roll fires from a SUCCESSFUL append whose `end` reached
+    `max_extent_size`, and it used to seal at that `end` and send `ResetTail`
+    without draining. Its comment said later-leased appends are "beyond it →
+    re-driven onto the new tail". Neither half was true, because the PS
+    pipelines up to `ps_inflight_cap` (8) Phase-2 appends on one stream, so the
+    roller is one caller among eight.
+
+    - **An append that completes BEFORE the reset is ACKED PAST THE SEAL.**
+      `ack` has no cap awareness: it advances the contiguous prefix and answers
+      that caller `Ok` at an offset above the `end` this roll is sealing at.
+      WAL replay clamps to `sealed_length`, so those acked bytes are invisible
+      on recovery — silent loss of acked data, the exact family notes 20/22/25a
+      exist to prevent. The window is the roller's own `alloc_new_extent`
+      manager RPC plus `build_stream_tail`, and under continuous load the
+      sibling's EN round trip is shorter than that, so this is the common case
+      at every 16 GiB boundary rather than a corner.
+    - **An append still IN FLIGHT at the reset is stranded.**
+      `reset_for_new_extent` sets `commit = 0` and clears `pending_acks`, but
+      the futures in the worker's `inflight` are untouched. Their completions
+      are then applied to the FRESH extent's state, where a 16 GiB-scale offset
+      can never join the prefix: the entry sits in `pending_acks` holding the
+      caller's oneshot, and nothing — no timer, no retry, no later ack — ever
+      removes it. The PS's Phase 2 is an unbounded `ack_rx.await`, so one such
+      entry stops that partition answering anything. Observed: connection
+      tasks waiting 1600 s past every downstream deadline, 100-220 MiB of
+      unread requests per partition, flush and SST threads idle, extent nodes
+      idle, nothing logged above INFO, unrecoverable without a restart.
+
+    The `SealCommit` handshake closes both: the drain makes the reported commit
+    cover every completed append and leaves none stranded, and `sealing = true`
+    bounces appends arriving during the roll onto the fresh tail instead of
+    letting them land past the seal. Cost per 16 GiB per stream: one drain, plus
+    the bounced siblings each paying a 100 ms backoff and a tail reload, plus the
+    PS holding Phase 3 behind the roller for that window. Two corners come with
+    it: a sibling's failure-roll landing between the roller's ack and its
+    handshake makes the roller seal-and-roll the FRESH extent once more (no data
+    loss — the seal is the drained commit), and a roll that seals but then fails
+    to allocate leaves the worker frozen until the next append's hard path rolls
+    it (logged at WARN).
+
+    `apply_completion` additionally REFUSES a completion whose `extent_id` is
+    not the current tail's, failing that caller so it re-drives. That is a
+    REACHABLE backstop, not an unreachable invariant: the soft-error tail
+    RELOAD cannot be quiesced, and although it is meant to be a same-extent
+    refresh, it takes its tail from a manager `StreamInfo` RPC while
+    `apply_reset_tail` decides same-vs-different by extent id — so a reload
+    served just before a concurrent roll's alloc lands moves the worker
+    BACKWARDS while completions for the new extent are still in flight.
+    Quiescing the rollers WIDENS that window rather than closing it, because a
+    cap-hitting roll now bounces its siblings into exactly that reload path. It
+    also removes a latent second bug: a stale FAILED completion used to run
+    `rewind_or_poison` against the fresh extent, poisoning it for the old
+    extent's failure.
+
+---
+
+## RPC wire protocol (`extent_rpc.rs`, in autumn-rpc)
+
+autumn-rpc custom binary protocol (10-byte frame header). No protobuf — hot-path
+RPCs use hand-coded binary encoding; control-plane RPCs use rkyv zero-copy.
+
+### Hot-path binary codecs
+
+| RPC | msg_type | Request | Response |
+|-----|----------|---------|----------|
+| Append | 1 | rkyv `AppendHeader` + payload as the value | 17B |
+| Read | 19 | rkyv `ReadReq` | `[code][rkyv ReadResp]` + bytes as the value |
+| ReadAm | 20 | rkyv `ReadAmReq` (`ReadReq`, tag, max_len) | value as the tagged AM, then `[code][rkyv ReadResp]` |
+| CommitLength | 3 | 16B | 5B |
+| FenceExtent | 17 | 16B | [code]+msg |
+
+### Control-plane (rkyv)
+
+AllocExtent(4), Df(5), RequireRecovery(6), ReAvali(7), ConvertToEc(9),
+DeleteExtent(11), ScrubExtents(18).
+`WriteShard` (10) is shaped like the append: ctrl = rkyv `WriteShardHeader`
+with the stripe's crc32c, the stripe the frame's value; the connection loop
+decodes it (`decode_write_shard`, value parts joined) and refuses a stripe
+that misses its crc before `handle_write_shard` stages it. The header carries
+the whole shard's length (`shard_len`, wire 85): a stripe past it is refused,
+and the stripe that ends there is the last. **A staged shard is described as
+it is written**: each stripe's block crcs are computed in the blocking pool
+while the stripe is written (`extent_cksum::PieceRecord`, kept on the
+`ExtentEntry` per shard index with the attempt nonce), and once the last
+stripe is durable the holder writes `.shard{i}.ck`. Stripe 0 resets the record
+and drops any description of the content it replaces; a stripe from another
+attempt, or a gap, leaves the shard undescribed for a scrub, and so does nonce
+0 (a pre-nonce peer's attempts are unordered, so two could meet in one record)
+or a failed crc task (the stripe is durable regardless). The EC rebuild
+(`rebuild_ec_shard_by_stripes`) collects the crcs of the bytes it reconstructs
+in the same blocking task and persists them after `land_rebuilt_shard`. Tests:
+`scrub::tests::staging_describes_the_shard_it_wrote` (red without the stripe-0
+forget or the nonce check), `each_stripe_reports_its_bytes_once_they_are_written`
+checks the rebuild's description, and `ec_participant_meta_seal.rs` checks every holder's `.ck`
+after a real conversion (red without the persist), and
+`scrub_on_demand.rs::an_ec_shard_described_at_conversion_is_checked_and_a_rotted_one_rebuilt`
+finds every shard clean on the first scrub and the rebuilt one described (red
+without the rebuild's persist).
+
+**Response codes are append-only and every one of them must be NAMED.**
+`CODE_CONTENT_CORRUPT = 8` is reserved; nothing produces it. Adding a code is a
+wire event
+(with client compatibility checked separately), and `code_description` must learn it in the same
+change: an unnamed code renders as one generic word, which is how a stale-fence
+rejection and a corrupt-content refusal become the same useless log line.
+
+**`MSG_FENCE_EXTENT` (17) — eager owner_epoch fence, no append.** `handle_fence_
+extent` raises the per-extent `owner_epoch` fence floor to `req.owner_epoch`
+WITHOUT writing: it mirrors the APPEND fence prologue (`owner_epoch.fetch_max` +
+`ensure_fence_durable`, fail-closed) minus the pwrite. `FenceExtentReq`
+(16 B binary `[extent_id][owner_epoch]`, same shape as CommitLength) →
+`FenceExtentResp` (`[code][message]`): `CODE_OK` = floor `>= owner_epoch` &
+durable; `CODE_LOCKED_BY_OTHER` = a HIGHER owner already holds it (caller stale);
+`CODE_PRECONDITION` = fail-closed (persist error / quarantined `.meta`).
+`owner_epoch <= 0` is a protocol error. It deliberately does NOT reject a SEALED
+extent — raising a sealed tail's floor is a harmless no-op. Used by
+`StreamClient::fence_tail` on partition TAKEOVER to close the idle-takeover
+zombie-writer window (see note 31).
+
+---
+
+## Performance (`benches/extent_bench.rs`)
+
+Single compio thread, loopback TCP, 4 KB payload, single pipelined
+connection opened as a peer (VERSION_HELLO, PEER_AUTH), each append's commit
+leased at the end of everything sent before it (as the stream client does —
+the reply's `end` lags the pipeline and would truncate the appends in flight).
+Run with `TMPDIR` on a real disk (`/tmp` may be overlayfs): every append
+fsyncs. On ext4 NVMe, the thread pinned to one idle core: write
+depth=1 ~40 MB/s, depth=32 ~200 MB/s, depth=64 ~330 MB/s (fsync-bound, wide
+run-to-run spread); 4 KB reads ~840 MB/s at depth 16.
+
+Optimizations: pwritev batch (consecutive MSG_APPEND → one `write_vectored_at`),
+pread batch, `write_vectored_all` (all responses from one TCP read in one
+syscall), client pipelining (sliding window hides RTT + enables server-side
+batching). See `benches/bench_results.md`.
+
+---
+
+## Background-loop supervision (extent-node)
+
+Every EN background loop runs under a supervisor (a bare `spawn(..).detach()`
+swallows panics). Two helpers in `extent_node.rs`:
+- `en_spawn_supervised(name, make)` — catch_unwind + ERROR-log + 1 s restart, for
+  the RESTARTABLE orphan-reconcile sweep (re-derives from `node.clone()` each
+  tick, owns no moved resource).
+- `en_spawn_failstop(name, fut)` — catch_unwind; normal return = expected lazy
+  exit; PANIC → ERROR-log + `std::process::exit(1)`, for the per-extent
+  `owner_loop` (the durability-critical single writer; a panic mid-burst must not
+  silently strand queued appends → fail-stop, EN restarts and recovers from disk).
+
+**Bounded connect**: `ConnPool::get_client` relies on the 5 s bound
+`RpcClient::connect_as` applies to TCP/UCX connect + VERSION_HELLO
+(`version_hello::TIMEOUT`), so a blackholed peer (SYN dropped) can't hang a
+caller. There is exactly ONE timer: a second, equal-length one here raced it,
+and the error's shape — which the classifiers read — depended on which won.
+The error is `RpcError::Timeout` (or the transport error) under a `connect
+<addr>` context; `{:#}` reads `connect <addr>: RPC timed out after 5s`, plain
+`to_string()` only `connect <addr>`, so both classifiers (`is_connect_failure`,
+`is_liveness_timeout`) format with `{:#}`.
+
+The connect stays OUTSIDE the caller's own deadline in `call_timeout` /
+`call_into_pooled`, which bound only the call after it: a read's deadline is
+~3 s for small values, shorter than the connect bound, and a connect failure
+has to surface as one or `is_connect_failure` never classifies a stale node
+address and every later small read to it waits out its deadline for the life
+of the process. `a_connect_that_never_completes_is_classified_through_the_real_pool`
+drives the real pool against a peer that never answers the hello and asserts
+both classifiers; putting the connect inside the call deadline, or reading
+`to_string()` in `is_liveness_timeout`, makes it red.
+
+**Invariant:** never reintroduce a bare `spawn(..).detach()` for an EN
+background loop — use `en_spawn_supervised` (re-derive-safe) or
+`en_spawn_failstop` (moved-resource / durability). Request-triggered detached
+tasks (`run_recovery_task`, EC convert) are NOT loops — a panic there fails one
+retried operation, so they stay as-is.
+
+---
+
+## Streaming recovery / re_avali (extent-node memory)
+
+**Node-to-node calls share one pool.** Every RPC an extent node makes — to the
+manager, a sibling shard, or a peer (recovery / peer-copy / EC-rebuild source
+reads, `WriteShard` stripes) — goes through its `pool` (`ConnPool`), so a
+recovery reading a 16 GiB extent in 256 MiB chunks uses one connection to its
+source, not one per chunk. A timeout evicts the connection
+(`call_frame_timeout`, `call_prepared_timeout`). The source reads keep the
+reply's value as received (`Bytes`) and write it out without copying it.
+
+`run_recovery_task` and `handle_re_avali` stream the full sealed extent from a
+healthy peer **chunk-by-chunk** via `stream_extent_from_sources`: per chunk read
+one `FILE_IO_CHUNK_BYTES` (256 MiB) range via `MSG_READ` (block crcs checked) → `pwrite` at its
+offset → drop → next. **Peak resident = one chunk**, independent of extent size;
+one `sync_data` after the full write. `dest` is truncated to 0 before each
+source attempt, so a mid-stream source failure abandons that source and the next
+restarts from offset 0 (partial write discarded — no corruption). Succeeds only
+on a full `sealed_length` transfer. EC recovery (`stream_ec_recovery_payload`)
+streams too: `rebuild_ec_shard_by_stripes` walks `ec_stripe_plan(want, 64 MiB)`,
+and per stripe `fetch_ec_stripe_from_peers` reads that byte range from K peers
+at once (a failed peer starts the next slot; exact length or refused), reconstructs the missing range, `pwrite`s it, drops
+it — peak `(K + 1) × stripe`. The walk takes the fetch as a closure so a test
+can drive it without peers.
+
+**Op progress rides `df` (`DfResp.op_progress`, keyed by extent, no op id).**
+`note_op_progress` overwrites one `(kind, done, total)` sample per extent;
+`OpProgressGuard` owns the slot for the life of a task and empties it on
+`Drop`, so an abandoned task cannot keep reporting (the recovery retry loop
+holds one across all attempts; its give-up path has no explicit clear and
+needs none). Rules the samples follow: **counts in bytes, never per byte** —
+one sample per 64 MiB stripe for EC convert and EC rebuild, one per 256 MiB
+chunk for replica copy; **EC rebuild samples AFTER the stripe is written**,
+never when the peers answer — a stripe needs K peers to decode, so a count of
+bytes fetched would move while a dead peer holds the rebuild at one offset
+forever, and `done` frozen at a stripe boundary IS the stall signal; **the
+recovery task opens with `(0, 0)`** (the ledger's "not reported" shape) and
+**resets to it the moment an attempt fails**, before the 10 s retry sleep, so
+a failed attempt's last ratio — bytes it has already unlinked — does not ride
+out the sleep or the next attempt's queue time as a fake stall. EC rebuild uses
+`OP_KIND_RECOVERY`, not a kind of its own: it is one `RecoveryTask`, and the
+manager's ledger entry for it is `(OP_KIND_RECOVERY, extent_id)`.
+
+**Stripe-wise EC convert.** RS over GF(256) is byte-wise per offset
+(`erasure::ec_encode_stripe`, byte-identical to a slice of `ec_encode`), so
+`handle_convert_to_ec` reads the K data sub-ranges at shard-offset `s`, encodes
+the M parity stripes, and sends every remote shard's stripe at once via `WriteShard` carrying
+`shard_offset: u64` and the stripe's crc (`WriteShardReq::prepared`, checked by
+the receiver); the receiver `pwrite`s into `.shard{i}` at `shard_offset` +
+`sync_data`s (`write_shard_stripe_local`). Peak RAM = `(K+M) ×
+EC_ENCODE_STRIPE_BYTES` (64 MiB default → ~256 MiB), independent of extent size;
+each WriteShard stays under the frame ceiling. Crash-safety: per-stripe
+`sync_data` + stripe after stripe (the next starts once every participant
+acked this one) grow the durable prefix monotonically; the
+coordinator writes its OWN shard-0 stripe LAST per stripe, so
+`coordinator_prepared` ⇒ every participant durably staged every stripe.
+`write_shard_stripe_local` bounds `shard_offset + stripe_len ≤ sealed_length` so
+a malformed/stale WriteShard can't balloon the shard file into a sparse one — a
+shard read is bounded by that file's length, so a sparse tail is served as part
+of the shard and EC reconstruct fails on the over-long slice. The
+peer-copy (coordinator local short) streams into a TEMP file via
+`peer_copy_full_extent_to_dat` and atomic-renames over `.dat` only after a full
+copy lands (never `set_len(0)` a live replica before securing a complete copy).
+
+**Invariant:** any new full-extent peer-copy-then-writeback path must stream via
+`stream_extent_from_sources` / `peer_copy_full_extent_to_dat` (or an equivalent
+read-chunk→write-chunk→drop loop) — never buffer the whole extent in a `Vec`
+unless shard-sized. Any new EC encode must be stripe-wise so the transient + the
+per-RPC WriteShard stay bounded regardless of extent size.
+
+### Recovery over-promised-seal reconciliation
+
+`stream_extent_from_sources` does NOT retry forever when the manager's
+`sealed_length` is an unrecoverable over-promise (the lenient failover seal can
+seal at a length no replica durably retains — e.g. a speculative byte that
+rolled back). It tracks per-source outcome: `best` (longest copy delivered),
+`err_count` (sources that errored mid-stream), `unverified` (non-excluded
+sources that could not even be attempted). If a source delivers the full
+`sealed_length` → return it. Otherwise, **only when EVERY non-excluded source
+was REACHED and is consistently SHORT** (`err_count == 0 && unverified == 0`),
+reconcile to the replica consensus: re-stream the longest available copy and
+return it. SAFE under all-replica-ACK (the acked prefix is on every committed
+replica, so the best reachable copy is ≥ acked; only phantom un-acked tail bytes
+drop). Two load-bearing guards: (1) re-stream errors are propagated
+(`stream_one_source(...).await?` then `got < best_len → Err`), NEVER swallowed to
+`Ok(0)`; (2) `unverified == 0` (not just `err_count == 0`) — an un-attempted
+source might hold the only full copy. **Invariant: never reconcile a sealed
+extent DOWN while any non-excluded source was unreachable or unattempted.**
+
+---
+
+## 崩溃一致性 fail-closed 不变量
+
+下面几处崩溃一致性都是 fail-closed（断电/内核崩溃触发；`kill -9` 不丢已 fsync 的
+page cache 或 dirent，chaos 测不到）。
+
+**META-FAILCLOSED — 损坏 `.meta` 隔离。** `load_extents` 读路径区分：(a) `.meta`
+present-but-corrupt（parse None = CRC/magic/eid 不符）→ quarantine；(b) 非-NotFound
+读错误（EIO/EACCES，状态未知）→ quarantine；(c) 真 NotFound → 默认 open（fresh
+extent）。`ExtentEntry.corrupt_meta: AtomicBool`；quarantine 时 append / read /
+commit_length **全部拒绝**；`write_meta_locked` 成功持久后清 flag（recovery/re_avali
+重建即 un-quarantine）。**不变量：`.meta` 损坏/不可读 + `.dat` 在 = 绝不默认 open，
+必 quarantine 待 manager 恢复**（否则一个本该 sealed/fenced 的 extent 重启即变
+open+epoch0，stale 低-epoch writer 绕过 fence ghost-append = split-brain）。
+
+**EC-STAGING-DURABLE — EC staging 的父目录 fsync。** 转换是
+copy-on-write：`write_shard_stripe_local` 把每个 stripe `pwrite` 进**附加文件**
+`extent-{id}.shard{i}`，`.dat` 全程不动。每个 stripe 写完 `sync_data()` 让内容持久，
+再 **fsync 父目录**（`fsync_staging_dir`）让**目录项**持久 —— POSIX 下新文件的名字
+不随内容 fsync 一起落盘。缺这一步，断电可能内容还在而 dirent 没了，下一个 stripe
+发现 staging 文件消失；而 `write_shard_stripe_local` 此时**拒绝**（绝不在原 offset
+重建一个文件，否则会造出带零洞的 shard 并可能被发布），于是这次 attempt 卡住，
+等 manager 重新派发。
+
+**没有 commit 阶段，所以没有 commit 崩溃窗要保护。** 旧方案是每个节点把 staging
+`rename` 覆盖 `.dat`，于是"rename 之后、`save_meta` 之前"是一个真实的崩溃窗（`.dat`
+已是 shard 而 `.meta` 还是 pre-EC），需要一个 commit-intent marker 才能修回来；更糟的是
+它会让集群停在"一部分节点已 rename、一部分没有"这个**没人能分类**的中间态，这正是
+当初 marker 卡死无法释放的根源。现在**唯一的 commit 点是 manager 那一次 layout flip**
+（`apply_ec_conversion_done`，单个 leader-fenced txn 同时改 membership / eversion /
+`avali` / `payload_location`）。在那之前什么都没提交 —— shard 只是没有任何 reader 被
+指向的附加文件 —— 所以放弃一次 attempt 的代价只是删掉几个文件。节点侧对应地**没有**
+rename、没有 `.ec.commit` marker、没有启动重放；`MSG_COMMIT_EC_SHARD` 是保留的墓碑。
+shard holder 的 seal 是在 `apply_placements` 处理 InShardFile 转移时，由
+`apply_extent_meta_durable` 一次 `save_meta` 写下（seal + location 一起）。
+
+**`.ec.prepared` 是 attempt 身份的载体。** staging 文件自己不带 attempt 信息，而
+`new_eversion` 在被释放后重发的 attempt 上会重复（它是 `live + 1`，被放弃的 attempt
+从没 bump 过 extent），所以 marker 里记的是 `[new_eversion][attempt_nonce]`，
+prepare-skip 必须**两者都匹配**才跳过重新编码。升级前留下的 8 字节旧 marker 读起来
+是"短"的，于是只会多做一次 prepare —— 永远安全。`remove_extent_files` 会连它一起
+unlink。
+
+## Compio 0.19 compatibility
+
+Compio is inherited from the workspace (0.19.2, Rust >=1.95). Prepared append
+CRC, all-replica persistence and ordering remain unchanged. For opt-in TCP
+zerocopy validation, AUTUMN_TEST_ZEROCOPY=1 enables the RPC prepared-frame
+threshold in the prepared_append integration test. AUTUMN_TEST_UCX_BIND still
+selects UCX, which keeps its existing send path even with this option enabled.
+
+## Keepalive ping (server side) and dead-peer eviction (client side)
+
+`process_frames_backpressured` answers `autumn_rpc::MSG_TYPE_PING` straight into
+`tx_bufs` — ahead of `dispatch` and without an inflight slot — so every
+`RpcClient`'s keepalive (autumn-rpc CLAUDE.md "Dead-peer detection") sees the
+connection loop alive. At its in-flight cap (64) the loop stops reading and a ping
+waits with everything else; 64 requests stalled ≥ 8 s on one connection can get
+that connection closed by its client. For a PS→EN append connection that close
+arrives at `launch_append` as a connection error — the same path a replica
+timeout takes (`mark_bad_node`, failure report, roll to a fresh extent) — rather
+than the appends being waited out. No measurement has shown an EN stalling that
+long; if one does, the choice is a longer `Keepalive` for the stream pool. `ConnPool::get_client` already replaces an
+`is_closed()` client, which now includes one closed for silence.
+
+## Connection pool refusal handling
+
+ConnPool call/call_timeout/call_vectored/call_into_pooled retain connections
+when RpcError is a Status, including a peer's Unavailable. Local deadlines and
+transport failures still evict. Errors are retained as typed RpcError inside
+anyhow; their Display text is unchanged. Pipelined PinnedRecv ownership and
+submit-time closed checks remain in effect. src/connection_tests.rs verifies
+all call shapes with real status frames, subsequent successes, EOF, bad CRC,
+and local timeouts.

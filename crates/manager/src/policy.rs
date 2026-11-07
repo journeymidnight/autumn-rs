@@ -1,0 +1,1354 @@
+//! policy engine: per-partition load metrics window + split/merge
+//! candidate computation. Stage 1 ships advisory only; auto-trigger is
+//! gated behind feature flags in Stage 2/3.
+
+use std::collections::{HashMap, HashSet, VecDeque};
+
+use crate::store::MetadataState;
+use autumn_rpc::manager_rpc::{
+    PartitionLoad, PolicyCandidate, POLICY_KIND_EC, POLICY_KIND_GC, POLICY_KIND_HOT_COLD,
+    POLICY_KIND_MAJOR_COMPACT, POLICY_KIND_MERGE, POLICY_KIND_REBALANCE,
+    POLICY_KIND_SPLIT,
+};
+
+const GIB: u64 = 1024 * 1024 * 1024;
+
+/// per-tick cap on EC-conversion advisory candidates. Without
+/// it, a backlog of N sealed-not-converted extents (real-cluster
+/// observation: 10k+ after a controller pause) emits N candidates per
+/// tick into both the manager's `advisory_cache` and every
+/// `MSG_GET_POLICY_CANDIDATES` response payload, with no upper bound.
+/// 256 was picked as ~1 MiB of rkyv'd advisory payload at the
+/// observed ~4 KiB per `PolicyCandidate` — keeps the response under
+/// etcd's default `max-request-bytes` ceiling and the controller's
+/// per-tick decision space tractable. Sort-by-sealed-length-desc
+/// preserves payoff-first ordering (the controller naturally drains
+/// the largest extents first, where 3 → K/(K+M) savings dominate);
+/// the same extents stay in the backlog across ticks until the
+/// controller dispatches `MSG_FORCE_EC_CONVERT`, so truncation does
+/// not "lose" them.
+pub const MAX_EC_ADVISORY_CANDIDATES: usize = 256;
+
+/// band tightener for hot/cold classification. A partition
+/// only qualifies as "hot" when its window MIN is still within
+/// 1/HOT_COLD_BAND_DIVISOR of the PS's hottest reading — i.e. its
+/// LOWEST bucket is still elevated. Symmetric on the cold side.
+/// Previously the classifier picked partitions on equality with the
+/// PS-wide max/min, so a partition that oscillated wildly (10k qps in
+/// bucket 1, 100 qps in bucket 5) registered as the PS's MAX in
+/// bucket 1 AND its MIN in bucket 5 — emitted into BOTH the hot and
+/// cold lists of the same advisory. D=2 ≈ "stable within a factor of
+/// 2 across the window"; a workload that swings 10× is genuinely
+/// neither sustained-hot nor sustained-cold and the advisory should
+/// stay silent rather than recommending an action against it.
+pub const HOT_COLD_BAND_DIVISOR: u32 = 2;
+
+/// Policy thresholds. Defaults and flags: `autumn_params::manager`; tests
+/// lower `required_buckets` / `tick_interval_sec` to run the tick fast.
+#[derive(Clone, Debug)]
+pub struct PolicyConfig {
+    /// Two size measures, two different questions, and getting them the wrong way
+    /// round produced both of this module's historical misfires.
+    ///
+    /// - `PartitionLoad.size_bytes` — **LSM-resident**: Σ SST len + memtables.
+    /// - `effective_size_bytes` — **carried**: `max(size_bytes, est_live)`, which
+    ///   adds the large-value payload sitting in `log_stream` (a VP workload keeps
+    ///   only ~24-40 B pointers in the LSM, so carried runs ~60× LSM: live part 17
+    ///   was 741 MB LSM against ~45 GB of stream bytes).
+    ///
+    /// **A split divides the key range, and only the LSM follows the key range.**
+    /// The values do not: a CoW split leaves both children referencing the SAME
+    /// log_stream extents, and nothing physically separates them until a major
+    /// compaction rewrites the tables and GC relocates the live payload. So a
+    /// partition carrying 73 GiB behind a 0 MiB LSM, serving no requests, gains
+    /// nothing from a split except that compaction bill — which is what the
+    /// carried-bytes trigger used to advise, every window, for as long as the
+    /// partition existed.
+    ///
+    /// Hence: the hard SIZE trigger reads LSM-resident bytes (`--split-lsm-hard-bytes`),
+    /// and carried bytes keep their two other jobs, where the payload genuinely is
+    /// what matters — the floor under the rate triggers (`--split-size-min-bytes`), and
+    /// the veto on merge (`--merge-size-low-bytes`), since merging two fat partitions
+    /// really does put all of those bytes behind one thread.
+    ///
+    /// For a small-value workload the two measures are CLOSE but not equal —
+    /// `est_live` also counts live `log_stream` (WAL) and meta_stream bytes on top
+    /// of the row_stream SSTs. The gap is the WAL tail, not the 60× the VP case
+    /// shows.
+    pub split_lsm_hard: u64,
+    /// CARRIED bytes a partition must exceed before a rate trigger may split
+    /// it — a floor, not a trigger.
+    pub split_size_min: u64,
+    /// The measured single-partition QPS ceiling on the perf_check workload is
+    /// ~30K (one P-log thread, one io_uring); 15K = 50% of it — "this partition
+    /// is using half its single-thread budget, time to split."
+    pub split_qps_high: u32,
+    /// The BYTE-RATE ceiling, which for a large-value workload is the one that
+    /// binds: a partition is one log_stream, measured at ~350 MB/s, and no number
+    /// of requests per second describes that limit — 1 500 ops/s of 8 MiB values
+    /// saturates it while reading as an idle partition to `--split-qps-high`.
+    ///
+    /// 175 MiB/s = 50 % of the measured ceiling, the same "using half its
+    /// single-stream budget" rule `--split-qps-high` applies to the request ceiling.
+    /// Read + write summed: the stream is one pipe.
+    ///
+    /// What "sustained" means here, precisely, because it is weaker than it sounds:
+    /// the PS ships a 5-SECOND average every 5 s and the policy bucket is 60 s
+    /// LAST-WINS, so "all N buckets" tests five 5-second samples taken a minute
+    /// apart — 25 s of coverage across a 5-minute span, not an integral over it. A
+    /// writer that bursts near each minute boundary passes; one at 170 MiB/s
+    /// continuously does not. This aliasing is inherited from `--split-qps-high`
+    /// rather than introduced here, but byte rate on a large-value workload is
+    /// burstier than request rate, so this trigger leans on it harder.
+    pub split_bw_high: u64,
+    pub split_immfull_high: u32,
+    pub split_cooldown_sec: i64,
+    pub merge_size_low: u64,
+    /// 10× hysteresis against `split_qps_high`: 1.5K = 5% of the single-partition
+    /// ceiling — "two adjacent cold partitions barely make a dent, merge
+    /// them to free a core slot."
+    pub merge_qps_low: u32,
+    /// Byte-rate counterpart of `--merge-qps-low`. Without it the cold test can pass
+    /// on a pair that is moving real data: 1 400 ops/s of 1 MiB values is under the
+    /// QPS floor and is 1.4 GB/s, and merging them puts all of it on one log_stream.
+    ///
+    /// Compared against the SUM over the pair and over both directions, exactly as
+    /// `--merge-qps-low` sums the pair's requests — so the 10× hysteresis holds of
+    /// the POST-MERGE partition (the entity a merge creates and the right one to
+    /// compare against `--split-bw-high-bytes`), and is 20× per side.
+    pub merge_bw_low: u64,
+    pub merge_cooldown_sec: i64,
+    pub bucket_sec: i64,
+    /// Only `required_buckets` are consulted; 10 keeps a 2× margin over the
+    /// default 5.
+    pub window_buckets: usize,
+    pub required_buckets: usize,
+    pub tick_interval_sec: i64,
+    /// drop a partition's metrics window when its latest bucket
+    /// is older than this. Without it, a deleted / merged-away partition's
+    /// final `PartitionLoad` snapshot kept driving advisories indefinitely
+    /// (the manager never explicitly clears `metrics[part_id]` on partition
+    /// drop). 5 min covers a full `required_buckets × bucket_sec` window plus
+    /// slack.
+    pub stale_metrics_age_sec: i64,
+    /// GC debt advisory threshold. Default 1 GiB sustained — large
+    /// enough to filter normal write churn, small enough that operators
+    /// notice before disk pressure.
+    pub gc_debt_high: u64,
+    /// major-compaction debt advisory threshold. Default 4 GiB — higher
+    /// than GC because compact's pending bytes naturally accumulate to
+    /// flush-size × N tables before the periodic loop fires.
+    pub compact_pending_high: u64,
+    /// GC advisory cooldown. Once an advisory fires for a partition,
+    /// suppress re-emission for 5 min so operators can react without
+    /// duplicate-noise.
+    pub gc_cooldown_sec: i64,
+    /// compaction advisory cooldown.
+    pub compact_cooldown_sec: i64,
+    /// minimum sealed-extent size to even consider EC advice. Below
+    /// this, the EC encode + K+M shard write + manager state churn
+    /// outweigh the (replication - K/(K+M)) × `sealed_length` saved.
+    /// 64 MiB matches WAS lazy-EC heuristics.
+    pub ec_min_extent_bytes: u64,
+    /// Phase B: emit a rebalance advisory only when the per-PS
+    /// partition-count spread (max − min) EXCEEDS this. `2` gives hysteresis — a
+    /// balanced cluster's irreducible remainder gap is ≤ 1, and a transient gap of 2
+    /// (one partition mid-reopen) shouldn't trigger a move; a gap of 3+ is a real
+    /// imbalance worth correcting.
+    pub rebalance_gap_threshold: usize,
+    /// Cluster-level cooldown between rebalance advisories — each actuation moves a
+    /// bounded batch, so re-emit only after the reopen churn settles.
+    pub rebalance_cooldown_sec: i64,
+    /// How many partitions one armed rebalance actuation moves per tick — bounded so
+    /// the target PSes aren't hit by a reopen storm; convergence is gradual across
+    /// ticks (HBase limits concurrent region moves the same way).
+    pub rebalance_max_moves_per_tick: u32,
+    /// Stage D: hot/cold imbalance advisory thresholds. Per PS, the
+    /// ratio `max(req_per_sec) / max(1, min(req_per_sec))` over
+    /// `required_buckets` consecutive sustained windows must exceed this
+    /// to trigger a single advisory candidate listing the hot + cold partitions.
+    pub hot_cold_ratio: u32,
+    /// The hottest partition must additionally exceed this floor so a
+    /// uniformly-cold cluster (e.g. idle dev) doesn't spam the operator.
+    /// pinned to **10_000** (≈ 1/3 of the measured ~30K single-partition
+    /// QPS ceiling). Decoupled from `--split-qps-high` — operators tuning
+    /// the split threshold no longer auto-shift the hot/cold floor.
+    pub hot_cold_min_hot_qps: u32,
+    /// Stage D (size dimension): same 10× ratio, but on
+    /// `size_bytes`. Catches large-value / low-QPS workloads that QPS
+    /// imbalance can't see.
+    pub hot_cold_size_ratio: u64,
+    /// Size-dimension floor: the largest partition must exceed this to be worth
+    /// flagging. 25 GiB of CARRIED bytes — this advisory's size dimension is about
+    /// where the data sits across the PS's partitions, so unlike the split trigger
+    /// it reads the payload too, and it is a standalone number rather than a
+    /// fraction of a threshold that measures something else.
+    pub hot_cold_min_hot_size_bytes: u64,
+    /// Per-PS advisory cooldown — suppress re-emission for 5 min so the
+    /// operator log isn't flooded while imbalance persists.
+    pub hot_cold_cooldown_sec: i64,
+}
+
+impl PolicyConfig {
+    pub fn from_params(p: &autumn_params::manager::ManagerParams) -> Self {
+        Self {
+            split_lsm_hard: p.split_lsm_hard_bytes.get(),
+            split_size_min: p.split_size_min_bytes.get(),
+            split_qps_high: p.split_qps_high.get(),
+            split_bw_high: p.split_bw_high_bytes.get(),
+            split_immfull_high: p.split_immfull_high.get(),
+            split_cooldown_sec: p.split_cooldown_secs.get(),
+            merge_size_low: p.merge_size_low_bytes.get(),
+            merge_qps_low: p.merge_qps_low.get(),
+            merge_bw_low: p.merge_bw_low_bytes.get(),
+            merge_cooldown_sec: p.merge_cooldown_secs.get(),
+            bucket_sec: p.policy_bucket_secs.get(),
+            window_buckets: p.policy_window_buckets.get(),
+            required_buckets: p.policy_required_buckets.get(),
+            tick_interval_sec: p.policy_tick_secs.get(),
+            stale_metrics_age_sec: p.policy_stale_metrics_secs.get(),
+            gc_debt_high: p.gc_debt_high_bytes.get(),
+            compact_pending_high: p.compact_pending_high_bytes.get(),
+            gc_cooldown_sec: p.gc_cooldown_secs.get(),
+            compact_cooldown_sec: p.compact_cooldown_secs.get(),
+            ec_min_extent_bytes: p.ec_min_extent_bytes.get(),
+            rebalance_gap_threshold: p.rebalance_gap_threshold.get(),
+            rebalance_cooldown_sec: p.rebalance_cooldown_secs.get(),
+            rebalance_max_moves_per_tick: p.rebalance_max_moves_per_tick.get(),
+            hot_cold_ratio: p.hot_cold_ratio.get(),
+            hot_cold_min_hot_qps: p.hot_cold_min_hot_qps.get(),
+            hot_cold_size_ratio: p.hot_cold_size_ratio.get(),
+            hot_cold_min_hot_size_bytes: p.hot_cold_min_hot_size_bytes.get(),
+            hot_cold_cooldown_sec: p.hot_cold_cooldown_secs.get(),
+        }
+    }
+}
+
+impl Default for PolicyConfig {
+    fn default() -> Self {
+        Self::from_params(&autumn_params::manager::ManagerParams::default())
+    }
+}
+
+/// per-partition Σ `sealed_length` over the
+/// partition's three streams' DEDUP'd extents — the manager-authoritative
+/// half of `est_live_bytes`. Mirrors `compute_cluster_overview_resp`'s
+/// `live_size` sealed sum (rpc_handlers.rs), sourced
+/// from `state.partitions` (carries log/row/meta stream ids for every live
+/// partition, present even before a region is assigned). Pure + read-only;
+/// called once per advisory pass on the 60 s policy tick — O(streams +
+/// extents) in-memory CPU, no RPC.
+///
+/// Known over-count (accepted, direction-safe — design doc §3.3): after a
+/// CoW split, extents shared with the SIBLING partition are counted in
+/// full by both children until major compaction drops the shared refs.
+/// Over-estimating only delays merge / hastens split.
+pub(crate) fn partition_sealed_sums(state: &MetadataState) -> HashMap<u64, u64> {
+    let mut out = HashMap::with_capacity(state.partitions.len());
+    for p in state.partitions.values() {
+        let mut seen: HashSet<u64> = HashSet::new();
+        let mut sum = 0u64;
+        for sid in [p.log_stream, p.row_stream, p.meta_stream] {
+            if let Some(st) = state.streams.get(&sid) {
+                for eid in &st.extent_ids {
+                    if seen.insert(*eid) {
+                        if let Some(e) = state.extents.get(eid) {
+                            sum = sum.saturating_add(e.sealed_length);
+                        }
+                    }
+                }
+            }
+        }
+        out.insert(p.part_id, sum);
+    }
+    out
+}
+
+/// (design doc §3.3 D3): estimated REAL live bytes a
+/// partition carries, VP payload included:
+///
+/// ```text
+/// est_live = Σ sealed_length (3 streams, dedup'd — manager state)
+///          + open_tail_bytes       (PS-reported)
+///          − gc_debt_bytes         (PS-reported: dead bytes before the replay floor)
+///          − open_tail_dead_bytes  (PS-reported: dead bytes at/after it, open tail incl.)
+/// ```
+///
+/// All four components already exist — zero wire change, zero PS hot-path
+/// cost. Arithmetic is SATURATING throughout: the sealed sum is a
+/// point-in-time manager snapshot while the three PS gauges refresh on
+/// their own cadences (open_tail 30 s probe, debts each GC tick), so a
+/// just-punched extent can transiently leave debts > sealed + open_tail;
+/// clamping to 0 (instead of wrapping) makes the degenerate value fall
+/// back to `size_bytes` via `effective_size_bytes`'s max.
+///
+/// Known error bars (accepted, documented in the design doc):
+/// - CoW-shared extents double-count across split siblings (see
+///   `partition_sealed_sums`) — over-estimate, direction-safe.
+/// - row_stream garbage (pre-truncate compacted-away SSTs) is NOT
+///   subtracted (only log_stream debt is tracked) — over-estimate,
+///   direction-safe.
+/// - `open_tail_bytes` is 0 until the PS's first successful probe and the
+///   gauges are minutes-stale at worst — matches the policy's 5-minute
+///   sustained window; the `max` in `effective_size_bytes` covers the
+///   under-estimate side.
+/// - `sealed_sum` is a SINGLE current-pass snapshot applied to EVERY bucket
+///   in the sliding window (see the caller in `split_candidates`), so the
+///   size dimension does NOT participate in the "all N buckets must trigger"
+///   debounce — only the PS-reported components (`open_tail`/debts) are
+///   per-bucket. A step change in sealed bytes (a fresh large SST, or a GC
+///   that drops a batch) therefore reaches the size trigger in one tick
+///   instead of a sustained window. ACCEPTED for now because: (a) the
+///   controller is off unless a policy with split/merge switched on is
+///   started, so this mostly affects the `policy-candidates` advisory; (b) sealed is
+///   a slow, near-monotonic variable; (c) split/merge both have cooldowns.
+///   Historising `sealed` per-bucket would push an O(extents) sum onto the
+///   high-frequency `handle_report_partition_load` hot path, which is exactly
+///   what this snapshot-per-pass design avoids. BEFORE arming size-based
+///   auto-exec this MUST be fixed — either historise sealed off the hot path
+///   (a per-partition sealed ring in PolicyEngine, updated each compute tick)
+///   or drop the size dimension out of the debounce entirely (size is a slow
+///   monotonic level, unlike QPS spikes the window exists to filter).
+pub fn est_live_bytes(sealed_sum: u64, l: &PartitionLoad) -> u64 {
+    sealed_sum
+        .saturating_add(l.open_tail_bytes)
+        .saturating_sub(l.gc_debt_bytes)
+        .saturating_sub(l.open_tail_dead_bytes)
+}
+
+/// The size metric every size predicate (split / merge / hot-cold)
+/// consumes: `max(size_bytes, est_live)`.
+///
+/// Why max on BOTH sides (deviation from the design doc's "est_live alone
+/// for merge", strictly MORE conservative than it): for split, `old ∨ new`
+/// only ADDS candidates (small-value loads keep the exact old trigger);
+/// for merge, requiring `max < threshold` = `old ∧ new` only REMOVES
+/// candidates — so a degraded est_live (open-tail probe not yet run →
+/// open_tail_bytes = 0 → under-estimate) can never flag a partition the
+/// old LSM-resident metric still sees as big. Either metric saying "big"
+/// vetoes a merge and qualifies a split.
+pub fn effective_size_bytes(sealed_sum: u64, l: &PartitionLoad) -> u64 {
+    l.size_bytes.max(est_live_bytes(sealed_sum, l))
+}
+
+#[derive(Default)]
+pub struct PartitionMetricsWindow {
+    pub buckets: VecDeque<(i64, PartitionLoad)>,
+}
+
+impl PartitionMetricsWindow {
+    #[cfg(test)]
+    pub fn push(&mut self, ts: i64, load: PartitionLoad) {
+        let c = PolicyConfig::default();
+        self.push_with_cap_and_bucket(ts, load, c.window_buckets, c.bucket_sec);
+    }
+    /// snap `ts` to a `bucket_sec` boundary. If the previous
+    /// entry shares that snapped bucket, REPLACE its load (last-wins
+    /// within a bucket). Previously every PS `report_load_loop` tick
+    /// (5 s cadence) produced a fresh bucket, so `required_buckets=5`
+    /// represented just 25 s of history, not the 5 minutes the
+    /// `bucket_sec=60` × `required_buckets=5` arithmetic implied — every
+    /// advisory's "sustained over 5 min" guarantee was off by 12×.
+    /// Bucketing here makes the windowed advisories' time-span match
+    /// their documented semantics regardless of report cadence.
+    pub fn push_with_cap_and_bucket(
+        &mut self,
+        ts: i64,
+        load: PartitionLoad,
+        cap: usize,
+        bucket_sec: i64,
+    ) {
+        let bucket_sec = bucket_sec.max(1);
+        let snapped = (ts / bucket_sec) * bucket_sec;
+        if let Some(back) = self.buckets.back_mut() {
+            if back.0 == snapped {
+                back.1 = load;
+                return;
+            }
+        }
+        self.buckets.push_back((snapped, load));
+        while self.buckets.len() > cap {
+            self.buckets.pop_front();
+        }
+    }
+
+    /// The most-recent `n` buckets (newest-first), or `None` when the window
+    /// holds fewer than `n` (insufficient history → the caller skips the
+    /// advisory). Dedups the `buckets.iter().rev().take(n)` + length-guard
+    /// preamble shared by every `compute_*` advisory.
+    fn recent(&self, n: usize) -> Option<Vec<&(i64, PartitionLoad)>> {
+        let bs: Vec<_> = self.buckets.iter().rev().take(n).collect();
+        (bs.len() >= n).then_some(bs)
+    }
+}
+
+#[derive(Default)]
+pub struct PolicyEngine {
+    pub metrics: HashMap<u64, PartitionMetricsWindow>,
+    /// (kind, primary, secondary) -> ts of last advisory log; used to
+    /// avoid spamming the same candidate every tick.
+    pub last_advisory_at: HashMap<(u8, u64, u64), i64>,
+    pub advisory_cache: Vec<PolicyCandidate>,
+    pub advisory_cache_at: i64,
+    /// runtime-configurable thresholds. Default production values;
+    /// tests can override via `set_config`.
+    pub config: PolicyConfig,
+    /// Stage D: per-PS hot/cold advisory cooldown. Keyed by
+    /// `ps_id`; value is the unix-epoch second of the last WARN.
+    pub last_hot_cold_at: HashMap<u64, i64>,
+    /// Phase B: cluster-level rebalance advisory cooldown
+    /// stamp (unix-epoch second of the last emission; 0 = never).
+    pub last_rebalance_at: i64,
+    /// step 4: split points an operator declared via
+    /// presplit (union over every registered namespace). A merge candidate whose
+    /// disappearing boundary is one of these is never advertised — the manager
+    /// would refuse the merge anyway, so proposing it would just make the
+    /// controller retry a doomed op forever and fill `policy-candidates` with
+    /// noise an operator can't act on.
+    ///
+    /// Lives on the engine rather than in `ComputeArgs` so the (many) existing
+    /// call sites keep working: empty set = no boundary is sacred = exactly the
+    /// pre-feature behaviour.
+    pub sacred_boundaries: std::collections::HashSet<Vec<u8>>,
+}
+
+impl PolicyEngine {
+    pub fn set_config(&mut self, config: PolicyConfig) {
+        self.config = config;
+    }
+
+    /// drop metrics windows that no longer correspond to a
+    /// known partition (post-split / merge / PS-evict) OR whose latest
+    /// bucket is stale beyond `--policy-stale-metrics-secs`. Previously the
+    /// `policy_tick_loop` would happily emit advisories — including
+    /// MERGE candidates pointing at a victim that no longer exists —
+    /// off these zombie windows. Also clears the per-PS hot/cold
+    /// cooldown for evicted PSes so the entry doesn't leak forever.
+    /// Called once at the top of `policy_tick_loop` before any
+    /// `compute_*_advisory` runs.
+    pub(crate) fn prune_stale_metrics(&mut self, state: &MetadataState, now: i64) {
+        let known_parts: HashSet<u64> = state.partitions.keys().copied().collect();
+        let known_pses: HashSet<u64> = state.regions.values().map(|r| r.ps_id).collect();
+        self.metrics.retain(|part_id, window| {
+            if !known_parts.contains(part_id) {
+                return false;
+            }
+            match window.buckets.back() {
+                Some((ts, _)) => now - *ts <= self.config.stale_metrics_age_sec,
+                None => false,
+            }
+        });
+        self.last_hot_cold_at
+            .retain(|ps_id, _| known_pses.contains(ps_id));
+        // last_advisory_at entries naturally age out as policy_tick_loop
+        // overwrites the cache; not worth a targeted prune.
+    }
+}
+
+pub struct ComputeArgs<'a> {
+    pub(crate) state: &'a MetadataState,
+    pub last_op_at: &'a HashMap<u64, i64>,
+    /// part_id -> ps_id from regions; used to mark merge candidates
+    /// `same_ps = false` when adjacent partitions live on different PSes.
+    pub region_owners: &'a HashMap<u64, u64>,
+    pub now: i64,
+}
+
+impl PolicyEngine {
+    pub fn compute_candidates(&mut self, args: ComputeArgs<'_>) -> Vec<PolicyCandidate> {
+        let mut out = self.split_candidates(&args);
+        out.extend(self.merge_candidates(&args));
+        self.advisory_cache = out.clone();
+        self.advisory_cache_at = args.now;
+        out
+    }
+
+    /// SPLIT pass — per-partition sliding-window trigger.
+    ///
+    /// **A split candidate must name a bottleneck a split relieves.** There are
+    /// exactly three, and each has the metric that measures it:
+    ///
+    /// | bottleneck | why one partition is the unit | metric |
+    /// |---|---|---|
+    /// | request rate | one partition = one P-log thread, ~30K ops/s | `req_per_sec` |
+    /// | byte rate | one partition = one log_stream, ~350 MB/s | `write+read_bytes_per_sec` |
+    /// | LSM size | memtable/compaction work, and it is what a key-range cut halves | `size_bytes` |
+    ///
+    /// CARRIED bytes are deliberately NOT a fourth row. The payload lives in the
+    /// shared `log_stream`; a CoW split leaves both children on the same extents
+    /// and buys nothing until a major compaction rewrites them (see
+    /// `--split-lsm-hard-bytes`). Carried bytes stay as the FLOOR under the two rate
+    /// triggers, which is the question they answer well: is there enough here
+    /// to be worth cutting at all.
+    ///
+    /// A partition that qualifies but still reports `has_overlap` yields a
+    /// COMPACT candidate instead — see `unblocking_compact`.
+    fn split_candidates(&self, args: &ComputeArgs<'_>) -> Vec<PolicyCandidate> {
+        let mut out = Vec::new();
+        let cfg = self.config.clone();
+        // one sealed-sum snapshot per pass (sealed
+        // lengths move slowly; the PS-reported QPS/imm-full stay per-bucket).
+        let sealed = partition_sealed_sums(args.state);
+
+        for (&part_id, window) in self.metrics.iter() {
+            let Some(bs) = window.recent(cfg.required_buckets) else {
+                continue;
+            };
+
+            let last_op = args.last_op_at.get(&part_id).copied().unwrap_or(0);
+            if args.now - last_op < cfg.split_cooldown_sec {
+                continue;
+            }
+
+            let sealed_sum = sealed.get(&part_id).copied().unwrap_or(0);
+            let recent = &bs[0].1;
+            let carried = effective_size_bytes(sealed_sum, recent);
+            // (design (b)): the SIZE dimension
+            // is NOT debounced. `required_buckets` debounce exists to filter
+            // RATE SPIKES; size is a slow, near-monotone quantity, so demanding
+            // "all N buckets big" is the wrong abstraction — a partition that
+            // IS big should split now, thrash guarded by `split_cooldown_sec`,
+            // not wait out a window. So:
+            //   • LSM-size    → evaluated ONCE on the current value;
+            //   • QPS / bytes-per-sec / imm-full (spiky) → all-N-buckets;
+            //   • the carried-size floor under the rate triggers also reads
+            //     CURRENT size (it's a floor, same slow-signal argument).
+            // `size_bytes` is the PS's LSM gauge, refreshed every 30 s and 0
+            // until the first refresh after a partition opens — the safe
+            // direction for a trigger: it can delay a split, never cause one.
+            let lsm_hard = recent.size_bytes > cfg.split_lsm_hard;
+            let qps_sustained = bs.iter().all(|(_, l)| l.req_per_sec > cfg.split_qps_high);
+            let bw_of = |l: &PartitionLoad| {
+                l.write_bytes_per_sec.saturating_add(l.read_bytes_per_sec)
+            };
+            let bw_sustained = bs.iter().all(|(_, l)| bw_of(l) > cfg.split_bw_high);
+            let big_enough = carried > cfg.split_size_min;
+            let qps_trigger = qps_sustained && big_enough;
+            let bw_trigger = bw_sustained && big_enough;
+            let immfull_sustained =
+                bs.iter().all(|(_, l)| l.imm_full_per_sec > cfg.split_immfull_high);
+            if !(lsm_hard || qps_trigger || bw_trigger || immfull_sustained) {
+                continue;
+            }
+            // `handle_split_part` REFUSES while the partition still carries
+            // CoW-shared out-of-range keys, and only a major compaction clears
+            // that. Advise the step that unblocks it instead of an action that
+            // cannot be taken — see `unblocking_compact`. Checked BEFORE the
+            // reason is formatted, which this path would only discard.
+            if recent.has_overlap != 0 {
+                out.extend(Self::unblocking_compact(part_id, recent, "split"));
+                continue;
+            }
+            // Reason names the trigger that actually fired (checked in the same
+            // priority order) and carries both size metrics, so a
+            // `policy-candidates` row shows WHICH bytes drove the decision.
+            let reason = if lsm_hard {
+                format!(
+                    "lsm>{} (lsm {} MiB; carries {} GiB incl. large-value payload)",
+                    cfg.split_lsm_hard,
+                    recent.size_bytes / (1024 * 1024),
+                    carried / GIB,
+                )
+            } else if immfull_sustained {
+                format!("imm_full_per_sec>{} sustained", cfg.split_immfull_high)
+            } else if qps_trigger {
+                format!(
+                    "req_per_sec>{} sustained AND size>{}",
+                    cfg.split_qps_high, cfg.split_size_min
+                )
+            } else {
+                format!(
+                    "bytes_per_sec>{} ({} MiB/s r+w on one log_stream) sustained AND size>{}",
+                    cfg.split_bw_high,
+                    bw_of(recent) / (1024 * 1024),
+                    cfg.split_size_min,
+                )
+            };
+            out.push(PolicyCandidate {
+                kind: POLICY_KIND_SPLIT,
+                primary_part_id: part_id,
+                secondary_part_id: 0,
+                reason,
+                // The SIZE column of `policy-candidates` stays CARRIED bytes:
+                // it answers "how big is this partition", which is the payload
+                // too. Only the TRIGGER changed measure.
+                size_bytes: carried,
+                req_per_sec: recent.req_per_sec,
+                imm_full_per_sec: recent.imm_full_per_sec,
+                same_ps: true, // not meaningful for split
+                last_op_at: last_op,
+            });
+        }
+        out
+    }
+
+    /// The major compaction a blocked split/merge wants, or `None` while one is
+    /// already running on that partition.
+    ///
+    /// Both ops refuse while `has_overlap` is set: `handle_split_part`, and the
+    /// PS's `MSG_MERGE_FREEZE` on EITHER side of a merge (an un-separated side
+    /// re-exposes its out-of-range keys over its sibling's history once the
+    /// range widens — partition-server CLAUDE.md, "Merge requires both sides
+    /// physically separated"). So the op is advice that cannot be taken until
+    /// the compaction lands.
+    ///
+    /// Either refusal is cheap (split checks first thing after decode; merge
+    /// refuses at the freeze, before any drain), so the argument for advising
+    /// the compaction instead is not cost. It is that the op is advice nothing
+    /// in the loop will ever make actionable, and it crowds out the one action
+    /// that would.
+    ///
+    /// **Only `compact_inflight` gates this, deliberately NOT the compact
+    /// cooldown.** The cooldown exists to stop the maintenance pass re-advising
+    /// on a debt LEVEL that has not moved. `has_overlap` is not a level: it is
+    /// a flag only a completed major compaction clears, so a compaction that
+    /// finished inside the cooldown window and left it set did not do the job,
+    /// and waiting out the rest of that window accomplishes nothing while the
+    /// partition produces no advisory at all.
+    ///
+    /// What still bounds re-ACTUATION, now that this no longer does: the
+    /// controller's per-target cooldown, floored at
+    /// `COMPACT_MIN_ACTUATION_COOLDOWN_SEC`. That floor is load-bearing rather
+    /// than belt-and-braces precisely because of this decision — the loop
+    /// actuates from a candidate list cached for a whole 60 s policy tick, so
+    /// a policy with `cooldown_sec = 0` would otherwise re-issue the same row
+    /// every `interval_sec`.
+    ///
+    /// The op emitted is a plain `POLICY_KIND_MAJOR_COMPACT`, actuated as
+    /// `compact <part>`, which reaches the PS as `CompactTask::Major` —
+    /// `MSG_MAINTENANCE` sends nothing else.
+    /// `has_overlap` does NOT by itself make a compaction major; it only
+    /// suppresses the too-few-tables skip. What keeps THIS loop convergent is a
+    /// PS invariant: a successful MAJOR compaction clears the flag, in every arm
+    /// that runs one — the dispatched compact and the periodic expiry pass
+    /// alike. That invariant was incomplete, and the gap was reachable: an
+    /// expiry major that emptied a CoW child's tables left the flag set with no
+    /// table left for a later compaction to rewrite, so `handle_split_part`
+    /// refused forever while this advisory re-issued a no-op every window. A
+    /// MINOR pass must NOT clear it (it does not drop out-of-range keys), so any
+    /// new compaction arm has to make the same distinction.
+    ///
+    /// KNOWN GAP, stated rather than papered over: while a major compaction IS
+    /// running, this returns `None` and the blocked partition contributes no
+    /// advisory row at all. Its state stays visible per-partition —
+    /// `autumn-op info --part N --detail` reports `has_overlap` and
+    /// `compact_inflight`, and the dashboard's partition drawer says so — but
+    /// `policy-candidates` is silent for it until that compaction lands.
+    ///
+    /// A policy with `split` on and `compact` off filters this candidate out
+    /// (`kinds_from_switches`) and NOTHING happens. That is the honest outcome
+    /// — a policy that refuses to compact cannot split a CoW child — and it is
+    /// visible, unlike a refusal loop. It is documented in `docs/ops.md`, not
+    /// in the reason string, whose job is to name the op and its target.
+    fn unblocking_compact(
+        part_id: u64,
+        recent: &PartitionLoad,
+        blocked_op: &str,
+    ) -> Option<PolicyCandidate> {
+        if recent.compact_inflight != 0 {
+            return None;
+        }
+        Some(PolicyCandidate {
+            kind: POLICY_KIND_MAJOR_COMPACT,
+            primary_part_id: part_id,
+            secondary_part_id: 0,
+            reason: format!(
+                "major compaction before {blocked_op}: partition still carries \
+                 CoW-shared out-of-range keys (has_overlap), and {blocked_op} is \
+                 REFUSED until a major compaction rewrites them"
+            ),
+            size_bytes: recent.pending_compaction_bytes,
+            req_per_sec: recent.req_per_sec,
+            imm_full_per_sec: recent.imm_full_per_sec,
+            same_ps: true,
+            last_op_at: recent.last_compact_at,
+        })
+    }
+
+    /// MERGE pass — adjacent-pair sliding-window trigger.
+    ///
+    /// Walks partitions sorted by `start_key`; for each adjacent pair
+    /// where `left.end_key == right.start_key`, requires ALL of the last
+    /// `required_buckets` in BOTH windows to qualify as cold (size-low,
+    /// summed-QPS-low, zero imm-full) and the pair to be outside
+    /// `merge_cooldown_sec`. Emits one `POLICY_KIND_MERGE` candidate
+    /// (survivor = left) per qualifying pair; `same_ps` reflects whether
+    /// the pair currently lives on the same PS (cross-PS merges are
+    /// infeasible and flagged in `reason`).
+    fn merge_candidates(&self, args: &ComputeArgs<'_>) -> Vec<PolicyCandidate> {
+        let mut out = Vec::new();
+        let cfg = self.config.clone();
+        // the smallness check MUST consume
+        // `effective_size_bytes` — otherwise the policy can flag the cluster's
+        // LARGEST partition (a few hundred MB LSM-resident vs tens of GB of
+        // real stream bytes under a VP workload) as a merge candidate because `size_bytes` couldn't see the VP bytes.
+        let sealed = partition_sealed_sums(args.state);
+
+        // Walk partitions sorted by start_key; for each adjacent pair where
+        // left.end_key == right.start_key, check both windows.
+        let mut sorted_parts: Vec<(u64, &crate::persist::records::PartitionRecord)> = args
+            .state
+            .partitions
+            .iter()
+            .filter_map(|(id, p)| p.rg.as_ref().map(|_| (*id, p)))
+            .collect();
+        sorted_parts.sort_by(|(_, a), (_, b)| {
+            a.rg.as_ref()
+                .unwrap()
+                .start_key
+                .cmp(&b.rg.as_ref().unwrap().start_key)
+        });
+
+        for win in sorted_parts.windows(2) {
+            let (left_id, left_meta) = win[0];
+            let (right_id, right_meta) = win[1];
+            if left_meta.rg.as_ref().unwrap().end_key != right_meta.rg.as_ref().unwrap().start_key {
+                continue;
+            }
+            // step 4: never advertise a merge that would
+            // erase an operator-declared presplit boundary. `handle_merge_
+            // partitions` refuses it anyway; skipping here keeps the controller
+            // from retrying a doomed op every tick. NOTE the shape this
+            // protects: an EMPTY lane partition is the ideal merge candidate
+            // (cold, tiny, zero QPS), and the window where fs lanes are empty is
+            // exactly the standard reset → presplit-on-empty → first-upload
+            // sequence.
+            if self
+                .sacred_boundaries
+                .contains(&right_meta.rg.as_ref().unwrap().start_key)
+            {
+                continue;
+            }
+            let lw = match self.metrics.get(&left_id) {
+                Some(w) => w,
+                None => continue,
+            };
+            let rw = match self.metrics.get(&right_id) {
+                Some(w) => w,
+                None => continue,
+            };
+            let (Some(lbs), Some(rbs)) = (
+                lw.recent(cfg.required_buckets),
+                rw.recent(cfg.required_buckets),
+            ) else {
+                continue;
+            };
+
+            let last_op_l = args.last_op_at.get(&left_id).copied().unwrap_or(0);
+            let last_op_r = args.last_op_at.get(&right_id).copied().unwrap_or(0);
+            let max_last_op = last_op_l.max(last_op_r);
+            if args.now - max_last_op < cfg.merge_cooldown_sec {
+                continue;
+            }
+
+            let sealed_l = sealed.get(&left_id).copied().unwrap_or(0);
+            let sealed_r = sealed.get(&right_id).copied().unwrap_or(0);
+            let recent_l = &lbs[0].1;
+            let recent_r = &rbs[0].1;
+            let eff_l = effective_size_bytes(sealed_l, recent_l);
+            let eff_r = effective_size_bytes(sealed_r, recent_r);
+            // (design (b)): symmetric to split —
+            // the SIZE condition (both sides small) is evaluated ONCE on the
+            // CURRENT effective size (slow signal, no debounce), while the COLD
+            // condition (summed QPS low + no imm-full pressure — spiky) keeps the
+            // all-N-buckets debounce so a brief lull can't trigger a merge.
+            // `effective_size_bytes` uses `max(size_bytes, est_live)`, so either
+            // metric reading "big" vetoes the pair (VP-load direction fix +
+            // strict non-regression for small-value loads).
+            let size_small =
+                eff_l < cfg.merge_size_low && eff_r < cfg.merge_size_low;
+            // Cold on BOTH rate dimensions. QPS alone is not cold: 1 400 ops/s
+            // of 1 MiB values passes `merge_qps_low` while moving 1.4 GB/s, and
+            // the merged partition would carry all of it on one log_stream.
+            let cold_sustained = lbs.iter().zip(rbs.iter()).all(|((_, lb), (_, rb))| {
+                let bw = lb
+                    .write_bytes_per_sec
+                    .saturating_add(lb.read_bytes_per_sec)
+                    .saturating_add(rb.write_bytes_per_sec)
+                    .saturating_add(rb.read_bytes_per_sec);
+                (lb.req_per_sec + rb.req_per_sec) < cfg.merge_qps_low
+                    && bw < cfg.merge_bw_low
+                    && lb.imm_full_per_sec == 0
+                    && rb.imm_full_per_sec == 0
+            });
+            if !(size_small && cold_sustained) {
+                continue;
+            }
+            // Compact before merge, EACH side that overlaps: the merge refuses
+            // while either does (see `unblocking_compact`). The victim is not
+            // spared for being deleted — its tables become the merged
+            // partition's, stale out-of-range keys included.
+            if recent_l.has_overlap != 0 || recent_r.has_overlap != 0 {
+                if recent_l.has_overlap != 0 {
+                    out.extend(Self::unblocking_compact(left_id, recent_l, "merge"));
+                }
+                if recent_r.has_overlap != 0 {
+                    out.extend(Self::unblocking_compact(right_id, recent_r, "merge"));
+                }
+                continue;
+            }
+
+            let same_ps = match (
+                args.region_owners.get(&left_id),
+                args.region_owners.get(&right_id),
+            ) {
+                (Some(a), Some(b)) => a == b,
+                _ => false,
+            };
+            out.push(PolicyCandidate {
+                kind: POLICY_KIND_MERGE,
+                primary_part_id: left_id, // survivor candidate = left
+                secondary_part_id: right_id,
+                // "size_each": the predicate is PER-SIDE < merge_size_low
+                // (the old "size_sum<" wording misread as a summed check —
+                // design doc §6 correction).
+                reason: format!(
+                    "size_each<{} qps_sum<{} bytes_sum<{} sustained{}",
+                    cfg.merge_size_low,
+                    cfg.merge_qps_low,
+                    cfg.merge_bw_low,
+                    if !same_ps {
+                        " (cross-PS, infeasible)"
+                    } else {
+                        ""
+                    }
+                ),
+                size_bytes: eff_l.saturating_add(eff_r),
+                req_per_sec: recent_l.req_per_sec + recent_r.req_per_sec,
+                imm_full_per_sec: 0,
+                same_ps,
+                last_op_at: max_last_op,
+            });
+        }
+
+        out
+    }
+
+    /// maintenance (GC + compact) advisory pass. Mirrors the
+    /// split/merge structure: require all of the most recent
+    /// `required_buckets` to exceed the threshold, gate by per-kind
+    /// cooldown driven from the partition's own `last_gc_at` /
+    /// `last_compact_at` (PS-reported, not manager-tracked — the PS is
+    /// the authority on when its loops actually ran). Skips partitions
+    /// where the corresponding loop is currently inflight (no point
+    /// telling an operator to GC a partition that's already GCing).
+    ///
+    /// The output uses `PolicyCandidate` with `kind = POLICY_KIND_GC`
+    /// or `POLICY_KIND_COMPACT`. `secondary_part_id = 0`,
+    /// `same_ps = true` (not meaningful for maintenance), `last_op_at`
+    /// carries the kind-specific last-run timestamp so the operator
+    /// dashboard can render "since X minutes ago".
+    pub fn compute_maintenance_advisory(&mut self, now: i64) -> Vec<PolicyCandidate> {
+        let mut out = Vec::new();
+        let cfg = self.config.clone();
+
+        for (&part_id, window) in self.metrics.iter() {
+            let Some(bs) = window.recent(cfg.required_buckets) else {
+                continue;
+            };
+            // Two independent maintenance checks per partition, each
+            // emitting at most one candidate (minor compaction is the PS's
+            // own, after every flush). Kept as separate named
+            // sub-checks (NOT one parametrised helper) because the
+            // metric / threshold / reason text differ per kind.
+            out.extend(Self::gc_advisory(part_id, &bs, &cfg, now));
+            out.extend(Self::major_compact_advisory(part_id, &bs, &cfg, now));
+        }
+
+        out
+    }
+
+    /// GC maintenance sub-check. Emits a `POLICY_KIND_GC`
+    /// candidate when no GC is inflight on the partition, it is outside
+    /// `gc_cooldown_sec`, and ALL recent buckets sustain
+    /// `gc_debt_bytes > gc_debt_high`.
+    fn gc_advisory(
+        part_id: u64,
+        bs: &[&(i64, PartitionLoad)],
+        cfg: &PolicyConfig,
+        now: i64,
+    ) -> Option<PolicyCandidate> {
+        let recent = &bs[0].1;
+        // Skip when an inflight GC is already chewing on this
+        // partition; let that complete before re-advising.
+        if recent.gc_inflight == 0
+            && (recent.last_gc_at == 0 || now - recent.last_gc_at >= cfg.gc_cooldown_sec)
+            && bs.iter().all(|(_, l)| l.gc_debt_bytes > cfg.gc_debt_high)
+        {
+            Some(PolicyCandidate {
+                kind: POLICY_KIND_GC,
+                primary_part_id: part_id,
+                secondary_part_id: 0,
+                reason: format!(
+                    "gc_debt_bytes>{} ({} MiB) sustained {}m",
+                    cfg.gc_debt_high,
+                    recent.gc_debt_bytes / (1024 * 1024),
+                    cfg.required_buckets * cfg.bucket_sec as usize / 60,
+                ),
+                size_bytes: recent.gc_debt_bytes,
+                req_per_sec: recent.req_per_sec,
+                imm_full_per_sec: recent.imm_full_per_sec,
+                same_ps: true,
+                last_op_at: recent.last_gc_at,
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Major-compaction maintenance sub-check. Emits a
+    /// `POLICY_KIND_MAJOR_COMPACT` candidate when no compaction is inflight,
+    /// the partition is outside `compact_cooldown_sec`, and ALL recent buckets
+    /// show one of two reasons:
+    ///
+    /// - BACKLOG: `pending_compaction_bytes > compact_pending_high`.
+    /// - SETTLE: deletes no major compaction has seen yet
+    ///   (`unsettled_deletes > 0`) and none new across the window. A delete
+    ///   reaches GC only through a compaction's discard, and for large values
+    ///   the LSM stays a few KB however many GiB were deleted — so BACKLOG
+    ///   never fires, and an idle partition keeps every deleted byte forever
+    ///   (its `est_live` never falls either). "None new" means the burst has
+    ///   ended: a partition that keeps deleting (cache eviction) would
+    ///   otherwise be told to compact every cooldown, and one burst needs one
+    ///   compaction. The PS flushes the memtable before a major compaction, so
+    ///   the compaction covers these deletes wherever they sit.
+    fn major_compact_advisory(
+        part_id: u64,
+        bs: &[&(i64, PartitionLoad)],
+        cfg: &PolicyConfig,
+        now: i64,
+    ) -> Option<PolicyCandidate> {
+        let recent = &bs[0].1;
+        if recent.compact_inflight != 0
+            || (recent.last_compact_at != 0
+                && now - recent.last_compact_at < cfg.compact_cooldown_sec)
+        {
+            return None;
+        }
+        let window_min = cfg.required_buckets * cfg.bucket_sec as usize / 60;
+        let (reason, size_bytes) = if bs
+            .iter()
+            .all(|(_, l)| l.pending_compaction_bytes > cfg.compact_pending_high)
+        {
+            (
+                format!(
+                    "pending_compaction_bytes>{} ({} MiB) sustained {}m",
+                    cfg.compact_pending_high,
+                    recent.pending_compaction_bytes / (1024 * 1024),
+                    window_min,
+                ),
+                recent.pending_compaction_bytes,
+            )
+        } else if recent.unsettled_deletes > 0
+            && bs
+                .iter()
+                .all(|(_, l)| l.unsettled_deletes == recent.unsettled_deletes)
+        {
+            (
+                format!(
+                    "{} deletes not yet compacted, none new in {}m",
+                    recent.unsettled_deletes, window_min,
+                ),
+                recent.size_bytes,
+            )
+        } else {
+            return None;
+        };
+        Some(PolicyCandidate {
+            kind: POLICY_KIND_MAJOR_COMPACT,
+            primary_part_id: part_id,
+            secondary_part_id: 0,
+            reason,
+            size_bytes,
+            req_per_sec: recent.req_per_sec,
+            imm_full_per_sec: recent.imm_full_per_sec,
+            same_ps: true,
+            last_op_at: recent.last_compact_at,
+        })
+    }
+
+    /// EC-conversion advisory. Scans the manager state for
+    /// sealed-but-not-converted extents that exceed
+    /// `cfg.ec_min_extent_bytes`. Emits one `POLICY_KIND_EC`
+    /// candidate per such extent. Stage 2 is advisory-only.
+    ///
+    /// **Note**: this advisory's input is `MetadataState`, not the
+    /// per-partition `metrics` window — EC is per-extent, not
+    /// per-partition. `secondary_part_id` carries the extent_id;
+    /// `primary_part_id = 0` (no partition association). `size_bytes`
+    /// carries `sealed_length` so external controllers can sort by
+    /// payoff.
+    ///
+    /// Common-sense filter: small sealed extents (< 64 MiB by
+    /// default) are NOT surfaced. Below that threshold, EC overhead
+    /// (network fanout + ec_encode CPU + metadata churn) outweighs
+    /// the 3 → K/(K+M) replication savings; we'd be advising a
+    /// negative-EV operation. Operators who still want to convert
+    /// such extents can use `client set-stream-ec --stream <ID>`
+    /// which bypasses the advisory layer entirely.
+    ///
+    /// Also skipped: an extent the arbiter would not let a conversion start on
+    /// now (`may_convert`, `extent_arbiter.rs`) — `handle_force_ec_convert`
+    /// would refuse it and an armed controller would file a FAILED op every
+    /// round.
+    pub(crate) fn compute_ec_advisory(
+        &self,
+        state: &MetadataState,
+        may_convert: &dyn Fn(u64, usize) -> bool,
+        now: i64,
+    ) -> Vec<PolicyCandidate> {
+        let mut out = Vec::new();
+        let cfg = &self.config;
+        for stream in state.streams.values() {
+            if stream.ec_data_shard == 0 || stream.ec_parity_shard == 0 {
+                // Replication-only stream — no EC policy attached, so
+                // there's nothing to convert.
+                continue;
+            }
+            for &eid in &stream.extent_ids {
+                let ext = match state.extents.get(&eid) {
+                    Some(e) => e,
+                    None => continue,
+                };
+                if ext.ec_converted {
+                    continue;
+                }
+                if ext.sealed_length == 0 {
+                    // Open or sealed-at-zero — encode has nothing to
+                    // do. Open-tail won't be EC'd until sealed;
+                    // GC empty-extent picks reclaims sealed-at-zero.
+                    continue;
+                }
+                if ext.sealed_length < cfg.ec_min_extent_bytes {
+                    continue;
+                }
+                let shards = (stream.ec_data_shard + stream.ec_parity_shard) as usize;
+                if !may_convert(eid, shards) {
+                    continue;
+                }
+                out.push(PolicyCandidate {
+                    kind: POLICY_KIND_EC,
+                    primary_part_id: 0,
+                    secondary_part_id: eid,
+                    reason: format!(
+                        "stream {} ec={}+{} sealed_length={} ({} MiB) not-converted",
+                        stream.stream_id,
+                        stream.ec_data_shard,
+                        stream.ec_parity_shard,
+                        ext.sealed_length,
+                        ext.sealed_length / (1024 * 1024),
+                    ),
+                    size_bytes: ext.sealed_length,
+                    req_per_sec: 0,
+                    imm_full_per_sec: 0,
+                    same_ps: true,
+                    last_op_at: now, // EC has no per-extent cooldown stamp; this is freshness only
+                });
+            }
+        }
+        // cap the per-tick advisory at the top
+        // `MAX_EC_ADVISORY_CANDIDATES` extents sorted by `sealed_length`
+        // desc. Previously the function emitted one candidate per
+        // sealed-not-converted extent unconditionally; on a cluster
+        // that ran without EC for a while (or any time the external
+        // controller is slow to drain candidates), the backlog of
+        // 10k+ sealed extents inflated both the manager's
+        // `advisory_cache` and every `MSG_GET_POLICY_CANDIDATES` RPC
+        // payload — a single tick's payload could reach 1.4 MiB, enough to push the etcd
+        // sidecar response past its 1 MiB default `max-request-bytes`.
+        // Sorting by `sealed_length` desc + truncating preserves
+        // payoff-first ordering (the controller works through the
+        // biggest extents first, where the 3 → K/(K+M) savings
+        // dominate) and survives across ticks because the same
+        // extents stay sealed-not-converted until the controller
+        // dispatches `MSG_FORCE_EC_CONVERT`.
+        if out.len() > MAX_EC_ADVISORY_CANDIDATES {
+            out.sort_unstable_by_key(|c| std::cmp::Reverse(c.size_bytes));
+            out.truncate(MAX_EC_ADVISORY_CANDIDATES);
+        }
+        out
+    }
+
+    /// Phase B: a CLUSTER-level advisory (not per-partition
+    /// or per-extent) — emitted when placement is out of balance by more than
+    /// `rebalance_gap_threshold` (see `ps_placement::imbalanced`) and we're
+    /// outside the cluster cooldown. Sourced from `regions`, `ps_nodes` and
+    /// `ps_slot_caps` (the same inputs `compute_rebalance_moves` uses), NOT
+    /// from PartitionLoad windows — partition COUNT against core slots is the
+    /// signal. At most ONE
+    /// candidate per tick: `kind = POLICY_KIND_REBALANCE`, primary/secondary = 0
+    /// (cluster-scoped); the armed controller's actuation calls
+    /// `handle_rebalance_regions` with a bounded per-tick `max_moves`.
+    pub(crate) fn compute_rebalance_advisory(
+        &mut self,
+        state: &MetadataState,
+        now: i64,
+    ) -> Vec<PolicyCandidate> {
+        let cfg = &self.config;
+        if cfg.rebalance_gap_threshold == 0 || state.ps_nodes.len() < 2 {
+            return Vec::new(); // advisory disabled, or nothing to balance across
+        }
+        // The same ranking `compute_rebalance_moves` uses, with the source
+        // giving up `rebalance_gap_threshold` partitions instead of one: among
+        // capacity-unknown PS that is "max − min count > threshold", and it
+        // never fires on a spread the moves would leave alone (a full cpuset
+        // PS next to a busier capacity-unknown one).
+        if !crate::ps_placement::imbalanced(state, cfg.rebalance_gap_threshold) {
+            return Vec::new(); // balanced within the hysteresis band
+        }
+        if now.saturating_sub(self.last_rebalance_at) < cfg.rebalance_cooldown_sec {
+            return Vec::new(); // still cooling down from a recent emission
+        }
+        self.last_rebalance_at = now;
+        vec![PolicyCandidate {
+            kind: POLICY_KIND_REBALANCE,
+            primary_part_id: 0,   // cluster-scoped, not a single partition
+            secondary_part_id: 0,
+            reason: format!(
+                "per-PS partitions/slots [{}] out of balance by more than {}",
+                crate::ps_placement::describe(state),
+                cfg.rebalance_gap_threshold,
+            ),
+            size_bytes: 0,
+            req_per_sec: 0,
+            imm_full_per_sec: 0,
+            same_ps: false,
+            last_op_at: now,
+        }]
+    }
+
+    /// Stage D — hot/cold imbalance advisory.
+    ///
+    /// Groups partitions by their owning PS via `region_owners` and, for
+    /// every PS that hosts at least two metrics-tracked partitions,
+    /// computes per-partition sustained min/max over the last
+    /// `required_buckets` for TWO dimensions:
+    ///
+    /// 1. **QPS**: `req_per_sec`. Triggers when the PS's `max(part.max_req)
+    ///    / max(1, min(part.min_req)) >= cfg.hot_cold_ratio (10)` AND the
+    ///    hottest's `max_req > cfg.hot_cold_min_hot_qps (10_000)`.
+    /// 2. **Size**: `size_bytes`. Same 10× ratio with floor
+    ///    `--hot-cold-min-hot-size-bytes` (25 GiB of CARRIED bytes — this
+    ///    advisory's size dimension is about where the data SITS, so unlike the
+    ///    split trigger it counts the large-value payload).
+    ///    Catches large-value / low-QPS workloads that the QPS check
+    ///    can't see.
+    ///
+    /// Either dimension is enough to fire. One `PolicyCandidate` per PS
+    /// is emitted (kind = `POLICY_KIND_HOT_COLD`), with the hottest +
+    /// coldest part_ids in `primary_part_id` / `secondary_part_id` and
+    /// the full hot/cold lists + ratios in `reason`. Shared per-PS
+    /// cooldown via `last_hot_cold_at`: at most one candidate per PS per
+    /// `--hot-cold-cooldown-secs` (5 min).
+    ///
+    /// The returned candidates are appended to the manager's
+    /// `advisory_cache` by `policy_tick_loop`, so `client info`
+    /// (via `MSG_GET_POLICY_CANDIDATES`) renders them next to SPLIT /
+    /// MERGE / GC / COMPACT advisories. A matching `WARN` line is also
+    /// emitted to `manager.log` for at-a-glance operator awareness.
+    /// hot/cold band classification for ONE dimension (qps or size).
+    /// Hot = own window MAX equals the PS's hottest AND own MIN is still
+    /// within the band of it (sustained-high across its buckets); symmetric
+    /// on cold. Returns sorted `(hot, cold)` part-id lists; both empty when
+    /// the dimension didn't fire. `parts` tuples are
+    /// `(part_id, min_req, max_req, min_size, max_size)` — the accessors
+    /// select which pair this dimension reads.
+    #[allow(clippy::too_many_arguments)]
+    fn classify_hot_cold_band<T: Copy + PartialOrd>(
+        parts: &[(u64, u32, u32, u64, u64)],
+        fire: bool,
+        min_of: impl Fn(&(u64, u32, u32, u64, u64)) -> T,
+        max_of: impl Fn(&(u64, u32, u32, u64, u64)) -> T,
+        hottest: T,
+        coldest: T,
+        hot_min: T,
+        cold_max: T,
+    ) -> (Vec<u64>, Vec<u64>) {
+        if !fire {
+            return (Vec::new(), Vec::new());
+        }
+        let mut hot: Vec<u64> = parts
+            .iter()
+            .filter(|t| min_of(t) >= hot_min && max_of(t) == hottest)
+            .map(|t| t.0)
+            .collect();
+        let mut cold: Vec<u64> = parts
+            .iter()
+            .filter(|t| max_of(t) <= cold_max && min_of(t) == coldest)
+            .map(|t| t.0)
+            .collect();
+        hot.sort_unstable();
+        cold.sort_unstable();
+        (hot, cold)
+    }
+
+    pub fn compute_hot_cold_advisory(
+        &mut self,
+        region_owners: &HashMap<u64, u64>,
+        sealed_sums: &HashMap<u64, u64>,
+        now: i64,
+    ) -> Vec<PolicyCandidate> {
+        let mut out: Vec<PolicyCandidate> = Vec::new();
+        let cfg = self.config.clone();
+        // ps_id -> Vec<(part_id, min_req, max_req, min_size, max_size)>
+        let mut by_ps: HashMap<u64, Vec<(u64, u32, u32, u64, u64)>> = HashMap::new();
+        for (&part_id, window) in self.metrics.iter() {
+            let Some(bs) = window.recent(cfg.required_buckets) else {
+                continue;
+            };
+            let ps_id = match region_owners.get(&part_id) {
+                Some(p) => *p,
+                None => continue,
+            };
+            // the size dimension consumes
+            // `effective_size_bytes` (same measure as split/merge) so a VP-heavy
+            // partition registers as size-hot even though its LSM-resident
+            // `size_bytes` is tiny (`sealed_sums` from
+            // `partition_sealed_sums(state)`, computed once per tick in
+            // `recompute_advisory_cache`).
+            let sealed_sum = sealed_sums.get(&part_id).copied().unwrap_or(0);
+            let min_req = bs.iter().map(|(_, l)| l.req_per_sec).min().unwrap_or(0);
+            let max_req = bs.iter().map(|(_, l)| l.req_per_sec).max().unwrap_or(0);
+            let min_size = bs
+                .iter()
+                .map(|(_, l)| effective_size_bytes(sealed_sum, l))
+                .min()
+                .unwrap_or(0);
+            let max_size = bs
+                .iter()
+                .map(|(_, l)| effective_size_bytes(sealed_sum, l))
+                .max()
+                .unwrap_or(0);
+            by_ps
+                .entry(ps_id)
+                .or_default()
+                .push((part_id, min_req, max_req, min_size, max_size));
+        }
+        for (ps_id, parts) in by_ps {
+            if parts.len() < 2 {
+                continue;
+            }
+            if let Some(&last) = self.last_hot_cold_at.get(&ps_id) {
+                if now - last < cfg.hot_cold_cooldown_sec {
+                    continue;
+                }
+            }
+            // ── QPS dimension ──────────────────────────────────────
+            let qps_hottest = parts.iter().map(|t| t.2).max().unwrap_or(0);
+            let qps_coldest = parts.iter().map(|t| t.1).min().unwrap_or(0);
+            let qps_fire = qps_hottest >= cfg.hot_cold_min_hot_qps
+                && qps_hottest / qps_coldest.max(1) >= cfg.hot_cold_ratio;
+            // ── Size dimension ─────────────────────────────────────
+            let size_hottest = parts.iter().map(|t| t.4).max().unwrap_or(0);
+            let size_coldest = parts.iter().map(|t| t.3).min().unwrap_or(0);
+            let size_fire = size_hottest >= cfg.hot_cold_min_hot_size_bytes
+                && size_hottest / size_coldest.max(1) >= cfg.hot_cold_size_ratio;
+            if !qps_fire && !size_fire {
+                continue;
+            }
+            // ── Hot/cold lists per triggering dimension ────────────
+            //
+            // Hot = every partition whose own max equals the PS's
+            // `hottest` (i.e. is "the busiest" — at least one partition
+            // always qualifies). Cold = every partition whose own min
+            // equals the PS's `coldest`. Ties (rare) put multiple
+            // partitions in the same list.
+            //
+            // The earlier median-based classification didn't work for
+            // 2-partition PSes (median == max → hot list empty), so
+            // this min/max-match approach is what we use.
+            // partition qualifies as "hot" only when its own
+            // window MIN is still within 1/HOT_COLD_BAND_DIVISOR of the
+            // PS's hottest reading (sustained-high across its buckets);
+            // symmetric on cold. Excludes rotating hotspots that would
+            // otherwise appear on BOTH lists in the same advisory.
+            let qps_band = HOT_COLD_BAND_DIVISOR.max(1);
+            let (qps_hot, qps_cold) = Self::classify_hot_cold_band(
+                &parts,
+                qps_fire,
+                |t| t.1,
+                |t| t.2,
+                qps_hottest,
+                qps_coldest,
+                qps_hottest / qps_band,
+                qps_coldest.saturating_mul(qps_band),
+            );
+            let size_band = HOT_COLD_BAND_DIVISOR.max(1) as u64;
+            let (size_hot, size_cold) = Self::classify_hot_cold_band(
+                &parts,
+                size_fire,
+                |t| t.3,
+                |t| t.4,
+                size_hottest,
+                size_coldest,
+                size_hottest / size_band,
+                size_coldest.saturating_mul(size_band),
+            );
+            // if the band filter dropped every candidate on a
+            // triggering dimension, suppress the advisory for that
+            // dimension. Without this we'd still log a fire WARN but
+            // emit empty hot/cold lists.
+            let qps_fire = qps_fire && !qps_hot.is_empty() && !qps_cold.is_empty();
+            let size_fire = size_fire && !size_hot.is_empty() && !size_cold.is_empty();
+            if !qps_fire && !size_fire {
+                continue;
+            }
+            let qps_ratio = qps_hottest / qps_coldest.max(1);
+            let size_ratio = size_hottest / size_coldest.max(1);
+            tracing::warn!(
+                ps_id,
+                qps_fire,
+                qps_ratio,
+                qps_hottest,
+                qps_coldest,
+                qps_hot_parts = ?qps_hot,
+                qps_cold_parts = ?qps_cold,
+                size_fire,
+                size_ratio,
+                size_hottest_mb = size_hottest / (1024 * 1024),
+                size_coldest_mb = size_coldest / (1024 * 1024),
+                size_hot_parts = ?size_hot,
+                size_cold_parts = ?size_cold,
+                "hot/cold imbalance on PS — consider auto-split for the hot partitions, or merge the cold pair to free a core slot"
+            );
+            // Hottest part = first qps_hot if QPS triggered else first
+            // size_hot; coldest = symmetric. Fall back to 0 when a
+            // dimension didn't trigger or its hot/cold list is empty.
+            let primary = qps_hot
+                .first()
+                .copied()
+                .or_else(|| size_hot.first().copied())
+                .unwrap_or(0);
+            let secondary = qps_cold
+                .first()
+                .copied()
+                .or_else(|| size_cold.first().copied())
+                .unwrap_or(0);
+            let mut reason_parts: Vec<String> = Vec::new();
+            reason_parts.push(format!("ps_id={ps_id}"));
+            if qps_fire {
+                reason_parts.push(format!(
+                    "qps_ratio={qps_ratio} hot={qps_hot:?} cold={qps_cold:?}"
+                ));
+            }
+            if size_fire {
+                reason_parts.push(format!(
+                    "size_ratio={size_ratio} hot={size_hot:?} cold={size_cold:?}"
+                ));
+            }
+            out.push(PolicyCandidate {
+                kind: POLICY_KIND_HOT_COLD,
+                primary_part_id: primary,
+                secondary_part_id: secondary,
+                reason: reason_parts.join(" "),
+                size_bytes: size_hottest,
+                req_per_sec: qps_hottest,
+                imm_full_per_sec: 0,
+                same_ps: true,
+                last_op_at: now,
+            });
+            self.last_hot_cold_at.insert(ps_id, now);
+        }
+        out
+    }
+}

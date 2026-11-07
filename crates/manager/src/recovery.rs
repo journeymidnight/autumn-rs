@@ -1,0 +1,4349 @@
+//! Recovery dispatch/collect loops and EC conversion for AutumnManager.
+
+use std::collections::{HashMap, HashSet};
+use std::time::Duration;
+
+use autumn_common::AppError;
+use autumn_rpc::extent_rpc::PayloadLocation;
+use autumn_rpc::manager_rpc::*;
+
+use crate::{AutumnManager, PendingDelete};
+use crate::persist::records::NodeRecord;
+use crate::persist::records::StreamRecord;
+use crate::persist::records::ExtentRecord;
+
+/// The coordinator pinned by an EC dispatch marker: shard index 0 drives the
+/// conversion, so `target_nodes[0]` is the ONLY node whose completion report may
+/// be applied for that marker.
+fn params_coordinator(p: &MgrEcDispatchInflight) -> Option<u64> {
+    p.target_nodes.first().copied()
+}
+
+/// The manager-side contribution to logical size. Open extent length comes
+/// from the PS commit-length probe, never from `sealed_length`.
+fn sealed_extent_logical_size(sealed: bool, sealed_length: u64) -> u64 {
+    if sealed {
+        sealed_length
+    } else {
+        0
+    }
+}
+
+/// Why a coordinator's `ec_done` report may not be applied to the live marker.
+/// Applying the wrong one flips the layout onto targets that hold no shards,
+/// after which cleanup deletes the last full replicas — so every rejection here
+/// RETAINS the marker and lets the re-dispatch reconcile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EcDoneRejection {
+    /// The sender is not this marker's pinned coordinator.
+    NotCoordinator,
+    /// The report names a different post-EC eversion than the marker.
+    EversionMismatch,
+    /// Right coordinator, right eversion — but a DIFFERENT attempt.
+    DifferentAttempt,
+}
+
+/// May `done`, reported by `reporter`, be applied to the marker `params`
+/// (whose attempt identity is `live_nonce`)?
+///
+/// The three checks are not redundant. Reporter identity alone is satisfied by
+/// a reissued attempt that picked the same coordinator; `new_eversion` alone is
+/// satisfied by ANY attempt on this extent, because it is `live + 1` and an
+/// abandoned attempt never bumped the extent. Only the nonce distinguishes two
+/// attempts that agree on both.
+pub(crate) fn classify_ec_done(
+    params: &MgrEcDispatchInflight,
+    live_nonce: u64,
+    reporter: u64,
+    done: &autumn_rpc::extent_rpc::EcConvertDone,
+) -> Result<(), EcDoneRejection> {
+    if params_coordinator(params) != Some(reporter) {
+        return Err(EcDoneRejection::NotCoordinator);
+    }
+    if params.new_eversion != done.new_eversion {
+        return Err(EcDoneRejection::EversionMismatch);
+    }
+    if live_nonce != done.attempt_nonce {
+        return Err(EcDoneRejection::DifferentAttempt);
+    }
+    Ok(())
+}
+
+/// The owner-lock epoch to stamp on an EC conversion's participant writes:
+/// the CURRENT epoch of whichever partition's stream holds `extent_id`, or 0
+/// when no partition claims it (no fence).
+///
+/// Resolved FRESH on every dispatch, never frozen into the marker. The epoch is
+/// re-acquired — and bumped — on every `open_partition`, so any routine PS
+/// reopen (a restart, a rebalance, a `LockedByOther` self-eviction) between the
+/// marker's creation and a re-dispatch raises the ENs' per-extent floor above a
+/// frozen value. Every participant then answers `CODE_LOCKED_BY_OTHER`, the
+/// conversion can never finish, the marker is never released, and that extent's
+/// GC is refused forever ("has in-flight ConvertToEc") — an unbounded space
+/// leak from an ordinary restart.
+///
+/// Refreshing keeps the fence's actual purpose intact: it exists to stop a
+/// FENCED ex-coordinator's ghost writes, and that ghost still carries the older
+/// epoch it captured, so it is still rejected. Only the live dispatch moves up.
+/// The rest of the marker (targets, disks, eversion) stays pinned — a re-derived
+/// ASSIGNMENT would corrupt EC; a re-read fence would not.
+pub(crate) fn dispatch_owner_epoch_for_extent(
+    state: &crate::store::MetadataState,
+    extent_id: u64,
+) -> i64 {
+    // The MAX over every partition that references this extent, not the first
+    // one found. After a split or a merge the extent is CoW-SHARED, so two
+    // partitions carry it on their streams with independent owner locks — and
+    // the EN's per-extent fence floor is raised by whichever of them writes.
+    // Returning the other one's epoch hands the coordinator a value below the
+    // floor, every WriteShard answers CODE_LOCKED_BY_OTHER, and because the
+    // re-dispatch resolves the same wrong partition again it never converges:
+    // the marker stays pinned and that extent's GC is refused for good.
+    // Fencing floors only rise, so the max is the safe answer, and it is
+    // unchanged when a single partition references the extent.
+    let mut epoch = 0;
+    for part in state.partitions.values() {
+        let streams = [part.log_stream, part.row_stream, part.meta_stream];
+        for sid in streams {
+            if state
+                .streams
+                .get(&sid)
+                .map(|st| st.extent_ids.contains(&extent_id))
+                .unwrap_or(false)
+            {
+                let key = format!("partition/{}", part.part_id);
+                epoch = epoch.max(state.owner_epochs.get(&key).copied().unwrap_or(0));
+                break;
+            }
+        }
+    }
+    epoch
+}
+
+/// One EC conversion the dispatch loop will (re-)dispatch this tick: the sealed
+/// `ex`, the `stream` whose `(K, M)` shape it converts to, and the authoritative
+/// ledger marker (`params`: target nodes / extra disks / post-EC eversion /
+/// owner_epoch) to reuse verbatim. Built by `collect_ec_dispatch_candidates`,
+/// consumed by `dispatch_one_ec_conversion`.
+struct EcDispatchCandidate {
+    ex: ExtentRecord,
+    stream: StreamRecord,
+    params: MgrEcDispatchInflight,
+}
+
+// ── TEST-ONLY failpoint for the G4 (EC apply-fail) reproduce harness ──
+// A one-shot, self-clearing flag that forces the NEXT `apply_ec_conversion_done`
+// call to return a transient `Internal` error WITHOUT touching etcd/leadership
+// (models an etcd blip while this manager stays leader). Compiled out of every
+// non-test build. See `ec_g4_wedge_harness.rs`.
+#[cfg(test)]
+thread_local! {
+    static EC_APPLY_FAIL_ONCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Arm the one-shot EC-apply failpoint (test-only).
+#[cfg(test)]
+pub(crate) fn _test_arm_ec_apply_fail_once() {
+    EC_APPLY_FAIL_ONCE.with(|c| c.set(true));
+}
+
+/// What one `dispatch_recovery_task` tick actually did — the distinction the
+/// rate limiter needs, because "we did not try" must not be filed as "we
+/// tried and it worked".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DispatchOutcome {
+    /// A target accepted the rebuild (or one was already running).
+    Dispatched,
+    /// No RPC was attempted, and not for a reason that is a failure: every
+    /// candidate was capped by the rate limiter, the arbiter holds the extent
+    /// back (another op in flight, a split/merge hold), or no node has proven
+    /// itself this term yet. Retry next tick; leave backoff accounting alone.
+    Deferred,
+}
+
+/// How a recovery completion relates to the ledger and the layout.
+///
+/// Split out from the logging so it can be tested by VALUE. An earlier test
+/// asserted on captured `tracing` events instead and was flaky under parallel
+/// test execution — the ambient subscriber is not reliably this thread's. What
+/// actually matters is the classification; the level follows from it.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum CompletionVerdict {
+    /// The live marker asked for exactly this. Apply it.
+    Apply,
+    /// No marker, and the layout already shows this rebuild landed — the
+    /// manager's own re-send echoing back after the executor adopted its
+    /// complete local copy. Routine, and quiet.
+    EchoOfAppliedWork,
+    /// No marker and no sign the rebuild landed: an attempt whose marker was
+    /// released while its executor kept working. The hazard the guard exists
+    /// for, and loud.
+    ReleasedAttempt,
+    /// A marker exists but names a different assignment. Loud.
+    DifferentAssignment,
+}
+
+/// Classify a completion. `pinned` is the live marker's `(node_id, replace_id)`
+/// if one is held; `reporter_is_member` and `replaced_is_member` describe the
+/// CURRENT layout.
+///
+/// Membership alone is not evidence the rebuild landed — a conversion assigning
+/// the reporter a parity slot produces exactly that — so an apply is recognised
+/// by the pair: the reporter is in, and the node it replaced is out.
+pub(crate) fn classify_recovery_completion(
+    pinned: Option<(u64, u64)>,
+    task_node: u64,
+    task_replace: u64,
+    reporter_is_member: bool,
+    replaced_is_member: bool,
+) -> CompletionVerdict {
+    match pinned {
+        Some((n, r)) if n == task_node && r == task_replace => CompletionVerdict::Apply,
+        Some(_) => CompletionVerdict::DifferentAssignment,
+        None if reporter_is_member && !replaced_is_member => CompletionVerdict::EchoOfAppliedWork,
+        None => CompletionVerdict::ReleasedAttempt,
+    }
+}
+
+impl AutumnManager {
+    /// Cancel every marker that depends on an abnormal node (class `Suspected`
+    /// or `Fence`): a Recovery on its executor, a ConvertToEc on any of its
+    /// targets — each one receives a shard. The owner writes the next attempt
+    /// from the state at that time: the recovery tick, or the auto-policy /
+    /// an operator for EC.
+    ///
+    /// LEVEL-TRIGGERED — re-derived from live node state every tick rather
+    /// than hooked onto the fence / maintenance / suspect transitions — so it
+    /// cannot miss an edge and re-converges after a leader failover. A
+    /// `Suspend` node is not abnormal: right after a failover every node is
+    /// one, and its work waits for its first df.
+    ///
+    /// Safe unconditionally: nothing is committed until the manager applies
+    /// it, so cancelling discards an ATTEMPT. A late completion is refused —
+    /// recovery for want of a marker, EC for want of a matching attempt nonce.
+    ///
+    /// Returns the extents whose markers were cancelled (for tests/diagnostics).
+    pub(crate) async fn cancel_markers_on_abnormal_nodes(&self) -> Vec<u64> {
+        let classes = self.classes();
+        let store = self.store.inner.borrow();
+        // (extent, node, kind, attempt nonce, reason)
+        let doomed: Vec<(u64, u64, crate::extent_inflight::ExtentOpKind, u64, String)> = self
+            .inflight
+            .borrow()
+            .values()
+            .filter_map(|rec| match rec.unpack()? {
+                (kind, crate::extent_inflight::ExtentOpPayload::ConvertToEc(p)) => {
+                    let ex = store.extents.get(&p.extent_id);
+                    ec_target_disks(ex, &p.target_nodes, &p.extra_disk_ids)
+                        .into_iter()
+                        .find_map(|(n, d)| {
+                        let why = abnormal_target(&classes, n, d)?;
+                        Some((p.extent_id, n, kind, why))
+                    })
+                }
+                (kind, crate::extent_inflight::ExtentOpPayload::Recovery(t)) => {
+                    let why = abnormal_target(&classes, t.node_id, None)?;
+                    Some((t.extent_id, t.node_id, kind, why))
+                }
+                _ => None,
+            })
+            .map(|(eid, node, kind, why)| (eid, node, kind, self.extent_inflight_nonce(eid), why))
+            .collect();
+        drop(store);
+        let mut cancelled = Vec::new();
+        for (extent_id, node_id, kind, nonce, reason) in doomed {
+            match self.drain_attempt(extent_id, nonce, &reason).await {
+                Ok(false) => {}
+                Ok(true) => {
+                    tracing::info!(extent_id, node_id, ?kind, "cancelled marker: {reason}");
+                    cancelled.push(extent_id);
+                }
+                Err(e) => tracing::warn!(
+                    extent_id,
+                    node_id,
+                    "could not cancel the marker on an abnormal node (retried next tick): {e}"
+                ),
+            }
+        }
+        cancelled
+    }
+
+    /// Release work whose source slot is healthy again (for example after
+    /// unfence). This is a state predicate, never a wall-clock expiry. Disk
+    /// faults, dark slots and corruption still require the pinned recovery.
+    ///
+    /// The question asked is the DISPATCHER's own: would this slot be rebuilt
+    /// if it were seen for the first time right now? Answering anything weaker
+    /// — "is the node un-fenced", say — releases rebuilds that other, equally
+    /// override-blind sources asked for. `slot_verdict` is therefore consulted
+    /// rather than re-derived, and only a `Keep` releases.
+
+    /// Drop what only the PREVIOUS leader term learned from `df`, so a fresh
+    /// term starts with no second-hand facts about any node's disks.
+    ///
+    /// `faulted_disks` already documents itself as "a new leader starts with it
+    /// empty", and across a process restart that was simply true. Election is
+    /// in-process, though, so a manager that leads, loses its lease and leads
+    /// again keeps every entry it ever wrote — including the absence of one for
+    /// a disk that faulted while another leader held the term. Both directions
+    /// then read a stale answer: the rebuild gate sees a faulted disk as
+    /// healthy, and `has_first_hand_df` answers for a node this term has not
+    /// heard from. The next `df` refills both within a tick or two, which is
+    /// exactly the interval the withhold-until-told rule is written for.
+    pub(crate) fn forget_node_health_facts_of_the_previous_term(&self) {
+        self.node_max_free.borrow_mut().clear();
+        self.faulted_disks.borrow_mut().clear();
+        // The degraded clocks too: a slot this term has not looked at has not
+        // been seen degraded by it.
+        self.slot_degraded_since.borrow_mut().clear();
+    }
+
+    /// Has THIS leader term applied a `df` from this node, or is it only
+    /// repeating what it replayed?
+    ///
+    /// `faulted_disks` is leader-local and starts empty, and `disks/<id>` is
+    /// persisted `online: true` from registration and replayed that way — so
+    /// between a promotion and the node's first `df`, a slot on a genuinely
+    /// faulted disk reads exactly like a healthy one. For the DISPATCH
+    /// direction that gap is the safe one (withhold the rebuild until the node
+    /// says again that its disk is bad). Releasing inverts the sign: it would
+    /// drop a real faulted-disk marker, discarding a rebuild that may be
+    /// mid-copy, after nothing worse than an ordinary failover. `node_max_free`
+    /// is written only by a successful `df`, never seeded by replay, and
+    /// emptied at promotion by
+    /// `forget_node_health_facts_of_the_previous_term` — without that last
+    /// part it would answer for a node only some EARLIER term had heard from,
+    /// since election is in-process. Its key set is therefore the set of nodes
+    /// THIS term has heard from first-hand.
+    pub(crate) fn has_first_hand_df(&self, node_id: u64) -> bool {
+        self.node_max_free.borrow().contains_key(&node_id)
+    }
+
+    pub(crate) async fn release_recovery_markers_for_healthy_slots(&self) -> Vec<u64> {
+        let ids: Vec<u64> = self.inflight.borrow().keys().copied().collect();
+        let mut released = Vec::new();
+        for extent_id in ids {
+            let Some(task) = self.extent_inflight_payload_recovery(extent_id) else {
+                continue;
+            };
+            let healthy = {
+                let s = self.store.inner.borrow();
+                s.extents.get(&extent_id).is_some_and(|ex| {
+                    let copies = Self::extent_nodes(ex);
+                    let Some(slot) = copies.iter().position(|n| *n == task.replace_id) else {
+                        return false;
+                    };
+                    let disk_id = if slot < ex.replicates.len() {
+                        ex.replicate_disks.get(slot)
+                    } else {
+                        ex.parity_disks.get(slot - ex.replicates.len())
+                    };
+                    let slot_fence = match disk_id {
+                        Some(&d) => {
+                            self.disk_class_of(task.replace_id, d)
+                                == crate::node_class::DiskClass::Fence
+                        }
+                        None => {
+                            self.node_class_of(task.replace_id)
+                                == crate::node_class::NodeClass::Fence
+                        }
+                    };
+                    // `None` is "no disk record", not "offline".
+                    let disk_online = disk_id.and_then(|id| s.disks.get(id)).map(|d| d.online);
+                    let verdict = slot_verdict(
+                        slot_fence,
+                        self.slot_is_corrupt(extent_id, slot),
+                        self.slot_repair_requested(extent_id, slot),
+                    );
+                    s.nodes.contains_key(&task.replace_id)
+                        && self.has_first_hand_df(task.replace_id)
+                        && self
+                            .node_states
+                            .borrow()
+                            .state_of(task.replace_id)
+                            .is_online()
+                        && (ex.avali & (1u32 << slot)) != 0
+                        && disk_online == Some(true)
+                        && verdict == SlotVerdict::Keep
+                })
+            };
+            if healthy {
+                match self
+                    .release_obsolete_recovery_marker(extent_id, "source slot is healthy again")
+                    .await
+                {
+                    Ok(()) => {
+                        tracing::info!(
+                            extent_id,
+                            replace_id = task.replace_id,
+                            target = task.node_id,
+                            "released recovery marker: source slot is healthy again"
+                        );
+                        released.push(extent_id);
+                    }
+                    Err(error) => {
+                        tracing::warn!(extent_id, %error, "failed to release obsolete recovery marker")
+                    }
+                }
+            }
+        }
+        released
+    }
+
+    /// Re-send needed work from its pinned assignment until it completes,
+    /// its executor disappears, or its source slot no longer needs rebuilding.
+    async fn resend_pinned_recovery_markers(&self) {
+        let pinned: Vec<u64> = self
+            .inflight
+            .borrow()
+            .iter()
+            .filter_map(|(id, rec)| match rec.kind() {
+                Some(crate::extent_inflight::ExtentOpKind::Recovery) => Some(*id),
+                _ => None,
+            })
+            .collect();
+        for extent_id in pinned {
+            if let Err(e) = self.redispatch_pinned_recovery(extent_id).await {
+                tracing::warn!(
+                    extent_id,
+                    error = %e,
+                    "re-sending a pinned recovery marker failed; retried next tick"
+                );
+            }
+        }
+    }
+
+    /// Re-send an already-pinned Recovery marker to the node it named.
+    ///
+    /// This is the "standing instruction" half of the marker model. It NEVER
+    /// re-runs candidate selection (the assignment was decided once, at acquire
+    /// time) and NEVER drains the marker: an unreachable executor is not
+    /// evidence that the task should be abandoned, only that this tick could not
+    /// reach it. Releasing a marker whose target is genuinely gone is an
+    /// event-driven decision (node offline/fenced/removed), not a timeout.
+    ///
+    /// Always `Ok`: a re-send is a keep-alive, not an attempt whose failure
+    /// should feed the (extent, slot) backoff.
+    async fn redispatch_pinned_recovery(
+        &self,
+        extent_id: u64,
+    ) -> Result<DispatchOutcome, AppError> {
+        let Some(task) = self.extent_inflight_payload_recovery(extent_id) else {
+            // Raced with a release — the next tick re-derives from scratch.
+            return Ok(DispatchOutcome::Dispatched);
+        };
+        if let Some(reason) = self.stale_recovery_reason(&task) {
+            self.retire_stale_recovery(&task, &reason).await?;
+            return Ok(DispatchOutcome::Dispatched);
+        }
+        // Don't spend a timeout on a node the manager already knows is not
+        // Online — a keep-alive to a corpse costs the whole dispatch tick, once
+        // per pinned marker. Releasing such a marker is event-driven (the node
+        // going offline/fenced/removed), not this path's job.
+        if !self.node_states.borrow().state_of(task.node_id).is_online() {
+            return Ok(DispatchOutcome::Dispatched);
+        }
+        let addr = {
+            let s = self.store.inner.borrow();
+            match s.nodes.get(&task.node_id) {
+                Some(n) => {
+                    let base = Self::normalize_endpoint(&n.address);
+                    Self::shard_addr_for_extent(&base, &n.shard_ports, extent_id)
+                }
+                // node gone from the map; offline handling owns it
+                None => return Ok(DispatchOutcome::Dispatched),
+            }
+        };
+        let node_id = task.node_id;
+        let Some(attempt) = self.recovery_attempt(extent_id) else {
+            self.drain_extent_inflight_marker(extent_id, "legacy recovery has no source snapshot")
+                .await?;
+            return Ok(DispatchOutcome::Dispatched);
+        };
+        let nonce = attempt.nonce;
+        let payload = rkyv_encode(&RequireRecoveryReq { task, attempt });
+        let result = self
+            .conn_pool
+            .call_timeout(
+                &addr,
+                EXT_MSG_REQUIRE_RECOVERY,
+                payload,
+                // Short: this is a keep-alive to a node believed Online, not the
+                // initial dispatch. A slow answer just means we re-send next tick.
+                Duration::from_secs(5),
+            )
+            .await;
+        // A marker is one attempt: the executor refusing it, or not being
+        // reachable at all, cancels it now and the next tick derives a fresh one.
+        // A TIMEOUT does not — a busy node may still be copying, and dropping a
+        // rebuild that is nearly done to start over costs far more than waiting;
+        // the node's class cancels it once it is Suspected.
+        let cancel = match result {
+            Ok(resp) => match rkyv_decode::<autumn_rpc::extent_rpc::CodeResp>(&resp) {
+                // CODE_OK covers both "started it" and "already running it".
+                Ok(r) if r.code == CODE_OK => None,
+                Ok(r) => Some(format!("node {node_id} refused the re-send: {}", r.message)),
+                Err(e) => Some(format!("node {node_id} answered the re-send undecodably: {e}")),
+            },
+            Err(e) if rpc_timed_out(&e) => {
+                tracing::warn!(extent_id, node_id, "recovery re-send timed out (marker kept): {e}");
+                None
+            }
+            Err(e) => Some(format!("node {node_id} is unreachable: {e}")),
+        };
+        if let Some(reason) = cancel {
+            tracing::warn!(extent_id, node_id, "recovery attempt cancelled: {reason}");
+            if let Err(e) = self.drain_attempt(extent_id, nonce, &reason).await {
+                tracing::warn!(extent_id, "cancelling the recovery attempt failed (retried next tick): {e}");
+            }
+        }
+        Ok(DispatchOutcome::Dispatched)
+    }
+
+    /// Who may rebuild `extent_id`, least loaded first.
+    ///
+    /// Extracted so the ORDER is observable. It used to be
+    /// `sort_by_key(node_id)` inline, and the walk that consumes it stops at
+    /// the first candidate with rate-limiter headroom — so the lowest ids won
+    /// every rebuild in the cluster. Draining one node then sent 12 of its 27
+    /// shards onto the two nodes queued to be decommissioned next (they had
+    /// the smallest ids), while four brand-new empty nodes received nothing.
+    ///
+    /// A full ordering rather than one pick: the walk needs somewhere to go
+    /// when a target is capped, so every candidate must appear exactly once.
+    ///
+    /// The hard constraints are applied BEFORE scoring, so scoring never gets
+    /// the chance to overrule them: a node already holding a slot of this
+    /// extent (`occupied` — two slots on one node quietly costs a replica's
+    /// worth of fault tolerance) and any node whose class is not `Health`
+    /// (rebuilding onto one only makes work to migrate off, or waits on a node
+    /// not yet heard from).
+    pub(crate) fn recovery_candidate_order(
+        &self,
+        extent_id: u64,
+    ) -> Result<(ExtentRecord, Vec<NodeRecord>), AppError> {
+        // Both read RefCells disjoint from the store; taken before its borrow.
+        let classes = self.classes();
+        let placement_load = self.placement_load();
+        let (extent, all) = {
+            let s = self.store.inner.borrow();
+            let extent = s
+                .extents
+                .get(&extent_id)
+                .cloned()
+                .ok_or_else(|| AppError::NotFound(format!("extent {extent_id}")))?;
+            let occupied = Self::extent_nodes(&extent)
+                .into_iter()
+                .collect::<HashSet<_>>();
+            let all = s
+                .nodes
+                .values()
+                .filter(|n| !occupied.contains(&n.node_id))
+                .filter(|n| classes.takes_new_data(n))
+                .cloned()
+                .collect::<Vec<_>>();
+            (extent, all)
+        };
+        let mut by_id: std::collections::HashMap<u64, NodeRecord> =
+            all.into_iter().map(|n| (n.node_id, n)).collect();
+        let ids: Vec<u64> = by_id.keys().copied().collect();
+        let ordered = crate::placement::order_by_load(
+            crate::placement::pool_for(ids, &placement_load),
+            &mut rand::thread_rng(),
+        )
+        .into_iter()
+        .filter_map(|id| by_id.remove(&id))
+        .collect();
+        Ok((extent, ordered))
+    }
+
+    pub(crate) async fn dispatch_recovery_task(
+        &self,
+        extent_id: u64,
+        replace_id: u64,
+    ) -> Result<DispatchOutcome, AppError> {
+        // any in-flight stream-layer op on this
+        // extent blocks recovery dispatch. This was previously three
+        // separate ad-hoc checks (recovery_tasks dedup, ec_conversion_inflight,
+        // pending_extent_deletes), now collapsed into one ledger
+        // read. The probe distinguishes "already-recovering (idempotent
+        // OK)" from "different op in flight (caller retries)".
+        match self.extent_inflight_op(extent_id) {
+            // A Recovery marker is a STANDING INSTRUCTION, not a "someone else
+            // has this, skip" flag: re-send it to the node it pinned. Skipping
+            // was what made a wall-clock TTL necessary — an executor that
+            // restarted (losing its in-memory in-flight set) or gave up silently
+            // left a marker nobody would ever act on again, so the only way back
+            // was to time the marker out. Re-sending covers those cases in one
+            // dispatch tick instead, and the EN answers an already-running task
+            // with CODE_OK (idempotent accept).
+            Some(crate::extent_inflight::ExtentOpKind::Recovery) => {
+                return self.redispatch_pinned_recovery(extent_id).await;
+            }
+            _ => {}
+        }
+        // Another op holding the extent (nothing preempts it), a split/merge
+        // hold: not a dispatch, not a failure — the backoff is left alone and
+        // the slot is looked at again next tick.
+        if let Err(why) = self.arbitrate(
+            &self.arbiter_view(),
+            extent_id,
+            crate::extent_arbiter::ExtentOp::Rebuild,
+        ) {
+            tracing::debug!(extent_id, "recovery deferred: {why}");
+            return Ok(DispatchOutcome::Deferred);
+        }
+
+        // Only onto a node that takes new data (`Classes::takes_new_data`).
+        let (extent, candidates) = self.recovery_candidate_order(extent_id)?;
+
+        if candidates.is_empty() {
+            // Right after a promotion every node is `Suspend` until its first
+            // df: no target YET is not a failed dispatch, so no backoff.
+            if self
+                .classes()
+                .nodes
+                .values()
+                .any(|c| *c == crate::node_class::NodeClass::Suspend)
+            {
+                return Ok(DispatchOutcome::Deferred);
+            }
+            return Err(AppError::Precondition(
+                "no candidate node for recovery".to_string(),
+            ));
+        }
+
+        let mut rate_limited = false;
+        // Did any candidate get PAST the limiter and still not work out? That
+        // is a real failure and must back off, even if a different candidate
+        // was capped in the same tick (see the deferral check at the tail).
+        let mut attempted = false;
+        for candidate in &candidates {
+            // gate this (source -> target) dispatch on the rate
+            // limiter (reseeded from the ledger at the top of the dispatch
+            // loop). On cap-hit try the NEXT candidate — a different target
+            // may have headroom; if every candidate is capped we return Ok
+            // below (deferred, NOT a failure: no backoff, retried next tick
+            // once capacity frees). The slot is released on any RPC-failure
+            // path below; on success it stays counted (and is re-derived
+            // from the ledger on the next tick's reseed).
+            if !self
+                .recovery_limiter
+                .borrow_mut()
+                .try_acquire(replace_id, candidate.node_id)
+            {
+                rate_limited = true;
+                continue;
+            }
+            attempted = true;
+            let base = Self::normalize_endpoint(&candidate.address);
+            // recovery targets a specific extent_id → route to owner shard.
+            let addr = Self::shard_addr_for_extent(&base, &candidate.shard_ports, extent_id);
+
+            let task = RecoveryTask {
+                extent_id,
+                replace_id,
+                node_id: candidate.node_id,
+                start_time: Self::epoch_seconds(),
+            };
+
+            // acquire the unified inflight marker BEFORE the
+            // EN RPC. The order was previously reversed (RPC → check
+            // code → acquire): if `acquire_extent_inflight` failed
+            // (NotLeader during the etcd CAS await, etcd transient,
+            // or someone else acquired between our probe at L24 and
+            // our acquire), the EN was ALREADY running `run_recovery_task`
+            // with no corresponding manager ledger entry. apply_recovery_done
+            // (which validates state from the ledger) would later be
+            // missing the I3 atomic put_and_delete_txn's delete target,
+            // and the ledger invariants drift.
+            //
+            // Now: acquire first; on success → RPC; if RPC fails or EN
+            // rejects, drain the marker (release etcd + in-memory) and
+            // try the next candidate. If acquire returns Precondition
+            // (someone else holds the marker), return Ok — the in-flight
+            // recovery is functionally what we wanted.
+            match self
+                .acquire_extent_inflight(
+                    extent.extent_id,
+                    crate::extent_inflight::ExtentOpPayload::Recovery(task.clone()),
+                )
+                .await
+            {
+                Ok(()) => {}
+                Err(AppError::Precondition(_)) => return Ok(DispatchOutcome::Dispatched),
+                Err(other) => return Err(other),
+            }
+
+            let attempt = self.recovery_attempt(extent_id).ok_or_else(|| {
+                AppError::Precondition("recovery cancelled before dispatch".into())
+            })?;
+            let dispatched_nonce = attempt.nonce;
+            let payload = rkyv_encode(&RequireRecoveryReq { task, attempt });
+            // 30 s ceiling — REQUIRE_RECOVERY only kicks off the
+            // background `run_recovery_task` on the EN; the EN returns
+            // OK immediately. A paged-out / dead EN otherwise wedges
+            // this loop and starves recovery of all other extents.
+            let resp = match self
+                .conn_pool
+                .call_timeout(
+                    &addr,
+                    EXT_MSG_REQUIRE_RECOVERY,
+                    payload,
+                    Duration::from_secs(self.params.recovery_dispatch_timeout_secs.get()),
+                )
+                .await
+            {
+                Ok(v) => Some(v),
+                // A timeout is not a report that the target is gone: it may have
+                // taken the rebuild and be slow to answer. The attempt stands and
+                // the re-send next tick finds out; the node's class cancels it if
+                // the node stays silent.
+                Err(e) if rpc_timed_out(&e) => {
+                    tracing::warn!(
+                        extent_id = extent.extent_id,
+                        executor = candidate.node_id,
+                        "recovery dispatch timed out; the attempt stands and is re-sent: {e}"
+                    );
+                    None
+                }
+                Err(_) => {
+                    // Refused at the transport or unreachable → release the
+                    // marker we just acquired and try the next candidate.
+                    if let Err(e) = self
+                        .drain_attempt(
+                            extent.extent_id,
+                            dispatched_nonce,
+                            "dispatch RPC failed",
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            extent_id = extent.extent_id,
+                            error = %e,
+                            "could not release the marker after a failed dispatch; it stays \
+                             pinned to that candidate until the node goes offline"
+                        );
+                    }
+                    // release the limiter slot we took above.
+                    self.recovery_limiter
+                        .borrow_mut()
+                        .release(replace_id, candidate.node_id);
+                    continue;
+                }
+            };
+            if self.extent_inflight_nonce(extent_id) != dispatched_nonce {
+                return Ok(DispatchOutcome::Dispatched);
+            }
+            let decoded = match &resp {
+                Some(bytes) => rkyv_decode::<autumn_rpc::extent_rpc::CodeResp>(bytes).map(Some),
+                None => Ok(None),
+            };
+            let r = match decoded {
+                Ok(v) => v,
+                Err(_) => {
+                    if let Err(e) = self
+                        .drain_attempt(
+                            extent.extent_id,
+                            dispatched_nonce,
+                            "the dispatch response was undecodable",
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            extent_id = extent.extent_id,
+                            error = %e,
+                            "could not release the marker after an undecodable response; it stays pinned \
+                             to that candidate until the node goes offline"
+                        );
+                    }
+                    // release the limiter slot we took above.
+                    self.recovery_limiter
+                        .borrow_mut()
+                        .release(replace_id, candidate.node_id);
+                    continue;
+                }
+            };
+            if r.as_ref().is_some_and(|r| r.code != CODE_OK) {
+                // EN rejected (e.g. extent exists locally already, or
+                // recovery_inflight conflict). Release marker
+                // and try next candidate.
+                if let Err(e) = self
+                    .drain_attempt(
+                        extent.extent_id,
+                        dispatched_nonce,
+                        "the target refused the rebuild",
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        extent_id = extent.extent_id,
+                        error = %e,
+                        "could not release the marker after the target refused the rebuild"
+                    );
+                }
+                // release the limiter slot we took above.
+                self.recovery_limiter
+                    .borrow_mut()
+                    .release(replace_id, candidate.node_id);
+                continue;
+            }
+
+            // Both acquire AND RPC succeeded. Marker stays in place
+            // until apply_recovery_done's atomic put_and_delete_txn
+            // releases it (invariant I3).
+            //
+            // Op-ledger: the EN accepted the rebuild, so this extent's recovery
+            // is genuinely RUNNING — record it (create-or-count-attempt) so an
+            // operator can see it in `ops list --kind recovery` instead of only
+            // in aggregate `recovery-stats`.
+            {
+                let slot = {
+                    let s = self.store.inner.borrow();
+                    s.extents
+                        .get(&extent.extent_id)
+                        .and_then(|ex| Self::extent_slot(ex, replace_id))
+                        .unwrap_or(0) as u32
+                };
+                let (now_s, now_ms) = Self::now_s_ms();
+                self.ops.borrow_mut().note_recovery_dispatch(
+                    extent.extent_id,
+                    slot,
+                    candidate.node_id,
+                    now_s,
+                    now_ms,
+                );
+                // The op ledger is a leader-local ring of 256 that dies with the
+                // leader, so it cannot answer "was this ever dispatched?" from a
+                // log file after the fact. Say it here too: this and the apply
+                // below are the two events a reader needs to tell a repair that
+                // ran from one that never started, and both used to be silent
+                // while a benign duplicate report was a WARN.
+                tracing::info!(
+                    extent_id = extent.extent_id,
+                    executor = candidate.node_id,
+                    replacing = replace_id,
+                    slot,
+                    "recovery dispatched: rebuilding this slot onto a healthy node"
+                );
+            }
+            return Ok(DispatchOutcome::Dispatched);
+        }
+
+        // Never reached an RPC because every candidate was capped: a deferral,
+        // not a failure. It is reported as such — NOT as success — because
+        // success CLEARS the accumulated backoff. During a mass fence, which is
+        // exactly when the limiter binds, treating deferrals as successes reset
+        // a persistently failing slot's 300 s backoff to 2 s every tick, so its
+        // 30 s-timeout dispatches recurred at nearly full tick rate and starved
+        // the sequential dispatch loop.
+        //
+        // `attempted` keeps this honest: if any candidate got past the limiter
+        // and failed, the tick FAILED, however many others were capped —
+        // otherwise one capped candidate would mask every real failure beside
+        // it, and that tick's reason would be recorded nowhere.
+        if rate_limited && !attempted {
+            return Ok(DispatchOutcome::Deferred);
+        }
+        Err(AppError::Precondition(
+            "all recovery candidates rejected".to_string(),
+        ))
+    }
+
+    /// Cancel the attempt `nonce` on `extent_id` — and only it: a successor
+    /// written since is left alone. `Ok(false)`: it was already gone (released,
+    /// completed, or cancelled by another path), so there is nothing to retry.
+    pub(crate) async fn drain_attempt(
+        &self,
+        extent_id: u64,
+        nonce: u64,
+        reason: &str,
+    ) -> Result<bool, AppError> {
+        if self.extent_inflight_nonce(extent_id) != nonce {
+            return Ok(false);
+        }
+        self.drain_extent_inflight_marker(extent_id, reason).await?;
+        Ok(true)
+    }
+
+    fn stale_recovery_reason(&self, task: &RecoveryTask) -> Option<String> {
+        let store = self.store.inner.borrow();
+        let Some(extent) = store.extents.get(&task.extent_id) else {
+            return Some(
+                "the extent was removed from manager state before the rebuild landed".into(),
+            );
+        };
+        let Some(slot) = Self::extent_slot(extent, task.replace_id) else {
+            return Some(format!(
+                "replace_id {} not in extent {}",
+                task.replace_id, task.extent_id
+            ));
+        };
+        if Self::extent_nodes(extent)
+            .iter()
+            .enumerate()
+            .any(|(index, node_id)| index != slot && *node_id == task.node_id)
+        {
+            return Some(format!(
+                "recovery target {} for extent {} already in extent node list at a different slot",
+                task.node_id, task.extent_id
+            ));
+        }
+        drop(store);
+        let Some(attempt) = self.recovery_attempt(task.extent_id) else {
+            return Some("recovery marker has no versioned source snapshot".into());
+        };
+        if let Err(error) = self.validate_recovery_attempt(task, &attempt, None) {
+            return Some(error.to_string());
+        }
+        None
+    }
+
+    async fn retire_stale_recovery(
+        &self,
+        task: &RecoveryTask,
+        reason: &str,
+    ) -> Result<(), AppError> {
+        let maybe_addr = {
+            let store = self.store.inner.borrow();
+            if store.extents.contains_key(&task.extent_id) {
+                None
+            } else {
+                store.nodes.get(&task.node_id).map(|node| {
+                    let base = Self::normalize_endpoint(&node.address);
+                    Self::shard_addr_for_extent(&base, &node.shard_ports, task.extent_id)
+                })
+            }
+        };
+        self.drain_extent_inflight_marker(task.extent_id, reason)
+            .await?;
+        if let Some(addr) = maybe_addr {
+            self.enqueue_pending_deletes(vec![PendingDelete {
+                extent_id: task.extent_id,
+                pending_targets: vec![crate::extent_delete::DeleteTarget {
+                    addr,
+                    node_uuid: String::new(),
+                }],
+                attempts: 0,
+            }])
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// Drive this extent's recovery ledger entry to a terminal FAILED state.
+    ///
+    /// `note_recovery_dispatch` opens one entry per extent on the way out and
+    /// only ever REUSES an active one, so an entry left RUNNING by an exit that
+    /// neither applies the rebuild nor leaves anyone to report it later is never
+    /// written again — `ops status` answers "running" for a recovery that ended,
+    /// forever. The TTL backstop does not cover this: it reaps only the
+    /// PS-executed kinds, by design, because recovery legitimately retries for
+    /// as long as the repair is outstanding.
+    ///
+    /// A no-op when no entry is active, which is the common case: the exits that
+    /// call this are reached far more often than a dispatch precedes them.
+    fn abandon_recovery_entry(&self, extent_id: u64, reason: String) {
+        let (now_s, _) = Self::now_s_ms();
+        self.ops
+            .borrow_mut()
+            .abandon_recovery(extent_id, reason, now_s);
+    }
+
+    /// Read the layout and classify a completion against it.
+    ///
+    /// Separate from `apply_recovery_done` so the WIRING is testable: which
+    /// membership question feeds which parameter is exactly the thing that
+    /// cannot be checked from the pure function or from the layout afterwards
+    /// (both non-applying verdicts leave the extent untouched, so they are
+    /// indistinguishable except by the verdict itself).
+    pub(crate) fn recovery_completion_verdict(
+        &self,
+        task: &RecoveryTask,
+        pinned: Option<&RecoveryTask>,
+    ) -> CompletionVerdict {
+        let (reporter_is_member, replaced_is_member) = {
+            let s = self.store.inner.borrow();
+            match s.extents.get(&task.extent_id) {
+                Some(ex) => (
+                    Self::extent_slot(ex, task.node_id).is_some(),
+                    Self::extent_slot(ex, task.replace_id).is_some(),
+                ),
+                // No extent: nothing shows a rebuild landed, so this cannot be
+                // an echo. `replaced_is_member = true` is what steers it to
+                // `ReleasedAttempt` rather than silently reading as applied.
+                None => (false, true),
+            }
+        };
+        classify_recovery_completion(
+            pinned.map(|p| (p.node_id, p.replace_id)),
+            task.node_id,
+            task.replace_id,
+            reporter_is_member,
+            replaced_is_member,
+        )
+    }
+
+    pub(crate) async fn apply_recovery_done(
+        &self,
+        done_task: RecoveryTaskDone,
+    ) -> Result<(), AppError> {
+        let task = &done_task.task;
+        let _lifecycle = self.node_lifecycle_lock.lock().await;
+
+        // if EC conversion is in flight for this extent,
+        // defer the recovery apply. apply_ec_conversion_done would
+        // overwrite both ex.replicates (reverting the slot replacement)
+        // and ex.eversion (losing the recovery's eversion bump). The
+        // Recovery marker is KEPT (we return before any release).
+        // CAVEAT (pre-existing, deferred): the df handler
+        // mem::take's recovery_done once, so THIS completion is consumed
+        // and NOT re-delivered — the "retry next tick" the old comment
+        // promised does not happen. Convergence is via the dispatch loop
+        // re-evaluating the now-EC'd extent's per-slot health and re-recovering
+        // any genuinely-missing shard. Recovery markers are standing
+        // instructions: the dispatch loop re-sends a valid marker and retries
+        // cleanup of a marker whose layout became stale. A manager-side
+        // completion-retry queue would converge faster but is deferred until
+        // the slow-convergence is reproduced as real harm.
+        // reads the unified ledger via `extent_inflight_op`.
+        if matches!(
+            self.extent_inflight_op(task.extent_id),
+            Some(crate::extent_inflight::ExtentOpKind::ConvertToEc)
+        ) {
+            return Err(AppError::Precondition(format!(
+                "ec conversion in flight on extent {}; deferring recovery apply",
+                task.extent_id
+            )));
+        }
+
+        // ATTEMPT IDENTITY, the recovery twin of `classify_ec_done`.
+        //
+        // A completion must be the one this marker asked for. Without this, ANY
+        // arriving `RecoveryTaskDone` was applied — including one from an
+        // executor whose marker was released while it kept working, which is a
+        // case the release path explicitly contemplates ("if the executor was
+        // in fact still working and finishes later, its completion is refused").
+        // That refusal did not exist; this is it.
+        //
+        // What it cost: release the marker (a df blip is enough to make the
+        // pinned node Suspected), let the extent be EC-converted, then let the
+        // old executor finish its PRE-conversion full copy and report. The slot
+        // was swapped onto a node holding a whole `.dat` while the layout says
+        // the payload is a shard file — and the replaced node, now a
+        // non-member, has its real shard reaped by the reconcile. The manager
+        // shows every slot available while the stripe silently runs one copy
+        // short.
+        //
+        // Refusing is one behaviour but several events, and reporting them all
+        // in the loudest available words put the alarm on the most ordinary one.
+        // The ledger ALONE cannot separate them — an absent marker looks the
+        // same whether the work landed or was thrown away — so the LAYOUT is
+        // asked as well: an applied rebuild has already moved this slot onto
+        // `task.node_id`, and an attempt that never applied has not.
+        //
+        //  - re-send echo (routine): the manager re-sends a pinned recovery
+        //    every 2 s, and one landing after the rebuild finished but before
+        //    the executor's next `df` drained its queue makes that executor
+        //    adopt its complete local copy and report AGAIN. The first copy
+        //    applies and releases the marker; every later one arrives here. The
+        //    slot already names the executor, so it is verifiably a duplicate of
+        //    work that IS committed. Quiet, like the EC twin
+        //    (`ec_done for an extent with no inflight marker; ignoring`).
+        //  - a released attempt finishing late: the marker went (a df blip is
+        //    enough to make its executor Suspected) and nothing applied, so the
+        //    slot still names the node this report wants to replace. This is the
+        //    near-miss the guard was built for — the narrative above — and it
+        //    stays loud even though the ledger is empty.
+        //  - a completion for a DIFFERENT live assignment: loud.
+        let pinned_recovery = self.extent_inflight_payload_recovery(task.extent_id);
+        // BOTH halves, and the second is the load-bearing one. "The reporter is
+        // a member" alone is not evidence its rebuild landed — an EC conversion
+        // assigning it a parity slot produces exactly that, and the guard below
+        // names that as the TYPICAL layout change. Reading membership alone put
+        // the released-attempt hazard back into the quiet branch whenever the
+        // reporter happened to hold any slot. An apply also REMOVES the node it
+        // replaced, so requiring that is what distinguishes the two.
+        //
+        // The residual it cannot settle, stated plainly rather than papered
+        // over: if the conversion ALSO dropped `replace_id` (plausible — it was
+        // Suspected, so placement may well have excluded it), both cases present
+        // the identical layout, and no read of the layout can separate them.
+        // That corner reads as an echo. Closing it needs attempt identity to
+        // outlive the marker, which is a bigger change than a log level.
+        let verdict = self.recovery_completion_verdict(task, pinned_recovery.as_ref());
+        match verdict {
+            CompletionVerdict::Apply => {}
+            CompletionVerdict::EchoOfAppliedWork => {
+                tracing::debug!(
+                    extent_id = task.extent_id,
+                    reported_node = task.node_id,
+                    reported_replace = task.replace_id,
+                    "recovery completion re-reported after its rebuild was already applied \
+                     (a standing-instruction re-send the executor adopted); ignoring — benign"
+                );
+                // This slot's repair IS committed, so the entry a dispatch
+                // opened before the completion arrived closes as the success it
+                // describes rather than as an abandoned attempt.
+                //
+                // But ONLY when the extent has nothing left to repair. The
+                // ledger keys entries by extent, not by slot, so the active
+                // entry here need not be about this slot at all: a second slot
+                // failing dispatch in the same window opens one carrying its own
+                // failure reason (`record_recovery_failure`, which creates an
+                // entry with no marker). Writing SUCCEEDED over that would
+                // report a repair that did not happen and erase why it did not.
+                // A dark slot means the dispatch loop still owes work and will
+                // refresh the entry itself.
+                let all_slots_available = {
+                    let s = self.store.inner.borrow();
+                    match s.extents.get(&task.extent_id) {
+                        Some(ex) => {
+                            let slots = Self::extent_nodes(ex).len();
+                            let full = if slots >= 32 {
+                                u32::MAX
+                            } else {
+                                (1u32 << slots) - 1
+                            };
+                            ex.avali & full == full
+                        }
+                        // No extent to repair: nothing is outstanding.
+                        None => true,
+                    }
+                };
+                if all_slots_available {
+                    let (now_s, _) = Self::now_s_ms();
+                    self.ops.borrow_mut().complete_recovery(
+                        task.extent_id,
+                        format!(
+                            "slot on node {} was already rebuilt; duplicate completion",
+                            task.node_id
+                        ),
+                        now_s,
+                    );
+                }
+                return Ok(());
+            }
+            CompletionVerdict::ReleasedAttempt => {
+                // Deliberately NOT "no inflight marker": another kind may hold
+                // the ledger slot (a Delete acquired once refs hit 0), and this
+                // path must not assert something it did not check.
+                tracing::warn!(
+                    extent_id = task.extent_id,
+                    reported_node = task.node_id,
+                    reported_replace = task.replace_id,
+                    other_op = ?self.extent_inflight_op(task.extent_id),
+                    "recovery completion with NO live recovery marker and no sign the \
+                     rebuild was applied — REFUSING (an attempt whose marker was released \
+                     while its executor kept working; applying it could swap the slot onto \
+                     a copy the current layout does not describe)"
+                );
+                self.abandon_recovery_entry(
+                    task.extent_id,
+                    "attempt refused: its marker was released and nothing shows the rebuild \
+                     applied"
+                        .to_string(),
+                );
+                return Ok(());
+            }
+            CompletionVerdict::DifferentAssignment => {
+                let pinned = pinned_recovery.as_ref().expect("classified as mismatched");
+                tracing::warn!(
+                    extent_id = task.extent_id,
+                    reported_node = task.node_id,
+                    reported_replace = task.replace_id,
+                    pinned = ?(pinned.node_id, pinned.replace_id),
+                    "recovery completion names a DIFFERENT assignment than the live marker \
+                     — REFUSING to apply (the marker is retained; its own executor reports \
+                     its own completion)"
+                );
+                return Ok(());
+            }
+        }
+
+        // A same-assignment predecessor may never touch its successor.
+        if self.recovery_attempt(task.extent_id).as_ref() != Some(&done_task.attempt)
+            || done_task.attempt.nonce == 0
+        {
+            return Err(AppError::Precondition("recovery attempt changed".into()));
+        }
+
+        // precheck — if `task.node_id` is already present in this
+        // extent at a slot OTHER than the failed `replace_id`, the layout
+        // has changed since dispatch (typically EC conversion completed
+        // during recovery and assigned this node as parity). Applying the
+        // recovery would produce a duplicate-node state where one node
+        // holds two shards; reads of the duplicated slot would return
+        // whatever shard EC conversion last wrote there (parity bytes in
+        // the documented production case), corrupting the read path.
+        // Discard the stale task (memory + etcd) so the dedup check in
+        // `dispatch_recovery_task` doesn't permanently block future
+        // attempts to repair this slot.
+        if let Some(reason) = self.stale_recovery_reason(task) {
+            let removed = !self
+                .store
+                .inner
+                .borrow()
+                .extents
+                .contains_key(&task.extent_id);
+            drop(_lifecycle);
+            self.retire_stale_recovery(task, &reason).await?;
+            return if removed {
+                Ok(())
+            } else {
+                Err(AppError::Precondition(reason))
+            };
+        }
+        self.validate_recovery_attempt(task, &done_task.attempt, Some(done_task.ready_disk_id))?;
+        let snapshot = self.snapshot_inflight(
+            task.extent_id,
+            crate::extent_inflight::ExtentOpKind::Recovery,
+        )?;
+
+        // etcd-first: compute updated_extent from a clone under
+        // read-only borrow. The borrow_mut block previously mutated
+        // s.extents[task.extent_id] in place, then the etcd put_and_delete_txn
+        // below ran. If etcd failed (NotLeader / fence break), the in-memory
+        // mutation had already advanced ex.replicates / eversion / avali —
+        // a window where reads observed the new state but etcd had the old.
+        // Replay rolled in-memory back later, but during the window other
+        // mutating handlers could derive their snapshots from the
+        // "fake-applied" state.
+        let (updated_extent, baseline) = {
+            let s = self.store.inner.borrow();
+            match s.extents.get(&task.extent_id) {
+                Some(ex) => {
+                    let slot = match Self::extent_slot(ex, task.replace_id) {
+                        Some(v) => v,
+                        // The stale-layout check above already covered this.
+                        // Kept as defense against a future refactor.
+                        None => {
+                            return Err(AppError::Precondition(format!(
+                                "replace_id {} not in extent {}",
+                                task.replace_id, task.extent_id
+                            )));
+                        }
+                    };
+
+                    let mut new_ex = ex.clone();
+                    if slot < new_ex.replicates.len() {
+                        new_ex.replicates[slot] = task.node_id;
+                        if new_ex.replicate_disks.len() <= slot {
+                            new_ex.replicate_disks.resize(slot + 1, 0);
+                        }
+                        new_ex.replicate_disks[slot] = done_task.ready_disk_id;
+                    } else {
+                        let parity_slot = slot - new_ex.replicates.len();
+                        new_ex.parity[parity_slot] = task.node_id;
+                        if new_ex.parity_disks.len() <= parity_slot {
+                            new_ex.parity_disks.resize(parity_slot + 1, 0);
+                        }
+                        new_ex.parity_disks[parity_slot] = done_task.ready_disk_id;
+                    }
+                    new_ex.avali |= 1u32 << slot;
+                    new_ex.eversion += 1;
+                    (new_ex, crate::persist::encode(ex))
+                }
+                None => return Err(AppError::NotFound(format!("extent {}", task.extent_id))),
+            }
+        };
+        self.commit_inflight_extent(&snapshot, baseline, updated_extent.clone(), vec![])
+            .await?;
+        drop(_lifecycle);
+        // Op-ledger: the extent layout is repaired — close the recovery entry
+        // before the awaits below, or a tick in between finds no marker and
+        // closes it as a rebuild nobody needed.
+        {
+            let (now_s, _) = Self::now_s_ms();
+            self.ops.borrow_mut().complete_recovery(
+                updated_extent.extent_id,
+                format!("recovered slot onto node {}", task.node_id),
+                now_s,
+            );
+        }
+        // The rebuilt slot holds fresh bytes copied from a healthy peer, so the
+        // corrupt mark that scheduled this rebuild has been satisfied. Clearing
+        // it also stops the slot from being force-dispatched every tick.
+        if let Some(slot) = Self::extent_slot(&updated_extent, task.node_id) {
+            // A repair request for the slot is satisfied the same way.
+            if let Err(e) = self
+                .clear_repair_slot(updated_extent.extent_id, slot)
+                .await
+            {
+                tracing::warn!(
+                    extent_id = updated_extent.extent_id,
+                    slot,
+                    error = %e,
+                    "rebuilt a slot with a repair request but could not clear the \
+                     request; it will be rebuilt again until the request clears"
+                );
+            }
+            if let Err(e) = self
+                .clear_corrupt_slot(updated_extent.extent_id, slot)
+                .await
+            {
+                tracing::warn!(
+                    extent_id = updated_extent.extent_id,
+                    slot,
+                    error = %e,
+                    "rebuilt a corrupt slot but could not clear its mark; it will be \
+                     re-dispatched until the mark clears"
+                );
+            }
+        }
+        tracing::info!(
+            extent_id = updated_extent.extent_id,
+            executor = task.node_id,
+            replaced = task.replace_id,
+            eversion = updated_extent.eversion,
+            "recovery applied: the slot now points at the rebuilt copy"
+        );
+        Ok(())
+    }
+
+    /// Dispatch a recovery for `(extent_id, slot → node_id)` and record the
+    /// outcome in the rate limiter (success clears backoff; failure backs off
+    /// `(extent_id, slot)`). Dedups the four byte-identical dispatch tails in
+    /// `recovery_dispatch_loop` (fenced / disk-offline / avali==0 / unhealthy-
+    /// probe). Keeps the `&Result` passthrough so the failure reason is never
+    /// dropped (note 30).
+    async fn dispatch_and_record(&self, extent_id: u64, slot: u32, node_id: u64, now_s: i64) {
+        let res = self.dispatch_recovery_task(extent_id, node_id).await;
+        self.record_dispatch_outcome(extent_id, slot, now_s, &res);
+    }
+
+    /// Start an in-place catch-up of `slot` as a background task, unless one
+    /// is already running for it or `--catch-up-max-inflight` are.
+    ///
+    /// Background because the node copies the whole missing range before it
+    /// answers (up to the 30 s timeout), and the dispatch tick is serial: a
+    /// node back from an hour away with hundreds of behind extents would
+    /// otherwise hold the tick — marker release, re-sends, every other
+    /// extent's rebuild, the fenced-tail drain — for the sum of their copies.
+    /// The cap bounds what a returning node is asked to copy at once; each
+    /// node also gates copies on its own recovery permits.
+    fn start_catch_up(
+        &self,
+        ex: &ExtentRecord,
+        slot: usize,
+        node: crate::persist::records::NodeRecord,
+    ) {
+        let key = (ex.extent_id, slot as u32);
+        {
+            let mut running = self.catch_up_inflight.borrow_mut();
+            if running.contains(&key)
+                || running.len() >= self.params.catch_up_max_inflight.get()
+            {
+                return;
+            }
+            running.insert(key);
+        }
+        let mgr = self.clone();
+        let ex = ex.clone();
+        compio::runtime::spawn(async move {
+            mgr.catch_up_in_place(&ex, slot, &node).await;
+            mgr.catch_up_inflight.borrow_mut().remove(&key);
+        })
+        .detach();
+    }
+
+    /// Bring a behind copy up to the sealed length on its own node
+    /// (`re_avali`), and mark the slot available once it is.
+    ///
+    /// The outcome goes to the slot's catch-up backoff (`catch_up_backoff`,
+    /// separate from the rebuild's), so a copy that keeps failing to catch up
+    /// is retried at a falling rate (cap 300 s) and warns at that rate, not
+    /// every 2 s tick. It is not a recovery op: nothing
+    /// moves, so it never enters the op ledger.
+    async fn catch_up_in_place(
+        &self,
+        ex: &ExtentRecord,
+        slot: usize,
+        node: &crate::persist::records::NodeRecord,
+    ) {
+        let base = Self::normalize_endpoint(&node.address);
+        let addr = Self::shard_addr_for_extent(&base, &node.shard_ports, ex.extent_id);
+        let payload = rkyv_encode(&ReAvaliReq {
+            extent_id: ex.extent_id,
+            eversion: ex.eversion,
+        });
+        // 30 s — RE_AVALI may copy the full extent from peers if local data
+        // lags sealed_length, so allow real work; cap to prevent a paged-out
+        // node from wedging the tick.
+        let outcome = match self
+            .conn_pool
+            .call_timeout(
+                &addr,
+                EXT_MSG_RE_AVALI,
+                payload,
+                Duration::from_secs(self.params.catch_up_timeout_secs.get()),
+            )
+            .await
+        {
+            Err(e) => Err(format!("re_avali to {addr}: {e}")),
+            Ok(resp) => match rkyv_decode::<autumn_rpc::extent_rpc::CodeResp>(&resp) {
+                Err(e) => Err(format!("re_avali to {addr}: undecodable reply: {e}")),
+                Ok(r) if r.code != CODE_OK => {
+                    if r.code == autumn_rpc::extent_rpc::CODE_NOT_FOUND {
+                        // The node says it has no such extent: the copy is
+                        // gone, and no catch-up will bring it back.
+                        self.catch_up_copy_gone
+                            .borrow_mut()
+                            .insert((ex.extent_id, slot as u32));
+                    }
+                    Err(format!("re_avali to {addr}: code {}: {}", r.code, r.message))
+                }
+                Ok(_) => Ok(()),
+            },
+        };
+        let slot32 = slot as u32;
+        // The backoff window starts when this attempt ENDED: the copy may
+        // have taken most of the 30 s timeout.
+        let now_s = Self::epoch_seconds();
+        match outcome {
+            Ok(()) => {
+                self.catch_up_backoff
+                    .borrow_mut()
+                    .record_success(ex.extent_id, slot32);
+                self.catch_up_copy_gone
+                    .borrow_mut()
+                    .remove(&(ex.extent_id, slot32));
+                if let Err(e) = self
+                    .mark_extent_available(ex.extent_id, slot, node.node_id)
+                    .await
+                {
+                    // The slot stays dark (the write is etcd-first) and the
+                    // next tick asks again; the node answers at once, its copy
+                    // being full now.
+                    tracing::warn!(
+                        extent_id = ex.extent_id,
+                        slot,
+                        error = %e,
+                        "re_avali reported OK but marking the slot available failed; \
+                         will retry next tick"
+                    );
+                } else {
+                    tracing::info!(
+                        extent_id = ex.extent_id,
+                        slot,
+                        node_id = node.node_id,
+                        sealed_length = ex.sealed_length,
+                        "caught a behind copy up to the sealed length in place"
+                    );
+                }
+            }
+            Err(error) => {
+                let consecutive = self.catch_up_backoff.borrow_mut().record_failure(
+                    ex.extent_id,
+                    slot32,
+                    now_s,
+                    &error,
+                );
+                tracing::warn!(
+                    extent_id = ex.extent_id,
+                    slot,
+                    node_id = node.node_id,
+                    consecutive_failures = consecutive,
+                    %error,
+                    "could not catch a behind copy up in place; it stays degraded \
+                     and is retried with backoff"
+                );
+            }
+        }
+    }
+
+    pub(crate) fn reseed_recovery_limiter(&self) {
+        let mut lim = self.recovery_limiter.borrow_mut();
+        lim.set_limits(&self.params);
+        self.catch_up_backoff.borrow_mut().set_limits(&self.params);
+        lim.reset_counts();
+        for rec in self.inflight.borrow().values() {
+            if let Some((_, crate::extent_inflight::ExtentOpPayload::Recovery(t))) = rec.unpack() {
+                lim.seed_inflight(t.replace_id, t.node_id);
+            }
+        }
+    }
+
+    pub(crate) async fn recovery_dispatch_loop(self) {
+        loop {
+            compio::time::sleep(Duration::from_secs(2)).await;
+            if !self.leader.get() {
+                continue;
+            }
+            self.recovery_dispatch_tick().await;
+        }
+    }
+
+    /// One pass of the recovery dispatch loop, split out so a test can drive
+    /// exactly one tick. The loop itself then holds only its cadence and the
+    /// leader gate, and every mechanism it drives — marker release, re-send,
+    /// limiter reseed, slot dispatch, fenced-tail drain — is reachable without
+    /// a running cluster.
+    pub(crate) async fn recovery_dispatch_tick(&self) {
+        // maintenance-TTL tick — clear expired Maintenance
+        // overrides before the dispatch decision. Cheap.
+        self.tick_maintenance_ttl().await;
+
+        // One class snapshot for the tick, so every slot's fence verdict agrees.
+        // Only `Fence` rebuilds by itself; a `Suspected` node's copies move on a
+        // repair request.
+        let classes = self.classes();
+        let now_s = Self::epoch_seconds();
+
+        self.cancel_markers_on_abnormal_nodes().await;
+        self.release_recovery_markers_for_healthy_slots().await;
+        self.resend_pinned_recovery_markers().await;
+
+        // reseed the recovery rate limiter from the inflight
+        // ledger so its counters reflect actually-in-flight recoveries.
+        // The ledger is the source of truth (survives leader failover);
+        // re-deriving every tick means no manual release bookkeeping
+        // (a completed recovery drops out of the ledger → out of the
+        // count next tick) and `recovery-stats` reports real numbers.
+        // Backoff state is preserved (reset_counts leaves it). The
+        // per-candidate `try_acquire` in `dispatch_recovery_task` then
+        // gates NEW dispatches against the caps on top of this baseline.
+        self.reseed_recovery_limiter();
+
+        // pre-filter under the store borrow so we DON'T clone
+        // extents that the loop body will skip on the next line. The
+        // loop body's first checks are `if ex.sealed_length == 0
+        // { continue; }` and `if ec_conversion_inflight.contains(...)
+        // { continue; }`. This previously cloned every single extent in
+        // `s.extents` (~200 B each for the 4 Vec fields) only to drop
+        // most on the floor — a 10K-extent cluster cloned 2 MB inline
+        // per 2 s tick on the manager's compio runtime, blocking
+        // heartbeat / register_ps / get_regions handlers for a few ms
+        // each tick. The ec_conversion_inflight gating is unchanged
+        // — `apply_recovery_done` / `mark_extent_available` /
+        // `handle_multi_modify_split` still re-check the set at apply
+        // time, so a stale snapshot here is safe (drops at most one
+        // tick's worth of dispatch latency on the racing extent).
+        // Extents whose conversion is in flight are not looked at this pass;
+        // their rebuild state is left as it is.
+        let mut converting: HashSet<u64> = HashSet::new();
+        let (extents, nodes, disks) = {
+            let s = self.store.inner.borrow();
+            // read the unified inflight ledger instead of the
+            // old `ec_conversion_inflight` HashSet. We filter for
+            // ConvertToEc specifically — recovery dispatch on an extent
+            // that's mid-Recovery or mid-Delete is handled by
+            // `dispatch_recovery_task`'s own refuse-at-start (which
+            // collapses those into the same probe).
+            let inflight = self.inflight.borrow();
+            let extents: Vec<ExtentRecord> = s
+                .extents
+                .values()
+                .filter(|ex| {
+                    // gate on the authoritative `sealed` STATE,
+                    // NOT `sealed_length == 0`. A sealed-EMPTY extent
+                    // (`sealed = true, sealed_length = 0` — a split/merge tail
+                    // seal, or an open tail sealed by the fence drain) is a
+                    // real recovery candidate: its fenced slots must be
+                    // rebuilt so `remove` can proceed, and EN recovery handles
+                    // the 0-byte copy (`stream_extent_from_sources` returns
+                    // Ok(0) on `total == 0`, then sets the `sealed` flag).
+                    // Open tails (`!sealed`) are still skipped here — they are
+                    // drained by the fence sweep's PS-driven roll first.
+                    if !ex.sealed {
+                        return false;
+                    }
+                    if matches!(
+                        inflight.get(&ex.extent_id).and_then(|r| r.kind()),
+                        Some(crate::extent_inflight::ExtentOpKind::ConvertToEc)
+                    ) {
+                        converting.insert(ex.extent_id);
+                        return false;
+                    }
+                    true
+                })
+                .cloned()
+                .collect();
+            (extents, s.nodes.clone(), s.disks.clone())
+        };
+
+        // Repair requests whose premise is gone, withdrawn after the pass.
+        let mut withdraw: HashMap<u64, u32> = HashMap::new();
+        // Slots whose rebuild is still owed, or whose Keep this pass is not
+        // yet a verdict: their backoff and recovery entry stay.
+        let mut open_need: HashSet<(u64, u32)> = HashSet::new();
+        for ex in extents {
+            let copies = Self::extent_nodes(&ex);
+            for (slot, node_id) in copies.iter().copied().enumerate() {
+                let bit = 1u32 << slot;
+                let node = nodes.get(&node_id).cloned();
+
+                let is_corrupt = self.slot_is_corrupt(ex.extent_id, slot);
+                // Which disk holds THIS slot, per the extent's own layout.
+                let disk_id = if slot < ex.replicate_disks.len() {
+                    Some(ex.replicate_disks[slot])
+                } else {
+                    let parity_slot = slot.checked_sub(ex.replicates.len());
+                    parity_slot.and_then(|ps| ex.parity_disks.get(ps).copied())
+                };
+                let disk_online = disk_id
+                    .and_then(|did| disks.get(&did))
+                    .map(|disk| disk.online);
+                // A fence node, or a disk its own node reports Faulted.
+                let slot_fence = match disk_id {
+                    Some(did) => classes.disk(node_id, did) == crate::node_class::DiskClass::Fence,
+                    None => classes.node(node_id) == crate::node_class::NodeClass::Fence,
+                };
+
+                // A repair request is a decision about a copy that is NOT
+                // there, and its node coming back changes that (Ceph's mark-in
+                // to its down→out). Without this a node back after the grace
+                // period had its copies moved anyway: off to a spare it was
+                // never lost to, or, with no spare, pinned to a rebuild that
+                // can never find a target while the catch-up never ran.
+                //   - The copy SERVES again: the request is withdrawn.
+                //   - The copy is BEHIND on a replicated extent: the catch-up
+                //     below goes first and the request waits; once caught up
+                //     the copy serves and the request is withdrawn. Only when
+                //     the node answers a catch-up that it does not have the
+                //     extent at all (a wiped node rejoined) does the request
+                //     rebuild it elsewhere: a timeout or any other failure is
+                //     no evidence the copy is gone — a node just back, busy
+                //     catching up hundreds of extents, queues past the 30 s
+                //     timeout — and moving a copy that a retry would refill is
+                //     the very move this rule exists to prevent.
+                //
+                // Only on FIRST-HAND evidence: the node is registered, THIS
+                // leader term has applied a `df` from it, and its disk is
+                // reported online. Right after a promotion every replayed node
+                // reads Online and every disk `online: true` until its first
+                // `df` — a dead node included — and acting on that would drop
+                // every persisted request at each failover, the very thing
+                // persisting them is for. The same predicate guards
+                // `release_recovery_markers_for_healthy_slots`.
+                //
+                // Withdrawals are collected and written after the pass, in
+                // batches: a returning node can carry a request on every slot.
+                let node_online = self.node_states.borrow().state_of(node_id).is_online();
+                let mut repair_requested = self.slot_repair_requested(ex.extent_id, slot);
+                let answers_first_hand = node.is_some()
+                    && self.has_first_hand_df(node_id)
+                    && node_online
+                    && disk_online == Some(true);
+                if repair_requested && answers_first_hand {
+                    if (ex.avali & bit) != 0 {
+                        *withdraw.entry(ex.extent_id).or_insert(0) |= bit;
+                        repair_requested = false;
+                    } else if !ex.ec_converted
+                        && !self
+                            .catch_up_copy_gone
+                            .borrow()
+                            .contains(&(ex.extent_id, slot as u32))
+                    {
+                        repair_requested = false; // this tick: catch up first
+                        // Suspended, not withdrawn: a catch-up that finds the
+                        // copy gone turns it back into a rebuild.
+                        open_need.insert((ex.extent_id, slot as u32));
+                    }
+                }
+                // Until this term hears the node's own `df`, a faulted disk
+                // reads healthy (`faulted_disks` starts empty), so Keep here
+                // proves nothing — the same rule the marker release follows.
+                if !self.has_first_hand_df(node_id) {
+                    open_need.insert((ex.extent_id, slot as u32));
+                }
+
+                // ONE place decides whether the copy moves. It used to be
+                // three checks in a row whose ORDER was the bug: the gate
+                // returned before anything looked at the disk.
+                if slot_verdict(slot_fence, is_corrupt, repair_requested)
+                    == SlotVerdict::Rebuild
+                {
+                    open_need.insert((ex.extent_id, slot as u32));
+                    // A slot whose rebuild keeps failing waits out its backoff;
+                    // one under a pending split or merge waits for it (`topology_gate.rs`).
+                    if !self
+                        .recovery_limiter
+                        .borrow()
+                        .in_backoff(ex.extent_id, slot as u32, now_s)
+                        && self.topology_holding_extent(ex.extent_id).is_none()
+                    {
+                        self.dispatch_and_record(ex.extent_id, slot as u32, node_id, now_s)
+                            .await;
+                    }
+                    continue;
+                }
+
+                // The copy stays where it is. If it is BEHIND — a member that
+                // was down when the extent was sealed, so its `avali` bit was
+                // never set — and its node answers again, bring it up to the
+                // sealed length in place. The sealed length came from a member
+                // that held every acked byte, so the peers that answered the
+                // seal hold all of it; `re_avali` copies it from them.
+                //
+                // Only to a node that answers: an unreachable one would hold
+                // this tick for the 30 s timeout per slot. A failure leaves
+                // the copy where it is and backs the slot off; moving the data
+                // elsewhere is a decision for the operator or the repair
+                // policy, never for a transient.
+                //
+                // Replicated extents only: `re_avali` is a replica primitive,
+                // and an EC node answers it OK without checking that its shard
+                // exists. A missing shard is rebuilt through recovery.
+                //
+                // Not while another op is in flight on the extent: marking the
+                // slot available bumps the eversion that op pinned (a sibling
+                // slot's rebuild would be retired and started over). It runs
+                // once the op is done.
+                if (ex.avali & bit) == 0
+                    && !ex.ec_converted
+                    && node_online
+                    && disk_online != Some(false)
+                    && self.extent_inflight_op(ex.extent_id).is_none()
+                    && self.topology_holding_extent(ex.extent_id).is_none()
+                    && !self
+                        .catch_up_backoff
+                        .borrow()
+                        .in_backoff(ex.extent_id, slot as u32, now_s)
+                {
+                    if let Some(n) = node {
+                        self.start_catch_up(&ex, slot, n);
+                    }
+                }
+            }
+        }
+
+        self.end_rebuilds_no_longer_owed(&open_need, &converting);
+
+        if !withdraw.is_empty() {
+            let withdraw: Vec<(u64, u32)> = withdraw.into_iter().collect();
+            match self.withdraw_repairs(&withdraw).await {
+                Ok(()) => tracing::info!(
+                    extents = withdraw.len(),
+                    slots = withdraw.iter().map(|(_, b)| b.count_ones()).sum::<u32>(),
+                    "repair requests withdrawn: their nodes answer again, and each copy \
+                     serves or is caught up in place"
+                ),
+                Err((done, e)) => tracing::warn!(
+                    done,
+                    of = withdraw.len(),
+                    error = %e,
+                    "could not withdraw every repair request whose node is back \
+                     (retried next tick)"
+                ),
+            }
+        }
+
+        // seal + roll open tails that sit on a fenced node so
+        // recovery (above) can rebuild them and `remove` can proceed. Runs
+        // each tick after the sealed-extent recovery dispatch.
+        self.drain_fenced_open_tails().await;
+    }
+
+    /// Backoff and the recovery entry belong to the NEED for a rebuild, not to
+    /// an attempt: a failed dispatch drains its marker but leaves both behind,
+    /// and a slot that stops needing a rebuild (unfence: the copy serves again)
+    /// is never dispatched again, so nothing else would ever end them. Without
+    /// this `recovery-stats` and `ops list` kept a backoff and a RUNNING repair
+    /// for an extent `health` correctly reported whole.
+    ///
+    /// `open_need` holds the slots this pass judged Rebuild (in backoff or
+    /// not) and those whose Keep is not yet a verdict; `converting` was not
+    /// looked at. Everything else loses its backoff (deleted and unsealed
+    /// extents included). A live Recovery marker keeps its entry: its own
+    /// completion or release closes it.
+    fn end_rebuilds_no_longer_owed(
+        &self,
+        open_need: &HashSet<(u64, u32)>,
+        converting: &HashSet<u64>,
+    ) {
+        self.recovery_limiter
+            .borrow_mut()
+            .retain_backoff(|extent_id, slot| {
+                open_need.contains(&(extent_id, slot)) || converting.contains(&extent_id)
+            });
+        let needed: HashSet<u64> = open_need.iter().map(|(e, _)| *e).collect();
+        let ended: Vec<u64> = self
+            .ops
+            .borrow()
+            .active_recovery_extents()
+            .into_iter()
+            .filter(|extent_id| {
+                !converting.contains(extent_id)
+                    && !needed.contains(extent_id)
+                    && self.extent_inflight_op(*extent_id)
+                        != Some(crate::extent_inflight::ExtentOpKind::Recovery)
+            })
+            .collect();
+        let (now_s, _) = Self::now_s_ms();
+        for extent_id in ended {
+            self.ops.borrow_mut().withdraw_recovery(
+                extent_id,
+                "no copy of the extent needs moving",
+                now_s,
+            );
+        }
+    }
+
+    /// find OPEN tail extents (`!sealed`) whose replica set
+    /// includes an operator-Fenced node and ask each owning partition's PS to
+    /// seal + roll them (`MSG_ROLL_TAILS`). Recovery only rebuilds SEALED
+    /// extents, so without this an idle partition's open tail on a fenced node
+    /// never drains and blocks `remove` forever. Maintenance / Suspected nodes
+    /// are NOT drained (they aren't being decommissioned). Per-partition 30 s
+    /// cooldown keeps a repeatedly-failing roll (e.g. all replicas unreachable)
+    /// from hammering the PS every tick.
+    async fn drain_fenced_open_tails(&self) {
+        let now_s = Self::epoch_seconds();
+        let fenced: HashSet<u64> = self
+            .classes()
+            .nodes
+            .into_iter()
+            .filter(|(_, c)| *c == crate::node_class::NodeClass::Fence)
+            .map(|(id, _)| id)
+            .collect();
+        if fenced.is_empty() {
+            return;
+        }
+        // Snapshot under one store borrow: (part_id, PS addr, [(stream, tail)]).
+        let mut work: Vec<(u64, String, Vec<(u64, u64)>)> = Vec::new();
+        {
+            let s = self.store.inner.borrow();
+            for meta in s.partitions.values() {
+                let mut entries: Vec<(u64, u64)> = Vec::new();
+                for stream_id in [meta.log_stream, meta.row_stream, meta.meta_stream] {
+                    let Some(stream) = s.streams.get(&stream_id) else {
+                        continue;
+                    };
+                    let Some(&tail_id) = stream.extent_ids.last() else {
+                        continue;
+                    };
+                    let Some(ex) = s.extents.get(&tail_id) else {
+                        continue;
+                    };
+                    if ex.sealed {
+                        continue; // only OPEN tails need draining
+                    }
+                    if ex
+                        .replicates
+                        .iter()
+                        .chain(ex.parity.iter())
+                        .any(|n| fenced.contains(n))
+                    {
+                        entries.push((stream_id, tail_id));
+                    }
+                }
+                if entries.is_empty() {
+                    continue;
+                }
+                // Resolve PS addr: per-partition hint first, region fallback.
+                let addr = s.part_addrs.get(&meta.part_id).cloned().or_else(|| {
+                    s.regions
+                        .get(&meta.part_id)
+                        .and_then(|r| s.ps_nodes.get(&r.ps_id).cloned())
+                });
+                match addr {
+                    Some(addr) => work.push((meta.part_id, addr, entries)),
+                    None => tracing::warn!(
+                        part_id = meta.part_id,
+                        "open tail on fenced node but no PS address to roll it (awaiting reassignment)"
+                    ),
+                }
+            }
+        }
+        for (part_id, addr, entries) in work {
+            // Per-partition 30 s cooldown.
+            {
+                let mut cd = self.roll_tails_cooldown.borrow_mut();
+                if let Some(&last) = cd.get(&part_id) {
+                    if now_s - last < 30 {
+                        continue;
+                    }
+                }
+                cd.insert(part_id, now_s);
+            }
+            let req = autumn_rpc::partition_rpc::RollTailsReq { part_id, entries };
+            let payload = autumn_rpc::partition_rpc::rkyv_encode(&req);
+            match self
+                .conn_pool
+                .call_timeout(
+                    &addr,
+                    autumn_rpc::partition_rpc::MSG_ROLL_TAILS,
+                    payload,
+                    Duration::from_secs(30),
+                )
+                .await
+            {
+                Ok(bytes) => {
+                    match autumn_rpc::partition_rpc::rkyv_decode::<
+                        autumn_rpc::partition_rpc::RollTailsResp,
+                    >(&bytes)
+                    {
+                        Ok(resp) if resp.rolled > 0 => tracing::info!(
+                            part_id,
+                            rolled = resp.rolled,
+                            "rolled open tail(s) off fenced node(s)"
+                        ),
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::warn!(part_id, error = %e, "bad RollTailsResp")
+                        }
+                    }
+                }
+                Err(e) => tracing::warn!(
+                    part_id, addr = %addr, error = %e,
+                    "roll_tails RPC failed (will retry)"
+                ),
+            }
+        }
+    }
+
+    /// record a (success / failure) outcome for the
+    /// (extent, slot) pair so the rate-limiter's backoff window
+    /// updates correctly.
+    pub(crate) fn record_dispatch_outcome(
+        &self,
+        extent_id: u64,
+        slot: u32,
+        now_s: i64,
+        res: &Result<DispatchOutcome, AppError>,
+    ) {
+        let mut l = self.recovery_limiter.borrow_mut();
+        match res {
+            Ok(DispatchOutcome::Dispatched) => l.record_success(extent_id, slot),
+            // A deferral is neither: the tick never got to try, so it says
+            // nothing about whether this slot is healthy. Touching the backoff
+            // either way would be a lie — clearing it (what `record_success`
+            // does) is the one that hurts, since it lets a failing slot retry
+            // at full rate for as long as the limiter stays saturated.
+            Ok(DispatchOutcome::Deferred) => {
+                tracing::debug!(
+                    extent_id,
+                    slot,
+                    "recovery dispatch deferred (rate-limited, held back, or no proven target yet); backoff untouched"
+                );
+            }
+            // Capture WHY it failed so `recovery-stats`
+            // can show the reason, not just a count. Pre-this the call
+            // sites passed `res.is_ok()` and the error was discarded.
+            Err(e) => {
+                let consecutive = l.record_failure(extent_id, slot, now_s, &e.to_string());
+                drop(l);
+                // Op-ledger: keep the entry RUNNING (the loop retries with
+                // exponential backoff — it never gives up) but carry the LAST
+                // failure + its code + the consecutive-failure count, so
+                // `ops status` shows a repair that is looping instead of
+                // converging. This is the reason recovery belongs in the ledger.
+                // The ledger carries STATE ("this repair is looping"), and it is
+                // a 256-entry in-memory ring that dies with the leader — so it
+                // cannot also be the record of what went wrong. Emit the EVENT
+                // to the leader log, where it is durable, greppable and
+                // alertable. Recovery backs off exponentially (cap 300 s), so
+                // this is at most one line per extent per 5 min.
+                tracing::warn!(
+                    extent_id,
+                    slot,
+                    consecutive_failures = consecutive,
+                    error_code = Self::err_to_code(e),
+                    error = %e,
+                    "recovery dispatch failed; will retry with backoff"
+                );
+                let (now_s2, now_ms) = Self::now_s_ms();
+                self.ops.borrow_mut().record_recovery_failure(
+                    extent_id,
+                    e.to_string(),
+                    Self::err_to_code(e),
+                    now_s2,
+                    now_ms,
+                );
+            }
+        }
+    }
+
+    /// #6: Maintenance auto-clear. Walk overrides; for any
+    /// Maintenance entry whose `expire_at` is in the past, delete the
+    /// etcd key + in-memory entry. Logs an INFO; no audit entry (the
+    /// system, not the operator, did this — the operator scheduled it
+    /// via `expire_at`).
+    pub(crate) async fn tick_maintenance_ttl(&self) {
+        let now = Self::epoch_seconds() as u64;
+        let expired: Vec<u64> = self
+            .node_overrides
+            .borrow()
+            .iter()
+            .filter_map(|(id, o)| {
+                if o.kind == NODE_OVERRIDE_MAINTENANCE && o.expire_at > 0 && o.expire_at <= now {
+                    Some(*id)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for id in expired {
+            let key = format!("{}{}", crate::NODE_OVERRIDE_PREFIX, id);
+            if let Some(etcd) = &self.etcd {
+                let _ = etcd.put_and_delete_txn(Vec::new(), vec![key]).await;
+            }
+            self.node_overrides.borrow_mut().remove(&id);
+            tracing::info!(node_id = id, "Maintenance override expired; auto-cleared");
+        }
+    }
+}
+
+/// What the dispatch loop should do about one replica slot.
+///
+/// A state, not a bool: "move this copy to another node" and "leave it where it
+/// is" are different actions, and the second still lets the loop catch a
+/// behind copy up in place.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub(crate) enum SlotVerdict {
+    /// Rebuild on another node now. The evidence is conclusive.
+    Rebuild,
+    /// Leave the copy on its node. Nothing conclusive says it is lost: a node
+    /// that stopped answering may be back in seconds, and moving its data is
+    /// expensive and irreversible. Moving it anyway is the operator's call
+    /// (fence, or an explicit repair), not this loop's.
+    Keep,
+}
+
+/// Should this slot be rebuilt on another node?
+///
+/// `slot_fence`: the slot's disk class is `Fence` — its node is fenced (that is
+/// what fencing is for), or its own node reports the disk Faulted (a local I/O
+/// error it has already suffered; it never clears without a restart). Never a
+/// disk record's `online` bit: a df that merely times out clears that
+/// node-wide, and rebuilding on it would rebuild every sealed slot of any node
+/// that missed one heartbeat — what the rolling-restart procedure relies on not
+/// happening. A Full disk is not fence either: it heals itself.
+///
+/// `corrupt`: a partition owner PROVED the copy wrong; `re_avali` cannot repair
+/// it (it compares length, which a full-length rotted replica passes).
+///
+/// `repair_requested`: an operator (`autumn-op repair`) or the repair policy
+/// after the slot stayed degraded past its grace period decided to move it.
+pub(crate) fn slot_verdict(slot_fence: bool, corrupt: bool, repair_requested: bool) -> SlotVerdict {
+    if slot_fence || corrupt || repair_requested {
+        SlotVerdict::Rebuild
+    } else {
+        SlotVerdict::Keep
+    }
+}
+
+/// The node a failed EC attempt names: `failed_target` indexes the request's
+/// targets, which are `target_nodes` in order; no index names the coordinator.
+pub(crate) fn ec_failed_node(target_nodes: &[u64], failed_target: Option<u32>) -> u64 {
+    let coord = target_nodes.first().copied().unwrap_or(0);
+    failed_target
+        .and_then(|i| target_nodes.get(i as usize).copied())
+        .unwrap_or(coord)
+}
+
+/// The call ran out of time without an answer — a slow peer, not proof it is
+/// gone. Every other failure to get an answer (connect refused, connection
+/// closed, I/O) is.
+pub(crate) fn rpc_timed_out(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| {
+        matches!(
+            c.downcast_ref::<autumn_rpc::RpcError>(),
+            Some(autumn_rpc::RpcError::Timeout(_))
+        )
+    })
+}
+
+/// Why `node` (writing to `disk`, when known) cannot take part in an attempt,
+/// or `None` when it can. A `Suspend` node can: it is waited for.
+pub(crate) fn abnormal_target(
+    classes: &crate::node_class::Classes,
+    node: u64,
+    disk: Option<u64>,
+) -> Option<String> {
+    let node_class = classes.node(node);
+    if node_class.is_abnormal() {
+        return Some(format!("node {node} is {node_class:?}"));
+    }
+    let disk = disk?;
+    let disk_class = classes.disk(node, disk);
+    disk_class
+        .is_abnormal()
+        .then(|| format!("disk {disk} on node {node} is {disk_class:?}"))
+}
+
+/// The disk each EC target writes its shard to, in target order: a target that
+/// already holds a replica keeps that replica's disk; every other target takes
+/// the next of `extra_disk_ids`. `None` when the extent or a disk is unknown.
+pub(crate) fn ec_target_disks(
+    ex: Option<&ExtentRecord>,
+    target_nodes: &[u64],
+    extra_disk_ids: &[u64],
+) -> Vec<(u64, Option<u64>)> {
+    let mut extras = extra_disk_ids.iter().copied();
+    target_nodes
+        .iter()
+        .map(|&n| {
+            let replica_disk = ex.and_then(|ex| {
+                let j = ex.replicates.iter().position(|&r| r == n)?;
+                ex.replicate_disks.get(j).copied()
+            });
+            match replica_disk {
+                Some(d) => (n, Some(d)),
+                None => (n, extras.next()),
+            }
+        })
+        .collect()
+}
+
+impl crate::AutumnManager {
+    /// unified node-health + recovery-collect loop. Merges the
+    /// former `recovery_collect_loop` (2 s, recovery-target nodes only,
+    /// non-empty `tasks`) and `disk_status_update_loop` (10 s, all nodes,
+    /// empty `tasks`) into a SINGLE `EXT_MSG_DF` caller per node per tick.
+    ///
+    /// Why merge: both old loops called `df` independently. The EN's
+    /// `handle_df` drains its ENTIRE `recovery_done` via `std::mem::take`
+    /// whenever `req.tasks.is_empty()` — which is exactly what
+    /// `disk_status_update_loop` sent. That loop then DISCARDED the
+    /// returned `done_tasks` (it only updated disk status), so whenever
+    /// its 10 s sweep won the race against the 2 s collect loop, the
+    /// recovery completion was lost: `apply_recovery_done` never ran, the
+    /// extent's slot was never repaired in manager metadata, the recovered
+    /// copy became an orphan, and the inflight marker sat until the
+    /// stale sweep released it ~10 min later. One loop = one df caller =
+    /// completions are always applied.
+    ///
+    /// Cadence 2 s (the recovery-responsive pace; `df` is a cheap
+    /// control-plane statvfs + Vec drain). The disk-status liveness signal
+    /// is now sampled every 2 s instead of 10 s — strictly better for
+    /// Suspected detection. `tasks` is always empty so the EN drains its
+    /// full `recovery_done`, and every completion is applied right here,
+    /// so nothing is ever stranded in the EN buffer.
+    pub(crate) async fn node_health_loop(self) {
+        // cluster-df logical-scan rotation state (persists across ticks). The
+        // logical_stored scan (Σ distinct sealed_length) is O(extents); at
+        // 10M+ extents a single-tick full scan would hold the store borrow for
+        // ~100s of ms, stalling the single-threaded manager loop. Instead we
+        // snapshot the id list once per cycle and process it in bounded chunks
+        // across ticks, committing the new total when the cycle completes (the
+        // committed value is republished every tick until then). A capacity
+        // gauge tolerates the resulting staleness (≤ ~one cycle).
+        const LOGICAL_SCAN_CHUNK: usize = 100_000; // ids per tick
+        let mut logical_committed: u64 = 0;
+        let mut logical_committed_ms: u64 = 0;
+        let mut logical_cycle_ids: Vec<u64> = Vec::new();
+        let mut logical_cursor: usize = 0;
+        let mut logical_partial: u64 = 0;
+        // Per-node (open, total) slot counts, accumulated over the same cycle.
+        let mut slots_partial: HashMap<u64, (u64, u64)> = HashMap::new();
+        loop {
+            let every = self.params.node_health_interval_secs.get();
+            compio::time::sleep(Duration::from_secs(every)).await;
+            let df_timeout = Duration::from_secs(self.params.df_timeout_secs.get());
+            if !self.leader.get() {
+                continue;
+            }
+
+            let nodes = {
+                let s = self.store.inner.borrow();
+                s.nodes.clone()
+            };
+
+            // cluster-df: accumulate this tick's RAW + extent-file snapshot.
+            // RAW is statvfs capacity truth. The EN also reports per-disk
+            // extent file lengths for diagnosis; manager only sums them.
+            let mut cdf_raw_total = 0u64;
+            let mut cdf_raw_free = 0u64;
+            let mut cdf_physical_used = 0u64;
+            let mut cdf_node_count = 0u64;
+            let mut cdf_per_node: Vec<(u64, crate::NodeCap)> = Vec::with_capacity(nodes.len());
+
+            for node in nodes.values() {
+                // prefer the control_address; fall back to data
+                // plane address for legacy / not-yet-re-registered nodes.
+                let raw_addr = if node.control_address.is_empty() {
+                    &node.address
+                } else {
+                    &node.control_address
+                };
+                let addr = Self::normalize_endpoint(raw_addr);
+                // empty `tasks` → EN returns its full `recovery_done`
+                // (std::mem::take). We apply ALL of it below, so no
+                // completion is ever discarded (the merge's whole point).
+                // P0: bound DF at 5 s via control_pool.call_timeout.
+                let payload = rkyv_encode(&DfReq {
+                    tasks: Vec::new(),
+                    disk_ids: Vec::new(),
+                });
+                let resp = match self
+                    .control_pool
+                    .call_timeout(&addr, EXT_MSG_DF, payload, df_timeout)
+                    .await
+                {
+                    Ok(v) => v,
+                    Err(_) => {
+                        // peer unreachable — mark its disks offline
+                        // so allocation/recovery skip it. ConnPool already
+                        // evicts the broken conn so the next poll reconnects.
+                        // feed the auto-state tracker (Online →
+                        // Suspected after the soft timeout). NOT a recovery
+                        // trigger — that requires explicit fence.
+                        Self::mark_node_disks_offline(&self.store, node);
+                        // What it said last is no longer a current verdict.
+                        self.store.inner.borrow_mut().en_reports.remove(&node.node_id);
+                        self.node_states
+                            .borrow_mut()
+                            .on_heartbeat_fail(node.node_id);
+                        // cluster-df: unreachable this tick (unknown != offline,
+                        // but its capacity can't be summed) — record online=false.
+                        cdf_per_node.push((
+                            node.node_id,
+                            crate::NodeCap {
+                                online: false,
+                                ..Default::default()
+                            },
+                        ));
+                        continue;
+                    }
+                };
+                let df: DfResp = match rkyv_decode(&resp) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        self.store.inner.borrow_mut().en_reports.remove(&node.node_id);
+                        cdf_per_node.push((
+                            node.node_id,
+                            crate::NodeCap {
+                                online: false,
+                                ..Default::default()
+                            },
+                        ));
+                        continue;
+                    }
+                };
+                // Act on the df identity echo (pure decision
+                // in `classify_df_echo`).
+                match classify_df_echo(
+                    &node.node_uuid,
+                    &node.address,
+                    &node.shard_ports,
+                    &df.node_uuid,
+                    &df.advertise_addr,
+                    &df.shard_ports,
+                ) {
+                    // A DIFFERENT process answers at this address (pod-IP reuse).
+                    // Do NOT heal the location to it — treat the df as FAILED for
+                    // liveness: the real node_id's process is gone (→ Suspected),
+                    // the new process is its own node_id via its own self-register.
+                    // A k8s safety net the pre-M1 (address-only) system couldn't
+                    // express.
+                    DfEchoAction::Imposter => {
+                        tracing::warn!(
+                            node_id = node.node_id,
+                            stored_uuid = %node.node_uuid,
+                            echo_uuid = %df.node_uuid,
+                            addr = %addr,
+                            "df echo uuid != stored — a DIFFERENT \
+                             process answers at this address (pod-IP reuse?); NOT \
+                             healing, treating df as failed"
+                        );
+                        Self::mark_node_disks_offline(&self.store, node);
+                        // What it said last is no longer a current verdict.
+                        self.store.inner.borrow_mut().en_reports.remove(&node.node_id);
+                        self.node_states
+                            .borrow_mut()
+                            .on_heartbeat_fail(node.node_id);
+                        cdf_per_node.push((
+                            node.node_id,
+                            crate::NodeCap {
+                                online: false,
+                                ..Default::default()
+                            },
+                        ));
+                        continue;
+                    }
+                    // uuid matches but the echoed location drifted from etcd
+                    // (hand-edited etcd — the EN's startup self-register makes the
+                    // lost-txn shape unreachable). WARN only: the EN's next boot
+                    // self-register, or an operator, is the authoritative fix. We
+                    // deliberately do NOT auto-write a healed record from the
+                    // loop-start snapshot — that could clobber a concurrent
+                    // register/remove. The node stays Online (df
+                    // succeeded — it IS reachable); only the stored routing
+                    // location is stale, which the WARN surfaces.
+                    DfEchoAction::DriftWarn => {
+                        tracing::warn!(
+                            node_id = node.node_id,
+                            stored_addr = %node.address,
+                            echo_addr = %df.advertise_addr,
+                            stored_ports = ?node.shard_ports,
+                            echo_ports = ?df.shard_ports,
+                            "stored EN location differs from the df echo \
+                             (stale etcd?); re-register the EN or correct etcd — NOT \
+                             auto-healing to avoid clobbering concurrent updates"
+                        );
+                    }
+                    DfEchoAction::Ok => {}
+                }
+                self.store.inner.borrow_mut().en_reports.insert(
+                    node.node_id,
+                    crate::store::EnDfReport {
+                        metrics_addr: df.metrics_addr.clone(),
+                        // Only its own disks, like `apply_df_disk_health`.
+                        full_disks: df
+                            .disk_status
+                            .iter()
+                            .filter(|(id, st)| st.full && node.disks.contains(id))
+                            .map(|(id, _)| *id)
+                            .collect(),
+                    },
+                );
+
+                // A successful df proves the NODE reachable, and carries what
+                // the node says about each of its DISKS. Apply the per-disk
+                // answer.
+                //
+                // This used to set every one of the node's disks online on any
+                // successful df, on the stated grounds that the payload's
+                // disk ids were EN-local and unrelated to the manager's. That
+                // is not true (see the note below), and the cost of believing
+                // it was the whole per-disk health signal: a node with one
+                // dead disk still answers df, so the manager overwrote the
+                // one fact that would have repaired it.
+                self.apply_df_disk_health(node, &df.disk_status);
+                // ENOSPC-1: stash the node's max per-disk free for the
+                // allocation free-space soft filter.
+                //
+                // MAX, not sum, and that is right for the question it answers:
+                // "can this node still take an extent at all" is about the
+                // emptiest disk, since that is where the extent would land. It
+                // is the wrong metric for "how loaded is this node" — a node
+                // with disks `[empty, full, full, full]` reports as empty — so
+                // placement reads `cluster_cap.per_node` instead, which sums.
+                //
+                // The rationale that used to sit here said the df payload's
+                // per-disk ids were EN-local and unrelated to the manager's, so
+                // a sum would need an id mapping. That is not true. `autumn-op
+                // format` takes each disk_id from the MANAGER's register
+                // response and writes it to `{dir}/disk_id`; `DiskFS::open`
+                // reads it back, `ExtentEntry.disk_id` is that value, and
+                // `handle_df` keys `disk_status` by it. Every disk id in the
+                // system is the manager's, `ready_disk_id` included — which is
+                // also what a future per-(node, disk) placement would need, and
+                // it is not blocked.
+                let max_free = df
+                    .disk_status
+                    .iter()
+                    .map(|(_, st)| st.free)
+                    .max()
+                    .unwrap_or(0);
+                self.node_max_free
+                    .borrow_mut()
+                    .insert(node.node_id, max_free);
+                // cluster-df: sum this node's ONLINE-disk capacity + diagnostic
+                // extent file lengths (excludes offline disks — unusable space).
+                let mut n_total = 0u64;
+                let mut n_free = 0u64;
+                let mut n_ext = 0u64;
+                for (_, st) in &df.disk_status {
+                    if st.online {
+                        n_total = n_total.saturating_add(st.total);
+                        n_free = n_free.saturating_add(st.free);
+                        n_ext = n_ext.saturating_add(st.extent_bytes);
+                    }
+                }
+                cdf_raw_total = cdf_raw_total.saturating_add(n_total);
+                cdf_raw_free = cdf_raw_free.saturating_add(n_free);
+                cdf_physical_used = cdf_physical_used.saturating_add(n_ext);
+                cdf_node_count += 1;
+                cdf_per_node.push((
+                    node.node_id,
+                    crate::NodeCap {
+                        total: n_total,
+                        free: n_free,
+                        extent_bytes: n_ext,
+                        online: true,
+                        // Carried whole, offline disks included: an offline
+                        // disk is excluded from the CAPACITY sums above
+                        // (unusable space) but is precisely the row an
+                        // operator opens this view to find.
+                        disks: df.disk_status.clone(),
+                    },
+                ));
+                // drop stale push-based failure reports so a residual
+                // burst can't re-flip the node offline on the next tick.
+                self.recent_failure_reports
+                    .borrow_mut()
+                    .remove(&node.node_id);
+                // heartbeat OK → flip Suspected back to Online.
+                self.node_states.borrow_mut().on_heartbeat_ok(node.node_id);
+                // apply EVERY completed recovery task — the step the
+                // old disk_status_update_loop omitted (it discarded them).
+                for done in df.done_tasks {
+                    // No-swallow: never `let _ =` the apply result. A completion
+                    // is delivered exactly once (the EN mem::take's it from
+                    // recovery_done), so on ANY error this completion is gone —
+                    // there is no immediate re-delivery. Convergence for the
+                    // kept-marker cases is via standing-instruction re-dispatch
+                    // (see the match arms). We surface the error so
+                    // it is never silent; we deliberately do NOT add a
+                    // manager-side completion-retry queue.
+                    if let Err(e) = self.apply_recovery_done(done).await {
+                        match e {
+                            AppError::Precondition(_) => {
+                                // Benign: stale-discard (layout changed / replace_id
+                                // gone) — marker released, completion correctly
+                                // dropped; OR EC-in-flight defer — marker kept,
+                                // completion dropped (the EN mem::take'd it once),
+                                // convergence via re-dispatch on the EC'd extent.
+                                tracing::trace!(error = %e, "apply_recovery_done deferred/stale (benign); converges via re-dispatch");
+                            }
+                            _ => {
+                                tracing::warn!(error = %e, "apply_recovery_done failed (etcd); inflight marker retained for retry");
+                            }
+                        }
+                    }
+                }
+
+                // Live progress for the ops this node is EXECUTING. Applied
+                // before the terminal reports below so a sample that arrives in
+                // the same `df` as the completion cannot overwrite the closed
+                // entry — `update_progress_by_extent` only touches RUNNING, and
+                // the completion runs after.
+                for p in &df.op_progress {
+                    self.ops.borrow_mut().update_progress_by_extent(
+                        p.kind,
+                        p.extent_id,
+                        p.done,
+                        p.total,
+                    );
+                }
+
+                // Why the node's attempt failed, on the heartbeat. Applied in
+                // the same window as the progress samples and for the same
+                // reason: a failure that arrives in the same `df` as the
+                // completion must not stamp an error onto a closed entry, and
+                // `record_node_op_failure` only touches RUNNING.
+                //
+                // Before this the reason reached the manager only in the NEXT
+                // dispatch's response, which exponential backoff can defer for
+                // a long time — so a rebuild that was failing and one that was
+                // merely slow read the same on the control plane until the
+                // retry came round.
+                for f in &df.op_failures {
+                    self.ops.borrow_mut().record_node_op_failure(
+                        f.kind,
+                        f.extent_id,
+                        f.reason.clone(),
+                        f.error_code,
+                    );
+                }
+
+                // Apply every EC conversion the coordinator reported finished. The
+                // dispatch RPC only ACCEPTS; THIS is where a conversion becomes real.
+                // The layout comes from the etcd marker's PINNED assignment, never
+                // from the report — the report only says "it finished" and carries
+                // `new_eversion` for a cross-check, so a stale/forged report can't
+                // steer the layout.
+                // Scrub outcomes. A ROT one is this node reading its own sealed
+                // content and finding it differs from the checksums recorded
+                // for it: isolate the slot so recovery rebuilds it — a clear
+                // `avali` bit alone reads as "behind", which `re_avali` tries
+                // to heal with a length comparison a full-length rotted replica
+                // passes. A finding that cannot be judged yet (the extent moved
+                // since the task was planned — another slot's isolation is
+                // enough) stays open in its op and the copy is checked again.
+                for done in &df.scrub_done {
+                    if done.outcome == autumn_rpc::extent_rpc::SCRUB_OUTCOME_ROT {
+                        let finding = self
+                            .isolate_rotted_slot(done.extent_id, node.node_id, done.eversion, "scrub")
+                            .await;
+                        if finding == crate::extent_corrupt::RotFinding::Stale
+                            && self.defer_scrub_recheck(node.node_id, done)
+                        {
+                            continue;
+                        }
+                        if finding == crate::extent_corrupt::RotFinding::Stale && done.op_id == 0 {
+                            tracing::warn!(
+                                extent_id = done.extent_id,
+                                node_id = node.node_id,
+                                "a rot finding outside any scrub op could not be judged yet \
+                                 and has no op to hold it; dropped"
+                            );
+                        }
+                    }
+                    self.record_scrub_outcome(node.node_id, done);
+                }
+                self.record_scrub_queued(node.node_id, &df.scrub_queued);
+                for done in df.ec_done {
+                    let Some(params) = self.extent_inflight_payload_ec(done.extent_id) else {
+                        // No marker: an already-applied conversion re-reported
+                        // (df is at-most-once but re-dispatch can re-adopt), or
+                        // an abandoned one. Benign — nothing to apply.
+                        tracing::debug!(
+                            extent_id = done.extent_id,
+                            "ec_done for an extent with no inflight marker; ignoring"
+                        );
+                        continue;
+                    };
+                    let live_nonce = self.extent_inflight_nonce(done.extent_id);
+                    if let Err(why) = classify_ec_done(&params, live_nonce, node.node_id, &done) {
+                        tracing::warn!(
+                            extent_id = done.extent_id,
+                            reporter = node.node_id,
+                            coordinator = ?params_coordinator(&params),
+                            marker_eversion = params.new_eversion,
+                            reported_eversion = done.new_eversion,
+                            marker_nonce = live_nonce,
+                            reported_nonce = done.attempt_nonce,
+                            ?why,
+                            "REFUSING to apply this ec_done (marker retained; the live \
+                             attempt reports its own completion)"
+                        );
+                        continue;
+                    }
+                    let data_shards = params.data_shards as usize;
+                    self.finalize_ec_dispatch_after_convert(
+                        done.extent_id,
+                        params.target_nodes,
+                        params.extra_disk_ids,
+                        data_shards,
+                        params.new_eversion,
+                    )
+                    .await;
+                }
+            }
+
+            // Rot findings held this round or earlier (`defer_scrub_recheck`)
+            // are checked again as soon as their extent has nothing in flight —
+            // before the recovery loop next picks a copy source, when it can.
+            self.recheck_scrub_findings();
+
+            // cluster-df: publish this tick's RAW + physical snapshot (cheap —
+            // one entry per disk), then drive the chunked logical-scan rotation.
+            let now_ms = autumn_common::metrics::unix_time_ms();
+
+            // (1) Start a fresh cycle when idle AND ≥30 s since the last commit:
+            // snapshot the extent id list (one O(N) borrow, just u64 copies).
+            if logical_cycle_ids.is_empty() && now_ms.saturating_sub(logical_committed_ms) >= 30_000
+            {
+                logical_cycle_ids = self.store.inner.borrow().extents.keys().copied().collect();
+                logical_cursor = 0;
+                logical_partial = 0;
+                slots_partial = HashMap::new();
+                if logical_cycle_ids.is_empty() {
+                    // Empty cluster — commit 0 now (nothing to chunk through).
+                    logical_committed = 0;
+                    logical_committed_ms = now_ms;
+                }
+            }
+            // (2) Process one bounded chunk of the in-progress cycle. Each id is
+            // re-looked-up (it may have been deleted since the snapshot) and
+            // filtered: skip extents pending physical delete (refs==0 &&
+            // vp_table_refs==0) — they no longer count as stored.
+            if !logical_cycle_ids.is_empty() {
+                let end = (logical_cursor + LOGICAL_SCAN_CHUNK).min(logical_cycle_ids.len());
+                {
+                    let s = self.store.inner.borrow();
+                    for id in &logical_cycle_ids[logical_cursor..end] {
+                        if let Some(ex) = s.extents.get(id) {
+                            if ex.refs != 0 || ex.vp_table_refs != 0 {
+                                // The logical scan owns SEALED extents. OPEN
+                                // extents are measured by the PS commit-length
+                                // probe below; keeping the state gate explicit
+                                // prevents a stale/non-zero open sealed_length
+                                // from being counted twice.
+                                logical_partial = logical_partial.saturating_add(
+                                    sealed_extent_logical_size(ex.sealed, ex.sealed_length),
+                                );
+                                // Slot counts for placement, on the same pass
+                                // and the same liveness predicate. An extent
+                                // already at refs 0 is on its way out; counting
+                                // it would hold a node down for work the delete
+                                // loop is about to undo.
+                                for nid in ex.replicates.iter().chain(ex.parity.iter()) {
+                                    let e = slots_partial.entry(*nid).or_insert((0u64, 0u64));
+                                    e.1 += 1;
+                                    if !ex.sealed {
+                                        e.0 += 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                logical_cursor = end;
+                if logical_cursor >= logical_cycle_ids.len() {
+                    // Cycle complete — publish the new total + free the id vec.
+                    logical_committed = logical_partial;
+                    logical_committed_ms = now_ms;
+                    logical_cycle_ids = Vec::new();
+                    // Publish whole cycles only. A partially-walked map would
+                    // report every node as holding a fraction of its slots, and
+                    // the fraction differs per node depending on where their
+                    // extents fell in the id order — a bias that looks like
+                    // load.
+                    *self.node_slot_counts.borrow_mut() = std::mem::take(&mut slots_partial);
+                }
+            }
+            // Σ latest PS-reported open-tail committed bytes across partitions
+            // (cheap — one back()-of-window read per partition). Added to the
+            // sealed scan to form logical extent size. Open tails are refs=1
+            // partition-private → simple sum, no CoW dedup.
+            let logical_open_tail: u64 = {
+                let pol = self.policy.borrow();
+                pol.metrics
+                    .values()
+                    .filter_map(|w| w.buckets.back())
+                    .map(|(_, l)| l.open_tail_bytes)
+                    .sum()
+            };
+            // Σ reclaimable dead bytes = before the replay floor (gc_debt) +
+            // at/after it incl. the open tail (open_tail_dead), across the
+            // same latest-bucket window.
+            let logical_wal_debt: u64 = {
+                let pol = self.policy.borrow();
+                pol.metrics
+                    .values()
+                    .filter_map(|w| w.buckets.back())
+                    .map(|(_, l)| l.gc_debt_bytes.saturating_add(l.open_tail_dead_bytes))
+                    .sum()
+            };
+            {
+                let mut snap = self.cluster_cap.borrow_mut();
+                snap.raw_total = cdf_raw_total;
+                snap.raw_free = cdf_raw_free;
+                snap.physical_used = cdf_physical_used;
+                snap.node_count = cdf_node_count;
+                snap.last_update_ms = now_ms;
+                // Republish the last fully-committed logical total every tick
+                // (a mid-flight cycle hasn't changed it yet).
+                snap.logical_stored = logical_committed;
+                snap.logical_open_tail = logical_open_tail;
+                snap.logical_wal_debt = logical_wal_debt;
+                snap.logical_last_update_ms = logical_committed_ms;
+                snap.per_node = cdf_per_node;
+            }
+        }
+    }
+
+    /// helper: flip `online=false` for every disk owned by `node`
+    /// when its `df` RPC fails. In-memory only — the manager reseeds
+    /// disk state from etcd on leader promotion via `replay_from_etcd`,
+    /// and a recovered node will overwrite `online=true` on the next
+    /// successful `df` poll.
+    pub(crate) fn mark_node_disks_offline(
+        store: &crate::store::MetadataStore,
+        node: &crate::persist::records::NodeRecord,
+    ) {
+        if node.disks.is_empty() {
+            return;
+        }
+        let mut s = store.inner.borrow_mut();
+        let mut changed = false;
+        for disk_id in &node.disks {
+            if let Some(disk) = s.disks.get_mut(disk_id) {
+                if disk.online {
+                    disk.online = false;
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            tracing::warn!(
+                node_id = node.node_id,
+                addr = %node.address,
+                "df RPC failed; marked node disks offline"
+            );
+        }
+    }
+
+    /// Act on a first-hand report that a node's own copy of `extent_id` is
+    /// rotted: isolate that slot so recovery rebuilds it.
+    ///
+    /// `reporter` is the node whose bytes were read and found wrong — by its
+    /// scrub, against the checksums recorded for that file. It cannot isolate
+    /// itself: clearing an `avali` bit is the manager's write.
+    ///
+    /// `Stale` = not judged: the extent is mid-change or changed since the
+    /// finding's task was planned, so the bytes read may not be the ones there
+    /// now. The caller has the copy checked again.
+    pub(crate) async fn isolate_rotted_slot(
+        &self,
+        extent_id: u64,
+        reporter: u64,
+        eversion: u64,
+        source: &'static str,
+    ) -> crate::extent_corrupt::RotFinding {
+        use crate::extent_corrupt::RotFinding;
+        let ex = {
+            let s = self.store.inner.borrow();
+            s.extents.get(&extent_id).cloned()
+        };
+        let Some(ex) = ex else {
+            return RotFinding::Settled;
+        };
+        let op_in_flight = self.extent_inflight_op(extent_id).is_some();
+        match crate::extent_corrupt::compute_corrupt_isolation(
+            &ex,
+            &[reporter],
+            eversion,
+            op_in_flight,
+        ) {
+            crate::extent_corrupt::IsolationOutcome::Isolate {
+                updated,
+                cleared_mask,
+            } => {
+                tracing::error!(
+                    extent_id = extent_id,
+                    node_id = reporter,
+                    source,
+                    "a node read its OWN copy and found it rotted — isolating that slot \
+                     so recovery rebuilds it"
+                );
+                let marked = match self
+                    .persist_isolation_with_mark(&updated, cleared_mask)
+                    .await
+                {
+                    Ok(marked) => marked,
+                    Err(e) => {
+                        tracing::warn!(
+                            extent_id = extent_id,
+                            error = %e,
+                            "could not persist the isolation of a rotted replica \
+                             (the copy is checked again)"
+                        );
+                        return RotFinding::Stale;
+                    }
+                };
+                // Verify at apply, as the RPC path does. The persist
+                // above is an await, and seal / split / EC dispatch /
+                // delete handlers interleave during it; writing this
+                // stale clone into memory would roll their work back.
+                // The copy is checked again, so dropping a raced apply
+                // delays the finding, not loses it.
+                {
+                    let mut s = self.store.inner.borrow_mut();
+                    match s.extents.get(&updated.extent_id) {
+                        Some(live) if live.eversion == eversion => {
+                            s.extents.insert(updated.extent_id, updated.clone());
+                            // OR, not overwrite: a concurrent report of another slot may
+                            // have recorded its bit while this write was in flight.
+                            *self
+                                .extent_corrupt_slots
+                                .borrow_mut()
+                                .entry(updated.extent_id)
+                                .or_insert(0) |= marked;
+                        }
+                        _ => {
+                            tracing::warn!(
+                                extent_id = extent_id,
+                                "extent changed while isolating a rotted replica; \
+                                 dropping this apply (the copy is checked again)"
+                            );
+                            return RotFinding::Stale;
+                        }
+                    }
+                }
+            }
+            crate::extent_corrupt::IsolationOutcome::AlreadyIsolated => {
+                // The bit is dark but the REASON may not be
+                // recorded: a slot isolated before the isolation and
+                // its mark were written in one transaction can be in
+                // exactly this shape. An unmarked dark slot reads as
+                // behind, and the dispatch loop would catch it up in
+                // place — a length check a rotted copy passes. This
+                // report records the reason.
+                let slot = ex
+                    .replicates
+                    .iter()
+                    .chain(ex.parity.iter())
+                    .position(|s| *s == reporter);
+                if let Some(slot) = slot {
+                    if !self.slot_is_corrupt(extent_id, slot) && slot < 32 {
+                        if let Err(e) =
+                            self.mark_slots_corrupt(extent_id, 1u32 << slot).await
+                        {
+                            tracing::warn!(
+                                extent_id = extent_id,
+                                error = %e,
+                                "could not record why an already-dark slot is dark"
+                            );
+                        }
+                    }
+                }
+            }
+            crate::extent_corrupt::IsolationOutcome::Stale { message } => {
+                tracing::info!(
+                    extent_id = extent_id,
+                    node_id = reporter,
+                    source,
+                    "a rot finding cannot be judged yet: {message}"
+                );
+                return RotFinding::Stale;
+            }
+            crate::extent_corrupt::IsolationOutcome::Refused { message, .. } => {
+                tracing::warn!(
+                    extent_id = extent_id,
+                    node_id = reporter,
+                    source,
+                    "a rot finding cannot be acted on: {message}"
+                );
+            }
+        }
+        RotFinding::Settled
+    }
+
+    /// helper: counterpart to `mark_node_disks_offline`. Flip
+    /// `online=true` on a successful df. Keys on `NodeRecord.disks`
+    /// (manager-allocated disk_ids) instead of the response payload's
+    /// extent-node-local disk_ids, which historically failed to map.
+    /// Apply what a successful `df` said about each of the node's disks.
+    ///
+    /// Per disk, not per node. The extent node reports `online = false` for a
+    /// disk it has marked `Faulted` — a local I/O error it already suffered,
+    /// which does not clear without a restart — and `true` for one that is
+    /// merely `Full`, which self-heals when space returns. Those are different
+    /// facts and only one of them should move data, so the manager stores what
+    /// it was told rather than a node-wide summary of it.
+    ///
+    /// A disk the payload does not mention is left alone: absence is not
+    /// evidence. Losing the df entirely is still node-wide
+    /// (`mark_node_disks_offline`), and that is right — with no answer at all,
+    /// nothing is known about any individual disk.
+    fn apply_df_disk_health(
+        &self,
+        node: &crate::persist::records::NodeRecord,
+        reported: &[(u64, autumn_rpc::extent_rpc::DiskStatus)],
+    ) {
+        if node.disks.is_empty() {
+            return;
+        }
+        let mut s = self.store.inner.borrow_mut();
+        let mut faulted = self.faulted_disks.borrow_mut();
+        for (disk_id, status) in reported {
+            // Only this node's own disks. Ids are small dense integers and a
+            // stale `{dir}/disk_id` sentinel (a dir reused without re-format
+            // after an etcd wipe — a dev and chaos reality) would otherwise let
+            // one node's `df` flip another node's disk, in either direction.
+            if !node.disks.contains(disk_id) {
+                continue;
+            }
+            // The narrow fact the rebuild decision reads: THIS node says THIS
+            // disk is faulted. Tracked apart from `online`, which is also
+            // written node-wide by paths that know nothing about any one disk.
+            let was_faulted = if status.online {
+                faulted.remove(disk_id)
+            } else {
+                !faulted.insert(*disk_id)
+            };
+            if !status.online && !was_faulted {
+                // Actionable rather than merely recorded: the dispatch loop
+                // rebuilds this disk's SEALED replicas on the next tick.
+                tracing::warn!(
+                    node_id = node.node_id,
+                    disk_id,
+                    "df: node reports this disk FAULTED — its sealed replicas will be \
+                     rebuilt elsewhere"
+                );
+            }
+            let Some(disk) = s.disks.get_mut(disk_id) else {
+                continue;
+            };
+            if disk.online == status.online {
+                continue;
+            }
+            disk.online = status.online;
+            if status.online {
+                tracing::info!(node_id = node.node_id, disk_id, "df: disk back online");
+            }
+        }
+    }
+
+    /// Drain-only EC-conversion dispatcher. Every ~5 s the leader drains
+    /// the ledger's ConvertToEc markers (written by `handle_force_ec_convert`
+    /// / restored by `replay_from_etcd`) and (re-)dispatches each to its
+    /// coordinator. Two phases per tick, split into helpers for clarity:
+    /// `collect_ec_dispatch_candidates` (snapshot + filter, holds the store
+    /// borrow) then `dispatch_one_ec_conversion` per candidate (RPC + apply,
+    /// no borrow held across the await).
+    pub(crate) async fn ec_conversion_dispatch_loop(self) {
+        // short initial delay so post-restart re-dispatch of replay-loaded
+        // markers fires quickly (otherwise PS startup sees up to 5 s of
+        // eversion-mismatch against extents whose `apply_ec_conversion_done`
+        // didn't commit last lifetime); steady-state cadence is 5 s thereafter.
+        let mut delay = Duration::from_millis(500);
+        loop {
+            compio::time::sleep(delay).await;
+            delay = Duration::from_secs(5);
+            if !self.leader.get() {
+                continue;
+            }
+            let (candidates, node_addrs) = self.collect_ec_dispatch_candidates();
+            // Dispatch CONCURRENTLY (bounded): these are now accept-ACKs, but a
+            // paged-out coordinator still burns its full RPC timeout, and
+            // serialising meant one such extent stalled every other conversion
+            // in the cluster for that tick. The cap keeps the fan-out (and the
+            // manager's socket use) bounded.
+            let concurrency = self.params.ec_dispatch_concurrency.get();
+            let this = &self;
+            let addrs = &node_addrs;
+            futures::stream::StreamExt::for_each_concurrent(
+                futures::stream::iter(candidates),
+                concurrency,
+                move |cand| async move { this.dispatch_one_ec_conversion(cand, addrs).await },
+            )
+            .await;
+        }
+    }
+
+    /// Best-effort drop of a stale/invalid ConvertToEc ledger marker. Spawned
+    /// detached because callers may hold the `store.inner` borrow and cannot
+    /// await inline; the drain is idempotent and re-attempted next tick, so a
+    /// failure is logged (not swallowed) rather than propagated.
+    fn spawn_drain_stale_ec_marker(&self, extent_id: u64) {
+        let mgr = self.clone();
+        compio::runtime::spawn(async move {
+            if let Err(e) = mgr
+                .drain_extent_inflight_marker(extent_id, "the marker no longer matches the extent")
+                .await
+            {
+                // WARN (not debug): a persistent drain failure leaks the marker
+                // and re-fires every ~5 s; it must be visible at prod log level,
+                // matching this loop's other warns (the no-swallow principle).
+                tracing::warn!(extent_id, error = %e, "drain stale EC marker failed; retried next tick");
+            }
+        })
+        .detach();
+    }
+
+    /// PHASE 1 of `ec_conversion_dispatch_loop`: snapshot the cluster once and
+    /// build the set of EC conversions to (re-)dispatch this tick.
+    ///
+    /// Drain-only: candidates are the ledger's ConvertToEc markers,
+    /// NOT a fresh `s.streams` scan — the manager is pure mechanism, an external
+    /// controller decides via `MSG_FORCE_EC_CONVERT`. The marker IS the rich
+    /// authoritative dispatch record (`MgrEcDispatchInflight`); we reuse its
+    /// target nodes / disks / eversion verbatim (replay-safe). Filters:
+    /// - skip extents with a Recovery in flight (avoid colliding with
+    ///   `run_recovery_task`);
+    /// - skip when any target's class is not `Health` — an abnormal one gets
+    ///   the marker cancelled by `cancel_markers_on_abnormal_nodes`;
+    /// - drop the marker for an extent that vanished, was already converted, or
+    ///   truncated to 0 (stale).
+    /// dedup is structural: ledger keys are unique by construction.
+    /// Returns the candidates + the per-tick node-address snapshot that
+    /// PHASE 2 resolves target addresses against.
+    fn collect_ec_dispatch_candidates(&self) -> (Vec<EcDispatchCandidate>, HashMap<u64, String>) {
+        let recovery_inflight_extents: HashSet<u64> = self
+            .inflight
+            .borrow()
+            .iter()
+            .filter_map(|(id, rec)| match rec.kind() {
+                Some(crate::extent_inflight::ExtentOpKind::Recovery) => Some(*id),
+                _ => None,
+            })
+            .collect();
+
+        let s = self.store.inner.borrow();
+        let node_addrs: HashMap<u64, String> = s
+            .nodes
+            .iter()
+            .map(|(id, n)| (*id, n.address.clone()))
+            .collect();
+        let pending: Vec<(u64, MgrEcDispatchInflight)> = self
+            .inflight
+            .borrow()
+            .iter()
+            .filter_map(|(eid, rec)| match rec.unpack() {
+                Some((_, crate::extent_inflight::ExtentOpPayload::ConvertToEc(p))) => {
+                    Some((*eid, p))
+                }
+                _ => None,
+            })
+            .collect();
+        let classes = self.classes();
+
+        // Every arm that drops a candidate says WHY.
+        //
+        // A marker whose candidate is filtered out stays ACTIVE with attempts=0
+        // and an empty last_error forever, and the extent's GC is blocked behind
+        // it — so a silent `continue` here is indistinguishable from "nothing to
+        // do" and leaves an operator with a pinned conversion and no thread to
+        // pull. This is the same shape as the EC diagnostic black hole recorded
+        // earlier: two adjacent guards, one logging and one not.
+        let mut candidates = Vec::new();
+        for (eid, params) in pending {
+            if recovery_inflight_extents.contains(&eid) {
+                tracing::debug!(
+                    extent_id = eid,
+                    "ec dispatch: deferring — a recovery holds this extent"
+                );
+                continue;
+            }
+            // Every target receives a shard, not just the coordinator. Only an
+            // all-`Health` set is dispatched: a `Suspend` target is waited for,
+            // an abnormal one gets the marker cancelled by
+            // `cancel_markers_on_abnormal_nodes`.
+            if let Some(&node) = params
+                .target_nodes
+                .iter()
+                .find(|&&n| classes.node(n) != crate::node_class::NodeClass::Health)
+            {
+                tracing::debug!(
+                    extent_id = eid,
+                    node,
+                    class = ?classes.node(node),
+                    "ec dispatch: deferring — a target node is not Health"
+                );
+                continue;
+            }
+            let ex = match s.extents.get(&eid) {
+                Some(e) => e.clone(),
+                None => {
+                    // Extent deleted between marker write and this tick.
+                    self.spawn_drain_stale_ec_marker(eid);
+                    continue;
+                }
+            };
+            if ex.ec_converted || ex.sealed_length == 0 {
+                // Already converted, or truncated to 0 — marker is stale.
+                self.spawn_drain_stale_ec_marker(eid);
+                continue;
+            }
+            // Any owning stream gives the EC shape: CoW-shared extents (refs >= 2)
+            // appear in multiple streams, but `compute_duplicate_stream` clones
+            // `(ec_data_shard, ec_parity_shard)`, so the first hit suffices.
+            let stream = match s
+                .streams
+                .values()
+                .find(|st| st.ec_parity_shard > 0 && st.extent_ids.contains(&eid))
+                .cloned()
+            {
+                Some(st) => st,
+                None => {
+                    // WARN, not debug, and not silent: unlike the two arms above
+                    // this is not a "try again next tick" state. Nothing in this
+                    // loop will ever make a stream adopt the extent, so the
+                    // marker is pinned for good and the extent's GC with it.
+                    // Reachable when the extent's membership moved to streams
+                    // that carry no EC shape (split/merge splice, punch), or the
+                    // owning stream's parity was set to 0 after the marker.
+                    tracing::warn!(
+                        extent_id = eid,
+                        target_nodes = ?params.target_nodes,
+                        "ec dispatch: NO stream with an EC shape lists this extent — the marker \
+                         cannot progress and is pinning the extent's GC; it needs draining"
+                    );
+                    continue;
+                }
+            };
+            candidates.push(EcDispatchCandidate { ex, stream, params });
+        }
+        (candidates, node_addrs)
+    }
+
+    /// PHASE 2 of `ec_conversion_dispatch_loop`: (re-)dispatch one candidate.
+    /// Resolves the coordinator + per-target shard addresses, sends
+    /// `EXT_MSG_CONVERT_TO_EC` (60 s ceiling), and on CODE_OK runs
+    /// `finalize_ec_dispatch_after_convert` (apply + marker release). The
+    /// ledger marker is the eversion-bump lock across the whole RPC→apply window.
+    /// A target-count/stream mismatch drops the marker (operator-induced
+    /// inconsistency); a transiently-missing node address defers (marker kept,
+    /// retried next tick).
+    async fn dispatch_one_ec_conversion(
+        &self,
+        cand: EcDispatchCandidate,
+        node_addrs: &HashMap<u64, String>,
+    ) {
+        let EcDispatchCandidate { ex, stream, params } = cand;
+        let extent_id = ex.extent_id;
+        let data_shards = stream.ec_data_shard as usize;
+        let parity_shards = stream.ec_parity_shard as usize;
+        let total_shards = data_shards + parity_shards;
+
+        // Marker target count must match the stream's current K+M. A mismatch
+        // only arises from operator-induced inconsistency (`set-stream-ec`
+        // between `force-ec-convert` and this tick); drop the stale marker so
+        // the operator can re-issue under the new shape.
+        if params.target_nodes.len() != total_shards {
+            tracing::warn!(
+                extent_id,
+                marker_targets = params.target_nodes.len(),
+                stream_total_shards = total_shards,
+                "dispatch marker target count != stream K+M; dropping stale marker"
+            );
+            self.spawn_drain_stale_ec_marker(extent_id);
+            return;
+        }
+
+        let mut target_addrs: Vec<String> = Vec::with_capacity(params.target_nodes.len());
+        for &nid in &params.target_nodes {
+            match node_addrs.get(&nid) {
+                Some(addr) => target_addrs.push(addr.clone()),
+                None => {
+                    tracing::warn!(
+                        extent_id,
+                        target_nodes = ?params.target_nodes,
+                        "marker target_node missing from cluster; deferring re-dispatch"
+                    );
+                    return;
+                }
+            }
+        }
+
+        // coordinator = the shard owning `extent_id` on the first target (a
+        // replica with a full copy); it reads the extent locally and fans
+        // WriteShard out to each target node's owner shard for `extent_id`.
+        let coordinator_base = Self::normalize_endpoint(&target_addrs[0]);
+        let coordinator_shard_ports = self.shard_ports_for_addr(&coordinator_base);
+        let coordinator_addr =
+            Self::shard_addr_for_extent(&coordinator_base, &coordinator_shard_ports, extent_id);
+        let ec_target_addrs: Vec<String> = target_addrs
+            .iter()
+            .map(|a| {
+                let b = Self::normalize_endpoint(a);
+                let sp = self.shard_ports_for_addr(&b);
+                Self::shard_addr_for_extent(&b, &sp, extent_id)
+            })
+            .collect();
+
+        // send the post-conversion eversion in-band so every target node
+        // bumps `entry.eversion` to match what `apply_ec_conversion_done`
+        // persists, closing the read-side stale-cache window.
+        // owner_epoch lets the coord stamp WriteShard / CommitEcShard for
+        // EN-side fence rejection of a ghost ex-coord.
+        let live_owner_epoch = {
+            let st = self.store.inner.borrow();
+            dispatch_owner_epoch_for_extent(&st, extent_id)
+        };
+
+        let attempt_nonce = self.extent_inflight_nonce(extent_id);
+        let payload = rkyv_encode(&ConvertToEcReq {
+            extent_id,
+            data_shards: data_shards as u32,
+            parity_shards: parity_shards as u32,
+            target_addrs: ec_target_addrs,
+            eversion: params.new_eversion,
+            owner_epoch: live_owner_epoch,
+            attempt_nonce,
+        });
+
+        // 60 s ceiling so a paged-out / silently dead EN can't wedge the loop;
+        // the convert itself can legitimately take seconds (RS-encode of
+        // multi-GiB extents + 3-replica WriteShard fanout + commit-rename).
+        let result = self
+            .conn_pool
+            .call_timeout(
+                &coordinator_addr,
+                EXT_MSG_CONVERT_TO_EC,
+                payload,
+                Duration::from_secs(self.params.ec_convert_timeout_secs.get()),
+            )
+            .await;
+
+        let coord = params.target_nodes.first().copied().unwrap_or(0);
+        // A marker is one attempt (docs/extent_op_arbitration_design.md §3): a
+        // failure the attempt reports, a refusal, or an unreachable coordinator
+        // cancels it now, and the next proposal derives a fresh attempt from the
+        // state at that time. A TIMEOUT does not: the coordinator may be slow,
+        // not gone, and its class cancels the marker once it is Suspected.
+        // CODE_OK + STARTED / RUNNING means ACCEPTED, not done: the coordinator
+        // encodes in the background and reports completion on its next `df`.
+        let cancel: Option<String> = match result {
+            Ok(resp_data) => match rkyv_decode::<autumn_rpc::extent_rpc::ConvertToEcResp>(&resp_data) {
+                Ok(r) if r.code == autumn_rpc::extent_rpc::CODE_CONTENT_CORRUPT => {
+                    self.release_rotted_ec_attempt(
+                        extent_id,
+                        attempt_nonce,
+                        coord,
+                        params.new_eversion.saturating_sub(1),
+                        &r.message,
+                    )
+                    .await;
+                    return;
+                }
+                Ok(r) if r.code == CODE_OK && r.state == autumn_rpc::extent_rpc::EC_ATTEMPT_FAILED => {
+                    let node = ec_failed_node(&params.target_nodes, r.failed_target);
+                    Some(format!("node {node} failed the conversion: {}", r.message))
+                }
+                Ok(r) if r.code == CODE_OK => {
+                    // The marker may have been drained while this response was
+                    // in flight (up to a minute). Refresh an existing entry, but
+                    // do not resurrect one — a RUNNING entry with no marker
+                    // behind it is never closed, and it makes later
+                    // force-ec-convert calls on this extent attach-dedup into
+                    // silent no-ops.
+                    let (now_s, now_ms) = Self::now_s_ms();
+                    let marker_still_held = self.inflight.borrow().contains_key(&extent_id);
+                    self.ops
+                        .borrow_mut()
+                        .note_ec_dispatch(extent_id, coord, marker_still_held, now_s, now_ms);
+                    tracing::debug!(extent_id, state = r.state, "EC convert accepted by coordinator");
+                    None
+                }
+                Ok(r) => Some(format!("coordinator node {coord} refused: {}", r.message)),
+                Err(e) => Some(format!("coordinator node {coord} answered undecodably: {e}")),
+            },
+            Err(e) if rpc_timed_out(&e) => {
+                tracing::warn!(extent_id, coord, "EC dispatch timed out (marker kept): {e}");
+                None
+            }
+            Err(e) => Some(format!("coordinator node {coord} is unreachable: {e}")),
+        };
+        if let Some(reason) = cancel {
+            tracing::warn!(extent_id, "EC conversion attempt cancelled: {reason}");
+            if let Err(e) = self.drain_attempt(extent_id, attempt_nonce, &reason).await {
+                tracing::warn!(extent_id, "cancelling the EC attempt failed (retried next tick): {e}");
+            }
+        }
+    }
+
+    /// The coordinator found its own `.dat` rotted while encoding it: give up
+    /// this attempt and isolate that copy, so recovery rebuilds it and the
+    /// conversion is refused until then (`acquire_extent_inflight`).
+    ///
+    /// Isolation refuses while the extent has an op in flight, so it has to
+    /// happen here, right after the release. The node's queued finding is the
+    /// backstop when this call bails (leader change, failed persist).
+    async fn release_rotted_ec_attempt(
+        &self,
+        extent_id: u64,
+        nonce: u64,
+        coord: u64,
+        eversion: u64,
+        message: &str,
+    ) {
+        if self.extent_inflight_op(extent_id)
+            != Some(crate::extent_inflight::ExtentOpKind::ConvertToEc)
+        {
+            return;
+        }
+        let reason = format!(
+            "the coordinator's copy on node {coord} failed its checksums ({message}); it is \
+             isolated and rebuilt before a conversion, unless it is the last available copy \
+             (then it stays, unconvertible)"
+        );
+        if let Err(e) = self.drain_attempt(extent_id, nonce, &reason).await {
+            tracing::warn!(extent_id, "releasing the rotted EC attempt failed: {e}");
+            return;
+        }
+        tracing::warn!(extent_id, coord, message, "EC source rotted: released the marker");
+        self.isolate_rotted_slot(extent_id, coord, eversion, "ec_convert").await;
+    }
+
+    /// Post-RPC finalize after a successful `EXT_MSG_CONVERT_TO_EC`: apply the
+    /// conversion to etcd + memory, then release the in-memory inflight marker.
+    ///
+    /// EC apply failure: the in-memory marker
+    /// MUST be released ONLY when `apply_ec_conversion_done` SUCCEEDS. Pre-fix
+    /// this was two unconditional `if rpc_ok` blocks — the apply error was
+    /// swallowed (`let _ =`) and the marker released regardless. If apply's
+    /// `txn_fenced` failed transiently WITHOUT losing leadership (etcd blip,
+    /// non-fence error), etcd kept the marker + pre-EC layout while THIS leader
+    /// dropped the in-memory marker; because `ec_conversion_dispatch_loop` is
+    /// drain-only (it enumerates the in-memory shadow, not a fresh etcd
+    /// scan), it never re-dispatched, so the extent stayed manager-pre-EC /
+    /// EN-post-EC and every read wedged on `EVERSION_MISMATCH` until a leader
+    /// failover replayed the etcd marker. Keeping the marker on apply-failure
+    /// lets the next tick re-dispatch; repeated convert calls are
+    /// idempotent, so a re-dispatch after the EN already converted is a no-op.
+    async fn finalize_ec_dispatch_after_convert(
+        &self,
+        extent_id: u64,
+        target_nodes: Vec<u64>,
+        extra_disk_ids: Vec<u64>,
+        data_shards: usize,
+        new_eversion: u64,
+    ) {
+        match self
+            .apply_ec_conversion_done(
+                extent_id,
+                target_nodes,
+                extra_disk_ids,
+                data_shards,
+                new_eversion,
+            )
+            .await
+        {
+            Ok(()) => {}
+            Err(e) => {
+                // Leadership-retained apply failure: keep the marker so the
+                // next dispatch tick re-dispatches (idempotent).
+                // A leadership-LOST failure (NotLeader) also keeps it; the new
+                // leader's replay reloads it from etcd either way.
+                tracing::warn!(
+                    extent_id,
+                    error = %e,
+                    "EC apply failed after a successful convert RPC; keeping inflight marker for re-dispatch"
+                );
+            }
+        }
+    }
+
+    /// drop a stale or no-longer-valid `extent_inflight/<id>` marker.
+    /// Used by the dispatch loop when it observes a ledger entry for an
+    /// extent that has been deleted or that has incompatible state (e.g.,
+    /// already EC-converted) — best-effort cleanup so the next tick's
+    /// candidate set shrinks. Idempotent.
+    /// Drop an in-flight marker AND close whatever op-ledger entry it backed.
+    ///
+    /// These must happen together. A marker has five ways to die — dead
+    /// executor, three dispatch-failure paths, and the stale-marker drains —
+    /// but the ledger was only ever closed by the two SUCCESS hooks. Every
+    /// other path left the entry RUNNING forever, because neither EC nor
+    /// recovery is covered by the TTL sweep.
+    ///
+    /// For EC that is not merely a cosmetic lie: `submit` attach-dedups on any
+    /// ACTIVE (kind, target), and `handle_op_submit` returns WITHOUT actuating
+    /// on an attach — so a leaked RUNNING entry makes every future
+    /// `force-ec-convert` of that extent a no-op that reports success, with no
+    /// escape short of a leader restart. Closing here, at the single funnel,
+    /// covers every present and future drop path.
+    pub(crate) async fn drain_extent_inflight_marker(
+        &self,
+        extent_id: u64,
+        reason: &str,
+    ) -> Result<(), AppError> {
+        let Some(kind) = self.remove_extent_inflight_marker(extent_id).await? else {
+            return Ok(());
+        };
+        // Only after the marker is really gone — a failed drain above returns
+        // early and leaves the entry RUNNING, which is then accurate.
+        let (now_s, _) = Self::now_s_ms();
+        match kind {
+            crate::extent_inflight::ExtentOpKind::ConvertToEc => {
+                self.ops.borrow_mut().complete_ec(
+                    extent_id,
+                    autumn_rpc::manager_rpc::OP_STATE_FAILED,
+                    String::new(),
+                    format!("conversion abandoned: {reason}"),
+                    now_s,
+                );
+            }
+            crate::extent_inflight::ExtentOpKind::Recovery => {
+                self.ops.borrow_mut().abandon_recovery(
+                    extent_id,
+                    format!("recovery abandoned: {reason}"),
+                    now_s,
+                );
+            }
+            crate::extent_inflight::ExtentOpKind::Delete => {}
+        }
+        Ok(())
+    }
+
+    /// Release a Recovery marker whose rebuild nobody needs any more, closing
+    /// its entry as withdrawn rather than abandoned.
+    async fn release_obsolete_recovery_marker(
+        &self,
+        extent_id: u64,
+        reason: &str,
+    ) -> Result<(), AppError> {
+        if self.extent_inflight_op(extent_id)
+            != Some(crate::extent_inflight::ExtentOpKind::Recovery)
+        {
+            return Ok(());
+        }
+        if self.remove_extent_inflight_marker(extent_id).await?.is_some() {
+            let (now_s, _) = Self::now_s_ms();
+            self.ops
+                .borrow_mut()
+                .withdraw_recovery(extent_id, reason, now_s);
+        }
+        Ok(())
+    }
+
+    /// Delete `extent_id`'s marker (etcd first, then memory); its kind, or
+    /// `None` when there was none.
+    async fn remove_extent_inflight_marker(
+        &self,
+        extent_id: u64,
+    ) -> Result<Option<crate::extent_inflight::ExtentOpKind>, AppError> {
+        let Some(record) = self.inflight.borrow().get(&extent_id).cloned() else {
+            return Ok(None);
+        };
+        let kind = record
+            .kind()
+            .ok_or_else(|| AppError::Precondition("invalid inflight kind".into()))?;
+        let snapshot = self.snapshot_inflight(extent_id, kind)?;
+        self.commit_inflight_txn(
+            &snapshot,
+            vec![],
+            vec![autumn_etcd::Op::delete(Self::extent_inflight_key(extent_id))],
+        )
+        .await?;
+        self.commit_extent_inflight_release(extent_id);
+        Ok(Some(kind))
+    }
+
+    pub async fn apply_ec_conversion_done(
+        &self,
+        extent_id: u64,
+        target_nodes: Vec<u64>,
+        extra_disk_ids: Vec<u64>,
+        data_shards: usize,
+        new_eversion: u64,
+    ) -> Result<(), AppError> {
+        let _lifecycle = self.node_lifecycle_lock.lock().await;
+        if let Some(id) = target_nodes
+            .iter()
+            .find(|&&id| self.node_class_of(id).is_abnormal())
+        {
+            return Err(AppError::Precondition(format!(
+                "EC target node {id} is {:?}; the attempt is cancelled",
+                self.node_class_of(*id)
+            )));
+        }
+        // TEST-ONLY (G4 harness): one-shot transient failure BEFORE any etcd /
+        // leadership interaction — a faithful model of "apply's etcd txn blipped
+        // while this manager stayed leader". No-op in production builds.
+        #[cfg(test)]
+        if EC_APPLY_FAIL_ONCE.with(|c| c.replace(false)) {
+            return Err(AppError::Internal(
+                "test-injected transient EC apply failure (G4)".into(),
+            ));
+        }
+        // etcd-first: compute `updated` from a clone under
+        // read-only borrow. The borrow_mut block previously mutated
+        // s.extents[extent_id] in place (ec_converted=true, replicates,
+        // parity, avali, eversion), then the etcd put_and_delete_txn
+        // ran. If etcd failed (NotLeader / fence break), in-memory had
+        // the new EC-converted shape but etcd still showed the pre-EC
+        // shape — replay rolled in-memory back later, but in the
+        // window concurrent reads observed EC state that wasn't durable.
+        let (updated, baseline) = {
+            let s = self.store.inner.borrow();
+            let ex = s
+                .extents
+                .get(&extent_id)
+                .ok_or_else(|| AppError::NotFound(format!("extent {extent_id}")))?;
+            // The snapshot this decision is computed from — the flip is CAS'd
+            // against it below.
+            let baseline = crate::persist::encode(ex);
+
+            // Each target's disk comes from the target itself: a replica keeps
+            // its own, a substitute or extra the one allocated on it — never a
+            // position in `replicate_disks ++ extra_disk_ids`, which a
+            // substituted replica would shift.
+            let all_disks = ec_target_disks(Some(ex), &target_nodes, &extra_disk_ids)
+                .into_iter()
+                .map(|(n, d)| {
+                    d.ok_or_else(|| {
+                        AppError::Precondition(format!(
+                            "EC target node {n} of extent {extent_id} has no disk"
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<u64>, AppError>>()?;
+
+            let mut new_ex = ex.clone();
+            new_ex.ec_converted = true;
+            new_ex.replicates = target_nodes[..data_shards].to_vec();
+            new_ex.parity = target_nodes[data_shards..].to_vec();
+            new_ex.replicate_disks = all_disks[..data_shards].to_vec();
+            new_ex.parity_disks = all_disks[data_shards..].to_vec();
+            // Use the eversion sent in-band to the extent nodes via
+            // ConvertToEcReq. Manager + every shard host now agree on
+            // the same post-EC eversion.
+            new_ex.eversion = new_eversion;
+            // post-EC the extent has K+M shards across K+M nodes;
+            // every slot is available by construction.
+            new_ex.avali = Self::all_bits(target_nodes.len());
+            (new_ex, baseline)
+        };
+
+        // THE COMMIT POINT. Everything before it is additive — shard files that
+        // no reader is pointed at — and everything after is driven cleanup. So
+        // membership, eversion and the payload LOCATION all move in ONE
+        // transaction: a location published separately from the layout it
+        // belongs to would, for the width of the gap, send readers to a file
+        // the layout does not yet say anyone holds.
+        let snapshot = self.snapshot_inflight(
+            extent_id,
+            crate::extent_inflight::ExtentOpKind::ConvertToEc,
+        )?;
+        self.commit_inflight_extent(
+            &snapshot,
+            baseline,
+            updated,
+            vec![autumn_etcd::Op::put(
+                crate::extent_layout::extent_layout_key(extent_id),
+                [PayloadLocation::InShardFile.as_byte()],
+            )],
+        )
+        .await?;
+        self.commit_payload_location(extent_id, PayloadLocation::InShardFile);
+
+        // Close any op-ledger EC-convert entry for this extent (authoritative —
+        // the manager IS the EC orchestrator; identity is exact by extent id).
+        {
+            let (now_s, _) = Self::now_s_ms();
+            self.ops.borrow_mut().complete_ec(
+                extent_id,
+                autumn_rpc::manager_rpc::OP_STATE_SUCCEEDED,
+                "ec conversion done".to_string(),
+                String::new(),
+                now_s,
+            );
+        }
+
+        Ok(())
+    }
+}
+
+/// What `node_health_loop` should do with a df identity echo.
+pub(crate) enum DfEchoAction {
+    /// No echo (EN not self-registered), or echo agrees with stored state.
+    Ok,
+    /// The echoed `node_uuid` differs from the stored one for this node_id — a
+    /// DIFFERENT process answers at this address (pod-IP reuse). Do NOT heal;
+    /// treat the df as failed for liveness. This is the load-bearing k8s safety
+    /// net (self-PROTECTING, no write).
+    Imposter,
+    /// uuid matches but the echoed location drifted from etcd — WARN only (no
+    /// auto-write; see the note on `classify_df_echo`).
+    DriftWarn,
+}
+
+/// Pure decision for the df identity echo. `echo_uuid` empty = the EN did
+/// not self-register (`--advertise` unset) → `Ok` (skip all checks). A non-empty
+/// echo uuid that differs from a non-empty stored uuid = `Imposter`. Otherwise
+/// the uuid matches (or the stored uuid is empty — a legacy record) and a
+/// location difference is `DriftWarn`. Empty echo fields are "unspecified",
+/// never a drift.
+///
+/// **Why `DriftWarn`, not an auto-heal write:**
+/// the EN's STARTUP self-register already writes the authoritative
+/// location to etcd, and `register_with_manager` only returns Ok on a committed
+/// `CODE_OK`, so the "registration txn lost" drift shape the design worried
+/// about cannot occur; the only residual drift source is a hand-edited etcd
+/// value (operator error). Auto-WRITING a healed record from the loop-start
+/// `nodes` snapshot after a `mirror_register_node` await could clobber a
+/// concurrent register / remove (resurrect a deleted node), and it
+/// would defend a near-unreachable scenario with a real data-safety risk. So
+/// The echo surfaces drift as a WARN (the operator, or the EN's next boot
+/// self-register, resolves it) and keeps only the self-protecting imposter
+/// check. A CAS-safe auto-heal (re-read + verify + `nodes/<id>` value-CAS) is a
+/// deferred, reproduce-first follow-up.
+pub(crate) fn classify_df_echo(
+    stored_uuid: &str,
+    stored_addr: &str,
+    stored_ports: &[u16],
+    echo_uuid: &str,
+    echo_addr: &str,
+    echo_ports: &[u16],
+) -> DfEchoAction {
+    if echo_uuid.is_empty() {
+        return DfEchoAction::Ok;
+    }
+    if !stored_uuid.is_empty() && echo_uuid != stored_uuid {
+        return DfEchoAction::Imposter;
+    }
+    let addr_drift = !echo_addr.is_empty() && echo_addr != stored_addr;
+    let ports_drift = !echo_ports.is_empty() && echo_ports != stored_ports;
+    if addr_drift || ports_drift {
+        DfEchoAction::DriftWarn
+    } else {
+        DfEchoAction::Ok
+    }
+}
+
+#[cfg(test)]
+mod ec_done_attempt_tests {
+    use super::{classify_ec_done, EcDoneRejection};
+    use autumn_rpc::extent_rpc::EcConvertDone;
+    use autumn_rpc::manager_rpc::MgrEcDispatchInflight;
+
+    const COORD: u64 = 7;
+    const OTHER: u64 = 9;
+
+    fn marker(new_eversion: u64) -> MgrEcDispatchInflight {
+        MgrEcDispatchInflight {
+            extent_id: 1,
+            target_nodes: vec![COORD, OTHER, 11],
+            extra_disk_ids: vec![],
+            data_shards: 2,
+            new_eversion,
+            owner_epoch: 0,
+        }
+    }
+
+    fn done(new_eversion: u64, attempt_nonce: u64) -> EcConvertDone {
+        EcConvertDone {
+            extent_id: 1,
+            new_eversion,
+            attempt_nonce,
+        }
+    }
+
+    #[test]
+    fn the_live_attempts_own_report_applies() {
+        assert_eq!(
+            classify_ec_done(&marker(5), 400, COORD, &done(5, 400)),
+            Ok(())
+        );
+    }
+
+    /// The hole the nonce exists to close, and the reason neither of the other
+    /// two checks can stand in for it: attempt A was abandoned and reissued as
+    /// B. B picked the SAME coordinator, and its `new_eversion` is identical
+    /// because it is `live + 1` and A never bumped the extent. A's late report
+    /// therefore passes the reporter check and the eversion check — and would
+    /// flip the layout onto B's targets, which have staged nothing.
+    #[test]
+    fn a_previous_attempts_late_report_is_refused() {
+        let reissued = marker(5);
+        let a_nonce = 400;
+        let b_nonce = 412;
+        assert_eq!(
+            classify_ec_done(&reissued, b_nonce, COORD, &done(5, a_nonce)),
+            Err(EcDoneRejection::DifferentAttempt),
+            "a report from the superseded attempt must not complete the live one"
+        );
+    }
+
+    #[test]
+    fn a_non_coordinator_is_refused_even_with_the_right_attempt() {
+        assert_eq!(
+            classify_ec_done(&marker(5), 400, OTHER, &done(5, 400)),
+            Err(EcDoneRejection::NotCoordinator)
+        );
+    }
+
+    #[test]
+    fn a_disagreeing_eversion_is_refused() {
+        assert_eq!(
+            classify_ec_done(&marker(5), 400, COORD, &done(6, 400)),
+            Err(EcDoneRejection::EversionMismatch)
+        );
+    }
+}
+
+#[cfg(test)]
+mod logical_capacity_tests {
+    use super::sealed_extent_logical_size;
+
+    #[test]
+    fn sealed_scan_never_counts_an_open_extent_length() {
+        assert_eq!(sealed_extent_logical_size(true, 4_096), 4_096);
+        assert_eq!(sealed_extent_logical_size(false, 4_096), 0);
+    }
+}
+
+#[cfg(test)]
+mod df_echo_tests {
+    use super::{classify_df_echo, DfEchoAction};
+
+    #[test]
+    fn no_echo_is_ok() {
+        // EN did not self-register (--advertise unset) → skip all checks.
+        assert!(matches!(
+            classify_df_echo("uuid-A", "10.0.0.1:9101", &[9101], "", "", &[]),
+            DfEchoAction::Ok
+        ));
+    }
+
+    #[test]
+    fn matching_echo_is_ok() {
+        assert!(matches!(
+            classify_df_echo(
+                "uuid-A",
+                "10.0.0.1:9101",
+                &[9101, 9111],
+                "uuid-A",
+                "10.0.0.1:9101",
+                &[9101, 9111],
+            ),
+            DfEchoAction::Ok
+        ));
+    }
+
+    #[test]
+    fn different_uuid_is_imposter() {
+        // Pod-IP reuse: a different process answers at this address.
+        assert!(matches!(
+            classify_df_echo(
+                "uuid-A",
+                "10.0.0.1:9101",
+                &[9101],
+                "uuid-B",
+                "10.0.0.1:9101",
+                &[9101]
+            ),
+            DfEchoAction::Imposter
+        ));
+    }
+
+    #[test]
+    fn drifted_location_under_same_uuid_warns() {
+        // Address drifted, ports unchanged → DriftWarn.
+        assert!(matches!(
+            classify_df_echo(
+                "uuid-A",
+                "10.0.0.1:9101",
+                &[9101, 9111],
+                "uuid-A",
+                "10.0.0.9:9101",
+                &[9101, 9111],
+            ),
+            DfEchoAction::DriftWarn
+        ));
+
+        // Ports drifted (a reshard), address unchanged → DriftWarn.
+        assert!(matches!(
+            classify_df_echo(
+                "uuid-A",
+                "10.0.0.1:9101",
+                &[9101],
+                "uuid-A",
+                "10.0.0.1:9101",
+                &[9101, 9111, 9121],
+            ),
+            DfEchoAction::DriftWarn
+        ));
+    }
+
+    #[test]
+    fn empty_echo_fields_never_flag_drift() {
+        // uuid matches but advertise_addr / shard_ports echo empty → "unspecified",
+        // must NOT be treated as a drift.
+        assert!(matches!(
+            classify_df_echo("uuid-A", "10.0.0.1:9101", &[9101], "uuid-A", "", &[]),
+            DfEchoAction::Ok
+        ));
+    }
+}
+
+// G4 (EC apply-fail wedge) loop-level reproduce harness. Kept in its own file;
+// declared here (child of `recovery`) so it can reach the module-private
+// `finalize_ec_dispatch_after_convert` / `collect_ec_dispatch_candidates`.
+#[cfg(test)]
+#[path = "ec_g4_wedge_harness.rs"]
+mod ec_g4_wedge_harness;
+
+#[cfg(test)]
+mod ec_apply_fail_tests {
+    //! `finalize_ec_dispatch_after_convert` must keep the
+    //! in-memory inflight marker when `apply_ec_conversion_done` FAILS, so the
+    //! drain-only dispatch loop re-dispatches on the next tick. Releasing it on
+    //! a leadership-retained apply failure strands the extent manager-pre-EC /
+    //! EN-post-EC → permanent EVERSION_MISMATCH wedge until a failover.
+    //!
+    //! Memory-mode (no etcd): `apply_ec_conversion_done` returns `NotFound`
+    //! for an absent extent BEFORE touching etcd or leadership — a faithful,
+    //! deterministic model of "apply failed while this manager stays leader".
+    use crate::extent_inflight::ExtentOpKind;
+    use crate::AutumnManager;
+
+    fn block_on<F: std::future::Future>(f: F) -> F::Output {
+        compio::runtime::Runtime::new().unwrap().block_on(f)
+    }
+
+    /// REPRODUCE: apply fails (extent absent → NotFound, leadership retained).
+    /// The inflight marker MUST survive so the next dispatch tick retries.
+    /// Pre-fix (unconditional release on rpc_ok) this dropped the marker.
+    #[test]
+    fn apply_failure_keeps_inflight_marker_for_redispatch() {
+        block_on(async {
+            let m = AutumnManager::new();
+            let extent_id: u64 = 7001;
+            // Marker present, but NO extent in the store → apply -> NotFound.
+            m._test_mark_ec_inflight(extent_id);
+            assert_eq!(
+                m.extent_inflight_op(extent_id),
+                Some(ExtentOpKind::ConvertToEc),
+                "precondition: marker must be in flight before finalize"
+            );
+
+            m.finalize_ec_dispatch_after_convert(extent_id, vec![1, 3, 5, 7], vec![70], 3, 4)
+                .await;
+
+            assert_eq!(
+                m.extent_inflight_op(extent_id),
+                Some(ExtentOpKind::ConvertToEc),
+                "BUG2-EC-APPLY-FAIL: marker MUST be retained when apply fails \
+                 (else the drain-only loop never re-dispatches → permanent wedge)"
+            );
+        });
+    }
+}
+
+#[cfg(test)]
+mod ec_dispatch_owner_epoch_tests {
+    use super::dispatch_owner_epoch_for_extent;
+    use crate::store::MetadataState;
+    use crate::persist::records::StreamRecord;
+    use crate::persist::records::PartitionRecord;
+
+    const EXTENT: u64 = 12;
+    const PART: u64 = 9001;
+
+    /// A partition owning `EXTENT` on its log stream, whose owner lock sits at
+    /// `epoch`.
+    fn state_at(epoch: i64) -> MetadataState {
+        let mut s = MetadataState::default();
+        s.streams.insert(
+            1,
+            StreamRecord {
+                stream_id: 1,
+                extent_ids: vec![7, EXTENT],
+                ..Default::default()
+            },
+        );
+        s.partitions.insert(
+            PART,
+            PartitionRecord {
+                part_id: PART,
+                log_stream: 1,
+                row_stream: 2,
+                meta_stream: 3,
+                rg: None,
+            },
+        );
+        s.owner_epochs.insert(format!("partition/{PART}"), epoch);
+        s
+    }
+
+    /// A CoW-shared extent: after a split (or merge) the SAME extent is on two
+    /// partitions' streams, each with its own owner lock. The EN's per-extent
+    /// fence floor is raised by whichever owner writes, so resolving to the
+    /// OTHER partition's epoch hands the coordinator a stale value and every
+    /// WriteShard comes back `CODE_LOCKED_BY_OTHER` — forever, because the
+    /// re-dispatch keeps resolving the same wrong partition. Observed live
+    /// (chaos, ec+kill+split+merge): `req_owner_epoch=24 local_owner_epoch=27`,
+    /// re-dispatched every 5 s, the marker pinned and that extent's GC refused
+    /// for the rest of the run.
+    ///
+    /// Fencing floors only rise, so the MAX across the partitions that
+    /// reference the extent is the only safe answer — and it is unchanged when
+    /// just one references it.
+    #[test]
+    fn cow_shared_extent_resolves_to_the_highest_owner_epoch() {
+        let mut s = state_at(24);
+        // The split child: its own log stream also carries EXTENT (CoW), and it
+        // holds the newer owner lock.
+        const CHILD: u64 = 9002;
+        s.streams.insert(
+            4,
+            StreamRecord {
+                stream_id: 4,
+                extent_ids: vec![EXTENT],
+                ..Default::default()
+            },
+        );
+        s.partitions.insert(
+            CHILD,
+            PartitionRecord {
+                part_id: CHILD,
+                log_stream: 4,
+                row_stream: 5,
+                meta_stream: 6,
+                rg: None,
+            },
+        );
+        s.owner_epochs.insert(format!("partition/{CHILD}"), 27);
+
+        assert_eq!(
+            dispatch_owner_epoch_for_extent(&s, EXTENT),
+            27,
+            "must not depend on which partition is visited first"
+        );
+    }
+
+    /// The regression. The epoch is re-acquired — and bumped — on every
+    /// `open_partition`, so a PS restart between the marker's creation and a
+    /// re-dispatch leaves any frozen copy BELOW the ENs' per-extent floor. Every
+    /// participant then answers `CODE_LOCKED_BY_OTHER` and the conversion can
+    /// never finish: the marker is pinned forever and the extent's GC is refused
+    /// forever with "has in-flight ConvertToEc".
+    ///
+    /// Observed in system_chaos: a coordinator re-dispatched every 5 s, each
+    /// time failing `WriteShard ... shard 1 @ 0`, holding extent 12's marker for
+    /// the entire run on an otherwise-quiesced cluster.
+    #[test]
+    fn resolves_the_epoch_live_so_a_partition_reopen_cannot_strand_a_conversion() {
+        let frozen = dispatch_owner_epoch_for_extent(&state_at(100), EXTENT);
+        assert_eq!(frozen, 100, "baseline: the epoch at marker-creation time");
+
+        // The PS reopens the partition (restart / rebalance / self-eviction).
+        let after_reopen = state_at(200);
+        assert_eq!(
+            dispatch_owner_epoch_for_extent(&after_reopen, EXTENT),
+            200,
+            "a re-dispatch must carry the CURRENT epoch; stamping the frozen {frozen} \
+             is below the ENs' floor and is refused by every participant forever"
+        );
+    }
+
+    /// No partition claims the extent ⇒ no fence (0), rather than inheriting some
+    /// unrelated partition's epoch.
+    #[test]
+    fn an_unclaimed_extent_gets_no_fence() {
+        assert_eq!(dispatch_owner_epoch_for_extent(&state_at(100), 4242), 0);
+    }
+}
+
+#[cfg(test)]
+mod rpc_timed_out_tests {
+    use super::rpc_timed_out;
+    use autumn_rpc::RpcError;
+
+    /// Only a timeout keeps a marker: the peer may be slow, not gone. A refused
+    /// connect or a closed connection says it is not reachable.
+    #[test]
+    fn only_a_timeout_is_a_timeout() {
+        let t = anyhow::Error::new(RpcError::Timeout(std::time::Duration::from_secs(5)));
+        assert!(rpc_timed_out(&t));
+        assert!(rpc_timed_out(&t.context("re-send")));
+        assert!(!rpc_timed_out(&anyhow::Error::new(RpcError::ConnectionClosed)));
+        assert!(!rpc_timed_out(&anyhow::anyhow!("connect 127.0.0.1:1: refused")));
+    }
+}
+
+#[cfg(test)]
+mod ec_failed_node_tests {
+    use super::ec_failed_node;
+
+    /// The coordinator reports the failed target by its position in the request,
+    /// which is the marker's target order.
+    #[test]
+    fn the_index_names_the_target_node() {
+        let targets = [11, 22, 33];
+        assert_eq!(ec_failed_node(&targets, Some(2)), 33);
+        assert_eq!(ec_failed_node(&targets, Some(0)), 11);
+        assert_eq!(ec_failed_node(&targets, None), 11, "no index: the coordinator");
+        assert_eq!(ec_failed_node(&targets, Some(9)), 11, "out of range: the coordinator");
+    }
+}
+
+#[cfg(test)]
+mod recovery_placement_tests {
+    use super::*;
+    use crate::placement::NodeLoad;
+    use crate::NodeCap;
+    use crate::persist::records::ExtentRecord;
+    use crate::persist::records::NodeRecord;
+
+    const LOADED: [u64; 3] = [1, 3, 5];
+    const EMPTY: [u64; 4] = [102, 104, 106, 108];
+    /// Holds the slot being rebuilt, so it is `occupied` and never a candidate.
+    const DYING: u64 = 200;
+
+    /// A cluster shaped like the AZ migration that exposed this: the loaded
+    /// nodes have the LOWEST ids, the fresh empty ones the highest.
+    fn skewed_manager() -> AutumnManager {
+        let m = AutumnManager::new();
+        {
+            let mut s = m.store.inner.borrow_mut();
+            for nid in LOADED.iter().chain(EMPTY.iter()).chain([DYING].iter()) {
+                s.nodes.insert(
+                    *nid,
+                    NodeRecord {
+                        node_id: *nid,
+                        address: format!("127.0.0.1:{}", 9000 + nid),
+                        disks: vec![*nid],
+                        shard_ports: vec![],
+                        control_address: String::new(),
+                        node_uuid: format!("uuid-{nid}"),
+                    },
+                );
+            }
+            s.extents.insert(
+                7,
+                ExtentRecord {
+                    extent_id: 7,
+                    replicates: vec![DYING],
+                    eversion: 1,
+                    refs: 1,
+                    sealed_length: 4096,
+                    sealed: true,
+                    avali: 0b1,
+                    ..Default::default()
+                },
+            );
+        }
+        {
+            let mut cap = m.cluster_cap.borrow_mut();
+            for nid in LOADED {
+                cap.per_node.push((
+                    nid,
+                    NodeCap {
+                        total: 1000,
+                        free: 100,
+                        extent_bytes: 900,
+                        online: true,
+                        disks: Vec::new(),
+                    },
+                ));
+            }
+            for nid in EMPTY.iter().chain([DYING].iter()) {
+                cap.per_node.push((
+                    *nid,
+                    NodeCap {
+                        total: 1000,
+                        free: 1000,
+                        extent_bytes: 0,
+                        online: true,
+                        disks: Vec::new(),
+                    },
+                ));
+            }
+        }
+        {
+            let mut slots = m.node_slot_counts.borrow_mut();
+            for nid in LOADED {
+                slots.insert(nid, (4, 45));
+            }
+            for nid in EMPTY {
+                slots.insert(nid, (0, 0));
+            }
+        }
+        m
+    }
+
+    /// THE REGRESSION. The rebuild must go to the empty nodes, not to the
+    /// lowest ids.
+    ///
+    /// Asserted through `recovery_candidate_order` rather than through the
+    /// scorer directly, because the scorer being right proves nothing about the
+    /// path using it — the same distinction that let an earlier bug in this
+    /// crate pass its own ablation.
+    ///
+    /// EVERY iteration, not a fraction of them: recovery orders its candidates
+    /// fully rather than sampling (the rate limiter is what spreads a burst
+    /// here), so an empty node is always first. Reverting the tail of that
+    /// function to `all.sort_by_key(|n| n.node_id)` takes this to 0.
+    #[test]
+    fn a_rebuild_goes_to_the_empty_nodes_not_the_lowest_ids() {
+        let m = skewed_manager();
+        const ITERS: usize = 200;
+        let mut to_empty = 0usize;
+        for _ in 0..ITERS {
+            let (_, order) = m.recovery_candidate_order(7).expect("order");
+            assert_eq!(
+                order.len(),
+                LOADED.len() + EMPTY.len(),
+                "the walk needs every candidate exactly once; the node holding \
+                 the slot must be the only one missing"
+            );
+            assert!(
+                !order.iter().any(|n| n.node_id == DYING),
+                "a node already holding a slot of this extent must never be a \
+                 rebuild target"
+            );
+            if EMPTY.contains(&order[0].node_id) {
+                to_empty += 1;
+            }
+        }
+        assert_eq!(
+            to_empty, ITERS,
+            "a loaded node was ordered ahead of an empty one; full ordering \
+             means this must never happen"
+        );
+    }
+
+    /// Load steers, it never overrules. A fenced node is out even when it is by
+    /// far the emptiest thing in the cluster.
+    #[test]
+    fn the_emptiest_node_is_still_refused_when_it_is_excluded() {
+        let m = skewed_manager();
+        m.node_overrides.borrow_mut().insert(
+            102,
+            autumn_rpc::manager_rpc::MgrNodeOverride {
+                node_id: 102,
+                kind: autumn_rpc::manager_rpc::NODE_OVERRIDE_FENCED,
+                set_at: 0,
+                set_by: "test".into(),
+                reason: "test".into(),
+                expire_at: 0,
+                node_uuid: "uuid-102".into(),
+            },
+        );
+        for _ in 0..50 {
+            let (_, order) = m.recovery_candidate_order(7).expect("order");
+            assert!(
+                !order.iter().any(|n| n.node_id == 102),
+                "a fenced node must not be a rebuild target however empty it is"
+            );
+        }
+    }
+
+    /// With no `df` data at all — a leader that has just won the election —
+    /// every node is unmeasured, and the order must stay unbiased rather than
+    /// collapsing back onto the id.
+    #[test]
+    fn a_cold_leader_still_spreads() {
+        let m = skewed_manager();
+        m.cluster_cap.borrow_mut().per_node.clear();
+        m.node_slot_counts.borrow_mut().clear();
+        let mut first_seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        for _ in 0..200 {
+            let (_, order) = m.recovery_candidate_order(7).expect("order");
+            first_seen.insert(order[0].node_id);
+        }
+        assert!(
+            first_seen.len() >= 5,
+            "unmeasured nodes must tie and spread, got {first_seen:?}"
+        );
+    }
+
+    /// `placement_load` must read the per-disk SUM, not the per-disk MAX that
+    /// `node_max_free` carries — otherwise a node with one fresh disk beside
+    /// three full ones scores as empty as a node with four fresh disks.
+    #[test]
+    fn a_node_is_measured_by_its_whole_footprint() {
+        let m = AutumnManager::new();
+        m.cluster_cap.borrow_mut().per_node = vec![(
+            1,
+            NodeCap {
+                total: 4000,
+                free: 1000,
+                extent_bytes: 3000,
+                online: true,
+                disks: Vec::new(),
+            },
+        )];
+        m.node_max_free.borrow_mut().insert(1, 1000);
+        let load = m.placement_load();
+        assert_eq!(
+            load.get(&1).copied(),
+            Some(NodeLoad {
+                used_bytes: 3000,
+                total_bytes: 4000,
+                open_extents: 0,
+                shards: 0,
+            })
+        );
+    }
+
+    /// A node whose `df` failed this tick reports nothing trustworthy, so it
+    /// must read as unmeasured rather than as whatever it last said.
+    #[test]
+    fn a_node_whose_df_failed_is_not_measured() {
+        let m = AutumnManager::new();
+        m.cluster_cap.borrow_mut().per_node = vec![(
+            1,
+            NodeCap {
+                total: 4000,
+                free: 4000,
+                extent_bytes: 0,
+                online: false,
+                disks: Vec::new(),
+            },
+        )];
+        assert!(!m.placement_load().contains_key(&1));
+    }
+}
+
+#[cfg(test)]
+mod slot_verdict_tests {
+    use super::{slot_verdict, SlotVerdict};
+
+    /// A node that is merely unreachable — `MgrDiskInfo.online` false because a
+    /// `df` timed out, or partition servers reported it — is no evidence about
+    /// any disk, and the verdict does not even take that bit. Its copies stay
+    /// put; the documented rolling-restart procedure (`docs/ops.md`, "a
+    /// merely-absent node does NOT trigger recovery") relies on it.
+    #[test]
+    fn an_unreachable_node_keeps_its_copies() {
+        assert_eq!(slot_verdict(false, false, false), SlotVerdict::Keep);
+    }
+
+    /// An operator's or the policy's repair request moves the copy even
+    /// though nothing conclusive says it is lost.
+    #[test]
+    fn a_repair_request_is_rebuilt() {
+        assert_eq!(slot_verdict(false, false, true), SlotVerdict::Rebuild);
+    }
+
+    #[test]
+    fn a_fenced_node_or_a_corrupt_slot_is_rebuilt() {
+        assert_eq!(slot_verdict(true, false, false), SlotVerdict::Rebuild);
+        assert_eq!(slot_verdict(false, true, false), SlotVerdict::Rebuild);
+    }
+}
+
+#[cfg(test)]
+mod df_disk_health_tests {
+    use super::*;
+    use autumn_rpc::extent_rpc::DiskStatus;
+    use crate::persist::records::NodeRecord;
+
+    fn node_with_two_disks(store: &crate::store::MetadataStore) -> NodeRecord {
+        let mut s = store.inner.borrow_mut();
+        for did in [10u64, 11] {
+            s.disks.insert(
+                did,
+                crate::persist::records::DiskRecord {
+                    disk_id: did,
+                    online: true,
+                    uuid: format!("uuid-{did}"),
+                },
+            );
+        }
+        NodeRecord {
+            node_id: 1,
+            address: "127.0.0.1:9101".into(),
+            disks: vec![10, 11],
+            shard_ports: vec![],
+            control_address: String::new(),
+            node_uuid: "uuid-n1".into(),
+        }
+    }
+
+    fn status(online: bool) -> DiskStatus {
+        DiskStatus {
+            total: 1000,
+            free: 500,
+            online,
+            extent_bytes: 500,
+            ..Default::default()
+        }
+    }
+
+    /// THE OTHER HALF OF THE BUG. One dead disk does not stop a node answering
+    /// `df`, and a node-wide "everything is online" overwrote the only fact
+    /// that could have repaired it.
+    ///
+    /// Reverting this to set every `node.disks` entry online turns the whole
+    /// per-disk repair path back off, silently — the verdict above would be
+    /// correct and never reached, because it would never see `Some(false)`.
+    #[test]
+    fn a_faulted_disk_survives_a_successful_df() {
+        let m = AutumnManager::new();
+        let node = node_with_two_disks(&m.store);
+        m.apply_df_disk_health(&node, &[(10, status(true)), (11, status(false))]);
+        let s = m.store.inner.borrow();
+        assert!(s.disks[&10].online, "the healthy disk stays online");
+        assert!(
+            !s.disks[&11].online,
+            "the node said this disk is faulted; a successful df must not \
+             overwrite that"
+        );
+    }
+
+    /// COMPOSITION, both directions. The predicate is fed by the real writers
+    /// rather than by hand — feeding it `Some(false)` and calling that "a dead
+    /// disk" is exactly how the storm below got written in the first place.
+    #[test]
+    fn an_unreachable_node_keeps_while_a_faulted_disk_rebuilds() {
+        let m = AutumnManager::new();
+        let node = node_with_two_disks(&m.store);
+
+        // (a) the node stops answering df at all.
+        AutumnManager::mark_node_disks_offline(&m.store, &node);
+        assert!(
+            !m.store.inner.borrow().disks[&10].online,
+            "the node-wide path does mark every disk offline"
+        );
+        assert!(
+            !m.faulted_disks.borrow().contains(&10),
+            "…but says nothing about any individual disk"
+        );
+        assert_eq!(
+            slot_verdict(m.faulted_disks.borrow().contains(&10), false, false),
+            SlotVerdict::Keep,
+            "a node that missed a heartbeat must not have its data rebuilt"
+        );
+
+        // (b) the node answers, and names one of its disks faulted.
+        m.apply_df_disk_health(&node, &[(10, status(true)), (11, status(false))]);
+        assert_eq!(
+            slot_verdict(m.faulted_disks.borrow().contains(&11), false, false),
+            SlotVerdict::Rebuild
+        );
+        assert_eq!(
+            slot_verdict(m.faulted_disks.borrow().contains(&10), false, false),
+            SlotVerdict::Keep,
+            "its healthy sibling is untouched"
+        );
+    }
+
+    /// A `df` from one node must not be able to flip another node's disk —
+    /// disk ids are small dense integers and a stale `{dir}/disk_id` sentinel
+    /// is a real way to get a collision.
+    #[test]
+    fn a_node_can_only_speak_about_its_own_disks() {
+        let m = AutumnManager::new();
+        let node = node_with_two_disks(&m.store);
+        let mut stranger = node.clone();
+        stranger.node_id = 2;
+        stranger.disks = vec![99];
+        m.apply_df_disk_health(&stranger, &[(10, status(false))]);
+        assert!(
+            m.store.inner.borrow().disks[&10].online,
+            "node 2 does not own disk 10 and must not mark it faulted"
+        );
+        assert!(!m.faulted_disks.borrow().contains(&10));
+    }
+
+    /// The self-heal direction still works: an EN restart clears `Faulted`, the
+    /// node reports the disk online again, and the manager believes it.
+    #[test]
+    fn a_recovered_disk_comes_back_online() {
+        let m = AutumnManager::new();
+        let node = node_with_two_disks(&m.store);
+        m.apply_df_disk_health(&node, &[(11, status(false))]);
+        assert!(!m.store.inner.borrow().disks[&11].online);
+        m.apply_df_disk_health(&node, &[(11, status(true))]);
+        assert!(m.store.inner.borrow().disks[&11].online);
+    }
+
+    /// Absence is not evidence. A disk the payload does not mention keeps
+    /// whatever was known about it — losing the df ENTIRELY is what is
+    /// node-wide, and that path is unchanged.
+    #[test]
+    fn an_unmentioned_disk_is_left_alone() {
+        let m = AutumnManager::new();
+        let node = node_with_two_disks(&m.store);
+        m.apply_df_disk_health(&node, &[(11, status(false))]);
+        m.apply_df_disk_health(&node, &[(10, status(true))]);
+        assert!(
+            !m.store.inner.borrow().disks[&11].online,
+            "disk 11 was not in the second report and must keep its state"
+        );
+    }
+}
+
+#[cfg(test)]
+mod recovery_cleanup_retry_tests {
+    use autumn_common::AppError;
+    use autumn_rpc::manager_rpc::RecoveryTask;
+
+    use crate::extent_inflight::{ExtentOpKind, ExtentOpPayload};
+    use crate::inflight_commit::tests::{arm, Stage};
+    use crate::AutumnManager;
+
+    #[test]
+    fn failed_stale_recovery_cleanup_keeps_marker_and_next_tick_retries() {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let manager = AutumnManager::new();
+            let extent_id = 9201;
+            let task = RecoveryTask {
+                extent_id,
+                replace_id: 3,
+                node_id: 9,
+                start_time: 1,
+            };
+            manager
+                ._test_acquire_marker(extent_id, ExtentOpPayload::Recovery(task))
+                .await
+                .unwrap();
+
+            arm(Stage::BeforeTxn, || {
+                Err(AppError::Internal(
+                    "test-injected marker cleanup failure".into(),
+                ))
+            });
+            let first = manager.redispatch_pinned_recovery(extent_id).await;
+            assert!(first.is_err(), "the injected durable cleanup failure must surface");
+            assert_eq!(
+                manager.extent_inflight_op(extent_id),
+                Some(ExtentOpKind::Recovery),
+                "a failed durable delete must keep the in-memory marker"
+            );
+
+            manager
+                .redispatch_pinned_recovery(extent_id)
+                .await
+                .expect("the next tick retries cleanup");
+            assert_eq!(
+                manager.extent_inflight_op(extent_id),
+                None,
+                "cleanup must converge without a leader restart"
+            );
+        });
+    }
+}

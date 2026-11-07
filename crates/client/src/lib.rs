@@ -1,0 +1,7219 @@
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
+use std::net::SocketAddr;
+use std::rc::Rc;
+use std::time::Duration;
+
+use anyhow::{anyhow, Context, Result};
+use autumn_params::client::ClientParams;
+use autumn_rpc::client::{Lane, RpcClient};
+use autumn_rpc::manager_rpc::*;
+use autumn_rpc::partition_rpc::{self, *};
+use autumn_rpc::{RpcError, StatusCode};
+use bytes::Bytes;
+
+/// Inode-lease client helpers. Used by autumn-fuse
+/// `open`/`release` callbacks. (Originated for the io_uring daemon,
+/// which has since been removed; autumn-fuse is now the sole caller.)
+pub mod lease;
+
+// ── Re-exports for SDK consumers ────────────────────────────────────────────
+
+pub use autumn_rpc::partition_rpc::RangeEntry;
+
+// ── Public helpers ──────────────────────────────────────────────────────────
+
+/// `host:port` to the addresses a connection may dial, in resolver order. An
+/// IP literal is parsed without a lookup; a host name is resolved on the
+/// blocking pool.
+pub async fn resolve_addrs(addr: &str) -> Result<Vec<SocketAddr>> {
+    use compio::net::ToSocketAddrsAsync;
+    let addrs: Vec<SocketAddr> = addr
+        .to_socket_addrs_async()
+        .await
+        .with_context(|| format!("resolve address: {addr}"))?
+        .collect();
+    if addrs.is_empty() {
+        return Err(anyhow!("address {addr} resolved to nothing"));
+    }
+    Ok(addrs)
+}
+
+/// The connect reached something that answered the handshake — a refusal or
+/// a malformed reply — so another address of the same name would answer the
+/// same. Transport failures and timeouts are not answers.
+fn server_answered(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<AutumnError>().is_some()
+        || matches!(
+            e.downcast_ref::<RpcError>(),
+            Some(RpcError::Status { .. } | RpcError::VersionMismatch { .. })
+        )
+}
+
+pub fn decode_err(e: String) -> anyhow::Error {
+    anyhow!("rkyv decode: {e}")
+}
+
+// ── Error type ──────────────────────────────────────────────────────────────
+
+#[derive(Debug)]
+pub enum AutumnError {
+    NotFound,
+    InvalidArgument(String),
+    PreconditionFailed(String),
+    ServerError(String),
+    RoutingError(String),
+    ConnectionError(String),
+    /// value exceeds the inline `Put` cap. Caller should retry
+    /// via `put_stream_begin` / `PutStreamHandle::send` / `commit`
+    /// (client-side striped write, no server-side multipart RPC any more).
+    ValueTooLarge {
+        size: u64,
+        cap: u64,
+    },
+    /// Lease write fencing: the PS fence floor rejected this write — a HIGHER
+    /// lease epoch has been seen for this inode, i.e. this writer's
+    /// lease was revoked. The caller must stop writing under this lease
+    /// and re-acquire.
+    Fenced(String),
+    /// the PS refused this request — the connection is not
+    /// authorized for the key range (no valid capability token, key outside the
+    /// granted prefixes, or the token expired). TERMINAL: retrying / refreshing
+    /// routing won't help; the caller must (re-)authenticate with a token that
+    /// grants the key. Distinct from `NotFound` so a denied key isn't mistaken
+    /// for an absent one.
+    PermissionDenied(String),
+    /// D7 Layer-A: the PS refused a put-class write because its key
+    /// falls in NO registered namespace. TERMINAL: retrying / refreshing routing
+    /// won't create the namespace — the operator must `namespace-create` it (or
+    /// the caller must write under a registered namespace). Distinct from
+    /// `NotFound` (a read-miss) and `InvalidArgument`.
+    NamespaceUnknown(String),
+    /// A server refused this client's wire version at `VERSION_HELLO`.
+    /// TERMINAL, and more sharply so than the two above: the version is baked
+    /// into this binary, so no amount of refreshing, reconnecting or waiting
+    /// can change the answer. The message is the SERVER's own, and names which
+    /// way round the mismatch is — rebuild this image, or deploy the cluster —
+    /// which is the entire point of the refusal and is lost if it gets
+    /// flattened into a connection error.
+    WireVersionRefused(String),
+    /// The cluster this client negotiated with is too old to serve the
+    /// requested operation (it has no handler for the opcode). TERMINAL until
+    /// the cluster is upgraded.
+    Unsupported(String),
+    /// A WRITE may or may not have been applied (HBase's "retries exhausted"):
+    /// an attempt reached the server and was given up there, or the request
+    /// was sent and no answer came back. The outcome is fixed later and never
+    /// changes once read; read the key to learn it. An idempotent write
+    /// (put, delete, batch) returns this when it fails in the end — retries
+    /// ran out, or a later attempt failed for another reason — after such an
+    /// attempt; a conditional write (`compare_put`, `compare_write`) returns it
+    /// at the first such attempt, because retrying could report a conflict
+    /// caused by its own first attempt. Every other write error means "not
+    /// applied".
+    OutcomeUnknown(String),
+}
+
+impl std::fmt::Display for AutumnError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AutumnError::NotFound => write!(f, "key not found"),
+            AutumnError::PermissionDenied(msg) => write!(f, "permission denied: {msg}"),
+            AutumnError::NamespaceUnknown(msg) => write!(f, "namespace unknown: {msg}"),
+            AutumnError::WireVersionRefused(msg) => write!(f, "{msg}"),
+            AutumnError::Unsupported(msg) => write!(f, "unsupported by this cluster: {msg}"),
+            AutumnError::OutcomeUnknown(msg) => {
+                write!(f, "write outcome unknown (it may or may not have been applied): {msg}")
+            }
+            AutumnError::Fenced(msg) => write!(f, "write fenced (lease revoked): {msg}"),
+            AutumnError::InvalidArgument(msg) => write!(f, "invalid argument: {msg}"),
+            AutumnError::PreconditionFailed(msg) => write!(f, "precondition failed: {msg}"),
+            AutumnError::ServerError(msg) => write!(f, "server error: {msg}"),
+            AutumnError::RoutingError(msg) => write!(f, "routing error: {msg}"),
+            AutumnError::ConnectionError(msg) => write!(f, "connection error: {msg}"),
+            AutumnError::ValueTooLarge { size, cap } => {
+                if *cap > 0 {
+                    write!(
+                        f,
+                        "value {size} bytes exceeds inline cap {cap} — use put_stream_begin"
+                    )
+                } else {
+                    write!(f, "value {size} bytes exceeds the partition server's inline cap — use put_stream_begin")
+                }
+            }
+        }
+    }
+}
+
+impl std::error::Error for AutumnError {}
+
+// ── D7: namespace binding ───────────────────────────────────────────
+
+/// (Option 3): the key-prefix scope a `ClusterClient`
+/// operates within. A scope is `{ns}/` (a whole
+/// namespace, e.g. `fs/`, `gallery/`) or an in-namespace sub-prefix
+/// (`mem/agent7/` — an app's own segment; the app owns its sub-structure). A
+/// scoped op ALWAYS PREPENDS the scope prefix to the user key before routing, so
+/// a scoped client **cannot** touch anything outside its own keyspace — scope is
+/// locked by construction, not merely checked. The built-in key builders
+/// (fuse / kvcache) emit keys RELATIVE to the scope prefix (the binding
+/// owns the prefix). `Raw` (`connect_raw` / `raw()`) applies NO client-side
+/// prefixing — for admin / cross-namespace tooling — but the PS still enforces
+/// Layer-A/B, so `raw()` only bypasses the CLIENT clamp, never authorization.
+#[derive(Clone, Debug)]
+pub enum NamespaceBinding {
+    Scoped {
+        /// The scope prefix bytes, always ending in `/` (`fs/`, `mem/agent7/`).
+        /// The first `/`-delimited segment is the namespace (Layer-A checks it).
+        prefix: Vec<u8>,
+    },
+    /// Admin / unscoped: no client-side prefixing.
+    Raw,
+}
+
+impl NamespaceBinding {
+    /// Build a scoped binding from a scope string (`fs`, `mem/agent7`,
+    /// `bench/perf`). Always Prepend (`{scope}/ ++ key`). A trailing `/` is
+    /// added if absent; an already-slash-terminated scope is taken verbatim.
+    pub fn scoped(scope: impl AsRef<str>) -> Self {
+        let scope = scope.as_ref().trim_end_matches('/');
+        let prefix = format!("{scope}/").into_bytes();
+        NamespaceBinding::Scoped { prefix }
+    }
+
+    /// `{scope}/` for a scoped binding; `None` for `Raw`.
+    pub fn prefix(&self) -> Option<&[u8]> {
+        match self {
+            NamespaceBinding::Scoped { prefix, .. } => Some(prefix),
+            NamespaceBinding::Raw => None,
+        }
+    }
+
+    /// Map a user key to the wire key. Scoped → `{scope}/ ++ key` (ALWAYS
+    /// prepend — scope is locked by construction); Raw → pass through unchanged.
+    /// Infallible (a scoped key can't escape its scope); returns `Result` only so
+    /// call sites keep the `?` shape.
+    pub fn bind_key(&self, key: &[u8]) -> std::result::Result<Vec<u8>, AutumnError> {
+        Ok(match self {
+            NamespaceBinding::Raw => key.to_vec(),
+            NamespaceBinding::Scoped { prefix, .. } => [prefix.as_slice(), key].concat(),
+        })
+    }
+
+    /// Map a user range prefix to the wire prefix. Same mapping as `bind_key`; an
+    /// EMPTY user prefix scans the whole `{scope}/`.
+    pub fn bind_prefix(&self, user_prefix: &[u8]) -> std::result::Result<Vec<u8>, AutumnError> {
+        self.bind_key(user_prefix)
+    }
+
+    /// Strip the binding prefix off a wire key returned by a scan, so a scoped
+    /// caller sees its original (relative) key. `Raw` returns the key unchanged.
+    pub fn strip(&self, wire_key: Vec<u8>) -> Vec<u8> {
+        match self {
+            NamespaceBinding::Scoped { prefix, .. } if wire_key.starts_with(prefix) => {
+                wire_key[prefix.len()..].to_vec()
+            }
+            _ => wire_key,
+        }
+    }
+
+    /// Upper cap for a scoped range scan: `{scope}0` (`0`=0x30 is the
+    /// successor of `/`=0x2f), so a limit-driven scan can never walk past this
+    /// scope into the next one. `None` for `Raw`.
+    pub fn upper_cap(&self) -> Option<Vec<u8>> {
+        match self {
+            NamespaceBinding::Scoped { prefix, .. } => {
+                // prefix ends with '/'; replace it with its successor '0'.
+                let mut cap = prefix.clone();
+                let last = cap.len() - 1;
+                cap[last] = b'/' + 1; // 0x30 == b'0'
+                Some(cap)
+            }
+            NamespaceBinding::Raw => None,
+        }
+    }
+}
+
+/// D7: validate a scope segment used at connect. Prepend-only embeds it
+/// verbatim into the scope prefix, so an EMPTY segment or one containing `/`
+/// would forge a nested/aliased scope (`//mem`). Enforce the same `[a-z0-9._-]+` charset the manager uses for
+/// namespace names, at connect (fail fast) — restores the dropped invariant for
+/// every frontend at once.
+pub(crate) fn is_valid_scope_segment(s: &str) -> bool {
+    !s.is_empty()
+        && s.bytes().all(|b| {
+            b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'_' | b'-')
+        })
+}
+
+/// D7: a borrow-view of a `ClusterClient` under a DIFFERENT namespace
+/// binding, SHARING all of its connection pools (no reconnect, no Rc refactor).
+/// Returned by `ClusterClient::raw()` (Raw binding — admin/migration, no client
+/// clamp) and `ClusterClient::rescope(scope)` (a different scope). Exposes
+/// the core KV ops; exotic bulk/batch/stream ops use a dedicated scoped
+/// `ClusterClient`. **The PS still enforces Layer-A/B** on every op — a view only
+/// changes the CLIENT-side key transform, never server authorization.
+pub struct NamespaceScope<'a> {
+    client: &'a ClusterClient,
+    binding: NamespaceBinding,
+}
+
+impl NamespaceScope<'_> {
+    /// The binding this scope operates under.
+    pub fn binding(&self) -> &NamespaceBinding {
+        &self.binding
+    }
+
+    pub async fn put(
+        &self,
+        key: &[u8],
+        value: impl IntoValue,
+        opts: WriteOptions,
+    ) -> std::result::Result<(), AutumnError> {
+        let bound = self.binding.bind_key(key)?;
+        self.client.put_bound(&bound, value.into_value(), opts).await
+    }
+
+    pub async fn get(&self, key: &[u8]) -> std::result::Result<Option<Vec<u8>>, AutumnError> {
+        let bound = self.binding.bind_key(key)?;
+        self.client.get_bound(&bound).await
+    }
+
+    pub async fn delete(&self, key: &[u8], opts: WriteOptions) -> std::result::Result<(), AutumnError> {
+        let bound = self.binding.bind_key(key)?;
+        self.client.delete_opts(&bound, opts.lease).await
+    }
+
+    pub async fn head(&self, key: &[u8]) -> std::result::Result<KeyMeta, AutumnError> {
+        let bound = self.binding.bind_key(key)?;
+        self.client.head_bound(&bound).await
+    }
+
+    /// Range scan clamped to this scope's prefix (Raw = unbounded).
+    /// Same bind/clamp/strip as `ClusterClient::range`, under the view's binding.
+    pub async fn range(
+        &self,
+        prefix: &[u8],
+        start: &[u8],
+        limit: u32,
+    ) -> std::result::Result<RangeResult, AutumnError> {
+        let wire_prefix = self.binding.bind_prefix(prefix)?;
+        let wire_start: Vec<u8> = if start.is_empty() {
+            Vec::new()
+        } else {
+            self.binding.bind_key(start)?
+        };
+        let cap = self.binding.upper_cap();
+        let mut result = self
+            .client
+            .range_bound(&wire_prefix, &wire_start, limit, cap.as_deref())
+            .await?;
+        for e in result.entries.iter_mut() {
+            e.key = self.binding.strip(std::mem::take(&mut e.key));
+        }
+        Ok(result)
+    }
+}
+
+/// Write-fencing identity stamped on lease-covered
+/// puts. `ANON` (all-zero) = anonymous write, PS skips fencing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WriteLease {
+    /// Inode this write belongs to (fuse ino). 0 = anonymous.
+    pub inode_hint: u64,
+    /// Manager lease version (`MgrInodeLeaseRecord.version`) the writer
+    /// holds for that inode.
+    pub lease_epoch: u64,
+}
+
+impl WriteLease {
+    pub const ANON: WriteLease = WriteLease {
+        inode_hint: 0,
+        lease_epoch: 0,
+    };
+}
+
+/// A value `put` takes: `Bytes` and `Vec<u8>` move in without a copy (a large
+/// `Bytes` is then sent straight from its memory); a borrowed slice is copied.
+/// A frozen [`ValueBuf`] keeps its pool buffer's registration, which a UCX
+/// send hands on.
+pub trait IntoValue {
+    fn into_value(self) -> RegBytes;
+}
+
+impl IntoValue for RegBytes {
+    fn into_value(self) -> RegBytes {
+        self
+    }
+}
+
+impl IntoValue for &RegBytes {
+    fn into_value(self) -> RegBytes {
+        self.clone()
+    }
+}
+
+impl IntoValue for ValueBuf {
+    fn into_value(self) -> RegBytes {
+        self.freeze()
+    }
+}
+
+impl IntoValue for Bytes {
+    fn into_value(self) -> RegBytes {
+        self.into()
+    }
+}
+
+impl IntoValue for Vec<u8> {
+    fn into_value(self) -> RegBytes {
+        Bytes::from(self).into()
+    }
+}
+
+impl IntoValue for &[u8] {
+    fn into_value(self) -> RegBytes {
+        Bytes::copy_from_slice(self).into()
+    }
+}
+
+impl<const N: usize> IntoValue for &[u8; N] {
+    fn into_value(self) -> RegBytes {
+        Bytes::copy_from_slice(self).into()
+    }
+}
+
+impl IntoValue for &Bytes {
+    fn into_value(self) -> RegBytes {
+        self.clone().into()
+    }
+}
+
+impl IntoValue for &Vec<u8> {
+    fn into_value(self) -> RegBytes {
+        Bytes::copy_from_slice(self).into()
+    }
+}
+
+/// Options of every write: `put`, `put_many`, `delete`, `delete_many`,
+/// `compare_put`. The default is no TTL and no lease fence.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WriteOptions {
+    /// Time to live, rounded up to whole seconds (a zero one is one second);
+    /// `None` = never expires. Deletes ignore it.
+    pub ttl: Option<Duration>,
+    /// Lease the PS fences the write on (`AutumnError::Fenced` once a newer
+    /// writer of the inode has been seen); `WriteLease::ANON` = unfenced.
+    pub lease: WriteLease,
+    /// Memory-tier eviction hint of a put: among values used at about the
+    /// same time a higher rank is evicted first (`PutReq::evict_rank`). The
+    /// KV-cache adapters give a page's position in its prefix, in tokens.
+    /// Ignored by deletes, and by a PS holding the value nowhere in memory.
+    pub evict_rank: u32,
+}
+
+impl WriteOptions {
+    /// No TTL, fenced on `lease`.
+    pub fn fenced(lease: WriteLease) -> Self {
+        WriteOptions { ttl: None, lease, evict_rank: 0 }
+    }
+
+    pub fn with_ttl(self, ttl: Duration) -> Self {
+        WriteOptions { ttl: Some(ttl), ..self }
+    }
+
+    pub fn with_lease(self, lease: WriteLease) -> Self {
+        WriteOptions { lease, ..self }
+    }
+
+    pub fn with_evict_rank(self, evict_rank: u32) -> Self {
+        WriteOptions { evict_rank, ..self }
+    }
+
+    /// Absolute unix seconds the wire carries; 0 = no expiry.
+    fn expires_at(&self) -> u64 {
+        self.ttl.map_or(0, |t| {
+            let secs = t.as_secs().saturating_add(u64::from(t.subsec_nanos() > 0));
+            ClusterClient::ttl_to_expires_at(secs.max(1))
+        })
+    }
+}
+
+fn code_to_error(code: u8, message: String) -> AutumnError {
+    match code {
+        partition_rpc::CODE_NOT_FOUND => AutumnError::NotFound,
+        partition_rpc::CODE_INVALID_ARGUMENT => AutumnError::InvalidArgument(message),
+        partition_rpc::CODE_PRECONDITION => AutumnError::PreconditionFailed(message),
+        partition_rpc::CODE_FENCED => AutumnError::Fenced(message),
+        partition_rpc::CODE_OUTCOME_UNKNOWN => AutumnError::OutcomeUnknown(message),
+        partition_rpc::CODE_VALUE_TOO_LARGE => {
+            // The cap is in the message; we don't try to parse it. Surface the
+            // raw size if the caller doesn't already know.
+            AutumnError::ValueTooLarge { size: 0, cap: 0 }
+        }
+        _ => AutumnError::ServerError(message),
+    }
+}
+
+/// Shared response-code guard: bail with the mapped `code_to_error` when a
+/// PS (partition-server) response body carries a non-OK application code.
+/// PS-ONLY — `code_to_error` maps `partition_rpc::CODE_*`; manager
+/// responses use a different code space (e.g. `CODE_NOT_LEADER`) and must
+/// NOT be routed here. Borrows `message` so it is only cloned on the
+/// (error) bail path.
+fn check_ps_code(code: u8, message: &str) -> std::result::Result<(), AutumnError> {
+    if code != partition_rpc::CODE_OK {
+        return Err(code_to_error(code, message.to_string()));
+    }
+    Ok(())
+}
+
+/// map an autumn-rpc FRAME-level error (`Err((StatusCode, msg))` returned
+/// by a PS handler — e.g. `handle_split_part`'s overlap precondition) into a
+/// typed `AutumnError`. `ps_call` returns this (wrapped in `anyhow`) instead of
+/// stringifying, so the routing-retry loops can classify terminal vs transient
+/// failures by `downcast`-ing rather than string-matching. Distinct from
+/// `code_to_error` above, which maps APPLICATION-level `CODE_*` carried in a
+/// successful response body.
+fn rpc_status_to_error(e: RpcError) -> AutumnError {
+    match e {
+        RpcError::Status { code, message } => match code {
+            StatusCode::NotFound => AutumnError::NotFound,
+            StatusCode::InvalidArgument => AutumnError::InvalidArgument(message),
+            StatusCode::FailedPrecondition => AutumnError::PreconditionFailed(message),
+            // TERMINAL — not in any retry set (refresh/retry can't
+            // grant access), so it propagates to the caller instead of burning
+            // the routing-refresh budget.
+            StatusCode::PermissionDenied => AutumnError::PermissionDenied(message),
+            // D7 Layer-A: TERMINAL like PermissionDenied — refreshing
+            // routing can't create the namespace, so it propagates instead of
+            // burning the routing-refresh budget.
+            StatusCode::NamespaceUnknown => AutumnError::NamespaceUnknown(message),
+            // Unavailable is transient (overloaded / draining) → keep retryable.
+            StatusCode::Unavailable => AutumnError::ConnectionError(message),
+            StatusCode::OutcomeUnknown => AutumnError::OutcomeUnknown(message),
+            // Ok-as-error / Internal / AlreadyExists: surface as ServerError
+            // (retryable in the loops, same as the previous stringified path).
+            StatusCode::Ok | StatusCode::Internal | StatusCode::AlreadyExists => {
+                AutumnError::ServerError(message)
+            }
+        },
+        // Non-status RpcError (including a local timeout) is a
+        // transport failure → ConnectionError so the loops refresh + retry.
+        other => AutumnError::ConnectionError(other.to_string()),
+    }
+}
+
+/// client-side hard cap. Matches the PS's `AUTUMN_PS_MAX_INLINE_BYTES_HARD`
+/// (256 MiB). Pre-checked in `put_opts` to avoid sending a 256 MB+ request
+/// over the wire only to get rejected. The PS may be configured with a
+/// stricter (lower) cap; in that case the server still rejects, mapped to
+/// `AutumnError::ValueTooLarge` with `cap = 0` (the size + cap parsed
+/// from the message would require parsing, which we skip).
+pub const CLIENT_PUT_HARD_CAP: u64 = 256 * 1024 * 1024;
+
+/// minimum value size for which the UCX zero-copy READ path
+/// (`get_into` / `MSG_GET`) is worth taking. Below this, the per-op
+/// registered-recv machinery (regpool_acquire + `UCP_OP_ATTR_FIELD_MEMH` +
+/// the 2-stage header/value recv) costs MORE than the single small copy it
+/// saves, so a small read regresses (~18% at 4 KiB in the perf_check A/B).
+/// At/above this, bulk reads are parity→2.3× (8 MiB). This is the
+/// "ucx ⟹ zerocopy" READ default's size guard; WRITES are always bulk on UCX
+/// (cheaper at every size — they drop the rkyv encode + value copies).
+/// The inline/VP boundary is `VALUE_THROTTLE` (4 KiB); 64 KiB is the
+/// conservative crossover (the mid-range is parity, large is a clear win).
+pub const BULK_MIN_BYTES: usize = autumn_rpc::BULK_MIN_BYTES;
+
+/// the single zero-copy selection rule. Engage bulk (`get_into`/`MSG_GET`, a
+/// write's own `MSG_PUT` in `put_many`) iff the value is at least
+/// `BULK_MIN_BYTES` (64 KiB). SYMMETRIC across reads and writes AND across transports — it mirrors
+/// the PS-side recv gates (`BULK_MIN_BYTES` here + `--bulk-recv-min-bytes`
+/// on the PS, both 64 KiB). Below 64 KiB the per-op registered/pooled-recv machinery
+/// costs more than the copy it saves (small UCX read regresses ~18%) AND the PS recv
+/// side doesn't bulk anyway, so end-to-end bulk only engages at/above 64 KiB. This is the
+/// ONE source of truth — perf-check, the python `BatchClient`, and `get_many_into`
+/// all call it (3 hand-rolled copies had drifted; collapsing them and
+/// making the write rule symmetric — was `is_ucx || large`, which only saved
+/// client-side allocs on small UCX writes while the PS still FrameDecoder-copied).
+pub fn bulk_worthwhile(value_size: usize) -> bool {
+    value_size >= BULK_MIN_BYTES
+}
+
+/// A value buffer backed by the transport RegPool — the SDK's data-plane
+/// buffer currency.
+///
+/// The pool hands out RECYCLED slabs with STABLE addresses: on a UCX runtime
+/// the slab is `ucp_mem_map`-registered at creation, so sends/recvs touching
+/// it are true zero-copy (rcache/memh hits) with no per-op `ibv_reg_mr`; on a
+/// TCP runtime the pool is a plain recycler (no registration — saves the
+/// per-op alloc + zeroing). Fresh per-op allocations are the anti-pattern:
+/// on UCX every send from a fresh address re-registers (~100 µs × rails) and
+/// the cache entry dies with the free.
+///
+/// Two directions, same currency:
+/// - **Write**: [`alloc_value_buf`] → fill via [`ValueBuf::as_mut_slice`] →
+///   [`ValueBuf::truncate`] to the written length → `put` it (or its
+///   [`ValueBuf::freeze`]), which sends it with the slab's registration.
+/// - **Read**: [`ClusterClient::get_pooled`] / `get_range_pooled` hand the
+///   recv'd pool buffer straight back as a `ValueBuf` — zero SDK-side copies.
+///   Read it in place (`Deref<[u8]>`), or `freeze().into_bytes()` into a
+///   `Bytes` to hand to a framework (HTTP body, channel); dropping either
+///   returns the slab to the pool.
+pub struct ValueBuf {
+    pb: autumn_rpc::PooledBuf,
+}
+
+/// Allocate a [`ValueBuf`] with writable capacity `len` from the RegPool.
+/// See [`ValueBuf`] for when this beats a fresh `Vec`.
+pub fn alloc_value_buf(len: usize) -> ValueBuf {
+    ValueBuf {
+        pb: autumn_rpc::regpool_acquire(len),
+    }
+}
+
+/// True iff the process transport is UCX. Decides the SOURCE-staging trade
+/// for a producer-owned fresh allocation (an HTTP body, a decoded blob):
+/// on UCX, one staging memcpy into an [`alloc_value_buf`] slab buys a stable
+/// REGISTERED source address (rcache hit on every send); on TCP the pool buys
+/// nothing for an already-allocated source — send the producer's own `Bytes`
+/// directly (zero copies). Producers that can write straight into a slab
+/// (file reads, generated data) skip the trade entirely and win on both
+/// transports.
+pub use autumn_rpc::runtime_transport_is_ucx;
+/// A value with the registration of the pool buffer it lives in, if any
+/// ([`ValueBuf::freeze`]); derefs to its `Bytes`.
+pub use autumn_rpc::RegBytes;
+
+impl ValueBuf {
+    fn from_pooled(pb: autumn_rpc::PooledBuf) -> Self {
+        Self { pb }
+    }
+
+    /// Filled length (what `Deref`/`freeze` expose). For a fresh
+    /// `alloc_value_buf(len)` this starts at `len`; `truncate` narrows it.
+    pub fn len(&self) -> usize {
+        self.pb.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.pb.len() == 0
+    }
+
+    /// Full writable capacity (the `len` passed to `alloc_value_buf`).
+    pub fn capacity(&self) -> usize {
+        self.pb.cap()
+    }
+
+    /// The full writable area (`[..capacity]`) — write your value here.
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        self.pb.dest_mut()
+    }
+
+    /// Narrow the filled view to the first `n` bytes (clamped to capacity).
+    /// Call after a short write/read so `freeze`/`Deref` expose exactly the
+    /// value bytes.
+    pub fn truncate(&mut self, n: usize) {
+        // SAFETY of the underlying `SetLen`: slab bytes are always initialized
+        // (zeroed at slab creation; recycled bytes hold prior data), so
+        // narrowing/re-widening within `[..capacity]` never exposes uninit
+        // memory — at worst stale pool bytes, which `truncate` only shrinks
+        // away from.
+        unsafe { compio::buf::SetLen::set_len(&mut self.pb, n) }
+    }
+
+    /// The filled bytes WITHOUT copying, with the slab's registration (the
+    /// value aliases the slab, which returns to the pool when the last clone
+    /// drops). `put` sends it with that registration over UCX; `into_bytes()`
+    /// gives a plain `Bytes` for any other sink (HTTP body, channel).
+    pub fn freeze(self) -> RegBytes {
+        self.pb.freeze()
+    }
+}
+
+impl std::ops::Deref for ValueBuf {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        self.pb.filled()
+    }
+}
+
+impl AsRef<[u8]> for ValueBuf {
+    fn as_ref(&self) -> &[u8] {
+        self.pb.filled()
+    }
+}
+
+impl std::fmt::Debug for ValueBuf {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ValueBuf")
+            .field("len", &self.len())
+            .field("capacity", &self.capacity())
+            .finish()
+    }
+}
+
+/// (§8.5): read a principal credential file into
+/// `(principal_name, raw_secret_bytes)` for
+/// [`ClusterClient::connect_with_credential`]. Because Option 3 dropped the
+/// `--principal` CLI flag, the principal IDENTITY now travels IN the file. Format
+/// (produced by `autumn-op principal-create`): two lines
+/// `<principal-name>` then `<hex-secret>`, or the labeled form
+/// `principal: <name>` / `credential: <hex>` (order-independent; extra stdout
+/// lines tolerated). The SDK/manager contract is RAW secret bytes (mint-token
+/// hex-decodes before sending; the manager stores the SHA-256 of the raw bytes),
+/// so handing ASCII hex straight through would present a WRONG credential — fail
+/// loud HERE at startup instead. A bare single hex line (no name) parses with an
+/// EMPTY name; a data-plane caller must reject that (mint needs the name).
+pub fn read_credential_file(path: impl AsRef<std::path::Path>) -> Result<(String, Vec<u8>)> {
+    let path = path.as_ref();
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| anyhow!("read credential file {}: {e}", path.display()))?;
+    parse_credential_text(&text).map_err(|e| anyhow!("credential file {}: {e}", path.display()))
+}
+
+/// Pure parser for [`read_credential_file`]: extract `(principal, hex-secret)` and
+/// decode the hex to raw bytes. Split out so it is unit-testable without the FS.
+fn parse_credential_text(text: &str) -> Result<(String, Vec<u8>)> {
+    let lines: Vec<&str> = text.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    let labeled = |k: &str| -> Option<&str> {
+        lines
+            .iter()
+            .find(|l| l.to_ascii_lowercase().starts_with(k))
+            .and_then(|l| l.split_once(':'))
+            .map(|(_, v)| v.trim())
+    };
+    let (name, hexs): (String, &str) = if let Some(h) = labeled("credential:") {
+        (labeled("principal:").unwrap_or("").to_string(), h)
+    } else if lines.len() == 2 {
+        // Two bare lines: <principal-name> then <hex-secret>.
+        (lines[0].to_string(), lines[1])
+    } else if lines.len() == 1 {
+        // Bare hex, no name (legacy / anonymous — caller must reject if it needs one).
+        (String::new(), lines[0])
+    } else {
+        anyhow::bail!(
+            "expected '<name>\\n<hex>', a 'principal:'/'credential:' pair, or a single hex line, got {} non-empty lines",
+            lines.len()
+        );
+    };
+    if hexs.is_empty() || !hexs.is_ascii() || hexs.len() % 2 != 0 {
+        anyhow::bail!("not valid hex (empty, odd length, or non-ASCII)");
+    }
+    let secret: Vec<u8> = (0..hexs.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hexs[i..i + 2], 16).map_err(|e| anyhow!("bad hex: {e}")))
+        .collect::<Result<Vec<u8>>>()?;
+    Ok((name, secret))
+}
+
+#[cfg(test)]
+mod credential_file_tests {
+    use super::parse_credential_text;
+
+    #[test]
+    fn bare_hex_line_decodes() {
+        // A single bare hex line = anonymous name (caller rejects on the data plane).
+        assert_eq!(parse_credential_text("deadbeef\n").unwrap(), ("".into(), vec![0xde, 0xad, 0xbe, 0xef]));
+        assert_eq!(parse_credential_text("  a1b2  ").unwrap(), ("".into(), vec![0xa1, 0xb2]));
+    }
+
+    #[test]
+    fn two_bare_lines_are_name_then_hex() {
+        // `autumn-op principal-create` writes `<name>\n<hex>`.
+        assert_eq!(
+            parse_credential_text("loader\n00ff10\n").unwrap(),
+            ("loader".into(), vec![0x00, 0xff, 0x10])
+        );
+    }
+
+    #[test]
+    fn labeled_lines_decode_name_and_hex() {
+        let text = "principal: default\ncredential: 00ff10\n";
+        assert_eq!(parse_credential_text(text).unwrap(), ("default".into(), vec![0x00, 0xff, 0x10]));
+    }
+
+    #[test]
+    fn rejects_three_bare_lines_without_label() {
+        assert!(parse_credential_text("aa\nbb\ncc\n").is_err());
+    }
+
+    #[test]
+    fn rejects_bad_hex() {
+        assert!(parse_credential_text("xyz\n").is_err()); // non-hex
+        assert!(parse_credential_text("abc\n").is_err()); // odd length
+        assert!(parse_credential_text("\n\n").is_err()); // empty
+    }
+}
+
+/// Latches after the first EC direct read that SUCCEEDS, so an operator gets
+/// one line saying the path is live and no per-read noise after it.
+static EC_DIRECT_ANNOUNCED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+/// Latches after the first EC direct read that falls back to the proxy — the
+/// EC counterpart of `DIRECT_FALLBACK_WARNED` below.
+static EC_FALLBACK_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+/// Latches after the first replicated direct-read→proxy fallback so the warning
+/// fires exactly once per process (default-ON direct read on a topology where
+/// ENs aren't client-reachable would otherwise warn on every large read).
+static DIRECT_FALLBACK_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// A value read from extent nodes: its bytes, or its length when it landed
+/// in the caller's memory (`LandAt`).
+enum DirectValue {
+    Bytes(bytes::Bytes),
+    Landed(usize),
+}
+
+impl DirectValue {
+    /// The bytes of a read that was given nowhere to land.
+    fn unlanded(self) -> bytes::Bytes {
+        match self {
+            DirectValue::Bytes(v) => v,
+            DirectValue::Landed(_) => unreachable!("a read with no landing does not land"),
+        }
+    }
+}
+
+/// Caller memory a value read from an extent node may land in
+/// (`MSG_READ_AM`). Built only by `get_many_direct_raw`, whose caller vouches
+/// for the memory until that call completes.
+#[derive(Clone, Copy)]
+struct LandAt<'a> {
+    ptr: *mut u8,
+    len: usize,
+    region: Option<&'a std::sync::Arc<autumn_rpc::Region>>,
+}
+
+/// Copy as much of `v` as fits into `[ptr, ptr + len)`; the value's length.
+///
+/// # Safety
+/// `[ptr, ptr + len)` must be valid for writes.
+unsafe fn copy_into_raw(ptr: *mut u8, len: usize, v: &[u8]) -> usize {
+    let n = v.len().min(len);
+    // SAFETY: the caller's contract.
+    unsafe { std::slice::from_raw_parts_mut(ptr, n) }.copy_from_slice(&v[..n]);
+    v.len()
+}
+
+/// Outcome of ONE attempt to serve a read from a redirect descriptor.
+enum DirectReadOutcome {
+    Value(DirectValue),
+    /// Every replica refused fast with a layout-staleness refusal and no
+    /// liveness anomaly: the descriptor was built from a pre-EC-conversion
+    /// cached ExtentInfo. Healable — see `read_position_with_stale_heal`.
+    StaleLayout,
+    /// An extent node refused this client (its credential, or the lack of
+    /// one). TERMINAL: every node of the cluster judges the same credential
+    /// the same way, so no other replica and no proxy fallback is tried; the
+    /// caller gets `AutumnError::PermissionDenied` and decides.
+    Denied(String),
+    Failed,
+}
+
+/// What a direct `MSG_GET` returned.
+enum DirectGet {
+    Value(ValueBuf),
+    Position(ValuePosition),
+}
+
+/// One item of a `MSG_BATCH_GET` reply.
+enum BatchGot {
+    /// A slice of the reply's tail.
+    Value(bytes::Bytes),
+    NotFound,
+    Position(ValuePosition),
+    /// Large, with no position: read it with its own `MSG_GET`.
+    Declined,
+    /// The item's status, an error.
+    Error(u8),
+}
+
+/// Why a whole `MSG_BATCH_GET` failed.
+enum BatchGetFailed {
+    /// Stale epoch (a split or merge): re-route and read per key.
+    Stale,
+    /// Every item fails with this error.
+    All(Box<dyn Fn() -> AutumnError>),
+}
+
+/// Copy as much of `v` as fits into `dest`; the value's length.
+fn copy_into(dest: &mut [u8], v: &[u8]) -> usize {
+    let n = v.len().min(dest.len());
+    dest[..n].copy_from_slice(&v[..n]);
+    v.len()
+}
+
+/// The extent node's refusal of this client, if that is what `e` is: a
+/// refused CLIENT_AUTH, or a read refused for want of a valid credential. A
+/// node that cannot judge yet answers `Unavailable`, which is not this.
+fn en_refusal(e: &anyhow::Error) -> Option<String> {
+    e.chain().find_map(|c| match c.downcast_ref::<RpcError>() {
+        Some(RpcError::Status {
+            code: StatusCode::PermissionDenied,
+            message,
+        }) => Some(message.clone()),
+        _ => None,
+    })
+}
+
+/// EN refusal text for `CODE_EVERSION_MISMATCH` (eversion bumped at the EC
+/// flip) / `CODE_PAYLOAD_NOT_HERE` (the pre-conversion `.dat` was reclaimed).
+/// Both are fast typed refusals, so healing them is cheaper than the proxy
+/// fallback. String-matched like the timeout classifier.
+fn is_stale_layout_refusal(msg: &str) -> bool {
+    msg.contains("eversion mismatch") || msg.contains("payload not in the named file")
+}
+
+#[cfg(test)]
+mod write_outcome_tests {
+    use super::*;
+
+    fn status(code: StatusCode) -> RpcError {
+        RpcError::Status { code, message: "m".into() }
+    }
+
+    #[test]
+    fn an_attempt_may_have_applied_only_when_sent_unanswered_or_said_so() {
+        assert!(may_have_applied(&sent_call_error(RpcError::ConnectionClosed)));
+        assert!(may_have_applied(&sent_call_error(RpcError::Timeout(Duration::from_secs(1)))));
+        assert!(may_have_applied(&sent_call_error(status(StatusCode::OutcomeUnknown))));
+        assert!(!may_have_applied(&sent_call_error(status(StatusCode::Unavailable))));
+        assert!(!may_have_applied(&sent_call_error(status(StatusCode::Internal))));
+        // A failure to connect never sent the request.
+        assert!(!may_have_applied(&anyhow!("connect 127.0.0.1:1: refused")));
+    }
+
+    #[test]
+    fn the_sent_marker_keeps_the_error_classifiable() {
+        let e = sent_call_error(RpcError::ConnectionClosed);
+        assert!(matches!(e.downcast::<AutumnError>(), Ok(AutumnError::ConnectionError(_))));
+    }
+
+    #[test]
+    fn a_resent_batch_op_is_unknown_only_if_its_first_attempt_may_have_applied() {
+        let failed = || Err(AutumnError::ConnectionError("down".into()));
+        let not_applied = partition_rpc::CODE_UNAVAILABLE;
+        let unknown = partition_rpc::CODE_OUTCOME_UNKNOWN;
+        assert!(matches!(resent_batch_op(not_applied, failed()), Err(AutumnError::ConnectionError(_))));
+        assert!(matches!(resent_batch_op(unknown, failed()), Err(AutumnError::OutcomeUnknown(_))));
+        assert!(resent_batch_op(unknown, Ok(())).is_ok());
+        // An applied op resent to keep a duplicate key's input order.
+        assert!(matches!(
+            resent_batch_op(partition_rpc::CODE_OK, failed()),
+            Err(AutumnError::OutcomeUnknown(_))
+        ));
+    }
+
+    #[test]
+    fn a_resend_keeps_last_input_wins_for_a_duplicate_key() {
+        let (ok, retry) = (partition_rpc::CODE_OK, partition_rpc::CODE_UNAVAILABLE);
+        let keys: [&[u8]; 4] = [b"k", b"j", b"k", b"j"];
+        // The first `k` is resent, so the later applied `k` is resent after it;
+        // `j` was applied both times and is left alone.
+        assert_eq!(batch_resend_plan(keys.into_iter(), &[retry, ok, ok, ok]), [true, false, true, false]);
+        // An applied op BEFORE the resent one stays applied: the resend wins.
+        assert_eq!(batch_resend_plan(keys.into_iter(), &[ok, ok, retry, ok]), [false, false, true, false]);
+        assert_eq!(
+            batch_resend_plan(keys.into_iter(), &[partition_rpc::CODE_FENCED, ok, ok, ok]),
+            [false, false, false, false]
+        );
+    }
+
+    #[test]
+    fn any_error_after_an_attempt_that_may_have_applied_is_unknown() {
+        let denied = || AutumnError::PermissionDenied("token expired".into());
+        assert!(matches!(settle_write_error(CallKind::Idempotent, true, denied()), AutumnError::OutcomeUnknown(_)));
+        assert!(matches!(settle_write_error(CallKind::Conditional, true, denied()), AutumnError::OutcomeUnknown(_)));
+        assert!(matches!(settle_write_error(CallKind::Idempotent, false, denied()), AutumnError::PermissionDenied(_)));
+        assert!(matches!(settle_write_error(CallKind::Read, true, denied()), AutumnError::PermissionDenied(_)));
+        let mut results = vec![Err(AutumnError::RoutingError("r".into())), Ok(()), Err(denied())];
+        settle_batch_ops(&mut results, vec![0, 1]);
+        assert!(matches!(results[0], Err(AutumnError::OutcomeUnknown(_))));
+        assert!(results[1].is_ok());
+        assert!(matches!(results[2], Err(AutumnError::PermissionDenied(_))));
+    }
+
+    #[test]
+    fn a_failed_batch_frame_keeps_its_class_for_every_op() {
+        let unknown = batch_frame_error(AutumnError::OutcomeUnknown("x".into()));
+        assert!(matches!(unknown(), AutumnError::OutcomeUnknown(m) if m == "x"));
+        let down = batch_frame_error(AutumnError::ConnectionError("y".into()));
+        assert!(matches!(down(), AutumnError::ConnectionError(_)));
+        let ns = batch_frame_error(AutumnError::NamespaceUnknown("z".into()));
+        assert!(matches!(ns(), AutumnError::NamespaceUnknown(m) if m == "z"));
+        let denied = batch_frame_error(AutumnError::PermissionDenied("w".into()));
+        assert!(matches!(denied(), AutumnError::PermissionDenied(_)));
+    }
+
+    #[test]
+    fn status_codes_map_to_the_two_write_classes() {
+        assert!(matches!(rpc_status_to_error(status(StatusCode::OutcomeUnknown)), AutumnError::OutcomeUnknown(_)));
+        assert!(matches!(rpc_status_to_error(status(StatusCode::Unavailable)), AutumnError::ConnectionError(_)));
+        assert!(matches!(
+            code_to_error(partition_rpc::CODE_OUTCOME_UNKNOWN, "m".into()),
+            AutumnError::OutcomeUnknown(_)
+        ));
+    }
+}
+
+#[cfg(test)]
+mod stale_layout_refusal_tests {
+    use super::is_stale_layout_refusal;
+
+    // The two EN refusal texts `read_extent_direct` stringifies from
+    // `code_description` — the exact messages the extent-713 shape produced.
+    #[test]
+    fn the_two_stale_refusals_match() {
+        assert!(is_stale_layout_refusal(
+            "direct read from 1.2.3.4:1 extent=713: code=6 (eversion mismatch (stale client cache))"
+        ));
+        assert!(is_stale_layout_refusal(
+            "direct read from 1.2.3.4:1 extent=713: code=7 (payload not in the named file on this node)"
+        ));
+    }
+
+    #[test]
+    fn everything_else_does_not() {
+        assert!(!is_stale_layout_refusal(
+            "direct read from 1.2.3.4:1 extent=713: operation timed out"
+        ));
+        assert!(!is_stale_layout_refusal(
+            "direct read from 1.2.3.4:1 extent=713: code=8 (content checksum failed)"
+        ));
+        assert!(!is_stale_layout_refusal(
+            "connect 1.2.3.4:1: connection refused"
+        ));
+    }
+}
+
+/// Every client SDK tunable (`autumn_params::client`), one per process: the
+/// binary that embeds the client sets the flags before connecting.
+pub fn params() -> &'static ClientParams {
+    static PARAMS: std::sync::LazyLock<ClientParams> = std::sync::LazyLock::new(ClientParams::default);
+    &PARAMS
+}
+
+/// In-flight concurrency for `get_many_into` (sliding-window pipeline over the
+/// per-partition multiplexed connections; `--batch-get-concurrency`). Modest to
+/// dodge the UCX rendezvous cliff on large batches.
+fn batch_get_concurrency() -> usize {
+    params().batch_get_concurrency.get()
+}
+
+/// In-flight concurrency for `put_many` (`--batch-put-concurrency`).
+fn batch_put_concurrency() -> usize {
+    params().batch_put_concurrency.get()
+}
+
+/// the streaming fan-out primitive — the ONE concurrency base under every
+/// batch API. Drives `futs` with bounded `concurrency` (sliding window) and
+/// yields `(input_index, output)` as each future COMPLETES (completion order,
+/// NOT input order). This is the same SQ/CQ "fire N, reap as they land" shape the
+/// EN/PS server loops use, lifted to the client.
+///
+/// Two consumption modes on top of it:
+/// - **collect** ([`fan_out_collect`]): re-order into an index-aligned `Vec`
+///   (`get_many_into` / `put_many` / `delete_many` / `head_many`).
+/// - **streaming** (caller drives the stream): act on each completion as it lands
+///   — e.g. the io_uring daemon pushing one CQE per finished SQE, with no
+///   head-of-line wait on the rest of the batch.
+pub fn fan_out<Fut: std::future::Future>(
+    futs: impl IntoIterator<Item = Fut>,
+    concurrency: usize,
+) -> impl futures::Stream<Item = (usize, Fut::Output)> {
+    use futures::stream::StreamExt;
+    futures::stream::iter(
+        futs.into_iter()
+            .enumerate()
+            .map(|(i, f)| async move { (i, f.await) }),
+    )
+    .buffer_unordered(concurrency.max(1))
+}
+
+/// collect convenience over [`fan_out`] — runs all `futs` with bounded
+/// `concurrency` and returns the outputs in INPUT order (result `i` ⇔ `futs[i]`).
+pub async fn fan_out_collect<Fut: std::future::Future>(
+    futs: impl IntoIterator<Item = Fut>,
+    concurrency: usize,
+) -> Vec<Fut::Output> {
+    use futures::stream::StreamExt;
+    let mut stream = fan_out(futs, concurrency);
+    let mut out: Vec<Option<Fut::Output>> = Vec::new();
+    while let Some((i, o)) = stream.next().await {
+        if out.len() <= i {
+            out.resize_with(i + 1, || None);
+        }
+        out[i] = Some(o);
+    }
+    out.into_iter()
+        .map(|o| o.expect("fan_out yields each input index exactly once"))
+        .collect()
+}
+
+// ── TiKV-style retry/backoff for async-split-tolerant routing ─
+//
+// Split is async on this codebase (see `crates/partition-server/CLAUDE.md`
+// "Partition Split"): `handle_split_part` returns the moment
+// `multi_modify_split` commits to etcd. The new sibling is opened on its
+// assigned PS asynchronously by `region_sync_loop` (~2 s tick) +
+// `open_partition`'s log_stream replay (variable; tens of seconds for
+// deep WAL tails). The SOURCE partition is ALSO dropped + reopened on
+// its host PS because `opened_with` no longer matches the post-split
+// (rg, region_epoch). During those windows clients see either
+// CODE_NOT_FOUND (mis-routed via `ps_details` fallback)
+// or TCP-refused/timeout (listener torn down for reopen).
+//
+// Modelled on `tikv-client-rust/src/backoff.rs::NoJitterBackoff`:
+// exponential backoff with cap + bounded retry count + refresh routing
+// cache between attempts. TiKV defaults `(base=2ms, cap=500ms,
+// attempts=10)` work because their region split is ~100 ms; our
+// `open_partition` replay can run ~1000× longer, so the budget is
+// correspondingly larger. CockroachDB's DistSender + Cassandra's
+// coordinator retry loops follow the same pattern: hide async control
+// plane convergence behind client-side retry so the user sees one
+// "send-receive" with a latency spike, not a hard error during
+// topology change.
+//
+// Defaults: `MAX_PS_REFRESHES = 10`, `base=100ms`, `cap=2000ms`.
+// Cumulative max wait through attempt 10: ~9 s. Typical 1-2 retries
+// finish in <500 ms. This budget targets the inherent right-child
+// open window (~2-4 s). It is deliberately NOT large enough to mask
+// PS-side correctness bugs that produce minute-scale unavailability
+// (e.g., the `opened_with` staleness that caused the
+// SOURCE partition to be needlessly dropped + reopened by
+// `sync_regions_once`). Such bugs should fail loudly here so they
+// get fixed at the source, not papered over with bigger retries.
+pub(crate) const MAX_PS_REFRESHES: u32 = 10;
+
+/// One PS address's connect turn. A caller that waited for the turn while a
+/// connect failed takes that failure instead of dialling again: on a host that
+/// does not answer, each waiter would otherwise pay the whole connect timeout
+/// in turn. A connect cut off by its caller's own deadline records nothing;
+/// callers that arrived with it carry deadlines that end their wait too.
+#[derive(Default)]
+struct ConnectGate {
+    turn: futures::lock::Mutex<()>,
+    /// Connects finished at this address.
+    done: Cell<u64>,
+    /// The last failed connect: which `done` count it was, and its error.
+    failed: RefCell<Option<(u64, String)>>,
+}
+
+/// What a retry loop may assume about repeating a request.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum CallKind {
+    /// A read or an admin call: retry anything retryable.
+    Read,
+    /// A write that leaves the same state when sent twice (put, delete,
+    /// batch): retry, and report `OutcomeUnknown` if it still fails after an
+    /// attempt that may have been applied.
+    Idempotent,
+    /// A conditional write: stop at the first attempt that may have been
+    /// applied and report `OutcomeUnknown`.
+    Conditional,
+}
+
+impl CallKind {
+    /// Reads and admin calls are small requests whose wait is the caller's
+    /// whole latency, so they go ahead of queued writes on the connection
+    /// (an `exists` probe used to wait behind every 16 MiB put queued before it).
+    fn lane(self) -> Lane {
+        match self {
+            CallKind::Read => Lane::Urgent,
+            CallKind::Idempotent | CallKind::Conditional => Lane::Normal,
+        }
+    }
+}
+
+/// Context on a transport failure after the request was handed to the
+/// connection: the server may have received and applied it.
+#[derive(Debug)]
+pub(crate) struct SentNoReply;
+
+impl std::fmt::Display for SentNoReply {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "request sent, no reply")
+    }
+}
+
+/// Whether a failed attempt may have been applied: the server said so
+/// (`OutcomeUnknown`), or the request was sent and no answer came back.
+fn may_have_applied(e: &anyhow::Error) -> bool {
+    matches!(e.downcast_ref::<AutumnError>(), Some(AutumnError::OutcomeUnknown(_)))
+        || e.downcast_ref::<SentNoReply>().is_some()
+}
+
+/// A write's final error: `OutcomeUnknown` when any attempt may have been
+/// applied, whatever the last attempt said — "not applied" holds only when no
+/// attempt may have been. Reads keep their error.
+fn settle_write_error(kind: CallKind, applied: bool, e: AutumnError) -> AutumnError {
+    if kind == CallKind::Read || !applied || matches!(e, AutumnError::OutcomeUnknown(_)) {
+        e
+    } else {
+        AutumnError::OutcomeUnknown(e.to_string())
+    }
+}
+
+/// What a conditional write returns at its first attempt that may have been
+/// applied.
+fn conditional_outcome_unknown(e: anyhow::Error) -> AutumnError {
+    match e.downcast::<AutumnError>() {
+        Ok(ae @ AutumnError::OutcomeUnknown(_)) => ae,
+        Ok(other) => AutumnError::OutcomeUnknown(other.to_string()),
+        Err(other) => AutumnError::OutcomeUnknown(format!("{other:#}")),
+    }
+}
+
+/// The error a failed request becomes once the connection carried it: a
+/// transport failure gains `SentNoReply`.
+fn sent_call_error(e: RpcError) -> anyhow::Error {
+    let sent = sent_and_lost(&e);
+    let err = anyhow::Error::new(rpc_status_to_error(e));
+    if sent { err.context(SentNoReply) } else { err }
+}
+
+/// A transport failure of a call made on an established connection: the
+/// request may have reached the server. A version refusal never sent it.
+fn sent_and_lost(e: &RpcError) -> bool {
+    e.is_connection_error() && !matches!(e, RpcError::VersionMismatch { .. })
+}
+
+/// TiKV-style `NoJitterBackoff` step: sleep BEFORE the Nth refresh.
+/// Sequence: 100, 200, 400, 800, 1600, 2000, 2000, ..., 2000 ms.
+/// Cumulative: 100, 300, 700, 1500, 3100, 5100, 7100, 9100 ms at
+/// attempt=10. Attempt 0 returns `Duration::ZERO` for callers that
+/// gate the first call without sleeping.
+pub(crate) fn refresh_backoff(attempt: u32) -> Duration {
+    if attempt == 0 {
+        return Duration::ZERO;
+    }
+    let shift = (attempt - 1).min(10);
+    let ms = 100u64.saturating_mul(1u64 << shift);
+    Duration::from_millis(ms.min(2000))
+}
+
+/// A batch write's frame failed after its retries: each op gets the same
+/// class — `OutcomeUnknown` when the frame may have been applied, the refusal
+/// itself for a namespace or permission refusal, else `ConnectionError`.
+fn batch_frame_error(e: AutumnError) -> impl Fn() -> AutumnError {
+    let (class, msg): (fn(String) -> AutumnError, String) = match e {
+        AutumnError::OutcomeUnknown(m) => (AutumnError::OutcomeUnknown, m),
+        AutumnError::NamespaceUnknown(m) => (AutumnError::NamespaceUnknown, m),
+        AutumnError::PermissionDenied(m) => (AutumnError::PermissionDenied, m),
+        other => (AutumnError::ConnectionError, other.to_string()),
+    };
+    move || class(msg.clone())
+}
+
+/// The result of resending, on its own, a batch op whose status said it was
+/// not applied (`CODE_UNAVAILABLE`), may have been (`CODE_OUTCOME_UNKNOWN`),
+/// or was (`CODE_OK`, resent to keep a duplicate key's input order); all are
+/// safe to repeat for a put or a delete. A failed resend of one that may have
+/// been applied leaves its outcome unknown.
+fn resent_batch_op(
+    status: u8,
+    resend: std::result::Result<(), AutumnError>,
+) -> std::result::Result<(), AutumnError> {
+    let applied = status == partition_rpc::CODE_OUTCOME_UNKNOWN || status == partition_rpc::CODE_OK;
+    resend.map_err(|e| settle_write_error(CallKind::Idempotent, applied, e))
+}
+
+/// The ops of a frame an earlier attempt of which may have been applied: an
+/// error any later step gave them — a fallback resend, a "not applied" status
+/// for a later attempt, the frame failing — leaves their outcome unknown.
+fn settle_batch_ops(results: &mut [std::result::Result<(), AutumnError>], maybe_applied: Vec<usize>) {
+    for idx in maybe_applied {
+        let r = std::mem::replace(&mut results[idx], Ok(()));
+        results[idx] = r.map_err(|e| settle_write_error(CallKind::Idempotent, true, e));
+    }
+}
+
+/// Whether a batch op's status asks for it to be sent again on its own.
+fn batch_op_resendable(status: u8) -> bool {
+    status == partition_rpc::CODE_UNAVAILABLE || status == partition_rpc::CODE_OUTCOME_UNKNOWN
+}
+
+/// Which ops of one frame to send again, in input order: those whose status
+/// asks for it, and an applied op whose key an earlier resent op has, so the
+/// resends keep last-input-wins for a duplicate key.
+fn batch_resend_plan<'a>(keys: impl Iterator<Item = &'a [u8]>, statuses: &[u8]) -> Vec<bool> {
+    let mut resent: std::collections::HashSet<&[u8]> = std::collections::HashSet::new();
+    keys.zip(statuses)
+        .map(|(k, &status)| {
+            let resend = batch_op_resendable(status)
+                || (status == partition_rpc::CODE_OK && resent.contains(k));
+            if resend {
+                resent.insert(k);
+            }
+            resend
+        })
+        .collect()
+}
+
+/// Write `err()` into every result slot named by `idxs` — the per-group
+/// failure fan-out used by the batched APIs (`get_many` / `batch_put`): one
+/// RPC failure fails every item that rode in that group's frame.
+fn fail_slots<T>(
+    results: &mut [std::result::Result<T, AutumnError>],
+    idxs: impl Iterator<Item = usize>,
+    err: impl Fn() -> AutumnError,
+) {
+    for i in idxs {
+        results[i] = Err(err());
+    }
+}
+
+// ── Range scan result ───────────────────────────────────────────────────────
+
+pub struct RangeResult {
+    pub entries: Vec<RangeEntry>,
+    pub has_more: bool,
+}
+
+// ── Key metadata ────────────────────────────────────────────────────────────
+
+pub struct KeyMeta {
+    pub found: bool,
+    pub value_length: u64,
+}
+
+/// One item for [`ClusterClient::get_many_into`]. `length == 0` reads the
+/// whole value; `offset`/`length` give a sub-range (fuse chunk reads, io_uring
+/// `sqe.offset`/`len`). `dest` is sized by the caller (e.g. from `head`, a
+/// fixed chunk size, or the ring-buffer slot); a value longer than `dest` is
+/// truncated to fit (the returned `Some(n)` carries the full value length).
+///
+/// The bulk recv lands in a read_loop-owned RegPool buffer (one UCX Stream
+/// unpack or TCP kernel copy), then ONE memcpy into
+/// `dest`. `dest` itself needs no registration and no special lifetime — it
+/// is a plain borrow filled after the RPC resolves.
+pub struct GetManyItem<'a> {
+    pub key: &'a [u8],
+    pub offset: u32,
+    pub length: u32,
+    pub dest: &'a mut [u8],
+}
+
+/// One whole-value read of [`ClusterClient::get_many_into_raw`]: the value
+/// lands at `[ptr, ptr + len)`.
+pub struct RawGetItem<'a> {
+    pub key: &'a [u8],
+    pub ptr: *mut u8,
+    pub len: usize,
+}
+
+/// One `MSG_GET_AM` attempt: register `[ptr, ptr + len)` for the value's AM,
+/// ask, and wait for the value when the reply says it was sent. Inside
+/// `region` the value lands in the memory; elsewhere in a pool buffer, copied
+/// in once it is there. `None` when the value is longer than the memory (not
+/// sent) or the memory cannot take an AM value (unregistered, over 256 MiB):
+/// the caller reads it the other way. Returns only once nothing writes the
+/// memory any more.
+///
+/// # Safety
+/// As `ClusterClient::get_range_into_raw`.
+async unsafe fn get_am_attempt(
+    client: &RpcClient,
+    req: &GetReq,
+    ptr: *mut u8,
+    len: usize,
+    region: Option<&std::sync::Arc<autumn_rpc::Region>>,
+    timeout: Option<Duration>,
+) -> std::result::Result<Option<(u8, String, (usize, Option<autumn_rpc::PooledBuf>))>, RpcError> {
+    use autumn_rpc::am::{self, Arrival};
+    let tag = am::next_tag();
+    let (dest, released) = autumn_rpc::RecvDest::new(ptr, len);
+    let expected = match am::expect(tag, dest, region) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
+            released.await;
+            return Ok(None);
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let ask = rkyv_encode(&GetAmReq {
+        part_id: req.part_id,
+        key: req.key.clone(),
+        offset: req.offset,
+        length: req.length,
+        region_epoch: req.region_epoch,
+        tag,
+        max_len: len as u64,
+    });
+    let reply = match timeout {
+        None => client.call(MSG_GET_AM, ask).await,
+        Some(t) => client.call_timeout(MSG_GET_AM, ask, t).await,
+    };
+    let out = match reply.and_then(|b| rkyv_decode::<GetAmResp>(&b).map_err(|e| RpcError::Io(std::io::Error::other(e)))) {
+        // The PS replies once its send completed: a rendezvous value is in the
+        // memory by then, an eager one at least on its way.
+        Ok(r) if r.code == partition_rpc::CODE_OK => {
+            let arrived = match timeout {
+                None => expected.arrived().await,
+                Some(t) => compio::time::timeout(t, expected.arrived()).await.unwrap_or(Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "the value's AM did not arrive",
+                ))),
+            };
+            match arrived {
+                Ok(Arrival::Received(n)) => Ok(Some((partition_rpc::CODE_OK, r.message, (n, None)))),
+                Ok(Arrival::TooLong(_)) => Ok(None),
+                Err(e) => Err(RpcError::Io(e)),
+            }
+        }
+        Ok(r) if r.code == partition_rpc::CODE_VALUE_TOO_LARGE => Ok(None),
+        Ok(r) => Ok(Some((r.code, r.message, (0, None)))),
+        Err(e) => Err(e),
+    };
+    expected.finish().await;
+    released.await;
+    out
+}
+
+// ── ClusterClient ───────────────────────────────────────────────────────────
+
+/// Client for interacting with an autumn-rs cluster.
+///
+/// Supports multiple manager addresses with round-robin failover on
+/// NotLeader or connection errors. PS connections auto-reconnect on failure.
+///
+/// **All hot-path methods take `&self`** so an `Rc<ClusterClient>` can be
+/// shared across concurrent compio tasks (e.g., FUSE dispatcher spawning
+/// per-request tasks). Internal mutability is provided via `RefCell` for
+/// the routing caches and `Cell` for the manager round-robin index.
+/// Borrows are deliberately scoped: every `borrow()` / `borrow_mut()` is
+/// released before any `.await`.
+
+/// current unix seconds.
+fn client_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// a minted capability token + its expiry (unix seconds).
+struct CachedToken {
+    bytes: Vec<u8>,
+    exp: u64,
+}
+
+/// the client's principal identity (permanent credential) + the current
+/// short-TTL token minted from it. One `ClusterClient` carries one principal.
+struct ClientAuth {
+    /// The principal identity (credential owner) used to mint tokens.
+    principal: String,
+    credential: Vec<u8>,
+    token: Option<CachedToken>,
+}
+
+pub struct ClusterClient {
+    role: autumn_rpc::version_hello::Role,
+    /// Manager addresses (comma-separated on construction).
+    manager_addrs: Vec<String>,
+    /// Current manager index (round-robin).
+    current_mgr: Cell<usize>,
+    /// Cached manager RPC connection. Recreated on error.
+    mgr_conn: Rc<RefCell<Option<Rc<RpcClient>>>>,
+    /// Cached PS RPC connections. Dropped on error, recreated on next use.
+    ps_conns: RefCell<HashMap<String, Rc<RpcClient>>>,
+    /// One connect at a time per PS address (`get_ps_client_inner`).
+    ps_connecting: RefCell<HashMap<String, Rc<ConnectGate>>>,
+    /// extent-node connections for redirect direct reads.
+    en_pool: autumn_stream::ConnPool,
+    /// Routing cache. Populated on `connect`, refreshed on `refresh_regions`.
+    /// `RefCell` so concurrent tasks holding `Rc<ClusterClient>` can do
+    /// brief lookup-and-clone borrows without blocking each other.
+    regions: RefCell<Vec<(u64, ClientRegion)>>,
+    ps_details: RefCell<HashMap<u64, MgrPsDetail>>,
+    /// per-partition listener addresses, indexed by `part_id`.
+    /// When an entry is present, it supersedes `ps_details[ps_id].address`
+    /// for routing decisions (thread-per-partition shard target).
+    part_addrs: RefCell<HashMap<u64, String>>,
+    /// Per-call timeout for ALL cluster RPCs (PS-bound AND manager-bound).
+    ///
+    /// Default = `Some(default_rpc_timeout())` — never wait forever. The
+    /// principle is "an unbounded RPC is a bug": a paged-out / hung peer
+    /// must surface as `ConnectionError` so the caller's
+    /// `refresh_regions` + retry path (or the user's own timeout) can
+    /// engage.
+    ///
+    /// `set_rpc_timeout(Duration)` overrides for tighter loops (tests
+    /// driving split/merge typically use 2 s); `clear_rpc_timeout()`
+    /// resets back to the default (NOT to `None` — wait-forever is no
+    /// longer a supported mode).
+    ///
+    /// Originally introduced to fix the partition-server
+    /// dropping a partition's `req_rx` mid-call (region_sync_loop
+    /// reload after merge / graceful shutdown drain): the per-request
+    /// response oneshot closes WITHOUT closing the underlying TCP
+    /// connection (other partitions on the same PS still use it).
+    /// autumn-rpc's `closed: Cell<bool>` flag fires on TCP close
+    /// but not on req_rx drop, so without a per-call timeout the
+    /// caller's `.await` would hang forever.
+    ///
+    /// Now also applied to `mgr_call` so a paged-out / hung manager
+    /// surfaces as `ConnectionError`; the existing `mgr_call_retry`
+    /// path's `rotate_manager` then walks to the next manager address.
+    rpc_timeout: Cell<Option<Duration>>,
+    /// First-attempt timeout for
+    /// `call_ps_for_key` / `call_ps_for_part`. See
+    /// `default_first_attempt_timeout()` for the rationale. `None`
+    /// disables fast-fail (every attempt uses the full `rpc_timeout`).
+    first_attempt_timeout: Cell<Option<Duration>>,
+    /// optional principal credential + cached token. `None` = anonymous
+    /// (no CLIENT_AUTH sent — the pre-authz behavior; works against non-authz
+    /// clusters). When `Some`, every fresh PS connection sends CLIENT_AUTH with a
+    /// (lazily minted, auto-renewed) token before use.
+    auth: RefCell<Option<ClientAuth>>,
+    /// bumped by `set_principal_credential`. `get_ps_client` captures it
+    /// before the CLIENT_AUTH await and refuses to CACHE a connection if the
+    /// identity changed mid-connect — so a principal switch can't leave a
+    /// wrong-identity-bound connection in the pool.
+    auth_gen: Cell<u64>,
+    /// The server's last wire-version REFUSAL, or `None` if the last hello was
+    /// admitted. NOT a latch: `say_hello` clears it on every successful
+    /// handshake, so a client refused for being NEWER than its cluster starts
+    /// working by itself once the cluster is deployed — no restart, which
+    /// matters for a fuse daemon nobody is watching.
+    ///
+    /// It exists because the refusal arrives from OPENING the connection, not
+    /// from the call, so it lands in each retry loop's connect-error arm —
+    /// seven of them, each free to classify it differently, which is how the
+    /// first version of this spent the full ~13 s refresh budget per operation
+    /// and then returned the refusal labelled as a connection error. One flag,
+    /// read by `refresh_and_backoff` and `routing_exhausted`, is one place to
+    /// be right instead of seven.
+    wire_refused: RefCell<Option<String>>,
+    /// Wire version reported by the manager connection used for routing.
+    /// During a rolling upgrade PS and manager versions may differ, so a PS
+    /// Hello must not change which routing opcode this client sends to manager.
+    /// Zero means no manager has completed a Hello yet.
+    negotiated_cluster_wire: Cell<u32>,
+    /// D7: the namespace scope this client operates within. Set at
+    /// `connect(mgr, scope)` (Scoped) or `connect_raw(mgr)` (Raw). Every
+    /// scoped op binds its key through this before routing. `raw()` / `rescope`
+    /// return borrow-views with a different binding sharing these pools.
+    binding: NamespaceBinding,
+}
+
+/// Default per-call timeout for cluster RPCs (`--rpc-timeout-ms`, 30 s).
+/// Generous enough to cover realistic slow-disk + 3-replica fanout + a couple
+/// of retries inside the server, tight enough to prevent open-ended hangs from
+/// a paged-out / dead peer.
+pub fn default_rpc_timeout() -> Duration {
+    Duration::from_millis(params().rpc_timeout_ms.get())
+}
+
+/// Short timeout used ONLY for the first
+/// attempt of `call_ps_for_key` / `call_ps_for_part`
+/// (`--first-attempt-timeout-ms`, 5 s). Subsequent retries fall back to the
+/// full rpc timeout.
+///
+/// **Why this exists:** when a PS process is killed and restarted
+/// (or the manager evicts + reassigns a partition between PS instances),
+/// the SDK's cached `ps_conns[ps_addr]` points at the dead listener.
+/// The next call against that conn hangs until TCP RST (which can take
+/// minutes on a `kill -9` of the listener) OR the 30 s
+/// `default_rpc_timeout()` — whichever wins. Either way, every key
+/// touching that PS pays a 30 s penalty before the retry loop can
+/// drop the conn + reconnect.
+///
+/// With this 5 s first-attempt cap:
+///   - Healthy steady-state calls return well under 5 s → no change.
+///   - Stale-conn calls fail at 5 s → `ps_conns.remove(ps_addr)` →
+///     `refresh_regions()` + retry uses the FULL 30 s timeout against
+///     a freshly-resolved listener. Total worst case: ~5 s + a healthy
+///     RTT, vs. ~30 s pre-fix.
+///   - Legit long calls (rare, e.g. bulk stream_put of multi-GiB) fail
+///     fast on attempt 0 then succeed on attempt 1. Costs ~5 s of
+///     extra latency for callers that can run > 5 s — acceptable
+///     trade-off and avoidable via `set_rpc_timeout` for callers that
+///     know they need it.
+///
+/// Per client via `set_first_attempt_timeout`; `None` disables the
+/// fast-fail (every attempt uses the full `rpc_timeout`).
+fn default_first_attempt_timeout() -> Duration {
+    Duration::from_millis(params().first_attempt_timeout_ms.get())
+}
+
+/// Which DATA SHARDS an EC extent's byte range covers, and where inside each.
+///
+/// Returns `(shard_index, shard_relative_offset, len)` in ascending shard
+/// order, or `None` when the range is not serviceable from data shards alone —
+/// in which case the caller must fall back to the partition server rather than
+/// guess.
+///
+/// The geometry, which is the whole reason no decode is needed: the payload is
+/// `shard0 ‖ shard1 ‖ … ‖ shard_{k-1}` with `shard_size = ceil(sealed_length /
+/// k)`, the last shard zero-padded, and no length trailer — `sealed_length` is
+/// authoritative. A range therefore covers a CONTIGUOUS run of shards. Reading
+/// past `sealed_length` would return padding as if it were data, so a range
+/// that does is refused here rather than trimmed.
+fn ec_shard_plan(
+    sealed_length: u64,
+    data_shards: u32,
+    offset: u64,
+    len: u64,
+) -> Option<Vec<(u32, u64, u64)>> {
+    let k = data_shards as u64;
+    if k == 0 || sealed_length == 0 {
+        return None;
+    }
+    if len == 0 {
+        return Some(Vec::new());
+    }
+    let end = offset.checked_add(len)?;
+    if end > sealed_length {
+        return None;
+    }
+    let shard_size = sealed_length.div_ceil(k).max(1);
+    let first = offset / shard_size;
+    let last = (end - 1) / shard_size;
+    if last >= k {
+        return None;
+    }
+    let mut plan = Vec::with_capacity((last - first + 1) as usize);
+    for shard in first..=last {
+        let base = shard * shard_size;
+        let lo = offset.max(base) - base;
+        let hi = end.min(base + shard_size) - base;
+        plan.push((shard as u32, lo, hi - lo));
+    }
+    Some(plan)
+}
+
+impl ClusterClient {
+    /// Current manager address.
+    fn manager_addr(&self) -> &str {
+        &self.manager_addrs[self.current_mgr.get() % self.manager_addrs.len()]
+    }
+
+    /// Rotate to next manager.
+    fn rotate_manager(&self) {
+        if self.manager_addrs.len() > 1 {
+            let next = (self.current_mgr.get() + 1) % self.manager_addrs.len();
+            self.current_mgr.set(next);
+            // Drop cached connection so next call reconnects to new manager
+            *self.mgr_conn.borrow_mut() = None;
+        }
+    }
+
+    /// The cluster wire version the servers last reported, or `0` if none has
+    /// answered yet. Read it to branch on what the cluster can be sent; do not
+    /// use it to decide how RECEIVED bytes are read — that is the msg_type's
+    /// job, so a frame stays self-describing (design §3 / §7).
+    pub fn negotiated_cluster_wire(&self) -> u32 {
+        self.negotiated_cluster_wire.get()
+    }
+
+    /// Bootstrap has already validated this connection before its RPC tasks
+    /// start. Record the server version used to choose client-surface opcodes.
+    async fn say_hello(&self, client: &RpcClient, _peer: &str) -> Result<()> {
+        if client.protocol().service == autumn_rpc::version_hello::Service::Manager {
+            self.negotiated_cluster_wire.set(client.protocol().remote_wire);
+        }
+        *self.wire_refused.borrow_mut() = None;
+        Ok(())
+    }
+
+    async fn open_rpc(
+        &self,
+        addr: SocketAddr,
+        service: autumn_rpc::version_hello::Service,
+    ) -> Result<Rc<RpcClient>> {
+        let connect = RpcClient::connect_as(addr, self.role, Some(service));
+        let result = match self.first_attempt_effective_timeout(0) {
+            None => connect.await,
+            Some(t) => compio::time::timeout(t, connect)
+                .await
+                .unwrap_or_else(|_| Err(RpcError::Timeout(t))),
+        };
+        match result {
+            Ok(c) => Ok(c),
+            Err(e @ RpcError::VersionMismatch { .. })
+                if self.role == autumn_rpc::version_hello::Role::Client =>
+            {
+                let why = format!("{addr}: {e}");
+                *self.wire_refused.borrow_mut() = Some(why.clone());
+                Err(anyhow!(AutumnError::WireVersionRefused(why)))
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// `open_rpc` to `host:port`: each resolved address in turn until one
+    /// connects, as `std::net::TcpStream::connect` does (a name can resolve to
+    /// an IPv6 address first while the server listens on IPv4 only). An answered
+    /// handshake (`server_answered`) ends the walk.
+    async fn open_rpc_named(
+        &self,
+        addr: &str,
+        service: autumn_rpc::version_hello::Service,
+    ) -> Result<Rc<RpcClient>> {
+        let mut last = None;
+        for sa in resolve_addrs(addr).await? {
+            match self.open_rpc(sa, service).await {
+                Ok(c) => return Ok(c),
+                Err(e) if server_answered(&e) => return Err(e),
+                Err(e) => last = Some(e),
+            }
+        }
+        Err(last.expect("resolve_addrs returns at least one address"))
+    }
+
+    /// Get or create a manager RPC connection. Auto-reconnects on failure.
+    async fn mgr_client(&self) -> Result<Rc<RpcClient>> {
+        {
+            // Closed = replace, the same rule as `get_ps_client`.
+            let guard = self.mgr_conn.borrow();
+            if let Some(c) = guard.as_ref().filter(|c| !c.is_closed()) {
+                return Ok(c.clone());
+            }
+        }
+        let client = self
+            .open_rpc_named(self.manager_addr(), autumn_rpc::version_hello::Service::Manager)
+            .await
+            .with_context(|| format!("connect manager {}", self.manager_addr()))?;
+        // Before the connection is cached, so a refused client never gets a
+        // pooled connection to send its next request down.
+        self.say_hello(&client, self.manager_addr()).await?;
+        *self.mgr_conn.borrow_mut() = Some(client.clone());
+        Ok(client)
+    }
+
+    /// Call the current manager. Transport errors and local deadlines reconnect;
+    /// a peer status refusal leaves the connection usable.
+    ///
+    /// Honors `rpc_timeout` (default `default_rpc_timeout()`). A timeout
+    /// surfaces as a transport error; `mgr_call_retry`'s
+    /// `rotate_manager` walks to the next manager address on the next
+    /// attempt.
+    pub async fn mgr_call(&self, msg_type: u8, payload: Bytes) -> Result<Bytes> {
+        let client = self.mgr_client().await?;
+        let outcome = match self.rpc_timeout.get() {
+            None => client.call(msg_type, payload).await,
+            Some(t) => client.call_timeout(msg_type, payload, t).await,
+        };
+        match outcome {
+            Ok(resp) => Ok(resp),
+            Err(e) => {
+                if e.is_connection_error() {
+                    *self.mgr_conn.borrow_mut() = None;
+                }
+                Err(anyhow::Error::new(e))
+            }
+        }
+    }
+
+    /// Call a LEADER-ONLY manager RPC. `mgr_call_retry` walks managers on
+    /// transport errors, but a follower answers a SUCCESSFUL response whose
+    /// body carries `CODE_NOT_LEADER` — so this also rotates + retries on
+    /// that, up to `leader_rotations` times. `decode` parses the response
+    /// into `(application_code, value)`; the value is returned once a
+    /// non-NOT_LEADER response arrives (callers still check their own
+    /// non-OK codes).
+    async fn mgr_call_leader<R>(
+        &self,
+        msg_type: u8,
+        payload: Bytes,
+        ctx: &str,
+        transport_retries: u32,
+        leader_rotations: u32,
+        decode: impl Fn(&[u8]) -> Result<(u8, R)>,
+    ) -> Result<R> {
+        let mut attempt = 0u32;
+        loop {
+            let bytes = self
+                .mgr_call_retry(msg_type, payload.clone(), transport_retries)
+                .await
+                .with_context(|| ctx.to_string())?;
+            let (code, resp) = decode(&bytes)?;
+            if code == CODE_NOT_LEADER {
+                attempt += 1;
+                if attempt > leader_rotations {
+                    return Err(anyhow!("{ctx}: no leader available"));
+                }
+                self.rotate_manager();
+                compio::time::sleep(Duration::from_millis(300)).await;
+                continue;
+            }
+            return Ok(resp);
+        }
+    }
+
+    /// cluster-df: fetch the aggregate cluster capacity summary
+    /// (`MSG_CLUSTER_DF`). Shared by `autumn-op df` and the FUSE statfs
+    /// background refresh. Leader-only (only the leader's `node_health_loop`
+    /// maintains the snapshot).
+    pub async fn cluster_df(&self) -> Result<ClusterDfResp> {
+        let req = rkyv_encode(&ClusterDfReq {});
+        let resp: ClusterDfResp = self
+            .mgr_call_leader(MSG_CLUSTER_DF, req, "cluster_df", 3, 3, |b| {
+                let r: ClusterDfResp = rkyv_decode(b).map_err(|e| anyhow!("{e}"))?;
+                Ok((r.code, r))
+            })
+            .await?;
+        if resp.code != autumn_rpc::manager_rpc::CODE_OK {
+            return Err(anyhow!("cluster_df failed: {}", resp.message));
+        }
+        Ok(resp)
+    }
+
+    /// The cluster overview (`MSG_GET_CLUSTER_OVERVIEW`). Leader-routed
+    /// (rotates on NOT_LEADER): only the leader hears PS heartbeats.
+    pub async fn cluster_overview(&self) -> Result<autumn_rpc::manager_rpc::GetClusterOverviewResp> {
+        use autumn_rpc::manager_rpc::{GetClusterOverviewReq, GetClusterOverviewResp, MSG_GET_CLUSTER_OVERVIEW};
+        let managers = self.manager_addrs.len().max(1) as u32;
+        let resp: GetClusterOverviewResp = self
+            .mgr_call_leader(
+                MSG_GET_CLUSTER_OVERVIEW,
+                rkyv_encode(&GetClusterOverviewReq {}),
+                "cluster_overview",
+                managers,
+                managers + 2,
+                |b| {
+                    let r: GetClusterOverviewResp = rkyv_decode(b).map_err(|e| anyhow!("{e}"))?;
+                    Ok((r.code, r))
+                },
+            )
+            .await?;
+        if resp.code != autumn_rpc::manager_rpc::CODE_OK {
+            return Err(anyhow!("cluster_overview failed: {}", resp.message));
+        }
+        Ok(resp)
+    }
+
+    /// Every extent node's state (`MSG_LIST_NODE_STATES`). Leader-routed
+    /// (rotates on NOT_LEADER): only the leader hears df answers.
+    pub async fn list_node_states(&self) -> Result<autumn_rpc::manager_rpc::ListNodeStatesResp> {
+        use autumn_rpc::manager_rpc::{ListNodeStatesReq, ListNodeStatesResp, MSG_LIST_NODE_STATES};
+        let managers = self.manager_addrs.len().max(1) as u32;
+        let resp: ListNodeStatesResp = self
+            .mgr_call_leader(
+                MSG_LIST_NODE_STATES,
+                rkyv_encode(&ListNodeStatesReq {}),
+                "list_node_states",
+                managers,
+                managers + 2,
+                |b| {
+                    let r: ListNodeStatesResp = rkyv_decode(b).map_err(|e| anyhow!("{e}"))?;
+                    Ok((r.code, r))
+                },
+            )
+            .await?;
+        if resp.code != autumn_rpc::manager_rpc::CODE_OK {
+            return Err(anyhow!("list_node_states failed: {}", resp.message));
+        }
+        Ok(resp)
+    }
+
+    /// M2: read the auto-policy controller state
+    /// (`MSG_AUTOPOLICY_GET`). Leader-routed (rotates on NOT_LEADER).
+    pub async fn auto_policy_get(&self) -> Result<AutoPolicyGetResp> {
+        let req = rkyv_encode(&AutoPolicyGetReq {});
+        let managers = self.manager_addrs.len().max(1) as u32;
+        let resp: AutoPolicyGetResp = self
+            .mgr_call_leader(
+                MSG_AUTOPOLICY_GET,
+                req,
+                "auto_policy_get",
+                managers,
+                managers + 2,
+                |b| {
+                    let r: AutoPolicyGetResp = rkyv_decode(b).map_err(|e| anyhow!("{e}"))?;
+                    Ok((r.code, r))
+                },
+            )
+            .await?;
+        if resp.code != autumn_rpc::manager_rpc::CODE_OK {
+            return Err(anyhow!("auto_policy_get failed: {}", resp.message));
+        }
+        Ok(resp)
+    }
+
+    /// M2: apply an auto-policy op (`MSG_AUTOPOLICY_SET`).
+    /// Leader-routed; the manager persists the new config to etcd.
+    pub async fn auto_policy_set(&self, req: AutoPolicySetReq) -> Result<AutoPolicySetResp> {
+        let payload = rkyv_encode(&req);
+        let managers = self.manager_addrs.len().max(1) as u32;
+        let resp: AutoPolicySetResp = self
+            .mgr_call_leader(
+                MSG_AUTOPOLICY_SET,
+                payload,
+                "auto_policy_set",
+                managers,
+                managers + 2,
+                |b| {
+                    let r: AutoPolicySetResp = rkyv_decode(b).map_err(|e| anyhow!("{e}"))?;
+                    Ok((r.code, r))
+                },
+            )
+            .await?;
+        if resp.code != autumn_rpc::manager_rpc::CODE_OK {
+            return Err(anyhow!("auto_policy_set failed: {}", resp.message));
+        }
+        Ok(resp)
+    }
+
+    /// Select policy `name` and arm it: one request, one persisted config, so
+    /// a failure leaves the previous config whole.
+    pub async fn auto_policy_start(&self, name: &str) -> Result<AutoPolicySetResp> {
+        self.auto_policy_set(AutoPolicySetReq {
+            op: autumn_rpc::manager_rpc::AUTOPOLICY_OP_START,
+            mode: 0,
+            name: name.to_string(),
+            entry: None,
+        })
+        .await
+    }
+
+    /// The operator's runtime parameter overrides (`MSG_GET_RUNTIME_CONFIG`).
+    /// Leader-routed.
+    pub async fn runtime_config_get(
+        &self,
+    ) -> Result<Vec<autumn_rpc::manager_rpc::RuntimeConfigEntry>> {
+        use autumn_rpc::manager_rpc::{GetRuntimeConfigResp, MSG_GET_RUNTIME_CONFIG};
+        let managers = self.manager_addrs.len().max(1) as u32;
+        let resp: GetRuntimeConfigResp = self
+            .mgr_call_leader(
+                MSG_GET_RUNTIME_CONFIG,
+                Bytes::new(),
+                "runtime_config_get",
+                managers,
+                managers + 2,
+                |b| {
+                    let r: GetRuntimeConfigResp = rkyv_decode(b).map_err(|e| anyhow!("{e}"))?;
+                    Ok((r.code, r))
+                },
+            )
+            .await?;
+        if resp.code != autumn_rpc::manager_rpc::CODE_OK {
+            return Err(anyhow!("runtime_config_get failed: {}", resp.message));
+        }
+        Ok(resp.entries)
+    }
+
+    /// Set (`Some`) or drop (`None`) one runtime override
+    /// (`MSG_SET_RUNTIME_CONFIG`, admin). Leader-routed.
+    pub async fn runtime_config_set(
+        &self,
+        key: &str,
+        value: Option<String>,
+        set_by: &str,
+    ) -> Result<()> {
+        use autumn_rpc::manager_rpc::{SetRuntimeConfigReq, MSG_SET_RUNTIME_CONFIG};
+        let req = rkyv_encode(&SetRuntimeConfigReq {
+            key: key.to_string(),
+            value,
+            set_by: set_by.to_string(),
+        });
+        let managers = self.manager_addrs.len().max(1) as u32;
+        let resp: CodeResp = self
+            .mgr_call_leader(
+                MSG_SET_RUNTIME_CONFIG,
+                req,
+                "runtime_config_set",
+                managers,
+                managers + 2,
+                |b| {
+                    let r: CodeResp = rkyv_decode(b).map_err(|e| anyhow!("{e}"))?;
+                    Ok((r.code, r))
+                },
+            )
+            .await?;
+        if resp.code != autumn_rpc::manager_rpc::CODE_OK {
+            return Err(anyhow!("{}", resp.message));
+        }
+        Ok(())
+    }
+
+    /// M0: grant a contiguous batch of fuse-fs inode numbers
+    /// `[base, base + count)` from the manager's crash-safe allocator
+    /// (leader-fenced etcd CAS — concurrent allocators always receive
+    /// disjoint ranges). `floor` is the legacy `[0x04]next_inode` fs KV
+    /// counter value (0 = none): the grant never returns a base below it,
+    /// so a pre-M0 filesystem migrates without duplicate inodes. Leader-only.
+    pub async fn alloc_inodes(&self, count: u32, floor: u64) -> Result<u64> {
+        let req = rkyv_encode(&AllocInodesReq {
+            count,
+            floor,
+            volume: Vec::new(),
+        });
+        let resp: AllocInodesResp = self
+            .mgr_call_leader(MSG_ALLOC_INODES, req, "alloc_inodes", 3, 3, |b| {
+                let r: AllocInodesResp = rkyv_decode(b).map_err(|e| anyhow!("{e}"))?;
+                Ok((r.code, r))
+            })
+            .await?;
+        if resp.code != autumn_rpc::manager_rpc::CODE_OK {
+            return Err(anyhow!("alloc_inodes failed: {}", resp.message));
+        }
+        Ok(resp.base)
+    }
+
+    /// mint a short-TTL capability token for `principal` from its
+    /// permanent `credential`. Leader-only. Returns `(token_bytes, exp_unix_secs)`.
+    pub async fn mint_token(&self, principal: &str, credential: Vec<u8>) -> Result<(Vec<u8>, u64)> {
+        let req = rkyv_encode(&MintTokenReq {
+            principal: principal.to_string(),
+            credential,
+        });
+        let managers = self.manager_addrs.len().max(1) as u32;
+        let resp: MintTokenResp = self
+            .mgr_call_leader(
+                MSG_MINT_TOKEN,
+                req,
+                "mint token",
+                managers,
+                managers + 2,
+                |b| {
+                    let r: MintTokenResp = rkyv_decode(b).map_err(decode_err)?;
+                    Ok((r.code, r))
+                },
+            )
+            .await?;
+        if resp.code != autumn_rpc::manager_rpc::CODE_OK {
+            return Err(anyhow!("mint token rejected: {}", resp.message));
+        }
+        Ok((resp.token, resp.exp))
+    }
+
+    /// create/rotate a principal account (admin). Returns
+    /// the permanent credential. Leader-only.
+    pub async fn principal_create(
+        &self,
+        principal: &str,
+        allowed_prefixes: Vec<Vec<u8>>,
+    ) -> Result<Vec<u8>> {
+        let req = rkyv_encode(&PrincipalCreateReq {
+            principal: principal.to_string(),
+            allowed_prefixes,
+        });
+        let managers = self.manager_addrs.len().max(1) as u32;
+        let resp: PrincipalCreateResp = self
+            .mgr_call_leader(
+                MSG_PRINCIPAL_CREATE,
+                req,
+                "principal-create",
+                managers,
+                managers + 2,
+                |b| {
+                    let r: PrincipalCreateResp = rkyv_decode(b).map_err(decode_err)?;
+                    Ok((r.code, r))
+                },
+            )
+            .await?;
+        if resp.code != autumn_rpc::manager_rpc::CODE_OK {
+            return Err(anyhow!("principal-create rejected: {}", resp.message));
+        }
+        Ok(resp.credential)
+    }
+
+    /// delete a principal account (admin). Leader-only.
+    pub async fn principal_delete(&self, principal: &str) -> Result<()> {
+        let req = rkyv_encode(&PrincipalDeleteReq {
+            principal: principal.to_string(),
+        });
+        let managers = self.manager_addrs.len().max(1) as u32;
+        let resp: CodeResp = self
+            .mgr_call_leader(
+                MSG_PRINCIPAL_DELETE,
+                req,
+                "principal-delete",
+                managers,
+                managers + 2,
+                |b| {
+                    let r: CodeResp = rkyv_decode(b).map_err(decode_err)?;
+                    Ok((r.code, r))
+                },
+            )
+            .await?;
+        if resp.code != autumn_rpc::manager_rpc::CODE_OK {
+            return Err(anyhow!("principal-delete rejected: {}", resp.message));
+        }
+        Ok(())
+    }
+
+    /// D2: register a namespace (admin). Leader-only. `presplit` records the
+    /// namespace's declared split points.
+    pub async fn namespace_create(&self, name: &str, presplit: Vec<Vec<u8>>) -> Result<()> {
+        let req = rkyv_encode(&NamespaceCreateReq {
+            name: name.to_string(),
+            presplit,
+        });
+        let managers = self.manager_addrs.len().max(1) as u32;
+        let resp: NamespaceCreateResp = self
+            .mgr_call_leader(
+                MSG_NAMESPACE_CREATE,
+                req,
+                "namespace-create",
+                managers,
+                managers + 2,
+                |b| {
+                    let r: NamespaceCreateResp = rkyv_decode(b).map_err(decode_err)?;
+                    Ok((r.code, r))
+                },
+            )
+            .await?;
+        if resp.code != autumn_rpc::manager_rpc::CODE_OK {
+            return Err(anyhow!("namespace-create rejected: {}", resp.message));
+        }
+        Ok(())
+    }
+
+    /// D2: delete a namespace registry row (admin). Leader-only. The
+    /// non-empty guard (`--force`) is enforced by the CALLER (autumn-op scans
+    /// the prefix); this only drops the registry row.
+    pub async fn namespace_delete(&self, name: &str) -> Result<()> {
+        let req = rkyv_encode(&NamespaceDeleteReq {
+            name: name.to_string(),
+        });
+        let managers = self.manager_addrs.len().max(1) as u32;
+        let resp: CodeResp = self
+            .mgr_call_leader(
+                MSG_NAMESPACE_DELETE,
+                req,
+                "namespace-delete",
+                managers,
+                managers + 2,
+                |b| {
+                    let r: CodeResp = rkyv_decode(b).map_err(decode_err)?;
+                    Ok((r.code, r))
+                },
+            )
+            .await?;
+        if resp.code != autumn_rpc::manager_rpc::CODE_OK {
+            return Err(anyhow!("namespace-delete rejected: {}", resp.message));
+        }
+        Ok(())
+    }
+
+    /// D2: list the full namespace registry (rich rows). Leader-routed
+    /// (rotates on NOT_LEADER). Read-only.
+    pub async fn namespace_list(&self) -> Result<Vec<MgrNamespace>> {
+        let managers = self.manager_addrs.len().max(1) as u32;
+        let resp: NamespaceListResp = self
+            .mgr_call_leader(
+                MSG_NAMESPACE_LIST,
+                Bytes::new(),
+                "namespace-list",
+                managers,
+                managers + 2,
+                |b| {
+                    let r: NamespaceListResp = rkyv_decode(b).map_err(decode_err)?;
+                    Ok((r.code, r))
+                },
+            )
+            .await?;
+        if resp.code != autumn_rpc::manager_rpc::CODE_OK {
+            return Err(anyhow!("namespace-list rejected: {}", resp.message));
+        }
+        Ok(resp.namespaces)
+    }
+
+    /// step 4: record the split points a presplit actually
+    /// applied onto an EXISTING namespace row, so `merge` refuses to undo them.
+    /// UNIONs with whatever is already recorded (never replaces). Admin connection
+    /// only.
+    pub async fn namespace_set_presplit(
+        &self,
+        name: &str,
+        points: Vec<Vec<u8>>,
+    ) -> Result<()> {
+        let managers = self.manager_addrs.len().max(1) as u32;
+        let req = rkyv_encode(&NamespaceSetPresplitReq {
+            name: name.to_string(),
+            points,
+        });
+        let resp: CodeResp = self
+            .mgr_call_leader(
+                MSG_NAMESPACE_SET_PRESPLIT,
+                req,
+                "namespace-set-presplit",
+                managers,
+                managers + 2,
+                |b| {
+                    let r: CodeResp = rkyv_decode(b).map_err(decode_err)?;
+                    Ok((r.code, r))
+                },
+            )
+            .await?;
+        if resp.code != autumn_rpc::manager_rpc::CODE_OK {
+            return Err(anyhow!("namespace-set-presplit rejected: {}", resp.message));
+        }
+        Ok(())
+    }
+
+    /// list every principal + its grants. Leader-routed
+    /// (rotates on NOT_LEADER), read-only. Never returns credential material.
+    pub async fn principal_list(&self) -> Result<Vec<PrincipalRow>> {
+        let managers = self.manager_addrs.len().max(1) as u32;
+        let resp: PrincipalListResp = self
+            .mgr_call_leader(
+                MSG_PRINCIPAL_LIST,
+                Bytes::new(),
+                "principal-list",
+                managers,
+                managers + 2,
+                |b| {
+                    let r: PrincipalListResp = rkyv_decode(b).map_err(decode_err)?;
+                    Ok((r.code, r))
+                },
+            )
+            .await?;
+        if resp.code != autumn_rpc::manager_rpc::CODE_OK {
+            return Err(anyhow!("principal-list rejected: {}", resp.message));
+        }
+        Ok(resp.principals)
+    }
+
+    /// Call manager with retry and round-robin on NotLeader/connection error.
+    pub async fn mgr_call_retry(
+        &self,
+        msg_type: u8,
+        payload: Bytes,
+        max_retries: u32,
+    ) -> Result<Bytes> {
+        let mut attempt = 0u32;
+        loop {
+            match self.mgr_call(msg_type, payload.clone()).await {
+                Ok(resp) => return Ok(resp),
+                Err(e) => {
+                    attempt += 1;
+                    if attempt > max_retries {
+                        return Err(e.context(format!("failed after {max_retries} retries")));
+                    }
+                    self.rotate_manager();
+                    compio::time::sleep(Duration::from_millis(500)).await;
+                }
+            }
+        }
+    }
+
+    pub fn mgr(&self) -> Result<Rc<RpcClient>> {
+        self.mgr_conn
+            .borrow()
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| anyhow!("manager not connected"))
+    }
+
+    /// connect a SCOPED client bound to a key-prefix
+    /// `scope` (`fs`, `gallery`, or an in-namespace sub-prefix `mem/agent7`). Every
+    /// data op is confined to `{scope}/` — **Prepend-only**: the client ALWAYS
+    /// prepends `{scope}/` to the user key (scope locked by construction; the
+    /// built-in key builders emit RELATIVE keys). This is the entry point EVERY
+    /// data-plane writer must use (CLI, PyO3 data clients, kvcache, bench). Admin /
+    /// mgr-only / unscoped callers use `connect_raw`. Each `/`-delimited segment of
+    /// `scope` must match `[a-z0-9._-]+`; the FIRST segment is the namespace
+    /// (Layer-A checks it against the registry).
+    pub async fn connect(manager: &str, scope: &str) -> Result<Self> {
+        for seg in scope.trim_end_matches('/').split('/') {
+            if !is_valid_scope_segment(seg) {
+                return Err(anyhow!(
+                    "invalid scope segment {seg:?} in {scope:?}: each segment must be non-empty and match [a-z0-9._-]+"
+                ));
+            }
+        }
+        Self::connect_with_binding(manager, NamespaceBinding::scoped(scope)).await
+    }
+
+    /// D7: connect an UNSCOPED client (`Raw` binding) — NO client-side
+    /// namespace clamp. For cross-namespace inspection/migration, tests
+    /// exercising other features, and fuse-before-SD3 (whose keys are still
+    /// raw bytes). **NOT for data-plane writers** — those must declare their
+    /// namespace via `connect`. The PS still enforces Layer-A/B, so this only
+    /// bypasses the CLIENT prefixing, never server authorization.
+    ///
+    /// It declares the CLIENT role, so only client-surface RPCs pass; split,
+    /// compact, gc, flush, merge, namespace/principal admin and the op ledger
+    /// are refused (`PermissionDenied`). Operator tooling uses `connect_admin`.
+    pub async fn connect_raw(manager: &str) -> Result<Self> {
+        Self::connect_with_binding(manager, NamespaceBinding::Raw).await
+    }
+
+    /// `connect_raw` declaring the ADMIN role: every opcode of each service,
+    /// at exact `WIRE_VERSION` equality. For operator tooling (`autumn-op`).
+    /// Every connection it opens must prove the cluster secret installed in
+    /// this process (`autumn_rpc::peer_auth::install`); servers refuse it
+    /// otherwise.
+    pub async fn connect_admin(manager: &str) -> Result<Self> {
+        Self::connect_with_role(
+            manager,
+            NamespaceBinding::Raw,
+            autumn_rpc::version_hello::Role::Admin,
+        )
+        .await
+    }
+
+    /// `connect_raw` declaring the PEER role (cluster members: the extent
+    /// node's startup calls). Exact `WIRE_VERSION` equality; no admin opcodes.
+    /// Proves the installed cluster secret, as `connect_admin` does.
+    pub async fn connect_peer(manager: &str) -> Result<Self> {
+        Self::connect_with_role(
+            manager,
+            NamespaceBinding::Raw,
+            autumn_rpc::version_hello::Role::Peer,
+        )
+        .await
+    }
+
+    /// Shared constructor for `connect` / `connect_raw` / `connect_with_credential`.
+    async fn connect_with_binding(manager: &str, binding: NamespaceBinding) -> Result<Self> {
+        Self::connect_with_role(manager, binding, autumn_rpc::version_hello::Role::Client).await
+    }
+
+    async fn connect_with_role(
+        manager: &str,
+        binding: NamespaceBinding,
+        role: autumn_rpc::version_hello::Role,
+    ) -> Result<Self> {
+        let manager_addrs: Vec<String> = manager.split(',').map(|s| s.trim().to_string()).collect();
+
+        let client = Self {
+            role,
+            manager_addrs,
+            current_mgr: Cell::new(0),
+            mgr_conn: Rc::new(RefCell::new(None)),
+            ps_conns: RefCell::new(HashMap::new()),
+            ps_connecting: RefCell::new(HashMap::new()),
+            en_pool: autumn_stream::ConnPool::with_role(autumn_rpc::version_hello::Role::Client),
+            regions: RefCell::new(Vec::new()),
+            ps_details: RefCell::new(HashMap::new()),
+            part_addrs: RefCell::new(HashMap::new()),
+            rpc_timeout: Cell::new(Some(default_rpc_timeout())),
+            first_attempt_timeout: Cell::new(Some(default_first_attempt_timeout())),
+            auth: RefCell::new(None),
+            auth_gen: Cell::new(0),
+            wire_refused: RefCell::new(None),
+            negotiated_cluster_wire: Cell::new(0),
+            binding,
+        };
+
+        // Try connecting to each manager until one responds. A wire-version
+        // REFUSAL ends the loop immediately: every manager in a cluster runs
+        // the same commit, so the next one answers the same thing, and the
+        // message names which way round the mismatch is — the one piece of
+        // information this failure carries. Flattening it into "cannot connect
+        // to any manager" is the shape this whole handshake exists to remove,
+        // and this is the entry point every wheel, fuse mount, gateway and
+        // autumn-op comes through.
+        let mut connected = false;
+        let mut last_err: Option<anyhow::Error> = None;
+        for idx in 0..client.manager_addrs.len() {
+            client.current_mgr.set(idx);
+            match client.mgr_client().await {
+                Ok(_) => {
+                    connected = true;
+                    break;
+                }
+                Err(e) => {
+                    if e.downcast_ref::<AutumnError>()
+                        .is_some_and(|a| matches!(a, AutumnError::WireVersionRefused(_)))
+                    {
+                        return Err(e);
+                    }
+                    last_err = Some(e);
+                }
+            }
+        }
+        if !connected {
+            return match last_err {
+                Some(e) => Err(e.context(format!("cannot connect to any manager: {manager}"))),
+                None => Err(anyhow!("cannot connect to any manager: {manager}")),
+            };
+        }
+
+        client.refresh_regions().await?;
+        Ok(client)
+    }
+
+    pub async fn refresh_regions(&self) -> Result<()> {
+        // get_regions is leader-gated (a follower's part_addrs view
+        // is empty/stale — manager-HA chaos H3 black-holed every client
+        // that connected to a rejoined follower first). On NOT_LEADER,
+        // rotate and retry until the leader answers.
+        // WHICH OPCODE, decided once per refresh from the version the hello
+        // negotiated. `MSG_GET_CLIENT_REGIONS` returns the narrowed routing
+        // record and is the one this client wants; a cluster below
+        // `WIRE_VERSION_WITH_CLIENT_REGIONS` has no handler for it: the
+        // manager's dispatch refuses an unknown msg_type with `InvalidArgument`,
+        // so asking blind would turn every routing refresh into a hard error.
+        //
+        // `negotiated_cluster_wire` is 0 until a hello succeeds and a silent
+        // connection never raises it, so this fails CLOSED: an unknown cluster
+        // gets the old opcode, which every cluster in the window serves. That
+        // is also what keeps an old SDK working against a new cluster — the old
+        // opcode is untouched and still carries all seven fields for the PS.
+        let narrow = self.negotiated_cluster_wire.get()
+            >= autumn_rpc::WIRE_VERSION_WITH_CLIENT_REGIONS;
+        let msg = if narrow {
+            MSG_GET_CLIENT_REGIONS
+        } else {
+            MSG_GET_REGIONS
+        };
+        type Routing = (
+            Vec<(u64, ClientRegion)>,
+            Vec<(u64, MgrPsDetail)>,
+            Vec<(u64, String)>,
+        );
+        let mut resp: Option<Routing> = None;
+        for _ in 0..(self.manager_addrs.len() * 3).max(3) {
+            let resp_bytes = self
+                .mgr_call_retry(msg, Bytes::new(), 3)
+                .await
+                .context("get regions")?;
+            // Both forms answer under the msg_type the request named, so the
+            // decode is chosen by what we SENT, never by connection state.
+            let (code, regions, ps_details, part_addrs) = if narrow {
+                let r: ClientRegionsResp = rkyv_decode(&resp_bytes).map_err(decode_err)?;
+                (r.code, r.regions, r.ps_details, r.part_addrs)
+            } else {
+                let r: GetRegionsResp = rkyv_decode(&resp_bytes).map_err(decode_err)?;
+                (
+                    r.code,
+                    r.regions
+                        .iter()
+                        .map(|(id, v)| (*id, ClientRegion::from(v)))
+                        .collect(),
+                    r.ps_details,
+                    r.part_addrs,
+                )
+            };
+            if code == CODE_NOT_LEADER {
+                self.rotate_manager();
+                *self.mgr_conn.borrow_mut() = None;
+                compio::time::sleep(Duration::from_millis(300)).await;
+                continue;
+            }
+            resp = Some((regions, ps_details, part_addrs));
+            break;
+        }
+        let resp =
+            resp.ok_or_else(|| anyhow!("get regions: no leader among {:?}", self.manager_addrs))?;
+        let (regions, ps_details, part_addrs) = resp;
+        let mut sorted: Vec<(u64, ClientRegion)> = regions;
+        sorted.sort_by(|a, b| {
+            a.1.rg
+                .as_ref()
+                .map(|r| r.start_key.as_slice())
+                .unwrap_or(&[])
+                .cmp(
+                    b.1.rg
+                        .as_ref()
+                        .map(|r| r.start_key.as_slice())
+                        .unwrap_or(&[]),
+                )
+        });
+        for i in 0..sorted.len().saturating_sub(1) {
+            let end_key = sorted[i]
+                .1
+                .rg
+                .as_ref()
+                .map(|r| r.end_key.as_slice())
+                .unwrap_or(&[]);
+            let next_start = sorted[i + 1]
+                .1
+                .rg
+                .as_ref()
+                .map(|r| r.start_key.as_slice())
+                .unwrap_or(&[]);
+            if end_key != next_start {
+                eprintln!(
+                    "WARNING: region gap: partition {} end_key != partition {} start_key",
+                    sorted[i].1.part_id,
+                    sorted[i + 1].1.part_id
+                );
+            }
+        }
+        // Brief swap — no .await held under any borrow.
+        *self.regions.borrow_mut() = sorted;
+        *self.ps_details.borrow_mut() = ps_details.into_iter().collect();
+        *self.part_addrs.borrow_mut() = part_addrs.into_iter().collect();
+        Ok(())
+    }
+
+    /// Wait until every partition reported by the manager has a
+    /// registered `part_addr` (the per-partition listener) AND
+    /// each `part_addr` accepts TCP connections. Polls `refresh_regions`
+    /// every `poll_interval` until the readiness condition holds or
+    /// `timeout` elapses.
+    ///
+    /// **Why this is needed:** right after
+    /// `cluster.sh start` bootstraps a presplit cluster, the manager
+    /// returns a routing record for every partition before each
+    /// partition's PS thread has bound its dedicated `base_port + ord`
+    /// listener AND called `RegisterPartitionAddr`. Until that
+    /// register lands, `part_addrs[part_id]` is missing → the SDK's
+    /// `lookup_key` falls back to `ps_details[ps_id].address` (the
+    /// base PS port). For a partition whose `ord != 0`, sending its
+    /// PutReq to the base port hits a `partition_loop` that owns a
+    /// DIFFERENT partition → mis-routed → synthesised `NotFound`
+    /// frame → `call_ps_for_key` retries 10×, exhausts → caller
+    /// (e.g. autumn-fuse's `init_root` kv_put) returns
+    /// `connection error: ps_call after 10 refreshes: key not found`.
+    ///
+    /// Callers that boot against a possibly-fresh cluster (fuse mount
+    /// daemon, ioring daemon, long-lived service binaries) should call
+    /// this between `connect` and the first request to ride out the
+    /// startup window. Short-lived one-shot tools (autumn-client CLI
+    /// invocations from operators) can skip it: a transient
+    /// `key not found` surfacing to the operator IS the right UX.
+    ///
+    /// Returns `Ok(())` on readiness or `Err` on timeout. The error
+    /// includes a count of partitions still missing `part_addr` so the
+    /// caller can decide whether to retry or fail-fast.
+    pub async fn wait_for_cluster_ready(
+        &self,
+        timeout: Duration,
+        poll_interval: Duration,
+    ) -> Result<()> {
+        let start = std::time::Instant::now();
+        loop {
+            self.refresh_regions().await?;
+            let summary = {
+                let regions = self.regions.borrow();
+                let part_addrs = self.part_addrs.borrow();
+                let ps_details = self.ps_details.borrow();
+                let regions_view: Vec<(u64, u64)> = regions
+                    .iter()
+                    .map(|(_, r)| (r.part_id, r.ps_id))
+                    .collect();
+                let part_addrs_view: HashMap<u64, String> = part_addrs.clone();
+                let ps_details_view: HashMap<u64, String> = ps_details
+                    .iter()
+                    .map(|(id, d)| (*id, d.address.clone()))
+                    .collect();
+                cluster_ready_summary(&regions_view, &part_addrs_view, &ps_details_view)
+            };
+
+            if summary.total_partitions == 0 {
+                if start.elapsed() >= timeout {
+                    return Err(anyhow!(
+                        "cluster_ready: manager reports zero partitions after {:?}",
+                        timeout
+                    ));
+                }
+                compio::time::sleep(poll_interval).await;
+                continue;
+            }
+            if summary.missing_addrs.is_empty() {
+                // Every partition has SOME ps_addr cached. Probe each
+                // distinct ps_addr with one quick TCP connect to weed
+                // out the case where the manager reports a listener
+                // that the PS process hasn't actually bound yet.
+                let mut unreachable: Vec<String> = Vec::new();
+                for addr in &summary.probe_addrs {
+                    match self.get_ps_client(addr).await {
+                        Ok(_) => {}
+                        Err(_) => unreachable.push(addr.clone()),
+                    }
+                }
+                if unreachable.is_empty() {
+                    return Ok(());
+                }
+                if start.elapsed() >= timeout {
+                    return Err(anyhow!(
+                        "cluster_ready: {} PS endpoint(s) unreachable after {:?}: {:?}",
+                        unreachable.len(),
+                        timeout,
+                        unreachable
+                    ));
+                }
+            } else if start.elapsed() >= timeout {
+                return Err(anyhow!(
+                    "cluster_ready: {} of {} partition(s) still missing part_addr after {:?}: {:?}",
+                    summary.missing_addrs.len(),
+                    summary.total_partitions,
+                    timeout,
+                    summary.missing_addrs
+                ));
+            }
+            compio::time::sleep(poll_interval).await;
+        }
+    }
+
+    /// Get or create a PS RPC connection. Auto-reconnects on failure.
+    /// set this client's principal credential. Enables authz — every
+    /// fresh PS connection sends CLIENT_AUTH with a (lazily minted,
+    /// auto-renewed) token scoped to the principal's granted prefixes. Anonymous (no credential,
+    /// the default) works unchanged against non-authz clusters. Clears cached PS
+    /// connections so they rebind under the new identity.
+    pub fn set_principal_credential(&self, principal: impl Into<String>, credential: Vec<u8>) {
+        *self.auth.borrow_mut() = Some(ClientAuth {
+            principal: principal.into(),
+            credential,
+            token: None,
+        });
+        // Bump the identity generation + drop cached PS conns so they rebind.
+        self.auth_gen.set(self.auth_gen.get().wrapping_add(1));
+        self.ps_conns.borrow_mut().clear();
+        self.en_pool.set_auth_token(None);
+    }
+
+    /// connect a SCOPED client + set its authz credential
+    /// in one call. `scope` is the KEY prefix (`fs`, `mem/agent7`); `principal` is
+    /// the authz identity (credential owner, sourced from the credential file's
+    /// name line, §8.5); `credential` is the raw secret. When authz is enabled this
+    /// validates at bind time that `{scope}/` is covered by one of the credential's
+    /// granted `allowed_prefixes` (fail-fast — a mis-scoped credential fails at
+    /// connect, not on the first write). When authz is off (no signing key) the
+    /// mint fails harmlessly and the check is skipped.
+    pub async fn connect_with_credential(
+        manager: &str,
+        scope: &str,
+        principal: impl Into<String>,
+        credential: Vec<u8>,
+    ) -> Result<Self> {
+        let c = Self::connect(manager, scope).await?;
+        c.set_principal_credential(principal, credential);
+        c.validate_credential_scope().await?;
+        Ok(c)
+    }
+
+    /// D7: when authz is on, verify the client's scope
+    /// is within one of the credential's granted prefixes, and FAIL FAST at
+    /// connect if not (no silent defer-to-first-write). Skipped
+    /// only when authz is DISABLED on the manager (no signing key) — there is
+    /// then nothing to validate against. `pub` so the PyO3 connect paths run the
+    /// SAME check as `connect_with_credential`.
+    pub async fn validate_credential_scope(&self) -> Result<()> {
+        let scope_prefix = match self.binding.prefix() {
+            Some(p) => p.to_vec(),
+            None => return Ok(()), // Raw binding: nothing to validate.
+        };
+        // Mint (or reuse) a token to read the credential's granted prefixes.
+        let token = match self.ensure_token().await {
+            Ok(t) => t,
+            Err(e) => {
+                // Only "authz is not enabled on this manager" is a legitimate
+                // skip (there is nothing to validate against). A REJECTED /
+                // invalid credential, a mint failure, or a transport error is a
+                // real config error — fail fast at CONNECT rather than silently
+                // deferring to the first write. The manager's
+                // disabled-marker (`handle_mint_token`) is stable; the wire is
+                // frozen (v25) so we classify on it instead of adding a code.
+                let msg = e.to_string();
+                if msg.contains("authz not enabled") || msg.contains("no signing key") {
+                    return Ok(());
+                }
+                return Err(e.context(
+                    "mint token to validate the credential's namespace scope at connect",
+                ));
+            }
+        };
+        // The wire token is `canonical_bytes(claims) ‖ sig[64]`; decode the
+        // leading claims bytes (our own manager-minted token — no signature check
+        // needed just to read the granted prefixes). A malformed token from a
+        // SUCCESSFUL mint is a real bug → fail loud (was silently skipped).
+        let cb = token
+            .len()
+            .checked_sub(autumn_rpc::cap_token::SIG_LEN)
+            .filter(|n| *n > 0)
+            .map(|n| &token[..n])
+            .ok_or_else(|| anyhow!("minted token too short to hold claims + signature"))?;
+        let claims: autumn_rpc::cap_token::CapClaims =
+            rkyv_decode(cb).map_err(|e| anyhow!("decode minted token claims: {e}"))?;
+        let covered = claims
+            .allowed_prefixes
+            .iter()
+            .any(|ap| scope_prefix.starts_with(ap.as_slice()));
+        if !covered {
+            return Err(anyhow!(
+                "credential does not grant the namespace scope {:?}: allowed_prefixes={:?}",
+                String::from_utf8_lossy(&scope_prefix),
+                claims
+                    .allowed_prefixes
+                    .iter()
+                    .map(|p| String::from_utf8_lossy(p).into_owned())
+                    .collect::<Vec<_>>()
+            ));
+        }
+        Ok(())
+    }
+
+    /// return a currently-valid token, minting/renewing via
+    /// `MSG_MINT_TOKEN` when there is none or it's within
+    /// `--token-renew-margin-secs` of expiry (so connections are re-bound to a
+    /// fresh token before the current one expires). On a renewal (a prior token existed),
+    /// drops cached PS connections so they rebind under the fresh token.
+    async fn ensure_token(&self) -> Result<Vec<u8>> {
+        // Fast path: a cached token with comfortable life left.
+        {
+            let auth = self.auth.borrow();
+            let a = auth
+                .as_ref()
+                .ok_or_else(|| anyhow!("no principal credential set"))?;
+            if let Some(t) = &a.token {
+                if t.exp > client_now_secs().saturating_add(params().token_renew_margin_secs.get()) {
+                    return Ok(t.bytes.clone());
+                }
+            }
+        }
+        // Mint / renew. Scoped borrow (nothing held across the await).
+        let (principal, credential) = {
+            let auth = self.auth.borrow();
+            let a = auth
+                .as_ref()
+                .ok_or_else(|| anyhow!("no principal credential set"))?;
+            (a.principal.clone(), a.credential.clone())
+        };
+        let (token, exp) = self.mint_token(&principal, credential).await?;
+        let renewed = {
+            let mut auth = self.auth.borrow_mut();
+            let a = auth
+                .as_mut()
+                .ok_or_else(|| anyhow!("no principal credential set"))?;
+            let renewed = a.token.is_some();
+            a.token = Some(CachedToken {
+                bytes: token.clone(),
+                exp,
+            });
+            renewed
+        };
+        if renewed {
+            self.ps_conns.borrow_mut().clear();
+        }
+        // Direct reads present the same token to the EN; a new one rebinds the
+        // pooled EN connections too.
+        self.en_pool.set_auth_token(Some(Bytes::from(token.clone())));
+        Ok(token)
+    }
+
+    pub async fn get_ps_client(&self, ps_addr: &str) -> Result<Rc<RpcClient>> {
+        self.get_ps_client_with_timeout(ps_addr, self.rpc_timeout.get())
+            .await
+    }
+
+    /// Get or create a PS connection within the caller's current attempt
+    /// budget.  The response timeout used to begin only after this function
+    /// returned, leaving TCP connect outside every RPC deadline.  A stale
+    /// partition route could therefore remain in SYN-SENT until an outer FUSE
+    /// deadline cancelled the whole operation, before the routing loop got a
+    /// chance to refresh.
+    async fn get_ps_client_with_timeout(
+        &self,
+        ps_addr: &str,
+        timeout: Option<Duration>,
+    ) -> Result<Rc<RpcClient>> {
+        let acquire = self.get_ps_client_inner(ps_addr);
+        match timeout {
+            None => acquire.await,
+            Some(t) => match compio::time::timeout(t, acquire).await {
+                Ok(result) => result,
+                Err(_) => Err(anyhow::Error::new(AutumnError::ConnectionError(format!(
+                    "connect/handshake PS {ps_addr} timed out after {t:?}"
+                )))),
+            },
+        }
+    }
+
+    async fn get_ps_client_inner(&self, ps_addr: &str) -> Result<Rc<RpcClient>> {
+        // renew the token BEFORE serving a cached connection so a
+        // long-lived client rebinds before the current token expires —
+        // `ensure_token` clears `ps_conns` on renewal, dropping stale-token
+        // connections so the cache lookup below misses and rebinds.
+        let authed = self.auth.borrow().is_some();
+        let token = if authed {
+            Some(self.ensure_token().await?)
+        } else {
+            None
+        };
+        let gen = self.auth_gen.get();
+        {
+            // A closed entry (peer gone, or silent past the keepalive) is
+            // skipped here and replaced below, instead of failing one more
+            // call before `evict_ps_on_error` removes it.
+            let conns = self.ps_conns.borrow();
+            if let Some(c) = conns.get(ps_addr).filter(|c| !c.is_closed()) {
+                return Ok(c.clone());
+            }
+        }
+        // One connection per PS address: concurrent first requests wait for
+        // the first connect instead of each opening (and handshaking) their
+        // own.
+        let gate = self.ps_connecting.borrow_mut().entry(ps_addr.to_string()).or_default().clone();
+        let seen = gate.done.get();
+        let _turn = gate.turn.lock().await;
+        {
+            let conns = self.ps_conns.borrow();
+            if let Some(c) = conns.get(ps_addr).filter(|c| !c.is_closed()) {
+                return Ok(c.clone());
+            }
+        }
+        let failed = gate.failed.borrow().clone();
+        if let Some((at, why)) = failed.filter(|(at, _)| *at > seen) {
+            return Err(anyhow::Error::new(AutumnError::ConnectionError(format!(
+                "connect PS {ps_addr} failed while this request waited (connect {at}): {why}"
+            ))));
+        }
+        let outcome = self.connect_ps(ps_addr, token, gen).await;
+        gate.done.set(gate.done.get() + 1);
+        *gate.failed.borrow_mut() = outcome.as_ref().err().map(|e| (gate.done.get(), format!("{e:#}")));
+        outcome
+    }
+
+    /// Opens, greets and (with a credential) authenticates a PS connection,
+    /// and caches it unless the identity changed meanwhile.
+    async fn connect_ps(&self, ps_addr: &str, token: Option<Vec<u8>>, gen: u64) -> Result<Rc<RpcClient>> {
+        let client = self
+            .open_rpc_named(ps_addr, autumn_rpc::version_hello::Service::PartitionServer)
+            .await
+            .with_context(|| format!("connect PS {ps_addr}"))?;
+        client.set_send_window(params().ps_send_window.get());
+        // BEFORE the CLIENT_AUTH: the PS gates CLIENT_AUTH itself on the client
+        // window, so a refused client that sent its credential first would be
+        // told "wire version" about a frame it thought was about identity.
+        self.say_hello(&client, ps_addr).await?;
+        // Bind this connection's principal via CLIENT_AUTH before it's cached.
+        if let Some(token) = token {
+            let auth_req = rkyv_encode(&ClientAuthReq { token });
+            // Bounded by rpc_timeout so a hung CLIENT_AUTH can't wedge connect
+            // — mirrors ps_call_with_timeout.
+            let resp_bytes = match self.rpc_timeout.get() {
+                None => client.call(MSG_CLIENT_AUTH, auth_req).await,
+                Some(t) => client.call_timeout(MSG_CLIENT_AUTH, auth_req, t).await,
+            }
+            .with_context(|| format!("CLIENT_AUTH to PS {ps_addr}"))?;
+            let resp: ClientAuthResp = rkyv_decode(&resp_bytes).map_err(decode_err)?;
+            if resp.code != StatusCode::Ok as u8 {
+                return Err(anyhow!(
+                    "CLIENT_AUTH rejected by PS {ps_addr}: {}",
+                    resp.message
+                ));
+            }
+        }
+        // Identity-switch guard: if `set_principal_credential` ran
+        // during the connect, this conn is bound to the OLD principal (or to
+        // none) — serve this in-flight call but DON'T cache it, so a later call
+        // rebinds under the new identity.
+        if self.auth_gen.get() != gen {
+            return Ok(client);
+        }
+        self.ps_conns
+            .borrow_mut()
+            .insert(ps_addr.to_string(), client.clone());
+        Ok(client)
+    }
+
+    /// Call a PS. Transport errors and local timeouts evict the connection;
+    /// peer status errors leave it pooled while routing/retry handles the refusal.
+    ///
+    /// Honors `rpc_timeout` (default `default_rpc_timeout()`); see the
+    /// field docstring for the partition-handle-drop hang this guards
+    /// against.
+    pub async fn ps_call(&self, ps_addr: &str, msg_type: u8, payload: Bytes) -> Result<Bytes> {
+        self.ps_call_with_timeout(ps_addr, msg_type, payload, self.rpc_timeout.get())
+            .await
+    }
+
+    /// `ps_call` variant that takes an
+    /// explicit per-call timeout override. `call_ps_for_key` /
+    /// `call_ps_for_part` use this on attempt 0 to fast-fail a stale
+    /// PS connection (the post-`kill -9`-then-restart window) without
+    /// waiting the full 30 s `rpc_timeout`. See
+    /// `first_attempt_effective_timeout`.
+    /// `ps_call_with_timeout` for a value-separable request whose tail is made
+    /// of N buffers (`MSG_BATCH_PUT`).
+    ///
+    /// The timeout is on awaiting the RESPONSE, not on the send: it never
+    /// abandons a frame mid-`writev`, it gives up on a reply that is not
+    /// coming. The inline batch this replaces went through
+    /// `ps_call_with_timeout`, so without one here every batch big enough to
+    /// take the bulk path would have silently traded a bounded wait for an
+    /// unbounded one — and the bound exists for a specific case: a PS killed
+    /// with `kill -9` leaves connections that accept writes and never answer.
+    pub async fn ps_call_bulk_multi<V: Into<RegBytes> + AsRef<[u8]>>(
+        &self,
+        ps_addr: &str,
+        msg_type: u8,
+        ctrl: Bytes,
+        values: Vec<V>,
+        timeout: Option<Duration>,
+    ) -> Result<Bytes> {
+        let client = self
+            .get_ps_client_with_timeout(ps_addr, timeout)
+            .await?;
+        let call = client.call_vectored_bulk_multi(msg_type, vec![ctrl], values);
+        let outcome = match timeout {
+            None => call.await,
+            Some(t) => match compio::time::timeout(t, call).await {
+                Ok(r) => r,
+                Err(_) => Err(RpcError::Timeout(t)),
+            },
+        };
+        match outcome {
+            Ok(resp) => Ok(resp),
+            Err(e) => {
+                self.evict_ps_on_error(ps_addr, &e);
+                Err(sent_call_error(e))
+            }
+        }
+    }
+
+    fn evict_ps_on_error(&self, ps_addr: &str, error: &RpcError) {
+        if error.is_connection_error() {
+            self.ps_conns.borrow_mut().remove(ps_addr);
+        }
+    }
+
+    pub async fn ps_call_with_timeout(
+        &self,
+        ps_addr: &str,
+        msg_type: u8,
+        payload: Bytes,
+        timeout: Option<Duration>,
+    ) -> Result<Bytes> {
+        self.ps_call_on(Lane::Normal, ps_addr, msg_type, payload, timeout).await
+    }
+
+    /// `ps_call_with_timeout` on the given lane of the PS connection.
+    async fn ps_call_on(
+        &self,
+        lane: Lane,
+        ps_addr: &str,
+        msg_type: u8,
+        payload: Bytes,
+        timeout: Option<Duration>,
+    ) -> Result<Bytes> {
+        let client = self
+            .get_ps_client_with_timeout(ps_addr, timeout)
+            .await?;
+        let outcome = match timeout {
+            None => client.call_on(lane, msg_type, payload).await,
+            Some(t) => client.call_on_timeout(lane, msg_type, payload, t).await,
+        };
+        match outcome {
+            Ok(resp) => Ok(resp),
+            Err(e) => {
+                self.evict_ps_on_error(ps_addr, &e);
+                // preserve the typed error inside anyhow (downcastable)
+                // instead of stringifying, so the routing-retry loops can tell
+                // a deterministic precondition from a transient routing miss.
+                Err(sent_call_error(e))
+            }
+        }
+    }
+
+    /// Override the per-call timeout for ALL cluster RPCs (PS + manager).
+    /// Default is `default_rpc_timeout()` (30 s). Recommended in
+    /// production: 2-5 s for read-heavy loads, 30+ s for bulk uploads.
+    /// Tests that drive split/merge typically use 2 s.
+    pub fn set_rpc_timeout(&self, t: Duration) {
+        self.rpc_timeout.set(Some(t));
+    }
+
+    /// Reset the per-call timeout to the crate default
+    /// (`default_rpc_timeout()`). Wait-forever is no longer a supported
+    /// mode — every RPC must be bounded.
+    pub fn clear_rpc_timeout(&self) {
+        self.rpc_timeout.set(Some(default_rpc_timeout()));
+    }
+
+    /// Read the current per-call timeout. Mostly for tests.
+    /// Always `Some(_)` in normal use; `None` only appears if a caller
+    /// has explicitly opted out (discouraged).
+    pub fn rpc_timeout(&self) -> Option<Duration> {
+        self.rpc_timeout.get()
+    }
+
+    /// Override the first-attempt timeout
+    /// for `call_ps_for_key` / `call_ps_for_part`. See
+    /// `default_first_attempt_timeout()` for the rationale.
+    pub fn set_first_attempt_timeout(&self, t: Option<Duration>) {
+        self.first_attempt_timeout.set(t);
+    }
+
+    /// Read the current first-attempt timeout.
+    pub fn first_attempt_timeout(&self) -> Option<Duration> {
+        self.first_attempt_timeout.get()
+    }
+
+    /// Resolve the effective timeout for the Nth attempt of a key /
+    /// part-bound RPC. Pure-fn so the policy is unit-testable.
+    ///   - `attempt == 0`: `min(rpc_timeout, first_attempt_timeout)`
+    ///     if both are Some — fast-fail a stale conn within the
+    ///     first-attempt budget so the retry path engages quickly.
+    ///     If `first_attempt_timeout` is None: use `rpc_timeout`.
+    ///   - `attempt > 0`: `rpc_timeout` — the cached conn is freshly
+    ///     dropped, the refresh has run, give the new connection the
+    ///     full budget.
+    ///
+    /// Both `None` ⇒ `None` (wait forever — discouraged but supported
+    /// for callers that explicitly opted out).
+    fn first_attempt_effective_timeout(&self, attempt: u32) -> Option<Duration> {
+        let rpc_t = self.rpc_timeout.get();
+        if attempt > 0 {
+            return rpc_t;
+        }
+        match self.first_attempt_timeout.get() {
+            Some(first_t) => Some(rpc_t.map_or(first_t, |rpc_t| rpc_t.min(first_t))),
+            None => rpc_t,
+        }
+    }
+
+    /// Look up the cached `region_epoch` for a partition. Returns 0 when
+    /// the partition is unknown (no cached region) — `0` is the wire-level
+    /// "skip check" sentinel so a request stamped with 0 is processed
+    /// without epoch validation. Used internally by `call_ps_for_key`
+    /// + `call_ps_for_part`; FUSE / ioring / CLI perf-check call it
+    /// directly when assembling a Req struct manually.
+    pub fn lookup_epoch_for_part(&self, part_id: u64) -> u64 {
+        self.regions
+            .borrow()
+            .iter()
+            .find(|(_, r)| r.part_id == part_id)
+            .map(|(_, r)| r.region_epoch)
+            .unwrap_or(0)
+    }
+
+    pub fn lookup_key(&self, key: &[u8]) -> Option<(u64, String)> {
+        let regions = self.regions.borrow();
+        if regions.is_empty() {
+            return None;
+        }
+        let idx = regions.partition_point(|(_, region)| match region.rg.as_ref() {
+            Some(rg) if !rg.end_key.is_empty() => rg.end_key.as_slice() <= key,
+            _ => false,
+        });
+        if idx >= regions.len() {
+            return None;
+        }
+        let (_, region) = &regions[idx];
+        // prefer per-partition listener if registered.
+        let part_addrs = self.part_addrs.borrow();
+        let ps_details = self.ps_details.borrow();
+        let addr = match part_addrs.get(&region.part_id) {
+            Some(a) => a.clone(),
+            None => ps_details.get(&region.ps_id)?.address.clone(),
+        };
+        Some((region.part_id, addr))
+    }
+
+    pub async fn resolve_key(&self, key: &[u8]) -> Result<(u64, String)> {
+        if let Some(result) = self.lookup_key(key) {
+            return Ok(result);
+        }
+        self.refresh_regions().await?;
+        self.lookup_key(key)
+            .ok_or_else(|| anyhow!("key is out of range"))
+    }
+
+    pub async fn resolve_part_id(&self, part_id: u64) -> Result<String> {
+        // prefer the per-partition listener address when
+        // registered; fall back to the PS-level base address otherwise.
+        // Borrows are scoped — released before any `.await`.
+        let lookup = |this: &Self| -> Option<String> {
+            let regions = this.regions.borrow();
+            let region = regions.iter().find(|(_, r)| r.part_id == part_id)?;
+            let part_addrs = this.part_addrs.borrow();
+            if let Some(a) = part_addrs.get(&region.1.part_id) {
+                return Some(a.clone());
+            }
+            let ps_details = this.ps_details.borrow();
+            ps_details.get(&region.1.ps_id).map(|d| d.address.clone())
+        };
+        if let Some(addr) = lookup(self) {
+            return Ok(addr);
+        }
+        self.refresh_regions().await?;
+        lookup(self).ok_or_else(|| anyhow!("partition {} not found", part_id))
+    }
+
+    pub async fn all_partitions(&self) -> Result<Vec<(u64, String)>> {
+        if self.regions.borrow().is_empty() {
+            self.refresh_regions().await?;
+        }
+        let regions = self.regions.borrow();
+        let part_addrs = self.part_addrs.borrow();
+        let ps_details = self.ps_details.borrow();
+        let mut result: Vec<(u64, String)> = regions
+            .iter()
+            .map(|(_, region)| {
+                // prefer per-partition listener address when present.
+                let addr = part_addrs
+                    .get(&region.part_id)
+                    .cloned()
+                    .or_else(|| ps_details.get(&region.ps_id).map(|d| d.address.clone()))
+                    .unwrap_or_default();
+                (region.part_id, addr)
+            })
+            .collect();
+        result.sort_by_key(|(pid, _)| *pid);
+        Ok(result)
+    }
+
+    /// c — like `all_partitions`, but also returns each partition's
+    /// `(start_key, end_key)` range so bench tools can generate keys that
+    /// actually land in each partition. Prior bench tools used a constant
+    /// prefix like "pc_{tid}_{seq}" / "bench_{tid}_{seq}" which lexically
+    /// always fell in ONE partition, making N>1 perf tests measure a single
+    /// partition with (N-1) rejecting load.
+    pub async fn all_partitions_with_range(&self) -> Result<Vec<(u64, String, Vec<u8>, Vec<u8>)>> {
+        if self.regions.borrow().is_empty() {
+            self.refresh_regions().await?;
+        }
+        let regions = self.regions.borrow();
+        let part_addrs = self.part_addrs.borrow();
+        let ps_details = self.ps_details.borrow();
+        let mut result: Vec<(u64, String, Vec<u8>, Vec<u8>)> = regions
+            .iter()
+            .map(|(_, region)| {
+                let addr = part_addrs
+                    .get(&region.part_id)
+                    .cloned()
+                    .or_else(|| ps_details.get(&region.ps_id).map(|d| d.address.clone()))
+                    .unwrap_or_default();
+                let (start_key, end_key) = region
+                    .rg
+                    .as_ref()
+                    .map(|r| (r.start_key.clone(), r.end_key.clone()))
+                    .unwrap_or_default();
+                (region.part_id, addr, start_key, end_key)
+            })
+            .collect();
+        result.sort_by_key(|(pid, _, _, _)| *pid);
+        Ok(result)
+    }
+
+    // ── Internal: PS call with routing retry ─────────────────────────────────
+
+    /// Resolve key to (part_id, ps_addr), call PS, retry with TiKV-style
+    /// backoff on failure.
+    ///
+    /// fix-2: same retry shape as `range()` so point queries
+    /// (get/put/delete/head/stream_put) absorb the same async-split
+    /// / async-merge convergence window. Pre-fix this had only ONE
+    /// retry with no backoff — adequate for stable steady state but
+    /// not for the post-split window where the right child takes
+    /// seconds to open. See module-level `refresh_backoff` doc for
+    /// the TiKV `NoJitterBackoff` derivation.
+    ///
+    /// The `build_payload` closure is invoked with `(part_id, region_epoch)`
+    /// so callers can stamp the epoch from the SDK's routing cache into
+    /// every request. After a refresh the closure is re-invoked with the
+    /// freshly-cached epoch.
+    async fn call_ps_for_key(
+        &self,
+        kind: CallKind,
+        key: &[u8],
+        msg_type: u8,
+        build_payload: impl Fn(u64, u64) -> Bytes,
+    ) -> std::result::Result<Bytes, AutumnError> {
+        let (result, applied) = self.call_ps_for_key_tracked(kind, key, msg_type, build_payload).await;
+        result.map_err(|e| settle_write_error(kind, applied, e))
+    }
+
+    /// `call_ps_for_key`, unsettled, with whether an attempt may have been
+    /// applied — for a caller that checks the answer's body and must settle
+    /// that error too.
+    async fn call_ps_for_key_tracked(
+        &self,
+        kind: CallKind,
+        key: &[u8],
+        msg_type: u8,
+        build_payload: impl Fn(u64, u64) -> Bytes,
+    ) -> (std::result::Result<Bytes, AutumnError>, bool) {
+        let mut any_applied = false;
+        let result = self
+            .call_ps_for_key_attempts(kind, key, msg_type, build_payload, None, &mut any_applied)
+            .await;
+        (result, any_applied)
+    }
+
+    /// `call_ps_for_key` for a value-separable request: `build_ctrl` is the
+    /// ctrl and `value` rides after it as its own iovec, never copied.
+    async fn call_ps_for_key_bulk(
+        &self,
+        kind: CallKind,
+        key: &[u8],
+        msg_type: u8,
+        build_ctrl: impl Fn(u64, u64) -> Bytes,
+        value: &Bytes,
+    ) -> std::result::Result<Bytes, AutumnError> {
+        let mut any_applied = false;
+        self.call_ps_for_key_attempts(kind, key, msg_type, build_ctrl, Some(value), &mut any_applied)
+            .await
+            .map_err(|e| settle_write_error(kind, any_applied, e))
+    }
+
+    async fn call_ps_for_key_attempts(
+        &self,
+        kind: CallKind,
+        key: &[u8],
+        msg_type: u8,
+        build_payload: impl Fn(u64, u64) -> Bytes,
+        tail: Option<&Bytes>,
+        any_applied: &mut bool,
+    ) -> std::result::Result<Bytes, AutumnError> {
+        let mut attempt: u32 = 0;
+        let mut last_err: Option<String> = None;
+        while attempt <= MAX_PS_REFRESHES {
+            let (part_id, ps_addr) = self
+                .resolve_key(key)
+                .await
+                .map_err(|e| AutumnError::RoutingError(e.to_string()))?;
+            let region_epoch = self.lookup_epoch_for_part(part_id);
+            // Fast-fail a stale conn within
+            // `first_attempt_effective_timeout(0)` instead of the full
+            // 30 s `rpc_timeout`. Subsequent attempts use the full
+            // budget against the freshly-reconnected listener.
+            let t = self.first_attempt_effective_timeout(attempt);
+            let payload = build_payload(part_id, region_epoch);
+            let outcome = match tail {
+                None => self.ps_call_on(kind.lane(), &ps_addr, msg_type, payload, t).await,
+                Some(value) => self.ps_call_bulk_multi(&ps_addr, msg_type, payload, vec![value.clone()], t).await,
+            };
+            match outcome {
+                Ok(b) => return Ok(b),
+                Err(e) => {
+                    let applied = kind != CallKind::Read && may_have_applied(&e);
+                    if applied && kind == CallKind::Conditional {
+                        return Err(conditional_outcome_unknown(e));
+                    }
+                    *any_applied |= applied;
+                    // PermissionDenied is TERMINAL on the data path —
+                    // refreshing routing can't grant access, so surface it
+                    // immediately instead of burning MAX_PS_REFRESHES and masking
+                    // it as ConnectionError. Unlike call_ps_for_part we
+                    // do NOT short-circuit PreconditionFailed / InvalidArgument
+                    // here: on the data path a FailedPrecondition is usually a
+                    // stale region_epoch that MUST refresh + retry.
+                    match e.downcast::<AutumnError>() {
+                        Ok(AutumnError::PermissionDenied(msg)) => {
+                            return Err(AutumnError::PermissionDenied(msg));
+                        }
+                        // D7 Layer-A: unregistered-namespace write is
+                        // TERMINAL — refreshing routing can't create the namespace
+                        // (same class as PermissionDenied above).
+                        Ok(AutumnError::NamespaceUnknown(msg)) => {
+                            return Err(AutumnError::NamespaceUnknown(msg));
+                        }
+                        Ok(ae) => last_err = Some(ae.to_string()),
+                        Err(other) => last_err = Some(other.to_string()),
+                    }
+                    if !self.refresh_and_backoff(&mut attempt).await {
+                        break;
+                    }
+                }
+            }
+        }
+        Err(self.routing_exhausted("ps_call", attempt, last_err))
+    }
+
+    /// How every routing-retry loop ends. ONE place, because the seven tails
+    /// were copy-pasted and a terminal condition reaching them must not be
+    /// classified seven different ways — which is exactly what happened to the
+    /// wire-version refusal, arriving as a `ConnectionError` with the server's
+    /// message buried in it.
+    fn routing_exhausted(&self, what: &str, attempt: u32, last_err: Option<String>) -> AutumnError {
+        if let Some(why) = self.wire_refused.borrow().clone() {
+            return AutumnError::WireVersionRefused(why);
+        }
+        AutumnError::ConnectionError(format!(
+            "{what} after {attempt} refreshes: {}",
+            last_err.unwrap_or_else(|| "unknown".to_string())
+        ))
+    }
+
+    /// One routing-retry step shared by all four PS-call loops
+    /// (`call_ps_for_key` / `call_ps_for_part` / `get_into` / `get_range_into`):
+    /// if the `MAX_PS_REFRESHES` budget is spent return `false` (the caller
+    /// breaks out of its loop); otherwise bump `attempt`, TiKV-style back off,
+    /// refresh the region cache, and return `true` to retry against the
+    /// (possibly re-resolved) routing.
+    async fn refresh_and_backoff(&self, attempt: &mut u32) -> bool {
+        // A wire-version refusal is the one failure no amount of refreshing can
+        // change: the version is compiled into this binary. Stop after the
+        // first attempt rather than spending the whole budget (~13 s) to arrive
+        // at the same answer. The attempt itself always happens, so a client
+        // refused for being ahead of its cluster retries — and succeeds — as
+        // soon as the cluster is deployed.
+        if self.wire_refused.borrow().is_some() {
+            return false;
+        }
+        if *attempt >= MAX_PS_REFRESHES {
+            return false;
+        }
+        *attempt += 1;
+        let sleep = refresh_backoff(*attempt);
+        if !sleep.is_zero() {
+            compio::time::sleep(sleep).await;
+        }
+        let _ = self.refresh_regions().await;
+        true
+    }
+
+    /// Resolve part_id to ps_addr, call PS, retry with TiKV-style
+    /// backoff on failure.
+    ///
+    /// `call_ps_for_part` for a multi-value bulk request. Same routing,
+    /// refresh and deterministic-error rules; the only difference is that the
+    /// values travel as their own iovecs instead of inside `payload`.
+    async fn call_ps_for_part_bulk(
+        &self,
+        kind: CallKind,
+        part_id: u64,
+        msg_type: u8,
+        ctrl: Bytes,
+        values: Vec<RegBytes>,
+    ) -> (std::result::Result<Bytes, AutumnError>, bool) {
+        let mut attempt: u32 = 0;
+        let mut last_err: Option<String> = None;
+        let mut any_applied = false;
+        while attempt <= MAX_PS_REFRESHES {
+            let ps_addr = match self.resolve_part_id(part_id).await {
+                Ok(addr) => addr,
+                Err(e) => return (Err(AutumnError::RoutingError(e.to_string())), any_applied),
+            };
+            // Same fast-fail-on-attempt-0 bound the inline batch path uses.
+            let t = self.first_attempt_effective_timeout(attempt);
+            match self
+                .ps_call_bulk_multi(&ps_addr, msg_type, ctrl.clone(), values.clone(), t)
+                .await
+            {
+                Ok(b) => return (Ok(b), any_applied),
+                Err(e) => {
+                    let applied = kind != CallKind::Read && may_have_applied(&e);
+                    if applied && kind == CallKind::Conditional {
+                        return (Err(conditional_outcome_unknown(e)), true);
+                    }
+                    any_applied |= applied;
+                    // Terminal, as in `call_ps_for_key_attempts`: refreshing routing
+                    // cannot grant access or create a namespace.
+                    match e.downcast::<AutumnError>() {
+                        Ok(
+                            ae @ (AutumnError::PreconditionFailed(_)
+                            | AutumnError::InvalidArgument(_)
+                            | AutumnError::ValueTooLarge { .. }
+                            | AutumnError::PermissionDenied(_)
+                            | AutumnError::NamespaceUnknown(_)),
+                        ) => {
+                            return (Err(ae), any_applied);
+                        }
+                        Ok(ae) => last_err = Some(ae.to_string()),
+                        Err(other) => last_err = Some(other.to_string()),
+                    }
+                    if !self.refresh_and_backoff(&mut attempt).await {
+                        break;
+                    }
+                }
+            }
+        }
+        (Err(self.routing_exhausted(&format!("ps_call_bulk(part {part_id})"), attempt, last_err)), any_applied)
+    }
+
+    /// `call_ps_for_part` for a request whose RESPONSE is value-separable —
+    /// the reply's ctrl and its raw tail come back separately, the tail already
+    /// in a pool buffer (received straight into it). Used by the batched
+    /// bulk read, where the tail holds every value at once.
+    async fn call_ps_for_part_pooled(
+        &self,
+        lane: Lane,
+        part_id: u64,
+        msg_type: u8,
+        payload: Bytes,
+    ) -> std::result::Result<autumn_rpc::client::BulkResp, AutumnError> {
+        let mut attempt: u32 = 0;
+        let mut last_err: Option<String> = None;
+        while attempt <= MAX_PS_REFRESHES {
+            let ps_addr = self
+                .resolve_part_id(part_id)
+                .await
+                .map_err(|e| AutumnError::RoutingError(e.to_string()))?;
+            let timeout = self.first_attempt_effective_timeout(attempt);
+            match self
+                .get_ps_client_with_timeout(&ps_addr, timeout)
+                .await
+            {
+                Ok(client) => {
+                    let call = client.call_into_pooled_on(lane, msg_type, payload.clone());
+                    // Cancel-safe like every other pooled call: a timed-out
+                    // call's buffer returns to the pool via the read loop.
+                    let outcome = match timeout {
+                        None => call.await,
+                        Some(t) => match compio::time::timeout(t, call).await {
+                            Ok(r) => r,
+                            Err(_) => Err(RpcError::Timeout(t)),
+                        },
+                    };
+                    match outcome {
+                        // A bulk reply is a normal FLAG_RESPONSE frame, so its
+                        // status arrives in `code` — NOT as an `Err` the routing
+                        // loop can see. Deterministic codes have to be converted
+                        // here or a caller's refresh-and-retry fallback is
+                        // unreachable: `get_many` keys its stale-epoch recovery
+                        // off `PreconditionFailed`, and without this every key in
+                        // the group surfaced an error on any split or merge
+                        // instead of being transparently retried.
+                        Ok(z) => match z.code {
+                            partition_rpc::CODE_PRECONDITION
+                            | partition_rpc::CODE_REGION_EPOCH_STALE => {
+                                // `z.message` is the ctrl read as text, which is
+                                // meaningless when the ctrl is a rkyv struct — so
+                                // say what happened rather than echo bytes.
+                                return Err(AutumnError::PreconditionFailed(
+                                    "region epoch stale".to_string(),
+                                ));
+                            }
+                            _ => return Ok(z),
+                        },
+                        Err(e) => {
+                            self.evict_ps_on_error(&ps_addr, &e);
+                            // Same rule as `call_ps_for_part`: a deterministic
+                            // failure (authz, malformed, misroute-to-nothing)
+                            // must not burn MAX_PS_REFRESHES of backoff before
+                            // the caller sees it.
+                            match rpc_status_to_error(e) {
+                                ae @ (AutumnError::PreconditionFailed(_)
+                                | AutumnError::InvalidArgument(_)
+                                | AutumnError::ValueTooLarge { .. }) => return Err(ae),
+                                ae => last_err = Some(ae.to_string()),
+                            }
+                        }
+                    }
+                }
+                Err(e) => last_err = Some(e.to_string()),
+            }
+            if !self.refresh_and_backoff(&mut attempt).await {
+                break;
+            }
+        }
+        Err(self.routing_exhausted(
+            &format!("ps_call_pooled(part {part_id})"),
+            attempt,
+            last_err,
+        ))
+    }
+
+    /// fix-2: same retry shape as `call_ps_for_key`. Admin ops
+    /// (split/compact/gc/flush) don't carry `region_epoch` on the
+    /// wire, but they CAN race the same post-split topology change
+    /// window — e.g. `compact <new_part_id>` issued immediately
+    /// after split can land while the new partition's part_addr
+    /// isn't registered yet.
+    async fn call_ps_for_part(
+        &self,
+        kind: CallKind,
+        part_id: u64,
+        msg_type: u8,
+        payload: Bytes,
+    ) -> std::result::Result<Bytes, AutumnError> {
+        let (result, applied) = self.call_ps_for_part_tracked(kind, part_id, msg_type, payload).await;
+        result.map_err(|e| settle_write_error(kind, applied, e))
+    }
+
+    /// `call_ps_for_part`, also saying whether an earlier attempt may have
+    /// been applied (`may_have_applied`) — a batch whose answer says an op was
+    /// not applied needs it: an attempt before may have been.
+    async fn call_ps_for_part_tracked(
+        &self,
+        kind: CallKind,
+        part_id: u64,
+        msg_type: u8,
+        payload: Bytes,
+    ) -> (std::result::Result<Bytes, AutumnError>, bool) {
+        let mut attempt: u32 = 0;
+        let mut last_err: Option<String> = None;
+        let mut any_applied = false;
+        while attempt <= MAX_PS_REFRESHES {
+            let ps_addr = match self.resolve_part_id(part_id).await {
+                Ok(addr) => addr,
+                Err(e) => return (Err(AutumnError::RoutingError(e.to_string())), any_applied),
+            };
+            // Same fast-fail-on-attempt-0 as call_ps_for_key.
+            let t = self.first_attempt_effective_timeout(attempt);
+            match self
+                .ps_call_on(kind.lane(), &ps_addr, msg_type, payload.clone(), t)
+                .await
+            {
+                Ok(b) => return (Ok(b), any_applied),
+                Err(e) => {
+                    let applied = kind != CallKind::Read && may_have_applied(&e);
+                    if applied && kind == CallKind::Conditional {
+                        return (Err(conditional_outcome_unknown(e)), true);
+                    }
+                    any_applied |= applied;
+                    // short-circuit DETERMINISTIC failures. Admin ops
+                    // (split/compact/gc/flush) are region_epoch-exempt, so a
+                    // FailedPrecondition here is never stale-routing — it's a
+                    // real precondition (e.g. "partition has overlapping keys",
+                    // "needs >= 2 keys") that refreshing routing cannot fix.
+                    // Surface it immediately instead of burning MAX_PS_REFRESHES
+                    // (~9 s of backoff). Only transient errors (routing miss /
+                    // NotFound from a not-yet-registered post-split partition /
+                    // connection) fall through to refresh + retry.
+                    match e.downcast::<AutumnError>() {
+                        Ok(
+                            ae @ (AutumnError::PreconditionFailed(_)
+                            | AutumnError::InvalidArgument(_)
+                            | AutumnError::ValueTooLarge { .. }),
+                        ) => {
+                            return (Err(ae), any_applied);
+                        }
+                        Ok(ae) => last_err = Some(ae.to_string()),
+                        Err(other) => last_err = Some(other.to_string()),
+                    }
+                    if !self.refresh_and_backoff(&mut attempt).await {
+                        break;
+                    }
+                }
+            }
+        }
+        (Err(self.routing_exhausted(&format!("ps_call(part {part_id})"), attempt, last_err)), any_applied)
+    }
+
+    // ── High-level SDK API ──────────────────────────────────────────────────
+
+    /// Put a key-value pair, durable through the extent-node group commit when
+    /// it returns. The value travels as the frame's tail straight from
+    /// `value`'s memory (`MSG_PUT`; RDMA on UCX for 64 KiB or more when that
+    /// memory is registered — see `alloc_value_buf` for which buffers are).
+    pub async fn put(
+        &self,
+        key: &[u8],
+        value: impl IntoValue,
+        opts: WriteOptions,
+    ) -> std::result::Result<(), AutumnError> {
+        let bound = self.binding.bind_key(key)?;
+        self.put_bound(&bound, value.into_value(), opts).await
+    }
+
+    /// `put` over an ALREADY-bound wire key; `raw()` / `rescope` views call
+    /// it with their own key transform. D7.
+    async fn put_bound(
+        &self,
+        key: &[u8],
+        value: RegBytes,
+        opts: WriteOptions,
+    ) -> std::result::Result<(), AutumnError> {
+        self.put_opts(key, value, opts.expires_at(), opts.lease, opts.evict_rank).await
+    }
+
+    /// Conditional write, decided on the PS in arrival order: when the key's
+    /// visible value equals `expected` (`None` = absent), write `value`
+    /// (`None` = delete the key) and return `true`; otherwise write nothing
+    /// and return `false`. `expected` is capped at 64 KiB; `value` has the
+    /// put cap and travels like a large put's. With `expected = None` the PS
+    /// only checks the key is there, without reading its value.
+    ///
+    /// A non-anonymous `opts.lease` is fence-checked BEFORE the comparison and
+    /// a raised floor is made durable even when the comparison fails, so a
+    /// call whose expectation cannot hold is a pure floor bump for the key's
+    /// partition; a stale epoch returns `AutumnError::Fenced`.
+    ///
+    /// An RPC error can leave the outcome unknown (`OutcomeUnknown`, never
+    /// retried here): a retry would compare against its own first attempt.
+    /// Callers that retry need a value unique to their attempt to tell their
+    /// own success from someone else's.
+    pub async fn compare_put(
+        &self,
+        key: &[u8],
+        expected: Option<&[u8]>,
+        value: Option<Bytes>,
+        opts: WriteOptions,
+    ) -> std::result::Result<bool, AutumnError> {
+        let cap = partition_rpc::MAX_COMPARE_PUT_BYTES;
+        if expected.is_some_and(|v| v.len() > cap) {
+            return Err(AutumnError::InvalidArgument(format!("compare_put expected exceeds {cap} bytes")));
+        }
+        let size = value.as_ref().map_or(0, Bytes::len) as u64;
+        if size > CLIENT_PUT_HARD_CAP {
+            return Err(AutumnError::ValueTooLarge { size, cap: CLIENT_PUT_HARD_CAP });
+        }
+        let key = self.binding.bind_key(key)?;
+        let (expires_at, lease) = (opts.expires_at(), opts.lease);
+        let response = self
+            .call_ps_for_key_bulk(
+                CallKind::Conditional,
+                &key,
+                partition_rpc::MSG_COMPARE_WRITE,
+                |part_id, region_epoch| {
+                    rkyv_encode(&partition_rpc::CompareWriteReq {
+                        part_id,
+                        region_epoch,
+                        key: key.clone(),
+                        expected: expected.map(<[u8]>::to_vec),
+                        delete: value.is_none(),
+                        expires_at,
+                        inode_hint: lease.inode_hint,
+                        lease_epoch: lease.lease_epoch,
+                    })
+                },
+                &value.clone().unwrap_or_default(),
+            )
+            .await?;
+        let response: PutResp = rkyv_decode(&response).map_err(AutumnError::ServerError)?;
+        match response.code {
+            partition_rpc::CODE_PRECONDITION => Ok(false),
+            partition_rpc::CODE_VALUE_TOO_LARGE => Err(AutumnError::ValueTooLarge { size, cap: 0 }),
+            code => check_ps_code(code, &response.message).map(|()| true),
+        }
+    }
+
+    /// Helper: convert a relative TTL (seconds from now) to an
+    /// absolute Unix-epoch `expires_at`. `0` is preserved (no expiry).
+    /// Used by the single-key `put` ttl convenience and by callers
+    /// preparing `put_many` items.
+    ///
+    /// `saturating_add`: an absurdly large `ttl_secs` that would overflow
+    /// `u64` epoch seconds saturates to `u64::MAX`, which the read-path expiry
+    /// check (`expires_at <= now`) treats as "never expires" — the safe reading
+    /// of "expire impossibly far in the future". (Without it, release-mode
+    /// wraparound could flip a huge TTL into instant-expiry or `0`/never; the
+    /// PyO3 `ttl_secs` arg is an unchecked `u64` from Python.)
+    pub(crate) fn ttl_to_expires_at(ttl_secs: u64) -> u64 {
+        if ttl_secs == 0 {
+            return 0;
+        }
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            .saturating_add(ttl_secs)
+    }
+
+    pub(crate) async fn put_opts(
+        &self,
+        key: &[u8],
+        value: RegBytes,
+        expires_at: u64,
+        lease: WriteLease,
+        evict_rank: u32,
+    ) -> std::result::Result<(), AutumnError> {
+        // Against the hard cap before sending; the PS answers its own (lower)
+        // cap in the reply body.
+        if value.len() as u64 > CLIENT_PUT_HARD_CAP {
+            return Err(AutumnError::ValueTooLarge {
+                size: value.len() as u64,
+                cap: CLIENT_PUT_HARD_CAP,
+            });
+        }
+        let mut any_applied = false;
+        self.put_attempts(key, value, expires_at, lease, evict_rank, &mut any_applied)
+            .await
+            .map_err(|e| settle_write_error(CallKind::Idempotent, any_applied, e))
+    }
+
+    async fn put_attempts(
+        &self,
+        key: &[u8],
+        value: RegBytes,
+        expires_at: u64,
+        lease: WriteLease,
+        evict_rank: u32,
+        any_applied: &mut bool,
+    ) -> std::result::Result<(), AutumnError> {
+        let key = key.to_vec();
+        let mut attempt: u32 = 0;
+        let mut last_err: Option<String> = None;
+        while attempt <= MAX_PS_REFRESHES {
+            let (part_id, ps_addr) = self
+                .resolve_key(&key)
+                .await
+                .map_err(|e| AutumnError::RoutingError(e.to_string()))?;
+            let region_epoch = self.lookup_epoch_for_part(part_id);
+            let meta = rkyv_encode(&PutReq {
+                part_id,
+                key: key.clone(),
+                expires_at,
+                region_epoch,
+                inode_hint: lease.inode_hint,
+                lease_epoch: lease.lease_epoch,
+                evict_rank,
+            });
+            let timeout = self.first_attempt_effective_timeout(attempt);
+            match self
+                .ps_call_bulk_multi(&ps_addr, partition_rpc::MSG_PUT, meta, vec![value.clone()], timeout)
+                .await
+            {
+                Ok(resp_bytes) => {
+                    let resp: PutResp = rkyv_decode(&resp_bytes).map_err(AutumnError::ServerError)?;
+                    match resp.code {
+                        partition_rpc::CODE_OK => return Ok(()),
+                        partition_rpc::CODE_VALUE_TOO_LARGE => {
+                            return Err(AutumnError::ValueTooLarge { size: value.len() as u64, cap: 0 });
+                        }
+                        // Epoch stale / frozen-for-merge → refresh + retry.
+                        partition_rpc::CODE_PRECONDITION
+                        | partition_rpc::CODE_REGION_EPOCH_STALE
+                        | partition_rpc::CODE_UNAVAILABLE => last_err = Some(resp.message),
+                        other => return Err(code_to_error(other, resp.message)),
+                    }
+                }
+                Err(e) => {
+                    *any_applied |= may_have_applied(&e);
+                    // Terminal, as in `call_ps_for_key_attempts`: refreshing
+                    // routing cannot grant access or create a namespace.
+                    match e.downcast::<AutumnError>() {
+                        Ok(AutumnError::PermissionDenied(msg)) => return Err(AutumnError::PermissionDenied(msg)),
+                        Ok(AutumnError::NamespaceUnknown(msg)) => return Err(AutumnError::NamespaceUnknown(msg)),
+                        Ok(ae) => last_err = Some(ae.to_string()),
+                        Err(other) => last_err = Some(other.to_string()),
+                    }
+                }
+            }
+            if !self.refresh_and_backoff(&mut attempt).await {
+                break;
+            }
+        }
+        Err(self.routing_exhausted("put", attempt, last_err))
+    }
+
+    /// Get a value by key. Returns None if not found.
+    pub async fn get(&self, key: &[u8]) -> std::result::Result<Option<Vec<u8>>, AutumnError> {
+        let bound = self.binding.bind_key(key)?;
+        self.get_bound(&bound).await
+    }
+
+    /// Internal: `get` over an ALREADY-bound wire key (no namespace binding).
+    /// D7 — see `put_bound`.
+    async fn get_bound(&self, key: &[u8]) -> std::result::Result<Option<Vec<u8>>, AutumnError> {
+        self.get_range_core(key, 0, 0).await
+    }
+
+    /// Get a sub-range of a value: bytes `[offset, offset+length)`.
+    /// `length == 0` means "from offset to the end of the value" (matches the
+    /// underlying `GetReq` semantics). Returns None if the key is not found.
+    ///
+    /// Served by `MSG_GET` through `get_range_pooled_bound`, with the same
+    /// refresh-and-retry classification as `call_ps_for_key`; a transport error
+    /// drops the cached PS connection.
+    pub async fn get_range(
+        &self,
+        key: &[u8],
+        offset: u32,
+        length: u32,
+    ) -> std::result::Result<Option<Vec<u8>>, AutumnError> {
+        let bound = self.binding.bind_key(key)?;
+        self.get_range_core(&bound, offset, length).await
+    }
+
+    /// Internal: `get_range` over an ALREADY-bound wire key (no namespace
+    /// binding). D7 — see `put_bound`.
+    async fn get_range_core(
+        &self,
+        key: &[u8],
+        offset: u32,
+        length: u32,
+    ) -> std::result::Result<Option<Vec<u8>>, AutumnError> {
+        // Served by `MSG_GET`: the PS sends the value as its own iovec and
+        // the read_loop receives it into a pooled buffer, so the returned `Vec`
+        // is the one application copy.
+        Ok(self
+            .get_range_pooled_bound(key, offset, length)
+            .await?
+            .map(|value| value.to_vec()))
+    }
+
+    /// GET with PS-bypass for large VP values: `MSG_GET` with `direct`; when
+    /// the PS answers with a position (a >= 64 KiB ValuePointer value), the
+    /// bytes are read STRAIGHT from an extent-node replica — the PS never
+    /// touches the data. Replica choice rotates by (extent, offset); failover
+    /// walks the rest. ANY direct-read failure (eversion bumped, extent GC'd,
+    /// replica down) falls back to the plain `get` — the position is an
+    /// optimization, never a correctness dependency.
+    pub async fn get_direct(
+        &self,
+        key: &[u8],
+    ) -> std::result::Result<Option<bytes::Bytes>, AutumnError> {
+        let key_v = self.binding.bind_key(key)?;
+        match self.get_direct_bound(&key_v, 0, 0).await? {
+            None => Ok(None),
+            Some(DirectGet::Value(v)) => Ok(Some(v.freeze().into_bytes())),
+            Some(DirectGet::Position(pos)) => {
+                if let Some(v) = self.read_position_with_stale_heal(&key_v, 0, 0, &pos, None).await? {
+                    return Ok(Some(v.unlanded()));
+                }
+                // All replicas failed → a plain read re-resolves through the
+                // PS (fresh VP after GC rewrite / fresh eversion after EC
+                // conversion).
+                Ok(self.get_range_pooled_bound(&key_v, 0, 0).await?.map(|v| v.freeze().into_bytes()))
+            }
+        }
+    }
+
+    /// `MSG_GET` with `direct` over an ALREADY-bound key: the value, or where
+    /// to read it. A position that does not decode is logged and the key read
+    /// again without `direct`, so a reply this build cannot read costs a round
+    /// trip, not the read.
+    async fn get_direct_bound(
+        &self,
+        key: &[u8],
+        offset: u32,
+        length: u32,
+    ) -> std::result::Result<Option<DirectGet>, AutumnError> {
+        let got = self
+            .get_bulk_bound(key, offset, length, true, "get_direct", |client, req, timeout| async move {
+                // Urgent: the request is small and usually answered with a
+                // position, so it should not queue behind large puts.
+                let call = client.call_into_pooled_on(Lane::Urgent, partition_rpc::MSG_GET, rkyv_encode(&req));
+                let z = match timeout {
+                    None => call.await,
+                    Some(t) => compio::time::timeout(t, call).await.unwrap_or(Err(RpcError::Timeout(t))),
+                }?;
+                Ok((z.code, z.message, (z.code, z.buf, z.ctrl)))
+            })
+            .await?;
+        Ok(match got {
+            None => None,
+            Some((partition_rpc::CODE_POSITION, _, ctrl)) => match rkyv_decode::<ValuePosition>(&ctrl) {
+                Ok(pos) => Some(DirectGet::Position(pos)),
+                Err(e) => {
+                    tracing::warn!(error = %e, "direct-read: undecodable position — reading through the PS");
+                    return Ok(self.get_range_pooled_bound(key, offset, length).await?.map(DirectGet::Value));
+                }
+            },
+            Some((_, buf, _)) => Some(DirectGet::Value(ValueBuf::from_pooled(buf))),
+        })
+    }
+
+    /// Serve a read from a position, healing the one known staleness mode.
+    /// The PS's `extent_info_cache` is pull-invalidated (the manager's EC flip
+    /// writes etcd, notifies nobody), so a PS that served the extent pre-flip
+    /// hands out a stale replicated position until something makes it
+    /// refetch. A read through the PS heals itself (`read_bytes_from_extent`
+    /// refetches on `EversionStale`); this gives the position path the same
+    /// cure, client-side: 1-byte read through the PS (it refetches as a side
+    /// effect) → ask for the position once more → read again. Any failure
+    /// returns `Ok(None)` and the caller reads through the PS; an extent node
+    /// refusing this client is `Err(PermissionDenied)`, with no fallback. One
+    /// heal per read. `key` is bound.
+    async fn read_position_with_stale_heal(
+        &self,
+        key: &[u8],
+        offset: u32,
+        length: u32,
+        first: &ValuePosition,
+        land: Option<LandAt<'_>>,
+    ) -> std::result::Result<Option<DirectValue>, AutumnError> {
+        Ok(match self.read_from_descriptor(first, land).await {
+            DirectReadOutcome::Value(v) => Some(v),
+            DirectReadOutcome::Failed => None,
+            DirectReadOutcome::Denied(m) => return Err(AutumnError::PermissionDenied(m)),
+            DirectReadOutcome::StaleLayout => {
+                static HEAL_ANNOUNCED: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !HEAL_ANNOUNCED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    tracing::info!(
+                        extent_id = first.extent_id,
+                        "direct read hit a pre-EC-conversion cached position; \
+                         healing with a 1-byte read through the PS + one more position"
+                    );
+                } else {
+                    tracing::debug!(
+                        extent_id = first.extent_id,
+                        "stale position; healing with a 1-byte read through the PS + one more position"
+                    );
+                }
+                // Best-effort: the probe heals the PS cache as a side effect.
+                if let Err(e) = self.get_range_pooled_bound(key, offset, 1).await {
+                    tracing::debug!(error = %e, "stale-position heal probe failed");
+                }
+                match self.get_direct_bound(key, offset, length).await {
+                    Ok(Some(DirectGet::Position(pos))) => match self.read_from_descriptor(&pos, land).await {
+                        DirectReadOutcome::Value(v) => Some(v),
+                        DirectReadOutcome::Denied(m) => return Err(AutumnError::PermissionDenied(m)),
+                        _ => None,
+                    },
+                    // The PS answered with the value itself this time.
+                    Ok(Some(DirectGet::Value(v))) => Some(DirectValue::Bytes(v.freeze().into_bytes())),
+                    _ => None,
+                }
+            }
+        })
+    }
+
+    /// Serve a read from whatever the descriptor turned out to describe.
+    ///
+    /// One entry point on purpose: the replicated and EC forms share a struct
+    /// and differ only by `ec_data_shards`, so a call site that reached for the
+    /// replicated reader directly would read shard bytes as a value. There are
+    /// three such call sites and this is the only thing they should call.
+    async fn read_from_descriptor(&self, resp: &ValuePosition, land: Option<LandAt<'_>>) -> DirectReadOutcome {
+        if resp.ec_data_shards > 0 {
+            return self.read_ec_shards(resp).await;
+        }
+        self.read_redirect_replicas(resp, land).await
+    }
+
+    /// Read a value out of an EC extent by fetching only the DATA SHARDS it
+    /// covers, straight from the nodes that hold them.
+    ///
+    /// No Reed-Solomon decode happens here, and that is not a shortcut: the
+    /// payload is a plain concatenation of the data shards, so a byte range is
+    /// a contiguous run of shard sub-ranges. Decoding is for RECONSTRUCTING a
+    /// shard whose node will not answer, which this cannot do — so any failure
+    /// returns `None` and the caller falls back to the partition server, which
+    /// can. That is also why the descriptor is refused up front when a shard's
+    /// node is Suspected: unlike a replicated read there is no second copy to
+    /// rotate to, and finding that out via a timeout is the expensive way.
+    async fn read_ec_shards(&self, resp: &ValuePosition) -> DirectReadOutcome {
+        let Some(plan) = ec_shard_plan(
+            resp.ec_sealed_length,
+            resp.ec_data_shards,
+            resp.value_offset,
+            resp.value_len,
+        ) else {
+            tracing::debug!(
+                extent_id = resp.extent_id,
+                sealed_length = resp.ec_sealed_length,
+                data_shards = resp.ec_data_shards,
+                offset = resp.value_offset,
+                len = resp.value_len,
+                "EC direct read: range not serviceable from data shards — proxying"
+            );
+            return DirectReadOutcome::Failed;
+        };
+        if plan.is_empty() {
+            return DirectReadOutcome::Value(DirectValue::Bytes(bytes::Bytes::new()));
+        }
+        if resp.replica_addrs.len() < resp.ec_data_shards as usize {
+            // Positional by shard index: a short list means some shard has no
+            // address and every index past the gap would name the wrong node.
+            tracing::warn!(
+                extent_id = resp.extent_id,
+                addrs = resp.replica_addrs.len(),
+                data_shards = resp.ec_data_shards,
+                "EC descriptor has fewer addresses than data shards — proxying \
+                 (positional mapping cannot be trusted)"
+            );
+            return DirectReadOutcome::Failed;
+        }
+        let futs = plan.iter().map(|&(shard, off, len)| async move {
+            autumn_stream::read_extent_shard_direct(
+                &self.en_pool,
+                &resp.replica_addrs[shard as usize],
+                resp.extent_id,
+                resp.eversion,
+                shard,
+                off,
+                len,
+            )
+            .await
+        });
+        let parts = fan_out_collect(futs, batch_get_concurrency()).await;
+        let mut out = bytes::BytesMut::with_capacity(resp.value_len as usize);
+        for (i, r) in parts.into_iter().enumerate() {
+            match r {
+                // Length is already exact — `read_extent_shard_direct` rejects a
+                // short read rather than returning it, because short bytes
+                // concatenated here would be silently wrong data, not an error.
+                Ok(b) => out.extend_from_slice(&b),
+                Err(e) => {
+                    if let Some(m) = en_refusal(&e) {
+                        return DirectReadOutcome::Denied(m);
+                    }
+                    let msg = format!("{e:#}");
+                    // Loud once, then debug — the same shape as the replicated
+                    // path's fallback warning, and for the same reason: falling
+                    // back is correct but SLOW, and on an EC-armed cluster this
+                    // is the path that carries the large reads. Without it the
+                    // degradation is invisible again, which is the state this
+                    // whole change exists to leave behind.
+                    if !EC_FALLBACK_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        tracing::warn!(
+                            extent_id = resp.extent_id,
+                            shard = plan[i].0,
+                            error = %e,
+                            "EC direct read fell back to the PS proxy (shard node not \
+                             client-reachable?) — large reads take the proxy path"
+                        );
+                    } else {
+                        tracing::debug!(
+                            extent_id = resp.extent_id,
+                            shard = plan[i].0,
+                            error = %e,
+                            "EC direct read failed on a shard — falling back to the PS proxy"
+                        );
+                    }
+                    if is_stale_layout_refusal(&msg) {
+                        return DirectReadOutcome::StaleLayout;
+                    }
+                    return DirectReadOutcome::Failed;
+                }
+            }
+        }
+        // One line the first time this works, then debug. Whether EC direct
+        // read is actually in play is otherwise unanswerable from outside: a
+        // decline and a success both end in correct bytes, so the only
+        // difference an operator can see is which machines did the work.
+        if !EC_DIRECT_ANNOUNCED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            tracing::info!(
+                extent_id = resp.extent_id,
+                data_shards = resp.ec_data_shards,
+                shards_read = plan.len(),
+                "EC direct read active: reading data shards straight from their nodes"
+            );
+        } else {
+            tracing::debug!(
+                extent_id = resp.extent_id,
+                shards_read = plan.len(),
+                "EC direct read"
+            );
+        }
+        DirectReadOutcome::Value(DirectValue::Bytes(out.freeze()))
+    }
+
+    /// Shared EN-direct-read replica loop for positions (`get_direct` +
+    /// `get_many_direct`). Reads the exact
+    /// byte range `[resp.value_offset, +resp.value_len)` from a replica, trying
+    /// them in a `(extent, value_offset)`-rotated order with failover. Returns
+    /// `Value` on the first success; `StaleLayout` when every replica refused
+    /// fast with a layout-staleness refusal and no timeout (the healable
+    /// pre-EC-conversion descriptor); `Failed` otherwise so the caller can
+    /// proxy-fall-back. Never a short read
+    /// (`read_extent_value_direct` treats `got < value_len` under CODE_OK as an
+    /// error → next replica → proxy).
+    ///
+    /// With `land`, a value that fits is read with `MSG_READ_AM` over UCX
+    /// (cluster at `WIRE_VERSION_WITH_READ_AM`), straight into that memory.
+    async fn read_redirect_replicas(&self, resp: &ValuePosition, land: Option<LandAt<'_>>) -> DirectReadOutcome {
+        let land = land.filter(|l| {
+            resp.value_len <= l.len as u64
+                && autumn_rpc::runtime_transport_is_ucx()
+                && self.negotiated_cluster_wire.get() >= autumn_rpc::WIRE_VERSION_WITH_READ_AM
+        });
+        let n = resp.replica_addrs.len();
+        if n == 0 {
+            return DirectReadOutcome::Failed;
+        }
+        let start = (resp.extent_id ^ (resp.value_offset << 32)) as usize % n;
+        let mut saw_timeout = false;
+        let mut saw_stale = false;
+        // Read-timeout storm: damp the retry on LIVENESS TIMEOUTS. The
+        // pre-fix loop walked ALL replicas at a fresh full (now size-scaled)
+        // deadline on any failure, then the caller ran a full proxy read — so a
+        // transient congestion event on one hot EN (the single-shard/replica[0]
+        // pinning) amplified into 566-646 timeouts + wasted EN egress. Now: on
+        // the FIRST timeout, try at most ONE more replica (the common
+        // single-dead-EN case where a sibling serves at full direct bandwidth);
+        // on the SECOND, stop and let the authoritative PS proxy fallback take
+        // over. FAST errors (eversion bump / GC'd / connect refusal) keep the
+        // full rotation — they're cheap and a sibling usually resolves them.
+        let mut timeouts = 0usize;
+        for i in 0..n {
+            let addr = &resp.replica_addrs[(start + i) % n];
+            let landed = match land {
+                // SAFETY: `LandAt`'s contract, and the read runs to completion
+                // before the next replica is tried.
+                Some(l) => unsafe {
+                    autumn_stream::read_extent_value_landed(
+                        &self.en_pool,
+                        addr,
+                        resp.extent_id,
+                        resp.eversion,
+                        resp.value_offset,
+                        resp.value_len,
+                        l.ptr,
+                        l.region,
+                    )
+                }
+                .await
+                .map(|got| match got {
+                    autumn_stream::Landed::In(n) => Some(n),
+                    autumn_stream::Landed::NotHere => None,
+                }),
+                None => Ok(None),
+            };
+            let read = match landed {
+                Ok(Some(n)) => Ok(DirectValue::Landed(n)),
+                Ok(None) => autumn_stream::read_extent_value_direct(
+                    &self.en_pool,
+                    addr,
+                    resp.extent_id,
+                    resp.eversion,
+                    resp.value_offset,
+                    resp.value_len,
+                )
+                .await
+                .map(DirectValue::Bytes),
+                Err(e) => Err(e),
+            };
+            match read {
+                Ok(v) => return DirectReadOutcome::Value(v),
+                Err(e) => {
+                    if let Some(m) = en_refusal(&e) {
+                        return DirectReadOutcome::Denied(m);
+                    }
+                    // A TIMEOUT is a liveness anomaly (dead endpoint /
+                    // stuck peer) that silently costs the op the full RPC
+                    // deadline — surface it at warn (UCX dead-endpoint stalls
+                    // were invisible precisely because this arm was
+                    // debug-only). Expected failover causes
+                    // (eversion bumped, extent GC'd, fast connect refusal)
+                    // stay at debug so routine EC/GC churn stays quiet.
+                    // "timed out" matches conn_pool's timeout message.
+                    let msg = format!("{e:#}");
+                    if msg.contains("timed out") {
+                        saw_timeout = true;
+                        timeouts += 1;
+                        tracing::warn!(
+                            extent_id = resp.extent_id,
+                            addr = %addr,
+                            error = %msg,
+                            "direct read TIMED OUT; trying next replica"
+                        );
+                        // Damp: 2 consecutive-ish timeouts = systemic
+                        // congestion; stop gambling deadlines → proxy fallback.
+                        if timeouts >= 2 {
+                            break;
+                        }
+                    } else {
+                        if is_stale_layout_refusal(&msg) {
+                            saw_stale = true;
+                        }
+                        tracing::debug!(
+                            extent_id = resp.extent_id,
+                            addr = %addr,
+                            error = %msg,
+                            "direct read failed; trying next replica"
+                        );
+                    }
+                }
+            }
+        }
+        // Fell out of the loop: every replica failed. The proxy fallback the
+        // caller runs hides that — leave a trace. Warn only when a liveness
+        // anomaly (timeout) was involved; an all-expected-errors sweep
+        // (eversion bump / EC conversion touching every replica) is routine
+        // and stays at debug.
+        if saw_timeout {
+            tracing::warn!(
+                extent_id = resp.extent_id,
+                replicas = n,
+                "direct read failed on ALL replicas (incl. timeout); falling back to PS proxy"
+            );
+        } else {
+            // default-ON: the FIRST proxy fallback WARNS (surfaces
+            // a topology where the ENs aren't client-reachable → direct-read is
+            // silently on the slow proxy path); later ones stay debug to avoid
+            // per-read spam. Correctness is unaffected — the proxy read is
+            // authoritative; this is a perf/topology signal only.
+            if !DIRECT_FALLBACK_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                tracing::warn!(
+                    extent_id = resp.extent_id,
+                    replicas = n,
+                    "direct-read fell back to PS proxy (ENs not client-reachable?) — large \
+                     reads use the proxy path; pass direct_read=false to disable"
+                );
+            } else {
+                tracing::debug!(
+                    extent_id = resp.extent_id,
+                    replicas = n,
+                    "direct read failed on ALL replicas; falling back to PS proxy"
+                );
+            }
+        }
+        // ALL-stale (no timeout) is the healable pre-EC-conversion descriptor.
+        if saw_stale && !saw_timeout {
+            return DirectReadOutcome::StaleLayout;
+        }
+        DirectReadOutcome::Failed
+    }
+
+    /// read one key's sub-range `[offset, offset+length)`
+    /// (`length == 0` = whole value) STRAIGHT from an EN into `dest`, with a
+    /// fallback through the PS — the per-item core of `get_many_direct`.
+    /// Returns `Some(value_len)` (`dest[..min(value_len, dest.len())]` filled)
+    /// or `None` if not found. `read_len = length>0 ? length : dest.len()`:
+    /// - `read_len < 64 KiB` (`!bulk_worthwhile`): a plain read — a small
+    ///   value never bypasses the PS (the EN connect would cost more than the
+    ///   copy it saves).
+    /// - `read_len >= 64 KiB`: `MSG_GET` with `direct`. A value is copied
+    ///   straight in; a position drives `read_position_with_stale_heal`; a
+    ///   failed direct read falls back to `get_range_into`.
+    async fn get_range_direct_into(
+        &self,
+        key: &[u8],
+        offset: u32,
+        length: u32,
+        dest: &mut [u8],
+    ) -> std::result::Result<Option<usize>, AutumnError> {
+        let read_len = if length > 0 { length as usize } else { dest.len() };
+        if !bulk_worthwhile(read_len) {
+            return self.get_range_into(key, offset, length, dest).await;
+        }
+        // D7: bind for the direct request; the fallback binds the user `key`
+        // itself, so a key is bound exactly ONCE per wire request.
+        let key_v = self.binding.bind_key(key)?;
+        match self.get_direct_bound(&key_v, offset, length).await? {
+            None => Ok(None),
+            Some(DirectGet::Value(v)) => Ok(Some(copy_into(dest, &v))),
+            Some(DirectGet::Position(pos)) => {
+                match self.read_position_with_stale_heal(&key_v, offset, length, &pos, None).await? {
+                    Some(v) => Ok(Some(copy_into(dest, &v.unlanded()))),
+                    None => self.get_range_into(key, offset, length, dest).await,
+                }
+            }
+        }
+    }
+
+    /// batched client direct-read — the batch mirror of `get_direct`, same
+    /// dest-based shape as `get_many_into`. One `MSG_BATCH_GET` with `direct`
+    /// per owning partition answers every item with its value or, for a
+    /// >= 64 KiB ValuePointer range, its position, which is read STRAIGHT from
+    /// an EN, taking the PS out of the large-value data path. Per item, ANY
+    /// direct-read failure falls back to a read through the PS — so it
+    /// degrades gracefully where ENs aren't client-reachable, which is why the
+    /// DECISION to call this vs `get_many_into` is a deploy-topology flag
+    /// OWNED BY THE FRONTEND (fuse `--direct-read`, python
+    /// `BatchClient(direct=…)`), never a hardcoded SDK default.
+    ///
+    /// Result `i` matches `items[i]`: `Ok(Some(n))` = value len
+    /// (`dest[..min(n, dest.len())]` filled), `Ok(None)` = not found, `Err` =
+    /// that item's RPC failed. Concurrency is the shared
+    /// `--batch-get-concurrency` sliding window (`fan_out_collect`).
+    ///
+    /// The direct EN read lands in a read_loop-owned pooled buffer
+    /// (`read_extent_value_direct`, cancel-safe → the size-scaled timeout +
+    /// replica failover are safe), then ONE memcpy into `dest`. The win over
+    /// `get_many_into` is not copy count but ROUTING: the PS NIC egress leaves
+    /// the large-value data path (cross-host).
+    pub async fn get_many_direct(
+        &self,
+        items: &mut [GetManyItem<'_>],
+    ) -> Vec<std::result::Result<Option<usize>, AutumnError>> {
+        let n = items.len();
+        // D7: bind each key ONCE for routing + the batched request. The
+        // per-item fallbacks take the ORIGINAL user key and bind it
+        // themselves, so a key is bound exactly once per wire request.
+        let bound_keys: Vec<Option<Vec<u8>>> =
+            items.iter().map(|it| self.binding.bind_key(it.key).ok()).collect();
+        let mut groups: std::collections::HashMap<u64, Vec<usize>> =
+            std::collections::HashMap::new();
+        for (i, bk) in bound_keys.iter().enumerate() {
+            let Some(bk) = bk else { continue };
+            if let Ok((pid, _addr)) = self.resolve_key(bk).await {
+                groups.entry(pid).or_default().push(i);
+            }
+        }
+        // One MSG_BATCH_GET per partition. A failed batch leaves its items
+        // empty and each is read on its own below.
+        let mut got: Vec<Option<BatchGot>> = (0..n).map(|_| None).collect();
+        let calls = groups.into_iter().map(|(part_id, idxs)| {
+            let req_items: Vec<partition_rpc::BatchGetItem> = idxs
+                .iter()
+                .map(|&i| partition_rpc::BatchGetItem {
+                    key: bound_keys[i].clone().expect("grouped keys are bound"),
+                    offset: items[i].offset,
+                    length: items[i].length,
+                })
+                .collect();
+            async move { (idxs, self.batch_get_part(part_id, req_items, true).await) }
+        });
+        for (idxs, result) in fan_out_collect(calls, batch_get_concurrency()).await {
+            match result {
+                Ok(answers) => {
+                    for (i, a) in idxs.into_iter().zip(answers) {
+                        got[i] = Some(a);
+                    }
+                }
+                Err(BatchGetFailed::Stale) => {
+                    tracing::debug!("direct-read: batch refused as stale — per-item reads")
+                }
+                Err(BatchGetFailed::All(e)) => {
+                    tracing::warn!(error = %e(), "direct-read: batch failed — per-item reads")
+                }
+            }
+        }
+        let futs = items.iter_mut().zip(got).zip(bound_keys).map(|((it, answer), bound)| {
+            let key: &[u8] = it.key;
+            let offset = it.offset;
+            let length = it.length;
+            let dest: &mut [u8] = &mut *it.dest;
+            async move {
+                match (answer, bound) {
+                    (Some(BatchGot::Value(v)), _) => Ok(Some(copy_into(dest, &v))),
+                    (Some(BatchGot::NotFound), _) => Ok(None),
+                    // Large with no position: its own read through the PS,
+                    // concurrent with the other items.
+                    (Some(BatchGot::Declined), _) => self.get_range_into(key, offset, length, dest).await,
+                    (Some(BatchGot::Position(pos)), Some(bound)) => {
+                        match self.read_position_with_stale_heal(&bound, offset, length, &pos, None).await? {
+                            Some(v) => Ok(Some(copy_into(dest, &v.unlanded()))),
+                            None => self.get_range_into(key, offset, length, dest).await,
+                        }
+                    }
+                    _ => self.get_range_direct_into(key, offset, length, dest).await,
+                }
+            }
+        });
+        fan_out_collect(futs, batch_get_concurrency()).await
+    }
+
+    /// `get_many_direct` for whole values received into each item's memory.
+    /// A value read from an extent node lands there over UCX (`MSG_READ_AM`;
+    /// without a copy when `region` holds the memory); every read through the
+    /// PS is `get_range_into_raw`. Result `i` matches `items[i]` as in
+    /// `get_many_into_raw`.
+    ///
+    /// # Safety
+    /// As `get_range_into_raw`, for every item.
+    pub async unsafe fn get_many_direct_raw(
+        &self,
+        items: &[RawGetItem<'_>],
+        region: Option<&std::sync::Arc<autumn_rpc::Region>>,
+    ) -> Vec<std::result::Result<Option<usize>, AutumnError>> {
+        let n = items.len();
+        let bound_keys: Vec<Option<Vec<u8>>> = items.iter().map(|it| self.binding.bind_key(it.key).ok()).collect();
+        let mut groups: std::collections::HashMap<u64, Vec<usize>> = std::collections::HashMap::new();
+        for (i, bk) in bound_keys.iter().enumerate() {
+            let Some(bk) = bk else { continue };
+            if let Ok((pid, _addr)) = self.resolve_key(bk).await {
+                groups.entry(pid).or_default().push(i);
+            }
+        }
+        let mut got: Vec<Option<BatchGot>> = (0..n).map(|_| None).collect();
+        let calls = groups.into_iter().map(|(part_id, idxs)| {
+            let req_items: Vec<partition_rpc::BatchGetItem> = idxs
+                .iter()
+                .map(|&i| partition_rpc::BatchGetItem {
+                    key: bound_keys[i].clone().expect("grouped keys are bound"),
+                    offset: 0,
+                    length: 0,
+                })
+                .collect();
+            async move { (idxs, self.batch_get_part(part_id, req_items, true).await) }
+        });
+        for (idxs, result) in fan_out_collect(calls, batch_get_concurrency()).await {
+            match result {
+                Ok(answers) => {
+                    for (i, a) in idxs.into_iter().zip(answers) {
+                        got[i] = Some(a);
+                    }
+                }
+                Err(BatchGetFailed::Stale) => {
+                    tracing::debug!("direct-read: batch refused as stale — per-item reads")
+                }
+                Err(BatchGetFailed::All(e)) => {
+                    tracing::warn!(error = %e(), "direct-read: batch failed — per-item reads")
+                }
+            }
+        }
+        let futs = items.iter().zip(got).zip(bound_keys).map(|((it, answer), bound)| async move {
+            let land = LandAt { ptr: it.ptr, len: it.len, region };
+            // SAFETY (every arm): the caller's contract for `it`.
+            match (answer, bound) {
+                (Some(BatchGot::Value(v)), _) => Ok(Some(unsafe { copy_into_raw(it.ptr, it.len, &v) })),
+                (Some(BatchGot::NotFound), _) => Ok(None),
+                (Some(BatchGot::Declined), _) => unsafe { self.get_range_into_raw(it.key, it.ptr, it.len, region) }.await,
+                (Some(BatchGot::Position(pos)), Some(bound)) => unsafe { self.position_into_raw(it.key, &bound, &pos, land) }.await,
+                _ => unsafe { self.get_direct_into_raw(it.key, land) }.await,
+            }
+        });
+        fan_out_collect(futs, batch_get_concurrency()).await
+    }
+
+    /// One whole value of `get_many_direct_raw` read on its own: `MSG_GET`
+    /// with `direct`, then the position or the value.
+    ///
+    /// # Safety
+    /// As `get_range_into_raw`, for `land`'s memory.
+    async unsafe fn get_direct_into_raw(
+        &self,
+        key: &[u8],
+        land: LandAt<'_>,
+    ) -> std::result::Result<Option<usize>, AutumnError> {
+        if !bulk_worthwhile(land.len) {
+            return unsafe { self.get_range_into_raw(key, land.ptr, land.len, land.region) }.await;
+        }
+        let key_v = self.binding.bind_key(key)?;
+        match self.get_direct_bound(&key_v, 0, 0).await? {
+            None => Ok(None),
+            Some(DirectGet::Value(v)) => Ok(Some(unsafe { copy_into_raw(land.ptr, land.len, v.as_ref()) })),
+            Some(DirectGet::Position(pos)) => unsafe { self.position_into_raw(key, &key_v, &pos, land) }.await,
+        }
+    }
+
+    /// A whole value at `pos` into `land`'s memory, from an extent node, else
+    /// through the PS. `bound` is `key` bound.
+    ///
+    /// # Safety
+    /// As `get_range_into_raw`, for `land`'s memory.
+    async unsafe fn position_into_raw(
+        &self,
+        key: &[u8],
+        bound: &[u8],
+        pos: &ValuePosition,
+        land: LandAt<'_>,
+    ) -> std::result::Result<Option<usize>, AutumnError> {
+        match self.read_position_with_stale_heal(bound, 0, 0, pos, Some(land)).await? {
+            Some(DirectValue::Landed(n)) => Ok(Some(n)),
+            Some(DirectValue::Bytes(v)) => Ok(Some(unsafe { copy_into_raw(land.ptr, land.len, &v) })),
+            None => unsafe { self.get_range_into_raw(key, land.ptr, land.len, land.region) }.await,
+        }
+    }
+
+    /// One `MSG_BATCH_GET` to one partition: an answer per item, in order.
+    /// Values are slices of the reply's one pool buffer.
+    async fn batch_get_part(
+        &self,
+        part_id: u64,
+        items: Vec<partition_rpc::BatchGetItem>,
+        direct: bool,
+    ) -> std::result::Result<Vec<BatchGot>, BatchGetFailed> {
+        let n = items.len();
+        let payload = rkyv_encode(&partition_rpc::BatchGetReq {
+            part_id,
+            region_epoch: self.lookup_epoch_for_part(part_id),
+            direct,
+            items,
+        });
+        // The values come back in the reply's raw tail (one pool buffer,
+        // RDMA'd into on UCX) with only statuses, lengths and positions in
+        // ctrl.
+        // A batch that may answer with positions is small, and rides the
+        // urgent lane past queued large puts, as reads that probe do.
+        let lane = if direct { Lane::Urgent } else { Lane::Normal };
+        let z = match self.call_ps_for_part_pooled(lane, part_id, partition_rpc::MSG_BATCH_GET, payload).await {
+            Ok(z) => z,
+            Err(AutumnError::PreconditionFailed(_)) => return Err(BatchGetFailed::Stale),
+            Err(e) => {
+                let s = e.to_string();
+                return Err(BatchGetFailed::All(Box::new(move || AutumnError::ConnectionError(s.clone()))));
+            }
+        };
+        let ctrl: partition_rpc::BatchGetCtrl = match rkyv_decode(&z.ctrl) {
+            Ok(c) => c,
+            Err(e) => return Err(BatchGetFailed::All(Box::new(move || AutumnError::ServerError(e.clone())))),
+        };
+        if z.code != partition_rpc::CODE_OK {
+            let (code, message) = (z.code, ctrl.message);
+            return Err(BatchGetFailed::All(Box::new(move || code_to_error(code, message.clone()))));
+        }
+        // Shape checks, because the values are only findable through ctrl:
+        // one status per item, lengths that account for exactly the tail that
+        // arrived, a position per position status. Any mismatch means the two
+        // halves of the reply disagree, and a wrong split would hand back
+        // another key's bytes as if they were this one's.
+        let tail = bytes::Bytes::from_owner(z.buf);
+        let declared: usize = ctrl.value_lens.iter().map(|l| *l as usize).sum();
+        let positioned = ctrl.statuses.iter().filter(|&&s| s == partition_rpc::BATCH_GET_POSITION).count();
+        if ctrl.statuses.len() != n
+            || ctrl.value_lens.len() != n
+            || declared != tail.len()
+            || positioned != ctrl.positions.len()
+        {
+            let mismatch = format!(
+                "batch get: {} statuses / {} lens / {declared} declared bytes / {} positions for {n} \
+                 items, {positioned} positioned, and a {}-byte tail",
+                ctrl.statuses.len(),
+                ctrl.value_lens.len(),
+                ctrl.positions.len(),
+                tail.len(),
+            );
+            return Err(BatchGetFailed::All(Box::new(move || AutumnError::ServerError(mismatch.clone()))));
+        }
+        let mut positions = ctrl.positions.into_iter();
+        let mut off = 0usize;
+        Ok(ctrl
+            .statuses
+            .iter()
+            .zip(&ctrl.value_lens)
+            .map(|(&status, &len)| {
+                let len = len as usize;
+                let value = tail.slice(off..off + len);
+                off += len;
+                match status {
+                    partition_rpc::BATCH_GET_FOUND => BatchGot::Value(value),
+                    partition_rpc::BATCH_GET_NOT_FOUND => BatchGot::NotFound,
+                    partition_rpc::BATCH_GET_POSITION => {
+                        BatchGot::Position(positions.next().expect("counted above"))
+                    }
+                    partition_rpc::BATCH_GET_DECLINED => BatchGot::Declined,
+                    s => BatchGot::Error(s),
+                }
+            })
+            .collect())
+    }
+
+    /// bulk GET: read a key's value into `dest` with ONE copy. The value is
+    /// recv'd into a read_loop-owned RegPool buffer (`MSG_GET` +
+    /// `RpcClient::call_into_pooled` — the UCX Stream unpack or, for TCP
+    /// ≥ 64 KiB, the kernel copy lands in the pool buffer, no FrameDecoder
+    /// accumulation) and then copied once into `dest`. Returns
+    /// `Some(value_len)`; `dest[..value_len.min(dest.len())]` is filled —
+    /// `value_len > dest.len()` means the value was TRUNCATED to fit (the
+    /// same contract as `get_many_into` / `get_many_direct`). `None` = not
+    /// found.
+    ///
+    /// Honors `rpc_timeout` — the pooled recv is cancel-safe (a timed-out
+    /// call's buffer returns to the pool), so this is a bounded RPC like
+    /// every other SDK call. (The old recv-into-caller-dest primitive,
+    /// `call_into_dest`, forbade any per-call timeout and was removed.)
+    pub async fn get_into(
+        &self,
+        key: &[u8],
+        dest: &mut [u8],
+    ) -> std::result::Result<Option<usize>, AutumnError> {
+        self.get_range_into(key, 0, 0, dest).await
+    }
+
+    /// Sub-range variant of [`get_into`] — reads bytes `[offset, offset+length)`
+    /// (`length == 0` = whole value) into `dest`: [`get_range_pooled`] + ONE
+    /// memcpy. Use this shape only when the bytes must land at YOUR address
+    /// (sglang page / torch tensor / python buffer / an assembly buffer);
+    /// address-unconstrained callers should use `get_range_pooled` directly
+    /// and skip the copy. `get_into(key, dest)` is exactly
+    /// `get_range_into(key, 0, 0, dest)`. Used by `get_many_into` and by
+    /// sub-range callers (fuse / ioring) that route per key.
+    ///
+    /// [`get_range_pooled`]: ClusterClient::get_range_pooled
+    pub async fn get_range_into(
+        &self,
+        key: &[u8],
+        offset: u32,
+        length: u32,
+        dest: &mut [u8],
+    ) -> std::result::Result<Option<usize>, AutumnError> {
+        match self.get_range_pooled(key, offset, length).await? {
+            None => Ok(None),
+            Some(vb) => {
+                let n = vb.len().min(dest.len());
+                dest[..n].copy_from_slice(&vb[..n]);
+                Ok(Some(vb.len()))
+            }
+        }
+    }
+
+    /// bulk GET, zero SDK-side copies: the value arrives in a read_loop-owned
+    /// RegPool buffer (`MSG_GET` + `RpcClient::call_into_pooled` — the UCX
+    /// Stream unpack or TCP kernel copy is the only copy) and is handed
+    /// straight back as a [`ValueBuf`]. Read it in place,
+    /// or `freeze()` into a `Bytes` for a framework sink; dropping either
+    /// returns the slab to the pool. `None` = not found.
+    ///
+    /// This is the address-UNCONSTRAINED read shape ("I just want the
+    /// value"); when the bytes must land at a specific address use
+    /// [`get_into`](ClusterClient::get_into) (one documented memcpy).
+    /// Any value size is fine — sub-64 KiB responses simply take the decode
+    /// path into a plain pool buffer.
+    pub async fn get_pooled(
+        &self,
+        key: &[u8],
+    ) -> std::result::Result<Option<ValueBuf>, AutumnError> {
+        self.get_range_pooled(key, 0, 0).await
+    }
+
+    /// Sub-range variant of [`get_pooled`](ClusterClient::get_pooled) — the
+    /// CORE every bulk read routes through. Reads bytes `[offset,
+    /// offset+length)` (`length == 0` = whole value / to-end). Same routing +
+    /// epoch-stale refresh + RPC retry shape as `call_ps_for_key`; honors
+    /// `rpc_timeout` (the pooled recv is cancel-safe — a timed-out call's
+    /// buffer returns to the pool).
+    pub async fn get_range_pooled(
+        &self,
+        key: &[u8],
+        offset: u32,
+        length: u32,
+    ) -> std::result::Result<Option<ValueBuf>, AutumnError> {
+        let key = self.binding.bind_key(key)?;
+        self.get_range_pooled_bound(&key, offset, length).await
+    }
+
+    /// `get_range_pooled` over an ALREADY-bound wire key. Every point read
+    /// comes through here, `get`/`get_range` included, so all of them share
+    /// one retry classification — the same as `call_ps_for_key`: NotFound is
+    /// a miss, PermissionDenied/NamespaceUnknown are terminal, and every other
+    /// refusal (stale epoch, GC-pinned extent, internal error) refreshes
+    /// routing and retries.
+    async fn get_range_pooled_bound(
+        &self,
+        key: &[u8],
+        offset: u32,
+        length: u32,
+    ) -> std::result::Result<Option<ValueBuf>, AutumnError> {
+        // A timed-out call's pool buffer returns to the pool via the read_loop.
+        self.get_bulk_bound(key, offset, length, false, "get_range_pooled", |client, req, timeout| async move {
+            let call = client.call_into_pooled(partition_rpc::MSG_GET, rkyv_encode(&req));
+            let z = match timeout {
+                None => call.await,
+                Some(t) => compio::time::timeout(t, call).await.unwrap_or(Err(RpcError::Timeout(t))),
+            }?;
+            Ok((z.code, z.message, ValueBuf::from_pooled(z.buf)))
+        })
+        .await
+    }
+
+    /// A `MSG_GET` with routing, epoch-stale refresh and retries; `call` makes
+    /// one attempt of `req` on a connection and returns `(code, message,
+    /// value)`. `direct` asks for a position, which counts as an answer.
+    async fn get_bulk_bound<T, F, Fut>(
+        &self,
+        key: &[u8],
+        offset: u32,
+        length: u32,
+        direct: bool,
+        what: &str,
+        mut call: F,
+    ) -> std::result::Result<Option<T>, AutumnError>
+    where
+        F: FnMut(Rc<RpcClient>, GetReq, Option<Duration>) -> Fut,
+        Fut: std::future::Future<Output = std::result::Result<(u8, String, T), RpcError>>,
+    {
+        let mut attempt: u32 = 0;
+        let mut last_err: Option<String> = None;
+        while attempt <= MAX_PS_REFRESHES {
+            let (part_id, ps_addr) = self
+                .resolve_key(key)
+                .await
+                .map_err(|e| AutumnError::RoutingError(e.to_string()))?;
+            let region_epoch = self.lookup_epoch_for_part(part_id);
+            let req = GetReq {
+                part_id,
+                key: key.to_vec(),
+                offset,
+                length,
+                region_epoch,
+                direct,
+            };
+            let timeout = self.first_attempt_effective_timeout(attempt);
+            match self
+                .get_ps_client_with_timeout(&ps_addr, timeout)
+                .await
+            {
+                Ok(client) => {
+                    match call(client, req, timeout).await {
+                        Ok((code, message, value)) => match code {
+                            partition_rpc::CODE_OK | partition_rpc::CODE_POSITION => return Ok(Some(value)),
+                            partition_rpc::CODE_NOT_FOUND => return Ok(None),
+                            // Stale epoch, GC-pinned extent, internal error:
+                            // refresh + retry, as `call_ps_for_key` does for
+                            // the same refusals.
+                            other => last_err = Some(code_to_error(other, message).to_string()),
+                        },
+                        Err(e) => {
+                            self.evict_ps_on_error(&ps_addr, &e);
+                            // Frame-level error or transport failure.
+                            match rpc_status_to_error(e) {
+                                // TERMINAL — retrying can't grant access /
+                                // create the namespace (same classification as
+                                // call_ps_for_key).
+                                AutumnError::PermissionDenied(m) => {
+                                    return Err(AutumnError::PermissionDenied(m))
+                                }
+                                AutumnError::NamespaceUnknown(m) => {
+                                    return Err(AutumnError::NamespaceUnknown(m))
+                                }
+                                // Frame-level FailedPrecondition = stale-epoch
+                                // class → refresh + retry on a healthy conn.
+                                AutumnError::PreconditionFailed(m) => {
+                                    last_err = Some(m);
+                                }
+                                other => {
+                                    last_err = Some(other.to_string());
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(e) => last_err = Some(e.to_string()),
+            }
+            if !self.refresh_and_backoff(&mut attempt).await {
+                break;
+            }
+        }
+        Err(self.routing_exhausted(what, attempt, last_err))
+    }
+
+    /// `get_range_into` whose value is received into `[ptr, ptr + len)`. Over
+    /// UCX that is without a copy only when `region` (registered by the
+    /// caller) holds the memory; otherwise the value lands in a pool buffer
+    /// and is copied in, since UCX never registers memory itself. A value
+    /// longer than `len` is received into a pool buffer and its first `len`
+    /// bytes copied, as `get_range_into` does. Returns the value's length.
+    ///
+    /// # Safety
+    /// `[ptr, ptr + len)` must be valid for writes and touched by nobody else
+    /// until the returned future completes, and the future must be run to
+    /// completion: dropped early, a receive may still write the memory.
+    pub async unsafe fn get_range_into_raw(
+        &self,
+        key: &[u8],
+        ptr: *mut u8,
+        len: usize,
+        region: Option<&std::sync::Arc<autumn_rpc::Region>>,
+    ) -> std::result::Result<Option<usize>, AutumnError> {
+        let key = self.binding.bind_key(key)?;
+        // Over UCX the value can come as an active message, moved by
+        // rendezvous into the memory or a pool buffer (`MSG_GET_AM`).
+        let am = autumn_rpc::runtime_transport_is_ucx()
+            && self.negotiated_cluster_wire.get() >= autumn_rpc::WIRE_VERSION_WITH_GET_AM;
+        let got = self
+            .get_bulk_bound(&key, 0, 0, false, "get_range_into_raw", |client, req, timeout| async move {
+                if am {
+                    // SAFETY: as below.
+                    if let Some(r) = unsafe { get_am_attempt(&client, &req, ptr, len, region, timeout) }.await? {
+                        return Ok(r);
+                    }
+                }
+                // SAFETY: the caller's contract; the previous attempt's
+                // `call_into_dest` returned, so nothing else holds the memory.
+                let (dest, released) = unsafe { autumn_rpc::RecvDest::new(ptr, len) };
+                let r = client
+                    .call_into_dest(partition_rpc::MSG_GET, rkyv_encode(&req), dest, released, timeout)
+                    .await?;
+                Ok((r.code, r.message, (r.value_len, r.spill)))
+            })
+            .await?;
+        Ok(got.map(|(value_len, spill)| {
+            if let Some(pb) = spill {
+                let n = len.min(pb.len());
+                // SAFETY: the caller's contract.
+                unsafe { std::slice::from_raw_parts_mut(ptr, n) }.copy_from_slice(&pb.as_ref()[..n]);
+            }
+            value_len
+        }))
+    }
+
+    /// batched point reads — the ONE client-side fan-out primitive. (Its first
+    /// branch delegates the homogeneous-small case to `get_many`, which IS
+    /// server-batched; everything else fans out per key from here.) All
+    /// batch-read callers route through this:
+    /// the python `BatchClient` (kvcache), fuse `read::execute`, and the io_uring
+    /// daemon. Each item is read concurrently (sliding window of `concurrency` —
+    /// callers pass `--batch-get-concurrency` or their own tuned cap, e.g.
+    /// python's `per_worker_cap`) over the per-partition multiplexed PS
+    /// connections, amortising per-call await latency + letting the writer_task
+    /// batch syscalls. Every per-key read is `get_range_into` (`MSG_GET`,
+    /// pooled recv — the transport's receive copy lands in the pool buffer —
+    /// then one copy into `dest`), whatever the size.
+    /// Result `i` matches `items[i]`: `Ok(Some(n))` = value len
+    /// (`dest[..n.min(dest.len())]` filled; `n > dest.len()` ⇒ truncated to fit),
+    /// `Ok(None)` = not found, `Err` = that item's RPC failed (others still ran).
+    pub async fn get_many_into(
+        &self,
+        items: &mut [GetManyItem<'_>],
+    ) -> Vec<std::result::Result<Option<usize>, AutumnError>> {
+        // Homogeneous small whole-value case → `get_many`, i.e. one
+        // server-batched frame per partition (measured 4× lower read p99 on
+        // loopback). Conditions: every item is a whole-value read
+        // (offset == 0 && length == 0) whose dest is below the bulk
+        // threshold. Mixed / range / large-bulk inputs fall through to
+        // the per-op fan_out which keeps the bulk pooled-receive path.
+        let homogeneous_small = !items.is_empty()
+            && items
+                .iter()
+                .all(|it| it.offset == 0 && it.length == 0 && !bulk_worthwhile(it.dest.len()));
+        if homogeneous_small {
+            let keys: Vec<&[u8]> = items.iter().map(|it| it.key).collect();
+            let resp = self.get_many(&keys).await;
+            // Copy each response into its dest in input order; the
+            // dest mutable borrow is taken per-iteration so each
+            // dest gets its own `&mut` slice.
+            let mut out: Vec<std::result::Result<Option<usize>, AutumnError>> =
+                Vec::with_capacity(items.len());
+            for (it, r) in items.iter_mut().zip(resp.into_iter()) {
+                match r {
+                    Ok(Some(v)) => {
+                        let n = v.len().min(it.dest.len());
+                        it.dest[..n].copy_from_slice(&v[..n]);
+                        out.push(Ok(Some(v.len())));
+                    }
+                    Ok(None) => out.push(Ok(None)),
+                    Err(e) => out.push(Err(e)),
+                }
+            }
+            return out;
+        }
+        let concurrency = batch_get_concurrency();
+        let futs = items.iter_mut().map(|it| {
+            let key: &[u8] = it.key;
+            let offset = it.offset;
+            let length = it.length;
+            let dest: &mut [u8] = &mut *it.dest;
+            async move { self.get_range_into(key, offset, length, dest).await }
+        });
+        fan_out_collect(futs, concurrency).await
+    }
+
+    /// `get_many_into` for whole values received straight into each item's
+    /// memory (`get_range_into_raw`). Small values are read in one batched
+    /// request per partition and copied, as `get_many_into` does.
+    ///
+    /// # Safety
+    /// As `get_range_into_raw`, for every item.
+    pub async unsafe fn get_many_into_raw(
+        &self,
+        items: &[RawGetItem<'_>],
+        region: Option<&std::sync::Arc<autumn_rpc::Region>>,
+    ) -> Vec<std::result::Result<Option<usize>, AutumnError>> {
+        if !items.is_empty() && items.iter().all(|it| !bulk_worthwhile(it.len)) {
+            let keys: Vec<&[u8]> = items.iter().map(|it| it.key).collect();
+            let resp = self.get_many(&keys).await;
+            return items
+                .iter()
+                .zip(resp)
+                .map(|(it, r)| {
+                    r.map(|v| {
+                        v.map(|v| {
+                            let n = v.len().min(it.len);
+                            // SAFETY: the caller's contract.
+                            unsafe { std::slice::from_raw_parts_mut(it.ptr, n) }.copy_from_slice(&v[..n]);
+                            v.len()
+                        })
+                    })
+                })
+                .collect();
+        }
+        let futs = items.iter().map(|it| unsafe { self.get_range_into_raw(it.key, it.ptr, it.len, region) });
+        fan_out_collect(futs, batch_get_concurrency()).await
+    }
+
+    /// Batched put, result `i` for `items[i]` (`Err` = that item failed;
+    /// the others still ran). Values of 64 KiB or more each go as their own
+    /// `MSG_PUT`; smaller ones are packed into one `MSG_BATCH_PUT` per owning
+    /// partition. A key
+    /// written twice keeps the later value. `opts` (TTL, lease, eviction
+    /// rank) applies to every item.
+    pub async fn put_many<V: Clone + Into<RegBytes>>(
+        &self,
+        items: &[(&[u8], V)],
+        opts: WriteOptions,
+    ) -> Vec<std::result::Result<(), AutumnError>> {
+        let ranks = vec![opts.evict_rank; items.len()];
+        self.put_many_ranked(items, &ranks, opts).await
+    }
+
+    /// `put_many` with item `i`'s eviction rank `ranks[i]` in place of
+    /// `opts.evict_rank` (`WriteOptions::evict_rank`).
+    pub async fn put_many_ranked<V: Clone + Into<RegBytes>>(
+        &self,
+        items: &[(&[u8], V)],
+        ranks: &[u32],
+        opts: WriteOptions,
+    ) -> Vec<std::result::Result<(), AutumnError>> {
+        if items.len() != ranks.len() {
+            let why = format!("{} items, {} eviction ranks", items.len(), ranks.len());
+            return items.iter().map(|_| Err(AutumnError::InvalidArgument(why.clone()))).collect();
+        }
+        let items: Vec<(&[u8], RegBytes)> = items.iter().map(|(k, v)| (*k, v.clone().into())).collect();
+        self.batch_put(&items, ranks, opts.expires_at(), opts.lease).await
+    }
+
+    /// **The batched-read API that does not require caller-owned
+    /// dest buffers.** Mirror of `put_many`. SDK allocates a
+    /// `Vec<u8>` per returned value; result `i` matches `keys[i]`.
+    ///
+    /// Wire: one `MSG_BATCH_GET` per owning partition — keys in ctrl, and
+    /// every value back in the reply's raw tail rather than inside the rkyv
+    /// response. The PS serves it on the ps-conn task, next to `MSG_GET`,
+    /// so a batched read no longer queues behind the single-writer
+    /// group-commit actor.
+    ///
+    /// When to use `get_many` vs `get_many_into`:
+    /// - **`get_many`** — when you don't know the value sizes (or
+    ///   don't care to alloc dests), or values are small (< 64 KiB)
+    ///   so bulk wouldn't engage anyway. SDK allocates each `Vec<u8>`.
+    /// - **`get_many_into`** — when values are ≥ 64 KiB AND you have
+    ///   caller-owned dest buffers (sglang pages / torch tensors). The
+    ///   value is received into a pool buffer, then copied once into the
+    ///   dest; no decode copy.
+    /// Below 64 KiB both APIs do one rkyv decode-copy regardless;
+    /// `get_many` saves you the dest-sizing footwork.
+    ///
+    /// Per-key result: `Ok(Some(value))` = present, `Ok(None)` = not
+    /// found, `Err` = per-key error.
+    pub async fn get_many(
+        &self,
+        keys: &[&[u8]],
+    ) -> Vec<std::result::Result<Option<Vec<u8>>, AutumnError>> {
+        let mut results: Vec<std::result::Result<Option<Vec<u8>>, AutumnError>> =
+            (0..keys.len()).map(|_| Ok(None)).collect();
+        // D7: bind each key ONCE before routing — the WIRE key
+        // determines the partition. Bind is infallible under Prepend-only (a
+        // scoped key can't escape scope), so every slot binds; the `Option`
+        // shape is kept defensively.
+        let mut bound_keys: Vec<Option<Vec<u8>>> = Vec::with_capacity(keys.len());
+        for (i, &k) in keys.iter().enumerate() {
+            match self.binding.bind_key(k) {
+                Ok(bk) => bound_keys.push(Some(bk)),
+                Err(e) => {
+                    results[i] = Err(e);
+                    bound_keys.push(None);
+                }
+            }
+        }
+        let mut groups: std::collections::HashMap<u64, Vec<usize>> =
+            std::collections::HashMap::new();
+        for (i, bk) in bound_keys.iter().enumerate() {
+            let bk = match bk {
+                Some(b) => b,
+                None => continue, // bind failed → already errored
+            };
+            let part_id = match self.resolve_key(bk).await {
+                Ok((pid, _addr)) => pid,
+                Err(e) => {
+                    results[i] = Err(AutumnError::RoutingError(e.to_string()));
+                    continue;
+                }
+            };
+            groups.entry(part_id).or_default().push(i);
+        }
+        for (part_id, group) in groups {
+            let req_items: Vec<partition_rpc::BatchGetItem> = group
+                .iter()
+                .map(|&i| partition_rpc::BatchGetItem {
+                    key: bound_keys[i].clone().expect("grouped keys are bound"),
+                    offset: 0,
+                    length: 0,
+                })
+                .collect();
+            match self.batch_get_part(part_id, req_items, false).await {
+                Ok(answers) => {
+                    for (&idx, answer) in group.iter().zip(answers) {
+                        results[idx] = match answer {
+                            BatchGot::Value(v) => Ok(Some(v.to_vec())),
+                            BatchGot::NotFound => Ok(None),
+                            BatchGot::Error(s) => Err(AutumnError::ServerError(format!("get_many op status={s}"))),
+                            BatchGot::Position(_) | BatchGot::Declined => {
+                                Err(AutumnError::ServerError("get_many: a direct answer nobody asked for".to_string()))
+                            }
+                        };
+                    }
+                }
+                Err(BatchGetFailed::Stale) => {
+                    // Same stale-epoch handling as batch_put — see comment
+                    // there. Fall back to per-key `get_bound` (call_ps_for_key
+                    // refreshes natively + handles post-split re-routing). Keys
+                    // are ALREADY bound (grouped from `bound_keys`), so use
+                    // `get_bound` to avoid double-binding.
+                    if let Err(e) = self.refresh_regions().await {
+                        tracing::debug!(error = %e, "get_many: region refresh failed; per-key reads retry");
+                    }
+                    for &idx in group.iter() {
+                        let bk = bound_keys[idx].clone().expect("grouped keys are bound");
+                        results[idx] = self.get_bound(&bk).await;
+                    }
+                }
+                Err(BatchGetFailed::All(err)) => fail_slots(&mut results, group.iter().copied(), err),
+            }
+        }
+        results
+    }
+
+    /// **Server-side batched PUT** (`MSG_BATCH_PUT`): N ops on the SAME
+    /// partition packed into ONE frame. The PS decodes once, injects
+    /// all N ops into `partition_loop::pending` as ONE mpsc message,
+    /// fires a wide batch immediately + can run multiple concurrent
+    /// batches (exercises `INFLIGHT_CAP`). This is the
+    /// fix for the cross-host 4K-write small-batch cliff documented in
+    /// `docs/perf_baseline.md`.
+    ///
+    /// Constraints (vs the client-side `put_many` fan-out):
+    /// * **Non-bulk only** — values >= 64 KiB skip this path (the wire
+    ///   bandwidth dominates per-op overhead; bundling them gives no
+    ///   win and bloats the frame). The caller may still pass large
+    ///   values; they're routed to per-op `put_bulk` individually here.
+    /// * **One frame per partition** — the client groups `items` by
+    ///   owning partition first, then issues one BATCH RPC per
+    ///   partition. A 32-key batch spread across 16 partitions becomes
+    ///   16 RPCs of ~2 ops each — still one server-side mpsc message
+    ///   per group, but the wire fan-out is per-partition not per-key.
+    /// * **Per-op result preserved**: returns `Vec<Result<()>>` with
+    ///   one entry per input item in input order.
+    pub(crate) async fn batch_put(
+        &self,
+        items: &[(&[u8], RegBytes)],
+        ranks: &[u32],
+        expires_at: u64,
+        lease: WriteLease,
+    ) -> Vec<std::result::Result<(), AutumnError>> {
+        let mut results: Vec<std::result::Result<(), AutumnError>> =
+            (0..items.len()).map(|_| Ok(())).collect();
+        // (idx, key, value) — threaded so the bulk fallback and per-partition
+        // packing can read them without re-indexing into `items` (which is
+        // borrowed immutably).
+        // D7: each tuple's 2nd element is the BOUND wire key (owned) —
+        // routing + the batch payload + the bulk/put fallbacks all use it, so a key
+        // is bound exactly ONCE. Bind is infallible under Prepend-only.
+        let mut groups: std::collections::HashMap<u64, Vec<(usize, Vec<u8>, RegBytes)>> =
+            std::collections::HashMap::new();
+        let mut bulk_only: Vec<(usize, Vec<u8>, RegBytes)> = Vec::new();
+        let bound: Vec<Option<Vec<u8>>> = items
+            .iter()
+            .enumerate()
+            .map(|(i, (k, _))| match self.binding.bind_key(k) {
+                Ok(b) => Some(b),
+                Err(e) => {
+                    results[i] = Err(e);
+                    None
+                }
+            })
+            .collect();
+        // The small groups are written before the bulk-only values, so a key
+        // with a value in each class would commit out of input order. Such a
+        // key takes the per-key serial path (below) for ALL its values.
+        const SMALL: u8 = 1;
+        const BULK: u8 = 2;
+        let mut classes: std::collections::HashMap<&[u8], u8> = std::collections::HashMap::new();
+        for (bk, (_, v)) in bound.iter().zip(items) {
+            if let Some(bk) = bk {
+                *classes.entry(bk.as_slice()).or_default() |=
+                    if bulk_worthwhile(v.len()) { BULK } else { SMALL };
+            }
+        }
+        for (i, ((_, v), bk)) in items.iter().zip(bound.iter()).enumerate() {
+            let Some(bk) = bk else { continue };
+            if classes[bk.as_slice()] != SMALL {
+                bulk_only.push((i, bk.clone(), v.clone()));
+                continue;
+            }
+            let bk = bk.clone();
+            let part_id = match self.resolve_key(&bk).await {
+                Ok((pid, _addr)) => pid,
+                Err(e) => {
+                    results[i] = Err(AutumnError::RoutingError(e.to_string()));
+                    continue;
+                }
+            };
+            groups
+                .entry(part_id)
+                .or_default()
+                .push((i, bk, v.clone()));
+        }
+        // Ops of a frame an earlier attempt of which may have been applied.
+        let mut maybe_applied: Vec<usize> = Vec::new();
+        for (part_id, group) in groups {
+            let region_epoch = self.lookup_epoch_for_part(part_id);
+            // Bulk on the GROUP's total value bytes, not on each item's.
+            // `bulk_worthwhile` answers "is this transfer big enough that
+            // sending it as its own iovec beats the per-op framing cost", and
+            // for a batch the transfer is the whole frame — 256 x 4 KiB is a
+            // megabyte on the wire however small each item looks. Deciding per
+            // item sent every batch of small values down the copying path no
+            // matter how much it added up to.
+            let ops: Vec<partition_rpc::BatchPutOp> = group
+                .iter()
+                .map(|(i, k, v)| partition_rpc::BatchPutOp {
+                    inode_hint: lease.inode_hint,
+                    lease_epoch: lease.lease_epoch,
+                    key: k.clone(),
+                    value_len: v.len() as u32,
+                    expires_at,
+                    evict_rank: ranks[*i],
+                })
+                .collect();
+            let ctrl = rkyv_encode(&partition_rpc::BatchPutReq { part_id, region_epoch, ops });
+            // `clone` on a `Bytes` is a refcount bump: the values reach
+            // `writev` as the caller's own buffers, never copied.
+            let values: Vec<RegBytes> = group.iter().map(|(_, _, v)| v.clone()).collect();
+            let call = self
+                .call_ps_for_part_bulk(CallKind::Idempotent, part_id, partition_rpc::MSG_BATCH_PUT, ctrl, values)
+                .await;
+            let (call, earlier_applied) = call;
+            if earlier_applied {
+                maybe_applied.extend(group.iter().map(|g| g.0));
+            }
+            let resp_bytes = match call {
+                Ok(b) => b,
+                Err(AutumnError::PreconditionFailed(_)) => {
+                    // Stale region_epoch: server returns FailedPrecondition
+                    // (`MSG_BATCH_PUT` enforces epoch on the data path, see
+                    // partition-server lib.rs:5830). `call_ps_for_part`
+                    // short-circuits PreconditionFailed under admin-op
+                    // semantics — correct for split/compact/gc/flush, WRONG
+                    // for the data path where the SDK's job is to refresh
+                    // routing and retry. Fall back to per-op `put_opts` for
+                    // this group; the single-key path routes via
+                    // `call_ps_for_key` which refreshes natively and handles
+                    // post-split re-routing (keys may no longer all belong to
+                    // `part_id` after the topology change).
+                    let _ = self.refresh_regions().await;
+                    for (idx, k, v) in group.iter() {
+                        results[*idx] = self.put_opts(k, v.clone(), expires_at, lease, ranks[*idx]).await;
+                    }
+                    continue;
+                }
+                Err(e) => {
+                    fail_slots(&mut results, group.iter().map(|g| g.0), batch_frame_error(e));
+                    continue;
+                }
+            };
+            let resp: partition_rpc::BatchPutResp = match rkyv_decode(&resp_bytes) {
+                Ok(r) => r,
+                Err(e) => {
+                    fail_slots(&mut results, group.iter().map(|g| g.0), || {
+                        AutumnError::ServerError(e.clone())
+                    });
+                    continue;
+                }
+            };
+            if resp.code != partition_rpc::CODE_OK {
+                fail_slots(&mut results, group.iter().map(|g| g.0), || {
+                    code_to_error(resp.code, resp.message.clone())
+                });
+                continue;
+            }
+            if resp.statuses.len() != group.len() {
+                let mismatch = format!(
+                    "batch_put: statuses len {} != group len {}",
+                    resp.statuses.len(),
+                    group.len()
+                );
+                fail_slots(&mut results, group.iter().map(|g| g.0), || {
+                    AutumnError::ServerError(mismatch.clone())
+                });
+                continue;
+            }
+            let plan = batch_resend_plan(group.iter().map(|g| g.1.as_slice()), &resp.statuses);
+            for (((idx, k, v), status), resend) in
+                group.iter().zip(resp.statuses.iter()).zip(plan)
+            {
+                if resend {
+                    let resend = self.put_opts(k, v.clone(), expires_at, lease, ranks[*idx]).await;
+                    results[*idx] = resent_batch_op(*status, resend);
+                } else if *status == partition_rpc::CODE_FENCED {
+                    results[*idx] = Err(AutumnError::Fenced(format!(
+                        "batch_put op fenced (ino={}, epoch={})",
+                        lease.inode_hint, lease.lease_epoch
+                    )));
+                } else if *status != 0 {
+                    results[*idx] = Err(AutumnError::ServerError(format!(
+                        "batch_put op status={status}"
+                    )));
+                }
+            }
+        }
+        settle_batch_ops(&mut results, maybe_applied);
+        // bulk-only entries (values ≥ 64 KiB — every autumnfs / fuse 8 MiB extent,
+        // every large kvcache page): per-op put_opts so the TTL from put_many's
+        // 3-tuple is preserved end-to-end (`PutReq` carries expires_at on the wire).
+        // `k` is the ALREADY-bound wire key.
+        //
+        // Fan these out CONCURRENTLY (mirrors delete_many / head_many). A serial
+        // `for … .await` here capped a single-inode large-file write at ONE 8 MiB
+        // durable put per round trip: throughput = 8 MiB ÷ (WAL append + 3-replica
+        // fanout + fsync) ≈ 40 MB/s WHEN the durable path is latency-bound (slow
+        // fsync / cross-host RTT). With the window in flight the PS group-commit
+        // (natural batching) coalesces the concurrent puts, so the write runs
+        // at the partition's bandwidth instead of its per-op latency. (No change
+        // when bandwidth-bound: one fast-local partition/connection saturates its
+        // stream ceiling regardless.)
+        //
+        // ORDERING: entries that share a bound wire key MUST commit in
+        // INPUT order so a duplicate-key batch keeps last-input-wins — the serial
+        // loop did, and the <64 KiB MSG_BATCH_PUT path does too (in-order seq
+        // assignment). So group by key: run each key's puts serially in input
+        // order, fan the GROUPS out concurrently. Unique keys (extents, distinct
+        // kvcache hashes) are all singletons ⇒ full concurrency; only the rare
+        // same-key-twice batch serialises, which is exactly where order matters.
+        // A key with values in BOTH classes is routed here whole (`classes`
+        // above), since the small groups have already been written by now.
+        //
+        // CONNECTIONS: each partition has one cached multiplexed conn that all
+        // groups reuse; on a cold cache the first group opens it and the others
+        // wait for it (`get_ps_client_inner`).
+        let mut key_groups: std::collections::HashMap<&[u8], Vec<usize>> =
+            std::collections::HashMap::new();
+        for (pos, (_, k, _)) in bulk_only.iter().enumerate() {
+            key_groups.entry(k.as_slice()).or_default().push(pos);
+        }
+        let bulk = &bulk_only;
+        let this = self;
+        let group_futs = key_groups.into_values().map(move |positions| async move {
+            let mut out = Vec::with_capacity(positions.len());
+            for pos in positions {
+                let (idx, k, v) = &bulk[pos];
+                out.push((*idx, this.put_opts(k, v.clone(), expires_at, lease, ranks[*idx]).await));
+            }
+            out
+        });
+        for group_out in fan_out_collect(group_futs, batch_put_concurrency()).await {
+            for (idx, r) in group_out {
+                results[idx] = r;
+            }
+        }
+        results
+    }
+
+    /// batched deletes — one `MSG_BATCH_DELETE` per owning partition (see
+    /// `batch_delete`). No bulk variant: a delete carries no value, so there is
+    /// no tail to keep out of the rkyv payload. Result `i` matches `keys[i]`
+    /// (`Ok(())` even if the key didn't exist, same as `delete`; `Err` = that
+    /// item failed, others still ran).
+    /// `opts.lease` stamps every key; a fenced key returns
+    /// `AutumnError::Fenced` in its own slot.
+    pub async fn delete_many(
+        &self,
+        keys: &[&[u8]],
+        opts: WriteOptions,
+    ) -> Vec<std::result::Result<(), AutumnError>> {
+        self.batch_delete(keys, opts.lease).await
+    }
+
+    /// One `MSG_BATCH_DELETE` per owning partition.
+    ///
+    /// This used to be a pure client-side fan-out of single-key deletes. That
+    /// looked like N concurrent requests and was not: a client holds ONE
+    /// multiplexed connection per partition, and deletes usually arrive in key
+    /// order, so consecutive keys share a partition and the whole fan-out
+    /// serialised onto one connection at that connection's in-flight limit.
+    /// Measured 3.10 keys per WAL append, against ~31 for the batched put that
+    /// packs its ops into one frame.
+    ///
+    /// The win is extent-node load rather than latency: an append is a
+    /// replicated write, so ten times the appends for the same keys is ten
+    /// times the work asked of the extent nodes.
+    pub(crate) async fn batch_delete(
+        &self,
+        keys: &[&[u8]],
+        lease: WriteLease,
+    ) -> Vec<std::result::Result<(), AutumnError>> {
+        let mut results: Vec<std::result::Result<(), AutumnError>> =
+            (0..keys.len()).map(|_| Ok(())).collect();
+        // (idx, bound key). Bound exactly once, as `batch_put` does — routing
+        // and the payload both read the same bytes.
+        let mut groups: std::collections::HashMap<u64, Vec<(usize, Vec<u8>)>> =
+            std::collections::HashMap::new();
+        for (i, k) in keys.iter().enumerate() {
+            let bk = match self.binding.bind_key(k) {
+                Ok(b) => b,
+                Err(e) => {
+                    results[i] = Err(e);
+                    continue;
+                }
+            };
+            let part_id = match self.resolve_key(&bk).await {
+                Ok((pid, _addr)) => pid,
+                Err(e) => {
+                    results[i] = Err(AutumnError::RoutingError(e.to_string()));
+                    continue;
+                }
+            };
+            groups.entry(part_id).or_default().push((i, bk));
+        }
+        // Ops of a frame an earlier attempt of which may have been applied.
+        let mut maybe_applied: Vec<usize> = Vec::new();
+        for (part_id, group) in groups {
+            let region_epoch = self.lookup_epoch_for_part(part_id);
+            let ops: Vec<partition_rpc::BatchDeleteOp> = group
+                .iter()
+                .map(|(_, k)| partition_rpc::BatchDeleteOp {
+                    key: k.clone(),
+                    inode_hint: lease.inode_hint,
+                    lease_epoch: lease.lease_epoch,
+                })
+                .collect();
+            let payload = rkyv_encode(&partition_rpc::BatchDeleteReq {
+                part_id,
+                region_epoch,
+                ops,
+            });
+            let (call, earlier_applied) = self
+                .call_ps_for_part_tracked(CallKind::Idempotent, part_id, partition_rpc::MSG_BATCH_DELETE, payload)
+                .await;
+            if earlier_applied {
+                maybe_applied.extend(group.iter().map(|g| g.0));
+            }
+            let resp_bytes = match call {
+                Ok(b) => b,
+                Err(AutumnError::PreconditionFailed(_)) => {
+                    // Stale routing. Same fallback `batch_put` makes: refresh,
+                    // then retry this group one key at a time, because after a
+                    // split the keys may no longer share a partition and the
+                    // single-key path re-routes natively.
+                    // `delete_opts`, NOT `delete`: these keys are ALREADY
+                    // bound, and `delete` binds again -- under a scoped
+                    // binding that targets `{prefix}{prefix}{key}`, which does
+                    // not exist, and deleting a missing key reports Ok. The
+                    // batch would claim success having removed nothing. Going
+                    // through `delete_opts` also keeps the lease, so a fenced
+                    // caller stays fenced across a split.
+                    let _ = self.refresh_regions().await;
+                    for (idx, k) in group.iter() {
+                        results[*idx] = self.delete_opts(k, lease).await;
+                    }
+                    continue;
+                }
+                Err(e) => {
+                    fail_slots(&mut results, group.iter().map(|g| g.0), batch_frame_error(e));
+                    continue;
+                }
+            };
+            let resp: partition_rpc::BatchDeleteResp = match rkyv_decode(&resp_bytes) {
+                Ok(r) => r,
+                Err(e) => {
+                    fail_slots(&mut results, group.iter().map(|g| g.0), || {
+                        AutumnError::ServerError(e.clone())
+                    });
+                    continue;
+                }
+            };
+            if resp.code != partition_rpc::CODE_OK {
+                fail_slots(&mut results, group.iter().map(|g| g.0), || {
+                    code_to_error(resp.code, resp.message.clone())
+                });
+                continue;
+            }
+            if resp.statuses.len() != group.len() {
+                // A reply that does not describe the request is not something
+                // to interpret — the two sides disagree about what was sent.
+                let mismatch = format!(
+                    "batch_delete: statuses len {} != group len {}",
+                    resp.statuses.len(),
+                    group.len()
+                );
+                fail_slots(&mut results, group.iter().map(|g| g.0), || {
+                    AutumnError::ServerError(mismatch.clone())
+                });
+                continue;
+            }
+            let plan = batch_resend_plan(group.iter().map(|g| g.1.as_slice()), &resp.statuses);
+            for (((idx, k), status), resend) in group.iter().zip(resp.statuses.iter()).zip(plan) {
+                if resend {
+                    let resend = self.delete_opts(k, lease).await;
+                    results[*idx] = resent_batch_op(*status, resend);
+                } else if *status == partition_rpc::CODE_FENCED {
+                    results[*idx] = Err(AutumnError::Fenced(format!(
+                        "batch_delete op fenced (ino={}, epoch={})",
+                        lease.inode_hint, lease.lease_epoch
+                    )));
+                } else if *status != 0 {
+                    results[*idx] = Err(AutumnError::ServerError(format!(
+                        "batch_delete op status={status}"
+                    )));
+                }
+            }
+        }
+        settle_batch_ops(&mut results, maybe_applied);
+        results
+    }
+
+    /// batched metadata lookups — pure client-side fan-out, `buffered` over
+    /// the per-partition multiplexed connections. No bulk (head carries no value).
+    /// Result `i` matches `keys[i]`: `Ok(KeyMeta{ found, value_length })`
+    /// (`found=false` for a missing key, NOT an `Err`); `Err` = that item's RPC
+    /// failed (others still ran).
+    pub async fn head_many(
+        &self,
+        keys: &[&[u8]],
+    ) -> Vec<std::result::Result<KeyMeta, AutumnError>> {
+        // head is a read → reuse the read-side concurrency cap.
+        let futs = keys.iter().map(|&key| async move { self.head(key).await });
+        fan_out_collect(futs, batch_get_concurrency()).await
+    }
+
+    /// Delete a key; Ok(()) even if it didn't exist. A non-anonymous
+    /// `opts.lease` is fenced like a put's (a revoked writer's late unlink
+    /// must not remove the new writer's data).
+    pub async fn delete(&self, key: &[u8], opts: WriteOptions) -> std::result::Result<(), AutumnError> {
+        let bound = self.binding.bind_key(key)?;
+        self.delete_opts(&bound, opts.lease).await
+    }
+
+    /// `delete` over an ALREADY-bound wire key. D7: Layer-A does NOT gate
+    /// deletes at the PS, but the CLIENT still prepends so a scoped delete
+    /// targets THIS scope's key, not a raw one.
+    async fn delete_opts(
+        &self,
+        key: &[u8],
+        lease: WriteLease,
+    ) -> std::result::Result<(), AutumnError> {
+        let key = key.to_vec();
+        let (call, applied) = self
+            .call_ps_for_key_tracked(CallKind::Idempotent, &key, MSG_DELETE, |part_id, region_epoch| {
+                rkyv_encode(&DeleteReq {
+                    part_id,
+                    key: key.clone(),
+                    region_epoch,
+                    inode_hint: lease.inode_hint,
+                    lease_epoch: lease.lease_epoch,
+                })
+            })
+            .await;
+        // Settled like the call's error: an earlier attempt may have applied.
+        let outcome = (|| {
+            let resp: DeleteResp = rkyv_decode(&call?).map_err(AutumnError::ServerError)?;
+            if resp.code != partition_rpc::CODE_OK && resp.code != partition_rpc::CODE_NOT_FOUND {
+                return Err(code_to_error(resp.code, resp.message));
+            }
+            Ok(())
+        })();
+        outcome.map_err(|e| settle_write_error(CallKind::Idempotent, applied, e))
+    }
+
+    /// Get key metadata (existence and value length).
+    pub async fn head(&self, key: &[u8]) -> std::result::Result<KeyMeta, AutumnError> {
+        let bound = self.binding.bind_key(key)?;
+        self.head_bound(&bound).await
+    }
+
+    /// Internal: `head` over an ALREADY-bound wire key (no namespace binding).
+    /// D7 — see `put_bound`.
+    async fn head_bound(&self, key: &[u8]) -> std::result::Result<KeyMeta, AutumnError> {
+        let key = key.to_vec();
+        let resp_bytes = self
+            .call_ps_for_key(CallKind::Read, &key, MSG_HEAD, |part_id, region_epoch| {
+                rkyv_encode(&HeadReq {
+                    part_id,
+                    key: key.clone(),
+                    region_epoch,
+                })
+            })
+            .await?;
+        let resp: HeadResp = rkyv_decode(&resp_bytes).map_err(AutumnError::ServerError)?;
+        Ok(KeyMeta {
+            found: resp.found,
+            value_length: resp.value_length,
+        })
+    }
+
+    /// Range scan with prefix filter. Scans across partitions like Go's Range().
+    ///
+    /// CockroachDB-style resume cursor. The SDK drives a per-partition
+    /// loop using `RangeResp.cur_end_key` from each successful response
+    /// as the next cursor — so a split that happened DURING the scan
+    /// auto-resolves when the cursor falls into the new sibling's range
+    /// on the next `resolve_key`. Already-accumulated results from
+    /// successful earlier partitions are KEPT across refresh+retry; only
+    /// the partition that returned epoch-stale gets re-resolved and
+    /// re-scanned from `cursor` (= the failing partition's expected
+    /// start). At most `MAX_RANGE_REFRESHES` refresh cycles per call to
+    /// bound work under pathological topology churn.
+    pub async fn range(
+        &self,
+        prefix: &[u8],
+        start: &[u8],
+        limit: u32,
+    ) -> std::result::Result<RangeResult, AutumnError> {
+        // D7: clamp the scan to the scope prefix — bind the prefix,
+        // bind the start (empty start → scan from the namespace lower bound),
+        // cap the upper end at `{scope}0`, then strip the binding prefix
+        // off returned keys so a Prepend caller sees its original keys. Raw
+        // binding is a no-op on all three (unbounded admin scan).
+        let wire_prefix = self.binding.bind_prefix(prefix)?;
+        let wire_start: Vec<u8> = if start.is_empty() {
+            Vec::new()
+        } else {
+            self.binding.bind_key(start)?
+        };
+        let cap = self.binding.upper_cap();
+        let mut result = self
+            .range_bound(&wire_prefix, &wire_start, limit, cap.as_deref())
+            .await?;
+        for e in result.entries.iter_mut() {
+            e.key = self.binding.strip(std::mem::take(&mut e.key));
+        }
+        Ok(result)
+    }
+
+    /// `range` that stops before `end` (exclusive): no key at or after it is
+    /// returned, and — the point — the scan does not walk into partitions
+    /// that start at or after it. A plain `range` whose page is not full in
+    /// its own partition keeps reading the next ones, which is costly when
+    /// those hold nothing but tombstones (a bulk delete walking a keyspace
+    /// partition by partition). `has_more` is false once `end` is reached.
+    pub async fn range_until(
+        &self,
+        prefix: &[u8],
+        start: &[u8],
+        end: &[u8],
+        limit: u32,
+    ) -> std::result::Result<RangeResult, AutumnError> {
+        let wire_prefix = self.binding.bind_prefix(prefix)?;
+        let wire_start: Vec<u8> = if start.is_empty() {
+            Vec::new()
+        } else {
+            self.binding.bind_key(start)?
+        };
+        let wire_end = self.binding.bind_key(end)?;
+        let cap = match self.binding.upper_cap() {
+            Some(ns_cap) if ns_cap < wire_end => ns_cap,
+            _ => wire_end.clone(),
+        };
+        let mut result = self
+            .range_bound(&wire_prefix, &wire_start, limit, Some(&cap))
+            .await?;
+        let before = result.entries.len();
+        result.entries.retain(|e| e.key < wire_end);
+        if result.entries.len() < before {
+            result.has_more = false;
+        }
+        for e in result.entries.iter_mut() {
+            e.key = self.binding.strip(std::mem::take(&mut e.key));
+        }
+        Ok(result)
+    }
+
+    /// D7: this client's namespace binding.
+    pub fn binding(&self) -> &NamespaceBinding {
+        &self.binding
+    }
+
+    /// D7: a Raw (unscoped) VIEW sharing this client's pools — bypasses
+    /// the CLIENT-side namespace clamp for admin / cross-namespace / migration
+    /// tooling. **The PS still enforces Layer-A/B**, so this only removes the
+    /// client prefixing, never server authorization. The low-level seams
+    /// (`resolve_key` / `ps_call` / `mgr_call` / `all_partitions*`) are already
+    /// unbound + public. Documented admin-only — NOT the default.
+    pub fn raw(&self) -> NamespaceScope<'_> {
+        NamespaceScope {
+            client: self,
+            binding: NamespaceBinding::Raw,
+        }
+    }
+
+    /// a VIEW of this client re-scoped to a DIFFERENT
+    /// key-prefix `scope` (`fs`, `mem/agent7`), sharing the same connection pools —
+    /// for multi-namespace tools (dashboard / migration) that operate across scopes
+    /// without reconnecting. Exposes the core KV ops (`put`/`get`/`delete`/
+    /// `head`/`range`); exotic bulk/batch/stream ops use a dedicated scoped
+    /// `ClusterClient`.
+    pub fn rescope(&self, scope: &str) -> NamespaceScope<'_> {
+        NamespaceScope {
+            client: self,
+            binding: NamespaceBinding::scoped(scope),
+        }
+    }
+
+    /// Internal: range scan over ALREADY-bound `prefix`/`start` wire keys, with
+    /// an optional `upper_cap` (`{scope}0`) that stops the limit-driven
+    /// walk at the namespace boundary. No prefix binding / stripping — the public
+    /// `range` (and the `raw()`/`rescope` views) do that. D7.
+    async fn range_bound(
+        &self,
+        prefix: &[u8],
+        start: &[u8],
+        limit: u32,
+        upper_cap: Option<&[u8]>,
+    ) -> std::result::Result<RangeResult, AutumnError> {
+        // fix-2 — uses the shared `refresh_backoff` + `MAX_PS_REFRESHES`
+        // helpers (module-level docs explain the TiKV-style budget). Same
+        // retry shape as point queries (`call_ps_for_key`) so async-split
+        // / async-merge windows are absorbed uniformly.
+        // Defensive iteration cap. Per-call work is also bounded by
+        // `limit`; this only fires under truly pathological topology
+        // churn (every partition splitting between requests).
+        const MAX_RANGE_ITERATIONS: u32 = 10_000;
+
+        if self.regions.borrow().is_empty() {
+            self.refresh_regions()
+                .await
+                .map_err(|e| AutumnError::RoutingError(e.to_string()))?;
+        }
+
+        let mut cursor: Vec<u8> = if start.is_empty() {
+            prefix.to_vec()
+        } else {
+            start.to_vec()
+        };
+        let mut all_entries: Vec<RangeEntry> = Vec::new();
+        let mut remaining = limit;
+        let mut has_more = false;
+        let mut refreshes_used: u32 = 0;
+        let mut iterations: u32 = 0;
+
+        loop {
+            if remaining == 0 {
+                has_more = true;
+                break;
+            }
+            // D7: stop at the namespace upper bound `{scope}0` so a
+            // limit-driven scan can't walk past the scope into the next
+            // namespace. `None` (Raw binding) = unbounded.
+            if let Some(cap) = upper_cap {
+                if cursor.as_slice() >= cap {
+                    break;
+                }
+            }
+            iterations += 1;
+            if iterations > MAX_RANGE_ITERATIONS {
+                return Err(AutumnError::ConnectionError(
+                    "range scan exceeded MAX_RANGE_ITERATIONS — topology churning".to_string(),
+                ));
+            }
+
+            // Resolve cursor → partition under a tight borrow scope.
+            let (part_id, ps_addr, region_start_key, region_epoch) = {
+                let regions = self.regions.borrow();
+                let part_addrs = self.part_addrs.borrow();
+                let ps_details = self.ps_details.borrow();
+                let idx = regions.partition_point(|(_, region)| match region.rg.as_ref() {
+                    Some(rg) if !rg.end_key.is_empty() => {
+                        rg.end_key.as_slice() <= cursor.as_slice()
+                    }
+                    _ => false,
+                });
+                if idx >= regions.len() {
+                    // Past the last partition's end_key → scan done.
+                    break;
+                }
+                let (_, region) = &regions[idx];
+                let ps_addr = match part_addrs.get(&region.part_id) {
+                    Some(a) => a.clone(),
+                    None => match ps_details.get(&region.ps_id) {
+                        Some(d) => d.address.clone(),
+                        None => {
+                            return Err(AutumnError::RoutingError(format!(
+                                "no address for partition {} (ps_id {})",
+                                region.part_id, region.ps_id
+                            )));
+                        }
+                    },
+                };
+                let region_start_key = region
+                    .rg
+                    .as_ref()
+                    .map(|r| r.start_key.clone())
+                    .unwrap_or_default();
+                (
+                    region.part_id,
+                    ps_addr,
+                    region_start_key,
+                    region.region_epoch,
+                )
+            };
+
+            // Prefix-exit: only after we've made forward progress.
+            // The first iteration might legitimately land on a
+            // partition whose `start_key` is lexically past `prefix`
+            // when the user passed an explicit `start` outside the
+            // prefix range.
+            if iterations > 1
+                && !prefix.is_empty()
+                && !region_start_key.is_empty()
+                && !region_start_key.starts_with(prefix)
+            {
+                break;
+            }
+
+            let resp_bytes = match self
+                .ps_call(
+                    &ps_addr,
+                    MSG_RANGE,
+                    rkyv_encode(&RangeReq {
+                        part_id,
+                        prefix: prefix.to_vec(),
+                        start: cursor.clone(),
+                        limit: remaining,
+                        region_epoch,
+                    }),
+                )
+                .await
+            {
+                Ok(b) => b,
+                Err(e) => {
+                    // PermissionDenied + NamespaceUnknown are
+                    // TERMINAL — refreshing routing can't grant access or create the
+                    // namespace, so surface immediately instead of burning
+                    // MAX_PS_REFRESHES (mirrors call_ps_for_key on the point path).
+                    // A stale region_epoch surfaces as FailedPrecondition, which is
+                    // NOT short-circuited here — it still refreshes + retries below.
+                    match e.downcast_ref::<AutumnError>() {
+                        Some(AutumnError::PermissionDenied(msg)) => {
+                            return Err(AutumnError::PermissionDenied(msg.clone()));
+                        }
+                        Some(AutumnError::NamespaceUnknown(msg)) => {
+                            return Err(AutumnError::NamespaceUnknown(msg.clone()));
+                        }
+                        _ => {}
+                    }
+                    // Epoch stale, transport error (incl. CODE_NOT_FOUND
+                    // from a mis-routed fallback on a freshly-split right
+                    // child whose part_addr isn't registered yet), or
+                    // generic connection failure. Keep results accumulated
+                    // so far; back off → refresh → retry with same cursor.
+                    if refreshes_used >= MAX_PS_REFRESHES {
+                        return Err(self.routing_exhausted(
+                            &format!("range on partition {part_id}"),
+                            refreshes_used,
+                            Some(e.to_string()),
+                        ));
+                    }
+                    refreshes_used += 1;
+                    let sleep = refresh_backoff(refreshes_used);
+                    if !sleep.is_zero() {
+                        compio::time::sleep(sleep).await;
+                    }
+                    let _ = self.refresh_regions().await;
+                    continue;
+                }
+            };
+            let resp: RangeResp = rkyv_decode(&resp_bytes).map_err(AutumnError::ServerError)?;
+            check_ps_code(resp.code, &resp.message)?;
+
+            let count = resp.entries.len() as u32;
+            all_entries.extend(resp.entries);
+            remaining = remaining.saturating_sub(count);
+            if resp.has_more {
+                has_more = true;
+            }
+
+            if resp.cur_end_key.is_empty() {
+                // Last partition in the keyspace (unbounded right).
+                break;
+            }
+            // Forward-progress check. A non-advancing cur_end_key almost
+            // always means our routing cache is stale: we just hit a
+            // partition whose end_key is at-or-before the cursor we
+            // sent, so partition_point will keep landing on the same
+            // partition next iteration and we'd loop forever. Refresh
+            // the cache and retry from the same cursor — typically the
+            // post-split sibling now appears in the cache and the next
+            // iteration's partition_point routes correctly. Bounded by
+            // MAX_PS_REFRESHES so a genuinely bogus PS still
+            // surfaces an error.
+            if resp.cur_end_key.as_slice() <= cursor.as_slice() {
+                if refreshes_used >= MAX_PS_REFRESHES {
+                    return Err(AutumnError::ServerError(format!(
+                        "range on partition {part_id}: cur_end_key did not advance cursor after {refreshes_used} refreshes"
+                    )));
+                }
+                refreshes_used += 1;
+                let sleep = refresh_backoff(refreshes_used);
+                if !sleep.is_zero() {
+                    compio::time::sleep(sleep).await;
+                }
+                let _ = self.refresh_regions().await;
+                continue;
+            }
+            cursor = resp.cur_end_key;
+        }
+
+        // Dedup by key — after split, overlapping SSTables may return
+        // the same key from multiple partitions before compaction cleans up.
+        // Keep the first occurrence (from the authoritative partition).
+        {
+            let mut seen = std::collections::HashSet::new();
+            all_entries.retain(|e| seen.insert(e.key.clone()));
+        }
+
+        Ok(RangeResult {
+            entries: all_entries,
+            has_more,
+        })
+    }
+
+
+    // ── multipart upload ──────────────────────────────────────────────
+
+    /// Open a multipart upload session for `key`. Returns a handle that
+    /// Begin a striped (Ceph-striperados-style) put. Returns a
+    /// handle that takes value bytes via `send` and finalises via
+    /// `commit`. Internals (no new server RPCs):
+    ///   - the handle draws a random upload id; each `send(chunk)` writes
+    ///     `chunk` to a chunk key of that upload under a reserved
+    ///     `\xff\xfe`-prefixed namespace via the existing `put` RPC
+    ///   - `commit` writes a 45-byte `Meta` blob (upload id + layout) to
+    ///     `key` — the linearisation point: until it lands, readers see the
+    ///     previous value (or NotFound), and then delete the replaced
+    ///     upload's chunks
+    ///   - `abort` best-effort deletes this upload's chunks
+    ///
+    /// `expires_at` is currently ignored — chunk-level TTL would
+    /// require setting `expires_at` on each chunk's Put. Future work.
+    pub fn put_stream_begin(&self, key: &[u8], _expires_at: u64) -> PutStreamHandle<'_> {
+        PutStreamHandle {
+            cluster: self,
+            user_key: key.to_vec(),
+            upload_id: *uuid::Uuid::new_v4().as_bytes(),
+            chunk_size: stripe_chunk_size(),
+            next_chunk_index: 0,
+            bytes_sent: 0,
+            state: PutStreamState::Open,
+        }
+    }
+
+    /// The stripe meta stored at `key`, if its value is one. Reads at most one
+    /// byte past a meta's length, so a large inline value is not fetched.
+    async fn stripe_meta(&self, key: &[u8]) -> std::result::Result<Option<StripeMeta>, AutumnError> {
+        Ok(match self.get_range(key, 0, META_ENCODED_LEN as u32 + 1).await? {
+            Some(head) => match StripeMeta::decode(&head) {
+                StoredValue::Striped(meta) => Some(meta),
+                StoredValue::StripedV1 | StoredValue::Inline => None,
+            },
+            None => None,
+        })
+    }
+
+    /// Open a streaming reader. Auto-detects:
+    ///   - **striped** values (key holds a stripe `Meta` blob) → reads the
+    ///     chunks of the upload it names and yields them via `next_chunk()`
+    ///   - **inline** values (anything else, including a normal small
+    ///     `put`) → yields the entire value in one `next_chunk()` call
+    ///
+    /// `chunk_size_hint` controls how much each `next_chunk()` returns
+    /// for striped values (chunks are buffered and re-sliced on the
+    /// client). Hint <= stored chunk_size yields slices; hint > stored
+    /// yields whatever the next stored chunk holds (no merging — keeps
+    /// memory bounded).
+    ///
+    /// Returns `Ok(None)` if the key doesn't exist.
+    pub async fn get_stream(
+        &self,
+        key: &[u8],
+        chunk_size_hint: u32,
+    ) -> std::result::Result<Option<GetStream<'_>>, AutumnError> {
+        let blob = match self.get(key).await? {
+            Some(b) => b,
+            None => return Ok(None),
+        };
+        let (inline, striped) = match StripeMeta::decode(&blob) {
+            StoredValue::Striped(meta) => (None, Some(meta)),
+            StoredValue::Inline => (Some(blob), None),
+            StoredValue::StripedV1 => {
+                return Err(AutumnError::InvalidArgument(
+                    "value is in the v1 stripe format, which is no longer read; \
+                     delete it and upload it again"
+                        .into(),
+                ))
+            }
+        };
+        Ok(Some(GetStream {
+            cluster: self,
+            user_key: key.to_vec(),
+            inline,
+            striped,
+            cursor: 0,
+            next_chunk_index: 0,
+            pending_buf: Vec::new(),
+            pending_pos: 0,
+            yield_size: chunk_size_hint.max(1),
+        }))
+    }
+
+    /// Delete a streamed value: the meta, then its upload's chunks. For a
+    /// non-striped key this is a plain delete. Idempotent on already-deleted
+    /// keys.
+    ///
+    /// Plain `delete()` (existing) only removes the meta key, leaving
+    /// chunks orphan — use this method when the caller has been
+    /// using `put_stream_begin` for the key.
+    pub async fn delete_stream(&self, key: &[u8]) -> std::result::Result<(), AutumnError> {
+        let meta = self.stripe_meta(key).await?;
+        self.delete(key, WriteOptions::default()).await?;
+        if let Some(meta) = meta {
+            delete_upload_chunks(self, key, &meta.upload_id, meta.chunk_count as u64).await;
+        }
+        Ok(())
+    }
+
+    /// Trigger partition split at the PS-chosen median split point (legacy).
+    pub async fn split(&self, part_id: u64) -> std::result::Result<(), AutumnError> {
+        self.split_at(part_id, None).await
+    }
+
+    /// (design doc D4): trigger partition split at an EXPLICIT
+    /// split point. `at_key = Some(key)` makes the PS validate the key lies
+    /// strictly inside the partition's `(start_key, end_key)` and use it
+    /// verbatim as `mid_key` (skipping median selection and the `>= 2 keys`
+    /// gate, so an empty partition can be split). `at_key = None` is identical
+    /// to `split(part_id)`.
+    pub async fn split_at(
+        &self,
+        part_id: u64,
+        at_key: Option<Vec<u8>>,
+    ) -> std::result::Result<(), AutumnError> {
+        self.call_ps_for_part(
+            CallKind::Read,
+            part_id,
+            MSG_SPLIT_PART,
+            rkyv_encode(&SplitPartReq { part_id, at_key, op_id: 0 }),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Trigger compaction on a partition.
+    pub async fn compact(&self, part_id: u64) -> std::result::Result<(), AutumnError> {
+        self.maintenance(part_id, MAINTENANCE_COMPACT, vec![])
+            .await
+            .map(|_| ())
+    }
+
+    /// Trigger automatic GC on a partition.
+    pub async fn gc(&self, part_id: u64) -> std::result::Result<(), AutumnError> {
+        self.gc_with_params(part_id, GcAutoParams::default()).await
+    }
+
+    /// trigger automatic GC with multi-tier filter parameters.
+    /// `params` is forwarded verbatim to the PS-side selection logic.
+    /// Default `GcAutoParams::default()` matches the prior behaviour
+    /// (`discard_ratio > 0.4`, plus the new empty-sealed-extent free
+    /// path).
+    pub async fn gc_with_params(
+        &self,
+        part_id: u64,
+        params: GcAutoParams,
+    ) -> std::result::Result<(), AutumnError> {
+        let req = MaintenanceReq {
+            part_id,
+            op: MAINTENANCE_AUTO_GC,
+            extent_ids: vec![],
+            gc_ratio: params.ratio,
+            gc_max_size: params.max_size,
+            gc_stream_debt: params.stream_debt,
+            gc_dead_bytes_high: params.dead_bytes_high,
+            gc_empty_only: params.empty_only,
+            // The caller named its own knobs, so this is an override by
+            // definition: run exactly as asked, but never redefine what the
+            // partition's debt gauge means for every later tick. Only the
+            // manager speaks for the cluster's standing policy.
+            gc_policy_is_standing: false,
+            op_id: 0,
+        };
+        let resp_bytes = self
+            .call_ps_for_part(CallKind::Read, part_id, MSG_MAINTENANCE, rkyv_encode(&req))
+            .await?;
+        let resp: MaintenanceResp = rkyv_decode(&resp_bytes).map_err(AutumnError::ServerError)?;
+        check_ps_code(resp.code, &resp.message)?;
+        Ok(())
+    }
+
+    /// Force GC of specific extents on a partition.
+    /// Returns the PS-side advisory (empty when all requested extents are
+    /// punchable; non-empty names the extents that fall inside the replay-floor
+    /// window and will be PROTECTED — "flush + MAJOR-compact then retry").
+    pub async fn force_gc(
+        &self,
+        part_id: u64,
+        extent_ids: Vec<u64>,
+    ) -> std::result::Result<String, AutumnError> {
+        self.maintenance(part_id, MAINTENANCE_FORCE_GC, extent_ids)
+            .await
+    }
+
+    /// Trigger flush on a partition.
+    pub async fn flush(&self, part_id: u64) -> std::result::Result<(), AutumnError> {
+        self.maintenance(part_id, MAINTENANCE_FLUSH, vec![])
+            .await
+            .map(|_| ())
+    }
+
+    /// merge two adjacent partitions. Survivor keeps its part_id;
+    /// victim is deleted from the manager.
+    ///
+    /// Thin wrapper around the manager-orchestrated `MSG_MERGE_PARTITIONS`.
+    ///
+    /// The manager (which is leader-fenced and crash-recoverable via etcd)
+    /// owns the full sequence:
+    ///   - acquire admin owner-lock for the partition pair
+    ///   - send `MSG_MERGE_FREEZE` to both PSes (drains pending+inflight,
+    ///     flushes all imm, halts new writes with `CODE_UNAVAILABLE`)
+    ///   - capture `commit_length` × 6 under the freeze (closes the
+    ///     ~5 % loss window)
+    ///   - run the atomic etcd merge txn
+    ///   - on success: leave PSes frozen — region_sync_loop drops the
+    ///     frozen `PartitionData` on its next ~2 s tick
+    ///   - on failure: send `freeze=false` rollback to both PSes
+    ///
+    /// CLI crashes mid-call are now benign: the manager continues
+    /// serving the orchestrated merge, and a 30 s `FREEZE_TTL` on the
+    /// PS side is the final backstop for an orchestrator crash.
+    /// `force` overrides the sacred-boundary refusal: merging erases the
+    /// boundary between the two partitions, and when
+    /// that boundary is a recorded presplit point the manager refuses unless
+    /// forced.
+    pub async fn merge_partitions(
+        &self,
+        survivor_part_id: u64,
+        victim_part_id: u64,
+        force: bool,
+    ) -> std::result::Result<(), AutumnError> {
+        self.flush(survivor_part_id).await?;
+        self.flush(victim_part_id).await?;
+        let req = rkyv_encode(&MergePartitionsReq {
+            survivor_part_id,
+            victim_part_id,
+            force,
+        });
+        let resp_bytes = self
+            .mgr_call(MSG_MERGE_PARTITIONS, req)
+            .await
+            .map_err(|e| AutumnError::ServerError(e.to_string()))?;
+        let resp: MergePartitionsResp =
+            rkyv_decode(&resp_bytes).map_err(AutumnError::ServerError)?;
+        if resp.code != autumn_rpc::manager_rpc::CODE_OK {
+            return Err(AutumnError::ServerError(resp.message));
+        }
+        Ok(())
+    }
+
+    /// actively re-spread partitions across the PS fleet
+    /// (most-loaded → least-loaded), bounded by `max_moves` (`0` = as many as
+    /// needed to balance). Returns the reassignments the manager applied.
+    pub async fn rebalance_regions(
+        &self,
+        max_moves: u32,
+    ) -> std::result::Result<Vec<RebalanceMove>, AutumnError> {
+        let req = rkyv_encode(&RebalanceRegionsReq { max_moves });
+        let resp_bytes = self
+            .mgr_call(MSG_REBALANCE_REGIONS, req)
+            .await
+            .map_err(|e| AutumnError::ServerError(e.to_string()))?;
+        let resp: RebalanceRegionsResp =
+            rkyv_decode(&resp_bytes).map_err(AutumnError::ServerError)?;
+        if resp.code != autumn_rpc::manager_rpc::CODE_OK {
+            return Err(AutumnError::ServerError(resp.message));
+        }
+        Ok(resp.moves)
+    }
+
+    /// Submit a long-running op to the manager's async op-ledger; returns the
+    /// assigned op id immediately (poll `op_query` for the outcome). The admin
+    /// token is prefixed automatically (MSG_OP_SUBMIT is in `is_admin_mgr_msg`).
+    pub async fn submit_op(
+        &self,
+        req: OpSubmitReq,
+    ) -> std::result::Result<OpSubmitResp, AutumnError> {
+        let resp_bytes = self
+            .mgr_call(MSG_OP_SUBMIT, rkyv_encode(&req))
+            .await
+            .map_err(|e| AutumnError::ServerError(e.to_string()))?;
+        rkyv_decode(&resp_bytes).map_err(AutumnError::ServerError)
+    }
+
+    /// Query the op-ledger: `op_id != 0` → one record (UNKNOWN if the leader
+    /// doesn't know it); `op_id == 0` → a filtered list.
+    pub async fn op_query(&self, req: OpQueryReq) -> std::result::Result<OpQueryResp, AutumnError> {
+        let resp_bytes = self
+            .mgr_call(MSG_OP_QUERY, rkyv_encode(&req))
+            .await
+            .map_err(|e| AutumnError::ServerError(e.to_string()))?;
+        rkyv_decode(&resp_bytes).map_err(AutumnError::ServerError)
+    }
+
+    /// Read durable terminal op history from the leader (etcd-backed), as
+    /// opposed to `op_query`'s live in-memory ledger.
+    pub async fn op_history(
+        &self,
+        req: autumn_rpc::manager_rpc::OpHistoryReq,
+    ) -> std::result::Result<autumn_rpc::manager_rpc::OpHistoryResp, AutumnError> {
+        let resp_bytes = self
+            .mgr_call(autumn_rpc::manager_rpc::MSG_OP_HISTORY, rkyv_encode(&req))
+            .await
+            .map_err(|e| AutumnError::ServerError(e.to_string()))?;
+        rkyv_decode(&resp_bytes).map_err(AutumnError::ServerError)
+    }
+
+    /// query the manager's policy-engine advisory cache.
+    pub async fn policy_candidates(
+        &self,
+    ) -> std::result::Result<Vec<PolicyCandidate>, AutumnError> {
+        let resp_bytes = self
+            .mgr_call(
+                MSG_GET_POLICY_CANDIDATES,
+                rkyv_encode(&GetPolicyCandidatesReq::default()),
+            )
+            .await
+            .map_err(|e| AutumnError::ServerError(e.to_string()))?;
+        let resp: GetPolicyCandidatesResp =
+            rkyv_decode(&resp_bytes).map_err(AutumnError::ServerError)?;
+        if resp.code != autumn_rpc::manager_rpc::CODE_OK {
+            return Err(AutumnError::ServerError(resp.message));
+        }
+        Ok(resp.candidates)
+    }
+
+    /// Returns the PS-side `MaintenanceResp.message` on success — empty for
+    /// most ops, but FORCE_GC carries a synchronous advisory (which requested
+    /// extents fall inside the replay-floor window and will be PROTECTED).
+    async fn maintenance(
+        &self,
+        part_id: u64,
+        op: u8,
+        extent_ids: Vec<u64>,
+    ) -> std::result::Result<String, AutumnError> {
+        let resp_bytes = self
+            .call_ps_for_part(
+                CallKind::Read,
+                part_id,
+                MSG_MAINTENANCE,
+                rkyv_encode(&MaintenanceReq {
+                    part_id,
+                    op,
+                    extent_ids,
+                    // legacy callers (compact / force_gc / flush)
+                    // don't supply GC tier params — they're ignored when
+                    // op != MAINTENANCE_AUTO_GC anyway. Defaults match
+                    // the prior wire shape semantically.
+                    gc_ratio: None,
+                    gc_max_size: None,
+                    gc_stream_debt: None,
+                    gc_dead_bytes_high: None,
+                    gc_empty_only: false,
+                    gc_policy_is_standing: false,
+                    op_id: 0,
+                }),
+            )
+            .await?;
+        let resp: MaintenanceResp = rkyv_decode(&resp_bytes).map_err(AutumnError::ServerError)?;
+        check_ps_code(resp.code, &resp.message)?;
+        Ok(resp.message)
+    }
+}
+
+/// SDK-visible mirror of the PS-side `GcAutoParams`. Forwarded
+/// verbatim through `MaintenanceReq` to the partition's GC loop.
+/// Default matches the prior behaviour (`discard_ratio > 0.4`).
+#[derive(Default, Clone, Debug)]
+pub struct GcAutoParams {
+    pub ratio: Option<f64>,
+    pub max_size: Option<u64>,
+    pub stream_debt: Option<u64>,
+    /// Per-extent absolute dead-byte floor; qualifies regardless of ratio.
+    /// Ignored when `empty_only` is set.
+    pub dead_bytes_high: Option<u64>,
+    pub empty_only: bool,
+}
+
+// ── client-side striperados (Ceph-style) ─────────────────────────────
+//
+// Replaces the server-side multipart upload + multi-fragment ValuePointer
+// + GC active rewrite. Pure client-side striping over the existing
+// MSG_PUT / MSG_GET / MSG_DELETE primitives — no new server RPCs, no
+// changes to the WAL / memtable / SSTable shape.
+//
+// Layout:
+//   - Meta object lives at the user's key: magic + version + upload id +
+//     total_bytes + chunk_count + chunk_size + crc32c. Writing it is the
+//     linearisation point.
+//   - Chunks live under a reserved 0xff-prefixed namespace, keyed by user
+//     key + upload id + index. Each upload writes only its own chunks, so an
+//     uncommitted or aborted overwrite never touches the value readers see.
+//   - A published meta always has all its chunks: commit swaps the meta
+//     first and only then deletes the replaced upload's chunks;
+//     delete_stream deletes the meta before the chunks.
+
+/// meta object header magic + version, 9 bytes total. The last
+/// byte is the version; bumping the wire format means bumping that
+/// byte.
+const META_MAGIC: [u8; 9] = *b"\xfeAUTSTRP\x02";
+const META_VERSION_BYTE_INDEX: usize = 8;
+const META_VERSION: u8 = 0x02;
+/// The first stripe format: no upload id, chunks shared between uploads of a
+/// key. Recognised only to refuse it.
+const META_VERSION_V1: u8 = 0x01;
+const META_V1_ENCODED_LEN: usize = 29;
+/// 9 (magic+version) + 16 (upload_id) + 8 (total_bytes) + 4 (chunk_count)
+/// + 4 (chunk_size) + 4 (crc32c) = 45 bytes. The CRC covers the first 41.
+const META_ENCODED_LEN: usize = 45;
+const META_CRC_AT: usize = 41;
+
+/// default chunk size for `put_stream_begin`. 4 MiB matches
+/// the inline-VP threshold ratio used by comparable
+/// systems (S3 multipart's 5 MiB minimum, Ceph striperados 4 MiB
+/// default). Each chunk is one `MSG_PUT` RPC + one VP entry on the
+/// PS — large enough to amortise per-chunk RPC framing, small enough
+/// that a transient connection error costs only a 4 MiB resend
+/// (`--stripe-chunk-bytes`).
+pub fn stripe_chunk_size() -> u32 {
+    params().stripe_chunk_bytes.get()
+}
+
+/// chunk-key namespace prefix. Starts with `\xff\xfe` so chunks
+/// sort AFTER all normal user keys; range scans within a user prefix
+/// naturally skip them. Followed by a 4-byte format tag (`acv2` =
+/// "Autumn Chunk v2") and a separator byte.
+const CHUNK_KEY_PREFIX: &[u8] = b"\xff\xfeacv2\xff";
+
+/// encode a chunk key as
+/// `[CHUNK_KEY_PREFIX][user_key_len:u32 BE][user_key][upload_id:16][chunk_index:u64 BE]`.
+/// Length-prefixing the user key avoids ambiguity if it contains the
+/// separator pattern; BE encoding on the index keeps chunks of one
+/// upload sorted in numerical order.
+pub(crate) fn make_chunk_key(user_key: &[u8], upload_id: &[u8; 16], chunk_index: u64) -> Vec<u8> {
+    let mut k = Vec::with_capacity(CHUNK_KEY_PREFIX.len() + 4 + user_key.len() + 16 + 8);
+    k.extend_from_slice(CHUNK_KEY_PREFIX);
+    k.extend_from_slice(&(user_key.len() as u32).to_be_bytes());
+    k.extend_from_slice(user_key);
+    k.extend_from_slice(upload_id);
+    k.extend_from_slice(&chunk_index.to_be_bytes());
+    k
+}
+
+/// striped-value meta header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct StripeMeta {
+    pub upload_id: [u8; 16],
+    pub total_bytes: u64,
+    pub chunk_count: u32,
+    pub chunk_size: u32,
+}
+
+impl StripeMeta {
+    fn encode(&self) -> [u8; META_ENCODED_LEN] {
+        let mut buf = [0u8; META_ENCODED_LEN];
+        buf[0..9].copy_from_slice(&META_MAGIC);
+        buf[9..25].copy_from_slice(&self.upload_id);
+        buf[25..33].copy_from_slice(&self.total_bytes.to_le_bytes());
+        buf[33..37].copy_from_slice(&self.chunk_count.to_le_bytes());
+        buf[37..41].copy_from_slice(&self.chunk_size.to_le_bytes());
+        let crc = crc32c::crc32c(&buf[..META_CRC_AT]);
+        buf[META_CRC_AT..].copy_from_slice(&crc.to_le_bytes());
+        buf
+    }
+
+    /// Classify a stored value. Anything whose length, magic or CRC doesn't
+    /// match is inline. False positives need the exact length, the 8-byte
+    /// magic and a 32-bit CRC to match by accident (~2^-96).
+    pub(crate) fn decode(blob: &[u8]) -> StoredValue {
+        let magic_ok = |len: usize| {
+            blob.len() == len
+                && blob[..META_VERSION_BYTE_INDEX] == META_MAGIC[..META_VERSION_BYTE_INDEX]
+        };
+        let crc_ok = |at: usize| {
+            u32::from_le_bytes(blob[at..at + 4].try_into().expect("4 bytes"))
+                == crc32c::crc32c(&blob[..at])
+        };
+        if magic_ok(META_V1_ENCODED_LEN)
+            && blob[META_VERSION_BYTE_INDEX] == META_VERSION_V1
+            && crc_ok(META_V1_ENCODED_LEN - 4)
+        {
+            return StoredValue::StripedV1;
+        }
+        if !magic_ok(META_ENCODED_LEN)
+            || blob[META_VERSION_BYTE_INDEX] != META_VERSION
+            || !crc_ok(META_CRC_AT)
+        {
+            return StoredValue::Inline;
+        }
+        StoredValue::Striped(StripeMeta {
+            upload_id: blob[9..25].try_into().expect("16 bytes"),
+            total_bytes: u64::from_le_bytes(blob[25..33].try_into().expect("8 bytes")),
+            chunk_count: u32::from_le_bytes(blob[33..37].try_into().expect("4 bytes")),
+            chunk_size: u32::from_le_bytes(blob[37..41].try_into().expect("4 bytes")),
+        })
+    }
+}
+
+pub(crate) enum StoredValue {
+    Striped(StripeMeta),
+    /// The first stripe format, whose chunks carry no upload id. Not read:
+    /// taken as inline it would return the meta bytes as the value. Overwrite
+    /// and delete leave its chunks behind.
+    StripedV1,
+    Inline,
+}
+
+/// Best-effort delete of one upload's first `count` chunks. Called only once
+/// no meta names the upload, so a failure leaves orphans, never a damaged value.
+async fn delete_upload_chunks(
+    cluster: &ClusterClient,
+    user_key: &[u8],
+    upload_id: &[u8; 16],
+    count: u64,
+) {
+    let keys: Vec<Vec<u8>> = (0..count).map(|i| make_chunk_key(user_key, upload_id, i)).collect();
+    let refs: Vec<&[u8]> = keys.iter().map(Vec::as_slice).collect();
+    for (i, r) in cluster.delete_many(&refs, WriteOptions::default()).await.into_iter().enumerate() {
+        if let Err(e) = r {
+            tracing::warn!(chunk = i, error = %e, "stripe chunk delete failed; chunk is orphaned");
+        }
+    }
+}
+
+/// Pure fn extracted from
+/// `wait_for_cluster_ready` so the readiness predicate is unit-testable
+/// without booting a real manager. Resolves every partition's
+/// `(part_id, ps_id)` to the address the SDK's `lookup_key` would
+/// produce (`part_addrs[part_id]` if present, else
+/// `ps_details[ps_id]`), and reports:
+///
+///   - `total_partitions`: regions count (manager's view).
+///   - `missing_addrs`: partitions whose `(part_id, ps_id)` resolved
+///     to NO address at all — the manager hasn't published a
+///     `RegisterPartitionAddr` for this partition AND there's no
+///     `ps_details` fallback. Treated as "not ready yet."
+///   - `probe_addrs`: distinct ps_addrs the caller should TCP-probe
+///     to confirm the listener is actually bound (a partition can
+///     have a `part_addr` in the manager's response and yet have a
+///     listener that won't accept until the PS thread's
+///     `partition_loop` runs `partition listener bound`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClusterReadySummary {
+    pub total_partitions: usize,
+    pub missing_addrs: Vec<u64>,
+    pub probe_addrs: Vec<String>,
+}
+
+pub fn cluster_ready_summary(
+    regions: &[(u64, u64)],
+    part_addrs: &HashMap<u64, String>,
+    ps_details: &HashMap<u64, String>,
+) -> ClusterReadySummary {
+    let mut missing_addrs: Vec<u64> = Vec::new();
+    let mut probe_addrs: Vec<String> = Vec::new();
+    for &(part_id, ps_id) in regions {
+        let addr = part_addrs
+            .get(&part_id)
+            .cloned()
+            .or_else(|| ps_details.get(&ps_id).cloned());
+        match addr {
+            Some(a) => probe_addrs.push(a),
+            None => missing_addrs.push(part_id),
+        }
+    }
+    probe_addrs.sort();
+    probe_addrs.dedup();
+    missing_addrs.sort();
+    ClusterReadySummary {
+        total_partitions: regions.len(),
+        missing_addrs,
+        probe_addrs,
+    }
+}
+
+#[cfg(test)]
+mod cluster_ready_tests {
+    use super::*;
+
+    fn psd(addr: &str) -> String {
+        addr.to_string()
+    }
+
+    #[test]
+    fn all_partitions_have_part_addrs_no_missing() {
+        // Healthy steady state: every partition has a per-partition
+        // listener registered.
+        let regions = vec![(13, 1), (20, 1), (27, 1)];
+        let part_addrs: HashMap<u64, String> = [
+            (13, psd("127.0.0.1:9301")),
+            (20, psd("127.0.0.1:9302")),
+            (27, psd("127.0.0.1:9303")),
+        ]
+        .into_iter()
+        .collect();
+        let ps_details: HashMap<u64, String> = [(1, psd("127.0.0.1:9301"))].into_iter().collect();
+        let s = cluster_ready_summary(&regions, &part_addrs, &ps_details);
+        assert_eq!(s.total_partitions, 3);
+        assert!(s.missing_addrs.is_empty());
+        assert_eq!(
+            s.probe_addrs,
+            vec![
+                "127.0.0.1:9301".to_string(),
+                "127.0.0.1:9302".to_string(),
+                "127.0.0.1:9303".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn missing_part_addr_with_ps_details_fallback_counts_as_resolved() {
+        // partition 20 has no per-partition listener YET — the
+        // manager reports it but `RegisterPartitionAddr` hasn't
+        // landed. ps_details for ps_id=1 has the base port. SDK's
+        // lookup_key would route to 9301 (the base PS port), which
+        // serves the FIRST partition opened on that PS (part 13).
+        //
+        // **Sending a part_id=20 PutReq to 9301 mis-routes** —
+        // partition_loop synths NotFound. The pure-fn here marks
+        // this as resolved (we DO have an address to try) but the
+        // probe step will still flag if 9301 isn't accepting yet.
+        let regions = vec![(13, 1), (20, 1)];
+        let part_addrs: HashMap<u64, String> =
+            [(13, psd("127.0.0.1:9301"))].into_iter().collect();
+        let ps_details: HashMap<u64, String> = [(1, psd("127.0.0.1:9301"))].into_iter().collect();
+        let s = cluster_ready_summary(&regions, &part_addrs, &ps_details);
+        assert_eq!(s.total_partitions, 2);
+        // Note: missing_addrs is empty (the ps_details fallback
+        // provided SOMETHING). This is the readiness false-positive
+        // case — the SDK has SOMETHING to call but it mis-routes.
+        // The caller's NEXT retry of refresh_regions picks up the
+        // real part_addr once PS registers it, fixing the resolve.
+        // wait_for_cluster_ready relies on the probe step + the
+        // 60 s retry budget to ride out this window.
+        assert!(s.missing_addrs.is_empty());
+        // Both partitions probe the same base port → deduped to one.
+        assert_eq!(s.probe_addrs, vec!["127.0.0.1:9301".to_string()]);
+    }
+
+    #[test]
+    fn missing_part_addr_and_missing_ps_details_reports_missing() {
+        // The strict "not ready" state: manager has assigned the
+        // partition to ps_id=2 but the PS process hasn't connected
+        // at all (no ps_details entry). No address to even try.
+        let regions = vec![(13, 1), (99, 2)];
+        let part_addrs: HashMap<u64, String> =
+            [(13, psd("127.0.0.1:9301"))].into_iter().collect();
+        let ps_details: HashMap<u64, String> = [(1, psd("127.0.0.1:9301"))].into_iter().collect();
+        let s = cluster_ready_summary(&regions, &part_addrs, &ps_details);
+        assert_eq!(s.total_partitions, 2);
+        assert_eq!(s.missing_addrs, vec![99]);
+    }
+
+    #[test]
+    fn missing_addrs_are_sorted_for_diagnostic_stability() {
+        // The error message must be deterministic across runs so
+        // operators can grep for it.
+        let regions = vec![(99, 7), (13, 1), (50, 9)];
+        let part_addrs: HashMap<u64, String> = HashMap::new();
+        let ps_details: HashMap<u64, String> = HashMap::new();
+        let s = cluster_ready_summary(&regions, &part_addrs, &ps_details);
+        assert_eq!(s.missing_addrs, vec![13, 50, 99]);
+    }
+}
+
+#[cfg(test)]
+mod first_attempt_timeout_tests {
+    //! `first_attempt_effective_timeout` is
+    //! the policy that fast-fails a stale PS conn within 5 s on the
+    //! first attempt of every routed PS call, including connection setup,
+    //! falling back to the full 30 s `rpc_timeout` on retries against
+    //! the freshly-reconnected listener.
+
+    use super::*;
+
+    fn client_with(rpc: Option<Duration>, first: Option<Duration>) -> ClusterClient {
+        // We can't actually `connect` in unit tests, so build a fake
+        // shell. The internal fields are private but the public
+        // setters cover what the test needs.
+        let cluster = compio::runtime::Runtime::new().unwrap().block_on(async {
+            // Touch nothing on the wire; just exercise the policy.
+            // We construct a fake ClusterClient via the visible API:
+            // there isn't one, so we use a real address that won't
+            // be dialled (the policy fn doesn't dial).
+            ClusterClient {
+                role: autumn_rpc::version_hello::Role::Client,
+                manager_addrs: vec!["127.0.0.1:1".to_string()],
+                current_mgr: Cell::new(0),
+                mgr_conn: Rc::new(RefCell::new(None)),
+                ps_conns: RefCell::new(HashMap::new()),
+                ps_connecting: RefCell::new(HashMap::new()),
+                en_pool: autumn_stream::ConnPool::with_role(
+                    autumn_rpc::version_hello::Role::Client,
+                ),
+                regions: RefCell::new(Vec::new()),
+                ps_details: RefCell::new(HashMap::new()),
+                part_addrs: RefCell::new(HashMap::new()),
+                rpc_timeout: Cell::new(rpc),
+                first_attempt_timeout: Cell::new(first),
+                auth: RefCell::new(None),
+                auth_gen: Cell::new(0),
+                wire_refused: RefCell::new(None),
+                negotiated_cluster_wire: Cell::new(0),
+                binding: NamespaceBinding::Raw,
+            }
+        });
+        cluster
+    }
+
+    #[test]
+    fn attempt_0_uses_min_of_rpc_and_first_attempt() {
+        let c = client_with(Some(Duration::from_secs(30)), Some(Duration::from_secs(5)));
+        assert_eq!(
+            c.first_attempt_effective_timeout(0),
+            Some(Duration::from_secs(5)),
+            "attempt 0 → fast-fail at 5 s (min)"
+        );
+    }
+
+    #[test]
+    fn ps_connection_setup_obeys_attempt_timeout() {
+        let client = client_with(Some(Duration::from_secs(1)), Some(Duration::from_secs(1)));
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let listener = compio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap().to_string();
+            let server = compio::runtime::spawn(async move {
+                let (_socket, _) = listener.accept().await.unwrap();
+                // Accept TCP but never answer MSG_CLIENT_HELLO. This is the
+                // same pre-RPC acquisition phase that used to sit outside the
+                // caller's attempt deadline.
+                compio::time::sleep(Duration::from_millis(100)).await;
+            });
+
+            let err = match client
+                .get_ps_client_with_timeout(&addr, Some(Duration::from_millis(20)))
+                .await
+            {
+                Ok(_) => panic!("connection handshake ignored the attempt timeout"),
+                Err(err) => err,
+            };
+            assert!(
+                err.downcast_ref::<AutumnError>()
+                    .is_some_and(|e| matches!(e, AutumnError::ConnectionError(_))),
+                "timeout must remain a retryable connection error: {err:#}"
+            );
+            server.await.unwrap();
+        });
+    }
+
+    #[test]
+    fn direct_batch_requests_partitions_concurrently_and_keeps_item_order() {
+        use compio::io::{AsyncRead, AsyncWriteExt};
+        use futures::{
+            channel::{mpsc, oneshot},
+            StreamExt,
+        };
+        let client = client_with(Some(Duration::from_secs(5)), None);
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let (arrived_tx, mut arrived_rx) = mpsc::unbounded();
+            let mut releases = Vec::new();
+            let mut servers = Vec::new();
+            for (id, start, end, value) in [
+                (1, b"".as_slice(), b"m".as_slice(), b"left".as_slice()),
+                (2, b"m".as_slice(), b"".as_slice(), b"right".as_slice()),
+            ] {
+                let listener = compio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                client
+                    .part_addrs
+                    .borrow_mut()
+                    .insert(id, listener.local_addr().unwrap().to_string());
+                client.regions.borrow_mut().push((
+                    id,
+                    ClientRegion {
+                        rg: Some(MgrRange {
+                            start_key: start.to_vec(),
+                            end_key: end.to_vec(),
+                        }),
+                        part_id: id,
+                        ps_id: 1,
+                        region_epoch: 1,
+                    },
+                ));
+                let (release_tx, release_rx) = oneshot::channel();
+                releases.push(release_tx);
+                let arrived_tx = arrived_tx.clone();
+                servers.push(compio::runtime::spawn(async move {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    test_protocol::accept_tcp(&mut socket, autumn_rpc::WIRE_VERSION, 2, 0, "")
+                        .await;
+                    let mut decoder = autumn_rpc::FrameDecoder::new();
+                    let mut buf = vec![0; 4096];
+                    let frame = 'outer: loop {
+                        let compio::BufResult(n, back) = socket.read(buf).await;
+                        buf = back;
+                        decoder.feed(&buf[..n.unwrap()]);
+                        while let Some(frame) = decoder.try_decode().unwrap() {
+                            break 'outer frame;
+                        }
+                    };
+                    assert_eq!(frame.msg_type, MSG_BATCH_GET);
+                    let req: BatchGetReq = rkyv_decode(&frame.payload).unwrap();
+                    assert!(req.direct);
+                    arrived_tx.unbounded_send(id).unwrap();
+                    release_rx.await.unwrap();
+                    let ctrl = rkyv_encode(&BatchGetCtrl {
+                        message: String::new(),
+                        statuses: vec![BATCH_GET_FOUND],
+                        value_lens: vec![value.len() as u32],
+                        positions: Vec::new(),
+                    });
+                    let head = autumn_rpc::frame::encode_bulk_response_head_bytes(
+                        frame.req_id,
+                        frame.msg_type,
+                        partition_rpc::CODE_OK,
+                        &ctrl,
+                        value.len(),
+                    );
+                    socket.write_all([head.as_ref(), value].concat()).await.0.unwrap();
+                }));
+            }
+            let mut right = vec![0; BULK_MIN_BYTES];
+            let mut left = vec![0; BULK_MIN_BYTES];
+            let mut items = [
+                GetManyItem {
+                    key: b"z",
+                    offset: 0,
+                    length: 0,
+                    dest: &mut right,
+                },
+                GetManyItem {
+                    key: b"a",
+                    offset: 0,
+                    length: 0,
+                    dest: &mut left,
+                },
+            ];
+            let release = async {
+                let a = arrived_rx.next().await.unwrap();
+                let b = arrived_rx.next().await.unwrap();
+                assert_ne!(a, b);
+                for tx in releases {
+                    tx.send(()).unwrap();
+                }
+            };
+            let (results, ()) = compio::time::timeout(Duration::from_secs(2), async {
+                futures::join!(client.get_many_direct(&mut items), release)
+            })
+            .await
+            .expect("both partitions must receive descriptors before either replies");
+            assert_eq!(*results[0].as_ref().unwrap(), Some(5));
+            assert_eq!(*results[1].as_ref().unwrap(), Some(4));
+            assert_eq!(&right[..5], b"right");
+            assert_eq!(&left[..4], b"left");
+            for server in servers {
+                server.await.unwrap();
+            }
+        });
+    }
+
+    #[test]
+    fn attempt_1_falls_back_to_full_rpc_timeout() {
+        let c = client_with(Some(Duration::from_secs(30)), Some(Duration::from_secs(5)));
+        assert_eq!(
+            c.first_attempt_effective_timeout(1),
+            Some(Duration::from_secs(30)),
+            "attempt 1 → freshly reconnected, give it the full 30 s"
+        );
+    }
+
+    #[test]
+    fn no_first_attempt_timeout_uses_rpc_timeout() {
+        let c = client_with(Some(Duration::from_secs(30)), None);
+        assert_eq!(c.first_attempt_effective_timeout(0), Some(Duration::from_secs(30)));
+        assert_eq!(c.first_attempt_effective_timeout(1), Some(Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn no_rpc_timeout_uses_first_attempt_on_first() {
+        // Discouraged but supported.
+        let c = client_with(None, Some(Duration::from_secs(5)));
+        assert_eq!(c.first_attempt_effective_timeout(0), Some(Duration::from_secs(5)));
+        assert_eq!(c.first_attempt_effective_timeout(1), None);
+    }
+
+    #[test]
+    fn first_attempt_longer_than_rpc_clamps_to_rpc() {
+        // Edge case: an operator sets `set_first_attempt_timeout`
+        // to a value LARGER than `rpc_timeout`. The min ensures we
+        // never go above `rpc_timeout` (it's a hard ceiling).
+        let c = client_with(Some(Duration::from_secs(2)), Some(Duration::from_secs(10)));
+        assert_eq!(
+            c.first_attempt_effective_timeout(0),
+            Some(Duration::from_secs(2))
+        );
+    }
+}
+
+#[cfg(test)]
+mod bulk_read_status_tests {
+    use super::*;
+
+    const HANDLER_STATUSES: [StatusCode; 9] = [
+        StatusCode::Ok,
+        StatusCode::NotFound,
+        StatusCode::InvalidArgument,
+        StatusCode::FailedPrecondition,
+        StatusCode::Internal,
+        StatusCode::Unavailable,
+        StatusCode::AlreadyExists,
+        StatusCode::PermissionDenied,
+        StatusCode::NamespaceUnknown,
+    ];
+
+    /// A PS read handler reports failure as a `StatusCode`; `MSG_GET`
+    /// carries it as a `CODE_*` byte that this crate decodes with
+    /// `code_to_error`. The spaces agree only up to 3, so a raw cast made the
+    /// GC-pin `Unavailable` (5) arrive as `CODE_VALUE_TOO_LARGE` — a terminal
+    /// "value too large" for a read that one retry would have served.
+    #[test]
+    fn a_handler_status_decodes_to_the_same_meaning_on_a_bulk_read() {
+        for status in HANDLER_STATUSES {
+            let code = partition_rpc::code_for_status(status);
+            let decoded = code_to_error(code, String::new());
+            assert!(
+                !matches!(decoded, AutumnError::ValueTooLarge { .. } | AutumnError::Fenced(_)),
+                "{status:?} decoded as {decoded:?}"
+            );
+            assert_eq!(code == partition_rpc::CODE_OK, status == StatusCode::Ok);
+            assert_eq!(
+                matches!(decoded, AutumnError::NotFound),
+                status == StatusCode::NotFound,
+                "{status:?} -> {decoded:?}"
+            );
+            assert_eq!(
+                matches!(decoded, AutumnError::PreconditionFailed(_)),
+                status == StatusCode::FailedPrecondition,
+                "{status:?} -> {decoded:?}"
+            );
+        }
+        assert_eq!(
+            partition_rpc::code_for_status(StatusCode::Unavailable),
+            partition_rpc::CODE_UNAVAILABLE
+        );
+    }
+}
+
+#[cfg(test)]
+mod zc_rule_tests {
+    use super::*;
+
+    /// write into a pool slab, truncate to the written length,
+    /// freeze into a Bytes exposing exactly those bytes (aliasing the slab —
+    /// the write-side currency for `put_bulk`).
+    #[test]
+    fn value_buf_truncate_freeze_roundtrip() {
+        let mut vb = alloc_value_buf(8192);
+        assert_eq!(vb.capacity(), 8192);
+        assert_eq!(vb.len(), 8192, "filled defaults to capacity");
+        vb.as_mut_slice()[..5].copy_from_slice(b"hello");
+        vb.truncate(5);
+        assert_eq!(&*vb, b"hello", "Deref exposes the filled view");
+        let b = vb.freeze();
+        assert_eq!(&b[..], b"hello", "freeze aliases exactly the filled bytes");
+    }
+}
+
+#[cfg(test)]
+mod fan_out_tests {
+    use super::*;
+    use futures::stream::StreamExt;
+    use std::time::Duration;
+
+    // bulk is engaged iff value >= 64 KiB — symmetric across read/write +
+    // transport. Guards against re-introducing an `is_ucx`-gated asymmetry.
+    #[test]
+    fn bulk_worthwhile_is_symmetric_at_64k() {
+        assert!(!bulk_worthwhile(0));
+        assert!(!bulk_worthwhile(4 * 1024));
+        assert!(!bulk_worthwhile(BULK_MIN_BYTES - 1));
+        assert!(bulk_worthwhile(BULK_MIN_BYTES));
+        assert!(bulk_worthwhile(8 * 1024 * 1024));
+    }
+
+    // `fan_out_collect` returns INPUT order even when futures complete in
+    // reverse (index 0 sleeps longest). The reorder is deterministic regardless
+    // of timing, so this is not flaky.
+    #[test]
+    fn collect_returns_input_order_despite_reverse_completion() {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let futs = (0..10usize).map(|i| async move {
+                compio::time::sleep(Duration::from_millis((10 - i as u64) * 3)).await;
+                i * 7
+            });
+            let out = fan_out_collect(futs, 4).await;
+            let expect: Vec<usize> = (0..10).map(|i| i * 7).collect();
+            assert_eq!(out, expect);
+        });
+    }
+
+    // `fan_out` (the streaming base the io_uring daemon will use) yields
+    // every input index exactly once, paired with its own output.
+    #[test]
+    fn fan_out_yields_every_index_once() {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let futs = (0..20usize).map(|i| async move { i });
+            let mut seen = [false; 20];
+            let mut count = 0;
+            let mut s = fan_out(futs, 5);
+            while let Some((i, v)) = s.next().await {
+                assert_eq!(v, i, "value paired with its index");
+                assert!(!seen[i], "index {i} yielded twice");
+                seen[i] = true;
+                count += 1;
+            }
+            assert_eq!(count, 20);
+            assert!(seen.iter().all(|&b| b), "every index yielded");
+        });
+    }
+}
+
+#[cfg(test)]
+mod stripe_meta_tests {
+    use super::*;
+
+    fn meta() -> StripeMeta {
+        StripeMeta {
+            upload_id: [7; 16],
+            total_bytes: 12 * 1024 * 1024,
+            chunk_count: 4,
+            chunk_size: 3 * 1024 * 1024,
+        }
+    }
+
+    fn is_inline(blob: &[u8]) -> bool {
+        matches!(StripeMeta::decode(blob), StoredValue::Inline)
+    }
+
+    #[test]
+    fn meta_roundtrip() {
+        let encoded = meta().encode();
+        assert_eq!(encoded.len(), META_ENCODED_LEN);
+        match StripeMeta::decode(&encoded) {
+            StoredValue::Striped(m) => assert_eq!(m, meta()),
+            _ => panic!("not decoded as striped"),
+        }
+    }
+
+    #[test]
+    fn non_meta_blobs_are_inline() {
+        assert!(is_inline(&[0u8; META_ENCODED_LEN - 1]));
+        assert!(is_inline(&[0u8; META_ENCODED_LEN + 1]));
+        assert!(is_inline(b"hello world"));
+        let mut bad_magic = meta().encode();
+        bad_magic[0] ^= 0x01;
+        assert!(is_inline(&bad_magic));
+        let mut bad_crc = meta().encode();
+        bad_crc[30] ^= 0x01;
+        assert!(is_inline(&bad_crc));
+    }
+
+    #[test]
+    fn a_v1_meta_is_recognised() {
+        // magic + version 1 + total_bytes + chunk_count + chunk_size + crc.
+        let mut v1 = [0u8; META_V1_ENCODED_LEN];
+        v1[..8].copy_from_slice(&META_MAGIC[..8]);
+        v1[8] = META_VERSION_V1;
+        v1[9..17].copy_from_slice(&100u64.to_le_bytes());
+        let crc = crc32c::crc32c(&v1[..25]);
+        v1[25..].copy_from_slice(&crc.to_le_bytes());
+        assert!(matches!(StripeMeta::decode(&v1), StoredValue::StripedV1));
+    }
+
+    #[test]
+    fn chunk_keys_are_distinct_per_key_and_upload() {
+        // Length-prefixing keeps "ab" and "abc" apart.
+        assert_ne!(make_chunk_key(b"ab", &[1; 16], 5), make_chunk_key(b"abc", &[1; 16], 5));
+        assert_ne!(make_chunk_key(b"k", &[1; 16], 0), make_chunk_key(b"k", &[2; 16], 0));
+        assert!(make_chunk_key(b"k", &[1; 16], 0).starts_with(CHUNK_KEY_PREFIX));
+    }
+
+    #[test]
+    fn chunk_keys_sort_by_index() {
+        let k = |i| make_chunk_key(b"key", &[1; 16], i);
+        assert!(k(0) < k(1));
+        assert!(k(1) < k(u64::MAX));
+    }
+}
+
+/// Lifecycle state of a `PutStreamHandle`. Open → (Committed | Aborted)
+/// transitions are one-way; the `commit` / `abort` consumers move the
+/// handle. A drop in the `Open` state logs a WARN; the chunks already
+/// written under the reserved namespace become orphan until a sweep
+/// cleans them up (no automatic TTL — that was a server-side
+/// feature; client-side striping pushes orphan handling to the
+/// application layer or a periodic GC tool).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PutStreamState {
+    Open,
+    Committed,
+    Aborted,
+}
+
+/// In-progress striped put. Borrows the `ClusterClient` so each
+/// `send`/`commit` can route its sub-Put through the SDK's existing
+/// resolution + connection caching. The handle is `!Send` (transitively
+/// through the SDK's `Rc` internals); don't move it across runtimes.
+pub struct PutStreamHandle<'a> {
+    cluster: &'a ClusterClient,
+    user_key: Vec<u8>,
+    upload_id: [u8; 16],
+    chunk_size: u32,
+    next_chunk_index: u64,
+    bytes_sent: u64,
+    state: PutStreamState,
+}
+
+impl<'a> PutStreamHandle<'a> {
+    /// Total bytes successfully appended (sum of all `send` sizes).
+    pub fn bytes_sent(&self) -> u64 {
+        self.bytes_sent
+    }
+
+    /// Number of chunks successfully appended.
+    pub fn chunks_sent(&self) -> u64 {
+        self.next_chunk_index
+    }
+
+    /// Override the default 4 MiB chunk size. Must be called before
+    /// the first `send`.
+    pub fn with_chunk_size(mut self, chunk_size: u32) -> Self {
+        debug_assert_eq!(self.next_chunk_index, 0, "chunk_size set after send");
+        self.chunk_size = chunk_size.max(1);
+        self
+    }
+
+    /// Append one chunk. The SDK writes it as a normal `Put` to a
+    /// reserved-namespace chunk key. Returns the running total bytes
+    /// committed.
+    ///
+    /// Caller is responsible for chunk sizing — typically 1–4 MiB. The
+    /// 4 KiB inline-VP threshold on the PS means each chunk goes via
+    /// the VP path on the server; very small chunks would inflate
+    /// memtable entry counts proportionally.
+    pub async fn send(&mut self, chunk: &[u8]) -> std::result::Result<u64, AutumnError> {
+        if self.state != PutStreamState::Open {
+            return Err(AutumnError::InvalidArgument(format!(
+                "PutStreamHandle is {:?}, not Open",
+                self.state
+            )));
+        }
+        // The chunk key `\xff\xfe…++user_key` is a normal user key to the binding:
+        // a scoped (Prepend) client prepends the scope prefix so chunks land in
+        // the scope range; Raw writes the legacy global chunk space.
+        let chunk_key = make_chunk_key(&self.user_key, &self.upload_id, self.next_chunk_index);
+        self.cluster.put(&chunk_key, chunk, WriteOptions::default()).await?;
+        self.next_chunk_index = self.next_chunk_index.saturating_add(1);
+        self.bytes_sent = self.bytes_sent.saturating_add(chunk.len() as u64);
+        Ok(self.bytes_sent)
+    }
+
+    /// Finalise the upload. Writes a meta blob naming this upload to the user
+    /// key — the linearisation point. Until it lands, readers see the previous
+    /// value (or NotFound). Then deletes the chunks of the upload it replaced;
+    /// a reader still on that upload gets `PreconditionFailed`.
+    ///
+    /// Two commits racing on one key can both read the same predecessor; the
+    /// earlier one's chunks are then orphaned (never served: no meta names them).
+    pub async fn commit(mut self) -> std::result::Result<(), AutumnError> {
+        if self.state != PutStreamState::Open {
+            return Err(AutumnError::InvalidArgument(format!(
+                "PutStreamHandle is {:?}, cannot commit",
+                self.state
+            )));
+        }
+        // Range guard: we encode chunk_count as u32 in the meta blob.
+        if self.next_chunk_index > u32::MAX as u64 {
+            self.state = PutStreamState::Aborted;
+            return Err(AutumnError::InvalidArgument(format!(
+                "chunk_count {} exceeds u32::MAX",
+                self.next_chunk_index
+            )));
+        }
+        let meta = StripeMeta {
+            upload_id: self.upload_id,
+            total_bytes: self.bytes_sent,
+            chunk_count: self.next_chunk_index as u32,
+            chunk_size: self.chunk_size,
+        };
+        let blob = meta.encode();
+        let replaced = match self.cluster.stripe_meta(&self.user_key).await {
+            Ok(m) => m,
+            Err(e) => {
+                self.state = PutStreamState::Aborted;
+                return Err(e);
+            }
+        };
+        match self.cluster.put(&self.user_key, &blob, WriteOptions::default()).await {
+            Ok(()) => {
+                self.state = PutStreamState::Committed;
+                if let Some(old) = replaced {
+                    delete_upload_chunks(self.cluster, &self.user_key, &old.upload_id, old.chunk_count as u64).await;
+                }
+                Ok(())
+            }
+            Err(e) => {
+                // The put may still have applied (OutcomeUnknown), so this
+                // upload's chunks are kept; if it did not, they are orphans.
+                self.state = PutStreamState::Aborted;
+                Err(e)
+            }
+        }
+    }
+
+    /// Discard the in-progress upload by best-effort deleting this upload's
+    /// chunks. Its meta was never written, so readers keep seeing the
+    /// previous value.
+    ///
+    /// A failed chunk delete is logged and leaves an orphan rather than
+    /// blocking the abort path.
+    pub async fn abort(mut self) -> std::result::Result<(), AutumnError> {
+        if self.state != PutStreamState::Open {
+            return Ok(());
+        }
+        delete_upload_chunks(self.cluster, &self.user_key, &self.upload_id, self.next_chunk_index).await;
+        self.state = PutStreamState::Aborted;
+        Ok(())
+    }
+}
+
+impl<'a> Drop for PutStreamHandle<'a> {
+    fn drop(&mut self) {
+        if self.state == PutStreamState::Open {
+            tracing::warn!(
+                key = ?String::from_utf8_lossy(&self.user_key),
+                bytes_sent = self.bytes_sent,
+                chunks_sent = self.next_chunk_index,
+                "PutStreamHandle dropped without commit/abort; meta blob \
+                 was not written so the value is invisible to readers, but \
+                 {} chunks are now orphan under the reserved namespace and \
+                 require a background sweep to clean",
+                self.next_chunk_index
+            );
+        }
+    }
+}
+
+/// streaming reader. For striped values: walks chunk keys
+/// in order. For inline values: yields the entire blob in one
+/// `next_chunk` call. The same `GetStream` shape so callers don't
+/// need to know which path they're on.
+pub struct GetStream<'a> {
+    cluster: &'a ClusterClient,
+    user_key: Vec<u8>,
+    /// `Some` for inline values — the blob to yield in one shot.
+    inline: Option<Vec<u8>>,
+    /// `Some` for striped values — describes the chunk layout.
+    striped: Option<StripeMeta>,
+    /// Bytes yielded so far (assembled-value cursor).
+    cursor: u64,
+    /// Next chunk index to fetch (only for striped).
+    next_chunk_index: u64,
+    /// Buffered chunk bytes from the most recent fetch (striped path).
+    pending_buf: Vec<u8>,
+    /// Read cursor inside `pending_buf`.
+    pending_pos: usize,
+    /// Max bytes to yield per `next_chunk` call.
+    yield_size: u32,
+}
+
+impl<'a> GetStream<'a> {
+    /// Total assembled-value size in bytes.
+    pub fn total_bytes(&self) -> u64 {
+        if let Some(m) = &self.striped {
+            m.total_bytes
+        } else if let Some(b) = &self.inline {
+            b.len() as u64
+        } else {
+            0
+        }
+    }
+
+    /// Bytes yielded so far.
+    pub fn position(&self) -> u64 {
+        self.cursor
+    }
+
+    /// Bytes remaining to yield.
+    pub fn remaining(&self) -> u64 {
+        self.total_bytes().saturating_sub(self.cursor)
+    }
+
+    /// Pull the next chunk. Returns `Ok(None)` when the value is
+    /// exhausted. The yielded chunk is at most `yield_size` bytes;
+    /// the final chunk may be shorter.
+    pub async fn next_chunk(&mut self) -> std::result::Result<Option<Vec<u8>>, AutumnError> {
+        if self.cursor >= self.total_bytes() {
+            return Ok(None);
+        }
+
+        // Inline path — single yield of the whole blob.
+        if let Some(blob) = self.inline.take() {
+            self.cursor = blob.len() as u64;
+            return Ok(Some(blob));
+        }
+
+        // Striped path — refill pending buf if drained.
+        let meta = self.striped.as_ref().expect("inline or striped");
+        while self.pending_pos >= self.pending_buf.len() {
+            if self.next_chunk_index >= meta.chunk_count as u64 {
+                return Ok(None);
+            }
+            let ck = make_chunk_key(&self.user_key, &meta.upload_id, self.next_chunk_index);
+            let chunk = match self.cluster.get(&ck).await? {
+                Some(c) => c,
+                None => {
+                    let upload_id = meta.upload_id;
+                    let current = self.cluster.stripe_meta(&self.user_key).await?;
+                    if current.map(|m| m.upload_id) != Some(upload_id) {
+                        return Err(AutumnError::PreconditionFailed(
+                            "streamed value was replaced or deleted while being read".into(),
+                        ));
+                    }
+                    return Err(AutumnError::ServerError(format!(
+                        "striped chunk {} missing for key — value may have been \
+                         partially deleted; call delete_stream + re-upload",
+                        self.next_chunk_index
+                    )));
+                }
+            };
+            self.pending_buf = chunk;
+            self.pending_pos = 0;
+            self.next_chunk_index = self.next_chunk_index.saturating_add(1);
+        }
+
+        let avail = self.pending_buf.len() - self.pending_pos;
+        let want = (self.yield_size as usize).min(avail);
+        let out = self.pending_buf[self.pending_pos..self.pending_pos + want].to_vec();
+        self.pending_pos += want;
+        self.cursor = self.cursor.saturating_add(want as u64);
+        Ok(Some(out))
+    }
+}
+
+#[cfg(test)]
+mod namespace_binding_tests {
+    //! D7: the client namespace binding (Prepend-only) — scoped-prepend /
+    //! Raw key mapping, prefix binding, range strip, and the upper-cap successor.
+    use super::*;
+
+    #[test]
+    fn scoped_always_prepends_incl_builtins() {
+        // Prepend-only, NS-FIRST (Option 3): EVERY scope prepends `{scope}/`;
+        // there is no Assert mode. Built-in key builders emit keys RELATIVE to the
+        // prefix, so there is no double-prefix. A scope may be a whole namespace
+        // (`fs`) or an in-namespace sub-prefix (`mem/agent7`).
+        for scope in ["fs", "kvc", "mem", "bench/perf", "mem/agent7"] {
+            let b = NamespaceBinding::scoped(scope);
+            let want = format!("{scope}/").into_bytes();
+            match &b {
+                NamespaceBinding::Scoped { prefix } => assert_eq!(prefix, &want),
+                _ => panic!("expected Scoped"),
+            }
+            assert_eq!(
+                b.bind_key(b"rel/key").unwrap(),
+                [want.as_slice(), b"rel/key"].concat()
+            );
+        }
+        // A trailing slash in the scope is idempotent.
+        assert_eq!(NamespaceBinding::scoped("fs/").prefix().unwrap(), b"fs/");
+    }
+
+    #[test]
+    fn prepend_binds_and_strips() {
+        let b = NamespaceBinding::scoped("bench/perf"); // → bench/perf/
+        assert_eq!(b.bind_key(b"k1").unwrap(), b"bench/perf/k1".to_vec());
+        assert_eq!(b.bind_key(b"").unwrap(), b"bench/perf/".to_vec());
+        // strip is the inverse for keys under the prefix.
+        assert_eq!(b.strip(b"bench/perf/k1".to_vec()), b"k1".to_vec());
+        // a key NOT under the prefix is returned unchanged by strip.
+        assert_eq!(b.strip(b"other".to_vec()), b"other".to_vec());
+    }
+
+    #[test]
+    fn scope_is_locked_by_construction() {
+        // The whole point of Prepend-only: a scoped client CANNOT emit a key
+        // outside its `{scope}/`. Even a key that "looks like" another scope is
+        // prepended, landing it firmly inside this one.
+        let b = NamespaceBinding::scoped("mem/acme"); // → mem/acme/
+        assert_eq!(
+            b.bind_key(b"other/mem/x").unwrap(),
+            b"mem/acme/other/mem/x".to_vec(),
+        );
+        // bind_key is infallible for a scoped binding — no escape, no reject.
+        assert!(b.bind_key(b"\xff\xfeanything").is_ok());
+    }
+
+    #[test]
+    fn raw_is_identity() {
+        let b = NamespaceBinding::Raw;
+        assert_eq!(b.bind_key(b"\x01\x02anything").unwrap(), b"\x01\x02anything".to_vec());
+        assert_eq!(b.strip(b"\x01raw".to_vec()), b"\x01raw".to_vec());
+        assert!(b.upper_cap().is_none());
+        assert!(b.prefix().is_none());
+    }
+
+    #[test]
+    fn upper_cap_is_the_slash_successor() {
+        // `{scope}/` → `{scope-last-seg}0` ('/'=0x2f, '0'=0x30).
+        let b = NamespaceBinding::scoped("bench/perf"); // → bench/perf/
+        assert_eq!(b.upper_cap().unwrap(), b"bench/perf0".to_vec());
+        // Every key under the prefix sorts strictly below the cap.
+        let cap = b.upper_cap().unwrap();
+        assert!(b"bench/perf/".to_vec() < cap);
+        assert!(b"bench/perf/zzzzz".to_vec() < cap);
+        assert!(b"bench/perf/\xff".to_vec() < cap);
+        // The next sub-prefix sorts at/above the cap.
+        assert!(b"bench/perg/".to_vec() >= cap);
+    }
+
+    #[test]
+    fn stripe_chunk_keys_land_in_the_scope_range() {
+        // A stripe chunk key (`\xff\xfe…`) is just a normal user key to the
+        // binding, so a scoped (Prepend) client prepends `{scope}/` and the chunk
+        // lands INSIDE the scope range (Layer-A / authz / presplit cover it). No
+        // special chunk path is needed under Prepend-only.
+        let chunk = make_chunk_key(b"userkey", &[0; 16], 3);
+        let b = NamespaceBinding::scoped("bench/perf"); // → bench/perf/
+        assert!(b.bind_key(&chunk).unwrap().starts_with(b"bench/perf/"));
+        // Raw: passthrough (legacy global chunk space).
+        assert_eq!(NamespaceBinding::Raw.bind_key(&chunk).unwrap(), chunk);
+    }
+
+    #[test]
+    fn scope_segment_validation_rejects_forged_scopes() {
+        // connect() validates EACH `/`-delimited segment against `[a-z0-9._-]+`,
+        // so an empty or illegal segment can't forge/nest a scope.
+        for ok in [
+            "bench",
+            "kvc",
+            "acme",
+            "default",
+            "model-cfg_1.0",
+            "a-b_c.d",
+        ] {
+            assert!(super::is_valid_scope_segment(ok), "{ok} should be valid");
+        }
+        for bad in ["", "acme/sub", "Acme", "a b", "a:b", "a/", "/x"] {
+            assert!(!super::is_valid_scope_segment(bad), "{bad} should be rejected");
+        }
+    }
+}
+
+#[cfg(test)]
+mod ec_shard_plan_tests {
+    use super::ec_shard_plan;
+
+    // 4+1 over 10 bytes: shard_size = ceil(10/4) = 3, so the shards hold
+    // logical [0,3) [3,6) [6,9) [9,10) — the last one is 1 real byte plus 2
+    // bytes of padding that must never be read.
+    const LEN: u64 = 10;
+    const K: u32 = 4;
+
+    #[test]
+    fn padding_is_never_reachable() {
+        // sealed_length is authoritative: one byte past it is not a short read
+        // to be trimmed, it is a range this path must refuse so the caller
+        // proxies instead of receiving zeros.
+        assert_eq!(ec_shard_plan(LEN, K, LEN - 1, 2), None);
+        assert_eq!(ec_shard_plan(LEN, K, LEN, 1), None);
+    }
+
+    #[test]
+    fn empty_and_degenerate_inputs() {
+        assert_eq!(ec_shard_plan(LEN, K, 5, 0), Some(Vec::new()));
+        assert_eq!(ec_shard_plan(0, K, 0, 1), None, "no payload");
+        assert_eq!(ec_shard_plan(LEN, 0, 0, 1), None, "k=0 would divide by zero");
+        assert_eq!(ec_shard_plan(LEN, K, u64::MAX, 1), None, "offset+len overflow");
+    }
+
+    #[test]
+    fn an_exactly_divisible_payload_has_no_padding_shard() {
+        // 12 over 4 = 3 each, so every shard is full and the last entry is a
+        // whole shard rather than a short tail.
+        assert_eq!(
+            ec_shard_plan(12, 4, 0, 12),
+            Some(vec![(0, 0, 3), (1, 0, 3), (2, 0, 3), (3, 0, 3)])
+        );
+    }
+
+    #[test]
+    fn plan_offsets_reconstruct_the_original_byte_order() {
+        // The contract the reader depends on: concatenating the planned pieces
+        // in order yields exactly the requested logical range. Model the extent
+        // as bytes 0..LEN laid out shard by shard and check the round trip.
+        let shard_size = LEN.div_ceil(K as u64);
+        for offset in 0..LEN {
+            for len in 1..=(LEN - offset) {
+                let plan = ec_shard_plan(LEN, K, offset, len).expect("in range");
+                let mut got = Vec::new();
+                for (shard, lo, n) in plan {
+                    let base = shard as u64 * shard_size;
+                    for b in 0..n {
+                        got.push((base + lo + b) as u8);
+                    }
+                }
+                let want: Vec<u8> = (offset..offset + len).map(|b| b as u8).collect();
+                assert_eq!(got, want, "offset={offset} len={len}");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod connection_tests;
+#[cfg(test)]
+#[path = "../../rpc/tests/support/protocol.rs"]
+mod test_protocol;
+
+#[cfg(test)]
+mod write_options_tests {
+    use super::*;
+
+    /// A TTL too long to add to now saturates, as `ttl_to_expires_at` does,
+    /// instead of wrapping into a one-second TTL. Ablation: a plain `+`.
+    #[test]
+    fn a_huge_ttl_saturates() {
+        let opts = WriteOptions::default().with_ttl(Duration::MAX);
+        assert_eq!(opts.expires_at(), ClusterClient::ttl_to_expires_at(u64::MAX));
+        assert_eq!(WriteOptions::default().expires_at(), 0, "no TTL, no expiry");
+        let half = WriteOptions::default().with_ttl(Duration::from_millis(500)).expires_at();
+        assert!(half >= ClusterClient::ttl_to_expires_at(1), "a sub-second TTL rounds up");
+    }
+}

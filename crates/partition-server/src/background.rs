@@ -1,0 +1,5820 @@
+//! Background loops: compaction, GC, write, and their helper functions.
+
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
+use std::rc::Rc;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use anyhow::Result;
+use autumn_stream::StreamClient;
+use bytes::Bytes;
+use futures::channel::mpsc;
+use futures::StreamExt;
+
+use crate::sstable::{
+    AsyncMergeIterator, AsyncTableIterator, FetchMode, IterItem, SstBuilder, SstReader,
+};
+
+use crate::*;
+use crate::metrics::MinorCause;
+
+/// Record a terminal maintenance outcome onto the partition's heartbeat ring so
+/// the manager's op-ledger learns the state + error string. No-op for untracked
+/// ops (`op_id == 0`: the PS-local scheduler / legacy SDK).
+fn record_maint_outcome(
+    metrics: &PartitionMetrics,
+    op_id: u64,
+    kind: u8,
+    state: u8,
+    error: String,
+    message: String,
+) {
+    if op_id == 0 {
+        return;
+    }
+    // The op is terminal, so any progress sample is now stale. Leaving it would
+    // show a finished op as forever mid-flight; every terminal exit routes
+    // through here, so this is the one place that cannot be forgotten.
+    metrics.clear_maintenance_progress();
+    metrics.push_maintenance_outcome(manager_rpc::MaintenanceOutcome {
+        op_id,
+        kind,
+        state,
+        error,
+        message,
+        finished_at: crate::now_secs() as i64,
+    });
+}
+
+fn is_frozen_for_maintenance(part: &Rc<RefCell<PartitionData>>) -> bool {
+    let p = part.borrow();
+    p.frozen_for_split.get().is_some() || p.merge_freeze.is_halted()
+}
+
+// the R4 4.4 MIN_PIPELINE_BATCH launch gate (and its
+// `--min-pipeline-batch` knob) is GONE. The gate required `n_inflight == 0
+// || pending >= 256` before launching a batch; whenever per-partition
+// concurrency was below 256 (the common case at N>1 partitions) pending
+// could never reach 256, so the pipeline degraded to lock-step — effective
+// depth=1 regardless of `ps_inflight_cap()`. partition_loop now launches
+// whatever `pending` holds as soon as a pipeline slot is free (natural
+// batching): batch size adapts to arrival-rate × in-flight latency, and a
+// naturally-full burst still lands as ONE batch because the (E) drain pulls
+// the whole req channel into `pending` before the launch check runs.
+
+/// How often the tick may probe the row stream's head extent for a reclaim
+/// (two manager RPCs), and how often it logs that no minor window exists.
+fn reclaim_check_interval() -> Duration {
+    Duration::from_secs(crate::params().reclaim_check_interval_secs.get())
+}
+
+/// Test switch: while set, no minor compaction is requested (flush, tick,
+/// reclaim), so a test can build a table shape first. Only tests set it.
+static MINOR_COMPACTION_PAUSED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+pub fn set_minor_compaction_paused(paused: bool) {
+    MINOR_COMPACTION_PAUSED.store(paused, std::sync::atomic::Ordering::Relaxed);
+}
+/// Minor compactions run, by what asked for them; tests read these.
+static MINOR_RUNS_FLUSH: AtomicU64 = AtomicU64::new(0);
+static MINOR_RUNS_TICK: AtomicU64 = AtomicU64::new(0);
+static MINOR_RUNS_RECLAIM: AtomicU64 = AtomicU64::new(0);
+/// `(flush, tick, reclaim)` minor compactions completed in this process.
+pub fn minor_compaction_runs() -> (u64, u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (
+        MINOR_RUNS_FLUSH.load(Relaxed),
+        MINOR_RUNS_TICK.load(Relaxed),
+        MINOR_RUNS_RECLAIM.load(Relaxed),
+    )
+}
+/// Deletion-triggered major compaction, TiKV's rule (`region-compact-min-
+/// tombstones` / `region-compact-tombstones-percent`, the region-level form of
+/// RocksDB's `CompactOnDeletionCollector`): compact when the partition's SSTs
+/// hold at least this many tombstones AND tombstones are at least this percent
+/// of all their entries. A range scan reads every tombstone and every value it
+/// shadows until a major compaction drops both, so without this a partition
+/// that keeps deleting makes every scan over the deleted keys pay for all of
+/// them (measured: 13 M tombstones, 185 s for the first page after a restart).
+/// (`--deletion-compact-min-tombstones`, `--deletion-compact-min-percent`).
+/// The rule is evaluated every `--deletion-compact-check-secs` (TiKV's
+/// `region-compact-check-interval`), which also bounds how often it can compact
+/// a partition that keeps deleting.
+fn deletion_compact_check_interval() -> Duration {
+    Duration::from_secs(crate::params().deletion_compact_check_secs.get())
+}
+
+/// TiKV's rule over the sums of `num_entries` / `num_deletions`.
+fn deletions_need_compaction(entries: u64, deletions: u64) -> bool {
+    let p = crate::params();
+    deletions >= p.deletion_compact_min_tombstones.get()
+        && deletions.saturating_mul(100)
+            >= entries.saturating_mul(p.deletion_compact_min_percent.get())
+}
+
+/// `(Σ num_entries, Σ num_deletions)` over the partition's live SSTs.
+pub(crate) fn sst_entry_counts(p: &crate::PartitionData) -> (u64, u64) {
+    p.sst_readers
+        .iter()
+        .fold((0, 0), |(e, d), r| (e + r.num_entries, d + r.num_deletions))
+}
+
+/// Test sync-point: when set, `process_gc_chunk` parks a VP record's liveness
+/// verdict AFTER the SST lookup but BEFORE the post-await re-validation + seq
+/// allocation — the exact point at which a concurrent, seq-assigned-but-not-yet-
+/// committed Put must be visible. Lets a test interleave such a Put and prove the
+/// verdict does (pre-fix) / does not (post-fix) shadow it. One relaxed load per
+/// VP record; only ever set by tests.
+static GC_VERDICT_PAUSE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Count of GC verdicts that have PARKED on `GC_VERDICT_PAUSE`. Tests poll this
+/// to know GC has scanned the value and is holding at the verdict.
+static GC_VERDICT_PARKED: AtomicU64 = AtomicU64::new(0);
+/// Test sync-point control — see `GC_VERDICT_PAUSE`. Only tests call this.
+pub fn set_gc_verdict_pause(paused: bool) {
+    GC_VERDICT_PAUSE.store(paused, std::sync::atomic::Ordering::Relaxed);
+}
+fn gc_verdict_paused() -> bool {
+    GC_VERDICT_PAUSE.load(std::sync::atomic::Ordering::Relaxed)
+}
+/// Number of GC verdicts currently/previously PARKED on the pause.
+pub fn gc_verdict_parked_count() -> u64 {
+    GC_VERDICT_PARKED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Test sync point: while set, a compaction parks after publishing a progress
+/// sample, so a test can kill its PS with the op mid-flight. Only tests set it.
+static COMPACTION_HOLD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static COMPACTION_HELD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// How many compactions have parked on `COMPACTION_HOLD`.
+pub fn compaction_held_count() -> u64 {
+    COMPACTION_HELD.load(std::sync::atomic::Ordering::Relaxed)
+}
+/// Set or release `COMPACTION_HOLD`. Only tests call this.
+pub fn set_compaction_hold(held: bool) {
+    COMPACTION_HOLD.store(held, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Test failpoint: when armed, the next compaction fails its checkpoint as an
+/// append that never landed, after its outputs are in the row stream.
+/// One-shot; only ever set by tests.
+static COMPACT_CHECKPOINT_FAIL: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+/// Arm `COMPACT_CHECKPOINT_FAIL` for the next compaction. Only tests call this.
+pub fn fail_next_compaction_checkpoint() {
+    COMPACT_CHECKPOINT_FAIL.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(crate) struct CompactStats {
+    pub input_tables: usize,
+    pub output_tables: usize,
+    pub entries_kept: usize,
+    pub entries_discarded: usize,
+    pub output_bytes: u64,
+}
+
+/// 5-7 s jittered timeout used by the compact + GC background loops to
+/// periodically refresh their maintenance metrics.
+fn random_delay() -> Duration {
+    Duration::from_millis(5_000 + rand_u64() % 2_000)
+}
+
+/// WAL replay floor for GC — returns `(floor_pos, pos_by_eid)`.
+///
+/// `floor_pos` is the minimum stream position (FIRST-occurrence index into
+/// `log_extent_ids`) over the live SSTs' vp_head extent ids — i.e. exactly
+/// `recover_partition`'s replay start (`chosen_pos`). GC must never punch a
+/// non-empty extent at/after it, or a crash before the next checkpoint loses
+/// the WAL recovery replays from there (the WAL replay-floor data-loss bug).
+///
+/// Details that are load-bearing:
+/// - **FIRST occurrence**, not last: a CoW-shared extent repeats in the spliced
+///   `log_extent_ids` after split/merge, and `recover_partition` keys off the
+///   first occurrence (`first_pos_by_eid`). A last-occurrence floor would land
+///   LATER than recovery's start and wrongly free an extent recovery replays.
+/// - **vp_heads that no longer resolve** (extent already gone from the stream)
+///   are skipped — recovery skips them too.
+/// - **floor 0** when none resolve (nothing flushed yet, or all vp_head extents
+///   gone): protect every non-empty extent, matching recovery's replay-from-0
+///   path and its `chosen_pos==MAX` whole-log fallback.
+pub(crate) fn gc_replay_floor(
+    log_extent_ids: &[u64],
+    sst_vp_extent_ids: impl IntoIterator<Item = u64>,
+) -> (usize, HashMap<u64, usize>) {
+    let mut pos_by_eid: HashMap<u64, usize> = HashMap::new();
+    for (pos, &eid) in log_extent_ids.iter().enumerate() {
+        pos_by_eid.entry(eid).or_insert(pos);
+    }
+    let floor = sst_vp_extent_ids
+        .into_iter()
+        .filter_map(|eid| pos_by_eid.get(&eid).copied())
+        .min()
+        .unwrap_or(0);
+    (floor, pos_by_eid)
+}
+
+/// BUG2 — raise the GC replay floor from the
+/// over-conservative MIN-over-SST-vps (`gc_replay_floor`) up to the position of
+/// the newest DURABLY-ACKed flush checkpoint vp (`durable_vp_eid`), when it
+/// resolves in the current stream. Returns the (possibly raised) floor.
+///
+/// Safe because every log record STRICTLY BELOW a durable checkpoint's vp is in
+/// that checkpoint's persisted SST set (or compaction-dead) — see the
+/// `PartitionData.durable_ckpt_vp` field doc. The vp extent itself sits AT the
+/// returned floor and the strictly-before punch rule (`gc_extent_punchable`)
+/// keeps it live, so recovery's Step-1 checkpoint resolution always succeeds.
+/// `durable_vp_eid == 0` (no flush committed yet this incarnation) or an
+/// unresolvable eid leaves the floor at the conservative MIN.
+///
+/// INVARIANT: `durable_vp_eid` MUST come from the ack-gated `durable_ckpt_vp`
+/// cell — NEVER from in-memory state (`vp_*`, or a MAX over live readers), which
+/// can run ahead of the durable checkpoint and punch a log region whose naming
+/// checkpoint never landed → silent loss.
+pub(crate) fn gc_floor_raise_to_durable_ckpt(
+    min_floor: usize,
+    pos_by_eid: &HashMap<u64, usize>,
+    durable_vp_eid: u64,
+) -> usize {
+    if durable_vp_eid == 0 {
+        return min_floor;
+    }
+    match pos_by_eid.get(&durable_vp_eid) {
+        Some(&p) => min_floor.max(p),
+        None => min_floor,
+    }
+}
+
+/// Whether a sealed extent is safe for GC to punch (the replay-floor guard): an empty
+/// extent (`sealed_length == 0`, no committed data) always is; a non-empty one
+/// only if it sits STRICTLY BEFORE the replay floor, so the WAL replay window
+/// at/after the floor — including the vp_head extent itself — is never truncated.
+pub(crate) fn gc_extent_punchable(
+    eid: u64,
+    sealed_length: u64,
+    pos_by_eid: &HashMap<u64, usize>,
+    replay_floor_pos: usize,
+) -> bool {
+    sealed_length == 0 || pos_by_eid.get(&eid).is_none_or(|&pos| pos < replay_floor_pos)
+}
+
+/// The vp_head a compaction stamps on its output SSTs IS recovery's replay-start
+/// for the merged data. Two forces pull it opposite ways:
+/// - it MUST NOT sit AHEAD of any acked-but-un-flushed write (those live in the
+///   active memtable at log offsets below the live cursor; a vp_head past them
+///   drops them out of the replay window → silent loss — regression
+///   `system_compact_unflushed_vp_head`), yet
+/// - it SHOULD advance as far as the merged data allows, so GC can reclaim the
+///   fully-flushed log region behind it (else post-split shared extents are
+///   pinned forever — `system_gc_multiversion_same_extent`).
+///
+/// The value that satisfies both is the MAX over the INPUT SSTs' OWN vp_heads,
+/// taken by STREAM POSITION (first-occurrence index into `log_extent_ids`,
+/// matching recovery's `chosen_pos` / `first_pos_by_eid`; extent_id order is
+/// non-monotonic after a CoW split so a raw `max(extent_id)` is wrong). The
+/// merged SST contains every input's data up to the newest input's `last_seq`,
+/// so recovery only needs the log AFTER the newest input's content — which is
+/// exactly the newest input's vp_head (the MAX). This advances the floor while
+/// staying ≤ the live cursor, so it is STRICTLY SAFER than the pre-fix stamp of
+/// `p.vp_*` (the live cursor, which sat past the un-flushed tail — the loss the
+/// regression reproduces).
+///
+/// A flush stamps its imm's rotation-time boundary (`imm_vp_heads`), so every
+/// input's vp_head is exactly its content boundary and the MAX never runs ahead.
+/// The checkpoint the compaction publishes takes the same MAX over every table
+/// left in the partition, not just these inputs (`checkpoint_vp_head`).
+///
+/// Fallback when no input vp_head resolves in the current log (all zero, or their
+/// extents already gone): replay from the FIRST log extent at offset 0 — the
+/// maximally-conservative safe anchor (recovery replays everything and dedups).
+/// NOT `(0,0)`: with a non-empty output table set that leaves recovery's
+/// `chosen_pos == usize::MAX`, which now costs a whole-log replay rather than
+/// the silent loss it used to (see
+/// `recover_partition`'s `replay_extents` selection).
+pub(crate) fn compaction_output_vp_head(
+    input_vp_heads: impl IntoIterator<Item = (u64, u64)>,
+    log_extent_ids: &[u64],
+) -> (u64, u64) {
+    let mut pos_by_eid: HashMap<u64, usize> = HashMap::new();
+    for (pos, &eid) in log_extent_ids.iter().enumerate() {
+        pos_by_eid.entry(eid).or_insert(pos);
+    }
+    // (position, extent_id, offset) with the LARGEST position, tie-broken by
+    // largest offset — the newest input's content boundary.
+    let mut best: Option<(usize, u64, u64)> = None;
+    for (eid, off) in input_vp_heads {
+        if eid == 0 {
+            continue;
+        }
+        let Some(&pos) = pos_by_eid.get(&eid) else {
+            continue;
+        };
+        let take = match best {
+            None => true,
+            Some((bp, _, boff)) => pos > bp || (pos == bp && off > boff),
+        };
+        if take {
+            best = Some((pos, eid, off));
+        }
+    }
+    match best {
+        Some((_, eid, off)) => (eid, off),
+        None => match log_extent_ids.first() {
+            Some(&eid) => (eid, 0),
+            None => (0, 0),
+        },
+    }
+}
+
+/// The replay cursor a compaction's checkpoint publishes: the newest content
+/// boundary among the compaction's own output stamp and every table the
+/// checkpoint lists (`readers`, the post-compaction set).
+///
+/// The output stamp alone is the newest INPUT's boundary. A minor compaction
+/// takes older tables while a newer flush's SST stays live, so publishing only
+/// that stamp moved the partition's checkpoint back behind the newer flush, and
+/// the next open replayed everything since (`system_restart_replay_cursor`). Every
+/// table the checkpoint lists is already durable in the row stream, and flushes
+/// commit in order, so all WAL below the newest boundary among them is in the
+/// listed set — the same argument as `compaction_output_vp_head`, taken over the
+/// whole set instead of the inputs.
+///
+/// Only used when no checkpoint cursor is durable yet; see
+/// `compaction_checkpoint_cursor`.
+fn checkpoint_vp_head(
+    readers: &[Arc<SstReader>],
+    output_vp_head: (u64, u64),
+    log_extent_ids: &[u64],
+) -> (u64, u64) {
+    compaction_output_vp_head(
+        std::iter::once(output_vp_head)
+            .chain(readers.iter().map(|r| (r.vp_extent_id, r.vp_offset))),
+        log_extent_ids,
+    )
+}
+
+/// Keys one compaction output chunk holds, for sizing its bloom filter: the
+/// inputs' entries at their average SST size (pass the inputs' `TableMeta.len`
+/// — the cut is in encoded bytes), capped by their total. With one chunk,
+/// dropped entries only make it high.
+pub(crate) fn compaction_chunk_keys(input_entries: u64, input_bytes: u64, max_chunk: u64) -> usize {
+    let keys = if input_bytes <= max_chunk {
+        input_entries
+    } else {
+        (input_entries as u128 * max_chunk as u128 / input_bytes as u128) as u64 + 1
+    };
+    keys.min(input_entries) as usize
+}
+
+/// The cursor a compaction's checkpoint publishes, before
+/// `advance_sealed_anchor`. Call under `publish_lock`. `durable` is the newest
+/// record's cursor and no live table is past it, so it is republished; a
+/// cursor rebuilt from the tables can fall behind it, below GC's floor.
+/// `(0, 0)` (none resolved at open) uses the tables, and so does a `durable`
+/// whose extent was swept: `swept` = it was read before `log_extent_ids` was
+/// fetched and is not in it (a sealed-empty extent, reclaimed). Republished,
+/// it would keep GC at the MIN floor until the next flush.
+pub(crate) fn compaction_checkpoint_cursor(
+    durable: (u64, u64),
+    swept: bool,
+    readers: &[Arc<SstReader>],
+    output_vp_head: (u64, u64),
+    log_extent_ids: &[u64],
+) -> (u64, u64) {
+    if durable.0 != 0 && !swept {
+        durable
+    } else {
+        checkpoint_vp_head(readers, output_vp_head, log_extent_ids)
+    }
+}
+
+/// Whether the durable cursor names an extent the log no longer has: unchanged
+/// since `seen`, read before `log_extent_ids` was fetched. A cursor published
+/// after the fetch may name an extent the list has not seen yet.
+pub(crate) fn durable_cursor_swept(
+    durable: (u64, u64),
+    seen: (u64, u64),
+    log_extent_ids: &[u64],
+) -> bool {
+    durable.0 != 0 && durable == seen && !log_extent_ids.contains(&durable.0)
+}
+
+/// A cursor at the very end of a sealed, non-tail extent replays nothing from
+/// it, so `(next, 0)` is the same replay start — and only then can GC, which
+/// keeps the floor extent, reclaim that extent. Without writes no flush ever
+/// moves the cursor off it.
+///
+/// `seals` holds authoritative sealed lengths (`anchor_seals`). Sealed-empty
+/// successors are skipped: the manager sweeps them, and a cursor naming a
+/// swept extent no longer resolves. Unchanged when the extent is the tail,
+/// holds records past `off`, or a needed seal is unknown.
+pub(crate) fn advance_sealed_anchor(
+    cursor: (u64, u64),
+    log_extent_ids: &[u64],
+    seals: &HashMap<u64, u64>,
+) -> (u64, u64) {
+    let first_pos = |eid: u64| log_extent_ids.iter().position(|&e| e == eid);
+    let Some(pos) = first_pos(cursor.0) else {
+        return cursor;
+    };
+    let tail = log_extent_ids.len() - 1;
+    if pos == tail || seals.get(&cursor.0) != Some(&cursor.1) {
+        return cursor;
+    }
+    let mut p = pos + 1;
+    while p < tail && seals.get(&log_extent_ids[p]) == Some(&0) {
+        p += 1;
+    }
+    let next = log_extent_ids[p];
+    // Unknown seal: it may be empty. A repeated member resolves earlier.
+    if (p < tail && !seals.contains_key(&next)) || first_pos(next) != Some(p) {
+        return cursor;
+    }
+    (next, 0)
+}
+
+/// The authoritative sealed lengths `advance_sealed_anchor` reads: `cursor`'s
+/// extent and the successors up to the first non-empty one. Nothing when the
+/// extent is the tail or not at its end.
+pub(crate) async fn anchor_seals(
+    sc: &StreamClient,
+    cursor: (u64, u64),
+    log_extent_ids: &[u64],
+) -> HashMap<u64, u64> {
+    let mut seals = HashMap::new();
+    let Some(pos) = log_extent_ids.iter().position(|&e| e == cursor.0) else {
+        return seals;
+    };
+    let tail = log_extent_ids.len() - 1;
+    if pos == tail {
+        return seals;
+    }
+    match authoritative_sealed(sc, cursor.0).await {
+        Some((len, _)) if len == cursor.1 => {
+            seals.insert(cursor.0, len);
+        }
+        _ => return seals,
+    }
+    for &eid in &log_extent_ids[pos + 1..tail] {
+        let Some((len, _)) = authoritative_sealed(sc, eid).await else {
+            break;
+        };
+        seals.insert(eid, len);
+        if len > 0 {
+            break;
+        }
+    }
+    seals
+}
+
+/// The sealed extents a major compaction re-counts: every one before the
+/// inputs' advanced content boundary. All of their records are then in the
+/// inputs (or dead), so the partition's live bytes there are exactly the
+/// value pointers the compaction keeps.
+async fn recount_extents(
+    sc: &StreamClient,
+    inputs_head: (u64, u64),
+    log_extent_ids: &[u64],
+) -> HashMap<u64, u64> {
+    let seals = anchor_seals(sc, inputs_head, log_extent_ids).await;
+    let start = advance_sealed_anchor(inputs_head, log_extent_ids, &seals);
+    let Some(end) = log_extent_ids.iter().position(|&e| e == start.0) else {
+        return HashMap::new();
+    };
+    let mut out = HashMap::new();
+    for &eid in &log_extent_ids[..end] {
+        if out.contains_key(&eid) {
+            continue;
+        }
+        if let Some((len, _)) = authoritative_sealed(sc, eid).await {
+            out.insert(eid, len);
+        }
+    }
+    out
+}
+
+pub(crate) async fn background_maintenance_loop(
+    part_id: u64,
+    part: Rc<RefCell<PartitionData>>,
+    mut compact_rx: mpsc::Receiver<CompactTask>,
+    mut gc_rx: mpsc::Receiver<GcTask>,
+    maintenance_gate: std::sync::Arc<crate::CompactionGate>,
+    concurrency_ctrl: std::sync::Arc<crate::ConcurrencyController>,
+) {
+    // Compaction + GC folded onto ONE task (was background_compact_loop +
+    // background_gc_loop). Single task => they are STRUCTURALLY serialized, so
+    // GC never runs while a compaction is mid-publish, with NO GC-vs-compaction
+    // gate (and `sst_readers` is never ahead of the durable checkpoint: every
+    // publisher changes it only after its append acks). Both sections still
+    // acquire the single per-partition `maintenance_gate` vs SPLIT (which runs
+    // on partition_loop, a different task, and must see no compact_row_append
+    // nor log_stream GC append in flight while it seals). See lock notes.
+    let p = crate::params();
+    // Empty sealed extents (sealed_length == 0) are FREE to reclaim — `run_gc`
+    // skips the read/relocate loop and only calls `punch_holes`. They sort LAST
+    // in the discard-desc candidate order (0 reclaimable bytes), so sharing the
+    // `--gc-max-extents-per-run` budget with big rewrite candidates let them
+    // starve forever under split/merge churn (which mints empty sealed tails in
+    // bulk). They get their OWN, more generous budget
+    // (`--gc-max-empty-per-run`) so they drain promptly.
+    let mut gc_failure_cooldown: std::collections::HashMap<u64, (Instant, Duration)> =
+        std::collections::HashMap::new();
+
+    // Independent deadline timers per kind (deadline, NOT per-iteration
+    // duration) so a busy compaction stream does not keep resetting the
+    // gc_debt refresh timer and vice-versa. Both timeout arms refresh metrics
+    // only (they were demoted off the dispatch path).
+    let mut next_compact_at = Instant::now() + random_delay();
+    let mut next_gc_at = Instant::now() + random_delay();
+    // next open-tail size probe (fires immediately on
+    // first iteration, then every `--size-refresh-interval-secs`).
+    let mut next_size_refresh_at = Instant::now();
+    // First check on the first tick, so a partition that opens with
+    // tombstone-heavy SSTs is compacted without waiting a whole interval.
+    let mut next_deletion_check_at = Instant::now();
+    let mut next_reclaim_check_at = Instant::now() + reclaim_check_interval();
+    let reclaim_probe_inflight = Rc::new(Cell::new(false));
+    let mut next_no_window_log_at = Instant::now();
+
+    loop {
+        use std::future::Future;
+        use std::pin::Pin;
+        use std::task::Poll;
+
+        enum Sel {
+            CompactRecv(Option<CompactTask>),
+            GcRecv(Option<GcTask>),
+            CompactTimeout,
+            GcTimeout,
+        }
+
+        let now = Instant::now();
+
+        // throttled, NON-BLOCKING open-tail size probe.
+        // Cluster-overview `live_size` = manager sealed-length sum + this. A
+        // `commit_length` on each of the 3 stream tails is up to 15 s
+        // worst-case (all-replica probe), so it runs DETACHED — it must never
+        // stall GC/compaction on this shared maintenance task. Guarded by an
+        // in-flight CAS so slow probes don't pile up. The value is kept at the
+        // prior reading on ANY probe error (a partial 3-tail sum would
+        // misreport, e.g. a briefly-unreachable replica dropping to a tiny
+        // number). Read by report_load_loop → shipped to the manager.
+        if now >= next_size_refresh_at {
+            next_size_refresh_at = now + Duration::from_secs(p.size_refresh_interval_secs.get());
+            let (sc, log_id, row_id, meta_id, metrics) = {
+                let p = part.borrow();
+                // revive the size gauge here (local +
+                // cheap, no RPC — unlike open_tail_bytes below). LSM-resident
+                // size (SST + memtable) drives the Prometheus
+                // `autumn_ps_size_bytes` gauge and the manager's
+                // size-based split/merge policy, both of which read a
+                // constant 0 before this.
+                p.metrics
+                    .size_bytes
+                    .store(p.lsm_resident_bytes(), std::sync::atomic::Ordering::Relaxed);
+                (
+                    p.stream_client.clone(),
+                    p.log_stream_id,
+                    p.row_stream_id,
+                    p.meta_stream_id,
+                    p.metrics.clone(),
+                )
+            };
+            use std::sync::atomic::Ordering::Relaxed;
+            if metrics
+                .open_tail_probe_inflight
+                .compare_exchange(false, true, Relaxed, Relaxed)
+                .is_ok()
+            {
+                compio::runtime::spawn(async move {
+                    let mut total = 0u64;
+                    let mut ok = true;
+                    for sid in [log_id, row_id, meta_id] {
+                        // `open_tail_committed_len` returns 0 when the tail is
+                        // SEALED — its length is already in the manager's
+                        // sealed_length sum, so counting it here would
+                        // double-count (a CoW split child / just-sealed tail).
+                        match sc.open_tail_committed_len(sid).await {
+                            Ok(len) => total = total.saturating_add(len),
+                            Err(_) => {
+                                ok = false;
+                                break;
+                            }
+                        }
+                    }
+                    if ok {
+                        metrics.open_tail_bytes.store(total, Relaxed);
+                    }
+                    metrics.open_tail_probe_inflight.store(false, Relaxed);
+                })
+                .detach();
+            }
+        }
+
+        let compact_sleep = next_compact_at.saturating_duration_since(now);
+        let gc_sleep = next_gc_at.saturating_duration_since(now);
+        // A due tick goes first: under steady writes every flush queues a
+        // minor, `compact_rx` is nearly always ready, and the tick (expiry and
+        // deletion majors, gauges, the reclaim probe) would never run.
+        let sel = if now >= next_compact_at {
+            Sel::CompactTimeout
+        } else {
+            let mut crecv = std::pin::pin!(compact_rx.next());
+            let mut grecv = std::pin::pin!(gc_rx.next());
+            let mut csleep = std::pin::pin!(compio::time::sleep(compact_sleep));
+            let mut gsleep = std::pin::pin!(compio::time::sleep(gc_sleep));
+            std::future::poll_fn(|cx| {
+                if let Poll::Ready(v) = Pin::new(&mut crecv).poll(cx) {
+                    return Poll::Ready(Sel::CompactRecv(v));
+                }
+                if let Poll::Ready(v) = Pin::new(&mut grecv).poll(cx) {
+                    return Poll::Ready(Sel::GcRecv(v));
+                }
+                if let Poll::Ready(()) = Pin::new(&mut csleep).poll(cx) {
+                    return Poll::Ready(Sel::CompactTimeout);
+                }
+                if let Poll::Ready(()) = Pin::new(&mut gsleep).poll(cx) {
+                    return Poll::Ready(Sel::GcTimeout);
+                }
+                Poll::Pending
+            })
+            .await
+        };
+
+        match sel {
+            // Either channel closing = partition shutdown -> exit the task.
+            Sel::CompactRecv(None) | Sel::GcRecv(None) => break,
+            Sel::CompactRecv(Some(first)) => {
+                // The tick keeps its own cadence (see the due-tick check
+                // above); a received task does not push it back.
+                // futures::channel::mpsc capacity is `buffer + num_senders`,
+                // and every sender clone (each flush's minor request, the
+                // deletion rule) adds a slot, so several tasks can be queued.
+                // Drain them and collapse: a major wins over any minor (it
+                // rewrites every table); a reclaim wins over a count minor (it
+                // carries the head extent's seal, which the next flush or tick
+                // does not bring back). `now_or_never()` never blocks.
+                use futures::stream::StreamExt;
+                // Carry a tracked op_id across the collapsed dispatches (prefer a
+                // non-zero id: a manual op coalescing with an untracked one still
+                // reports its outcome). Same-target manual ops share one id via
+                // the manager's attach-dedup, so two distinct non-zero ids here
+                // can't both be active.
+                let mut major_op: Option<u64> = None;
+                let mut minor: Option<MinorTrigger> = None;
+                let mut take = |task: CompactTask| match task {
+                    CompactTask::Major { op_id } => {
+                        major_op = Some(major_op.unwrap_or(0).max(op_id));
+                    }
+                    CompactTask::Minor(t) => {
+                        if !matches!(minor, Some(MinorTrigger::Reclaim { .. })) {
+                            minor = Some(t);
+                        }
+                    }
+                };
+                take(first);
+                while let Some(Some(more)) = compact_rx.next().now_or_never() {
+                    take(more);
+                }
+                let Some(compact_op_id) = major_op else {
+                    if let Some(trigger) = minor {
+                        run_minor_compaction(
+                            &part,
+                            part_id,
+                            trigger,
+                            &maintenance_gate,
+                            &concurrency_ctrl,
+                        )
+                        .await;
+                    }
+                    continue;
+                };
+                // Refuse to start a compaction while a split / merge freeze is
+                // in flight: the freeze drain finishes once it holds the
+                // maintenance gate, and a compaction that started its
+                // row_stream append after that would land past the captured
+                // commit_length (`stale_vp_offset_past_sealed_length` /
+                // `invalid meta_len` on the next open). The dispatcher
+                // (`autumn-op compact`, the policy) retries after the freeze.
+                {
+                    let p = part.borrow();
+                    if p.frozen_for_split.get().is_some() || p.merge_freeze.is_halted() {
+                        // Defer; the dispatcher will retry once the freeze
+                        // clears (region_sync_loop drops + reopens the
+                        // partition on split-survivor / merge-victim, or
+                        // partition_loop clears the flag on rollback).
+                        record_maint_outcome(
+                            &p.metrics,
+                            compact_op_id,
+                            manager_rpc::OP_KIND_COMPACT,
+                            manager_rpc::OP_STATE_FAILED,
+                            "deferred: partition frozen for split/merge — retry".to_string(),
+                            String::new(),
+                        );
+                        continue;
+                    }
+                }
+                let metrics = part.borrow().metrics.clone();
+                // fix MED-4: latch compact_inflight=1 at dequeue,
+                // not after gate.acquire(). The scheduler reads
+                // compact_inflight to gate duplicate dispatches; the
+                // gate.acquire() can block for seconds when other
+                // partitions hold --major-compact-parallelism.
+                metrics
+                    .compact_inflight
+                    .store(1, std::sync::atomic::Ordering::Relaxed);
+                // fix HIGH-2: stamp last_compact_at on EVERY recv
+                // arm exit (skip + ok + err), so the scheduler's
+                // cooldown gate engages even on no-op / failed ticks.
+                // See the matching gc_loop fix for full rationale.
+                let stamp_last_compact = || {
+                    metrics.last_compact_at.store(
+                        crate::now_secs() as i64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                };
+                let clear_compact_inflight = || {
+                    metrics
+                        .compact_inflight
+                        .store(0, std::sync::atomic::Ordering::Relaxed);
+                };
+                // A MAJOR compaction flushes the memtable first, under the
+                // same gate + permit its do_compact holds. Deletes live in the
+                // memtable until a flush, and a flush only happens on size or
+                // on the WAL gap — so on an idle partition a major compaction
+                // would otherwise run over SSTs that hold no tombstone at all,
+                // discard nothing, and leave every value those deletes killed
+                // unreclaimable (no discard ⇒ no GC debt ⇒ no GC). The flush
+                // precedes the table snapshot so the new SST is in it.
+                // `settling` = the deletes this compaction covers; read in the
+                // same synchronous step as the flush's rotate, so a delete that
+                // lands during the compaction stays counted.
+                // Held to the end of the arm: the gate serializes with split,
+                // the permit bounds PS-wide compaction memory.
+                let (_gate, _permit, settling) = {
+                    let gate = maintenance_gate.acquire().await;
+                    if is_frozen_for_maintenance(&part) {
+                        record_maint_outcome(
+                            &metrics,
+                            compact_op_id,
+                            manager_rpc::OP_KIND_COMPACT,
+                            manager_rpc::OP_STATE_FAILED,
+                            "deferred: partition frozen for split/merge — retry".to_string(),
+                            String::new(),
+                        );
+                        stamp_last_compact();
+                        clear_compact_inflight();
+                        continue;
+                    }
+                    let permit = concurrency_ctrl.acquire_compact().await;
+                    let settling = metrics
+                        .unsettled_deletes
+                        .load(std::sync::atomic::Ordering::Relaxed);
+                    if let Err(e) = crate::flush_memtable_locked(&part).await {
+                        let es = format!("flush before major compaction: {e}");
+                        tracing::error!("compaction: {es}");
+                        record_maint_outcome(
+                            &metrics,
+                            compact_op_id,
+                            manager_rpc::OP_KIND_COMPACT,
+                            manager_rpc::OP_STATE_FAILED,
+                            es,
+                            String::new(),
+                        );
+                        refresh_metrics(&part);
+                        stamp_last_compact();
+                        clear_compact_inflight();
+                        continue;
+                    }
+                    (gate, permit, settling)
+                };
+                // A major rewrites even one SST: its old extent may contain
+                // arbitrarily much dead data, including after a restart.
+                let compact_tbls = part.borrow().tables.clone();
+                if compact_tbls.is_empty() {
+                    if is_frozen_for_maintenance(&part) {
+                        record_maint_outcome(
+                            &metrics,
+                            compact_op_id,
+                            manager_rpc::OP_KIND_COMPACT,
+                            manager_rpc::OP_STATE_FAILED,
+                            "deferred: partition frozen for split/merge — retry".to_string(),
+                            String::new(),
+                        );
+                        stamp_last_compact();
+                        clear_compact_inflight();
+                        continue;
+                    }
+                    if let Err(e) = checkpoint_and_truncate_row_prefix(&part, part_id).await {
+                        record_maint_outcome(
+                            &metrics,
+                            compact_op_id,
+                            manager_rpc::OP_KIND_COMPACT,
+                            manager_rpc::OP_STATE_FAILED,
+                            format!("{e:#}"),
+                            String::new(),
+                        );
+                        refresh_metrics(&part);
+                        stamp_last_compact();
+                        clear_compact_inflight();
+                        continue;
+                    }
+                    // A major skips only with no table left after its flush,
+                    // so no tombstone exists anywhere: the deletes counted in
+                    // `settling` are gone — an expiry major that dropped every
+                    // entry leaves no table and does not settle. Without this
+                    // the count stayed up and SETTLE re-advised this no-op
+                    // compaction every cooldown.
+                    settle_deletes(&metrics, settling);
+                    metrics.pending_compaction_bytes.store(
+                        compute_pending_compaction_bytes(&part),
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    record_maint_outcome(
+                        &metrics,
+                        compact_op_id,
+                        manager_rpc::OP_KIND_COMPACT,
+                        manager_rpc::OP_STATE_SUCCEEDED,
+                        String::new(),
+                        "nothing to compact".to_string(),
+                    );
+                    refresh_metrics(&part);
+                    stamp_last_compact();
+                    clear_compact_inflight();
+                    continue;
+                }
+
+                // compact_inflight already latched at top of recv arm.
+                let result = do_compact(&part, compact_tbls, true, compact_op_id).await;
+                match result {
+                    Ok(s) => {
+                        tracing::info!(
+                            "compact part {}: major, input={} tables, output={} tables, kept={}, discarded={}, output={}",
+                            part_id,
+                            s.input_tables, s.output_tables, s.entries_kept, s.entries_discarded,
+                            crate::human_size(s.output_bytes)
+                        );
+                        part.borrow().set_has_overlap(0);
+                        settle_deletes(&metrics, settling);
+                        if let Err(e) = truncate_unreferenced_row_prefix(&part, part_id).await {
+                            tracing::warn!(part_id, "compaction: row stream truncate: {e:#}");
+                        }
+                        record_maint_outcome(
+                            &metrics,
+                            compact_op_id,
+                            manager_rpc::OP_KIND_COMPACT,
+                            manager_rpc::OP_STATE_SUCCEEDED,
+                            String::new(),
+                            format!(
+                                "major compaction: {} → {} tables",
+                                s.input_tables, s.output_tables
+                            ),
+                        );
+                    }
+                    Err(e) => {
+                        let es = format!("{e}");
+                        tracing::error!("compaction: {es}");
+                        record_maint_outcome(
+                            &metrics,
+                            compact_op_id,
+                            manager_rpc::OP_KIND_COMPACT,
+                            manager_rpc::OP_STATE_FAILED,
+                            es,
+                            String::new(),
+                        );
+                    }
+                }
+                // fix-r2 HIGH: stamp + refresh pending bytes BEFORE
+                // clearing compact_inflight. Round-2 audit caught that
+                // the previous order let the scheduler observe
+                // inflight=false + last_compact_at=stale-0 +
+                // pending_compaction_bytes=stale-high in the gap, then
+                // dispatch a redundant compact for the partition that
+                // had JUST finished compacting. Stamp-then-clear closes
+                // that window.
+                metrics.pending_compaction_bytes.store(
+                    compute_pending_compaction_bytes(&part),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                refresh_metrics(&part);
+                stamp_last_compact();
+                clear_compact_inflight();
+            }
+            Sel::CompactTimeout => {
+                next_compact_at = Instant::now() + random_delay();
+
+                // refresh pending_compaction_bytes every periodic
+                // tick — independent of whether we end up compacting.
+                // same cadence refreshes the dead-data + minor-
+                // compact-debt gauges (`sst_expired_bytes`,
+                // `sst_out_of_range_bytes`, `minor_compact_pending_bytes`).
+                let metrics = part.borrow().metrics.clone();
+                metrics.pending_compaction_bytes.store(
+                    compute_pending_compaction_bytes(&part),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                refresh_metrics(&part);
+
+                // timeout branch is now metric-refresh-only.
+                // Actual compactions only fire on `compact_rx` triggers
+                // (scheduler dispatches + manual `client compact`).
+                // Expiry-major compaction is the one exception — TTL
+                // keys ARE a wall-clock event the scheduler doesn't see,
+                // so the loop continues to pick it up via the periodic
+                // tick rather than waiting for an external trigger.
+                let _expiry_continue_below = ();
+
+                // Check if any SSTable has expired keys — trigger major compaction
+                let has_expired = {
+                    let p = part.borrow();
+                    let now = crate::now_secs();
+                    p.sst_readers
+                        .iter()
+                        .any(|r| r.min_expires_at > 0 && r.min_expires_at <= now)
+                };
+                if has_expired {
+                    let tbls = part.borrow().tables.clone();
+                    if !tbls.is_empty() {
+                        // Per-partition maintenance_gate (see main arm above).
+                        let _local_gate = maintenance_gate.acquire().await;
+                        if is_frozen_for_maintenance(&part) {
+                            continue;
+                        }
+                        let _permit = concurrency_ctrl.acquire_compact().await;
+                        metrics
+                            .compact_inflight
+                            .store(1, std::sync::atomic::Ordering::Relaxed);
+                        let result = do_compact(&part, tbls, true, /* no submitted op */ 0).await;
+                        match result {
+                            Ok(s) => {
+                                tracing::info!(
+                                    "compact part {}: expiry major, input={} tables, output={} tables, kept={}, discarded={}, output={}",
+                                    part_id, s.input_tables, s.output_tables, s.entries_kept, s.entries_discarded,
+                                    crate::human_size(s.output_bytes)
+                                );
+                                // A successful MAJOR compaction rewrote every
+                                // table without its out-of-range keys, so the
+                                // flag must follow — whichever arm ran it. Only
+                                // the dispatched-compact arm did this, and an
+                                // expiry pass that emptied a CoW child's tables
+                                // left `has_overlap` set with no table left for
+                                // a later compaction to rewrite: `split` refused
+                                // forever, the policy re-issued a no-op compact
+                                // every window, and only a PS reopen healed it.
+                                // A minor compaction must not clear it: it
+                                // rewrites only some of the tables.
+                                part.borrow().set_has_overlap(0);
+                                if let Err(e) =
+                                    truncate_unreferenced_row_prefix(&part, part_id).await
+                                {
+                                    tracing::warn!(
+                                        part_id,
+                                        "expiry major compaction: row stream truncate: {e:#}"
+                                    );
+                                }
+                            }
+                            Err(e) => tracing::error!("expiry major compaction: {e}"),
+                        }
+                        // fix-r2 HIGH: stamp + refresh BEFORE clearing
+                        // inflight; same race as the Recv arm fix above.
+                        metrics.pending_compaction_bytes.store(
+                            compute_pending_compaction_bytes(&part),
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                        metrics.last_compact_at.store(
+                            crate::now_secs() as i64,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                        metrics
+                            .compact_inflight
+                            .store(0, std::sync::atomic::Ordering::Relaxed);
+                        continue;
+                    }
+                }
+
+                if part.borrow().row_cut_deferred {
+                    let _local_gate = maintenance_gate.acquire().await;
+                    if !is_frozen_for_maintenance(&part) {
+                        if let Err(e) = truncate_unreferenced_row_prefix(&part, part_id).await {
+                            tracing::warn!(part_id, "deferred row stream truncate: {e:#}");
+                        }
+                    }
+                }
+
+                if Instant::now() >= next_deletion_check_at {
+                    next_deletion_check_at = Instant::now() + deletion_compact_check_interval();
+                    let (entries, deletions) = sst_entry_counts(&part.borrow());
+                    if deletions_need_compaction(entries, deletions) {
+                        tracing::info!(
+                            part_id,
+                            entries,
+                            deletions,
+                            "compaction: tombstones reached the deletion-trigger rule; \
+                             scheduling a major compaction"
+                        );
+                        // The dispatched-major arm flushes the memtable first
+                        // and settles `unsettled_deletes`. This loop is the
+                        // channel's only consumer, so the task is picked up on
+                        // the next select.
+                        let mut tx = part.borrow().compact_tx.clone();
+                        if let Err(e) = tx.try_send(crate::CompactTask::Major { op_id: 0 }) {
+                            if e.is_disconnected() {
+                                break;
+                            }
+                        }
+                        continue;
+                    }
+                }
+
+                // The minor check that runs after every flush, repeated here
+                // for table lists that grew without one (a merged or split
+                // open, a restart). With no window, the head-extent reclaim
+                // probe (RPCs, detached) at most once a minute.
+                if !request_minor_compaction(&part, MinorTrigger::Tick) {
+                    let now = Instant::now();
+                    let (n_tables, min_files) =
+                        (part.borrow().tables.len(), crate::compact_policy::minor_policy().min_files);
+                    if n_tables >= min_files && now >= next_no_window_log_at {
+                        next_no_window_log_at = now + reclaim_check_interval();
+                        tracing::debug!(part_id, n_tables, "minor compaction: no window in ratio");
+                    }
+                    if now >= next_reclaim_check_at && !reclaim_probe_inflight.get() {
+                        next_reclaim_check_at = now + reclaim_check_interval();
+                        spawn_reclaim_probe(&part, part_id, reclaim_probe_inflight.clone());
+                    }
+                }
+            }
+            Sel::GcRecv(Some(first)) => {
+                next_gc_at = Instant::now() + random_delay();
+                let gc_task: GcTask = {
+                    // fix HIGH-1: drain backlogged sends (cap=1 +
+                    // 2 senders ⇒ up to 3 messages can accumulate). Any
+                    // queued Force unions its extents into the chosen
+                    // task; multiple Autos collapse to a single Auto.
+                    use futures::stream::StreamExt;
+                    // fix-r2 LOW: when an Auto is queued behind a
+                    // Force (or vice versa), keep BOTH semantics by
+                    // promoting to Force with the operator's explicit
+                    // extents — and let the auto-discard scan still run
+                    // by tagging the Force with a `..Default::default()`-
+                    // style flag we don't have. Compromise: under Force,
+                    // also union the auto-eligible extents we'd pick from
+                    // the discards map. Cheap because we'll iterate
+                    // sst_readers anyway. For now, the simpler middle
+                    // ground is to flip the merged result to `Auto` when
+                    // EITHER input was Auto so the threshold-based scan
+                    // covers both extent sets — Force's explicit list is
+                    // handled by promoting matched-Force-extents into
+                    // Auto-pick at run time. The cleanest implementation
+                    // would carry both lists; we accept one Auto extra
+                    // tick rather than touching the GcTask enum shape.
+                    //
+                    // Net behavior: Force + Auto in the drain → run
+                    // Force this tick; the dropped Auto is dispatched
+                    // again on the next scheduler tick (5 s later) since
+                    // the cooldown stamp from this run sets last_gc_at
+                    // and the scheduler re-evaluates urgency next tick.
+                    // Acceptable.
+                    let mut chosen = first;
+                    while let Some(Some(more)) = gc_rx.next().now_or_never() {
+                        // Carry a tracked op_id across the collapse (prefer
+                        // non-zero, like the compact drain).
+                        let op_id = chosen.op_id().max(more.op_id());
+                        chosen = match (chosen, more) {
+                            (
+                                GcTask::Force { mut extent_ids, .. },
+                                GcTask::Force {
+                                    extent_ids: more_eids,
+                                    ..
+                                },
+                            ) => {
+                                for e in more_eids {
+                                    if !extent_ids.contains(&e) {
+                                        extent_ids.push(e);
+                                    }
+                                }
+                                GcTask::Force { extent_ids, op_id }
+                            }
+                            (GcTask::Force { extent_ids, .. }, GcTask::Auto { .. }) => {
+                                GcTask::Force { extent_ids, op_id }
+                            }
+                            (GcTask::Auto { .. }, GcTask::Force { extent_ids, .. }) => {
+                                GcTask::Force { extent_ids, op_id }
+                            }
+                            // when two Auto ticks coalesce, keep the
+                            // most-recent params (the operator's latest
+                            // intent supersedes anything queued behind it).
+                            (GcTask::Auto { .. }, GcTask::Auto { params, .. }) => {
+                                GcTask::Auto { params, op_id }
+                            }
+                        };
+                    }
+                    chosen
+                };
+                // op-ledger correlation for the terminal outcome (0 = untracked);
+                // derived here so EVERY GC exit path (incl. the early
+                // <2-extent / stream-info-error ones) can report it.
+                let gc_op_id = gc_task.op_id();
+                let is_force = matches!(gc_task, GcTask::Force { .. });
+                let gc_kind = if is_force {
+                    manager_rpc::OP_KIND_FORCE_GC
+                } else {
+                    manager_rpc::OP_KIND_GC
+                };
+                // fix MED-4: latch gc_inflight=1 at the very top of the
+                // loop iteration, not after maintenance_gate. The scheduler reads
+                // gc_inflight to gate duplicate dispatches; without the early
+                // latch, a slow get_stream_info / get_extent_info (manager
+                // RPC) leaves the flag at 0 for seconds and the scheduler
+                // queues redundant Auto tasks behind us. The cleanup at every
+                // exit path (continue + loop end) clears it back to 0.
+                let metrics = part.borrow().metrics.clone();
+                metrics
+                    .gc_inflight
+                    .store(1, std::sync::atomic::Ordering::Relaxed);
+                let clear_inflight = |m: &PartitionMetrics| {
+                    m.gc_inflight.store(0, std::sync::atomic::Ordering::Relaxed);
+                };
+
+                let (log_stream_id, readers_snapshot, part_sc) = {
+                    let p = part.borrow();
+                    (
+                        p.log_stream_id,
+                        p.sst_readers.clone(),
+                        p.stream_client.clone(),
+                    )
+                };
+
+                // fix-r2 MEDIUM: stamp last_gc_at on EVERY early-continue
+                // path so the scheduler's cooldown gate engages. Round-2 audit
+                // caught that get_stream_info-failure and extent_ids<2 paths
+                // skipped the stamp, letting the scheduler re-dispatch every
+                // 5 s during transient manager/extent-node hiccups OR for
+                // partitions that legitimately have <2 log_stream extents
+                // (single-extent → no GC possible). Stamp BEFORE clearing
+                // inflight so the scheduler's tuple-read sees both updates.
+                let stamp_last_gc = || {
+                    metrics.last_gc_at.store(
+                        crate::now_secs() as i64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                };
+
+                let stream_info = match part_sc.get_stream_info(log_stream_id).await {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!("GC get_stream_info: {e}");
+                        record_maint_outcome(
+                            &metrics,
+                            gc_op_id,
+                            gc_kind,
+                            manager_rpc::OP_STATE_FAILED,
+                            format!("get_stream_info: {e}"),
+                            String::new(),
+                        );
+                        stamp_last_gc();
+                        clear_inflight(&metrics);
+                        continue;
+                    }
+                };
+                let extent_ids = stream_info.extent_ids;
+                // WAL replay-floor guard: GC must NEVER punch a log extent
+                // at/after the floor — recovery replays the log_stream from there
+                // forward, so punching it drops records recovery needs (un-flushed
+                // small values not yet in any SST, or the vp_head extent itself →
+                // chosen_pos==MAX → a whole-log replay). Only extents strictly BEFORE
+                // the floor are fully flushed and safe to reclaim. Running on the
+                // SAME task as compaction (the only op that REMOVES SSTs and could
+                // raise the floor) means `readers_snapshot` matches the durable
+                // checkpoint recovery loads, so this floor == recovery's chosen_pos.
+                // (Flush only ADDS forward-vp_head SSTs, which never lower the min.)
+                // See `gc_replay_floor` for the first-occurrence / floor-0 details.
+
+                // BUG2: raise the floor to the newest
+                // DURABLY-ACKed flush checkpoint vp. The MIN-over-SST-vps floor
+                // above is over-conservative — it drags back to the OLDEST live
+                // SST's vp_head, pinning GC (and recovery's replay window) far
+                // behind the region that is actually still needed. Every log
+                // record strictly below the durable checkpoint vp is in that
+                // checkpoint's persisted SST set (or compaction-dead), so it is
+                // safe to reclaim. Safety rests on THREE properties:
+                //   (i)  ack-gated — `durable_ckpt_vp` is set only AFTER
+                //        save_table_locs_raw acks, so a crash-time recovery is
+                //        guaranteed to load a checkpoint whose vp/SST set covers
+                //        everything below it (never an in-memory value that ran
+                //        ahead of the durable checkpoint — that would punch a log
+                //        region whose naming checkpoint never landed → loss);
+                //   (ii) the vp extent sits AT the raised floor and the
+                //        strictly-before punch rule (`gc_extent_punchable`)
+                //        protects it, so recovery Step 1 always resolves it;
+                //   (iii) SSTs whose vp extents we punch become unresolvable, and
+                //        recovery's per-SST pass simply skips them (lib.rs Step 2,
+                //        `if let Some(reader_pos) = first_pos_by_eid.get(...)`), so
+                //        `chosen_pos` naturally lands at the first surviving
+                //        position — no recovery-code change needed.
+                // NEVER substitute an in-memory value (p.vp_*, MAX over
+                // readers_snapshot vp_heads): see the `durable_ckpt_vp` field doc.
+                let (dv_eid, _dv_off) = part.borrow().durable_ckpt_vp.get();
+                let (replay_floor_pos, pos_by_eid) = effective_replay_floor(
+                    &extent_ids,
+                    readers_snapshot.iter().map(|r| r.vp_extent_id),
+                    dv_eid,
+                );
+
+                // refresh the replay-window dead-byte gauge from the
+                // (already-persisted) SST discard maps BEFORE the <2-extent gate.
+                // A log-heavy / all-open-tail partition — the exact case this
+                // metric exists for — commonly has a SINGLE log extent (the open
+                // tail), which continues below and would NEVER refresh if we
+                // waited for the sealed-extent GC path. What stays in
+                // `tick_discards` is the gc_debt basis below.
+                let mut tick_discards = get_discards(&readers_snapshot);
+                let protected_dead =
+                    split_at_replay_floor(&mut tick_discards, &pos_by_eid, replay_floor_pos);
+                metrics
+                    .open_tail_dead_bytes
+                    .store(protected_dead, std::sync::atomic::Ordering::Relaxed);
+                if extent_ids.len() < 2 {
+                    // No sealed extents (only the open tail, or none) ⇒ sealed-only
+                    // gc_debt is definitionally 0. Store it (don't leave the last
+                    // ≥2-extent value stale): the manager now sums gc_debt into
+                    // `logical_wal_debt` for df, and a partition GC-reclaimed down
+                    // to one extent would otherwise over-report debt forever (and
+                    // keep the urgency scheduler re-dispatching a no-op GC).
+                    metrics
+                        .gc_debt_bytes
+                        .store(0, std::sync::atomic::Ordering::Relaxed);
+                    record_maint_outcome(
+                        &metrics,
+                        gc_op_id,
+                        gc_kind,
+                        manager_rpc::OP_STATE_SUCCEEDED,
+                        String::new(),
+                        "no sealed extents to reclaim".to_string(),
+                    );
+                    stamp_last_gc();
+                    clear_inflight(&metrics);
+                    continue;
+                }
+
+                let sealed_extents = &extent_ids[..extent_ids.len() - 1];
+                // Auto GC never selects these (no debt), so the punch guard's
+                // hint below no longer fires for them: say it here.
+                if protected_dead > 0 {
+                    tracing::info!(
+                        part_id,
+                        protected_dead,
+                        floor_extent = extent_ids.get(replay_floor_pos).copied().unwrap_or(0),
+                        "GC: dead bytes in the replay window are not collectable until a \
+                         flush or compaction moves the checkpoint past them"
+                    );
+                }
+
+                // refresh gc_debt_bytes from the discards before the replay
+                // floor. `tick_discards` was split at the floor before the gate
+                // (the rest went to open_tail_dead_bytes), so the two gauges
+                // stay disjoint (no double-count).
+                //
+                // Answer with the standing policy, exactly like the other two
+                // stores. This one runs on EVERY dispatch and the Force path
+                // never narrows it afterwards, so a raw sum here was a THIRD
+                // writer answering a different question than the advisory asks
+                // — the precise shape of the bug this basis exists to close.
+                // Before any standing policy has arrived it degrades to the raw
+                // sum: over-reporting can ask for work that will not qualify,
+                // but it cannot hide work that does.
+                let gc_debt = {
+                    let p = part.borrow();
+                    let basis = p.gc_debt_basis.borrow();
+                    gc_debt_from_basis(&tick_discards, basis.as_ref())
+                };
+                metrics
+                    .gc_debt_bytes
+                    .store(gc_debt, std::sync::atomic::Ordering::Relaxed);
+
+                // (extent_id, authoritative sealed_length) — validated ONCE at selection
+                // so the execution loop never re-reads (possibly stale) state before the
+                // destructive punch. See `authoritative_sealed`.
+                let mut holes: Vec<(u64, u64)> = match gc_task {
+                    GcTask::Force { ref extent_ids, .. } => {
+                        let idx: HashSet<u64> = sealed_extents.iter().copied().collect();
+                        let mut hs: Vec<(u64, u64)> = Vec::new();
+                        let mut skipped = 0usize;
+                        // Count the --gc-max-extents-per-run quota by VALIDATED holes, not by
+                        // input candidates — i.e. apply `take` AFTER `authoritative_
+                        // sealed_length`, not before. Otherwise a transient `None`
+                        // (manager RPC hiccup / not-yet-observable seal) on the first
+                        // few requested extents consumes the quota and starves the later
+                        // valid ones, and Force GC is a one-shot consume (no "later
+                        // tick" for the skipped tail).
+                        for e in extent_ids.iter().copied().filter(|e| idx.contains(e)) {
+                            if hs.len() >= p.gc_max_extents_per_run.get() {
+                                break;
+                            }
+                            // Even an operator Force GC must not punch on stale/open
+                            // state: re-validate authoritatively. A skip (None) means the
+                            // seal isn't authoritatively observable yet; the operator can
+                            // re-issue once it is.
+                            if let Some((sealed_length, _refs)) =
+                                authoritative_sealed(&part_sc, e).await
+                            {
+                                // Force GC is an explicit operator instruction:
+                                // it names the extents, so no ratio/refs gate
+                                // applies — only the seal must be authoritative.
+                                hs.push((e, sealed_length));
+                            } else {
+                                skipped += 1;
+                            }
+                        }
+                        if skipped > 0 {
+                            tracing::info!(
+                                skipped,
+                                "Force GC: skipped extents not authoritatively sealed yet"
+                            );
+                        }
+                        hs
+                    }
+                    GcTask::Auto { ref params, .. } => {
+                        let discards = tick_discards;
+
+                        // candidate set is ALL sealed (non-tail) extents,
+                        // not just those with non-zero discard. Empty sealed
+                        // extents (sealed_length == 0, allocated but never
+                        // received data before stream_alloc_extent sealed them
+                        // via commit_length capture) never appear in any SST's
+                        // `discards` map, so the earlier code path (which
+                        // built `candidates` from `discards.keys()`) never even
+                        // considered them — they stayed pinned in `extent_ids`
+                        // forever. We now iterate every sealed extent, sorted
+                        // by reclaimable bytes desc (zero-discard extents land
+                        // last but still reachable).
+                        let mut candidates: Vec<u64> = sealed_extents.to_vec();
+                        candidates.sort_by(|a, b| {
+                            let da = discards.get(a).copied().unwrap_or(0);
+                            let db = discards.get(b).copied().unwrap_or(0);
+                            db.cmp(&da)
+                        });
+
+                        // resolve effective filter parameters. If the
+                        // caller asked for `empty_only`, short-circuit other
+                        // filters. Else apply `ratio` (default 0.4) optionally
+                        // halved when stream-level dead bytes cross
+                        // `stream_debt`, plus `max_size` upper bound.
+                        let stream_dead: u64 = discards.values().map(|v| (*v).max(0) as u64).sum();
+                        let stream_debt_hit =
+                            params.stream_debt.is_some_and(|hw| stream_dead >= hw);
+                        let effective_ratio = if params.empty_only {
+                            f64::INFINITY // ratio gate unreachable
+                        } else {
+                            let r = params.ratio.unwrap_or(p.gc_discard_ratio.get());
+                            if stream_debt_hit {
+                                r * 0.5
+                            } else {
+                                r
+                            }
+                        };
+
+                        let mut holes = Vec::new();
+                        // Two INDEPENDENT budgets: expensive rewrite candidates
+                        // (bounded by --gc-max-extents-per-run — each holds ~chunk of RAM + moves
+                        // live VPs) vs free empty-sealed reclaims (bounded by the
+                        // larger --gc-max-empty-per-run — just punch_holes). Empties sort
+                        // LAST here (0 reclaimable bytes), so we must NOT stop scanning
+                        // when the rewrite budget fills — else split/merge-minted empty
+                        // sealed extents at the tail of the list starve forever.
+                        let mut nonempty_selected = 0usize;
+                        let mut empty_selected = 0usize;
+                        // Sizes this pass actually resolved. Used after the loop
+                        // to re-derive `gc_debt_bytes` as bytes policy would
+                        // COME FOR, not merely bytes that are dead — these are
+                        // the same fetches selection needs, so it costs nothing.
+                        let mut resolved: HashMap<u64, (u64, u64)> = HashMap::new();
+                        // No `empty_only` special-case here: that mode already
+                        // `continue`s before the predicate, and it is barred
+                        // from defining the gauge's policy at the one place
+                        // that decides it (`defines_policy`, below). A second
+                        // guard here changed nothing observable.
+                        let dead_bytes_high = params.dead_bytes_high;
+                        for eid in candidates {
+                            if nonempty_selected >= p.gc_max_extents_per_run.get()
+                                && empty_selected >= p.gc_max_empty_per_run.get()
+                            {
+                                break;
+                            }
+                            // Authoritative (never stale) sealed state — see
+                            // `authoritative_sealed`. `None` ⇒ unsealed/open or
+                            // fetch failed ⇒ NEVER GC (open extents look like
+                            // `sealed_length==0` but are not empty).
+                            let (sealed_length, refs) =
+                                match authoritative_sealed(&part_sc, eid).await {
+                                    Some(v) => v,
+                                    None => continue,
+                                };
+                            resolved.insert(eid, (sealed_length, refs));
+                            if sealed_length == 0 {
+                                // a CONFIRMED sealed-empty extent — no committed
+                                // data to rewrite, just punch. `run_gc` with
+                                // sealed_length=0 skips the read loop and goes straight
+                                // to flush_gc_batch (no-op) + punch_holes. Uses the
+                                // SEPARATE empty budget so it never starves behind big
+                                // rewrite candidates (the split/merge-churn gap).
+                                if empty_selected < p.gc_max_empty_per_run.get() {
+                                    holes.push((eid, sealed_length));
+                                    empty_selected += 1;
+                                }
+                                continue;
+                            }
+                            // Non-empty rewrite candidate: bounded by --gc-max-extents-per-run, but
+                            // `continue` (not `break`) so we keep scanning for empties.
+                            if nonempty_selected >= p.gc_max_extents_per_run.get() {
+                                continue;
+                            }
+                            if params.empty_only {
+                                continue;
+                            }
+                            if let Some(mx) = params.max_size {
+                                if sealed_length > mx {
+                                    continue;
+                                }
+                            }
+                            let discard_bytes = discards.get(&eid).copied().unwrap_or(0);
+                            if discard_bytes <= 0 {
+                                continue;
+                            }
+                            if gc_selects(
+                                discard_bytes.max(0) as u64,
+                                sealed_length,
+                                refs,
+                                effective_ratio,
+                                dead_bytes_high,
+                            ) {
+                                holes.push((eid, sealed_length));
+                                nonempty_selected += 1;
+                            }
+                        }
+
+                        // Re-derive the operator-facing debt as what GC would
+                        // actually reclaim. The field's own doc says "Σ
+                        // reclaimable bytes"; counting every dead byte made it
+                        // say otherwise, and the advisory believed it — firing
+                        // on 3 GiB of garbage sitting in a 16 GiB extent that
+                        // the ratio gate will never let GC rewrite, every
+                        // cooldown, forever, while GC answered "no eligible
+                        // extents to reclaim" each time.
+                        //
+                        // Unexamined extents keep their raw dead bytes: the
+                        // budget stopped the scan, so their collectability is
+                        // unknown and under-reporting would silence an advisory
+                        // for work that does exist.
+                        // Publish the basis so the IDLE refresh tick can answer
+                        // with the same predicate instead of the raw sum. That
+                        // tick re-arms every 5-7 s and overwrites this store, so
+                        // without it the advisory reads "every dead byte" almost
+                        // all of the time and the fire-and-refuse loop survives
+                        // for garbage spread thinly across extents. Reusing what
+                        // selection already resolved costs no extra RPC.
+                        //
+                        // EVERY writer of the gauge reads the SAME basis —
+                        // dispatch-top, this store, and the idle tick — so a
+                        // dispatch that carries
+                        // no floor can no longer answer a different question
+                        // than the one the advisory asks (`next_gc_debt_basis`).
+                        let policy = GcDebtPolicy {
+                            ratio_base: params.ratio.unwrap_or(p.gc_discard_ratio.get()),
+                            stream_debt: params.stream_debt,
+                            floor: dead_bytes_high,
+                        };
+                        // Only the MANAGER may say "these params are the
+                        // standing policy"; an operator's one-off override
+                        // runs exactly as asked but never redefines what the
+                        // gauge means. `empty_only` can never be it — that
+                        // mode judges nothing but empties.
+                        let defines_policy =
+                            params.policy_is_standing && !params.empty_only;
+                        let collectable = {
+                            let p = part.borrow();
+                            let mut slot = p.gc_debt_basis.borrow_mut();
+                            let next =
+                                next_gc_debt_basis(slot.as_ref(), resolved, policy, defines_policy);
+                            *slot = next;
+                            gc_debt_from_basis(&discards, slot.as_ref())
+                        };
+                        metrics
+                            .gc_debt_bytes
+                            .store(collectable, std::sync::atomic::Ordering::Relaxed);
+
+                        holes
+                    }
+                };
+
+                // WAL replay-floor guard (applies to BOTH Auto and Force — even an
+                // operator Force must not punch the replay window; compact first to
+                // advance the floor). Never punch a NON-EMPTY extent at/after the
+                // replay floor (see floor computation above). Empty (sealed_length==0)
+                // extents carry no committed data and stay eligible.
+                {
+                    let mut protected_eids: Vec<u64> = Vec::new();
+                    holes.retain(|(eid, sealed_length)| {
+                        let keep = gc_extent_punchable(
+                            *eid,
+                            *sealed_length,
+                            &pos_by_eid,
+                            replay_floor_pos,
+                        );
+                        if !keep {
+                            protected_eids.push(*eid);
+                        }
+                        keep
+                    });
+                    if !protected_eids.is_empty() {
+                        // The extent recovery would replay FROM (floor position).
+                        let floor_extent = extent_ids.get(replay_floor_pos).copied().unwrap_or(0);
+                        // Which live SST's vp_head anchors that floor (the SST
+                        // pinning the window). First match is enough for a hint.
+                        let pinned_by_sst_vp_extent = readers_snapshot
+                            .iter()
+                            .map(|r| r.vp_extent_id)
+                            .find(|eid| pos_by_eid.get(eid).copied() == Some(replay_floor_pos))
+                            .unwrap_or(0);
+                        tracing::info!(
+                            part_id,
+                            protected = ?protected_eids,
+                            floor_extent,
+                            floor_pos = replay_floor_pos,
+                            pinned_by_sst_vp_extent,
+                            "GC: protected extent(s) at/before the recovery replay floor — \
+                             recovery replays log_stream from floor_extent forward, so punching \
+                             them could lose un-flushed writes. This is EXPECTED, not a bug. To \
+                             advance the floor: flush + MAJOR-compact so every live SST's vp_head \
+                             moves past floor_extent, then retry (see `autumn-op info --part`)."
+                        );
+                    }
+                }
+
+                // filter against the per-extent failure cooldown. Force
+                // tasks bypass the cooldown (operator override), Auto tasks
+                // respect it. Stale entries (older than the cooldown window)
+                // are evicted lazily to keep the map bounded.
+                if !is_force {
+                    let now = Instant::now();
+                    // Evict stale entries (past their own cooldown window).
+                    gc_failure_cooldown.retain(|_, (t, dur)| now.duration_since(*t) < *dur);
+                    let initial_len = holes.len();
+                    holes.retain(|(eid, _)| {
+                        gc_failure_cooldown
+                            .get(eid)
+                            .is_none_or(|(t, dur)| now.duration_since(*t) >= *dur)
+                    });
+                    if holes.len() < initial_len {
+                        tracing::info!(
+                            skipped = initial_len - holes.len(),
+                            remaining = holes.len(),
+                            "GC skipping recently-failed extents (cooldown active)"
+                        );
+                    }
+                }
+
+                if holes.is_empty() {
+                    // fix HIGH-2 + r2: same stamp-then-clear rationale as
+                    // the early-exit paths above. Cooldown engages even when
+                    // there's nothing to punch.
+                    record_maint_outcome(
+                        &metrics,
+                        gc_op_id,
+                        gc_kind,
+                        manager_rpc::OP_STATE_SUCCEEDED,
+                        String::new(),
+                        "no eligible extents to reclaim".to_string(),
+                    );
+                    stamp_last_gc();
+                    clear_inflight(&metrics);
+                    continue;
+                }
+
+                // D-r6: PS-wide GC concurrency cap (via the unified
+                // AdmissionController). Acquired AFTER the per-partition
+                // maintenance_gate so multiple partitions on the same PS don't all
+                // enter run_gc together — each holds ~64 MiB chunk buffer +
+                // rewrite staging. Default 1 (full serialization), tunable
+                // via `--gc-parallelism`.
+                // PS-wide gc concurrency cap FIRST (cross-partition RAM), THEN
+                // the per-partition maintenance_gate. Permit-before-gate is
+                // deliberate: a GC queued on the global gc permit must NOT
+                // hold this partition's maintenance_gate while it waits, or it
+                // needlessly blocks a same-partition split. Safe despite the
+                // asymmetry with compaction/split (which are gate-first): GC uses
+                // `acquire_gc`, split/compaction use `acquire_compact`, so GC
+                // never shares a PS-wide permit with them — the wait-for graph
+                // acquire_gc → maintenance_gate → acquire_compact stays acyclic.
+                // (Compaction MUST stay gate-first to match split's
+                // maintenance_gate → acquire_compact, else AC↔MG would cycle; GC
+                // has no such constraint, so permit-first is both safe and
+                // avoids the split-blocking.)
+                let _gc_conc_permit = concurrency_ctrl.acquire_gc().await;
+                // maintenance_gate held around the holes-processing loop below
+                // (the read-only candidate selection above ran without it) so
+                // handle_split_part sees no log_stream GC append in-flight.
+                let _gc_permit = maintenance_gate.acquire().await;
+                if is_frozen_for_maintenance(&part) {
+                    record_maint_outcome(
+                        &metrics,
+                        gc_op_id,
+                        gc_kind,
+                        manager_rpc::OP_STATE_FAILED,
+                        "deferred: partition frozen for split/merge — retry".to_string(),
+                        String::new(),
+                    );
+                    stamp_last_gc();
+                    clear_inflight(&metrics);
+                    continue;
+                }
+                // Nothing preempts an op in flight on an extent (a recovery, an
+                // EC conversion), a punch included: ask first rather than
+                // relocate an extent's live values and then have the punch
+                // refused. One that slips in after the answer still refuses the
+                // punch. When the manager cannot be asked, the punch decides.
+                let (holes, busy): (Vec<(u64, u64)>, Vec<u64>) = {
+                    let sc = part.borrow().stream_client.clone();
+                    let ids: Vec<u64> = holes.iter().map(|(e, _)| *e).collect();
+                    match sc.extents_in_flight(&ids).await {
+                        Ok(busy) if !busy.is_empty() => {
+                            tracing::info!(?busy, "GC: skipping extents with an op in flight");
+                            for e in &busy {
+                                gc_failure_cooldown
+                                    .insert(*e, (Instant::now(), Duration::from_secs(p.gc_failure_soft_cooldown_secs.get())));
+                            }
+                            let free = holes.into_iter().filter(|(e, _)| !busy.contains(e)).collect();
+                            (free, busy)
+                        }
+                        Ok(_) => (holes, Vec::new()),
+                        Err(e) => {
+                            tracing::debug!("GC: could not ask which extents are busy: {e}");
+                            (holes, Vec::new())
+                        }
+                    }
+                };
+                if holes.is_empty() {
+                    // Everything asked for is busy: nothing ran, like a run
+                    // deferred for a frozen partition.
+                    record_maint_outcome(
+                        &metrics,
+                        gc_op_id,
+                        gc_kind,
+                        manager_rpc::OP_STATE_FAILED,
+                        format!(
+                            "deferred: an op is in flight on extent(s) {busy:?}; retry after it \
+                             completes"
+                        ),
+                        String::new(),
+                    );
+                    stamp_last_gc();
+                    clear_inflight(&metrics);
+                    continue;
+                }
+                tracing::info!("GC: starting, extents={:?}", holes);
+                // fix MED-4: gc_inflight already latched at top of loop;
+                // hold through the punch and clear at the bottom.
+                // `sealed_length` was validated AUTHORITATIVELY at selection
+                // (`authoritative_sealed`) and carried here — do NOT re-read it
+                // from the (possibly stale) extent_info cache, or the check/use split
+                // re-opens the seed=583 stale-cache punch on a sealed extent.
+                let n_holes = holes.len();
+                // First failure across the batch → the op's reported error.
+                let mut gc_failed: Option<String> = None;
+                for (eid, sealed_length) in holes {
+                    match run_gc(&part, eid, sealed_length, gc_op_id, gc_kind).await {
+                        Ok(()) => {
+                            // success → clear any prior failure stamp so
+                            // a transient EC fall-back hiccup doesn't suppress
+                            // the next legitimate GC need.
+                            gc_failure_cooldown.remove(&eid);
+                        }
+                        Err(e) => {
+                            let dur = classify_gc_failure_cooldown(
+                                &e,
+                                Duration::from_secs(p.gc_failure_soft_cooldown_secs.get()),
+                                Duration::from_secs(p.gc_failure_cooldown_secs.get()),
+                            );
+                            tracing::error!(
+                                extent_id = eid,
+                                cooldown_secs = dur.as_secs(),
+                                "GC run_gc extent: {e}"
+                            );
+                            if gc_failed.is_none() {
+                                gc_failed = Some(format!("extent {eid}: {e}"));
+                            }
+                            gc_failure_cooldown.insert(eid, (Instant::now(), dur));
+                        }
+                    }
+                }
+                match gc_failed {
+                    None => record_maint_outcome(
+                        &metrics,
+                        gc_op_id,
+                        gc_kind,
+                        manager_rpc::OP_STATE_SUCCEEDED,
+                        String::new(),
+                        if busy.is_empty() {
+                            format!("reclaimed {n_holes} extent(s)")
+                        } else {
+                            format!(
+                                "reclaimed {n_holes} extent(s); skipped {busy:?} (an op is in \
+                                 flight on them)"
+                            )
+                        },
+                    ),
+                    Some(err) => record_maint_outcome(
+                        &metrics,
+                        gc_op_id,
+                        gc_kind,
+                        manager_rpc::OP_STATE_FAILED,
+                        err,
+                        String::new(),
+                    ),
+                }
+                // fix HIGH-2 + r2: stamp BEFORE clear so the scheduler
+                // doesn't see (inflight=0, last_gc_at=stale) and re-dispatch.
+                stamp_last_gc();
+                clear_inflight(&metrics);
+                drop(_gc_permit);
+            }
+            Sel::GcTimeout => {
+                next_gc_at = Instant::now() + random_delay();
+                // refresh `gc_debt_bytes` metric without
+                // dispatching. `report_load_loop` and any external
+                // policy controller queries see fresh debt without
+                // the loop deciding to act on it.
+                let metrics = part.borrow().metrics.clone();
+                let (log_stream_id, readers_snapshot, part_sc) = {
+                    let p = part.borrow();
+                    (
+                        p.log_stream_id,
+                        p.sst_readers.clone(),
+                        p.stream_client.clone(),
+                    )
+                };
+                if let Ok(stream_info) = part_sc.get_stream_info(log_stream_id).await {
+                    let extent_ids = stream_info.extent_ids;
+                    // The same floor the dispatch path splits at.
+                    let (dv_eid, _) = part.borrow().durable_ckpt_vp.get();
+                    let (floor, pos_by_eid) = effective_replay_floor(
+                        &extent_ids,
+                        readers_snapshot.iter().map(|r| r.vp_extent_id),
+                        dv_eid,
+                    );
+                    let mut discards = get_discards(&readers_snapshot);
+                    // refresh the replay-window dead bytes on EVERY periodic
+                    // tick, regardless of extent count — this is the idle-refresh
+                    // path (no GC dispatched), and an all-open-tail partition with a
+                    // single log extent would otherwise never update it. What stays
+                    // in `discards` is the gc_debt basis below.
+                    metrics.open_tail_dead_bytes.store(
+                        split_at_replay_floor(&mut discards, &pos_by_eid, floor),
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    // Always store gc_debt (0 when there is no sealed prefix) so a
+                    // partition reclaimed down to one extent doesn't leave a stale
+                    // sealed-debt inflating the manager's `logical_wal_debt`.
+                    let gc_debt: u64 = if extent_ids.len() >= 2 {
+                        // Answer with the SAME predicate selection uses, from the
+                        // basis the last selection pass resolved. Before the first
+                        // dispatch there is none, and this degrades to the raw sum
+                        // — over-reporting, which is the safe direction: it can
+                        // only ask for work, never silence work that exists.
+                        let p = part.borrow();
+                        let basis = p.gc_debt_basis.borrow();
+                        gc_debt_from_basis(&discards, basis.as_ref())
+                    } else {
+                        0
+                    };
+                    metrics
+                        .gc_debt_bytes
+                        .store(gc_debt, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
+    }
+}
+
+// `background_write_loop` and its R1/LF dispatch helpers are gone —
+// the write loop is now inlined into `partition_loop` on the main
+// P-log task. The primitives below (`start_write_batch`, `finish_write_batch`,
+// `handle_completion`, `InflightCompletion`, `InFlightBatch`, `BatchData`)
+// remain as building blocks used by that merged loop.
+
+/// Carrier payload pushed through the FuturesUnordered completion queue.
+/// `data` is the Phase-1 validated batch; `phase2_result` is the return
+/// value of the P-log `append_batch` / `append_segments` call.
+pub(crate) struct InflightCompletion {
+    pub(crate) data: BatchData,
+    pub(crate) phase2_result: Result<autumn_stream::AppendResult>,
+}
+
+/// Consume one completion: run Phase 3 (memtable insert + client reply),
+/// update metrics, and surface `LockedByOther` via the shared flag so the
+/// main loop can terminate the partition. Returns how many client frames were
+/// just answered — the admission slots this completion released, which is how
+/// the loop's `CoalesceWindow` sizes the refill it waits for. A failed batch
+/// answers nothing here — its clients get an error and back off, so no refill
+/// is coming.
+pub(crate) async fn handle_completion(
+    part: &Rc<RefCell<PartitionData>>,
+    metrics: &mut WriteLoopMetrics,
+    poisoned: &Rc<Cell<bool>>,
+    part_id: u64,
+    c: InflightCompletion,
+) -> usize {
+    let acked = match finish_write_batch(part, c.data, c.phase2_result).await {
+        Ok(stats) => {
+            // LAT-1: every op in a group-committed batch experienced the
+            // batch's end-to-end latency — observe `ops` at that value.
+            // Reuses the already-measured BatchStats (no new timing).
+            part.borrow()
+                .metrics
+                .write_lat
+                .observe_n(stats.end_to_end_ns, stats.ops);
+            let acked = stats.replies as usize;
+            metrics.record(stats);
+            acked
+        }
+        Err(e) => {
+            if is_locked_by_other(&e) {
+                tracing::error!(part_id, "LockedByOther detected, poisoning partition");
+                poisoned.set(true);
+            } else if must_reopen(&e) {
+                tracing::error!(part_id, "log append failed after it was sent, poisoning partition for a reopen: {e:#}");
+                poisoned.set(true);
+            } else {
+                tracing::error!(part_id, "write batch error: {e:#}");
+            }
+            0
+        }
+    };
+    metrics.maybe_report(part_id);
+    acked
+}
+
+// ---------------------------------------------------------------------------
+// Write batch processing — split into start (Phase1) + finish (Phase3)
+// with Phase2 (append I/O) as an in-flight future for double-buffering.
+// ---------------------------------------------------------------------------
+
+pub(crate) struct ValidatedEntry {
+    internal_key: Vec<u8>,
+    user_key: Bytes,
+    op: u8,
+    value: autumn_transport::RegBytes,
+    expires_at: u64,
+    /// direct responder. On Phase 3 success we call `send_ok` which
+    /// encodes the `PutResp` / `DeleteResp` frame bytes and forwards to the
+    /// outer ps-conn oneshot — no inner oneshot hop.
+    resp: crate::WriteResponder,
+}
+
+pub(crate) type Phase2Fut =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<autumn_stream::AppendResult>>>>;
+
+/// In-flight batch data (without the future).
+pub(crate) struct BatchData {
+    picked_at: Instant,
+    phase1_ns: u64,
+    phase2_started_at: Instant,
+    valid: Vec<ValidatedEntry>,
+    record_sizes: Vec<u32>,
+    /// Hashes of this batch's non-fence user keys, added to
+    /// `PartitionData.inflight_write_keys` in Phase 1 and removed in Phase 3.
+    /// Computed once here so Phase 3 needn't re-hash. See `inflight_key_hash`.
+    inflight_key_hashes: Vec<u64>,
+}
+
+/// 64-bit hash of a user key for `PartitionData.inflight_write_keys`. FNV-1a —
+/// fast, dependency-free, no allocation. Collisions only cause a spurious GC
+/// verdict abort (safe, retried next tick), so cryptographic strength is
+/// unnecessary.
+pub(crate) fn inflight_key_hash(user_key: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &b in user_key {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+/// Drop one in-flight reference for `kh` from `PartitionData.inflight_write_keys`
+/// (removing the entry at zero). Paired with the `+= 1` in `start_write_batch`;
+/// called once per key in Phase 3 (and on the Phase-1b encode-error abort).
+pub(crate) fn release_inflight_key(map: &mut HashMap<u64, u32>, kh: u64) {
+    if let Some(c) = map.get_mut(&kh) {
+        *c -= 1;
+        if *c == 0 {
+            map.remove(&kh);
+        }
+    }
+}
+
+/// In-flight batch: Phase1 done, Phase2 future running.
+pub(crate) struct InFlightBatch {
+    pub(crate) data: BatchData,
+    pub(crate) phase2_fut: Phase2Fut,
+}
+
+/// payload-byte threshold for offloading Phase 1's WAL encoding
+/// (CRC32C compute + segment build) to `spawn_blocking`. Below this
+/// threshold the encode runs inline on the P-log compio runtime —
+/// spawn_blocking's ~10-20 µs join overhead would dominate small
+/// batches. Above this, the inline CPU cost (CRC32C ~12 GB/s = ~83 µs
+/// per MB) dominates and offloading wins. 4 MiB → ~350 µs CRC, 17×
+/// the spawn overhead.
+const PHASE1_OFFLOAD_THRESHOLD: u64 = 4 * 1024 * 1024;
+
+/// Phase 1: validate + encode + launch Phase2 future.
+///
+/// **Async + conditional spawn_blocking on big batches.**
+/// This was formerly sync and ran the full encode loop (CRC32C +
+/// `Bytes::copy_from_slice` of every value) inline under the P-log
+/// `borrow_mut`. For 8 MiB-value workloads a 256-record batch ran
+/// ~950 ms inline CPU on the compio runtime, blocking all other tasks
+/// (ps-conn, flush_loop, compact_loop, gc_loop) for the duration —
+/// observed as 744 ms p99 on the perf bench. The fix splits Phase 1
+/// into two sub-phases:
+///   - **Phase 1a (sync, under `borrow_mut`):** validate range, assign
+///     seq numbers, build `ValidatedEntry` list. Bounded CPU; no per-
+///     record CRC.
+///   - **Phase 1b (CRC + segment build):** runs **inline** when total
+///     batch payload < `PHASE1_OFFLOAD_THRESHOLD` (= 4 MiB), otherwise
+///     `spawn_blocking` so the CPU work moves to the blocking pool and
+///     the P-log runtime stays responsive for ps-conn / heartbeat /
+///     other tasks.
+pub(crate) async fn start_write_batch(
+    part: &Rc<RefCell<PartitionData>>,
+    batch: Vec<WriteRequest>,
+) -> Result<Option<InFlightBatch>> {
+    let picked_at = Instant::now();
+    let phase1_started_at = Instant::now();
+
+    // Phase 1a: validate + assign seq + collect entries.
+    let (valid, inflight_key_hashes, log_stream_id, part_sc, admission) = {
+        let mut p = part.borrow_mut();
+
+        let mut valid: Vec<ValidatedEntry> = Vec::with_capacity(batch.len());
+        let mut inflight_key_hashes: Vec<u64> = Vec::with_capacity(batch.len());
+        for req in batch {
+            let (user_key, op, value, expires_at) = match req.op {
+                WriteOp::Put {
+                    user_key,
+                    value,
+                    expires_at,
+                } => (user_key, 1u8, value, expires_at),
+                WriteOp::Delete { user_key } => (
+                    Bytes::from(user_key),
+                    crate::OP_TOMBSTONE,
+                    Default::default(),
+                    0u64,
+                ),
+                // Lease write fencing: fence-floor bump record. key = raw
+                // ino bytes (NOT a user key — skips in_range below), value
+                // = epoch. Never inserted into the memtable (Phase 3 skips
+                // OP_FENCE_BUMP); replay max-merges it into fence_floors.
+                WriteOp::FenceBump { ino, epoch } => (
+                    Bytes::copy_from_slice(&ino.to_be_bytes()),
+                    crate::OP_FENCE_BUMP,
+                    Bytes::copy_from_slice(&epoch.to_le_bytes()).into(),
+                    0u64,
+                ),
+            };
+            if op != crate::OP_FENCE_BUMP && !in_range(&p.rg, &user_key) {
+                req.resp.send_err("key is out of range".to_string());
+                continue;
+            }
+            p.seq_number += 1;
+            let seq = p.seq_number;
+            let internal_key = key_with_ts(&user_key, seq);
+            // Mark this key in-flight (seq assigned, not yet in the memtable) so
+            // a concurrent GC value-relocation can't shadow it (see
+            // `inflight_write_keys`). Fence-bump records never enter the memtable
+            // (Phase 3 skips them) and carry no VP, so GC never relocates them —
+            // exclude them to keep the add/remove symmetric.
+            if op != crate::OP_FENCE_BUMP {
+                let kh = inflight_key_hash(&user_key);
+                *p.inflight_write_keys.entry(kh).or_insert(0) += 1;
+                inflight_key_hashes.push(kh);
+            }
+            valid.push(ValidatedEntry {
+                internal_key,
+                user_key,
+                op,
+                value,
+                expires_at,
+                resp: req.resp,
+            });
+        }
+
+        if valid.is_empty() {
+            return Ok(None);
+        }
+
+        let log_stream_id = p.log_stream_id;
+        let part_sc = p.stream_client.clone();
+        let admission = p.rate_ctrl.clone();
+        (
+            valid,
+            inflight_key_hashes,
+            log_stream_id,
+            part_sc,
+            admission,
+        )
+    };
+    // borrow_mut released here — safe to await below.
+
+    // Phase 1b: CRC32C + segment build. Decide inline vs spawn_blocking
+    // by total batch payload. Each ValidatedEntry contributes
+    // `value.len()` bytes to the CRC compute (the dominant cost); keys
+    // and headers are tens of bytes per record, negligible.
+    let total_value_bytes: u64 = valid.iter().map(|e| e.value.len() as u64).sum();
+    // Write-throughput accounting: accumulate value bytes once per batch (P-log
+    // thread, no contention). report_load_loop swaps this for write_bytes_per_sec.
+    part.borrow()
+        .metrics
+        .write_bytes
+        .fetch_add(total_value_bytes, std::sync::atomic::Ordering::Relaxed);
+
+    // The batch's crc32c is computed record by record as it is encoded, while
+    // each record is in cache, and rides the append ctrl to every replica.
+    let (segments, record_sizes, batch_crc) = if total_value_bytes >= PHASE1_OFFLOAD_THRESHOLD {
+        // big-batch path — move encode inputs into spawn_blocking.
+        // We MUST keep `valid` alive on the main runtime (its `resp` /
+        // `WriteResponder` holds Rc<...> oneshot senders that are !Send).
+        // So we stage `(op, internal_key, value: Bytes, expires_at)`
+        // tuples into a Send Vec, and clone `value` (Bytes::clone =
+        // Arc::clone, ~free for both small + large values).
+        let inputs: Vec<(u8, Vec<u8>, autumn_transport::RegBytes, u64)> = valid
+            .iter()
+            .map(|e| {
+                let wal_op = if e.value.len() > VALUE_THROTTLE {
+                    e.op | OP_VALUE_POINTER
+                } else {
+                    e.op
+                };
+                (
+                    wal_op,
+                    e.internal_key.clone(),
+                    e.value.clone(),
+                    e.expires_at,
+                )
+            })
+            .collect();
+        let result = compio::runtime::spawn_blocking(move || {
+            crate::wal_record::encode_batch(inputs.iter().map(|(op, key, value, exp)| (*op, key.as_slice(), value, *exp)))
+        })
+        .await;
+        match result {
+            Ok(r) => r,
+            Err(_) => {
+                // Encode panicked — the batch is abandoned before launch, so
+                // Phase 3 never runs; release its in-flight keys here.
+                let mut p = part.borrow_mut();
+                for kh in &inflight_key_hashes {
+                    release_inflight_key(&mut p.inflight_write_keys, *kh);
+                }
+                return Err(anyhow!("spawn_blocking encode panicked"));
+            }
+        }
+    } else {
+        // Small-batch fast path: encode inline. Spawn overhead would
+        // dominate sub-4 MiB batches. The values are refcount clones, so each stays in its
+        // ValidatedEntry for the Phase 3 memtable insert.
+        crate::wal_record::encode_batch(valid.iter().map(|e| {
+            let wal_op = if e.value.len() > VALUE_THROTTLE {
+                e.op | OP_VALUE_POINTER
+            } else {
+                e.op
+            };
+            (wal_op, e.internal_key.as_slice(), &e.value, e.expires_at)
+        }))
+    };
+
+    // Every append is durable when it returns: each replica's per-extent
+    // owner fsyncs a burst before it acks, and the append needs every
+    // replica's ack. Phase 3 inserts into the memtable only after that, so
+    // a flush has no durability left to check before publishing an SST.
+    let phase1_ns = duration_to_ns(phase1_started_at.elapsed());
+
+    // foreground admission. Per-batch single Mutex acquire +
+    // (bytes, ops) accounting. bytes catches large-value workloads;
+    // ops catches small-value IOPS-bound workloads (4 KiB Puts saturate
+    // P-log long before bytes hit the cap). EITHER cap reached → fg
+    // sleeps. With both caps at 0 (unlimited) returns immediately —
+    // hot path stays cheap.
+    admission
+        .account_fg(total_value_bytes, valid.len() as u64)
+        .await;
+
+    // Launch Phase 2 as a future (not awaited yet).
+    let phase2_started_at = Instant::now();
+    let phase2_fut =
+        Box::pin(async move { part_sc.append_segments_with_crc(log_stream_id, segments, batch_crc).await });
+
+    Ok(Some(InFlightBatch {
+        data: BatchData {
+            picked_at,
+            phase1_ns,
+            phase2_started_at,
+            valid,
+            record_sizes,
+            inflight_key_hashes,
+        },
+        phase2_fut,
+    }))
+}
+
+/// fence classifier — the trigger for poison-and-reopen self-heal.
+/// Matches the "LockedByOther" marker emitted by BOTH fence layers: the
+/// EN's native `CODE_LOCKED_BY_OTHER` rejection (append / commit_length)
+/// and the stream client's typed
+/// `ManagerError` Display for a manager-side `ensure_owner_epoch`
+/// rejection (stale owner_epoch on `alloc_new_extent` etc.).
+///
+/// `{e:#}` (anyhow alternate Display) prints the WHOLE context chain —
+/// plain `{e}` shows only the outermost context, so a `.context(...)`
+/// wrap added along the append path (e.g. client.rs "alloc_new_extent
+/// failed after append error: …") would HIDE the marker and silently
+/// downgrade a fence to a generic write error (no poison → no
+/// fresh-epoch reopen).
+/// A failed log append the partition must reopen for: fenced by a newer owner,
+/// or given up after the batch was handed to the stream — then it may sit on
+/// some replicas of an open tail, and the reopen's seal settles it. A failure
+/// before anything was sent is just a failed write; reopening for it would
+/// repeat on every write while, say, no new tail can be allocated.
+pub(crate) fn must_reopen(e: &anyhow::Error) -> bool {
+    is_locked_by_other(e) || autumn_stream::is_append_outcome_unknown(e)
+}
+
+pub(crate) fn is_locked_by_other(e: &anyhow::Error) -> bool {
+    format!("{e:#}").contains("LockedByOther")
+}
+
+/// Phase 3: given Phase2 result, insert into memtable, reply to callers.
+pub(crate) async fn finish_write_batch(
+    part: &Rc<RefCell<PartitionData>>,
+    bd: BatchData,
+    phase2_result: Result<autumn_stream::AppendResult>,
+) -> Result<BatchStats> {
+    let phase2_elapsed = bd.phase2_started_at.elapsed();
+
+    let result = match phase2_result {
+        Ok(result) => result,
+        Err(e) => {
+            // Each writer is told to retry, never that its write failed: when
+            // the batch was handed to the stream it may sit on some replicas of
+            // a tail still open, and only the seal of the reopen the caller
+            // triggers decides whether it counts (docs/seal_length_design.md §5).
+            let reopen = must_reopen(&e);
+            let msg = if reopen {
+                format!(
+                    "log append failed; the partition is reopening and this write may or \
+                     may not have been applied: {e:#}"
+                )
+            } else {
+                format!("log append failed before anything was written; this write was not applied: {e:#}")
+            };
+            for entry in bd.valid {
+                if reopen {
+                    entry.resp.send_outcome_unknown(msg.clone());
+                } else {
+                    entry.resp.send_unavailable(msg.clone());
+                }
+            }
+            // The write FAILED — release its in-flight keys. Phase 3 never
+            // inserted them, and the OLD value stays correctly live, so a later
+            // GC value-relocation of it is fine.
+            {
+                let mut p = part.borrow_mut();
+                for kh in &bd.inflight_key_hashes {
+                    release_inflight_key(&mut p.inflight_write_keys, *kh);
+                }
+            }
+            return Err(anyhow!(msg));
+        }
+    };
+
+    // Test-only sync point: hold this batch AFTER Phase 2 (seq assigned in
+    // Phase 1, bytes durable) but BEFORE the Phase-3 memtable insert — the
+    // "in-flight WAL queue" state. Parks with NO borrow held so a concurrent GC
+    // task runs; a background GC value-relocation must not shadow this write.
+    if crate::write_phase3_paused() {
+        crate::note_write_phase3_parked();
+        while crate::write_phase3_paused() {
+            compio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+    }
+
+    // Phase 3: insert into memtable + update VP head.
+    //
+    // batch all N (up to 256) memtable inserts under ONE RwLock write
+    // guard acquisition via `insert_batch`. Previously this loop called
+    // `p.active.insert` N times; under the new RwLock<BTreeMap> backing that
+    // would mean N write-lock acquire/release cycles per batch. Collapsing
+    // into one saves N-1 atomic-CAS pairs per batch (256 → 1 on the hot
+    // --threads 256 workload) while preserving the single-writer semantics.
+    //
+    // the per-entry responder is a direct `WriteResponder` into the
+    // outer ps-conn oneshot, carrying the encoded `PutResp` / `DeleteResp`
+    // frame bytes. No inner oneshot; `handle_put` is gone.
+    let phase3_started_at = Instant::now();
+    let mut responders: Vec<crate::WriteResponder> = Vec::new();
+    let batch_ops = bd.record_sizes.len() as u64;
+    let record_sizes = bd.record_sizes;
+    // BUG1: total log_stream bytes this batch appended
+    // (value included) — feeds the memtable's log_bytes counter so the
+    // WAL-gap force-rotate bounds the true replay window. Computed BEFORE
+    // `record_sizes` is moved into the insert closure below.
+    let batch_log_bytes: u64 = record_sizes.iter().map(|&s| s as u64).sum();
+    let base_offset = result.offset;
+    let extent_id_for_vp = result.extent_id;
+    {
+        let mut p = part.borrow_mut();
+
+        // Materialise the inserts as an iterator that also side-effects
+        // `responders`. The iterator is fully consumed inside insert_batch,
+        // so the side effects all happen under the (single) write lock.
+        let valid = bd.valid;
+        let mut cumulative: u64 = 0;
+        let mut idx: usize = 0;
+        let responders_ref = &mut responders;
+        let mut durable_bumps: Vec<(u64, u64)> = Vec::new();
+        let durable_bumps_ref = &mut durable_bumps;
+        let mut deletes: u64 = 0;
+        let deletes_ref = &mut deletes;
+        // Keys the memory tier must hear about once applied (`mem_tier.rs`).
+        let mut applied_keys: Option<Vec<Bytes>> = p.mem_tier.as_ref().map(|_| Vec::new());
+        let mem_budget = p.mem_tier.as_ref().map(|m| m.budget());
+        let mem_covers = move |k: &[u8]| mem_budget.as_ref().is_some_and(|b| b.covers(k));
+        let applied_keys_ref = &mut applied_keys;
+        // Value bytes this batch left behind ValuePointers: the only part of
+        // its log records still live after the flush (`Memtable::wal_dead`).
+        let mut vp_value_bytes: u64 = 0;
+        let vp_value_bytes_ref = &mut vp_value_bytes;
+        let iter = valid.into_iter().filter_map(move |entry| {
+            let record_offset = base_offset + cumulative;
+            cumulative += record_sizes[idx] as u64;
+            idx += 1;
+
+            // Lease write fencing: fence-bump records are WAL-only — the
+            // floor was already raised in fence_floors at enqueue time;
+            // nothing enters the memtable. (Offset accounting above must
+            // still advance: record_sizes is aligned over ALL entries.)
+            if entry.op == crate::OP_FENCE_BUMP {
+                if let (Ok(ino), Ok(epoch)) = (
+                    <[u8; 8]>::try_from(entry.user_key.as_ref()),
+                    <[u8; 8]>::try_from(entry.value.as_ref()),
+                ) {
+                    durable_bumps_ref.push((u64::from_be_bytes(ino), u64::from_le_bytes(epoch)));
+                }
+                responders_ref.push(entry.resp);
+                return None;
+            }
+
+            let mem_entry = if entry.value.len() > VALUE_THROTTLE {
+                // V1 record layout:
+                //   [V1_SENTINEL:1][payload_len:4][op:1][key_len:4]
+                //   [val_len:4][expires_at:8][key bytes][value bytes][crc:4]
+                //
+                // Value starts at record_offset + 1 + 4 + 17 + key.len()
+                //                                        ^^^^^^ V0 inner header
+                //                                  ^^ V1 envelope (sentinel+length)
+                //                                = 22 + key.len()
+                //
+                // Pre-fix this used `+ 17 +` which was the V0-layout calc;
+                // the V1 envelope's 5-byte sentinel+length prefix makes the
+                // VP offset point 5 bytes EARLIER than the value bytes,
+                // returning the last 5 bytes of internal_key (inverted-seq)
+                // followed by (val_len - 5) bytes of value. Latent since
+                // flipped V1 default-on; surfaced by the putstream
+                // tests because they were the first to verify > VALUE_THROTTLE
+                // value content end-to-end with V1 records.
+                let vp = ValuePointer {
+                    extent_id: extent_id_for_vp,
+                    offset: record_offset + 22 + entry.internal_key.len() as u64,
+                    len: entry.value.len() as u64,
+                };
+                *vp_value_bytes_ref += vp.len;
+                MemEntry {
+                    op: entry.op | OP_VALUE_POINTER,
+                    value: vp.encode().to_vec(),
+                    expires_at: entry.expires_at,
+                }
+            } else {
+                MemEntry {
+                    op: entry.op,
+                    value: entry.value.to_vec(),
+                    expires_at: entry.expires_at,
+                }
+            };
+
+            if let Some(keys) = applied_keys_ref.as_mut() {
+                if mem_covers(&entry.user_key) {
+                    keys.push(entry.user_key.clone());
+                }
+            }
+            if entry.op == crate::OP_TOMBSTONE {
+                *deletes_ref += 1;
+            }
+            let write_size = (entry.user_key.len() + mem_entry.value.len() + 32) as u64;
+            responders_ref.push(entry.resp);
+            Some((entry.internal_key, mem_entry, write_size))
+        });
+
+        p.active.insert_batch(iter);
+        if let (Some(keys), Some(mem)) = (applied_keys, p.mem_tier.as_mut()) {
+            for k in keys {
+                mem.applied(&k);
+            }
+        }
+        p.publish_lsm_gauges();
+        if deletes > 0 {
+            p.metrics
+                .unsettled_deletes
+                .fetch_add(deletes, std::sync::atomic::Ordering::Relaxed);
+        }
+        // The fence records in this batch are committed: their floors are
+        // durable now.
+        for (ino, epoch) in durable_bumps {
+            p.fence_floors.mark_durable(ino, epoch);
+        }
+        // Phase 3 committed these keys to the memtable — release their in-flight
+        // marks now, under THIS borrow (NO await between the insert and the
+        // release), so a concurrent GC value-relocation always sees each key in
+        // EITHER the memtable OR inflight_write_keys, never neither.
+        for kh in &bd.inflight_key_hashes {
+            release_inflight_key(&mut p.inflight_write_keys, *kh);
+        }
+        // BUG1: track the un-flushed LOG window (value
+        // included) for the force-rotate; `mem_bytes` would only see the
+        // ~24-byte VP for large values and never trip the 2 GiB gap.
+        p.active.add_log_bytes(batch_log_bytes);
+        p.active
+            .add_wal_dead(result.extent_id, batch_log_bytes.saturating_sub(vp_value_bytes));
+
+        p.vp_extent_id = result.extent_id;
+        p.vp_offset = result.end;
+
+        maybe_rotate(&mut p);
+    }
+    let phase3_elapsed = phase3_started_at.elapsed();
+
+    // Send replies AFTER releasing the partition borrow so a poorly-timed
+    // executor wake on the waking ps-conn can't re-enter PartitionData.
+    let mut replies = 0u64;
+    for resp in responders {
+        if resp.send_ok() {
+            replies += 1;
+        }
+    }
+
+    Ok(BatchStats {
+        ops: batch_ops,
+        replies,
+        batch_size: batch_ops,
+        phase1_ns: bd.phase1_ns,
+        phase2_ns: duration_to_ns(phase2_elapsed),
+        phase3_ns: duration_to_ns(phase3_elapsed),
+        end_to_end_ns: duration_to_ns(bd.picked_at.elapsed()),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Compaction
+// ---------------------------------------------------------------------------
+
+/// A major compaction covered `settled` deletes: take them off
+/// `unsettled_deletes`. Saturating, because a partition reopened while one ran
+/// re-seeds the counter from its replayed memtable.
+pub(crate) fn settle_deletes(metrics: &crate::PartitionMetrics, settled: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    metrics
+        .unsettled_deletes
+        .try_update(Relaxed, Relaxed, |n| Some(n.saturating_sub(settled)))
+        .expect("the update closure never declines");
+}
+
+/// snapshot how many SSTable bytes compaction has pending.
+/// `has_overlap == 1` means major compaction is mandated and will rewrite
+/// every table — so the answer is total SST bytes. Otherwise it is the minor
+/// window `select_minor` picks now. Cheap (no I/O, no borrow_mut on Memtable).
+pub(crate) fn compute_pending_compaction_bytes(part: &Rc<RefCell<PartitionData>>) -> u64 {
+    let p = part.borrow();
+    let tbls = p.tables.clone();
+    let overlap = p.has_overlap.get();
+    drop(p);
+    if overlap == 1 {
+        return tbls.iter().map(|t| t.estimated_size).sum();
+    }
+    minor_window_bytes(&tbls)
+}
+
+fn minor_window_bytes(tables: &[TableMeta]) -> u64 {
+    pick_minor(tables).map_or(0, |pick| tables[pick.window].iter().map(|t| t.estimated_size).sum())
+}
+
+/// `select_minor` with the current policy; tables of 0.6 × the output cap or
+/// more stay out of windows (see there).
+fn pick_minor(tables: &[TableMeta]) -> Option<crate::compact_policy::MinorPick> {
+    crate::compact_policy::select_minor(
+        tables,
+        &crate::compact_policy::minor_policy(),
+        crate::max_sst_bytes() / 5 * 3,
+    )
+}
+
+/// Queue a minor compaction when `select_minor` finds a window (after a
+/// flush commits, and on the tick). Returns whether one was queued.
+pub(crate) fn request_minor_compaction(
+    part: &Rc<RefCell<PartitionData>>,
+    trigger: MinorTrigger,
+) -> bool {
+    let found = pick_minor(&part.borrow().tables).is_some();
+    found && send_minor(part, trigger)
+}
+
+fn send_minor(part: &Rc<RefCell<PartitionData>>, trigger: MinorTrigger) -> bool {
+    if MINOR_COMPACTION_PAUSED.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
+    let mut tx = part.borrow().compact_tx.clone();
+    match tx.try_send(CompactTask::Minor(trigger)) {
+        Ok(()) => true,
+        // Each clone brings its own slot, so this is not Full in practice
+        // (queued tasks collapse when the loop drains them). Disconnected:
+        // the partition is closing.
+        Err(_) => false,
+    }
+}
+
+/// Probe the row stream's head extent and queue a reclaim when its live
+/// tables are a small share of it. Detached: `get_stream_info` /
+/// `get_extent_info` are manager RPCs and must not stall the maintenance task.
+fn spawn_reclaim_probe(
+    part: &Rc<RefCell<PartitionData>>,
+    part_id: u64,
+    inflight: Rc<Cell<bool>>,
+) {
+    let (sc, row_stream_id) = {
+        let p = part.borrow();
+        (p.stream_client.clone(), p.row_stream_id)
+    };
+    let weak = Rc::downgrade(part);
+    inflight.set(true);
+    compio::runtime::spawn(async move {
+        match row_head_seal(&sc, row_stream_id).await {
+            Ok(Some((extent_id, sealed_len))) => {
+                if let Some(part) = weak.upgrade() {
+                    let found = crate::compact_policy::select_reclaim(
+                        &part.borrow().tables,
+                        extent_id,
+                        sealed_len,
+                        crate::compact_policy::minor_policy().max_files,
+                    )
+                    .is_some();
+                    if found {
+                        send_minor(&part, MinorTrigger::Reclaim { extent_id, sealed_len });
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(e) => tracing::warn!(part_id, "row stream reclaim probe: {e:#}"),
+        }
+        inflight.set(false);
+    })
+    .detach();
+}
+
+/// The row stream's first extent and its sealed length, unless it is the tail.
+async fn row_head_seal(sc: &StreamClient, row_stream_id: u64) -> Result<Option<(u64, u64)>> {
+    let ids = sc.get_stream_info(row_stream_id).await?.extent_ids;
+    let [head, _, ..] = ids.as_slice() else {
+        return Ok(None);
+    };
+    let mut info = sc.get_extent_info(*head).await?;
+    if !info.sealed {
+        // Cached while it was the tail (SST reads fetch it); every extent but
+        // the stream's last is sealed, so ask the manager again.
+        sc.invalidate_extent_cache(*head);
+        info = sc.get_extent_info(*head).await?;
+    }
+    Ok(info.sealed.then_some((*head, info.sealed_length)))
+}
+
+/// Run one minor compaction. The window is chosen under the gate: until it is
+/// released only a flush changes the table list, and a flush appends, so the
+/// window stays a contiguous run of the list `do_compact` splices into. It
+/// stamps no `last_compact_at`: that is the manager's cooldown input for the
+/// major advisories, and minors run after every few flushes.
+async fn run_minor_compaction(
+    part: &Rc<RefCell<PartitionData>>,
+    part_id: u64,
+    trigger: MinorTrigger,
+    maintenance_gate: &Arc<crate::CompactionGate>,
+    concurrency_ctrl: &Arc<crate::ConcurrencyController>,
+) {
+    use std::sync::atomic::Ordering::Relaxed;
+    // Frozen for split/merge: the next flush or tick asks again once the
+    // freeze clears.
+    if is_frozen_for_maintenance(part) {
+        return;
+    }
+    let metrics = part.borrow().metrics.clone();
+    metrics.compact_inflight.store(1, Relaxed);
+    let _gate = maintenance_gate.acquire().await;
+    let _permit = concurrency_ctrl.acquire_compact().await;
+    if !is_frozen_for_maintenance(part) {
+        let tables = part.borrow().tables.clone();
+        let policy = crate::compact_policy::minor_policy();
+        let pick = match trigger {
+            MinorTrigger::Reclaim { extent_id, sealed_len } => {
+                crate::compact_policy::select_reclaim(&tables, extent_id, sealed_len, policy.max_files)
+                    .map(|w| (w, MinorCause::Reclaim))
+            }
+            MinorTrigger::Flush | MinorTrigger::Tick => {
+                pick_minor(&tables).map(|p| {
+                    let why = match (p.forced, trigger) {
+                        (true, _) => MinorCause::Blocking,
+                        (false, MinorTrigger::Flush) => MinorCause::Flush,
+                        (false, _) => MinorCause::Tick,
+                    };
+                    (p.window, why)
+                })
+            }
+        };
+        if let Some((window, why)) = pick {
+            let input_bytes: u64 = tables[window.clone()].iter().map(|t| t.estimated_size).sum();
+            match do_compact(part, tables[window.clone()].to_vec(), false, 0).await {
+                Ok(s) => {
+                    let runs = match trigger {
+                        MinorTrigger::Flush => &MINOR_RUNS_FLUSH,
+                        MinorTrigger::Tick => &MINOR_RUNS_TICK,
+                        MinorTrigger::Reclaim { .. } => &MINOR_RUNS_RECLAIM,
+                    };
+                    runs.fetch_add(1, Relaxed);
+                    metrics.record_minor_compaction(why);
+                    tracing::info!(
+                        part_id,
+                        trigger = why.name(),
+                        ?window,
+                        tables_before = tables.len(),
+                        input = crate::human_size(input_bytes),
+                        output = crate::human_size(s.output_bytes),
+                        "minor compaction: {} → {} tables, kept={}, discarded={}",
+                        s.input_tables,
+                        s.output_tables,
+                        s.entries_kept,
+                        s.entries_discarded,
+                    );
+                    if let Err(e) = truncate_unreferenced_row_prefix(part, part_id).await {
+                        tracing::warn!(part_id, "minor compaction: row stream truncate: {e:#}");
+                    }
+                }
+                Err(e) => tracing::error!(part_id, trigger = why.name(), "minor compaction: {e:#}"),
+            }
+        }
+    }
+    metrics
+        .pending_compaction_bytes
+        .store(compute_pending_compaction_bytes(part), Relaxed);
+    refresh_metrics(part);
+    metrics.compact_inflight.store(0, Relaxed);
+}
+
+/// refresh the per-partition dead-data + minor-compact-debt
+/// gauges. Called at the same points as `compute_pending_compaction_bytes`
+/// (every compact tick) AND after flush completes (tables change).
+///
+/// Approximations:
+/// - `sst_expired_bytes`: Σ `estimated_size` for tables whose paired
+///   `SstReader.min_expires_at` is non-zero and `<= now`. Conservative
+///   upper bound (counts whole SST, not just expired entries; tightening
+///   needs an on-disk aggregate change deferred to a future stage).
+/// - `sst_out_of_range_bytes`: Σ `estimated_size` of all tables when
+///   `has_overlap == 1` (post-split CoW-shared SSTs); 0 otherwise. Same
+///   conservative shape as `pending_compaction_bytes`'s overlap branch.
+/// - `minor_compact_pending_bytes`: Σ `estimated_size` of
+///   the `select_minor` window when `has_overlap == 0`. 0 when overlap is
+///   set (a major would run instead, accounted for in
+///   `pending_compaction_bytes`).
+/// - `sst_tombstone_bytes`: left at 0. The MetaBlock counts tombstones
+///   (`num_deletions`, which the deletion trigger uses) but not their
+///   bytes; bytes would mean scanning every block on the refresh path. The
+///   advisory layer treats 0 as "no signal" for this dimension.
+/// - `sealed_log_extent_count`: left at 0. The PS doesn't keep a
+///   cached log-stream extent count without an RPC; future stages
+///   can plumb this from the GC loop's `get_stream_info` call.
+pub(crate) fn refresh_metrics(part: &Rc<RefCell<PartitionData>>) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let now = crate::now_secs();
+
+    let (tbls, readers, overlap, metrics) = {
+        let p = part.borrow();
+        (
+            p.tables.clone(),
+            p.sst_readers.clone(),
+            p.has_overlap.get(),
+            p.metrics.clone(),
+        )
+    };
+
+    // `tables` and `sst_readers` are aligned by index by construction
+    // (see partition-server/CLAUDE.md programming note 7). zip is safe.
+    let sst_expired: u64 = tbls
+        .iter()
+        .zip(readers.iter())
+        .filter(|(_, r)| r.min_expires_at > 0 && r.min_expires_at <= now)
+        .map(|(t, _)| t.estimated_size)
+        .sum();
+    metrics.sst_expired_bytes.store(sst_expired, Relaxed);
+
+    let sst_oor: u64 = if overlap == 1 {
+        tbls.iter().map(|t| t.estimated_size).sum()
+    } else {
+        0
+    };
+    metrics.sst_out_of_range_bytes.store(sst_oor, Relaxed);
+
+    let minor_pending: u64 = if overlap == 0 {
+        minor_window_bytes(&tbls)
+    } else {
+        0
+    };
+    metrics
+        .minor_compact_pending_bytes
+        .store(minor_pending, Relaxed);
+
+    // sst_tombstone_bytes + sealed_log_extent_count: deferred. The
+    // advisory layer treats 0 in these dimensions as "no signal".
+}
+
+/// The row-stream extent to truncate before: the first one, in STREAM order,
+/// that must be kept — one a live table sits in, or the floor of a queued
+/// flush. Everything ahead of it holds no SST anyone will read. `None` =
+/// nothing to drop. With nothing to keep, only the tail stays.
+///
+/// This is the only sound basis. The truncate point used to come from the
+/// table list's ORDER (the head extent, or the last input's extent), which is
+/// not stream order: a minor compaction's output is listed by its `last_seq`
+/// but is written to the newest extent, and a merged partition interleaves
+/// both sources' tables. The row stream was then cut past extents live
+/// tables still referenced; the manager deleted them, and the partition could
+/// not reopen from its checkpoint (`repro_truncate_point_skips_a_still_
+/// referenced_extent`).
+pub(crate) fn row_truncate_point(
+    row_extent_ids: &[u64],
+    keep_extents: &HashSet<u64>,
+) -> Option<u64> {
+    let cut = if keep_extents.is_empty() {
+        row_extent_ids.len().checked_sub(1)?
+    } else {
+        // A kept extent missing from the stream is already damage; cutting on
+        // the strength of the rest could only add to it.
+        if !keep_extents.iter().all(|e| row_extent_ids.contains(e)) {
+            return None;
+        }
+        row_extent_ids.iter().position(|e| keep_extents.contains(e))?
+    };
+    (cut > 0).then(|| row_extent_ids[cut])
+}
+
+/// The row extents a truncate must keep: every live table's, plus the floor of
+/// every queued flush (see `truncate_unreferenced_row_prefix`). `None` = a
+/// queued flush has no floor, so nothing may be cut.
+pub(crate) fn row_keep_set(
+    tables: &[TableMeta],
+    queued_floors: impl IntoIterator<Item = Option<u64>>,
+) -> Option<HashSet<u64>> {
+    let mut keep: HashSet<u64> = tables.iter().map(|t| t.extent_id).collect();
+    for floor in queued_floors {
+        keep.insert(floor?);
+    }
+    Some(keep)
+}
+
+/// Drop the row-stream prefix nothing will read (`row_truncate_point`). Runs
+/// after a compaction, whose checkpoint is already durable, and on the tick
+/// while a cut is pending: the live tables are the last checkpoint's plus any
+/// later flush, so nothing a recovery could load is dropped.
+///
+/// A queued flush may already have appended its SST to an extent the table
+/// list does not name yet (the table joins at commit), and after a roll that
+/// extent can sit ahead of every listed one. Each imm's rotation-time row floor
+/// (`PartitionData::imm_row_floors`) bounds it: the SST lands at or after that
+/// extent, so keeping it keeps the SST. An imm frozen with no table listed has
+/// no floor, and then nothing is cut this time.
+///
+/// What to keep is taken BEFORE the stream is read: a flush that commits or
+/// starts after that appends at the tail, which is never cut, and every kept
+/// extent is then certainly in the list read.
+async fn truncate_unreferenced_row_prefix(
+    part: &Rc<RefCell<PartitionData>>,
+    part_id: u64,
+) -> Result<()> {
+    // Cleared once the cut lands or there is nothing to cut; any other exit
+    // (a deferral, the manager unreachable) leaves it for the tick to retry.
+    part.borrow_mut().row_cut_deferred = true;
+    let (row_stream_id, part_sc, keep) = {
+        let p = part.borrow();
+        let floors = p.imm_row_floors.borrow();
+        let queued = p
+            .imm
+            .iter()
+            .map(|imm| floors.get(&(Arc::as_ptr(imm) as usize)).copied().flatten());
+        let Some(keep) = row_keep_set(&p.tables, queued) else {
+            return Ok(());
+        };
+        (p.row_stream_id, p.stream_client.clone(), keep)
+    };
+    let row_extent_ids = part_sc.get_stream_info(row_stream_id).await?.extent_ids;
+    let Some(cut) = row_truncate_point(&row_extent_ids, &keep) else {
+        part.borrow_mut().row_cut_deferred = false;
+        if !keep.iter().all(|e| row_extent_ids.contains(e)) {
+            tracing::error!(
+                part_id,
+                row_stream_id,
+                ?row_extent_ids,
+                "live tables reference row extents missing from the row stream; \
+                 not truncating"
+            );
+        }
+        return Ok(());
+    };
+    if let Err(e) = part_sc.truncate(row_stream_id, cut).await {
+        // Another op in flight on one of the extents: nothing preempts it.
+        // The next compaction tick cuts again, whether or not the partition
+        // takes another write.
+        if !crate::manager_says_retry_later(&e) {
+            return Err(e);
+        }
+        tracing::info!(part_id, row_stream_id, "row stream prefix cut deferred: {e}");
+        return Ok(());
+    }
+    part.borrow_mut().row_cut_deferred = false;
+    tracing::info!(
+        part_id,
+        row_stream_id,
+        before = cut,
+        "row stream: dropped the extents no live table references"
+    );
+    Ok(())
+}
+
+/// A no-op compaction publishes the current tables before retrying
+/// truncation, just as a real compaction does. Never use the live WAL tail:
+/// active/queued data may not yet be in these SSTs. The durable cursor and SST
+/// boundaries are safe floors, advanced past a sealed extent's end.
+async fn checkpoint_and_truncate_row_prefix(
+    part: &Rc<RefCell<PartitionData>>,
+    part_id: u64,
+) -> Result<()> {
+    let (sc, log_id, meta_id, publish_lock) = {
+        let p = part.borrow();
+        (
+            p.stream_client.clone(),
+            p.log_stream_id,
+            p.meta_stream_id,
+            p.publish_lock.clone(),
+        )
+    };
+    let durable = part.borrow().durable_ckpt_vp.get();
+    let log_ids = sc.get_stream_info(log_id).await?.extent_ids;
+    let publish = publish_lock.lock().await;
+    let (tables, floors, base) = {
+        let p = part.borrow();
+        let now = p.durable_ckpt_vp.get();
+        (
+            p.tables.clone(),
+            crate::snapshot_fence_floors(&p),
+            compaction_checkpoint_cursor(
+                now,
+                durable_cursor_swept(now, durable, &log_ids),
+                &p.sst_readers,
+                (0, 0),
+                &log_ids,
+            ),
+        )
+    };
+    // Under the lock: no publisher can change the tables or the cursor.
+    let seals = anchor_seals(&sc, base, &log_ids).await;
+    let vp = advance_sealed_anchor(base, &log_ids, &seals);
+    save_table_locs_raw(&sc, meta_id, &tables, vp.0, vp.1, floors).await?;
+    part.borrow().durable_ckpt_vp.set(vp);
+    drop(publish);
+    truncate_unreferenced_row_prefix(part, part_id).await
+}
+
+// streaming `do_compact`. The earlier implementation built a
+// `chunks: Vec<(Vec<IterItem>, u64)>` accumulator that materialized EVERY
+// kept entry as a cloned `IterItem { key: Vec<u8>, value: Vec<u8>, ... }`
+// (~150 B/entry for VP-path workloads). At 38 M entries per 5 GB partition
+// this Vec alone was ~6 GB; with 4 concurrent partitions that's ~24 GB of
+// pure accumulator overhead, which combined with input + output SST byte
+// buffers drove single-PS RSS into the tens of GB during
+// `compact ALL`.
+//
+// The streaming version below builds each output chunk inline within the
+// merge loop: when `current_builder` exceeds `max_chunk`, finalize and
+// append immediately, then start a fresh builder. Peak intermediate state
+// is one in-progress `SstBuilder` (≈current_chunk bytes) instead of the
+// full output materialized as IterItem clones. The Go reference
+// (Go autumn `range_partition/compaction.go`
+// `doCompact`, L257-329) uses the same pattern; the Rust port had
+// regressed to a Vec accumulator.
+//
+// Crash semantics are unchanged: `save_table_locs_raw` at the end remains
+// the single atomic commit point. Any chunks appended to row_stream
+// before that commit are orphan bytes if we crash, recoverable via the
+// pre-existing meta_stream-authoritative recovery path.
+/// route a single row_stream append through P-sst's StreamClient.
+///
+/// **Why this matters:** flush is owned by P-sst, which holds its own
+/// `StreamClient` with its own per-stream commit-tracking state. If
+/// compaction independently appends to row_stream via P-log's `part_sc`,
+/// the two clients each carry their own commit watermark. When one client's
+/// stale `commit` field hits the ExtentNode replicas, the server truncates
+/// data written by the other client (commit-protocol step 5). Result: SST
+/// bytes from one writer are silently destroyed mid-flight, surfacing later
+/// as `invalid meta_len` on PS restart.
+///
+/// The fix is to funnel ALL row_stream appends through P-sst's single
+/// StreamClient. Flush does so via `FlushReq`; compaction does so via
+/// `RowAppendReq`. P-log → P-sst hand-off is a oneshot per request, so
+/// callers see the same `AppendResult` shape as a direct append.
+///
+/// Pre-this we also kept an in-thread fallback when P-sst failed to spawn
+/// (`row_append_tx == None`, append via P-log's `part_sc`). That kept the
+/// single-writer property by accident — flush had a matching fallback, so
+/// in the spawn-failed case both writers happened to be `part_sc`. The
+/// fallback is gone: `open_partition` returns Err on P-sst spawn failure,
+/// so this function's contract is now type-level — `row_append_tx` is
+/// always live.
+///
+/// `RowAppendReq` carries no invalidate flag; the invalidate is
+/// performed as a synchronous P-log → P-sst BARRIER by `handle_split_part`
+/// before the manager seals the row_stream tail (see `RowInvalidateBarrierReq`
+/// in lib.rs). By the time `do_compact` runs, any prior split's barrier
+/// has already drained P-sst's inflight FU to zero and invalidated
+/// `sst_sc`'s stale per-stream worker cache, so `compact_row_append`'s
+/// append is guaranteed to land on a fresh, post-seal worker. No per-chunk
+/// flag-checking — the structural barrier replaces the lazy fetch-and-
+/// clear approach (the lazy form had a window where a FlushReq with
+/// `invalidate=false` could race a RowAppendReq with `invalidate=true`
+/// inside P-sst's cap=2 FuturesUnordered).
+async fn compact_row_append(
+    row_append_tx: &futures::channel::mpsc::Sender<crate::RowAppendReq>,
+    row_stream_id: u64,
+    sst_segments: Vec<Bytes>,
+    sst_crc: u32,
+) -> Result<autumn_stream::AppendResult> {
+    let (resp_tx, resp_rx) = futures::channel::oneshot::channel();
+    let req = crate::RowAppendReq {
+        sst_segments,
+        sst_crc,
+        row_stream_id,
+        resp_tx,
+    };
+    row_append_tx
+        .clone()
+        .send(req)
+        .await
+        .map_err(|_| anyhow::anyhow!("P-sst row_append channel closed"))?;
+    resp_rx
+        .await
+        .map_err(|_| anyhow::anyhow!("P-sst row_append response dropped"))?
+}
+
+/// Finalize one compaction-output chunk: build the SST bytes off the compio
+/// runtime, account the per-partition compact rate, append to row_stream
+/// through P-sst's single writer, parse the paged SstReader (off-runtime
+/// too), and push `(TableMeta, reader)` into `new_readers`. Returns the
+/// chunk's byte size. Shared by `do_compact`'s in-loop and final chunk
+/// emits — the only difference is that the final caller attaches
+/// `set_discards` to the builder before calling.
+async fn emit_compact_chunk(
+    builder: SstBuilder,
+    row_append_tx: &futures::channel::mpsc::Sender<crate::RowAppendReq>,
+    row_stream_id: u64,
+    rate_ctrl: &crate::RateController,
+    chunk_last_seq: u64,
+    new_readers: &mut Vec<(TableMeta, Arc<SstReader>)>,
+) -> Result<u64> {
+    // Finish off the compio runtime (spawn_blocking): bloom finalize, meta
+    // encode, the last block's CRC32C and the whole table's crc for the
+    // append — the same offload flush does via build_sst (note 17).
+    let sst = compio::runtime::spawn_blocking(move || builder.finish())
+        .await
+        .map_err(|_| anyhow!("compact builder finish join failed"))?;
+    let chunk_bytes = sst.len();
+    // Sleep BEFORE the append so the counter reflects "intent to write".
+    rate_ctrl.account_compact(chunk_bytes).await;
+    // Route through P-sst's StreamClient to preserve the single-writer
+    // invariant on row_stream.
+    let result = compact_row_append(row_append_tx, row_stream_id, sst.segments.clone(), sst.crc()).await?;
+    let reader = compio::runtime::spawn_blocking(move || {
+        SstReader::open_paged_from_meta(sst.meta(), result.extent_id, result.offset, result.end - result.offset)
+    })
+    .await
+    .map_err(|_| anyhow!("compact SstReader join failed"))??;
+    new_readers.push((
+        TableMeta {
+            extent_id: result.extent_id,
+            offset: result.offset,
+            len: result.end - result.offset,
+            estimated_size: chunk_bytes,
+            last_seq: chunk_last_seq,
+        },
+        Arc::new(reader),
+    ));
+    Ok(chunk_bytes)
+}
+
+// clippy false-positive: every `part.borrow()` / `borrow_mut()` here ends before
+// the following `.await`. The lint flags the borrow because awaits exist later
+// in the fn; it doesn't track the drop.
+#[allow(clippy::await_holding_refcell_ref)]
+pub(crate) async fn do_compact(
+    part: &Rc<RefCell<PartitionData>>,
+    tbls: Vec<TableMeta>,
+    major: bool,
+    op_id: u64,
+) -> Result<CompactStats> {
+    if tbls.is_empty() {
+        return Ok(CompactStats {
+            input_tables: 0,
+            output_tables: 0,
+            entries_kept: 0,
+            entries_discarded: 0,
+            output_bytes: 0,
+        });
+    }
+
+    let input_tables = tbls.len();
+    let compact_keys: HashSet<(u64, u64)> = tbls.iter().map(|t| t.loc()).collect();
+
+    let (readers, row_stream_id, meta_stream_id, rg, part_sc, part_cache, row_append_tx, rate_ctrl) = {
+        let p = part.borrow();
+        let mut rds: Vec<Arc<SstReader>> = Vec::new();
+        for t in &tbls {
+            if let Some(idx) = p.tables.iter().position(|x| x.loc() == t.loc()) {
+                rds.push(p.sst_readers[idx].clone());
+            }
+        }
+        (
+            rds,
+            p.row_stream_id,
+            p.meta_stream_id,
+            p.rg.clone(),
+            p.stream_client.clone(),
+            p.block_cache.clone(),
+            p.row_append_tx.clone(),
+            p.rate_ctrl.clone(),
+        )
+    };
+
+    if readers.is_empty() {
+        return Ok(CompactStats {
+            input_tables,
+            output_tables: 0,
+            entries_kept: 0,
+            entries_discarded: 0,
+            output_bytes: 0,
+        });
+    }
+
+    if major {
+        // The maintenance gate excludes split, and compact_inflight makes
+        // merge freeze wait. Only P-sst may seal its row writer; the barrier
+        // drains appends before rolling and admits queued flushes afterwards.
+        crate::seal_and_roll_row_tail(part)
+            .await
+            .map_err(|e| anyhow::anyhow!("major compact: roll row tail: {e:#}"))?;
+    }
+
+    // async window iteration directly over the (paged) inputs — one
+    // 8 MiB bulk read per window, cache-bypassing (scan-resistant). Replaces
+    // Stage-1's materialized_for_iteration whole-SST transient residency;
+    // peak read-side memory = inputs × one window instead of Σ input bytes.
+    // Newest first, by list position (`tbls` is in list order).
+    let readers_with_meta: Vec<(Arc<SstReader>, u64)> = readers
+        .iter()
+        .zip(tbls.iter())
+        .rev()
+        .map(|(r, t)| (r.clone(), t.last_seq))
+        .collect();
+
+    let iters: Vec<AsyncTableIterator> = readers_with_meta
+        .iter()
+        .map(|(r, _)| {
+            AsyncTableIterator::new(
+                r.clone(),
+                part_sc.clone(),
+                part_cache.clone(),
+                FetchMode::Window(crate::params().scan_read_window_bytes.get()),
+            )
+        })
+        .collect();
+    let mut merge = AsyncMergeIterator::new(iters);
+    merge.rewind().await?;
+
+    let mut discards = get_discards(&readers);
+
+    // log_extent_ids is needed by `valid_discard` to filter out discards
+    // that point at extents already truncated from log_stream. Fetch it
+    // once up front (cheap — one StreamInfo RPC).
+    let log_stream_id = part.borrow().log_stream_id;
+    // `log_extent_ids` is load-bearing for the output vp_head below, so a fetch
+    // failure MUST NOT be swallowed into an empty list: an empty list
+    // makes `compaction_output_vp_head` fall back to `(0, 0)`, and recovery then
+    // takes the whole-log fallback (`chosen_pos == usize::MAX`) → a slow open on
+    // every recovery, and before that fallback existed, silent loss of the
+    // acked-but-un-flushed WAL tail. Abort the
+    // compaction instead — this is BEFORE any row_stream append, so nothing is
+    // half-published; the maintenance loop retries next tick.
+    let log_extent_ids = part_sc.get_stream_info(log_stream_id).await?.extent_ids;
+
+    // The output SSTs' vp_head (recovery replay-start) = MAX over the INPUT
+    // SSTs' vp_heads by stream position (the newest input's content boundary) —
+    // NOT the live write cursor `p.vp_*`. The live cursor sits past the
+    // acked-but-un-flushed tail → those writes fall outside the replay window
+    // and are lost on crash. MAX advances the floor for GC while staying behind
+    // the un-flushed tail. See `compaction_output_vp_head` + regressions
+    // `system_compact_unflushed_vp_head` / `system_gc_multiversion_same_extent`.
+    let (compact_vp_eid, compact_vp_off) = compaction_output_vp_head(
+        readers.iter().map(|r| (r.vp_extent_id, r.vp_offset)),
+        &log_extent_ids,
+    );
+
+    // A major's inputs are every table, so behind their boundary the bytes it
+    // does not keep alive are dead — including ones no write ever counted
+    // (`wal_dead` arrived after inline WAL did). Replaces the running sums.
+    let recount = if major {
+        recount_extents(&part_sc, (compact_vp_eid, compact_vp_off), &log_extent_ids).await
+    } else {
+        HashMap::new()
+    };
+    let mut recount_live: HashMap<u64, u64> = HashMap::new();
+
+    let now = now_secs();
+    let max_chunk = crate::max_sst_bytes() as usize;
+
+    // yield to other tasks on this compio runtime every
+    // COMPACT_YIELD_EVERY entries. Formerly the merge loop ran up to
+    // `max_chunk = 512 MiB` of entries inline (~16M entries, ~1-2s of
+    // CPU) before the chunk-emit `await` released the event loop —
+    // long enough to stall client puts/gets to the same partition
+    // for the entire duration. Heartbeat lives on PS-main (different
+    // runtime) so it wasn't lost, but the thread-per-core principle
+    // was violated. The yield cost is negligible (one poll
+    // round-trip per 1000 entries, which is <1 µs amortised against
+    // ~100ns of per-entry encode work).
+    const COMPACT_YIELD_EVERY: usize = 1000;
+    let mut entries_since_yield: usize = 0;
+
+    // Streaming output state. `current_builder` accumulates the in-progress
+    // chunk; when its byte budget is exceeded we finalize, append to
+    // row_stream, push (TableMeta, Arc<SstReader>) into new_readers, and
+    // start a fresh builder.
+    let chunk_keys = compaction_chunk_keys(
+        readers.iter().map(|r| r.num_entries).sum(),
+        tbls.iter().map(|t| t.len).sum(),
+        max_chunk as u64,
+    );
+    let mut current_builder = SstBuilder::new(compact_vp_eid, compact_vp_off, chunk_keys);
+    let mut chunk_last_seq: u64 = 0;
+    let mut prev_user_key: Option<Vec<u8>> = None;
+    let mut entries_kept = 0usize;
+    let mut entries_discarded = 0usize;
+    let mut output_bytes = 0u64;
+    let mut new_readers: Vec<(TableMeta, Arc<SstReader>)> = Vec::new();
+
+    // Sampling cadence for the progress report below. Blocks, not entries, are
+    // what a merge advances in, so a few thousand entries is far less than one
+    // block on any realistic value size — the sample is cheap and the number it
+    // publishes only changes at block boundaries anyway.
+    const PROGRESS_SAMPLE_ENTRIES: u64 = 4096;
+    // Primed so the FIRST entry publishes. That sample is `(0, total)`, which
+    // is what tells an operator the denominator — waiting 4096 entries to
+    // reveal how big the job is defeats the point of reporting at all.
+    let mut since_progress = PROGRESS_SAMPLE_ENTRIES;
+
+    while merge.valid() {
+        // Publish how much of the input the merge has consumed, in SST data
+        // blocks. Both terms are already in memory, so this costs no I/O.
+        since_progress += 1;
+        if since_progress >= PROGRESS_SAMPLE_ENTRIES {
+            since_progress = 0;
+            let (done, total) = merge.block_progress();
+            part.borrow().metrics.set_maintenance_progress(
+                op_id,
+                manager_rpc::OP_KIND_COMPACT,
+                done,
+                total,
+            );
+            if COMPACTION_HOLD.load(std::sync::atomic::Ordering::Relaxed) {
+                COMPACTION_HELD.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            while COMPACTION_HOLD.load(std::sync::atomic::Ordering::Relaxed) {
+                compio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        }
+        // Snapshot the current item's needed fields. We can't hold the
+        // `&IterItem` borrow across `merge.next()` (mutable borrow), and
+        // an intermediate chunk emit is async, so copy out.
+        let (raw_key, raw_op, raw_value, raw_expires) = {
+            let item = match merge.item() {
+                Some(i) => i,
+                None => break,
+            };
+            (
+                item.key.clone(),
+                item.op,
+                item.value.clone(),
+                item.expires_at,
+            )
+        };
+        // a block-read failure aborts the compaction (Err) — the old
+        // sync iterator silently went invalid on error, which would have
+        // TRUNCATED the merge output once reads became network-backed.
+        merge.next().await?;
+        let raw_ts = parse_ts(&raw_key);
+
+        let user_key = parse_key(&raw_key).to_vec();
+        if prev_user_key.as_deref() == Some(&user_key) {
+            bump_discards_for_dropped_entry(&mut discards, raw_op, &raw_value);
+            entries_discarded += 1;
+            continue;
+        }
+        prev_user_key = Some(user_key);
+
+        if !in_range(&rg, prev_user_key.as_ref().unwrap()) {
+            bump_discards_for_dropped_entry(&mut discards, raw_op, &raw_value);
+            entries_discarded += 1;
+            continue;
+        }
+
+        if major {
+            if raw_op == crate::OP_TOMBSTONE {
+                bump_discards_for_dropped_entry(&mut discards, raw_op, &raw_value);
+                entries_discarded += 1;
+                continue;
+            }
+            if raw_expires > 0 && raw_expires <= now {
+                bump_discards_for_dropped_entry(&mut discards, raw_op, &raw_value);
+                entries_discarded += 1;
+                continue;
+            }
+        }
+
+        // Cut on encoded bytes — the unit minor selection measures tables in
+        // (`TableMeta.len`); `sst_entry_bytes` approximates this entry's
+        // encoding (over by its shared prefix, so a cut comes slightly early).
+        let entry_size = crate::sst_entry_bytes(raw_key.len(), raw_value.len());
+        if current_builder.encoded_len() + entry_size as u64 > max_chunk as u64
+            && !current_builder.is_empty()
+        {
+            // Finalize this chunk inline. Intermediate chunks carry NO
+            // discards; only the final chunk after the loop attaches the
+            // aggregated discard map (matches the earlier behaviour where
+            // `last_chunk_idx` was the only chunk to call set_discards).
+            let builder = std::mem::replace(
+                &mut current_builder,
+                SstBuilder::new(compact_vp_eid, compact_vp_off, chunk_keys),
+            );
+            output_bytes += emit_compact_chunk(
+                builder,
+                &row_append_tx,
+                row_stream_id,
+                &rate_ctrl,
+                chunk_last_seq,
+                &mut new_readers,
+            )
+            .await?;
+            chunk_last_seq = 0;
+        }
+        // After the emit: this entry belongs to the next chunk.
+        if raw_ts > chunk_last_seq {
+            chunk_last_seq = raw_ts;
+        }
+
+        if raw_op & OP_VALUE_POINTER != 0 && raw_value.len() >= VALUE_POINTER_SIZE {
+            let vp = ValuePointer::decode(&raw_value);
+            if recount.contains_key(&vp.extent_id) {
+                *recount_live.entry(vp.extent_id).or_insert(0) += vp.len;
+            }
+        }
+        current_builder.add(&raw_key, raw_op, &raw_value, raw_expires);
+        entries_kept += 1;
+
+        // cooperative yield to keep the compio runtime responsive
+        // for other tasks (partition_loop, ps-conn, etc.).
+        entries_since_yield += 1;
+        if entries_since_yield >= COMPACT_YIELD_EVERY {
+            yield_to_runtime().await;
+            entries_since_yield = 0;
+        }
+    }
+
+    valid_discard(&mut discards, &log_extent_ids);
+    for (&eid, &sealed_length) in &recount {
+        let live = recount_live.get(&eid).copied().unwrap_or(0);
+        match sealed_length.saturating_sub(live) {
+            0 => discards.remove(&eid),
+            dead => discards.insert(eid, dead as i64),
+        };
+    }
+
+    // Final chunk: attach the aggregated discards. `discards` began as the
+    // INPUT tables' own maps, and the swap below removes those tables — so
+    // whatever does not ride out on an output SST is gone, and GC can never
+    // again learn that those bytes died. The trailing builder is empty only
+    // when no entry was kept at all (every in-loop emit is followed by adding
+    // the entry that triggered it) — a major compaction over a partition whose
+    // data was all deleted, the one whose whole log is garbage. The discards
+    // then get an SST of their own with no entries. The readers skip it — its
+    // bloom has no key and it has no block — and the overlap checks ignore it,
+    // having no key out of range.
+    //
+    // Its seq covers the inputs' newest, not just the newest entry it kept.
+    // The dropped entries were written at those seqs and may still be in the
+    // log; recovery skips log records at or below the tables' max seq and
+    // seeds the seq counter from it. Below them, a later write reuses their
+    // seqs and a whole-log replay brings an old tombstone back over it
+    // (`system_compact_seq_below_dropped`).
+    if !current_builder.is_empty() || !discards.is_empty() {
+        let input_seq = tbls.iter().map(|t| t.last_seq).max().unwrap_or(0);
+        let mut builder = std::mem::replace(
+            &mut current_builder,
+            SstBuilder::new(compact_vp_eid, compact_vp_off, chunk_keys),
+        );
+        builder.set_discards(discards.clone());
+        builder.cover_seq(input_seq);
+        output_bytes += emit_compact_chunk(
+            builder,
+            &row_append_tx,
+            row_stream_id,
+            &rate_ctrl,
+            chunk_last_seq.max(input_seq),
+            &mut new_readers,
+        )
+        .await?;
+    }
+
+    let output_tables = new_readers.len();
+
+    // Drop local input-reader Arc clones: once the partition's list drops the
+    // inputs, their SST bytes are released instead of being retained until
+    // function return.
+    drop(merge);
+    drop(readers);
+    drop(readers_with_meta);
+
+    // Publish first, then change the table list: the checkpoint names the
+    // outputs before the partition serves them, so the list in memory is never
+    // ahead of the durable checkpoint. A failed append leaves the inputs in
+    // place and the outputs as orphan bytes in the row stream (dropped by a
+    // later compaction's truncate). The lock holds every other publisher off
+    // until the list has changed; without it a flush could snapshot the list
+    // while this append is in flight and publish it without the outputs.
+    // The log may have rolled while the compaction ran; the cursor is
+    // advanced against what follows its extent now.
+    let durable = part.borrow().durable_ckpt_vp.get();
+    let publish_log_ids = part_sc.get_stream_info(log_stream_id).await?.extent_ids;
+    let publish_lock = part.borrow().publish_lock.clone();
+    let _publish = publish_lock.lock().await;
+    let (tables, sst_readers, floors_snapshot, base) = {
+        let p = part.borrow();
+        let mut tables = p.tables.clone();
+        let mut sst_readers = p.sst_readers.clone();
+        splice_compaction_outputs(&mut tables, &mut sst_readers, &compact_keys, new_readers)?;
+        let now = p.durable_ckpt_vp.get();
+        let base = compaction_checkpoint_cursor(
+            now,
+            durable_cursor_swept(now, durable, &publish_log_ids),
+            &sst_readers,
+            (compact_vp_eid, compact_vp_off),
+            &publish_log_ids,
+        );
+        (tables, sst_readers, crate::snapshot_fence_floors(&p), base)
+    };
+    // Under the lock: no publisher can change the tables or the cursor.
+    let seals = anchor_seals(&part_sc, base, &publish_log_ids).await;
+    let (ckpt_vp_eid, ckpt_vp_off) = advance_sealed_anchor(base, &publish_log_ids, &seals);
+    if COMPACT_CHECKPOINT_FAIL.swap(false, std::sync::atomic::Ordering::Relaxed) {
+        return Err(anyhow::anyhow!("compaction checkpoint: test failpoint"));
+    }
+    save_table_locs_raw(
+        &part_sc,
+        meta_stream_id,
+        &tables,
+        ckpt_vp_eid,
+        ckpt_vp_off,
+        floors_snapshot,
+    )
+    .await?;
+    {
+        let mut p = part.borrow_mut();
+        p.tables = tables;
+        p.sst_readers = sst_readers;
+        p.durable_ckpt_vp.set((ckpt_vp_eid, ckpt_vp_off));
+        p.metrics.record_compaction(major, output_bytes);
+        p.publish_lsm_gauges();
+    }
+    Ok(CompactStats {
+        input_tables,
+        output_tables,
+        entries_kept,
+        entries_discarded,
+        output_bytes,
+    })
+}
+
+/// Put a compaction's outputs where its inputs were. The inputs must be one
+/// contiguous run of the list: list order is every key's recency order, so
+/// the outputs then stay newer than every table before the run and older than
+/// every table after it — including a flush that committed during the
+/// compaction (it appended at the end). Placing outputs by `last_seq` broke
+/// after a merge: the sources' seq counters are independent, and an output
+/// whose seq came from the other side tied the next table of its own side and
+/// sorted after it (`system_merge_minor_tie_order`). Appending at the end broke
+/// on that concurrent flush (the chaos fence+flush data-loss bug).
+pub(crate) fn splice_compaction_outputs(
+    tables: &mut Vec<TableMeta>,
+    sst_readers: &mut Vec<Arc<SstReader>>,
+    inputs: &HashSet<(u64, u64)>,
+    outputs: Vec<(TableMeta, Arc<SstReader>)>,
+) -> Result<()> {
+    let positions: Vec<usize> = tables
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| inputs.contains(&t.loc()))
+        .map(|(i, _)| i)
+        .collect();
+    let (Some(&first), Some(&last)) = (positions.first(), positions.last()) else {
+        anyhow::bail!("compaction inputs are no longer listed");
+    };
+    if positions.len() != inputs.len() || last + 1 - first != positions.len() {
+        anyhow::bail!(
+            "compaction inputs are not one contiguous run of the table list \
+             (listed at {positions:?}, {} inputs)",
+            inputs.len()
+        );
+    }
+    let (metas, readers): (Vec<TableMeta>, Vec<Arc<SstReader>>) = outputs.into_iter().unzip();
+    tables.splice(first..=last, metas);
+    sst_readers.splice(first..=last, readers);
+    Ok(())
+}
+
+/// classify a `run_gc` failure into a cooldown duration. Scans
+/// the anyhow chain for sentinel substrings used by recoverable
+/// cooperative races: `"precondition failed"` (from
+/// `AppError::Precondition` Display — manager rejects punch_holes
+/// while `ec_conversion_inflight`) and `"eversion
+/// mismatch"` (from autumn-stream's private `EversionStale` sentinel
+/// — stale `extent_info_cache` after an EC bump). Soft cooldown lets
+/// these recover in ~30 s; hard cooldown applies to anything else
+/// (timeouts, irrecoverable EC shard shortage, etc.).
+pub(crate) fn classify_gc_failure_cooldown(
+    e: &anyhow::Error,
+    soft: Duration,
+    hard: Duration,
+) -> Duration {
+    let recoverable = e.chain().any(|cause| {
+        let msg = cause.to_string();
+        msg.contains("precondition failed") || msg.contains("eversion mismatch")
+    });
+    if recoverable {
+        soft
+    } else {
+        hard
+    }
+}
+
+pub(crate) fn get_discards(readers: &[Arc<SstReader>]) -> HashMap<u64, i64> {
+    let mut out: HashMap<u64, i64> = HashMap::new();
+    for r in readers {
+        for (&eid, &sz) in &r.discards {
+            *out.entry(eid).or_insert(0) += sz;
+        }
+    }
+    out
+}
+
+/// The debt gauge's value for one refresh, given whatever the last selection
+/// pass resolved.
+///
+/// With a basis, this is `collectable_debt` — the same predicate selection
+/// judges by. Without one (no dispatch yet this process), it falls back to the
+/// raw sum of every dead byte, which OVER-reports: the safe direction, since it
+/// can only ask for work that may not qualify, never silence work that does.
+///
+/// It exists as its own function because the idle refresh tick re-arms every
+/// 5-7 s and overwrites whatever selection stored, so this is what the advisory
+/// actually reads almost all the time.
+pub(crate) fn gc_debt_from_basis(discards: &HashMap<u64, i64>, basis: Option<&GcDebtBasis>) -> u64 {
+    match basis {
+        Some((resolved, policy)) => {
+            // Re-derive the stream-debt relaxation HERE rather than storing a
+            // pre-halved ratio: whether the stream is over its debt high-water
+            // is a FACT about live dead bytes, and freezing one dispatch's
+            // answer to it makes the gauge go on reporting a relaxation that
+            // has since turned off (or miss one that has since turned on).
+            let stream_dead: u64 = discards.values().map(|v| (*v).max(0) as u64).sum();
+            let ratio = if policy.stream_debt.is_some_and(|hw| stream_dead >= hw) {
+                policy.ratio_base * 0.5
+            } else {
+                policy.ratio_base
+            };
+            collectable_debt(discards, resolved, ratio, policy.floor)
+        }
+        None => discards.values().map(|v| (*v).max(0) as u64).sum(),
+    }
+}
+
+/// The QUESTION the debt gauge asks — never one dispatch's ANSWER to it.
+///
+/// `stream_debt` is kept here instead of a pre-halved ratio on purpose: the
+/// halving is a fact about how much is dead RIGHT NOW, so it is re-derived on
+/// every read (`gc_debt_from_basis`). Storing the halved value froze a live
+/// fact into standing policy.
+#[derive(Clone, Debug)]
+pub(crate) struct GcDebtPolicy {
+    /// the un-halved per-extent ratio gate (`--gc-discard-ratio` unless the
+    /// dispatch overrode it).
+    pub ratio_base: f64,
+    /// stream-level dead-byte high-water that halves `ratio_base`.
+    pub stream_debt: Option<u64>,
+    /// per-extent absolute dead-byte floor; shares its source with the
+    /// advisory's `gc_debt_high` so both ends ask the same question.
+    pub floor: Option<u64>,
+}
+
+/// What the debt gauge answers from: the extent FACTS a selection pass
+/// resolved (`extent_id -> (sealed_length, refs)`) plus the POLICY to judge
+/// them by.
+pub(crate) type GcDebtBasis = (HashMap<u64, (u64, u64)>, GcDebtPolicy);
+
+/// Fold a finished selection pass into the gauge's basis.
+///
+/// The two halves have different lifetimes and that distinction is the whole
+/// point. `resolved` is a fact about the world — an extent's sealed length is
+/// immutable and its refs are what they are — so every pass adopts what it
+/// just learned. The policy is the QUESTION the gauge asks, and only a pass
+/// the manager marked `gc_policy_is_standing` may set it.
+///
+/// That signal has to be EXPLICIT, because nothing about the params
+/// distinguishes the controller from an operator: a bare `autumn-op gc PART`
+/// names no knobs, while `--ratio 0.9 --dead-bytes 100G` carries a perfectly
+/// real floor. Two earlier rules were both forgeable — publish
+/// unconditionally, then publish whenever a floor was present — and each let
+/// one manual command permanently redefine the gauge: the idle tick re-answers
+/// from this basis every 5-7 s, so the 3 GiB pile inside a 16 GiB extent
+/// scored 0 forever, the advisory went quiet, the manager never sent the floor
+/// again, and the bytes were stranded until the partition reopened. That is
+/// the SILENT direction of the very loop this basis exists to close, and it is
+/// worse than the raw sum it replaced, which at least corrected itself within
+/// seconds.
+///
+/// With no standing policy ever received the basis stays `None` and the gauge
+/// degrades to the raw dead-byte sum — over-reporting, which can only ask for
+/// work that may not exist, never hide work that does. An override arriving
+/// before any standing pass therefore DISCARDS the facts it resolved rather
+/// than inventing a policy to pair them with; the cost is one tick of raw sum,
+/// which is the direction that cannot hide anything.
+pub(crate) fn next_gc_debt_basis(
+    prev: Option<&GcDebtBasis>,
+    resolved: HashMap<u64, (u64, u64)>,
+    policy: GcDebtPolicy,
+    defines_policy: bool,
+) -> Option<GcDebtBasis> {
+    if defines_policy {
+        return Some((resolved, policy));
+    }
+    prev.map(|(_, p)| (resolved, p.clone()))
+}
+
+/// Does GC come for this extent?
+///
+/// ONE definition, called by BOTH the selection loop and `collectable_debt`,
+/// which is the gauge the advisory fires on. They are the same question — "will
+/// GC reclaim these bytes" — and when they were two separate expressions they
+/// disagreed: the advisory fired on absolute dead bytes while selection asked
+/// for a ratio those bytes could never reach, so the policy asked every cooldown
+/// and GC answered "no eligible extents to reclaim" every time.
+///
+/// EVERY writer of `gc_debt_bytes` goes through it — the dispatch-top store,
+/// the selection pass, and the idle refresh tick — the last two via the basis
+/// selection publishes (the `store(0)` early exits aside, which mean "no sealed
+/// prefix, no debt"). The idle tick re-arms every 5-7 s and overwrites, so
+/// leaving ANY of them on a raw sum kept the loop alive for garbage spread
+/// thinly across extents: agreement has to hold at all three, not just at the
+/// one selection happens to write last.
+///
+/// `dead_bytes_high: Some(0)` is treated as no floor rather than "everything
+/// qualifies": a zero threshold would select every extent with a single dead
+/// byte, which is not a thing any caller means.
+///
+/// Three ways to qualify, for three different reasons:
+/// - **RATIO** — enough of the extent is dead that rewriting the remainder pays
+///   for itself. The original rule.
+/// - **ABSOLUTE** — a large enough pile is worth reclaiming even as a small
+///   fraction. 3 GiB dead inside a 16 GiB extent is 0.195, under every ratio
+///   gate ever configured here, and it is still 3 GiB. `dead_bytes_high` shares
+///   its source with the advisory's `gc_debt_high`, so the two ends cannot ask
+///   for different things.
+/// - **SHARED** — `refs > 1` means more than one stream holds this extent, and
+///   the FILE is freed only at `refs == 0`. Progress on it is worth more than
+///   the same bytes in a private extent, because it is what lets the extent
+///   become independently owned and eventually deleted, so the ratio bar is
+///   halved. DETERMINISTIC, not probabilistic: an operator must be able to
+///   answer "why was this not collected", and a coin flip has no answer.
+///   Note the limit — halving only helps if the sibling also collects its own
+///   reference; if it never runs, this side has paid a rewrite and `refs` stays
+///   at 1. It is a weighting, not a promise.
+///
+/// `sealed_length == 0` is NOT handled here: a sealed-empty extent is punched,
+/// never rewritten, and both callers treat it separately.
+pub(crate) fn gc_selects(
+    dead: u64,
+    sealed_length: u64,
+    refs: u64,
+    ratio_gate: f64,
+    dead_bytes_high: Option<u64>,
+) -> bool {
+    if dead == 0 || sealed_length == 0 {
+        return false;
+    }
+    if dead_bytes_high.is_some_and(|x| x > 0 && dead >= x) {
+        return true;
+    }
+    let gate = if refs > 1 { ratio_gate * 0.5 } else { ratio_gate };
+    (dead as f64 / sealed_length as f64) > gate
+}
+
+/// Dead bytes GC would actually come for, given the ratio gate it selects by.
+///
+/// `gc_debt_bytes` is what the auto-policy fires on, and its own doc calls it
+/// "Σ reclaimable bytes". Summing every dead byte made it mean something else:
+/// on a 16 GiB extent holding 3.12 GiB of garbage — ratio 0.195 against a 0.4
+/// gate, or 0.2 once the stream-debt relief halves it — the advisory fired
+/// every cooldown and GC answered "no eligible extents to reclaim" every time.
+/// The garbage was real; the promise to collect it was not.
+///
+/// `resolved` holds only the extents this pass looked up, as `(sealed_length, refs)`. One the scan
+/// never reached keeps its raw dead bytes: its collectability is unknown, and
+/// guessing zero would silence an advisory for work that does exist.
+pub(crate) fn collectable_debt(
+    discards: &HashMap<u64, i64>,
+    resolved: &HashMap<u64, (u64, u64)>,
+    effective_ratio: f64,
+    dead_bytes_high: Option<u64>,
+) -> u64 {
+    discards
+        .iter()
+        .map(|(eid, dead)| {
+            let dead = (*dead).max(0) as u64;
+            match resolved.get(eid) {
+                Some(&(len, refs)) if len > 0 => {
+                    if gc_selects(dead, len, refs, effective_ratio, dead_bytes_high) {
+                        dead
+                    } else {
+                        0
+                    }
+                }
+                // Sealed-empty: `run_gc` skips the rewrite and punches it, so
+                // whatever it holds is free to reclaim.
+                Some(_) => dead,
+                None => dead,
+            }
+        })
+        .sum()
+}
+
+pub(crate) fn valid_discard(discards: &mut HashMap<u64, i64>, extent_ids: &[u64]) {
+    let idx: HashSet<u64> = extent_ids.iter().copied().collect();
+    discards.retain(|eid, _| idx.contains(eid));
+}
+
+/// The floor GC punches by: the MIN over the live SSTs' vp_heads
+/// (`gc_replay_floor`), raised to the durable checkpoint cursor
+/// (`gc_floor_raise_to_durable_ckpt`). The debt gauges are split at the same
+/// floor, so they never count bytes the punch guard refuses.
+pub(crate) fn effective_replay_floor(
+    extent_ids: &[u64],
+    sst_vp_heads: impl IntoIterator<Item = u64>,
+    durable_vp_eid: u64,
+) -> (usize, HashMap<u64, usize>) {
+    let (floor, pos_by_eid) = gc_replay_floor(extent_ids, sst_vp_heads);
+    let floor = gc_floor_raise_to_durable_ckpt(floor, &pos_by_eid, durable_vp_eid);
+    (floor, pos_by_eid)
+}
+
+/// Keeps in `discards` only the extents strictly before the replay floor —
+/// what GC may take, the basis of `gc_debt_bytes` — and returns the dead
+/// bytes at or after it, the open tail included: `open_tail_dead_bytes`, WAL
+/// garbage GC cannot take yet. Extents gone from the stream are dropped. The
+/// two never overlap and together are every dead byte of the log. Counting
+/// the replay window as debt made the advisory dispatch a GC the punch guard
+/// then refused, every cooldown ("no eligible extents to reclaim").
+pub(crate) fn split_at_replay_floor(
+    discards: &mut HashMap<u64, i64>,
+    pos_by_eid: &HashMap<u64, usize>,
+    floor: usize,
+) -> u64 {
+    let mut protected = 0u64;
+    discards.retain(|eid, dead| match pos_by_eid.get(eid) {
+        Some(&pos) if pos < floor => true,
+        Some(_) => {
+            protected += (*dead).max(0) as u64;
+            false
+        }
+        None => false,
+    });
+    protected
+}
+
+// ---------------------------------------------------------------------------
+// GC
+// ---------------------------------------------------------------------------
+
+/// chunk size for `run_gc` streaming reads. Bounds peak GC RAM
+/// (one chunk + partial-record carry).
+///
+/// lowered the default from 64 MiB → 8 MiB after observing that a
+/// single 64 MiB EC-subrange-read against a 1 GiB sealed log_stream
+/// extent could stall extent-node 1's compio runtime for ~15 s,
+/// causing foreground put fanout against partitions sharing that node
+/// to time out at the StreamClient's 5 s ceiling. Smaller chunks keep
+/// the extent-node's read I/O slot returning often enough that
+/// foreground appends don't hit the timeout. Overridable via
+/// `--gc-read-chunk-bytes`.
+fn gc_read_chunk_bytes() -> u32 {
+    crate::params().gc_read_chunk_bytes.get()
+}
+
+/// max records per GC append batch. Defaults to 256 to match
+/// `MAX_WRITE_BATCH` on the foreground put path (`--gc-batch-records`).
+fn gc_batch_records() -> usize {
+    crate::params().gc_batch_records.get()
+}
+
+/// max bytes per GC append batch. Defaults to 4 MiB so a single
+/// `append_segments` payload is bounded regardless of how large the
+/// individual VP values are. Hit the records cap first on small VPs;
+/// hit the bytes cap first on large VPs (`--gc-batch-bytes`).
+fn gc_batch_bytes() -> usize {
+    crate::params().gc_batch_bytes.get()
+}
+
+/// GC log_stream rewrite throttle in bytes/sec. 0 = unlimited.
+/// Default 64 MiB/s — bounded headroom relative to typical foreground
+/// put traffic so GC doesn't starve client writes on the shared
+/// log_stream worker / extent-node fanout (`--gc-rate-bytes-per-sec`, a
+/// runtime parameter: read on every batch).
+fn gc_rate_bytes_per_sec() -> u64 {
+    crate::params().gc_rate_bytes_per_sec.get()
+}
+
+/// Per-record metadata kept alongside the encoded segments for memtable
+/// post-processing once `append_segments` returns the batch's offset.
+struct GcRecord {
+    user_key: Vec<u8>,
+    internal_key: Vec<u8>,
+    value_len: u32,
+    expires_at: u64,
+    /// Total bytes the record occupies in log_stream: 17 + key_len + value_len.
+    record_size: u32,
+}
+
+/// accumulates a batch of GC rewrites. Records are encoded into
+/// `segments` (alternating header+key / value Bytes per record). The
+/// per-record metadata in `pending` is consumed when the batch flushes
+/// into the memtable, walking the tail offset returned by
+/// `append_segments`.
+struct GcWriteBatch {
+    segments: Vec<autumn_transport::RegBytes>,
+    pending: Vec<GcRecord>,
+    bytes: u64,
+    record_cap: usize,
+    byte_cap: u64,
+}
+
+impl GcWriteBatch {
+    fn new() -> Self {
+        Self {
+            segments: Vec::new(),
+            pending: Vec::new(),
+            bytes: 0,
+            record_cap: gc_batch_records(),
+            byte_cap: gc_batch_bytes() as u64,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.pending.is_empty()
+    }
+
+    fn is_full(&self) -> bool {
+        self.pending.len() >= self.record_cap || self.bytes >= self.byte_cap
+    }
+}
+
+/// simple wall-clock rate limiter. After each batch flush we add
+/// the batch's bytes to a 1-second sliding window; if cumulative bytes
+/// exceed what the budget allows for the elapsed time, sleep enough to
+/// catch up. Window resets every second to bound drift.
+struct GcRateLimiter {
+    window_start: Instant,
+    bytes_in_window: u64,
+}
+
+impl GcRateLimiter {
+    fn new() -> Self {
+        Self {
+            window_start: Instant::now(),
+            bytes_in_window: 0,
+        }
+    }
+
+    fn account(&mut self, bytes: u64) -> Option<Duration> {
+        let bytes_per_sec = gc_rate_bytes_per_sec();
+        if bytes_per_sec == 0 {
+            return None;
+        }
+        self.bytes_in_window = self.bytes_in_window.saturating_add(bytes);
+        let elapsed = self.window_start.elapsed();
+        if elapsed >= Duration::from_secs(1) {
+            // Reset window — we earned a full second's worth of budget.
+            self.window_start = Instant::now();
+            self.bytes_in_window = 0;
+            return None;
+        }
+        let target_secs = self.bytes_in_window as f64 / bytes_per_sec as f64;
+        let target = Duration::from_secs_f64(target_secs);
+        if target > elapsed {
+            Some(target - elapsed)
+        } else {
+            None
+        }
+    }
+}
+
+/// cooperative single-step yield. Lets other tasks on
+/// this compio runtime (partition_loop, ps-conn,
+/// background_flush_loop, etc.) make forward progress between
+/// long stretches of inline CPU work that would otherwise starve
+/// the event loop.
+///
+/// Pattern: `poll_fn` returns `Pending` once after waking itself, so
+/// the runtime polls all OTHER ready tasks before returning to this
+/// one. Lighter-weight than `compio::time::sleep(Duration::ZERO)`
+/// which routes through the timer wheel.
+///
+/// promoted from `gc_yield_now` (was GC-only) to a crate-private
+/// helper and now also called from `do_compact`'s merge loop every
+/// `COMPACT_YIELD_EVERY` entries (1000) — formerly the inline merge
+/// loop ran a whole output (512 MiB at the time) of entries with NO
+/// `.await`, blocking the P-log compio runtime for ~1-2 SECONDS on
+/// large compactions. Client puts/gets to the same partition stalled
+/// for that duration. Heartbeat (PS-main runtime) was unaffected —
+/// it lives on a different thread — but the thread-per-core
+/// principle ("compio runtime should NEVER block due to CPU busy")
+/// was violated. This periodic yield enforces the principle while
+/// keeping the per-yield cost tiny (one poll round-trip).
+async fn yield_to_runtime() {
+    let mut yielded = false;
+    std::future::poll_fn(|cx| {
+        if yielded {
+            std::task::Poll::Ready(())
+        } else {
+            yielded = true;
+            cx.waker().wake_by_ref();
+            std::task::Poll::Pending
+        }
+    })
+    .await
+}
+
+/// Backwards-compat alias for the historical name.
+async fn gc_yield_now() {
+    yield_to_runtime().await
+}
+
+/// Flush a non-empty `GcWriteBatch`: send all queued records as ONE
+/// `append_segments`, then walk the returned tail offset to insert the
+/// new VPs into the memtable in a single `insert_batch`. The flush is
+/// the only place GC awaits the network, so it's also the place where
+/// the rate limiter and yield run.
+async fn flush_gc_batch(
+    part: &Rc<RefCell<PartitionData>>,
+    log_stream_id: u64,
+    part_sc: &Rc<StreamClient>,
+    batch: &mut GcWriteBatch,
+    rate_limiter: &mut GcRateLimiter,
+    rate_ctrl: &std::sync::Arc<crate::RateController>,
+    moved: &mut usize,
+) -> Result<()> {
+    if batch.is_empty() {
+        return Ok(());
+    }
+    let segments = std::mem::take(&mut batch.segments);
+    let pending = std::mem::take(&mut batch.pending);
+    let batch_bytes = std::mem::replace(&mut batch.bytes, 0);
+    let n = pending.len();
+
+    let result = part_sc.append_segments(log_stream_id, segments).await?;
+
+    let mut cur_offset = result.offset;
+    let mut insert_items: Vec<(Vec<u8>, MemEntry, u64)> = Vec::with_capacity(n);
+    let mut vp_value_bytes = 0u64;
+    for r in pending {
+        // fix: V1 envelope adds 5 bytes (sentinel+length) before the
+        // V0 inner header, so value bytes start at +22 not +17. See
+        // `finish_write_batch` for the full layout discussion.
+        let new_vp = ValuePointer {
+            extent_id: result.extent_id,
+            offset: cur_offset + 22 + r.internal_key.len() as u64,
+            len: r.value_len as u64,
+        };
+        let mem_entry = MemEntry {
+            op: 1 | OP_VALUE_POINTER,
+            value: new_vp.encode().to_vec(),
+            expires_at: r.expires_at,
+        };
+        vp_value_bytes += r.value_len as u64;
+        let write_size = (r.user_key.len() + r.value_len as usize + 32) as u64;
+        insert_items.push((r.internal_key, mem_entry, write_size));
+        cur_offset = cur_offset.saturating_add(r.record_size as u64);
+    }
+
+    {
+        let mut p = part.borrow_mut();
+        p.vp_extent_id = result.extent_id;
+        p.vp_offset = result.end;
+        p.active.insert_batch(insert_items);
+        p.publish_lsm_gauges();
+        // BUG1: the GC multi-frag rewrite re-appends live
+        // values to log_stream and seeds them into the active memtable, so they
+        // join the un-flushed LOG window that recovery would replay. Track the
+        // appended bytes for an accurate force-rotate gap.
+        p.active.add_log_bytes(batch_bytes);
+        p.active
+            .add_wal_dead(result.extent_id, batch_bytes.saturating_sub(vp_value_bytes));
+    }
+    *moved += n;
+
+    // Cooperative yield: even if the rate limiter has no budget to
+    // burn, give partition_loop / ps-conn a turn before the
+    // next batch.
+    gc_yield_now().await;
+
+    if let Some(sleep_dur) = rate_limiter.account(batch_bytes) {
+        compio::time::sleep(sleep_dur).await;
+    }
+    // D-r7: per-partition gc rate cap (replaces the earlier bg cap).
+    rate_ctrl.account_gc(batch_bytes).await;
+
+    Ok(())
+}
+
+/// when compaction drops an entry (dedup, range filter,
+/// tombstone, expired), bump the per-extent discard counter for every
+/// log_stream byte the dropped entry was holding live.
+///
+/// Single-VP path (existing): one VP → one fragment → one extent.
+/// Multi-frag path: one mfvp → N fragments → potentially N
+/// extents. Per the full-rewrite invariant, when a multi-frag mfvp
+/// is shadowed by a newer entry (whether a fresh foreground Put or a
+/// GC rewrite), every fragment of the shadowed mfvp is truly dead —
+/// the newer entry has its own fresh fragment list. So we can blindly
+/// bump discards for every frag.
+fn bump_discards_for_dropped_entry(discards: &mut HashMap<u64, i64>, op: u8, raw_value: &[u8]) {
+    if op & OP_VALUE_POINTER != 0 && raw_value.len() >= VALUE_POINTER_SIZE {
+        let vp = ValuePointer::decode(raw_value);
+        *discards.entry(vp.extent_id).or_insert(0) += vp.len as i64;
+    }
+    // multi-frag VP discard handling deleted with the rest
+    // of the server-side multipart machinery. Stripe-write chunks are
+    // now normal Puts under reserved-namespace keys, so each chunk's
+    // single-VP discard already covers its bytes via the branch above.
+}
+
+/// Seal state gate for a GC punch decision: returns the `sealed_length` ONLY for
+/// an authoritatively-sealed extent, else `None` (skip — never GC it).
+///
+/// A GC punch is DESTRUCTIVE + irreversible, so it must NEVER fire on stale or
+/// open state. The trap: `StreamClient::alloc_new_extent` caches the NEW tail
+/// after a seal-and-roll but does NOT evict the OLD one, so a now-sealed extent
+/// can linger in `extent_info_cache` as its pre-seal OPEN snapshot
+/// (`sealed=false, sealed_length=0`). The earlier fast-punch trusted that
+/// stale `sealed_length==0` and punched a sealed extent full of live
+/// ValuePointers as if empty → silent big-value loss (chaos seed=583: extent
+/// sealed at 7.8 MB read back as stale `sealed_length=0`, punched, GET of the
+/// VP'd key returned NotFound).
+///
+/// The gate: `sealed` is IMMUTABLE once set, so a cached `sealed=true` is always
+/// trustworthy; only a `sealed=false` snapshot can be stale. We therefore SKIP
+/// any candidate that reads NOT sealed (`None`) — conservatively refusing to GC
+/// anything not authoritatively known sealed. An OPEN extent always reports
+/// `sealed_length==0` but is NOT empty (its committed length is `last_synced`,
+/// invisible here; it is the live tail or holds uncommitted data), so skipping is
+/// exactly right. A stale `sealed=false` snapshot of a genuinely-sealed extent is
+/// likewise skipped — data-safe (never punched → no loss). Every roll evicts the
+/// tail it sealed (`StreamClient::alloc_new_extent`), so the next read here
+/// fetches the sealed view.
+///
+/// We deliberately do NOT `invalidate_extent_cache` + refetch here to "freshen" a
+/// `sealed=false` read: an extra GC→manager RPC per stale candidate shifts P-log
+/// timing and (chaos seed=603) exposed a SEPARATE pre-existing split-child-open
+/// wedge. The conservative skip is data-safe with ZERO added RPCs (one
+/// `get_extent_info` per candidate, same as the pre-fix baseline). Trade-off: a
+/// stale-cached-as-open sealed extent isn't reclaimed until its cache refreshes —
+/// a GC-promptness gap, never a data-loss or correctness gap.
+///
+/// Returns `Some(sealed_length)` for a confirmed-sealed extent (incl. `0` for a
+/// genuinely sealed-empty one — safe to fast-punch). EVERY path that feeds
+/// `run_gc` / `punch_holes` (Auto candidate selection AND Force GC) goes through
+/// this, carrying the validated `(eid, sealed_length)` to execution — so there is
+/// no check/use split where a re-read could resurrect the stale value.
+async fn authoritative_sealed(part_sc: &StreamClient, eid: u64) -> Option<(u64, u64)> {
+    let info = match part_sc.get_extent_info(eid).await {
+        Ok(i) => i,
+        Err(e) => {
+            tracing::warn!("GC extent_info {eid}: {e}");
+            return None;
+        }
+    };
+    // Trust the immutable `sealed` flag; skip anything not authoritatively sealed.
+    // No invalidate+refetch (see doc: avoids the seed=603 timing regression).
+    if !info.sealed {
+        return None;
+    }
+    // `refs` rides along on the info this already fetched, at zero additional
+    // RPCs — but ONLY the seal is authoritative here. `extent_info_cache` is
+    // not invalidated by a split or by a sibling's punch, so `refs` can be a
+    // first-observation snapshot: stale-low on a split parent, stale-high on a
+    // child whose sibling already collected. That is tolerable because refs
+    // only WEIGHTS a heuristic (it halves a ratio bar); it never gates
+    // correctness, and it must never be used as if it were live.
+    Some((info.sealed_length, info.refs))
+}
+
+fn ensure_gc_scan_complete(
+    extent_id: u64,
+    scanned: u64,
+    sealed_length: u64,
+    trailing_bytes: usize,
+) -> Result<()> {
+    if scanned != sealed_length {
+        return Err(anyhow!(
+            "run_gc extent {extent_id}: scanned {scanned} of {sealed_length} bytes; refusing to punch"
+        ));
+    }
+    if trailing_bytes != 0 {
+        return Err(anyhow!(
+            "run_gc extent {extent_id}: {trailing_bytes} trailing bytes did not form a complete record; refusing to punch"
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) async fn run_gc(
+    part: &Rc<RefCell<PartitionData>>,
+    extent_id: u64,
+    sealed_length: u64,
+    op_id: u64,
+    // `OP_KIND_GC` or `OP_KIND_FORCE_GC` — the caller knows which task this
+    // is, and progress filed under the wrong kind is worse than none.
+    op_kind: u8,
+) -> Result<()> {
+    let (log_stream_id, rg, part_sc, rate_ctrl) = {
+        let p = part.borrow();
+        (
+            p.log_stream_id,
+            p.rg.clone(),
+            p.stream_client.clone(),
+            p.rate_ctrl.clone(),
+        )
+    };
+
+    // streaming: read the sealed extent in `gc_read_chunk_bytes()`
+    // slices, decoding complete records as they arrive. The partial
+    // record at the chunk tail (if any) is carried into the next chunk.
+    // This formerly slurped the whole extent into one Vec, which (a)
+    // peaked at GBs of RAM per extent with several partitions collecting at
+    // once, and (b) tripped the macOS pread INT_MAX limit (also addressed by
+    // read_bytes_from_extent chunking — the streaming read keeps memory bounded
+    // even when the read path is forced to materialise the full read).
+    //
+    // batching: rewrites accumulate into `batch` and flush via
+    // `append_segments` when the batch hits its record/byte caps.
+    // made every append durable via the per-extent coalescer
+    // (group commit), so the per-record fsync storm of the old path is
+    // structurally impossible — multiple in-flight batch appends share
+    // one coalesced fsync per wake-cycle.
+    // multi-frag VP rewrite pre-pass deleted — stripe-
+    // write chunks are now plain Puts under reserved-namespace keys, so
+    // each chunk has its OWN single-VP entry in memtable that the
+    // existing process_gc_chunk loop below correctly rewrites or skips.
+    // No special multi-frag handling needed.
+
+    let chunk_bytes = gc_read_chunk_bytes();
+    let mut moved = 0usize;
+    let mut cur: u64 = 0;
+    let mut carry: Vec<u8> = Vec::new();
+    let mut batch = GcWriteBatch::new();
+    let mut rate_limiter = GcRateLimiter::new();
+
+    while cur < sealed_length {
+        // Publish how far this extent's scan has got. Once per chunk (64 MiB by
+        // default), never per record, so the cost is one short lock per tens of
+        // MB. Bytes rather than a percentage: an operator deciding whether to
+        // wait needs the magnitude, and the consumer can divide.
+        {
+            let p = part.borrow();
+            p.metrics
+                .set_maintenance_progress(op_id, op_kind, cur, sealed_length);
+        }
+        let want = (sealed_length - cur).min(chunk_bytes as u64);
+        let (chunk, _end) = part_sc.read_bytes_from_extent(extent_id, cur, want).await?;
+        if chunk.len() as u64 != want {
+            return Err(anyhow!(
+                "run_gc extent {extent_id}: short read at {cur}: wanted {want}, got {}; refusing to punch",
+                chunk.len()
+            ));
+        }
+        let chunk_len = chunk.len() as u64;
+        // `buf` = carry (the unconsumed record-tail preceding this chunk) ++
+        // chunk, so buf[0] sits at absolute extent offset (read offset -
+        // carry.len()). `cur` is still the read offset here (incremented below).
+        let buf_base_offset = cur - carry.len() as u64;
+        cur = cur.saturating_add(chunk_len);
+
+        let buf: Bytes = if carry.is_empty() {
+            chunk
+        } else {
+            let mut b = std::mem::take(&mut carry);
+            b.extend_from_slice(&chunk);
+            Bytes::from(b)
+        };
+
+        let consumed = process_gc_chunk(
+            part,
+            log_stream_id,
+            extent_id,
+            &rg,
+            &part_sc,
+            buf_base_offset,
+            &buf,
+            &mut moved,
+            &mut batch,
+            &mut rate_limiter,
+            &rate_ctrl,
+        )
+        .await?;
+        if consumed < buf.len() {
+            carry = buf[consumed..].to_vec();
+        }
+
+        // read-side throttle: a 64 MiB chunk read against an
+        // EC-converted, replicated source extent (e.g. extent 20 with
+        // sealed_length ≈ 1 GiB) is not free — it competes with
+        // foreground put fanout on the same extent-nodes. After each
+        // chunk yield + bill the bytes against the same rate limiter
+        // we use for writes, so GC's total log-layer footprint stays
+        // bounded regardless of which side dominates.
+        gc_yield_now().await;
+        if let Some(sleep_dur) = rate_limiter.account(chunk_len) {
+            compio::time::sleep(sleep_dur).await;
+        }
+        // D-r7: per-partition gc rate cap on the read side (so
+        // GC's read pressure is throttled too, not just the write side).
+        rate_ctrl.account_gc(chunk_len).await;
+    }
+
+    ensure_gc_scan_complete(extent_id, cur, sealed_length, carry.len())?;
+
+    // Final flush: every append is made durable via the per-extent
+    // coalescer, so by the time `flush_gc_batch` returns, the moved
+    // values are durable on a quorum of replicas. punch_holes is safe
+    // to fire after this.
+    flush_gc_batch(
+        part,
+        log_stream_id,
+        &part_sc,
+        &mut batch,
+        &mut rate_limiter,
+        &rate_ctrl,
+        &mut moved,
+    )
+    .await?;
+
+    // (MED-2): try-acquire writer pin on this extent BEFORE punch_holes.
+    // If a `handle_get → resolve_value` reader is currently in-flight on this
+    // extent (rare race window — they typically complete in milliseconds),
+    // defer this extent's GC to the next 30-60 s tick rather than letting
+    // the reader return spurious NotFound bytes when the manager processes
+    // the punch_holes RPC and enqueues a physical delete.
+    let pin = part.borrow().pin_for(extent_id);
+    if !crate::try_acquire_writer_pin(&pin) {
+        tracing::info!(
+            extent_id,
+            "GC deferred — reader pin held; will retry on next gc tick"
+        );
+        return Ok(());
+    }
+    let punch_result = part_sc.punch_holes(log_stream_id, vec![extent_id]).await;
+    crate::release_writer_pin(&pin);
+    punch_result?;
+    tracing::info!("GC: punched extent {extent_id}, moved {moved} entries");
+    Ok(())
+}
+
+/// Process every complete record in `buf`, staging VP rewrites into
+/// `batch` and flushing mid-chunk when the batch fills. Returns how
+/// many bytes were consumed (always at a record boundary). The
+/// remaining `buf.len() - consumed` bytes are an incomplete record
+/// that must be carried into the next chunk.
+async fn process_gc_chunk(
+    part: &Rc<RefCell<PartitionData>>,
+    log_stream_id: u64,
+    extent_id: u64,
+    rg: &Range,
+    part_sc: &Rc<StreamClient>,
+    // Absolute offset in `extent_id` where `buf[0]` sits (carry-tail of the
+    // previous chunk ++ this chunk). Used to compute each scanned record's
+    // absolute value offset for full VP-identity liveness matching.
+    buf_base_offset: u64,
+    buf: &[u8],
+    moved: &mut usize,
+    batch: &mut GcWriteBatch,
+    rate_limiter: &mut GcRateLimiter,
+    rate_ctrl: &std::sync::Arc<crate::RateController>,
+) -> Result<usize> {
+    // decode via shared codec — handles both V0 (legacy on-disk) and V1
+    // (with CRC). On a V1 CRC failure we log + skip + continue,
+    // matching the recover_partition decoder semantics.
+    let mut cursor = 0usize;
+    while cursor < buf.len() {
+        let record_start = cursor;
+        let (op, key_owned, value_owned, expires_at, val_off) =
+            match crate::wal_record::decode_one(&buf[cursor..]) {
+                crate::wal_record::DecodeOne::Ok(r) => {
+                    let op = r.op;
+                    let key = r.key.to_vec();
+                    let value = r.value.to_vec();
+                    let expires_at = r.expires_at;
+                    let val_off = r.val_off;
+                    cursor += r.total;
+                    (op, key, value, expires_at, val_off)
+                }
+                crate::wal_record::DecodeOne::Incomplete => {
+                    // Caller carries this partial record into the next chunk.
+                    break;
+                }
+                crate::wal_record::DecodeOne::Corrupt { skip_bytes, reason } => {
+                    // WAL-FAILSTOP: a corrupt record
+                    // means we can't trust which value pointers are live in
+                    // this extent — continuing the GC scan past it could
+                    // punch_holes / reclaim data still referenced by the
+                    // corrupt (unparseable) record. Abort this GC pass loud
+                    // instead of skipping; the classify-cooldown backs it off
+                    // and recovery handles the corrupt replica.
+                    return Err(anyhow::anyhow!(
+                        "WAL-FAILSTOP: GC hit corrupt log_stream record on extent \
+                         {extent_id} at offset {record_start} ({reason}, len={skip_bytes}) — \
+                         aborting GC (refusing to punch holes past unparseable records)"
+                    ));
+                }
+            };
+        let key = key_owned.as_slice();
+        let value = value_owned.as_slice();
+        let val_len = value.len();
+        let _ = expires_at; // used downstream by GcRecord builder
+
+        // Same predicate the replay uses — see `record_carries_value_pointer`.
+        // GC relocates from this scan and then punches the extent, so a record
+        // the replay treats as a ValuePointer and this scan skips is a value
+        // destroyed while live.
+        if !crate::record_carries_value_pointer(op, val_len) {
+            continue;
+        }
+        let user_key = parse_key(key).to_vec();
+        if !in_range(rg, &user_key) {
+            continue;
+        }
+
+        // The paged-SST liveness lookup AWAITS, so the
+        // sst_readers snapshot it ran against can go STALE mid-lookup — a
+        // concurrent Put for this key can land in active AND be flushed all
+        // the way into a NEW SST within the await window, where neither the
+        // snapshot lookup nor an active/imm re-check sees it. Acting on the
+        // stale verdict would rewrite the OLD value at a fresh (higher) seq
+        // — resurrecting it over the new write. The dual hazard makes
+        // "just skip on any change" wrong too: if the old value WAS still
+        // live, skipping its rewrite and then punching the extent destroys
+        // it. So: VALIDATE the snapshot after the await (P-log is single-
+        // threaded — interleaving happens only at awaits, and there is no
+        // await between this validation, the verdict use, and the seq
+        // allocation below). If sst_readers changed, REDO the lookup
+        // against a fresh snapshot; on repeated churn, abort this extent's
+        // round (no punch — safe, retried next tick).
+        let mut lookup_attempts = 0u32;
+        let current: Option<(u8, Bytes, u64)> = loop {
+            lookup_attempts += 1;
+            if lookup_attempts > 4 {
+                return Err(anyhow::anyhow!(
+                    "gc liveness lookup: sst_readers changed on {} consecutive \
+                     attempts (heavy flush/compact churn); aborting extent round",
+                    lookup_attempts - 1
+                ));
+            }
+            let p = part.borrow();
+            let mem = p
+                .active
+                .seek_user_key(&user_key)
+                .or_else(|| p.imm.iter().rev().find_map(|m| m.seek_user_key(&user_key)))
+                .map(|e| (e.op, Bytes::from(e.value), e.expires_at));
+            if mem.is_some() {
+                break mem;
+            }
+            // paged SST lookup awaits — snapshot + drop borrow.
+            let readers: Vec<Arc<SstReader>> = p.sst_readers.to_vec();
+            let sc = p.stream_client.clone();
+            let cache = p.block_cache.clone();
+            drop(p);
+            let mut found = None;
+            for r in readers.iter().rev() {
+                // A read ERROR must abort this extent's GC
+                // round (no punch) — folding it into "miss" deleted
+                // still-referenced VP data.
+                match lookup_in_sst_via(r, &user_key, &sc, &cache).await {
+                    Ok(Some(e)) => {
+                        found = Some(e);
+                        break;
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        return Err(e.context("gc liveness lookup (paged sst)"));
+                    }
+                }
+            }
+            // Test-only sync point: hold the verdict here (SST lookup done, no
+            // borrow held) so a test can inject a seq-assigned-but-not-yet-
+            // committed Put before the post-await re-validation runs.
+            if gc_verdict_paused() {
+                GC_VERDICT_PARKED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                while gc_verdict_paused() {
+                    compio::time::sleep(std::time::Duration::from_millis(2)).await;
+                }
+            }
+            // Post-await validation under one borrow:
+            // (a) did the key appear in active/imm during the await (a
+            //     concurrent Put)? → the SST verdict is superseded; loop —
+            //     the next iteration takes the mem branch and judges
+            //     against the NEW version.
+            // (b) did sst_readers change (flush push / compact swap)? →
+            //     the snapshot lookup may have missed a newer flushed
+            //     version; loop with a fresh snapshot.
+            // There is NO await between this validation, the verdict use,
+            // and the seq allocation below (single-threaded P-log), so a
+            // verdict that passes here cannot go stale before the rewrite
+            // is staged.
+            let p = part.borrow();
+            let appeared_in_mem = p.active.seek_user_key(&user_key).is_some()
+                || p.imm
+                    .iter()
+                    .rev()
+                    .any(|m| m.seek_user_key(&user_key).is_some());
+            let snapshot_stale = crate::sst_readers_changed(&p.sst_readers, &readers);
+            drop(p);
+            if appeared_in_mem || snapshot_stale {
+                continue;
+            }
+            break found;
+        };
+
+        let Some((cur_op, cur_val, _)) = current else {
+            continue;
+        };
+        if cur_op & OP_VALUE_POINTER == 0 || cur_val.len() < VALUE_POINTER_SIZE {
+            continue;
+        }
+        // Full VP-identity liveness. The scanned record is the LIVE version of
+        // its key ONLY if the current live VP points at THIS record's exact
+        // bytes — extent_id AND absolute offset AND len. Comparing extent_id
+        // alone (the pre-fix bug) misclassifies a SUPERSEDED older version of
+        // the same key that happens to live in the same extent as "live"; GC
+        // then relocates the OLD value with a fresh (higher) seq, reviving it
+        // over the newer version and dropping the newer one on the next punch
+        // (regression: tests/system_gc_multiversion_same_extent).
+        let scanned_value_offset = buf_base_offset + record_start as u64 + val_off as u64;
+        let vp = ValuePointer::decode(&cur_val);
+        if vp.extent_id != extent_id
+            || vp.offset != scanned_value_offset
+            || vp.len != val_len as u64
+        {
+            continue;
+        }
+
+        // In-flight-write guard. The liveness lookup above sees only the
+        // memtable + SSTs, but a Put/Delete for this key can be seq-assigned
+        // (Phase 1, `start_write_batch`) yet not yet committed to the memtable
+        // (Phase 3 pending) — invisible above. Since Phase 1 already bumped
+        // `seq_number`, the relocation seq allocated below would be HIGHER than
+        // that in-flight write and shadow it (a silent lost-update,
+        // `system_gc_inflight_wal_put`); and we cannot safely `punch_holes` (the
+        // in-flight write may never commit, leaving THIS scanned value live). So
+        // ABORT this extent's GC round — no relocation, no punch. It retries next
+        // tick, by when the write has settled into the memtable where the
+        // active/imm guards above catch it. Hash key ⇒ a collision only costs a
+        // spurious abort (safe).
+        if part
+            .borrow()
+            .inflight_write_keys
+            .contains_key(&inflight_key_hash(&user_key))
+        {
+            return Err(anyhow::anyhow!(
+                "gc: key has an in-flight (seq-assigned, not-yet-committed) write \
+                 on extent {extent_id}; aborting round (retry next tick)"
+            ));
+        }
+
+        // Stage the WAL record into the batch under a brief borrow_mut
+        // (seq assignment + internal_key encode). No await happens
+        // inside the borrow.
+        // Stale-verdict protection lives in the validation loop ABOVE (the
+        // post-await active/imm + sst_readers re-check) — NOT here. A naive
+        // "skip if key present in active/imm" check at this point would be
+        // WRONG: the mem branch finds the live VP in the memtable (the
+        // normal recently-written case), and skipping its rewrite before
+        // the punch would destroy live data.
+        let internal_key = {
+            let mut p = part.borrow_mut();
+            p.seq_number += 1;
+            let seq = p.seq_number;
+            key_with_ts(&user_key, seq)
+        };
+
+        // `value` borrows the chunk read buffer, so it is copied; GC
+        // batches are bounded (`gc_batch_bytes()`), a cold path.
+        let value_bytes = Bytes::copy_from_slice(value);
+        // Mark the record as carrying a ValuePointer, matching the memtable
+        // entry this same relocation inserts. Leaving it bare made GC's own
+        // output invisible to GC's next scan.
+        let (hdr_seg, val_seg, crc_seg) = crate::wal_record::encode_v1_segments(
+            1u8 | crate::OP_VALUE_POINTER,
+            &internal_key,
+            value_bytes,
+            expires_at,
+        );
+        let record_size = (hdr_seg.len() + val_seg.len() + crc_seg.len()) as u32;
+        batch.segments.push(hdr_seg.into());
+        if !value.is_empty() {
+            batch.segments.push(val_seg.into());
+        }
+        batch.segments.push(crc_seg.into());
+        batch.bytes = batch.bytes.saturating_add(record_size as u64);
+        batch.pending.push(GcRecord {
+            user_key,
+            internal_key,
+            value_len: val_len as u32,
+            expires_at,
+            record_size,
+        });
+
+        if batch.is_full() {
+            flush_gc_batch(
+                part,
+                log_stream_id,
+                part_sc,
+                batch,
+                rate_limiter,
+                rate_ctrl,
+                moved,
+            )
+            .await?;
+        }
+    }
+    Ok(cursor)
+}
+
+// ---------------------------------------------------------------------------
+// Lookup helpers
+// ---------------------------------------------------------------------------
+
+pub(crate) fn lookup_in_memtable(mem: &Memtable, user_key: &[u8]) -> Option<(u8, Bytes, u64)> {
+    mem.seek_user_key(user_key)
+        .map(|e| (e.op, Bytes::from(e.value), e.expires_at))
+}
+
+/// diag: return the newest seq for `user_key` in this SST (or 0).
+/// Re-walks `lookup_in_sst`'s logic but returns the parsed seq instead
+/// of the value. Used only by `MSG_DIAG_TRACE_KEY`.
+///
+/// `use_bloom`: when true, mirror the real GET path (return 0 if the
+/// key range or the bloom excludes the key). When false, skip the bloom and scan anyway — so a
+/// bloom FALSE NEGATIVE (key present but bloom says absent) shows up as
+/// a divergence between the two.
+pub(crate) fn lookup_in_sst_seq_opt(reader: &SstReader, user_key: &[u8], use_bloom: bool) -> u64 {
+    if use_bloom && !reader.may_contain(user_key) {
+        return 0;
+    }
+    let target = key_with_ts(user_key, u64::MAX);
+    let block_idx = reader.find_block_for_key(&target);
+    let Ok(block) = reader.read_block(block_idx) else {
+        return 0;
+    };
+    let n = block.num_entries();
+    if n == 0 {
+        return 0;
+    }
+    let mut lo = 0usize;
+    let mut hi = n;
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let Ok(key) = block.get_key(mid) else {
+            return 0;
+        };
+        if crate::cmp_internal_keys(&key, &target).is_lt() {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    if lo < n {
+        let Ok(key) = block.get_key(lo) else {
+            return 0;
+        };
+        if parse_key(key.as_slice()) == user_key {
+            return parse_ts(key.as_slice());
+        }
+    }
+    0
+}
+
+/// diag: FULL linear scan of every block/entry for `user_key`,
+/// ignoring bloom AND `find_block_for_key`. Returns the newest (max)
+/// seq found, or 0. If this finds the key where `lookup_in_sst_seq`
+/// (binary-search-in-one-block) returns 0, the bug is in block
+/// SELECTION / lookup, not data presence.
+pub(crate) fn lookup_in_sst_seq_fullscan(reader: &SstReader, user_key: &[u8]) -> u64 {
+    let mut best = 0u64;
+    for bi in 0..reader.block_count() {
+        let Ok(block) = reader.read_block(bi) else {
+            continue;
+        };
+        for ei in 0..block.num_entries() {
+            let Ok(key) = block.get_key(ei) else {
+                continue;
+            };
+            if parse_key(key.as_slice()) == user_key {
+                let ts = parse_ts(key.as_slice());
+                if ts > best {
+                    best = ts;
+                }
+            }
+        }
+    }
+    best
+}
+
+/// async point lookup that works for paged AND resident readers —
+/// exact mirror of `lookup_in_sst` (incl. the next-block hop), with
+/// block reads going through `read_block_via` (bounded global cache; miss
+/// fetched from row_stream). MUST be called with NO RefCell borrow held
+/// (note 15) — callers snapshot Arc<SstReader>s first.
+/// Errors are PROPAGATED, never folded into "miss": a paged
+/// block read is a fallible network read — treating a transient failure
+/// as "key absent" let GC punch extents whose VPs were still live, and
+/// let GET return a false NotFound. `Ok(None)` strictly means "definitely
+/// not in this SST".
+pub(crate) async fn lookup_in_sst_via(
+    reader: &SstReader,
+    user_key: &[u8],
+    sc: &Rc<StreamClient>,
+    cache: &crate::sstable::BlockCache,
+) -> Result<Option<(u8, Bytes, u64)>> {
+    if !reader.may_contain(user_key) {
+        return Ok(None);
+    }
+    read_sst_entry_via(reader, user_key, sc, cache).await
+}
+
+/// `lookup_in_sst_via` past its `may_contain` check: reads the key's block.
+pub(crate) async fn read_sst_entry_via(
+    reader: &SstReader,
+    user_key: &[u8],
+    sc: &Rc<StreamClient>,
+    cache: &crate::sstable::BlockCache,
+) -> Result<Option<(u8, Bytes, u64)>> {
+    let target = key_with_ts(user_key, u64::MAX);
+    let block_idx = reader.find_block_for_key(&target);
+    let block = reader.read_block_via(block_idx, sc, cache).await?;
+    let n = block.num_entries();
+    if n == 0 {
+        return Ok(None);
+    }
+    let mut lo = 0usize;
+    let mut hi = n;
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let key = block
+            .get_key(mid)
+            .map_err(|e| anyhow!("sst block entry decode: {e}"))?;
+        if crate::cmp_internal_keys(&key, &target).is_lt() {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    // next-block hop — see lookup_in_sst for the full rationale.
+    let (blk, pos) = if lo < n {
+        (block, lo)
+    } else if block_idx + 1 < reader.block_count() {
+        let nb = reader.read_block_via(block_idx + 1, sc, cache).await?;
+        if nb.num_entries() == 0 {
+            return Ok(None);
+        }
+        (nb, 0usize)
+    } else {
+        return Ok(None);
+    };
+    let (key, op, value, expires_at) = blk
+        .get_entry(pos)
+        .map_err(|e| anyhow!("sst block entry decode: {e}"))?;
+    if parse_key(&key) == user_key {
+        return Ok(Some((op, value, expires_at)));
+    }
+    Ok(None)
+}
+
+/// TEST-ONLY reference implementation of the SST point lookup (incl. the
+/// next-block hop) — the production paths are its specialised siblings
+/// `lookup_in_sst_seq_opt` / `lookup_in_sst_via`, which mirror this logic.
+#[cfg(test)]
+pub(crate) fn lookup_in_sst(reader: &SstReader, user_key: &[u8]) -> Option<(u8, Bytes, u64)> {
+    if !reader.may_contain(user_key) {
+        return None;
+    }
+    let target = key_with_ts(user_key, u64::MAX);
+    let block_idx = reader.find_block_for_key(&target);
+    let block = reader.read_block(block_idx).ok()?;
+    let n = block.num_entries();
+    if n == 0 {
+        return None;
+    }
+
+    // Binary search: find first entry whose key >= target.
+    let mut lo = 0usize;
+    let mut hi = n;
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let key = block.get_key(mid).ok()?;
+        if crate::cmp_internal_keys(&key, &target).is_lt() {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+
+    // The first entry whose key >= target is the newest version for
+    // user_key. It is at `lo` in THIS block when `lo < n`. But when
+    // `lo == n` (every key in `block_idx` sorts < target), the answer is
+    // the FIRST entry of the NEXT block: `find_block_for_key` returns the
+    // last block whose base_key <= target, so `base_key[block_idx+1]` is
+    // the smallest key > target. Without this next-block hop a user_key
+    // whose newest entry happens to be the base (first entry) of a block
+    // is missed entirely — the binary search runs off the end of the
+    // preceding block and we return None, the read then falls through to
+    // an older SST and returns a STALE value. This was the
+    // fence+flush "data loss" — actually a point-lookup block-boundary
+    // bug, invisible until SSTs grew past one block per table.
+    let (blk, pos) = if lo < n {
+        (block, lo)
+    } else if block_idx + 1 < reader.block_count() {
+        let nb = reader.read_block(block_idx + 1).ok()?;
+        if nb.num_entries() == 0 {
+            return None;
+        }
+        (nb, 0usize)
+    } else {
+        return None;
+    };
+    let (key, op, value, expires_at) = blk.get_entry(pos).ok()?;
+    if parse_key(&key) == user_key {
+        return Some((op, value, expires_at));
+    }
+    None
+}
+
+/// The RANGE path's memtable view: one capped WINDOW from `from` onward, values
+/// dropped. See `Memtable::snapshot_range_keys` for why the full snapshot the
+/// range path used to take is O(memtable) per page.
+///
+/// Returns the items plus an optional BOUND. `Some(k)` means at least one
+/// memtable ran out of window at `k`, so beyond `k` this view may be missing
+/// entries and the caller must not emit a key it cannot prove is the newest
+/// version. The bound is the MINIMUM last-key over the truncated runs — the
+/// first point past which ANY run goes blind.
+///
+/// The bound is a signal to REFILL, not to stop: `range_scan_sst_merge` calls
+/// this again from `Excluded(bound)` and keeps merging. Stopping instead makes
+/// the window visible on the wire, and it cannot be made visible safely — see
+/// the invariant in `handle_range`.
+pub(crate) fn collect_mem_items_for_range(
+    part: &PartitionData,
+    from: std::ops::Bound<&[u8]>,
+    cap: usize,
+) -> (Vec<IterItem>, Option<Vec<u8>>) {
+    let mut items: Vec<IterItem> = Vec::new();
+    let mut bound: Option<Vec<u8>> = None;
+    let note = |chunk: &[IterItem], truncated: bool, bound: &mut Option<Vec<u8>>| {
+        if !truncated {
+            return;
+        }
+        let Some(last) = chunk.last() else { return };
+        let replace = match bound.as_deref() {
+            Some(b) => crate::cmp_internal_keys(&last.key, b).is_lt(),
+            None => true,
+        };
+        if replace {
+            *bound = Some(last.key.clone());
+        }
+    };
+    let (chunk, truncated) = part.active.snapshot_range_keys(from, cap);
+    note(&chunk, truncated, &mut bound);
+    items.extend(chunk);
+    for imm in part.imm.iter().rev() {
+        let (chunk, truncated) = imm.snapshot_range_keys(from, cap);
+        note(&chunk, truncated, &mut bound);
+        items.extend(chunk);
+    }
+    (items, bound)
+}
+
+pub(crate) fn collect_mem_items(part: &PartitionData) -> Vec<IterItem> {
+    let mut items = part.active.snapshot_sorted();
+    for imm in part.imm.iter().rev() {
+        items.extend(imm.snapshot_sorted());
+    }
+    items
+}
+
+/// async window scan over the (paged) readers — SST side only, no
+/// materialization. Caller snapshots `readers` + `sc` under a brief borrow,
+/// DROPS it, then awaits (note 15). The split path holds `maintenance_gate`,
+/// so the reader set is stable across the scan. Returns the newest
+/// (first-occurrence, newest-first reader order) version per user key.
+///
+/// The MEMTABLE sample is deliberately NOT taken here —
+/// this scan can run for a while on large SST sets while normal writes
+/// keep landing in active. The caller samples the memtable AFTER this
+/// returns (`finalize_unique_user_keys`), so writes that arrived during
+/// the scan still participate in split's `< 2 keys` check and midpoint
+/// selection (parity with the old sync scan, which sampled mem after the
+/// materialization await).
+pub(crate) async fn sst_user_key_versions(
+    readers: &[Arc<SstReader>],
+    sc: &Rc<StreamClient>,
+    cache: &Arc<crate::sstable::BlockCache>,
+) -> Result<BTreeMap<Vec<u8>, (u8, u64)>> {
+    let mut seen: BTreeMap<Vec<u8>, (u8, u64)> = BTreeMap::new();
+    for reader in readers.iter().rev() {
+        let mut it = AsyncTableIterator::new(
+            reader.clone(),
+            sc.clone(),
+            cache.clone(),
+            FetchMode::Window(crate::params().scan_read_window_bytes.get()),
+        );
+        it.rewind().await?;
+        while it.valid() {
+            let item = it.item().unwrap();
+            let uk = parse_key(&item.key).to_vec();
+            seen.entry(uk).or_insert((item.op, item.expires_at));
+            it.next().await?;
+        }
+    }
+    Ok(seen)
+}
+
+/// Merge a FRESH memtable sample over the SST scan result (memtable holds
+/// strictly newer versions, so it wins per key), then drop tombstones and
+/// expired entries. Sync — call under/right after a brief borrow.
+pub(crate) fn finalize_unique_user_keys(
+    mem_items: &[IterItem],
+    sst_seen: BTreeMap<Vec<u8>, (u8, u64)>,
+) -> Vec<Vec<u8>> {
+    let now = now_secs();
+    let mut seen: BTreeMap<Vec<u8>, (u8, u64)> = BTreeMap::new();
+    // mem_items are sorted by internal key (newest version of each user
+    // key first) — or_insert keeps the newest, mirroring the old combined
+    // scan's first-occurrence-wins discipline.
+    for item in mem_items {
+        let uk = parse_key(&item.key).to_vec();
+        seen.entry(uk).or_insert((item.op, item.expires_at));
+    }
+    for (uk, v) in sst_seen {
+        seen.entry(uk).or_insert(v);
+    }
+    seen.into_iter()
+        .filter_map(|(uk, (op, expires_at))| {
+            if op == crate::OP_TOMBSTONE {
+                return None;
+            }
+            if expires_at > 0 && expires_at <= now {
+                return None;
+            }
+            Some(uk)
+        })
+        .collect()
+}
+
+/// Resolve a value, optionally reading only a sub-range.
+/// `offset` and `length` are byte offsets within the value (0/0 = full read).
+pub(crate) async fn resolve_value(
+    op: u8,
+    raw_value: Bytes,
+    stream_client: &Rc<StreamClient>,
+    offset: u64,
+    length: u64,
+) -> Result<autumn_transport::RegBytes> {
+    if op & OP_VALUE_POINTER != 0 {
+        if raw_value.len() < VALUE_POINTER_SIZE {
+            return Err(anyhow!("ValuePointer too short"));
+        }
+        let vp = ValuePointer::decode(&raw_value[..VALUE_POINTER_SIZE]);
+        read_value_from_log(&vp, stream_client, offset, length).await
+    } else {
+        // Inline value already in a memtable Bytes — slice it zero-copy.
+        let n = raw_value.len();
+        if offset == 0 && length == 0 {
+            Ok(raw_value.into())
+        } else {
+            let start = (offset as usize).min(n);
+            let end = if length == 0 {
+                n
+            } else {
+                (start + length as usize).min(n)
+            };
+            Ok(raw_value.slice(start..end).into())
+        }
+    }
+}
+
+/// Read value bytes from logStream. VP.offset points to value start.
+/// `offset`/`length` = 0/0 means read the entire value. On the bulk read the
+/// value is the pool buffer it was received into, with that buffer's memh
+/// (`pb.freeze()`, no copy), so a GET reply hands UCX the registration; on the
+/// copy-path fallback the Vec is moved in and carries none.
+pub(crate) async fn read_value_from_log(
+    vp: &ValuePointer,
+    stream_client: &Rc<StreamClient>,
+    offset: u64,
+    length: u64,
+) -> Result<autumn_transport::RegBytes> {
+    let (read_off, read_len) = if offset == 0 && length == 0 {
+        (vp.offset, vp.len)
+    } else {
+        let off = offset.min(vp.len);
+        let len = if length == 0 {
+            vp.len - off
+        } else {
+            length.min(vp.len - off)
+        };
+        (vp.offset + off, len)
+    };
+    // Sub-range fully past the value end (offset >= vp.len) clamps to a
+    // zero-length read — return empty EXPLICITLY. Pre-fix this fell
+    // through to `read_value_into_pooled(.., 0)`, whose pooled fast path
+    // handed back the recycled RegPool buffer's STALE contents as the
+    // value (`Bytes::from_owner(pb)` with a dirty buffer) — fuse reads of
+    // a shortened/sparse extent window returned VARYING GARBAGE instead
+    // of zeros (caught by fuse_chaos T2: shrink→grow read non-zero,
+    // non-source bytes that changed between reads).
+    if read_len == 0 {
+        return Ok(Default::default());
+    }
+    // R3/R4: zero-copy fast path — recv the value straight into a
+    // registered RegPool buffer over UCX (exact `MSG_READ`) and hand it onward
+    // as a RegBytes ALIASING that buffer with its memh (freeze; pb returns to the
+    // pool when the last clone drops). No off-wire copy, no pb->Vec. A case the bulk read does
+    // not take (EC across shards, chunked, non-OK) returns None -> the
+    // read_bytes_from_extent copy path.
+    if let Ok(Some((pb, _n))) = stream_client
+        .read_value_into_pooled(vp.extent_id, read_off, read_len)
+        .await
+    {
+        return Ok(pb.freeze());
+    }
+    let (data, _) = stream_client
+        .read_bytes_from_extent(vp.extent_id, read_off, read_len)
+        .await?;
+    if (data.len() as u64) < read_len {
+        return Err(anyhow!(
+            "logStream value short: need {} bytes, got {}, extent={}, offset={}",
+            read_len,
+            data.len(),
+            vp.extent_id,
+            read_off
+        ));
+    }
+    Ok(data.into())
+}
+
+// ---------------------------------------------------------------------------
+// GC scan-completeness tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod gc_streaming_tests {
+    use super::ensure_gc_scan_complete;
+    use crate::{decode_records_full, encode_record};
+
+    fn rec(op: u8, key: &[u8], value: &[u8]) -> Vec<u8> {
+        encode_record(op, key, value, 0)
+    }
+
+    #[test]
+    fn gc_refuses_record_aligned_early_eof_with_no_carry() {
+        let prefix = rec(0x80, b"mem/old", &[1; 8192]);
+        let live = rec(0x80, b"mem/live", &[2; 8192]);
+        let sealed_length = (prefix.len() + live.len()) as u64;
+        assert_eq!(decode_records_full(&prefix).len(), 1);
+        for scanned in [0, prefix.len() as u64] {
+            let error = ensure_gc_scan_complete(42, scanned, sealed_length, 0).unwrap_err();
+            assert!(error.to_string().contains("refusing to punch"));
+        }
+        assert!(ensure_gc_scan_complete(42, sealed_length, sealed_length, 0).is_ok());
+        assert!(ensure_gc_scan_complete(42, sealed_length, sealed_length, 1).is_err());
+        assert!(ensure_gc_scan_complete(42, 0, 0, 0).is_ok());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// GC failure-cooldown classification tests
+// ---------------------------------------------------------------------------
+//
+// Pure-fn coverage for `classify_gc_failure_cooldown`. The full GC loop
+// is harder to unit-test (requires PartitionData + StreamClient
+// fixtures); this covers the classifier itself end-to-end via anyhow
+// chains representative of the production error shapes.
+
+#[cfg(test)]
+mod classify_cooldown_tests {
+    use super::classify_gc_failure_cooldown;
+    use anyhow::anyhow;
+    use std::time::Duration;
+
+    const SOFT: Duration = Duration::from_secs(30);
+    const HARD: Duration = Duration::from_secs(300);
+
+    /// Manager rejects punch_holes with CODE_PRECONDITION while a
+    /// concurrent EC conversion holds `ec_conversion_inflight`. The
+    /// stream-client surfaces this as `anyhow!("punch_holes failed:
+    /// precondition failed: ...")`. Soft cooldown so we retry once
+    /// EC completes (typically within seconds).
+    #[test]
+    fn precondition_in_chain_uses_soft_cooldown() {
+        let inner = anyhow!("precondition failed: ec_conversion_inflight contains 42");
+        let outer = inner.context("punch_holes failed");
+        assert_eq!(classify_gc_failure_cooldown(&outer, SOFT, HARD), SOFT);
+    }
+
+    /// Stream client returns `eversion mismatch (stale extent_info_cache)`
+    /// after the 2-attempt retry loop exhausts and the cache is still
+    /// stale — typically a momentary EC dispatch finishing mid-GC read.
+    /// Soft cooldown.
+    #[test]
+    fn eversion_mismatch_uses_soft_cooldown() {
+        let inner = anyhow!("eversion mismatch (stale extent_info_cache)");
+        let wrapped = inner.context("run_gc extent 42 process_gc_chunk read failed");
+        assert_eq!(classify_gc_failure_cooldown(&wrapped, SOFT, HARD), SOFT);
+    }
+
+    /// Network timeout / disk failure / decode error — anything not on
+    /// the sentinel substring list gets the hard 300 s cooldown so we
+    /// don't burn IO retrying every 5-7 s against a broken EC layout.
+    #[test]
+    fn unrecognised_failure_uses_hard_cooldown() {
+        let err = anyhow!("connection closed mid-read");
+        assert_eq!(classify_gc_failure_cooldown(&err, SOFT, HARD), HARD);
+    }
+}
+
+#[cfg(test)]
+mod lookup_block_boundary_tests {
+    use super::*;
+    use crate::key_with_ts;
+    use crate::sstable::builder::SstBuilder;
+    use crate::sstable::reader::SstReader;
+
+    /// Regression for the fence+flush "data loss" — actually a
+    /// point-lookup block-boundary bug. When a user_key's newest entry is
+    /// the FIRST entry (base_key) of an SST block, `find_block_for_key`
+    /// (last block with base <= target) selected the PRECEDING block (whose
+    /// base <= target = `user_key++BE(0)`), and the single-block
+    /// binary search ran off the end → `lookup_in_sst` returned None →
+    /// the read fell through to an older SST and returned a STALE value.
+    /// `lookup_in_sst` must hop to the next block's first entry in that
+    /// case. Invisible until SSTs grew past one block per table (>64 KiB),
+    /// which is why the 64-key reproducer passed but the 1024-key one failed.
+    #[test]
+    fn lookup_in_sst_finds_keys_at_block_boundaries() {
+        // ~2 KiB values × 300 keys ≈ 600 KiB → many 64 KiB blocks, so
+        // several keys necessarily become block base_keys.
+        let val = vec![b'x'; 2048];
+        let n: u32 = 300;
+        let mut b = SstBuilder::new(0, 0, 1024);
+        for i in 0..n {
+            let uk = format!("k{i:06}").into_bytes();
+            // distinct seq per key so the stored ts is checkable
+            let seq = (i as u64) + 1;
+            b.add(&key_with_ts(&uk, seq), 1, &val, 0);
+        }
+        let reader = SstReader::from_bytes(b.finish().to_bytes()).expect("reader");
+
+        // The bug only exists with >1 block; assert we actually exercise it.
+        assert!(
+            reader.block_count() > 1,
+            "test must span multiple blocks (got {})",
+            reader.block_count()
+        );
+
+        // EVERY key — including the ones sitting at block boundaries — must
+        // be found via the bloom-gated point lookup the GET path uses.
+        for i in 0..n {
+            let uk = format!("k{i:06}").into_bytes();
+            let got = lookup_in_sst(&reader, &uk);
+            assert!(
+                got.is_some(),
+                "lookup_in_sst missed k{i:06} (block-boundary regression)"
+            );
+            let (op, value, _) = got.unwrap();
+            assert_eq!(op, 1);
+            assert_eq!(value.len(), val.len(), "wrong value for k{i:06}");
+        }
+
+        // A key that does not exist must still return None.
+        assert!(lookup_in_sst(&reader, b"zzzzzz").is_none());
+    }
+}
+
+#[cfg(test)]
+mod wal_debt_tests {
+    //! The debt gauges are split at the replay floor the punch guard uses:
+    //! `gc_debt` only before it, `open_tail_dead_bytes` at/after it (open tail
+    //! included). Disjoint, and together every dead byte of the log.
+    use super::{effective_replay_floor, split_at_replay_floor};
+    use std::collections::HashMap;
+
+    fn split(discards: &[(u64, i64)], extent_ids: &[u64], ssts: &[u64], durable: u64) -> (u64, u64) {
+        let mut d: HashMap<u64, i64> = discards.iter().copied().collect();
+        let (floor, pos) = effective_replay_floor(extent_ids, ssts.iter().copied(), durable);
+        let protected = split_at_replay_floor(&mut d, &pos, floor);
+        (d.values().map(|v| (*v).max(0) as u64).sum(), protected)
+    }
+
+    #[test]
+    fn the_floor_extent_and_everything_after_it_are_not_debt() {
+        // Floor at 20 (durable cursor): 10 is collectable, 20 and the tail 30 are not.
+        let d = [(10u64, 100i64), (20, 200), (30, 500)];
+        assert_eq!(split(&d, &[10, 20, 30], &[10], 20), (100, 700));
+        // Floor at the tail: only the tail is protected.
+        assert_eq!(split(&d, &[10, 20, 30], &[10], 30), (300, 500));
+    }
+
+    #[test]
+    fn with_no_cursor_resolving_everything_is_protected() {
+        // Floor 0: GC may take no non-empty extent, so none of it is debt.
+        let d = [(10u64, 100i64), (20, 200)];
+        assert_eq!(split(&d, &[10, 20], &[], 0), (0, 300));
+    }
+
+    #[test]
+    fn extents_gone_from_the_log_count_nowhere_and_negatives_clamp() {
+        let d = [(7u64, 900i64), (10, 100), (30, -50)];
+        assert_eq!(split(&d, &[10, 20, 30], &[20], 0), (100, 0));
+    }
+}
+
+#[cfg(test)]
+mod gc_replay_floor_tests {
+    //! Replay-floor regression: GC must never punch a log_stream extent that crash
+    //! recovery still replays. These pin the floor computation (== recovery's
+    //! `chosen_pos`) and the punch guard.
+    use super::{gc_extent_punchable, gc_floor_raise_to_durable_ckpt, gc_replay_floor};
+
+    #[test]
+    fn floor_is_min_first_occurrence_position() {
+        let log = [10u64, 11, 12, 13];
+        let (floor, pos) = gc_replay_floor(&log, [11u64]);
+        assert_eq!(floor, 1);
+        assert_eq!(pos.get(&10), Some(&0));
+        assert_eq!(pos.get(&13), Some(&3));
+    }
+
+    #[test]
+    fn floor_uses_first_occurrence_for_cow_shared_extent() {
+        // Regression: post split/merge the spliced log_stream repeats a
+        // CoW-shared extent (11). recover_partition replays from the FIRST
+        // occurrence (pos 1). A last-occurrence floor would be 3, wrongly
+        // freeing extent 12 (pos 2) that recovery still replays.
+        let log = [10u64, 11, 12, 11, 13];
+        assert_eq!(
+            gc_replay_floor(&log, [11u64]).0,
+            1,
+            "must be first occurrence of 11, not 3"
+        );
+    }
+
+    #[test]
+    fn floor_zero_protects_all_when_nothing_resolves() {
+        let log = [10u64, 11, 12];
+        // No SSTs at all (nothing flushed) → recovery replays from 0.
+        assert_eq!(gc_replay_floor(&log, std::iter::empty()).0, 0);
+        // vp_head points at an extent already gone from the stream.
+        assert_eq!(gc_replay_floor(&log, [99u64]).0, 0);
+    }
+
+    #[test]
+    fn floor_skips_unresolvable_vp_heads_like_recovery() {
+        let log = [10u64, 11, 12, 13];
+        // 99 is gone; 12 resolves at pos 2 → min over resolvable = 2.
+        assert_eq!(gc_replay_floor(&log, [99u64, 12]).0, 2);
+    }
+
+    #[test]
+    fn guard_punches_only_below_floor_protects_replay_window() {
+        // The replay-floor scenario: floor sits at the vp_head extent 11 (pos 1). Without
+        // the guard GC would punch 11 (the vp_head extent) and 12 (after it) —
+        // both have high discard — and a crash before the next checkpoint would
+        // then lose the WAL recovery replays from 11 forward. With the guard
+        // only the fully-flushed extent 10 and the empty extent 13 are punched.
+        let log = [10u64, 11, 12, 13];
+        let (floor, pos) = gc_replay_floor(&log, [11u64]);
+        assert_eq!(floor, 1);
+        let candidates = [
+            (10u64, 1_000u64), // before floor, non-empty → punchable
+            (11, 1_000),       // AT floor (vp_head extent) → PROTECTED
+            (12, 1_000),       // after floor → PROTECTED
+            (13, 0),           // empty → punchable regardless
+        ];
+        let punchable: Vec<u64> = candidates
+            .iter()
+            .filter(|(eid, sl)| gc_extent_punchable(*eid, *sl, &pos, floor))
+            .map(|(eid, _)| *eid)
+            .collect();
+        assert_eq!(punchable, vec![10, 13]);
+    }
+
+    // BUG2 — the durable-checkpoint floor raise.
+
+    #[test]
+    fn durable_ckpt_raise_advances_floor_and_frees_covered_prefix() {
+        // Live SST vp_heads span extents 11 (pos 1) .. 14 (pos 4); the
+        // over-conservative MIN floor is 1. The newest DURABLY-ACKed flush
+        // checkpoint's vp is at extent 13 (pos 3): every record below pos 3 is
+        // in that checkpoint's persisted SST set → safe to reclaim. The raise
+        // lifts the floor to 3, so 11 and 12 become punchable while 13 (the vp
+        // extent, AT the floor) and 14 stay protected.
+        let log = [10u64, 11, 12, 13, 14];
+        let (min_floor, pos) = gc_replay_floor(&log, [11u64, 12, 13, 14]);
+        assert_eq!(min_floor, 1, "MIN over SST vp_heads");
+        let raised = gc_floor_raise_to_durable_ckpt(min_floor, &pos, /*durable vp eid*/ 13);
+        assert_eq!(raised, 3);
+        let candidates = [
+            (10u64, 1_000u64), // before raised floor → punchable
+            (11, 1_000),       // now below floor 3 → punchable (was protected at MIN)
+            (12, 1_000),       // now below floor 3 → punchable
+            (13, 1_000),       // AT floor (durable vp extent) → PROTECTED
+            (14, 1_000),       // after floor → PROTECTED
+        ];
+        let punchable: Vec<u64> = candidates
+            .iter()
+            .filter(|(eid, sl)| gc_extent_punchable(*eid, *sl, &pos, raised))
+            .map(|(eid, _)| *eid)
+            .collect();
+        assert_eq!(punchable, vec![10, 11, 12]);
+    }
+
+    #[test]
+    fn durable_ckpt_raise_is_noop_before_first_flush_or_when_unresolvable() {
+        let log = [10u64, 11, 12, 13];
+        let (min_floor, pos) = gc_replay_floor(&log, [11u64]);
+        assert_eq!(min_floor, 1);
+        // (0,0) = no flush committed this incarnation → stay at the MIN floor.
+        assert_eq!(gc_floor_raise_to_durable_ckpt(min_floor, &pos, 0), 1);
+        // Durable vp extent already gone from the stream (e.g. post-merge GC) →
+        // conservative: keep the MIN floor, never raise past what resolves.
+        assert_eq!(gc_floor_raise_to_durable_ckpt(min_floor, &pos, 99), 1);
+    }
+
+    #[test]
+    fn durable_ckpt_raise_never_lowers_the_min_floor() {
+        // A durable vp that resolves EARLIER than the MIN floor (a stale/older
+        // checkpoint vp) must never pull the floor backward — the raise is a
+        // max, so the more-conservative MIN wins.
+        let log = [10u64, 11, 12, 13];
+        let (min_floor, pos) = gc_replay_floor(&log, [12u64]); // MIN floor = 2
+        assert_eq!(min_floor, 2);
+        // durable vp resolves at pos 1 (< 2) → floor stays 2.
+        assert_eq!(gc_floor_raise_to_durable_ckpt(min_floor, &pos, 11), 2);
+    }
+}
+
+#[cfg(test)]
+mod compaction_vp_head_tests {
+    //! Regression: a compaction's output vp_head (recovery replay-start) is the
+    //! MAX over the INPUT SSTs' vp_heads by stream position — the newest input's
+    //! content boundary. It advances the GC floor while staying BEHIND the
+    //! acked-but-un-flushed tail (which the pre-fix live-cursor stamp overran →
+    //! `system_compact_unflushed_vp_head`).
+    use super::compaction_output_vp_head;
+
+    #[test]
+    fn a_compaction_chunk_filter_is_sized_for_one_chunk() {
+        use super::compaction_chunk_keys;
+        // Fits in one chunk: every input entry.
+        assert_eq!(compaction_chunk_keys(1000, 10_000, 1 << 20), 1000);
+        // 16M entries over 4 chunks: a quarter each, not all 16M.
+        assert_eq!(compaction_chunk_keys(16_000_000, 4 << 29, 1 << 29), 4_000_001);
+        assert_eq!(compaction_chunk_keys(0, 0, 1 << 29), 0);
+    }
+
+    #[test]
+    fn takes_max_first_occurrence_position() {
+        let log = [10u64, 11, 12, 13];
+        // positions: 10→0, 11→1. max over {(10,500),(11,400)} is 11 (pos 1).
+        assert_eq!(
+            compaction_output_vp_head([(10u64, 500u64), (11, 400)], &log),
+            (11, 400)
+        );
+    }
+
+    #[test]
+    fn tie_breaks_by_larger_offset() {
+        let log = [10u64, 11];
+        // same extent 10 (pos 0): the larger offset is the newer boundary.
+        assert_eq!(
+            compaction_output_vp_head([(10u64, 100u64), (10, 900), (10, 400)], &log),
+            (10, 900)
+        );
+    }
+
+    #[test]
+    fn skips_zero_and_unresolvable_vp_heads() {
+        let log = [10u64, 11, 12];
+        // eid 0 = no vp_head; eid 99 = gone from the stream. Only 11 resolves.
+        assert_eq!(
+            compaction_output_vp_head([(0u64, 5u64), (99, 5), (11, 700)], &log),
+            (11, 700)
+        );
+    }
+
+    #[test]
+    fn falls_back_to_first_extent_when_none_resolve() {
+        let log = [10u64, 11, 12];
+        // No input resolves → replay from the first log extent, offset 0
+        // (conservative full replay — NEVER (0,0), which forfeits the cursor).
+        assert_eq!(
+            compaction_output_vp_head([(0u64, 5u64), (99, 5)], &log),
+            (10, 0)
+        );
+        assert_eq!(compaction_output_vp_head(std::iter::empty(), &log), (10, 0));
+        // Truly empty log (no data): (0,0) is fine — nothing to replay.
+        assert_eq!(compaction_output_vp_head([(11u64, 5u64)], &[]), (0, 0));
+    }
+
+    #[test]
+    fn cow_shared_extent_uses_first_occurrence_position() {
+        // Post split/merge the spliced log_stream repeats a CoW extent (11).
+        // Position keys off the FIRST occurrence (pos 1), matching recovery.
+        let log = [10u64, 11, 12, 11, 13];
+        // inputs at extent 11 (first-occ pos 1) and extent 12 (pos 2): max = 12.
+        assert_eq!(
+            compaction_output_vp_head([(11u64, 400u64), (12, 100)], &log),
+            (12, 100)
+        );
+    }
+}
+
+#[cfg(test)]
+mod sealed_anchor_tests {
+    use super::advance_sealed_anchor;
+    use std::collections::HashMap;
+
+    #[test]
+    fn a_cursor_at_a_sealed_end_moves_to_the_successor() {
+        let seals = HashMap::from([(10u64, 500u64)]);
+        assert_eq!(advance_sealed_anchor((10, 500), &[10, 11], &seals), (11, 0));
+    }
+
+    #[test]
+    fn records_past_the_cursor_keep_it() {
+        let seals = HashMap::from([(10u64, 900u64)]);
+        assert_eq!(
+            advance_sealed_anchor((10, 500), &[10, 11], &seals),
+            (10, 500)
+        );
+    }
+
+    #[test]
+    fn the_tail_and_unknown_seals_keep_it() {
+        let seals = HashMap::from([(11u64, 500u64)]);
+        assert_eq!(
+            advance_sealed_anchor((11, 500), &[10, 11], &seals),
+            (11, 500)
+        );
+        assert_eq!(
+            advance_sealed_anchor((10, 500), &[10, 11], &HashMap::new()),
+            (10, 500)
+        );
+        assert_eq!(advance_sealed_anchor((0, 0), &[10, 11], &seals), (0, 0));
+    }
+
+    #[test]
+    fn sealed_empty_successors_are_skipped() {
+        // 11 and 12 are sealed empty: the sweep may reclaim them.
+        let seals = HashMap::from([(10u64, 500u64), (11, 0), (12, 0), (13, 7)]);
+        assert_eq!(
+            advance_sealed_anchor((10, 500), &[10, 11, 12, 13, 14], &seals),
+            (13, 0)
+        );
+        assert_eq!(
+            advance_sealed_anchor((10, 500), &[10, 11, 12, 14], &seals),
+            (14, 0)
+        );
+        // 12's seal is unknown: it may be empty, so it is not a safe anchor.
+        let partial = HashMap::from([(10u64, 500u64), (11, 0)]);
+        assert_eq!(
+            advance_sealed_anchor((10, 500), &[10, 11, 12, 13], &partial),
+            (10, 500)
+        );
+    }
+
+    #[test]
+    fn only_an_unchanged_cursor_missing_from_a_later_list_is_swept() {
+        use super::durable_cursor_swept;
+        assert!(durable_cursor_swept((11, 0), (11, 0), &[10, 12]));
+        // Published after the list was fetched: may name a newer extent.
+        assert!(!durable_cursor_swept((13, 0), (11, 0), &[10, 12]));
+        assert!(!durable_cursor_swept((11, 0), (11, 0), &[10, 11, 12]));
+        assert!(!durable_cursor_swept((0, 0), (0, 0), &[10]));
+    }
+
+    #[test]
+    fn a_successor_listed_earlier_is_not_taken() {
+        // After a merge an extent can appear twice; its first position counts.
+        let seals = HashMap::from([(10u64, 500u64), (11, 7)]);
+        assert_eq!(
+            advance_sealed_anchor((10, 500), &[11, 10, 11, 12], &seals),
+            (10, 500)
+        );
+    }
+}
+
+/// The fence classifier must see the WHOLE anyhow
+/// chain — a `.context(...)` wrap added along the append path (e.g. stream
+/// client.rs "alloc_new_extent failed after append error: …") hides the
+/// "LockedByOther" marker from plain `{e}` Display, which only prints the
+/// outermost context. Pre-fix that silently downgraded a fence to a generic
+/// write error: no poison, no fresh-epoch reopen.
+#[cfg(test)]
+mod fence_classifier_tests {
+    use super::is_locked_by_other;
+
+    #[test]
+    fn locked_by_other_survives_context_wrap() {
+        // EN-layer shape (commit_length probe).
+        let en = anyhow::anyhow!(
+            "commit_length on extent 42: only 2/3 replicas responded \
+             (1 rejected LockedByOther — stale owner epoch)"
+        );
+        assert!(is_locked_by_other(&en));
+
+        // Manager-layer shape (typed ManagerError Display) wrapped by the
+        // append path's context — the regression this test pins.
+        let mgr = anyhow::anyhow!(
+            "stream_alloc_extent fenced (LockedByOther): precondition failed: \
+             owner_key=partition/17 owner_epoch mismatch, expected 14396, got 14364"
+        )
+        .context("alloc_new_extent failed after append error: replica timeout");
+        assert!(
+            format!("{mgr}") == "alloc_new_extent failed after append error: replica timeout",
+            "precondition of this test: plain Display hides the marker"
+        );
+        assert!(
+            is_locked_by_other(&mgr),
+            "chain-wide match must survive the context wrap"
+        );
+
+        // Generic errors must not classify.
+        let plain = anyhow::anyhow!("replica 1 rpc error: connection reset");
+        assert!(!is_locked_by_other(&plain));
+    }
+}
+
+#[cfg(test)]
+mod splice_tests {
+    use super::splice_compaction_outputs;
+    use crate::sstable::{SstBuilder, SstReader};
+    use crate::{key_with_ts, TableMeta};
+    use std::collections::HashSet;
+    use std::sync::Arc;
+
+    fn t(offset: u64, last_seq: u64) -> (TableMeta, Arc<SstReader>) {
+        let mut b = SstBuilder::new(0, 0, 1);
+        b.add(&key_with_ts(b"k", last_seq), 1, b"v", 0);
+        let reader = SstReader::from_bytes(b.finish().to_bytes()).expect("reader");
+        let meta = TableMeta { extent_id: 1, offset, len: 1, estimated_size: 1, last_seq };
+        (meta, Arc::new(reader))
+    }
+
+    fn list(ts: &[(TableMeta, Arc<SstReader>)]) -> (Vec<TableMeta>, Vec<Arc<SstReader>>) {
+        ts.iter().cloned().unzip()
+    }
+
+    fn keys(ts: &[(TableMeta, Arc<SstReader>)]) -> HashSet<(u64, u64)> {
+        ts.iter().map(|(m, _)| m.loc()).collect()
+    }
+
+    fn offsets(tables: &[TableMeta]) -> Vec<u64> {
+        tables.iter().map(|m| m.offset).collect()
+    }
+
+    /// After a merge: the window `[V0, S1, S2]` takes S2's seq, which ties V1
+    /// (a newer table of V0's side). The output stays in front of V1.
+    #[test]
+    fn a_tied_output_stays_in_its_window_slot() {
+        let all = [t(1, 40), t(2, 50), t(3, 100), t(4, 100), t(5, 101)];
+        let (mut tables, mut readers) = list(&all);
+        let out = t(9, 100);
+        splice_compaction_outputs(&mut tables, &mut readers, &keys(&all[..3]), vec![out.clone()])
+            .expect("splice");
+        assert_eq!(offsets(&tables), vec![9, 4, 5]);
+        assert!(Arc::ptr_eq(&readers[0], &out.1) && Arc::ptr_eq(&readers[1], &all[3].1));
+    }
+
+    /// A flush that committed during the compaction appended at the end; the
+    /// outputs go to the window, not after it.
+    #[test]
+    fn outputs_stay_older_than_a_concurrent_flush() {
+        let all = [t(1, 10), t(2, 20), t(3, 30), t(4, 40)];
+        let (mut tables, mut readers) = list(&all);
+        let outs = vec![t(8, 15), t(9, 20)];
+        splice_compaction_outputs(&mut tables, &mut readers, &keys(&all[..2]), outs)
+            .expect("splice");
+        assert_eq!(offsets(&tables), vec![8, 9, 3, 4]);
+        assert_eq!(readers.len(), tables.len());
+    }
+
+    #[test]
+    fn a_window_that_is_not_one_run_is_refused() {
+        let all = [t(1, 10), t(2, 20), t(3, 30)];
+        let (mut tables, mut readers) = list(&all);
+        let window: HashSet<(u64, u64)> = [all[0].0.loc(), all[2].0.loc()].into_iter().collect();
+        assert!(splice_compaction_outputs(&mut tables, &mut readers, &window, vec![t(9, 30)]).is_err());
+        assert_eq!(offsets(&tables), vec![1, 2, 3], "nothing changed");
+        let gone: HashSet<(u64, u64)> = [(1, 77)].into_iter().collect();
+        assert!(splice_compaction_outputs(&mut tables, &mut readers, &gone, vec![]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod compaction_truncate_tests {
+    use super::{row_keep_set, row_truncate_point};
+    use crate::TableMeta;
+    use std::collections::HashSet;
+
+    const MB: u64 = 1024 * 1024;
+
+    fn t(extent_id: u64, last_seq: u64, size: u64) -> TableMeta {
+        TableMeta {
+            extent_id,
+            offset: last_seq, // distinct per table, so `loc()` tells them apart
+            len: size,
+            estimated_size: size,
+            last_seq,
+        }
+    }
+
+    /// Extents a truncate before `cut` drops that a live table references.
+    fn dropped_but_live(row_stream: &[u64], cut: Option<u64>, live: &HashSet<u64>) -> Vec<u64> {
+        let Some(cut) = cut else { return Vec::new() };
+        let pos = row_stream.iter().position(|&e| e == cut).expect("cut is in the stream");
+        row_stream[..pos].iter().copied().filter(|e| live.contains(e)).collect()
+    }
+
+    /// What the live tables are once `picked` is merged into one output
+    /// written to the stream's tail.
+    fn live_after(tables: &[TableMeta], picked: &[TableMeta], tail: u64) -> HashSet<u64> {
+        let picked: HashSet<(u64, u64)> = picked.iter().map(|t| t.loc()).collect();
+        let mut live: HashSet<u64> = tables
+            .iter()
+            .filter(|t| !picked.contains(&t.loc()))
+            .map(|t| t.extent_id)
+            .collect();
+        live.insert(tail);
+        live
+    }
+
+    /// Table order is not row-stream order. A minor compaction skips a big
+    /// full-memtable SST, merges small ones after it, and lists the output
+    /// among older tables although its bytes sit in the NEWEST extent. The
+    /// old head rule then took "the next table's extent" (12) as the truncate
+    /// point and deleted extent 11, which live tables still reference — the
+    /// shape of the partition that could not reopen.
+    #[test]
+    fn repro_truncate_point_skips_a_still_referenced_extent() {
+        let row_stream = [10u64, 11, 12];
+        let tables = vec![
+            t(10, 1, 100 * MB),
+            t(10, 2, 100 * MB),
+            t(12, 5, 20 * MB), // an earlier compaction's output
+            t(11, 6, 300 * MB),
+            t(11, 7, 300 * MB),
+            t(12, 8, 10 * MB),
+        ];
+        // A reclaim of extent 10.
+        let picked = tables[0..2].to_vec();
+        let live = live_after(&tables, &picked, 12);
+        let cut = row_truncate_point(&row_stream, &live);
+        assert_eq!(dropped_but_live(&row_stream, cut, &live), Vec::<u64>::new());
+        assert_eq!(cut, Some(11), "extent 10 is fully consumed and goes");
+    }
+
+    /// More head tables than one compaction takes: the rest stay live in the
+    /// head extent, so nothing may be dropped.
+    #[test]
+    fn a_partly_consumed_head_extent_is_kept() {
+        let mut tables: Vec<TableMeta> = (0..8).map(|i| t(10, i + 1, 10 * MB)).collect();
+        tables.push(t(11, 100, 4 * 1024 * MB));
+        let picked = tables[0..5].to_vec();
+        let live = live_after(&tables, &picked, 11);
+        assert_eq!(row_truncate_point(&[10, 11], &live), None);
+    }
+
+    #[test]
+    fn a_fully_consumed_head_extent_is_dropped() {
+        let mut tables: Vec<TableMeta> = (0..3).map(|i| t(10, i + 1, 10 * MB)).collect();
+        tables.push(t(11, 100, 4 * 1024 * MB));
+        let picked = tables[0..3].to_vec();
+        let live = live_after(&tables, &picked, 12);
+        assert_eq!(row_truncate_point(&[10, 11, 12], &live), Some(11));
+    }
+
+    /// A merged partition's row stream repeats CoW-shared extents; the manager
+    /// truncates by FIRST occurrence, and so does the point.
+    #[test]
+    fn stream_order_decides_not_extent_ids_or_repeats() {
+        let live: HashSet<u64> = [7u64].into_iter().collect();
+        assert_eq!(row_truncate_point(&[20, 7, 30, 7], &live), Some(7));
+        let live: HashSet<u64> = [30u64, 7].into_iter().collect();
+        assert_eq!(row_truncate_point(&[20, 7, 30], &live), Some(7));
+    }
+
+    /// A queued flush may have appended its SST to extent 11 before the stream
+    /// rolled to 12, where the compaction then wrote; its table is not listed
+    /// until the flush commits. The imm's rotation-time floor (11) keeps it.
+    #[test]
+    fn a_queued_flush_floor_stops_the_cut_before_its_sst() {
+        let tables = vec![t(12, 9, 20 * MB)];
+        let keep = row_keep_set(&tables, [Some(11)]).expect("the imm has a floor");
+        assert_eq!(row_truncate_point(&[10, 11, 12], &keep), Some(11));
+        let keep = row_keep_set(&tables, []).unwrap();
+        assert_eq!(row_truncate_point(&[10, 11, 12], &keep), Some(12), "no flush queued");
+        assert!(row_keep_set(&tables, [Some(11), None]).is_none(), "an imm without a floor");
+    }
+
+    #[test]
+    fn no_table_keeps_only_the_tail() {
+        assert_eq!(row_truncate_point(&[10, 11, 12], &HashSet::new()), Some(12));
+        assert_eq!(row_truncate_point(&[10], &HashSet::new()), None);
+    }
+
+    /// A live table in an extent the stream no longer has is damage already
+    /// done; the truncate must not act on the rest.
+    #[test]
+    fn a_live_extent_missing_from_the_stream_stops_the_truncate() {
+        let live: HashSet<u64> = [9u64, 12].into_iter().collect();
+        assert_eq!(row_truncate_point(&[10, 11, 12], &live), None);
+    }
+}
+
+#[cfg(test)]
+mod gc_selection_tests {
+    use super::{
+        collectable_debt, gc_debt_from_basis, gc_selects, next_gc_debt_basis, GcDebtPolicy,
+    };
+    use std::collections::HashMap;
+
+    /// What the manager actuates from its own config: the cluster's standing
+    /// GC policy.
+    fn standing() -> GcDebtPolicy {
+        GcDebtPolicy {
+            ratio_base: 0.4,
+            stream_debt: Some(GIB),
+            floor: Some(GIB),
+        }
+    }
+
+    const GIB: u64 = 1024 * 1024 * 1024;
+    /// A large extent with 3.12 GiB dead inside 16 GiB.
+    const DEAD_190: u64 = 3_351_453_696;
+    const LEN_190: u64 = 17_184_065_911;
+
+    /// The acceptance case. Ratio 0.195 — under the 0.4 gate AND under the 0.2
+    /// it becomes when stream-debt relief halves it — so no typical ratio gate
+    /// would ever select it, and those 3.12 GiB would never be reclaimed while
+    /// the advisory kept asking. A pile that size is worth collecting whatever
+    /// fraction it happens to be.
+    ///
+    /// ABLATION: drop the absolute arm from `gc_selects` and the last assert
+    /// goes red.
+    #[test]
+    fn three_gib_dead_in_a_sixteen_gib_extent_is_selected_by_the_absolute_floor() {
+        assert!(!gc_selects(DEAD_190, LEN_190, 1, 0.4, None), "ratio alone never takes it");
+        assert!(!gc_selects(DEAD_190, LEN_190, 1, 0.2, None), "nor at the halved gate");
+        assert!(gc_selects(DEAD_190, LEN_190, 1, 0.4, Some(GIB)), "3.12 GiB clears a 1 GiB floor");
+    }
+
+    /// …and the floor is a floor, not a free pass. An extent holding
+    /// 0.43 GiB in 15.25 GiB is still not worth rewriting 14.8 GiB
+    /// of live data for.
+    #[test]
+    fn a_small_pile_stays_unselected_under_the_same_floor() {
+        assert!(!gc_selects(461_373_440, 16_374_562_816, 1, 0.4, Some(GIB)));
+    }
+
+    /// A shared extent gets a lower bar. The FILE is freed only at `refs == 0`,
+    /// so collecting this side's reference is what lets the extent become
+    /// independently owned and eventually deleted — worth more than the same
+    /// bytes sitting in a private extent.
+    #[test]
+    fn a_shared_extent_clears_a_bar_a_private_one_does_not() {
+        assert!(!gc_selects(300, 1000, 1, 0.4, None), "private: 0.3 is under 0.4");
+        assert!(gc_selects(300, 1000, 2, 0.4, None), "shared: 0.3 is over the halved 0.2");
+    }
+
+    /// A dispatch that names no knobs may refresh what it resolved, but it
+    /// must not leave the gauge answering a different question than the
+    /// advisory asks.
+    ///
+    /// ABLATION: let a `defines_policy = false` pass replace the policy and
+    /// the second assert goes red.
+    #[test]
+    fn a_floorless_dispatch_refreshes_the_facts_but_never_retracts_the_floor() {
+        // Extent 190: ratio 0.195, under every ratio gate, so ONLY the absolute floor ever selects it.
+        let discards = HashMap::from([(190u64, DEAD_190 as i64)]);
+        let resolved = HashMap::from([(190u64, (LEN_190, 1u64))]);
+
+        // The manager's auto pass carries the standing policy.
+        let auto = next_gc_debt_basis(None, resolved.clone(), standing(), true);
+        assert_eq!(gc_debt_from_basis(&discards, auto.as_ref()), DEAD_190);
+
+        // `autumn-op gc PART` carries none, and neither does the dashboard's
+        // GC button. Such a pass may refresh what it resolved; it may not
+        // leave the gauge answering a different question than the advisory
+        // asks.
+        let bare = GcDebtPolicy {
+            ratio_base: 0.4,
+            stream_debt: None,
+            floor: None,
+        };
+        let manual = next_gc_debt_basis(auto.as_ref(), resolved, bare, false);
+        assert_eq!(
+            gc_debt_from_basis(&discards, manual.as_ref()),
+            DEAD_190,
+            "a floor-less dispatch retracted the floor: the advisory goes \
+             quiet and the pile is stranded until the partition reopens"
+        );
+    }
+
+    /// An `--empty-only` sweep punches empties and judges nothing else, so it
+    /// must never become the gauge's policy. The call site is what bars it
+    /// (`defines_policy = policy_is_standing && !empty_only`); this pins the
+    /// half the fold owns — that a non-defining pass keeps the standing policy.
+    #[test]
+    fn an_empty_only_sweep_does_not_become_the_gauges_policy() {
+        let discards = HashMap::from([(190u64, DEAD_190 as i64)]);
+        let resolved = HashMap::from([(190u64, (LEN_190, 1u64))]);
+        let auto = next_gc_debt_basis(None, resolved.clone(), standing(), true);
+        // The shape selection actually builds for such a dispatch. There is no
+        // caller-side floor suppression, so an
+        // `--empty-only --dead-bytes 100G` sweep carries a REAL floor here —
+        // which is exactly why `defines_policy`, and not the floor's presence,
+        // is what bars it. The unreachable INFINITY gate is PS-local to
+        // selection and never reaches a policy.
+        let sweep_policy = GcDebtPolicy {
+            ratio_base: 0.4,
+            stream_debt: None,
+            floor: Some(100 * GIB),
+        };
+        let sweep = next_gc_debt_basis(auto.as_ref(), resolved, sweep_policy, false);
+        assert_eq!(gc_debt_from_basis(&discards, sweep.as_ref()), DEAD_190);
+    }
+
+    /// An operator override runs exactly as asked, but it must not redefine
+    /// what the gauge MEANS for every later tick. This is why "carries a real
+    /// floor" cannot stand in for "came from the controller":
+    /// `autumn-op gc --ratio 0.9 --dead-bytes 100G PART` carries a perfectly
+    /// real floor, and inferring standing policy from it strands the pile
+    /// silently — exactly the bug, one flag further back.
+    ///
+    /// ABLATION: let a floor-carrying pass define policy and this goes red.
+    #[test]
+    fn an_operator_override_never_becomes_the_standing_policy() {
+        let discards = HashMap::from([(190u64, DEAD_190 as i64)]);
+        let resolved = HashMap::from([(190u64, (LEN_190, 1u64))]);
+        let auto = next_gc_debt_basis(None, resolved.clone(), standing(), true);
+
+        let overridden = GcDebtPolicy {
+            ratio_base: 0.9,
+            stream_debt: None,
+            floor: Some(100 * GIB),
+        };
+        let after = next_gc_debt_basis(auto.as_ref(), resolved, overridden, false);
+        assert_eq!(
+            gc_debt_from_basis(&discards, after.as_ref()),
+            DEAD_190,
+            "an override's strict ratio and huge floor became the standing \
+             policy: the gauge reads 0 and the advisory never fires again"
+        );
+    }
+
+    /// The stream-debt halving is a fact about how much is dead RIGHT NOW, so
+    /// the gauge re-derives it on every read. Storing one dispatch's answer
+    /// froze a live fact into standing policy: the gauge went on reporting a
+    /// relaxation that had since turned off, or missed one that had turned on.
+    ///
+    /// ABLATION: use `policy.ratio_base` without re-deriving the halving and
+    /// the first assert goes red.
+    #[test]
+    fn the_stream_debt_halving_is_re_derived_from_live_discards() {
+        const SMALL: u64 = 1024 * 1024 * 1024;
+        // 0.293 of the extent — over the halved 0.2, under the plain 0.4.
+        let dead: u64 = 300 * 1024 * 1024;
+        let resolved: HashMap<u64, (u64, u64)> =
+            (0..4u64).map(|i| (i, (SMALL, 1u64))).collect();
+        let basis = next_gc_debt_basis(None, resolved, standing(), true);
+
+        // 4 x 300 MiB is over the high-water, so the gate halves and every
+        // extent qualifies.
+        let heavy: HashMap<u64, i64> = (0..4u64).map(|i| (i, dead as i64)).collect();
+        assert_eq!(gc_debt_from_basis(&heavy, basis.as_ref()), 4 * dead);
+
+        // The SAME basis once GC has taken most of it: one extent's 300 MiB is
+        // under the high-water, the gate is back to 0.4, and 0.293 no longer
+        // clears it.
+        let light: HashMap<u64, i64> = HashMap::from([(0u64, dead as i64)]);
+        assert_eq!(gc_debt_from_basis(&light, basis.as_ref()), 0);
+    }
+
+    /// Before any standing policy has arrived there is nothing to judge by, so
+    /// the gauge reports every dead byte. An override arriving first discards
+    /// even the facts it resolved rather than inventing a policy to pair them
+    /// with — over-reporting can ask for work that will not qualify, but it
+    /// cannot hide work that does.
+    #[test]
+    fn the_gauge_stays_on_the_raw_sum_until_a_standing_policy_has_ever_arrived() {
+        let discards = HashMap::from([(190u64, DEAD_190 as i64)]);
+        let resolved = HashMap::from([(190u64, (LEN_190, 1u64))]);
+        // No pass has ever carried the standing policy, so there is nothing to
+        // judge by: over-report rather than guess a gate.
+        let bare = GcDebtPolicy {
+            ratio_base: 0.4,
+            stream_debt: None,
+            floor: None,
+        };
+        let b = next_gc_debt_basis(None, resolved, bare, false);
+        assert!(b.is_none());
+        assert_eq!(gc_debt_from_basis(&discards, b.as_ref()), DEAD_190);
+    }
+
+    /// The idle refresh tick must answer with the same predicate selection uses.
+    /// It re-arms every 5-7 s and overwrites selection's store, so while it
+    /// reported the raw sum the advisory read "every dead byte" almost all the
+    /// time — and for garbage spread thinly across extents, each under both the
+    /// ratio and the floor, the fire-and-refuse loop survived untouched.
+    ///
+    /// ABLATION: make `gc_debt_from_basis` ignore its basis and the first
+    /// assert goes red.
+    #[test]
+    fn the_idle_refresh_answers_with_selections_predicate_not_a_raw_sum() {
+        let discards = HashMap::from([(190u64, DEAD_190 as i64)]);
+        // A 0.4 gate with no stream-debt relief and no floor: nothing relaxes,
+        // so 0.195 stays under it.
+        let basis = (
+            HashMap::from([(190u64, (LEN_190, 1u64))]),
+            GcDebtPolicy {
+                ratio_base: 0.4,
+                stream_debt: None,
+                floor: None,
+            },
+        );
+        assert_eq!(
+            gc_debt_from_basis(&discards, Some(&basis)),
+            0,
+            "0.195 is under the gate, so GC will not come for it and the gauge must not say so"
+        );
+        // No dispatch yet: fall back to the raw sum. Over-reporting is the safe
+        // direction — it can ask for work that will not qualify, but it cannot
+        // silence work that does.
+        assert_eq!(gc_debt_from_basis(&discards, None), DEAD_190);
+    }
+
+    #[test]
+    fn nothing_qualifies_without_dead_bytes_or_a_sealed_length() {
+        assert!(!gc_selects(0, 1000, 2, 0.0, Some(GIB)));
+        assert!(!gc_selects(500, 0, 2, 0.0, Some(GIB)));
+    }
+
+    /// The whole point of one shared predicate: the debt gauge reports exactly
+    /// what selection would take. When these were two expressions they
+    /// disagreed, and the advisory asked every cooldown for work GC refused.
+    #[test]
+    fn the_debt_gauge_reports_exactly_what_selection_would_take() {
+        let discards = HashMap::from([(190u64, DEAD_190 as i64)]);
+        let resolved = HashMap::from([(190u64, (LEN_190, 1u64))]);
+        assert!(!gc_selects(DEAD_190, LEN_190, 1, 0.4, None));
+        assert_eq!(collectable_debt(&discards, &resolved, 0.4, None), 0);
+        assert!(gc_selects(DEAD_190, LEN_190, 1, 0.4, Some(GIB)));
+        assert_eq!(collectable_debt(&discards, &resolved, 0.4, Some(GIB)), DEAD_190);
+    }
+
+    /// Same agreement on the shared-extent arm.
+    #[test]
+    fn the_debt_gauge_follows_the_shared_extent_relaxation() {
+        let discards = HashMap::from([(1u64, 300i64)]);
+        let private = HashMap::from([(1u64, (1000u64, 1u64))]);
+        let shared = HashMap::from([(1u64, (1000u64, 2u64))]);
+        assert_eq!(collectable_debt(&discards, &private, 0.4, None), 0);
+        assert_eq!(collectable_debt(&discards, &shared, 0.4, None), 300);
+    }
+
+    /// GC will not rewrite 12.9 GiB of live data to reclaim 0.195 of an extent,
+    /// so with no absolute floor the gauge must not report it as reclaimable
+    /// and set the advisory asking every cooldown.
+    #[test]
+    fn garbage_below_the_ratio_gate_is_not_reported_as_debt() {
+        let discards = HashMap::from([(190u64, DEAD_190 as i64)]);
+        let resolved = HashMap::from([(190u64, (LEN_190, 1u64))]);
+
+        assert_eq!(collectable_debt(&discards, &resolved, 0.4, None), 0);
+        assert_eq!(collectable_debt(&discards, &resolved, 0.2, None), 0, "0.195 < 0.2");
+        // Relax the gate below the extent's own ratio and it counts again.
+        assert_eq!(collectable_debt(&discards, &resolved, 0.1, None), DEAD_190);
+    }
+
+    /// An extent the scan never reached keeps its bytes. Reporting zero for it
+    /// would silence the advisory for work that is there — the opposite failure,
+    /// and the worse one, since nothing else would raise it.
+    #[test]
+    fn an_extent_the_scan_never_reached_still_counts() {
+        let discards = HashMap::from([(1u64, 900i64), (2u64, 100i64)]);
+        let resolved = HashMap::from([(1u64, (1000u64, 1u64))]); // 2 was never looked up
+        // 900/1000 = 0.9 > 0.4 counts; 2 is unknown so it counts too.
+        assert_eq!(collectable_debt(&discards, &resolved, 0.4, None), 1000);
+    }
+
+    /// A sealed-empty extent is punched outright — no rewrite, no ratio.
+    #[test]
+    fn a_sealed_empty_extent_is_free_to_reclaim() {
+        let discards = HashMap::from([(7u64, 42i64)]);
+        let resolved = HashMap::from([(7u64, (0u64, 1u64))]);
+        assert_eq!(collectable_debt(&discards, &resolved, 0.4, None), 42);
+    }
+
+    /// Negative discard entries are noise from concurrent accounting, not
+    /// credit against other extents' garbage.
+    #[test]
+    fn a_negative_discard_does_not_subtract_from_the_total() {
+        let discards = HashMap::from([(1u64, 900i64), (2u64, -500i64)]);
+        let resolved = HashMap::from([(1u64, (1000u64, 1u64)), (2u64, (1000u64, 1u64))]);
+        assert_eq!(collectable_debt(&discards, &resolved, 0.4, None), 900);
+    }
+}
+
+#[cfg(test)]
+mod deletion_trigger_tests {
+    use super::*;
+
+    #[test]
+    fn tikv_rule_needs_both_the_count_and_the_share() {
+        // Below the count: never, however dominant.
+        assert!(!deletions_need_compaction(9_999, 9_999));
+        // Enough tombstones, but under 30% of the entries.
+        assert!(!deletions_need_compaction(100_000, 29_999));
+        // Exactly both thresholds.
+        assert!(deletions_need_compaction(100_000, 30_000));
+        assert!(deletions_need_compaction(10_000, 10_000));
+        // The production shape: every key written, flushed, then deleted.
+        assert!(deletions_need_compaction(26_000_000, 13_000_000));
+        // Empty partition.
+        assert!(!deletions_need_compaction(0, 0));
+    }
+}
