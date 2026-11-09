@@ -55,16 +55,16 @@ cleanup(){
   [ -n "$STOPPED_PID" ] && kill -CONT "$STOPPED_PID" 2>/dev/null
   [ -n "$FUSE_PID" ] && kill -9 "$FUSE_PID" 2>/dev/null
   [ -n "$PROXY_PID" ] && kill -9 "$PROXY_PID" 2>/dev/null
-  umnt; bash "$ROOT/cluster.sh" stop > /dev/null 2>&1
+  umnt; bash "$ROOT/scripts/cluster.sh" stop > /dev/null 2>&1
 }
 trap cleanup EXIT
 case " $SCENARIOS " in *" mgr-freeze "*) [ "$TRANSPORT" = tcp ] || { echo "mgr-freeze needs TCP"; exit 2; };; esac
 
 say "starting cluster (3 EN, presplit 4, transport=$TRANSPORT, scenarios: $SCENARIOS; work=$WORK)"
-umnt; bash "$ROOT/cluster.sh" stop > /dev/null 2>&1
+umnt; bash "$ROOT/scripts/cluster.sh" stop > /dev/null 2>&1
 rm -rf "$AUTUMN_DATA_ROOT"
 env AUTUMN_EXTENT_BASE_PORT=20000 AUTUMN_BOOTSTRAP_PRESPLIT="4:hexstring" AUTUMN_TRANSPORT="$TRANSPORT" \
-  bash "$ROOT/cluster.sh" start 3 > "$WORK/cluster.log" 2>&1
+  bash "$ROOT/scripts/cluster.sh" start 3 > "$WORK/cluster.log" 2>&1
 grep -q "bootstrap succeeded" "$WORK/cluster.log" || { echo "cluster start failed"; tail -20 "$WORK/cluster.log"; exit 1; }
 sleep 3
 OP=("$BIN/autumn-op" --manager "$MGR" --cluster-secret-file "${AUTUMN_CLUSTER_SECRET_FILE:-$AUTUMN_DATA_ROOT/cluster.secret}")

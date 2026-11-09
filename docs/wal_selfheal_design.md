@@ -1,101 +1,131 @@
-# WAL replay 自愈环
+# WAL replay self-heal loop
 
-## 目标
+## Goal
 
-log_stream replay 遇到 mid-stream 损坏记录 **fail loud**（WAL-FAILSTOP 不变量，见
-`crates/partition-server/CLAUDE.md`），不静默跳过丢数据。但只 fail loud 是
-**loud-but-stuck**：读用确定性副本选择、坏字节不是 stream 层的读错误，于是反复读到同
-一个坏副本 → 分区永久打不开。实际损坏通常只在一个盘上 bit-rot，另两个副本是好的。
+When log_stream replay hits a corrupt record in the middle of the stream, it **fails loud**
+(the WAL-FAILSTOP invariant, see `crates/partition-server/CLAUDE.md`) instead of silently
+skipping it and losing data. But failing loud alone is **loud-but-stuck**: reads use
+deterministic replica selection, and bad bytes are not a stream-layer read error, so the
+same bad replica is read again and again → the partition can never open. In practice the
+corruption is usually bit-rot on a single disk, and the other two replicas are fine.
 
-自愈环把 loud-but-stuck 变成：**replay 发现坏副本 → 跨副本重读修好这段窗口 → 同步隔离
-坏副本（成功才 serving）**。
+The self-heal loop turns loud-but-stuck into: **replay finds a bad replica → re-read across
+replicas to repair that window → synchronously isolate the bad replica (serve only on
+success)**.
 
-## 链路
+## Path
 
-全部在 `recover_partition`（`crates/partition-server/src/lib.rs`）+
-`StreamClient`（`crates/stream/src/client.rs`）+ manager
-`handle_report_corrupt_replica`（`crates/manager/src/rpc_handlers.rs`）：
+Everything lives in `recover_partition` (`crates/partition-server/src/lib.rs`) +
+`StreamClient` (`crates/stream/src/client.rs`) + the manager's
+`handle_report_corrupt_replica` (`crates/manager/src/rpc_handlers.rs`):
 
-1. 每个 committed 窗口跑 `decode_records_chunk`。三个损坏信号任一命中即触发自愈：
-   短读（serving 副本截断）、complete 记录 CRC/内长不符（`Err`）、final chunk 解完仍
-   有残留（`consumed < buf.len()`）。
-2. `self_heal_replay_chunk`：对 **sealed replicated** extent，从每个 eligible 副本用
-   `StreamClient::read_committed_from_replica(eid, idx, off, len)`（不 failover、返回
-   服务它的 node_id）重读**同一 committed 窗口**，纯函数 `select_clean_replica_chunk`
-   挑第一个 decode 干净的，并收集坏 node_id。
-3. OPEN tail 的**内容损坏** → `StreamClient::seal_and_roll_tail`（seal-over-reachable
-   封当前 tail + roll 新 tail 到健康节点），同一 pass 重取已 sealed 的 ExtentInfo，再走
-   第 2 步的 sealed 跨副本隔离（不依赖重开）。
-4. EC extent / 全副本都坏 / **截断**（short）的 open tail / seal-and-roll 失败 →
-   不自愈，fail loud。
-5. chunk 循环结束、**partition serving 之前**：对每个坏 extent
-   `invalidate_extent_cache` → 重取 eversion → `report_corrupt_replica`
-   (`MSG_REPORT_CORRUPT_REPLICA`)。manager 清坏 slot 的 `avali` 位 + bump eversion
-   （etcd-first）。被拒（stale owner/eversion、会隔离掉最后一个副本、extent 仍 open、
-   已 EC）→ `Err` → partition open fail loud → region_sync 重试 → 重新检测重新上报。
-6. 读路径 `eligible_replica_slots` 按 `avali` 过滤（`replicated_read_order` 消费它）。
+1. Each committed window runs through `decode_records_chunk`. Any one of three corruption
+   signals triggers self-heal: a short read (the serving replica is truncated), a CRC /
+   inner-length mismatch on a complete record (`Err`), or leftover bytes after the final
+   chunk is decoded (`consumed < buf.len()`).
+2. `self_heal_replay_chunk`: for a **sealed replicated** extent, re-read **the same
+   committed window** from every eligible replica with
+   `StreamClient::read_committed_from_replica(eid, idx, off, len)` (no failover; returns
+   the node_id that served it). The pure function `select_clean_replica_chunk` picks the
+   first one that decodes cleanly and collects the bad node_ids.
+3. **Content corruption** in the OPEN tail → `StreamClient::seal_and_roll_tail`
+   (seal-over-reachable seals the current tail + rolls a new tail onto healthy nodes);
+   in the same pass, re-fetch the now-sealed ExtentInfo and go through the sealed
+   cross-replica isolation of step 2 (no reopen needed).
+4. EC extent / all replicas bad / a **truncated** (short) open tail / seal-and-roll
+   failure → no self-heal, fail loud.
+5. After the chunk loop ends and **before the partition serves**: for each bad extent,
+   `invalidate_extent_cache` → re-fetch eversion → `report_corrupt_replica`
+   (`MSG_REPORT_CORRUPT_REPLICA`). The manager clears the bad slot's `avali` bit + bumps
+   eversion (etcd-first). Rejected (stale owner/eversion, would isolate the last replica,
+   extent still open, already EC) → `Err` → partition open fails loud → region_sync
+   retries → detect again and report again.
+6. The read path's `eligible_replica_slots` filters by `avali` (consumed by
+   `replicated_read_order`).
 
-## 不变量（load-bearing）
+## Invariants (load-bearing)
 
-> 编号被代码注释直接引用（`I1`/`I2`/`I4`/`I5`/`I7`），改动请勿重编号。
+> The numbers are referenced directly by code comments (`I1`/`I2`/`I4`/`I5`/`I7`); do not
+> renumber them.
 
-- **I1 隔离先于 serving**：replay 确认副本坏 → 必须先持久隔离（坏 slot 从读集移除）
-  成功，partition 才 serving。隔离失败 → 维持 fail-loud，绝不在坏副本仍可读时开服。
-- **I2 读路径按 avali 隔离（仅 sealed replicated）**：sealed replicated extent 的
-  failover 读跳过 `avali` 位为 0 的 slot。**open extent 不过滤**（avali=0 是"未封"
-  常态，不是"坏"；open 一致性由 commit-min 协议管）。**EC extent 不过滤 addr 列表**
-  （会破坏 shard↔addr 索引对齐；缺 shard 由 EC 重建处理）。防御：过滤后 0 个可用 →
-  回退全读 + 调用方记日志（不回归可用性）。
-- **I3 open tail 坏副本 = seal-and-roll**：open tail 没有固定长度，直接 failover 读
-  含糊（commit-min 随读集变）。改为 seal-over-reachable 封当前 tail + roll 新 tail。
-  已 ACK 前缀存在于每个 committed 成员上 → min over 健康副本 ≥ ACK，不丢已确认数据；
-  超出健康 committed 的字节是未 ACK 的投机写，封掉是正确的。新写落新 tail。已经
-  sealed 的 extent 不再 seal，直接隔离 + 按固定 `sealed_length` 处理。
-- **I4 fencing**：上报带 `owner_epoch + partition_id + log_stream_id + extent_id +
-  eversion`；manager 四层校验后才动布局 —— ① 上报者必须是该 partition 的当前
-  owner_epoch；② 该 log_stream 必须属于这个 partition；③ 该 extent 必须是这个
-  log_stream 的成员；④ eversion 必须与当前一致。任一不符 → `CODE_PRECONDITION`，
-  stale PS 改不了布局，也不能跨 partition 隔离别人的副本。
-- **I5 etcd-first**：清 avali / bump eversion 先 `persist_extent` 落 etcd，成功后才写
-  内存，并在写内存前做 verify-at-apply（live eversion 仍等于上报快照才 insert，否则
-  拒绝，不用陈旧 clone 覆盖并发 mutator）。
-- **I7 干净源选择**：跨副本重读时，`avali=0` 的 slot 不作为干净源候选（已被隔离，
-  即使这次 decode 干净也不可信）；**读错误 ≠ 损坏**（节点不可达/超时是 transient，
-  不进坏副本集，绝不隔离不可达节点）；判定按 WAL V1 CRC decode，不只验长度；全部
-  可达副本都不干净 → fail loud，绝不"最长 wins"。
-- **I8 重读窗口对齐 carry**：跨副本重读从 `buf_base = cur_off - carry.len()` 起读
-  `carry.len() + got` 字节，换副本后重算 consumed / carry / record_extent_off（否则
-  坏 carry 会误判健康副本，且 VP offset 错位）。请求的是 **full 窗口**
-  （`want_full`），不是可能被截短的 `buf.len()` —— 截断的 serving 副本不能缩小向干净
-  副本索要的窗口。
-- **I9 保障边界**：强完整性只对 V1 WAL（带 CRC）。V0 legacy 无 CRC，bit-flip 若不过
-  长度边界 `decode_one` 会直接 `Ok`，自愈报告只能标 `legacy_unchecked`，不宣称
-  2^-32。
+- **I1 isolate before serving**: once replay confirms a replica is bad → durable isolation
+  (removing the bad slot from the read set) must succeed before the partition serves.
+  Isolation fails → stay fail-loud; never start serving while the bad replica is still
+  readable.
+- **I2 the read path isolates by avali (sealed replicated only)**: failover reads on a
+  sealed replicated extent skip slots whose `avali` bit is 0. **Open extents are not
+  filtered** (avali=0 is the normal "not sealed" state, not "bad"; open consistency is
+  governed by the commit-min protocol). **EC extents do not filter the addr list** (that
+  would break the shard↔addr index alignment; a missing shard is handled by EC
+  reconstruction). Defense: 0 usable after filtering → fall back to reading all + the
+  caller logs it (no availability regression).
+- **I3 bad replica in the open tail = seal-and-roll**: the open tail has no fixed length,
+  so a direct failover read is ambiguous (commit-min changes with the read set). Instead,
+  seal-over-reachable seals the current tail + rolls a new tail. The ACKed prefix exists
+  on every committed member → min over healthy replicas ≥ ACK, so no acknowledged data is
+  lost; bytes beyond the healthy committed length are un-ACKed speculative writes, and
+  sealing them off is correct. New writes land in the new tail. An extent that is already
+  sealed is not sealed again; it is isolated directly + handled by its fixed
+  `sealed_length`.
+- **I4 fencing**: the report carries `owner_epoch + partition_id + log_stream_id +
+  extent_id + eversion`; the manager checks four layers before touching layout —
+  ① the reporter must hold the partition's current owner_epoch; ② the log_stream must
+  belong to that partition; ③ the extent must be a member of that log_stream; ④ the
+  eversion must match the current one. Any mismatch → `CODE_PRECONDITION`, so a stale PS
+  cannot change layout and cannot isolate another partition's replicas.
+- **I5 etcd-first**: clearing avali / bumping eversion first goes to etcd via
+  `persist_extent`; only on success is memory written, and before writing memory a
+  verify-at-apply runs (insert only if the live eversion still equals the reported
+  snapshot, otherwise reject, so a stale clone never overwrites a concurrent mutator).
+- **I7 clean-source selection**: during the cross-replica re-read, a slot with `avali=0`
+  is not a candidate clean source (it is already isolated; untrustworthy even if it
+  decodes cleanly this time); **a read error ≠ corruption** (node unreachable / timeout
+  is transient, does not enter the bad-replica set, and an unreachable node is never
+  isolated); the verdict uses WAL V1 CRC decoding, not just length checks; if no
+  reachable replica is clean → fail loud, never "longest wins".
+- **I8 the re-read window aligns with carry**: the cross-replica re-read starts at
+  `buf_base = cur_off - carry.len()` and reads `carry.len() + got` bytes; after switching
+  replicas, consumed / carry / record_extent_off are recomputed (otherwise a bad carry
+  would misjudge a healthy replica, and VP offsets would be misaligned). The request is
+  for the **full window** (`want_full`), not the possibly truncated `buf.len()` — a
+  truncated serving replica must not shrink the window asked of a clean replica.
+- **I9 guarantee boundary**: strong integrity applies only to V1 WAL (with CRC). V0
+  legacy has no CRC; a bit-flip that does not cross a length boundary makes `decode_one`
+  return `Ok` outright, so the self-heal report can only mark it `legacy_unchecked` and
+  does not claim 2^-32.
 
-## 边界（当前实现的已知缺口）
+## Limits (known gaps in the current implementation)
 
-- **隔离不是永久的**：manager `recovery_dispatch_loop` 把 `avali & bit == 0` 当成
-  "该副本需要修"，会向该 node 发 `EXT_MSG_RE_AVALI`；而 bit-rot 副本长度是完整的，
-  EN 的 `handle_re_avali` 在 `local_len >= sealed_length` 时直接返回 `CODE_OK`，
-  manager 随即 `mark_extent_available` 把 `avali` 位重新置上。所以对**内容损坏**
-  （非长度缺失）的副本，隔离只在这次 open 的读窗口内成立，随后会被 recovery 环撤销。
-  真正复活坏副本需要 forced-overwrite（staging + WAL-CRC 校验 + 原子 rename）——
-  未实现；`re_avali` 按长度判"最新"，对 bit-rot 无效。
-- **EN 侧没有本地 quarantine**：坏 node 不会本地标记数据损坏、也不会拒绝
-  `build_read_future`（与 META-FAILCLOSED 的 `corrupt_meta` 不同形态）。隔离完全靠
-  manager 侧 `avali` + eversion 淘汰 client 缓存。
-- **VP 读不校验 WAL CRC**：`resolve_value` 不做 per-record CRC，所以 I1 的
-  "隔离先于 serving" 是用户 GET 大值不读到坏字节的唯一保障。
-- **A5 的 etcd 写是 blind put**（`extents/<id>`，不是 value-CAS），与
-  `apply_recovery_done` / `apply_ec_conversion_done` / split-seal 同一类残留
-  （manager CLAUDE.md note 33，reproduce-first 挂起）；靠 verify-at-apply 收口。
-- 初始 serving read 不返回 node_id：bit-rot 重读仍坏时可归因，超时不可归因
-  （按 I7 不隔离不可达副本）。
+- **Isolation is not permanent**: the manager's `recovery_dispatch_loop` treats
+  `avali & bit == 0` as "this replica needs repair" and sends `EXT_MSG_RE_AVALI` to that
+  node; but a bit-rotted replica has its full length, so the EN's `handle_re_avali`
+  returns `CODE_OK` straight away when `local_len >= sealed_length`, and the manager then
+  calls `mark_extent_available`, setting the `avali` bit again. So for a replica with
+  **content corruption** (as opposed to missing length), isolation holds only for the
+  read window of this open and is later undone by the recovery loop. Actually reviving a
+  bad replica needs a forced overwrite (staging + WAL-CRC check + atomic rename) — not
+  implemented; `re_avali` judges "latest" by length, which is useless against bit-rot.
+- **No local quarantine on the EN**: the bad node neither marks the data as corrupt
+  locally nor refuses `build_read_future` (a different shape from META-FAILCLOSED's
+  `corrupt_meta`). Isolation relies entirely on the manager-side `avali` + eversion
+  evicting client caches.
+- **VP reads do not check WAL CRC**: `resolve_value` does no per-record CRC, so I1's
+  "isolate before serving" is the only guarantee that a user GET of a large value does
+  not read bad bytes.
+- **The etcd write for the report is a blind put** (`extents/<id>`, not a value-CAS), the
+  same class of residue as `apply_recovery_done` / `apply_ec_conversion_done` /
+  split-seal (manager CLAUDE.md note 33, on hold pending a reproduction); closed off by
+  verify-at-apply.
+- The initial serving read does not return a node_id: when the bit-rot re-read is still
+  bad it can be attributed; a timeout cannot (per I7, unreachable replicas are not
+  isolated).
 
-## 否决的备选
+## Rejected alternatives
 
-- stream 层加 per-record CRC + 读自动 failover：侵入热路径、跨层、EC 不适用 →
-  放在 partition 层。
-- 直接 `re_avali` 修复：本地长度够就判"最新" → 对 bit-rot 无效。
-- 只 fail-loud 靠人工 fence：可用性不可接受。
-- best-effort 上报 + 不隔离就 serving：会变成"可用但返回坏数据"，比 fail-loud 更糟。
+- Per-record CRC in the stream layer + automatic failover on read: intrudes on the hot
+  path, crosses layers, does not apply to EC → keep it in the partition layer.
+- Repair directly with `re_avali`: it judges "latest" whenever the local length suffices →
+  useless against bit-rot.
+- Fail loud only and rely on manual fencing: unacceptable availability.
+- Best-effort report + serve without isolation: becomes "available but returns bad
+  data", worse than failing loud.

@@ -9,8 +9,8 @@
 # → 4 cluster restarts (size is client-side only; inner-loop).
 #
 # UCX legs need AUTUMN_BIND_HOST set to a RoCE NIC IP (see the UCX block
-# below); on 127.0.0.1 the script refuses them, so run `--tcp` there. The
-# committed baselines come from two invocations: `--tcp` on 127.0.0.1 and
+# below); on 127.0.0.1 the script refuses them, so run `--tcp` there. A
+# host's baselines come from two invocations: `--tcp` on 127.0.0.1 and
 # `--ucx` with the RoCE bind — docs/ops.md, next to the perf matrix.
 #
 # Client concurrency: `--threads 16` by default (override with --threads N).
@@ -18,8 +18,9 @@
 # scale via pipeline-depth — this is thread-per-core-correct on the client
 # side AND keeps each partition's single-threaded UCX worker on the PS
 # in its supported region (see "UCX cliff" note below).
-# The default point is 16t × d=8 = 128 in-flight; reference numbers per
-# transport / partition count / size live in perf/perf_baseline_*.json.
+# The default point is 16t × d=8 = 128 in-flight; this host's numbers per
+# transport / partition count / size live in perf/perf_baseline_*.json
+# (written by --update-baseline, not kept in the repository).
 # UCX 4 KB writes pay an rc round trip per small append.
 #
 # UCX cliff (after UcxEp stopped closing on Drop). Each
@@ -371,7 +372,7 @@ start_cluster_for() {
     # and keeps the baselines' replica count.
     unset AUTUMN_BOOTSTRAP_PRESPLIT AUTUMN_REPLICATION
     if (( SKIP_CLUSTER == 0 )); then
-        bash "$ROOT_DIR/cluster.sh" clean
+        bash "$ROOT_DIR/scripts/cluster.sh" clean
         await_ports_clear
         # fix: default to AUTUMN_EXTENT_SHARDS=4 so each EN process has 4
         # cores serving extent traffic (single-shard mode put all 3-replica
@@ -400,7 +401,7 @@ start_cluster_for() {
         # serialises on its single shard regardless of total shard count).
         AUTUMN_EXTENT_SHARDS="${AUTUMN_EXTENT_SHARDS:-8}" \
         AUTUMN_PS_PARTS_HINT="${ps_parts_hint_for_bench:-8}" \
-        AUTUMN_TRANSPORT="$mode" bash "$ROOT_DIR/cluster.sh" start 3 \
+        AUTUMN_TRANSPORT="$mode" bash "$ROOT_DIR/scripts/cluster.sh" start 3 \
             "${cluster_3disk[@]}" \
             || { echo "[perf-check] FAILED to start cluster (mode=$mode parts=$parts)"; return 1; }
         prepare_bench_namespace "$mode" "$parts"
@@ -427,6 +428,6 @@ for mode in $TRANSPORT_LIST; do
 done
 
 # Final cluster cleanup so the matrix leaves no dangling processes.
-bash "$ROOT_DIR/cluster.sh" clean >/dev/null 2>&1 || true
+bash "$ROOT_DIR/scripts/cluster.sh" clean >/dev/null 2>&1 || true
 
 exit $OVERALL_RC

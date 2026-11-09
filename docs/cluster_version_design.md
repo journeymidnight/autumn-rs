@@ -1,254 +1,254 @@
-# rkyv、统一 Hello 与滚动升级计划
+# rkyv, unified Hello, and the rolling upgrade plan
 
-状态：RPC 准入、旧版本机制删除和运维流程已实现。
+Status: RPC admission, removal of the old version mechanism, and the operations procedure are implemented.
 
-## 本次实现的三项变化
+## The three changes implemented here
 
-1. **RPC 层显式版本检查**：每条连接在业务 decode 前完成 Hello；内部/admin 使用 WIRE_VERSION 相等检查，client 使用现有 [MIN_CLIENT_WIRE_VERSION, WIRE_VERSION] 区间检查。版本不匹配明确返回双方版本及拒绝原因，与传输错误、身份错误和业务 decode 错误区分；不是等 decode 失败后猜测是否在升级。
-2. **删除 cluster_version 和 cluster bump 机制**：删除 manager 的 etcd 版本 latch、启动/replay 检查、查询与 bump RPC，以及 autumn-op 的 cluster-version、upgrade-version 命令。不再以 cluster_version 判断持久化兼容或限制回滚；持久化变更按每次发布单独处理。冻结响应中的历史字段不改变已有编码，退役后仅作保留占位；旧 opcode 不复用，cluster_id 和 ownership generation 保留。
-3. **更新 docs/ops.md 的一般升级流程**：记录原 policy 并切换为 Off，停止新的管理任务，等待 compaction、EC、GC、split/merge、rebalance 等已派发任务结束，核查 recovery 和 PS 本地后台任务；再 drain、替换、验证恢复，最后恢复原 policy。首次统一 Hello 使用已确定的 stopworld；后续在持久化兼容、现有 fencing/恢复机制保证已 ACK 数据不丢失的条件下，允许有 RPC 失败、超时、结果未知和短暂不可用的 rolling upgrade，wire 改变也适用。
+1. **Explicit version check at the RPC layer**: every connection completes Hello before any business decode; internal/admin connections use a WIRE_VERSION equality check, clients use the existing [MIN_CLIENT_WIRE_VERSION, WIRE_VERSION] range check. A version mismatch explicitly returns both sides' versions and the rejection reason, distinct from transport errors, identity errors and business decode errors; we do not wait for a decode failure and then guess whether an upgrade is in progress.
+2. **Remove cluster_version and the cluster bump mechanism**: remove the manager's etcd version latch, the startup/replay checks, the query and bump RPCs, and autumn-op's cluster-version and upgrade-version commands. cluster_version is no longer used to judge persistence compatibility or to restrict rollback; persistence changes are handled per release. Historical fields in frozen responses keep their existing encoding and remain only as reserved placeholders after retirement; old opcodes are not reused; cluster_id and ownership generation are kept.
+3. **Update the general upgrade procedure in docs/ops.md**: record the original policy and switch it to Off, stop new management tasks, wait for already-dispatched compaction, EC, GC, split/merge, rebalance and similar tasks to finish, and check recovery and PS-local background tasks; then drain, replace, verify recovery, and finally restore the original policy. The first rollout of unified Hello uses the decided stopworld; afterwards, provided persistence is compatible and the existing fencing/recovery mechanisms guarantee that ACKed data is not lost, a rolling upgrade that allows RPC failures, timeouts, unknown results and brief unavailability is permitted, and this applies to wire changes as well.
 
-后文是这三项变化的实现与验收细节；保留 rkyv、现有客户端兼容区间，以及持久化按次分析的方式。
+The rest of this document gives the implementation and acceptance details of these three changes; rkyv, the existing client compatibility range, and per-change persistence analysis are retained.
 
-## 1. 决策与范围
+## 1. Decisions and scope
 
-1. RPC 保留 rkyv，不迁移 Protobuf，不新增 proto/protoc。
-2. 所有业务 RPC 连接先完成稳定的 bootstrap Hello。内部 peer 和 admin 要求 WIRE_VERSION 相等；客户端按 client_wire_version 兼容规则准入。
-3. 连接准入与请求准入都在必经入口执行。通过客户端兼容窗口不代表可以调用内部或 admin RPC。
-4. **首次上线统一 Hello 采用 stopworld**：同步更新 manager、PS、EN、SDK、autumn-op 及其他后台调用方，关闭旧连接。不要求这次迁移兼容无 Hello 的旧连接；保留现有 WIRE_VERSION 与 MIN_CLIENT_WIRE_VERSION 及客户端区间准入机制。
-5. **WIRE_VERSION 改变也可以 rolling upgrade**：不同 wire 的进程可以在逐实例替换期间暂时并存，但异 wire 内部 RPC 一律在 Hello 阶段拒绝，不解码或执行业务。不支持跨 wire 互通，也不引入双 codec；混合阶段允许 RPC 失败、超时和业务暂时不可用，最终收敛为同一 wire。持久化是否允许滚动升级按具体改动单独判断。
-6. 持久化格式改动很少，涉及改动时逐次分析受影响的 reader/writer、格式与恢复语义，单独确定转换与停机范围；本计划不建设统一持久化 read/write 入口，也不引入统一 cluster_version/storage epoch gate。
+1. RPC keeps rkyv; no migration to Protobuf, no new proto/protoc.
+2. Every business RPC connection first completes a stable bootstrap Hello. Internal peers and admin require equal WIRE_VERSION; clients are admitted by the client_wire_version compatibility rules.
+3. Connection admission and request admission both run at mandatory entry points. Passing the client compatibility window does not mean a connection may call internal or admin RPCs.
+4. **The first rollout of unified Hello uses stopworld**: manager, PS, EN, SDK, autumn-op and other background callers are updated together, and old connections are closed. This migration is not required to be compatible with old connections that have no Hello; the existing WIRE_VERSION and MIN_CLIENT_WIRE_VERSION and the client range admission mechanism are kept.
+5. **A WIRE_VERSION change can also be a rolling upgrade**: processes with different wires may coexist temporarily during instance-by-instance replacement, but cross-wire internal RPCs are always rejected at the Hello stage and no business is decoded or executed. Cross-wire interoperation is not supported and no dual codec is introduced; the mixed phase allows RPC failures, timeouts and temporary business unavailability, and eventually converges on a single wire. Whether persistence permits a rolling upgrade is decided separately for each specific change.
+6. Persistent format changes are rare; when one happens, the affected readers/writers, format and recovery semantics are analyzed for that change, and the conversion and downtime scope are decided separately. This plan does not build a unified persistence read/write entry point and does not introduce a unified cluster_version/storage epoch gate.
 
-本文不采用 Protobuf 或统一 storage epoch。首次握手机制迁移按已确定的 stopworld 执行；机制落地后，wire 改变本身不要求 stopworld。持久化变化仍逐次处理，必要时可要求停写或 stopworld。
+This document adopts neither Protobuf nor a unified storage epoch. The first handshake mechanism migration runs as the decided stopworld; once the mechanism is in place, a wire change by itself does not require stopworld. Persistence changes are still handled case by case and may require stopping writes or stopworld when necessary.
 
-## 2. 版本的职责
+## 2. Responsibilities of each version
 
-| 项目 | 职责 | 变更规则 |
+| Item | Responsibility | Change rule |
 |---|---|---|
-| WIRE_VERSION | 内部及 admin RPC 的布局、编码和协议语义硬边界；也是当前客户端协议上界 | 改变布局或不兼容语义时 bump；不是每次发布都 bump |
-| client_wire_version | 客户端连接声明的协议版本 | 按客户端兼容规则判断；不能代替内部 peer exact-match |
-| MIN_CLIENT_WIRE_VERSION | 当前实现真实支持的客户端协议下界 | 保留现有下界；只有实际收紧客户端兼容范围时才调整，不能因服务端发布或内部 wire bump 自动提高 |
-| bootstrap 协议标识/版本 | 业务版本检查之前的固定握手格式 | 独立于业务 DTO 冻结；未知 bootstrap 版本拒绝，不尝试业务解码 |
-| 现有格式版本（如有） | 具体持久化格式的解释依据 | 涉及该格式改动时按本次迁移方案处理，不要求统一补齐版本或 envelope |
+| WIRE_VERSION | Hard boundary for layout, encoding and protocol semantics of internal and admin RPCs; also the current upper bound of the client protocol | Bump when layout or semantics change incompatibly; not bumped on every release |
+| client_wire_version | Protocol version declared by a client connection | Judged by the client compatibility rules; cannot replace internal peer exact-match |
+| MIN_CLIENT_WIRE_VERSION | Lower bound of the client protocol the current implementation truly supports | Keep the existing lower bound; adjust only when the client compatibility range is actually tightened, never raised automatically by a server release or an internal wire bump |
+| bootstrap protocol identifier/version | Fixed handshake format ahead of the business version check | Frozen independently of business DTOs; unknown bootstrap versions are rejected without attempting business decode |
+| Existing format versions (if any) | Basis for interpreting a specific persistent format | When that format changes, handled by that change's migration plan; no requirement to retrofit versions or envelopes uniformly |
 
-rkyv 不提供 Protobuf 式字段增补兼容：新增 Option 字段也可能改变 archived layout，需要判断并 bump wire。普通优化、修复和未改变协议的发布不 bump。客户端 surface 改变时须保留真实旧入口/类型，或明确收紧兼容范围；不能仅用整数窗口声称兼容。
+rkyv does not offer Protobuf-style field-addition compatibility: even adding an Option field can change the archived layout, which has to be assessed and may require a wire bump. Ordinary optimizations, fixes and releases that do not change the protocol do not bump. When the client surface changes, the real old entry points/types must be kept, or the compatibility range must be explicitly tightened; compatibility cannot be claimed by an integer window alone.
 
-当前 WIRE_VERSION = 54、MIN_CLIENT_WIRE_VERSION = 43。新增 Hello 不自动 bump wire 或提高客户端下界；业务协议确有变化时，再按相应变更规则处理。
+Currently WIRE_VERSION = 54 and MIN_CLIENT_WIRE_VERSION = 43. Adding Hello does not automatically bump the wire or raise the client lower bound; when the business protocol really changes, the corresponding change rule applies.
 
-客户端连接时使用现有区间检查：服务端提供 [MIN_CLIENT_WIRE_VERSION, WIRE_VERSION]，客户端声明的 client_wire_version 必须位于该区间。当前 SDK 使用自身 WIRE_VERSION 作为声明值。这是客户端所用协议与服务端支持集合有交集；不把内部 peer 的准入改成区间 overlap。内部成员只使用 WIRE_VERSION exact-match。
+Clients use the existing range check at connect: the server offers [MIN_CLIENT_WIRE_VERSION, WIRE_VERSION], and the client's declared client_wire_version must fall within it. The current SDK declares its own WIRE_VERSION. This expresses that the protocol the client uses intersects the set the server supports; internal peer admission is not changed to range overlap. Internal members use only WIRE_VERSION exact-match.
 
-“内部不允许混合 wire”指不允许不同 wire 之间建立可用业务 RPC 连接，不要求部署中的全部进程始终只有一种 wire。升级期间 manager、PS、EN 可以存在不同 wire 的进程；它们只与相同 wire 的对端通信。异 wire 的注册或业务请求被拒绝，依赖未满足的节点保持等待，最终全体收敛。同 wire 的不同 build/commit 不因源码差异被拒绝，客户端兼容区间也不参与内部 peer exact-match。
+"No mixed wire internally" means no usable business RPC connection may be established between different wires; it does not require every process in a deployment to be on a single wire at all times. During an upgrade, manager, PS and EN processes with different wires may exist; they communicate only with peers on the same wire. Cross-wire registration or business requests are rejected, nodes whose dependencies are not met keep waiting, and everything eventually converges. Different builds/commits on the same wire are not rejected because of source differences, and the client compatibility range plays no part in internal peer exact-match.
 
-统一 Hello 是连接准入的另一个条件。首次 stopworld 更新旧 SDK 的握手实现，不借此自动收紧其业务协议支持区间；仍保留区间内实际支持的客户端入口、类型与行为。区间声明不能替代必需的 Hello，也不能单独证明未更新握手的历史 binary 可以连接。
+Unified Hello is an additional condition for connection admission. The first stopworld updates the handshake implementation of old SDKs without using that to automatically tighten their supported business protocol range; the client entry points, types and behavior actually supported within the range are kept. The range declaration cannot replace the required Hello, nor can it on its own prove that a historical binary with a non-updated handshake can connect.
 
-现有 MSG_CLIENT_HELLO、GetClusterIdResp 等冻结编码不直接加字段、改变含义或复用为新的 role 编码。新 bootstrap 使用独立、明确的标识；旧 Hello 不能使未校验连接成为可用业务连接。保留历史字段不等于继续接受旧握手。
+Existing frozen encodings such as MSG_CLIENT_HELLO and GetClusterIdResp are not directly extended with fields, given new meanings, or reused as new role encodings. The new bootstrap uses its own explicit identifier; the old Hello cannot turn an unchecked connection into a usable business connection. Keeping historical fields does not mean continuing to accept the old handshake.
 
-删除现有 etcd cluster_version latch 的读写、启动/replay 检查、查询/bump RPC 和 cluster-version、upgrade-version 命令（cluster bump）。GetClusterIdResp 等冻结编码中的历史字段保持占位，不再承载有效版本状态；退役 opcode 保留编号，不复用。遗留 etcd key 不再读取或影响行为，清理可单独安排。不得误删 cluster_id/ownership generation，也不能因为移除旧 latch 就默认旧 build 可安全回滚。
+Remove the reads and writes of the existing etcd cluster_version latch, the startup/replay checks, the query/bump RPCs, and the cluster-version and upgrade-version commands (cluster bump). Historical fields in frozen encodings such as GetClusterIdResp remain as placeholders and no longer carry valid version state; retired opcodes keep their numbers and are not reused. Leftover etcd keys are no longer read and do not affect behavior; cleaning them up can be scheduled separately. cluster_id/ownership generation must not be removed by mistake, and removing the old latch does not by default mean an old build can be safely rolled back to.
 
-## 3. 已接入的连接路径
+## 3. Connection paths covered
 
-- manager、PS、EN 的 listener 均先完成 `version_hello::accept`，再对 Peer / Admin 连接完成 `peer_auth::accept`（集群密钥，见 `cluster_secret_design.md`），然后才创建业务 `FrameDecoder`。
-- `RpcClient::connect` / `from_conn` 在启动业务 reader/writer 前完成两步握手（VERSION_HELLO，Peer / Admin 再加 PEER_AUTH）。默认 peer；SDK 使用 client，autumn-op 使用 admin，EN 身份检查和注册显式使用 peer。
-- `ConnPool` 的角色在构造时固定；失败握手不会进入连接池。SDK 到 EN 的 direct-read 池独立使用 client。
-- manager、PS、EN 在分派或批量 append 合并前执行 role × opcode 检查。role 只是声明，Peer / Admin 由 PEER_AUTH 证明；capability（CLIENT_AUTH）、cluster_id、ownership 检查继续执行。
-- PS 获取 owner lock 和注册、EN 校验 manager 身份和注册，在明确的 wire mismatch 或暂时传输故障时等待重试，不跳过版本检查。身份、授权、存储异常仍返回错误。
+- The manager, PS and EN listeners all first complete `version_hello::accept`, then complete `peer_auth::accept` for Peer / Admin connections (cluster secret, see `cluster_secret_design.md`), and only then create the business `FrameDecoder`.
+- `RpcClient::connect` / `from_conn` complete the two-step handshake (VERSION_HELLO, plus PEER_AUTH for Peer / Admin) before starting the business reader/writer. The default is peer; the SDK uses client, autumn-op uses admin, and EN identity checks and registration explicitly use peer.
+- A `ConnPool`'s role is fixed at construction; a failed handshake never enters the pool. The SDK's direct-read pool to EN independently uses client.
+- The manager, PS and EN run the role × opcode check before dispatch or before merging batched appends. The role is only a declaration; Peer / Admin is proven by PEER_AUTH. Capability (CLIENT_AUTH), cluster_id and ownership checks still run.
+- PS acquiring the owner lock and registering, and EN verifying the manager's identity and registering, wait and retry on an explicit wire mismatch or a transient transport failure, without skipping the version check. Identity, authorization and storage errors still return errors.
 
-## 4. 连接与请求的统一准入
+## 4. Unified admission for connections and requests
 
-### 4.1 bootstrap 的冻结边界
+### 4.1 The frozen bootstrap boundary
 
-统一版本握手命名为 VERSION_HELLO，常量 MSG_VERSION_HELLO = 0xF0（manager、PS、EN 共用）。使用新 magic AUPH，bootstrap_version 初始为 1；既有 MSG_CLIENT_HELLO = 0x5F 的冻结编码不修改。VERSION_HELLO 使用独立冻结的固定格式解析，不依赖 rkyv 或业务 FrameDecoder。
+The unified version handshake is named VERSION_HELLO, with the constant MSG_VERSION_HELLO = 0xF0 (shared by manager, PS and EN). It uses the new magic AUPH, and bootstrap_version starts at 1; the frozen encoding of the existing MSG_CLIENT_HELLO = 0x5F is not modified. VERSION_HELLO is parsed with its own independently frozen fixed format and does not depend on rkyv or the business FrameDecoder.
 
-CLIENT_AUTH = 0x55 是既有 SDK → PS 认证消息，仍使用现有 rkyv 编码：请求 ClientAuthReq { token: Vec<u8> }，响应 ClientAuthResp { code: u8, message: String }。客户端连接先完成 VERSION_HELLO，再按现有认证配置执行 CLIENT_AUTH（PS；开启 authz 时也包括 EN 的直读连接）。Peer / Admin 连接在 VERSION_HELLO 之后执行 PEER_AUTH（MSG_PEER_AUTH = 0xF1，与 VERSION_HELLO 同一冻结帧格式），证明持有集群密钥。版本 Hello 的 role 仅作协议声明，不授予身份或权限。
+CLIENT_AUTH = 0x55 is the existing SDK → PS authentication message and still uses the existing rkyv encoding: request ClientAuthReq { token: Vec<u8> }, response ClientAuthResp { code: u8, message: String }. A client connection first completes VERSION_HELLO, then runs CLIENT_AUTH according to the existing auth configuration (PS; with authz on, also EN direct-read connections). Peer / Admin connections run PEER_AUTH after VERSION_HELLO (MSG_PEER_AUTH = 0xF1, same frozen frame format as VERSION_HELLO) to prove they hold the cluster secret. The role in the version Hello is only a protocol declaration and grants no identity or permission.
 
-bootstrap 使用固定二进制格式，包含协议标识/版本、连接角色、声明的 wire/client 版本。请求、成功响应和拒绝响应都不能依赖可变的 rkyv DTO。响应明确携带目标服务类型、服务端 wire、客户端兼容范围和失败原因，连接发起方也必须校验，不能仅依赖 listener 单向判断。
+The bootstrap uses a fixed binary format containing the protocol identifier/version, connection role, and declared wire/client versions. Requests, success responses and rejection responses must not depend on mutable rkyv DTOs. The response explicitly carries the target service type, the server wire, the client compatibility range and the failure reason, and the initiating side must check it too, rather than relying on a one-way decision by the listener.
 
-冻结范围覆盖 bootstrap 外层 framing、字段宽度、字节序、长度上限和错误结果，而不只是 Hello payload。握手不得依赖可能随业务 wire 改变的 FrameDecoder 才能读出版本。当前实现的固定格式如下（整数均为 little-endian）：
+The frozen scope covers the bootstrap's outer framing, field widths, byte order, length limits and error results, not just the Hello payload. The handshake must not depend on a FrameDecoder that may change with the business wire in order to read the version. The fixed format of the current implementation is as follows (all integers little-endian):
 
-外层：`req_id:u32=1 | opcode:u8=0xF0 | flags:u8 | payload_len:u32 | ctrl_len:u32 | ctrl | crc32c:u32`。
-`flags` 请求为 0、响应为 1；`payload_len=ctrl_len+8`；CRC 覆盖 header、ctrl_len 与 ctrl，无 value tail。
-这一 framing 单独实现，不随业务 Frame/FrameDecoder 改变。请求总长 34 字节，响应总长 40～296 字节。
+Outer: `req_id:u32=1 | opcode:u8=0xF0 | flags:u8 | payload_len:u32 | ctrl_len:u32 | ctrl | crc32c:u32`.
+`flags` is 0 for requests and 1 for responses; `payload_len=ctrl_len+8`; the CRC covers header, ctrl_len and ctrl, with no value tail.
+This framing is implemented separately and does not change with the business Frame/FrameDecoder. A request is 34 bytes in total; a response is 40–296 bytes in total.
 
-| ctrl | 字段，按发送顺序 |
+| ctrl | Fields, in send order |
 |---|---|
-| 请求，16 字节 | `magic[4]=AUPH, bootstrap_version:u16=1, role:u8, reserved:u8=0, wire_version:u32, client_version:u32` |
-| 响应，22+n 字节 | `magic[4]=AUPH, bootstrap_version:u16=1, verdict:u8, service:u8, wire_version:u32, min_client:u32, max_client:u32, message_len:u16, message[n]` |
+| Request, 16 bytes | `magic[4]=AUPH, bootstrap_version:u16=1, role:u8, reserved:u8=0, wire_version:u32, client_version:u32` |
+| Response, 22+n bytes | `magic[4]=AUPH, bootstrap_version:u16=1, verdict:u8, service:u8, wire_version:u32, min_client:u32, max_client:u32, message_len:u16, message[n]` |
 
-角色：client=1、peer=2、admin=3；目标服务：manager=1、PS=2、EN=3。
-结果：成功=0、wire 不匹配=1、client 不匹配=2、malformed=3、bootstrap 不匹配=4。
-peer/admin 的 client_version 必须为 0；客户端以 client_version 判断区间。原因消息最多 256 字节。
-握手及 RpcClient 的 connect+握手上限为 5 秒；调用方更短的预算优先。请求/成功响应固定字节、角色/版本边界和异常 framing 已有测试。
+Roles: client=1, peer=2, admin=3; target services: manager=1, PS=2, EN=3.
+Verdicts: success=0, wire mismatch=1, client mismatch=2, malformed=3, bootstrap mismatch=4.
+For peer/admin, client_version must be 0; a client is judged against the range by client_version. The reason message is at most 256 bytes.
+The handshake, and RpcClient's connect+handshake, are capped at 5 seconds; a shorter caller budget takes precedence. Fixed bytes of request/success response, role/version boundaries and abnormal framing are covered by tests.
 
-握手使用独立长度上限和超时；长度在读取或分配 body 前检查。未知协议、非法 role、malformed、无 Hello、无法获取版本或超时均拒绝并关闭连接，不通过 decode 失败猜测版本，不回退到无校验模式。
+The handshake uses its own length limit and timeout; the length is checked before reading or allocating the body. Unknown protocol, invalid role, malformed, no Hello, unobtainable version or timeout are all rejected and the connection closed; the version is never guessed from a decode failure, and there is no fallback to an unchecked mode.
 
-cluster_id/auth/ownership 校验继续独立执行；Hello 中的 role 是协议声明，不是身份或授权证明。只有完成所需的版本和身份校验后，连接才成为可用于业务的已校验连接。
+cluster_id/auth/ownership checks still run independently; the role in Hello is a protocol declaration, not proof of identity or authorization. Only after the required version and identity checks complete does a connection become a checked connection usable for business.
 
-### 4.2 角色与请求准入矩阵
+### 4.2 Role and request admission matrix
 
-| 连接角色 | 连接版本规则 | 允许的请求 |
+| Connection role | Connection version rule | Allowed requests |
 |---|---|---|
-| client | MIN_CLIENT_WIRE_VERSION ≤ client_wire_version ≤ 服务端 WIRE_VERSION | 明确列入客户端兼容 surface 的请求；按声明版本选择对应 codec/行为 |
-| peer（manager/PS/EN） | 本地与对端 WIRE_VERSION 相等 | 对应 peer 类型允许的内部请求，以及明确允许的共享请求 |
-| admin（autumn-op 等） | 本地与对端 WIRE_VERSION 相等 | 明确列入 admin surface 的请求，以及明确允许的共享请求；授权仍按现有规则执行 |
+| client | MIN_CLIENT_WIRE_VERSION ≤ client_wire_version ≤ server WIRE_VERSION | Requests explicitly listed in the client compatibility surface; the matching codec/behavior is chosen by the declared version |
+| peer (manager/PS/EN) | Local and remote WIRE_VERSION are equal | Internal requests allowed for that peer type, plus explicitly allowed shared requests |
+| admin (autumn-op, etc.) | Local and remote WIRE_VERSION are equal | Requests explicitly listed in the admin surface, plus explicitly allowed shared requests; authorization still follows the existing rules |
 
-已校验连接记录本地及远端服务类型、角色、版本和适用兼容规则。连接角色建立后不可更换；重复 Hello 不得重置准入状态，拒绝后不能再尝试另一角色进入业务。
+A checked connection records the local and remote service types, role, version and applicable compatibility rule. A connection's role cannot change once established; a repeated Hello must not reset the admission state, and after a rejection the connection cannot try another role to get into business.
 
-统一分派入口在解码业务 body 前检查 role × opcode × declared version。client 连接不能调用注册、内部 mutation 或 admin 请求；peer 连接不能自动获得 admin 权限。共享 opcode 必须显式登记可用角色及其布局/语义兼容范围，不能简单把所有共享请求都当作内部请求拒绝旧客户端。
+The unified dispatch entry checks role × opcode × declared version before decoding the business body. A client connection cannot call registration, internal mutations or admin requests; a peer connection does not automatically get admin rights. A shared opcode must explicitly register the roles allowed to use it and its layout/semantic compatibility range; shared requests cannot simply all be treated as internal requests that reject old clients.
 
-EN 注册与 startup identity check 显式使用 peer 模式；autumn-op 显式使用 admin 模式。普通 SDK 保持 client 模式。同一库供多个调用方使用时，通过构造入口和类型显式区分，不以库名或进程名推断角色。
+EN registration and the startup identity check explicitly use peer mode; autumn-op explicitly uses admin mode. The ordinary SDK stays in client mode. When one library serves several callers, they are distinguished explicitly through construction entry points and types; the role is never inferred from the library or process name.
 
-请求、响应、节点直连、池连接、批量、streaming、后台任务和 admin 路径都经过此入口。业务裸 codec 和原始连接分派限定在基础设施模块；业务 send/receive 只接受已校验连接。客户端历史 codec 依据已校验的声明版本选择，不能由业务 handler 自行猜测版本。
+Requests, responses, direct node connections, pooled connections, batch, streaming, background tasks and admin paths all go through this entry. Raw business codecs and raw connection dispatch are confined to infrastructure modules; business send/receive accept only checked connections. A client's historical codec is chosen from the checked declared version; a business handler must not guess the version on its own.
 
 ### 4.3 SDK → EN direct-read
 
-direct-read 是独立客户端连接：首次建连必须 Hello；EN 按 client_wire_version 与对应客户端读请求的兼容规则准入。不能因为请求绕过 PS、读取的是 bytes 或已经向 manager/PS 做过 Hello 而跳过检查。
+Direct-read is a separate client connection: the first connect must Hello; the EN admits it by client_wire_version and the compatibility rules for the corresponding client read requests. The check is not skipped because the request bypasses the PS, because it reads bytes, or because Hello was already done with the manager/PS.
 
-重连、连接池替换、换 replica/EN 地址均重新握手。连接池的复用条件至少包含地址、角色与版本/身份上下文，不能把同一地址的 client、peer、admin 连接混用。开启 authz 时，EN 只在 CLIENT_AUTH 绑定了有效 principal 的连接上服务直读（只验身份，不验 key 范围，见 `data_plane_authz_design.md` §10）；extent eversion 检查继续执行。
+Reconnects, pool replacement, and switching replica/EN address all redo the handshake. A pool's reuse key includes at least address, role and version/identity context; client, peer and admin connections to the same address are never mixed. With authz on, the EN serves direct reads only on connections whose CLIENT_AUTH bound a valid principal (identity only, no key-range check, see `data_plane_authz_design.md` §10); the extent eversion check still runs.
 
-首次发布不以旧 SDK 的 proxy fallback 代替 SDK 更新，也不因此自动提高 MIN_CLIENT_WIRE_VERSION。后续支持窗口内的客户端还须支持统一 Hello；新服务端需保留它实际使用的 direct-read 请求及相关 token/响应编码，或对具体不兼容变更明确收紧范围。
+The first release does not substitute the old SDK's proxy fallback for updating the SDK, nor does it automatically raise MIN_CLIENT_WIRE_VERSION because of it. Clients within the supported window from now on must also support unified Hello; a new server must keep the direct-read requests it actually uses and the related token/response encodings, or explicitly tighten the range for a specific incompatible change.
 
-### 4.4 连接生命周期
+### 4.4 Connection lifecycle
 
-连接状态为：未校验 → 握手中 → 已校验 → 关闭；拒绝、超时和传输错误进入关闭状态。连接只有在 Hello 成功后才能放入可用连接池或发送业务；不能在握手中排入业务帧。
+Connection states are: unchecked → handshaking → checked → closed; rejection, timeout and transport errors go to closed. A connection may be put into the usable pool or send business only after Hello succeeds; business frames cannot be queued during the handshake.
 
-每次新建连接、断线重连、连接池替换都重新 Hello。版本在连接建立时比较一次，正常消息不逐次查版本或 etcd；framing/length/codec 与请求角色准入仍逐条执行。
+Every new connection, reconnect after disconnect, and pool replacement redoes Hello. Versions are compared once at connection establishment; normal messages do not check the version or etcd per message; framing/length/codec and request role admission are still checked per message.
 
-普通替换进程会关闭旧 socket，新进程不得继承旧连接的校验状态。mismatch 连接不保留为可用连接；不能复用已编码旧布局的 buffer 发给新连接。重试的编码和发送必须经过新连接的校验与 codec 选择。
+Replacing a process normally closes the old sockets, and the new process must not inherit the old connections' checked state. A mismatched connection is not kept as usable; a buffer already encoded in the old layout must not be sent on a new connection. A retry's encoding and sending must go through the new connection's check and codec selection.
 
-## 5. mismatch、启动和请求恢复
+## 5. Mismatch, startup and request recovery
 
-内部 wire mismatch 表示当前对端不能通信，关闭连接并明确拒绝。它可以是 wire 滚动升级中的预期暂态；节点可保持已启动、依赖未就绪的等待状态，退避重连，直到对端也升级到相同 wire。异 wire 注册和业务不能放行；不能把重试当作跨 wire 兼容。
+An internal wire mismatch means the current peer cannot communicate; the connection is closed and explicitly rejected. It can be an expected transient during a wire rolling upgrade; a node may stay in a started-but-dependencies-not-ready waiting state and reconnect with backoff until the peer is also upgraded to the same wire. Cross-wire registration and business must not be let through; retrying must not be treated as cross-wire compatibility.
 
-等待状态须能通过本地诊断或管理平台观测，不能依赖被拒绝的业务 RPC 才能查看。错误记录双方版本、角色、客户端范围和原因；启动等待日志记录节点/目标、wire、错误链及下一次重试间隔。当前启动重连使用 1～5 秒退避；部署系统负责整体升级超时，后续可按规模加入抖动和专门等待指标。节点的长期等待和升级总超时分开，永久 mismatch 必须被报告，不能无限静默等待。
+The waiting state must be observable through local diagnostics or the management platform, not only through rejected business RPCs. Errors record both sides' versions, roles, client range and the reason; the startup wait log records node/target, wire, error chain and the next retry interval. Startup reconnect currently uses 1–5 second backoff; the deployment system owns the overall upgrade timeout, and jitter and dedicated wait metrics can be added later as scale requires. A node's long wait and the total upgrade timeout are kept separate; a permanent mismatch must be reported, never waited on silently forever.
 
-传输失败、节点重启中的暂时不可达与版本拒绝分别处理，新连接均重新 Hello。身份、授权失败与非法协议单独分类，不能被 wire 等待逻辑掩盖。移除 PS best-effort wire skip；无法完成检查时保持未校验状态，不先注册再等待验证。核查 EN 注册、启动检查和后台 worker 的固定 retry 上限，避免预期 mismatch 等待退化为反复退出重启。
+Transport failures, temporary unreachability during a node restart, and version rejections are handled separately, and new connections always redo Hello. Identity and authorization failures and invalid protocol are classified separately and must not be masked by the wire-wait logic. The PS best-effort wire skip is removed; if the check cannot complete, the connection stays unchecked, rather than registering first and verifying later. Check the fixed retry limits in EN registration, startup checks and background workers so that an expected mismatch wait does not degrade into repeated exit-and-restart.
 
-ConnPool 的限时调用以同一预算覆盖 connect、Hello、发送与响应；SDK 的连接初始化受首尝试预算限制。节点长期重连与单次调用分开。SDK 现有 routing retry 仍使用每次尝试的预算及有限次数，本次未新增全操作总 deadline；不能据此承诺整个 SDK 操作在单次 RPC timeout 内结束。取消未来尝试后不得重新排队；已发送业务请求仍可能执行。
+A ConnPool timed call covers connect, Hello, send and response with a single budget; SDK connection initialization is bounded by the first attempt's budget. A node's long-term reconnect is separate from a single call. The SDK's existing routing retry still uses a per-attempt budget and a finite count; no overall deadline per operation was added in this change, so it cannot be promised that a whole SDK operation finishes within a single RPC timeout. Future attempts that were cancelled must not be re-queued; a business request already sent may still execute.
 
-Hello 拒绝前未执行业务请求；业务发送后断线仍可能已经执行。对各写入口记录“未发送可重试”“已发送且可去重”“已发送但结果未知”的处理规则。沿用已有幂等/去重能力，不能因版本检查盲目重放 append、管理操作或已超时请求；缺少去重保证的入口返回结果未知或遵循现有查询/恢复流程。
+No business request has executed before a Hello rejection; after a business request is sent, a disconnect may still mean it executed. For each write entry point, record the handling rules for "not sent, retryable", "sent and deduplicable" and "sent but result unknown". Existing idempotency/dedup capabilities are reused; append, management operations or timed-out requests must not be blindly replayed because of the version check; entry points without a dedup guarantee return result-unknown or follow the existing query/recovery procedure.
 
-允许丢失的是未完成的 RPC 消息或响应，表现为明确失败、超时或结果未知；已 ACK 的持久化写不能丢失。升级期间节点判死、ownership 转移和后台恢复仍须遵守现有 fencing 与数据保护规则。Hello 拒绝只能证明异 wire 的业务没有被解码或执行，不能单独证明所有控制流程的数据安全。
+What may be lost is an unfinished RPC message or response, surfacing as an explicit failure, timeout or unknown result; an ACKed persistent write must not be lost. During the upgrade, node death detection, ownership transfer and background recovery must still obey the existing fencing and data protection rules. A Hello rejection proves only that cross-wire business was not decoded or executed; it cannot on its own prove the data safety of every control flow.
 
-## 6. 部署方式
+## 6. Deployment
 
-### 6.1 首次统一 Hello 上线：stopworld
+### 6.1 First rollout of unified Hello: stopworld
 
-这次部署覆盖角色准入迁移与 SDK → EN Hello，使用已确定的首次 stopworld，不将其等同于机制落地后的 wire 滚动升级。发布前列出全部调用方，包括 SDK/wheel、FUSE、S3 gateway、autumn-op、定时任务、迁移工具和其他后台进程，并明确停止、更新和恢复责任。
+This deployment covers the role admission migration and SDK → EN Hello, and uses the decided first stopworld; it is not to be equated with a wire rolling upgrade after the mechanism is in place. Before release, list every caller, including SDK/wheel, FUSE, S3 gateway, autumn-op, scheduled jobs, migration tools and other background processes, and assign responsibility for stopping, updating and restoring each.
 
-执行步骤在 docs/ops.md 落成可操作清单：
+The execution steps are written into docs/ops.md as an actionable checklist:
 
-1. 确认服务端、SDK 和工具的新 build 均已准备，现有客户端兼容区间及上线恢复方案已经验收；若涉及 persist 变化，另完成该次迁移验收。
-2. 停止新业务和后台管理写入，drain 已接收请求，记录未确定结果的操作；停止全部旧调用方及服务实例，确认旧 socket 已关闭，禁止旧进程自动拉起。
-3. 若本次同时涉及持久化布局或语义变化，按第 7 节为这次改动单独确定的停写/fencing、备份与转换顺序执行。stopworld 本身不能证明数据兼容。
-4. 部署全部新服务端、SDK 和工具。按演练验证的依赖顺序启动，在流量关闭状态下完成 Hello、身份检查、注册与恢复。
-5. 检查 leader、partition、replicas、读写和 EN direct-read；确认无未更新握手的旧调用方重连，且现有客户端区间与实际支持集合一致，再开放业务和后台任务。
+1. Confirm the new builds of servers, SDK and tools are all ready, and that the existing client compatibility range and the rollout recovery plan have passed acceptance; if persist changes are involved, also complete acceptance of that migration.
+2. Stop new business and background management writes, drain accepted requests, record operations with undetermined results; stop all old callers and service instances, confirm the old sockets are closed, and prevent old processes from being restarted automatically.
+3. If this release also involves persistent layout or semantic changes, follow the stop-write/fencing, backup and conversion order determined separately for this change under section 7. Stopworld by itself does not prove data compatibility.
+4. Deploy all new servers, SDK and tools. Start them in the dependency order validated in rehearsal, and complete Hello, identity checks, registration and recovery with traffic closed.
+5. Check leader, partitions, replicas, reads/writes and EN direct-read; confirm that no old caller with a non-updated handshake reconnects and that the existing client range matches the actually supported set; then open business and background tasks.
 
-上线失败时保持业务关闭，并执行已验证的恢复方案。有持久化变化时，不能直接回滚 binary 或跳过转换；未发生不兼容数据写入时，也要以兼容矩阵和实际状态确认可否整体回滚。
+If the rollout fails, keep business closed and run the validated recovery plan. With persistence changes, binaries cannot simply be rolled back and conversion cannot be skipped; even if no incompatible data was written, whether a full rollback is possible must be confirmed from the compatibility matrix and the actual state.
 
-旧 SDK/旧工具遗留进程必须被拒绝并可观测，不能将拒绝解释为需要临时放开校验。现有冻结 Hello/响应编码保留规则不意味着旧进程获得业务准入。
+Leftover processes of old SDKs/tools must be rejected and observable; a rejection must not be read as a reason to temporarily relax the check. The rules for keeping the existing frozen Hello/response encodings do not grant old processes business admission.
 
-### 6.2 后续升级的选择
+### 6.2 Choosing how to upgrade later
 
-| 发布变化 | 部署方式 |
+| Release change | Deployment |
 |---|---|
-| 同 wire、无持久化不兼容变化 | 正常 drain、逐实例重启和 Ready 等待 |
-| wire 改变、无 persist 变化或该次 persist 方案允许混合运行 | 逐实例或按依赖组替换；允许暂时 mismatch、RPC 失败和业务不可用；最终收敛为目标 wire |
-| 持久化不允许新旧 writer 共存 | 按本次格式分析停止有关 writer、fencing 与转换；必要时 stopworld |
-| bootstrap 冻结边界发生不兼容变化 | 单独制定握手机制迁移方案及调用方更新范围，不能直接套用普通 wire 滚动流程 |
+| Same wire, no incompatible persistence change | Normal drain, instance-by-instance restart and Ready wait |
+| Wire change, no persist change or that change's persist plan allows mixed running | Replace instance by instance or by dependency group; temporary mismatch, RPC failures and business unavailability are allowed; eventually converges on the target wire |
+| Persistence does not allow old and new writers to coexist | Stop the relevant writers, fence and convert according to this change's format analysis; stopworld if necessary |
+| Incompatible change to the frozen bootstrap boundary | Draw up a separate handshake mechanism migration plan and caller update scope; the ordinary wire rolling procedure cannot be applied directly |
 
-一般升级先记录 policy 的名称和模式，执行 auto-policy deactivate 并确认 Off，停止新的人工/外部后台管理任务，等待已派发的 compaction、EC、GC、split/merge、rebalance 等结束并检查结果，同时核查 recovery 和 PS 本地后台任务。policy Off 不等于所有后台任务都已暂停。确认后执行替换，恢复验证通过再恢复原 policy 名称与模式；详见 docs/ops.md。暂停 policy 与等待任务用于减少升级期间的干扰，不替代持久化兼容分析、drain、ownership fencing 与恢复保证。
+A general upgrade first records the policy name and mode, runs auto-policy deactivate and confirms Off, stops new manual/external background management tasks, waits for already-dispatched compaction, EC, GC, split/merge, rebalance and similar tasks to finish and checks their results, and also checks recovery and PS-local background tasks. Policy Off does not mean all background tasks are paused. After confirmation, perform the replacement, and once recovery is verified restore the original policy name and mode; see docs/ops.md for details. Pausing the policy and waiting for tasks reduces interference during the upgrade; it does not replace persistence compatibility analysis, drain, ownership fencing or recovery guarantees.
 
-后续 wire 改变不自动提高 MIN_CLIENT_WIRE_VERSION。保留客户端 surface 的兼容实现时，区间内客户端可以继续使用；admin 工具随内部 wire 更新。内部协议升级是否需要更新 SDK，依据该次客户端 surface 与握手变化决定，不要求每个内部 wire bump 都重建客户端。
+Later wire changes do not automatically raise MIN_CLIENT_WIRE_VERSION. While the compatible implementation of the client surface is kept, clients within the range can keep working; admin tools are updated with the internal wire. Whether an internal protocol upgrade requires updating the SDK depends on that change's client surface and handshake changes; not every internal wire bump requires rebuilding clients.
 
-版本拒绝阻止不同布局互相解码，但 retry 不会让不同 wire 的双方互通。同 wire 滚动重启需满足必要依赖和 replica/EC 服务预算；wire 改变的滚动升级明确接受依赖暂时不足造成的不可用，不能承诺无中断或所有请求自动成功。不可用持续时间由实际依赖和部署速度决定，不预设固定上限。
+Version rejection stops different layouts from decoding each other, but retry does not make two sides on different wires interoperate. A same-wire rolling restart must meet the necessary dependencies and the replica/EC service budget; a wire-change rolling upgrade explicitly accepts unavailability caused by temporarily insufficient dependencies and cannot promise zero interruption or that every request succeeds automatically. The duration of unavailability depends on the actual dependencies and deployment speed; no fixed upper bound is assumed.
 
-### 6.3 推进条件与最终恢复
+### 6.3 Progress conditions and final recovery
 
-同 wire rolling upgrade 采用 drain → 重启 → Hello/注册/恢复 → Ready → 下一实例的流程。每次替换前检查剩余实例和 replica/EC 的服务预算；新实例未 Ready 时停止推进，设置单实例与整体超时，并按本次恢复方案处理。
+A same-wire rolling upgrade follows drain → restart → Hello/registration/recovery → Ready → next instance. Before each replacement, check the remaining instances and the replica/EC service budget; stop advancing while a new instance is not Ready, set per-instance and overall timeouts, and handle failures per this change's recovery plan.
 
-wire 改变时不能无条件等待业务 Ready：新实例可能必须连接尚未升级的 manager/EN 才能 Ready，部署器等它 Ready 才升级下一实例就会卡住。区分“进程已启动、本地初始化完成并因已知 wire mismatch 等待”与“整体业务 Ready”，按演练确定的条件继续推进后续实例，或协调替换依赖组。身份、存储或其他初始化错误不能被当作预期 mismatch 忽略。
+With a wire change, the deployer cannot wait unconditionally for business Ready: a new instance may have to connect to a manager/EN that has not been upgraded yet before it can become Ready, and a deployer that waits for it to be Ready before upgrading the next instance will get stuck. Distinguish "process started, local initialization done, waiting because of a known wire mismatch" from "overall business Ready", and either advance subsequent instances under conditions established in rehearsal or coordinate replacing a dependency group. Identity, storage or other initialization errors must not be ignored as an expected mismatch.
 
-逐个 drain、停止并替换实例，关闭旧连接，新实例重新 Hello。有关 drain 或关闭步骤若因对端 mismatch 不能正常完成，使用该次演练验证的超时与恢复步骤，不能强制继续并假定已提交写一定安全。设置升级总超时、失败报告和恢复方案；防止旧进程意外拉起拖延版本收敛。
+Drain, stop and replace instances one at a time, close old connections, and let new instances redo Hello. If a drain or shutdown step cannot complete normally because of a peer mismatch, use the timeout and recovery steps validated in that rehearsal; do not force ahead on the assumption that committed writes are necessarily safe. Set a total upgrade timeout, failure reporting and a recovery plan; prevent old processes from being restarted unexpectedly and delaying version convergence.
 
-具体替换顺序通过真实拓扑验证，不能预设 manager → PS → EN 一定可行。演练观察心跳中断引发的节点判死、partition ownership 迁移、replica 恢复和 GC 行为，明确维护期间是否需要暂停有关控制任务。manager 经 etcd 选举的路径不受 Hello 保护，仍需验证领导权、共享状态和 ownership fencing 在版本切换期间保持正确；不以部署中同时存在不同 wire 的进程作为错误。
+The concrete replacement order is validated against the real topology; it cannot be assumed that manager → PS → EN always works. The rehearsal observes node death detection triggered by heartbeat interruption, partition ownership migration, replica recovery and GC behavior, and settles whether the related control tasks must be paused during maintenance. The manager's election path through etcd is not protected by Hello, so it must still be verified that leadership, shared state and ownership fencing stay correct across the version switch; processes on different wires coexisting in a deployment is not treated as an error.
 
-所有进程更新后检查 leader、注册、ownership、partition、replicas/EC 和业务恢复，验证已 ACK 写入可读且无错误删除，再宣布升级完成。
+After all processes are updated, check leader, registration, ownership, partitions, replicas/EC and business recovery, and verify that ACKed writes are readable and nothing was wrongly deleted, before declaring the upgrade complete.
 
-每次发布说明 wire、client surface 是否变化，以及是否涉及持久化布局/语义变化。wire 改变本身不要求 stopworld；涉及持久化变化时，先完成该次改动的升级分析，再决定允许的替换方式与停写范围。Hello 只保护 RPC，不保护磁盘数据或共享 etcd 状态。
+Each release states whether the wire and the client surface changed, and whether persistent layout/semantic changes are involved. A wire change by itself does not require stopworld; when persistence changes are involved, first complete that change's upgrade analysis, then decide the allowed replacement method and stop-write scope. Hello protects only RPC, not on-disk data or shared etcd state.
 
-### 6.4 缩小中断范围与时间
+### 6.4 Narrowing the scope and duration of interruption
 
-当前约束下，缩小中断首先依赖部署准备和实际依赖拓扑。全局 wire 精确匹配不提供新旧服务间的桥接；共享 manager、跨分区共享的 EN 会扩大影响范围，不能仅按进程数量推断受影响分区数量。当前 stream append 等待全部副本成功，不能按“保留多数副本即可继续写”的假设安排升级。
+Under the current constraints, narrowing interruption depends first on deployment preparation and the actual dependency topology. Global wire exact-match provides no bridge between old and new services; a shared manager and ENs shared across partitions widen the blast radius, so the number of affected partitions cannot be inferred from the number of processes alone. Stream append currently waits for all replicas to succeed, so the upgrade cannot be planned on the assumption that "keeping a majority of replicas is enough to keep writing".
 
-发布前完成 binary/image 分发、配置与数据兼容检查，并记录 partition → PS → 活跃 stream 的 EN 副本依赖、已封存数据的读取依赖和 manager 依赖。明确每批会影响哪些分区的读、写和控制请求；节点被多个分区共享时取实际影响集合，不能承诺逐分区隔离。
+Before release, complete binary/image distribution and config and data compatibility checks, and record the partition → PS → EN replica dependencies of active streams, the read dependencies of sealed data, and the manager dependencies. State which partitions' reads, writes and control requests each batch will affect; where a node is shared by several partitions, take the actual affected set, and do not promise per-partition isolation.
 
-wire 改变时，在验证 drain、ownership 和启动条件后，协调切换紧密相关的 PS/EN，使用有上限的并发缩短依赖版本不一致的时间。不能把整个发布做成每个实例等待完整业务 Ready 的长串行流程，也不能单靠提高并发保证业务正确。准备阶段不让新旧进程同时写同一数据目录或持有同一 partition ownership。
+With a wire change, after drain, ownership and startup conditions have been verified, switch closely related PS/EN in a coordinated way, using bounded concurrency to shorten the time dependencies are on mismatched versions. The whole release must not become a long serial process where each instance waits for full business Ready, nor can raising concurrency alone guarantee business correctness. During preparation, old and new processes must not write the same data directory or hold the same partition ownership at the same time.
 
-manager 领导权切换单独安排：先完成准备，再在协调的切换窗口更换 leader，避免新 manager 提前当选导致旧 wire 节点大面积失联。现有 etcd 自动选举没有升级版本门槛；若要提前启动新 manager standby，需补充并验证禁止提前竞选的控制，不能假定启动后自然保持 standby。旧 leader 也不能为已升级节点提供跨 wire 控制服务。
+Manager leadership switching is scheduled separately: finish preparation first, then change the leader in a coordinated switch window, so that a new manager is not elected early and cuts off large numbers of old-wire nodes. The existing etcd automatic election has no upgrade version threshold; to start a new manager standby early, a control that prevents early campaigning must be added and validated, and it cannot be assumed that it naturally stays standby after starting. The old leader also cannot provide cross-wire control service to upgraded nodes.
 
-升级前确定有界的维护范围，避免预期心跳中断触发无谓的 reassignment、recovery、rebalance 或 GC，延长业务恢复。现有 EN maintenance 与 PS 心跳判死分别核查，不把 EN maintenance 当作 PS 的升级保护；保留 ownership fencing 和维护范围外的真实故障处理，超时后明确恢复策略。
+Determine a bounded maintenance scope before the upgrade, so that expected heartbeat interruptions do not trigger needless reassignment, recovery, rebalance or GC that prolongs business recovery. The existing EN maintenance and PS heartbeat death detection are checked separately; EN maintenance is not treated as upgrade protection for PS. Ownership fencing and handling of real failures outside the maintenance scope are kept, with an explicit recovery strategy after timeout.
 
-版本拒绝须快速返回，与请求超时分开。读取路径在符合现有 committed-prefix/EC 规则时尽快选择可用副本，避免对每个拒绝端点耗尽完整 timeout；后台连接退避不能直接成为前台请求的长等待。一条业务路径恢复后即可恢复其服务，无需人为等待全部无关节点更新，但共享依赖可能使多个分区一起受阻。
+Version rejection must return quickly and be kept separate from request timeouts. When it complies with the existing committed-prefix/EC rules, the read path picks an available replica as soon as possible instead of exhausting the full timeout on each rejecting endpoint; background connection backoff must not directly become a long foreground request wait. Once a business path recovers, its service can resume without artificially waiting for all unrelated nodes to update, but shared dependencies may block several partitions together.
 
-验收分别测量不可读分区数、不可写分区数、最长连续中断、首个分区恢复时间和全量恢复时间。若要求 wire 改变时也严格限制为单个分区受影响，需要另行解决跨版本共享 manager 与 EN 的服务隔离；当前部署优化不能单独提供这个保证。
+Acceptance measures separately the number of unreadable partitions, the number of unwritable partitions, the longest continuous interruption, the time to first partition recovery, and the time to full recovery. If a wire change must also be strictly limited to affecting a single partition, service isolation of the shared manager and EN across versions has to be solved separately; the current deployment optimizations alone cannot provide that guarantee.
 
-## 7. 持久化变更按次处理
+## 7. Persistence changes are handled case by case
 
-项目持久化格式改动很少，每次涉及改动的升级单独处理。本计划只约定变更时需要说明的事项，不建设统一 read/write 入口、通用版本化 codec、全格式 envelope 或持久化防绕过框架。不以全局 cluster_version 数值证明数据兼容。
+The project's persistent formats change rarely, and each upgrade involving such a change is handled on its own. This plan only lists what must be stated when a change happens; it does not build a unified read/write entry point, a generic versioned codec, an all-format envelope, or an anti-bypass framework for persistence. A global cluster_version number is not used to prove data compatibility.
 
-### 7.1 触发条件与分析范围
+### 7.1 Triggers and scope of analysis
 
-发布没有持久化布局或语义变化时，明确记录“无 persist 变化”，不要求为 Hello 改造重构现有存储路径、补齐格式版本或安排转换。
+When a release has no persistent layout or semantic change, record "no persist change" explicitly; the Hello work does not require refactoring existing storage paths, retrofitting format versions or scheduling conversions.
 
-涉及 persist 变化时，仅分析受影响格式和相关路径。按本次改动需要决定是否使用现有格式版本、增加局部标识、保留历史 reader 或执行一次性转换，不预设统一机制。格式编号本身不能证明语义兼容。
+When persist changes are involved, analyze only the affected formats and related paths. Based on what the change needs, decide whether to use an existing format version, add a local marker, keep a historical reader or run a one-off conversion; no unified mechanism is presupposed. A format number by itself does not prove semantic compatibility.
 
-分析范围可包括受影响的 manager etcd records、SST/entry、WAL/value pointer、checkpoint/TableLocations、EN metadata、FS 元数据或 control records。存在关联的格式一起分析，并核查恢复、GC、compaction、repair、FUSE/SDK 等实际读写方；这不是要求本次发布完成全项目持久化目录改造。
+The scope of analysis can include the affected manager etcd records, SST/entry, WAL/value pointer, checkpoint/TableLocations, EN metadata, FS metadata or control records. Related formats are analyzed together, and the actual readers and writers such as recovery, GC, compaction, repair and FUSE/SDK are checked; this does not require the release to complete a project-wide persistence catalogue overhaul.
 
-应用 opaque value 不属于 Autumn schema；eversion/ownership generation 不等于格式版本。
+Opaque application values are not part of Autumn's schema; eversion/ownership generation is not a format version.
 
-### 7.2 单次变更说明
+### 7.2 Per-change statement
 
-1. 说明具体改变的布局或语义、受影响的 reader/writer，以及新旧 build 对相关数据的实际读写兼容性。
-2. 决定本次能否新旧进程共同运行；若不能，明确需要停止的 writer、drain/fencing 范围及是否 stopworld，不能依赖 Hello retry。
-3. 如需转换，给出本次 converter、执行顺序、服务启动/停止条件和必要资源；不需要转换时说明依据。
-4. 按受影响格式验证历史数据读取与恢复、转换结果及相关引用一致性。涉及 offset/VP/checkpoint/ownership 时验证对应关系；有新旧格式识别时，检查失败不能被误当作坏尾部或缺失数据而继续覆盖状态。
-5. 明确失败后的接续或恢复方案，以及是否允许直接回滚 binary；需要备份或反向转换时写出具体步骤。
-6. 将该次可执行升级与验收步骤写入 docs/ops.md 或本次迁移文档。
+1. State the specific layout or semantics changed, the affected readers/writers, and the actual read/write compatibility of old and new builds with the related data.
+2. Decide whether old and new processes can run together for this change; if not, state which writers must stop, the drain/fencing scope and whether stopworld is needed; do not rely on Hello retry.
+3. If conversion is needed, give this change's converter, execution order, service start/stop conditions and required resources; if not, state why.
+4. Verify historical data reads and recovery, the conversion result and the consistency of related references for the affected formats. When offset/VP/checkpoint/ownership are involved, verify the corresponding relationships; where old and new formats are distinguished, a failed check must not be mistaken for a bad tail or missing data and then overwrite state.
+5. State how to resume or recover after a failure, and whether direct binary rollback is allowed; when a backup or reverse conversion is needed, write out the concrete steps.
+6. Write the executable upgrade and acceptance steps for that change into docs/ops.md or that change's migration document.
 
-## 8. 防遗漏与性能
+## 8. Preventing omissions, and performance
 
-- 统一连接类型、RPC 分派与 codec 的模块可见性和 CI 架构检查约束绕过 Hello；审计直接使用 transport、rpc_oneshot、bulk、admin 和跨 shard 路径。
-- 固定字节测试覆盖 bootstrap 请求/成功/拒绝/外层 framing。bootstrap 格式变化必须走独立迁移决策，不能只更新测试期望值。持久化测试随具体改动安排，验证受影响历史数据、转换和恢复，不要求建立统一布局测试框架。
-- RPC 业务布局变更的 wire bump 由样本测试和 review 共同约束，不恢复全文件源码 fingerprint。编码不变但语义变化无法全部自动识别，review 检查升级分析和验收证据。
-- RPC 版本比较合并到 Hello，不引入每请求版本查询或全局锁。持久化检查沿用现有路径，需要调整时随具体格式改动处理。
-- 沿用 rkyv 性能路径。验证正常连接只握手一次，池复用不增加握手 RTT，client → EN direct-read 的带宽/延迟及 PS 负载无意外退化。
+- Module visibility of the unified connection type, RPC dispatch and codecs, plus CI architecture checks, prevent bypassing Hello; audit direct uses of transport, rpc_oneshot, bulk, admin and cross-shard paths.
+- Fixed-byte tests cover bootstrap request/success/rejection/outer framing. A change to the bootstrap format must go through a separate migration decision, not just an update to the tests' expected values. Persistence tests are arranged with each specific change, verifying the affected historical data, conversion and recovery; no unified layout testing framework is required.
+- Wire bumps for RPC business layout changes are enforced jointly by sample tests and review; the whole-file source fingerprint is not restored. Semantic changes with unchanged encoding cannot all be detected automatically; review checks the upgrade analysis and acceptance evidence.
+- The RPC version comparison is folded into Hello; no per-request version lookup or global lock is introduced. Persistence checks keep their existing paths and are adjusted along with specific format changes when needed.
+- The rkyv performance path is kept. Verify that a normal connection handshakes only once, pool reuse adds no handshake RTT, and client → EN direct-read bandwidth/latency and PS load show no unexpected regression.
 
-## 9. 实施阶段与退出条件
+## 9. Implementation phases and exit criteria
 
-阶段按依赖推进。首次 stopworld 部署必须等待前四阶段完成；后续同 wire 与 wire 改变的 rolling upgrade 分别验收。wire 改变不新增全局停机要求，持久化限制按具体升级单独处理。
+Phases advance by dependency. The first stopworld deployment must wait for the first four phases to complete; later same-wire and wire-change rolling upgrades are accepted separately. A wire change adds no global downtime requirement; persistence restrictions are handled per specific upgrade.
 
-| 阶段 | 交付 | 退出条件 |
+| Phase | Deliverables | Exit criteria |
 |---|---|---|
-| 1. 路径与协议审计 | 连接路径表、opcode 准入矩阵、精确 bootstrap 字节规范、现有客户端兼容区间 | 所有生产路径归类；peer/admin/client 的构造入口与冻结范围明确 |
-| 2. Hello 与请求准入 | 已校验连接类型、listener 状态机、各连接池及 SDK/工具改造 | 无 Hello、malformed、wire mismatch、错误角色均在业务解码前拒绝；覆盖 direct-read 和重连 |
-| 3. 启动与恢复 | 等待/Ready 状态、错误分类、mismatch 退避重连、绝对 deadline、写重试规则 | mismatch 业务拒绝且等待可观测；节点等待不被有限 retry 意外终止；超时/取消请求不继续重放 |
-| 4. 首次发布准备 | 旧 gate 依赖审计及退役、ops stopworld 清单、全调用方 build 清单；说明是否涉及 persist 变化 | 若涉及 persist 变化，该次迁移与恢复验收通过；实际支持集合与现有客户端区间一致；首次上线及失败恢复演练通过 |
-| 5. 首次部署 | 按第 6.1 节执行 stopworld | 全部服务端/调用方已更新、旧连接关闭、注册与业务恢复后才开放流量 |
-| 6. 后续升级流程 | 同 wire 不同 build 与不同 wire 的真实 rolling 演练、异 wire RPC 拒绝测试 | 同 wire Ready 后推进；wire 改变可在预期等待状态下推进；manager failover、升级超时、最终业务恢复及 ACK 数据验证通过 |
+| 1. Path and protocol audit | Connection path table, opcode admission matrix, exact bootstrap byte specification, existing client compatibility range | Every production path classified; construction entry points for peer/admin/client and the frozen scope are explicit |
+| 2. Hello and request admission | Checked connection type, listener state machine, changes to every connection pool and to the SDK/tools | No Hello, malformed, wire mismatch and wrong role are all rejected before business decode; covers direct-read and reconnect |
+| 3. Startup and recovery | Waiting/Ready states, error classification, mismatch backoff reconnect, absolute deadline, write retry rules | Mismatched business rejected and the wait observable; node waiting not unexpectedly terminated by a finite retry; timed-out/cancelled requests not replayed |
+| 4. First release preparation | Audit and retirement of old gate dependencies, ops stopworld checklist, build list for all callers; statement of whether persist changes are involved | If persist changes are involved, that migration and recovery pass acceptance; the actually supported set matches the existing client range; first rollout and failure recovery rehearsals pass |
+| 5. First deployment | Run stopworld per section 6.1 | Traffic opens only after all servers/callers are updated, old connections are closed, and registration and business have recovered |
+| 6. Later upgrade procedure | Real rolling rehearsals of same wire with different builds and of different wires; cross-wire RPC rejection tests | Same wire advances after Ready; a wire change can advance in the expected waiting state; manager failover, upgrade timeout, final business recovery and ACKed data verification pass |
 
-首次发布不安排全格式 envelope 补齐或统一持久化入口建设。旧 gate 的实际依赖在阶段 4 闭环；若本次确实改变 persist 格式，再单独完成第 7 节的分析与处理。后续每次 persist 改动重新制定升级步骤，不能沿用第一次 stopworld 的结论。
+The first release does not schedule retrofitting all-format envelopes or building a unified persistence entry point. The actual dependencies of the old gate are closed out in phase 4; if this release really changes a persist format, section 7's analysis and handling are completed separately. Every later persist change draws up its own upgrade steps and cannot reuse the conclusions of the first stopworld.
 
-### 9.1 必需验收场景
+### 9.1 Required acceptance scenarios
 
-1. Hello 成功/拒绝固定字节、未知 bootstrap 版本、非法长度、超时、无 Hello、错误服务类型和重复 Hello。
-2. 内部/admin wire 两方向 mismatch 均没有业务 body 被 rkyv 解码；client 冒用内部/admin opcode 在 body 解码前拒绝。
-3. EN 注册使用 peer、autumn-op 使用 admin；所有 ConnPool、rpc_oneshot、节点直连、跨 shard、bulk、streaming 和后台路径完成握手。
-4. SDK → EN direct-read 在支持的客户端版本下成功；EN 重启、换 replica、连接池替换后重新 Hello；同地址不同角色的连接不混用。
-5. 首次 stopworld 使用真实未更新握手的 SDK/工具验证遗留调用方被拒绝，使用更新后的 SDK 验证 direct-read；支持统一 Hello 的真实客户端验证现有区间的下界、内部及上界可用，区间外被拒绝，不靠伪造版本整数证明兼容。
-6. 异 wire 注册/业务 RPC 被拒绝，不能因 retry 或 best-effort skip 获得连接准入；节点可持续处于可观测等待，部署器可按既定条件推进后续实例；重启重连重新 Hello；单次请求在自己的 deadline 内结束，取消后不再重试。
-7. 已执行但响应丢失的写按各入口幂等/去重规则处理；无去重能力的操作不盲目重放；恢复后验证已 ACK 数据与 ownership。
-8. 首次 Hello stopworld、后续不同 wire 的 rolling upgrade 与同 wire rolling upgrade 分别演练。不同 wire 演练使用两个都支持统一 Hello 的真实 build，覆盖两个版本切换方向、manager failover、未 Ready 时推进、心跳中断后的控制任务和最终恢复；报告请求失败、超时、结果未知及业务中断范围，验证已 ACK 的持久化写不丢失。
+1. Hello success/rejection fixed bytes, unknown bootstrap version, invalid length, timeout, no Hello, wrong service type and repeated Hello.
+2. In both directions of an internal/admin wire mismatch, no business body is rkyv-decoded; a client using internal/admin opcodes is rejected before body decode.
+3. EN registration uses peer and autumn-op uses admin; every ConnPool, rpc_oneshot, direct node connection, cross-shard, bulk, streaming and background path completes the handshake.
+4. SDK → EN direct-read succeeds at supported client versions; Hello is redone after EN restart, replica switch and pool replacement; connections to the same address with different roles are not mixed.
+5. The first stopworld uses real SDKs/tools with non-updated handshakes to verify that leftover callers are rejected, and the updated SDK to verify direct-read; real clients supporting unified Hello verify that the lower bound, interior and upper bound of the existing range work and that anything outside the range is rejected, without proving compatibility by faking version integers.
+6. Cross-wire registration/business RPCs are rejected and cannot gain admission through retry or best-effort skip; a node can stay in an observable waiting state, and the deployer can advance subsequent instances under the agreed conditions; restart and reconnect redo Hello; a single request finishes within its own deadline and is not retried after cancellation.
+7. Writes that executed but whose responses were lost are handled per each entry point's idempotency/dedup rules; operations without dedup are not blindly replayed; after recovery, ACKed data and ownership are verified.
+8. The first Hello stopworld, later different-wire rolling upgrades, and same-wire rolling upgrades are rehearsed separately. The different-wire rehearsal uses two real builds that both support unified Hello, covering both switch directions, manager failover, advancing while not Ready, control tasks after heartbeat interruption, and final recovery; it reports request failures, timeouts, unknown results and the scope of business interruption, and verifies that no ACKed persistent write is lost.
 
-若本次涉及 persist 变化，另按该次变更说明验收受影响数据的兼容性、转换、恢复和回滚；这些验收不作为无 persist 变化的 Hello 发布的额外改造任务。
+If this release involves persist changes, the compatibility, conversion, recovery and rollback of the affected data are accepted separately per that change's statement; these acceptances are not extra retrofit tasks for a Hello release with no persist change.
 
-RPC 显式准入与 cluster_version/cluster bump 删除已实现。旧一次性 SST/FS 转换工具和旧持久化开关注释已删除；现有 SST/FS 格式拒绝检查保留。etcd 遗留 key 清理与历史数据转换不在本次实现范围内。上述发布演练与真实历史客户端兼容性验收由具体发布完成，不能以握手测试中声明的版本整数代替。
+RPC explicit admission and the removal of cluster_version/cluster bump are implemented. The old one-off SST/FS conversion tools and the old persistence-switch comments have been deleted; the existing SST/FS format rejection checks remain. Cleanup of leftover etcd keys and conversion of historical data are out of scope for this implementation. The release rehearsals above and acceptance against real historical clients are completed by the specific release and cannot be replaced by version integers declared in handshake tests.

@@ -101,8 +101,8 @@ for i in $(seq 1 50); do mountpoint -q "$MNT" && break; sleep 0.1; done
 mountpoint -q "$MNT" || { log "LAZYFS MOUNT FAIL"; tail "$W/lazyfs.stdout"; exit 1; }
 mkdir -p "$MNT/etcd"; mount --bind "$ETCD_REAL" "$MNT/etcd" || log "WARN etcd bind-mount failed (etcd will ride on LazyFS; relies on etcd's own fsync)"
 cd "$REPO"
-bash cluster.sh reset >/dev/null 2>&1 || true
-AUTUMN_NAMESPACES=mem bash cluster.sh start 1 > "$W/start1.log" 2>&1 || { log "cluster start FAIL"; tail -20 "$W/start1.log"; exit 1; }
+bash scripts/cluster.sh reset >/dev/null 2>&1 || true
+AUTUMN_NAMESPACES=mem bash scripts/cluster.sh start 1 > "$W/start1.log" 2>&1 || { log "cluster start FAIL"; tail -20 "$W/start1.log"; exit 1; }
 sleep 5
 log "cluster up (crash mode: $([[ $QUIESCE == 0 ]] && echo IMMEDIATE || echo "quiesced ${QUIESCE}s"))"
 
@@ -130,7 +130,7 @@ log "unsynced data dropped"
 
 # ==================== PHASE 4: restart + recover ===========================
 log "=== PHASE 4: restart cluster (recovery reloads checkpoint + replays WAL) ==="
-bash cluster.sh start 1 > "$W/start2.log" 2>&1 || { log "RESTART FAIL"; tail -25 "$W/start2.log"; }
+bash scripts/cluster.sh start 1 > "$W/start2.log" 2>&1 || { log "RESTART FAIL"; tail -25 "$W/start2.log"; }
 sleep 6
 if grep -qE 'cluster ready|partition: 127.0.0.1:23300' "$W/start2.log"; then log "cluster restarted + serving"; else log "WARN restart may be degraded"; tail -8 "$W/start2.log"; fi
 

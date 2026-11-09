@@ -3,7 +3,7 @@
 Test and verification drivers. None of them is needed to run a cluster; most
 back a section of [`docs/ops.md`](../docs/ops.md), which has the expected
 output and the environment each one needs. Most boot a throwaway cluster with
-[`cluster.sh`](../cluster.sh) (data under `AUTUMN_DATA_ROOT`, default
+[`cluster.sh`](cluster.sh) (data under `AUTUMN_DATA_ROOT`, default
 `/tmp/autumn-rs`) and need a Linux host with `etcd` in PATH; the FUSE ones need
 `libfuse3` and a user who may mount.
 

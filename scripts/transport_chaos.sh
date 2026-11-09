@@ -77,7 +77,7 @@ rm -rf "$AUTUMN_DATA_ROOT" /tmp/autumn-rs
 env AUTUMN_EXTENT_BASE_PORT=20000 \
     AUTUMN_BOOTSTRAP_PRESPLIT="4:hexstring" \
     AUTUMN_TRANSPORT="$T" \
-    bash "$ROOT/cluster.sh" start 3 > "$WORK/cluster.log" 2>&1
+    bash "$ROOT/scripts/cluster.sh" start 3 > "$WORK/cluster.log" 2>&1
 if ! grep -q "bootstrap succeeded" "$WORK/cluster.log"; then
     echo "cluster start failed:"; tail -20 "$WORK/cluster.log"; exit 1
 fi

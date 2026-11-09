@@ -6,7 +6,7 @@ text, and **HLS-encoded video** from the distributed KV store.
 ## Prerequisites
 
 - A running autumn-rs cluster (manager + extent nodes + ps). The simplest path
-  is `./cluster.sh start 3` from the repo root (after `cargo build --release
+  is `./scripts/cluster.sh start 3` from the repo root (after `cargo build --release
   --workspace`).
 - `ffmpeg` 4.x or newer in `$PATH`. Required for video transcoding and image
   thumbnail extraction. On macOS: `brew install ffmpeg`.
@@ -147,7 +147,7 @@ missing. This recovers in-flight transcodes from a process crash.
 
 ```bash
 # 1. Bring up cluster + gallery
-./cluster.sh start 3
+./scripts/cluster.sh start 3
 cargo run --release -p gallery -- --manager 127.0.0.1:9001 &
 
 # 2. Open the UI
@@ -185,7 +185,7 @@ done
 curl -sS -o /dev/null -w "%{http_code}\n" http://127.0.0.1:5001/get/sample.mp4   # expect 404
 
 # 7. Tear down
-./cluster.sh stop
+./scripts/cluster.sh stop
 ```
 
 In-browser verification: while ffmpeg runs the video shows in the separate

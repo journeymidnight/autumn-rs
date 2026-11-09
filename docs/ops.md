@@ -744,7 +744,7 @@ data root.
 **Verify** (dev cluster; each step must hold):
 
 ```bash
-bash cluster.sh reset 3
+bash scripts/cluster.sh reset 3
 DR=${AUTUMN_DATA_ROOT:-/tmp/autumn-rs}
 autumn-op --manager 127.0.0.1:9001 info              # refused: "... requires the cluster secret;
                                                      #  start this process with --cluster-secret-file"
@@ -1149,7 +1149,7 @@ A PS's series are PS-wide; under the charts, "hottest partitions" is the
 overview's current per-partition load, top 10 by iops (no per-partition history).
 
 ```bash
-./cluster.sh start 3
+./scripts/cluster.sh start 3
 # Each PS's reported endpoint (null = started with --metrics-port 0):
 autumn-op --manager $MGR --json overview | python3 -c '
 import json,sys
@@ -1917,7 +1917,7 @@ motivated the fix (3.12 GiB dead in 16.00 GiB = 0.195):
 
 ```bash
 # Default everything, including the 16 GiB extent seal size.
-AUTUMN_DATA_ROOT=/tmp/autumn-gcverify bash cluster.sh reset 3
+AUTUMN_DATA_ROOT=/tmp/autumn-gcverify bash scripts/cluster.sh reset 3
 AO=(autumn-op --manager 127.0.0.1:9001 --cluster-secret-file <DATA_ROOT>/cluster.secret)
 AC=(autumn-client --manager 127.0.0.1:9001 --namespace bench)
 
@@ -1975,7 +1975,7 @@ memtable before compacting. Check it end to end, deleting EVERYTHING — the
 compaction then keeps no entry, and its discards must still reach GC:
 
 ```bash
-AUTUMN_DATA_ROOT=/tmp/<scratch> AUTUMN_EXTENT_BASE_PORT=21000 bash cluster.sh reset 3
+AUTUMN_DATA_ROOT=/tmp/<scratch> AUTUMN_EXTENT_BASE_PORT=21000 bash scripts/cluster.sh reset 3
 AO=(autumn-op --manager 127.0.0.1:9001 --cluster-secret-file <DATA_ROOT>/cluster.secret)
 AC=(autumn-client --manager 127.0.0.1:9001 --namespace bench)
 
@@ -2025,7 +2025,7 @@ flush every ~1000 keys (each table ~4 MiB, far below `large_size`):
 
 ```bash
 AUTUMN_DATA_ROOT=/tmp/<scratch> AUTUMN_EXTENT_BASE_PORT=21000 \
-  AUTUMN_PS_FLUSH_MEM_BYTES=$((4<<20)) bash cluster.sh reset 3
+  AUTUMN_PS_FLUSH_MEM_BYTES=$((4<<20)) bash scripts/cluster.sh reset 3
 AO=(autumn-op --manager 127.0.0.1:9001 --cluster-secret-file <DATA_ROOT>/cluster.secret)
 AC=(autumn-client --manager 127.0.0.1:9001)
 
@@ -2173,7 +2173,7 @@ Pick one:
 - on Kubernetes, `kubernetes_sd_configs` with pod annotations.
 
 ```bash
-AUTUMN_TRANSPORT=tcp ./cluster.sh start 3
+AUTUMN_TRANSPORT=tcp ./scripts/cluster.sh start 3
 autumn-op --manager 127.0.0.1:9001 --cluster-secret-file $SECRET info --file-sd
 # [{"targets":["127.0.0.1:9801"],"labels":{"autumn_role":"ps","ps_id":"1"}}, {"targets":["127.0.0.1:9601"],"labels":{"autumn_role":"en","node_id":...}}, ...]
 curl -s http://127.0.0.1:9801/metrics   # PS
@@ -2322,7 +2322,7 @@ autumn-client --manager 127.0.0.1:9001 perf-check --threads 16 --duration 8 --si
 # 3. bytes survive a restart: put odd sizes, restart the whole cluster, compare
 for sz in 5000 1048577 3145851 17829887; do head -c $sz /dev/urandom > /tmp/v$sz
   autumn-client --manager 127.0.0.1:9001 --namespace bench put dio-$sz /tmp/v$sz; done
-AUTUMN_DISKS=<d1>,<d2>,<d3> ./cluster.sh restart 3 --3disk   # wait for 'partition server serving'
+AUTUMN_DISKS=<d1>,<d2>,<d3> ./scripts/cluster.sh restart 3 --3disk   # wait for 'partition server serving'
 for sz in 5000 1048577 3145851 17829887; do
   autumn-client --manager 127.0.0.1:9001 --namespace bench get dio-$sz | cmp - /tmp/v$sz && echo ok $sz; done
 ```
@@ -2696,20 +2696,20 @@ new tail:
 
 ```bash
 export AUTUMN_DATA_ROOT=/tmp/autumn-outcome AUTUMN_EXTENT_BASE_PORT=20000
-./cluster.sh reset 3
+./scripts/cluster.sh reset 3
 AC=(target/release/autumn-client --manager 127.0.0.1:9001 --namespace mem/demo)
 echo v0 | "${AC[@]}" put k0 /dev/stdin            # ok
-./cluster.sh stop-node 3
+./scripts/cluster.sh stop-node 3
 echo v1 | "${AC[@]}" put k1 /dev/stdin            # Error: put: write outcome unknown (it may or may not have been applied): …
 "${AC[@]}" get k1                                 # v1 — the record reached the two live copies; the reopen kept it
 echo v2 | "${AC[@]}" put k2 /dev/stdin            # Error: put: connection error: … this write was not applied: … not enough nodes
-kill -9 "$(cat $AUTUMN_DATA_ROOT/pids/ps.pid)"; ./cluster.sh start-ps
+kill -9 "$(cat $AUTUMN_DATA_ROOT/pids/ps.pid)"; ./scripts/cluster.sh start-ps
 "${AC[@]}" get k1                                 # v1 again: the answer never changes
 grep -c "seal_tail: sealed the open tail for replay" /tmp/autumn-rs-logs/manager.log   # > 0
-./cluster.sh start-node 3; sleep 15
+./scripts/cluster.sh start-node 3; sleep 15
 grep "re_avali:" /tmp/autumn-rs-logs/node3.log     # "copied the whole extent from a peer … local_len=48 sealed_length=96"
 grep "caught a behind copy" /tmp/autumn-rs-logs/manager.log
-./cluster.sh clean; rm -rf "$AUTUMN_DATA_ROOT"
+./scripts/cluster.sh clean; rm -rf "$AUTUMN_DATA_ROOT"
 ```
 
 `re_avali` logs which way it went: "the copy already holds the sealed length;
@@ -2853,7 +2853,7 @@ gives both. Three things are not obvious:
   EC conversion refuses an open extent, and the default threshold is large
   enough that a test would have to write for a long time to roll one.
 
-`AUTUMN_PS_MAX_EXTENT_SIZE_BYTES=4831838208 bash cluster.sh reset 6` then gives
+`AUTUMN_PS_MAX_EXTENT_SIZE_BYTES=4831838208 bash scripts/cluster.sh reset 6` then gives
 a 4.5 GiB sealed extent, whose 4+1 shard is 1.125 GiB — big enough that a
 rebuild takes long enough to watch, and small enough to fit twice on a 40 GiB
 scratch disk.
@@ -3536,7 +3536,7 @@ under one partition's 32 x 128 MiB):
 ```bash
 AUTUMN_TRANSPORT=ucx AUTUMN_BIND_HOST='[<roce-ip>]' UCX_TLS=rc_mlx5,tcp,self \
   UCX_NET_DEVICES=<dev>:1 AUTUMN_PS_CONN_INFLIGHT_CAP=32 AUTUMN_UCX_REGPOOL_CAP_BYTES=$((2<<30)) \
-  bash cluster.sh start 3
+  bash scripts/cluster.sh start 3
 grep 'is below --conn-inflight-cap' /tmp/autumn-rs-logs/ps.log   # one WARN
 ```
 
@@ -3574,12 +3574,12 @@ its partition's held entries all evicted goes durable without evicting them. `RA
 cargo test -p autumn-partition-server --lib mem_tier   # incl. a chain written in two batches losing its tail first
 cargo test -p autumn-manager --test mem_tier             # incl. a put/batch ranked below everything held going durable
 # live: start with the tier on, put a covered key, read it, restart the PS, read again
-AUTUMN_PS_MEM_TIER_BYTES=$((64<<30)) AUTUMN_PS_MEM_TIER_PREFIX=kvc/ bash cluster.sh start 3
+AUTUMN_PS_MEM_TIER_BYTES=$((64<<30)) AUTUMN_PS_MEM_TIER_PREFIX=kvc/ bash scripts/cluster.sh start 3
 curl -s http://127.0.0.1:9801/metrics | grep autumn_ps_mem_tier   # bytes / hits / evictions
 # eviction keeps a hot set read every round: 8 GiB tier, 1 GiB hot, 2 GiB written
 # per round; run once from empty and once after --pre 6144 (steady state). Every
 # round must print 512/512 (exit 1 otherwise); evicted bytes climb meanwhile.
-AUTUMN_PS_MEM_TIER_BYTES=$((8<<30)) AUTUMN_PS_MEM_TIER_PREFIX=kvc/ bash cluster.sh start 3
+AUTUMN_PS_MEM_TIER_BYTES=$((8<<30)) AUTUMN_PS_MEM_TIER_PREFIX=kvc/ bash scripts/cluster.sh start 3
 python3 scripts/mem_tier_hot_set.py --manager 127.0.0.1:9001
 python3 scripts/mem_tier_hot_set.py --manager 127.0.0.1:9001 --pre 6144
 ```
@@ -4104,7 +4104,7 @@ end-to-end. `AUTUMN_AUTH=1` generates a signing key under
 for `fs/`, `kvc/` and `gallery/`:
 
 ```bash
-AUTUMN_AUTH=1 ./cluster.sh reset 5      # → $DATA_ROOT/authz/{signing.key,fs.cred,kvc.cred,gallery.cred}
+AUTUMN_AUTH=1 ./scripts/cluster.sh reset 5      # → $DATA_ROOT/authz/{signing.key,fs.cred,kvc.cred,gallery.cred}
 
 # gallery (scope gallery/) — Scoped client, credential via a flag:
 ./target/release/gallery --manager 127.0.0.1:9001 \
@@ -4123,7 +4123,7 @@ reads no environment variable; `gallery --help` lists its listen address
 # 2) Start the cluster with authz enabled (cluster.sh env→flag translation;
 #    every keyed op then needs a token — there is no protected-prefix list):
 AUTUMN_AUTH_SIGNING_KEY_FILE=/path/signing.key \
-  bash cluster.sh start 4
+  bash scripts/cluster.sh start 4
 
 # 3) Create a PRINCIPAL (admin; credential printed ONCE as principal:/credential:
 #    two lines — redirect straight to a credential file).
@@ -4266,10 +4266,10 @@ $AO gc --dead-bytes 1GiB PART_ID          # absolute floor: take an extent holdi
 #     $AO --json info --part PART --detail | grep gc_debt_bytes
 $AO policy-candidates                    # advisory engine output (split/merge/gc/compact/EC)
 
-# Cluster lifecycle (subshells so cwd stays at the repo root for ./cluster.sh)
+# Cluster lifecycle (subshells so cwd stays at the repo root for ./scripts/cluster.sh)
 (cd deploy/baremetal && ./autumn-deploy -t topology-singlehost.conf start)         # deploy path
 (cd deploy/baremetal && ./autumn-deploy -t topology-singlehost.conf destroy --wipe) # tear down + wipe
-./cluster.sh start 3                     # TEST harness only: 3-replica + auto-EC + chaos hooks
+./scripts/cluster.sh start 3                     # TEST harness only: 3-replica + auto-EC + chaos hooks
 ```
 
 Extent refcount integrity (MERGE-REFS-LEAK class) is asserted by the in-process
@@ -4471,7 +4471,7 @@ ip link add veth-ra0 type veth peer name veth-ra1
 ip link set veth-ra1 netns autumnra
 ip addr add 10.231.0.1/24 dev veth-ra0 && ip link set veth-ra0 up
 ip netns exec autumnra sh -c 'ip addr add 10.231.0.2/24 dev veth-ra1; ip link set veth-ra1 up; ip link set lo up'
-AUTUMN_BIND_HOST=10.231.0.2 AUTUMN_EXTENT_BASE_PORT=20000 ip netns exec autumnra bash cluster.sh start 3
+AUTUMN_BIND_HOST=10.231.0.2 AUTUMN_EXTENT_BASE_PORT=20000 ip netns exec autumnra bash scripts/cluster.sh start 3
 ./target/release/autumn-fuse --manager 10.231.0.2:9001 --mountpoint /mnt/autumn-ra --transport tcp &
 tc qdisc add dev veth-ra0 root netem delay 1ms limit 100000
 ip netns exec autumnra tc qdisc add dev veth-ra1 root netem delay 1ms limit 100000
@@ -5061,7 +5061,7 @@ bash scripts/rolling_restart.sh
 Manual verification:
 
 ```bash
-bash cluster.sh reset 3                       # or: AUTUMN_BOOTSTRAP_PRESPLIT=4:hexstring bash cluster.sh reset 3
+bash scripts/cluster.sh reset 3                       # or: AUTUMN_BOOTSTRAP_PRESPLIT=4:hexstring bash scripts/cluster.sh reset 3
 bash scripts/rolling_restart.sh               # expect: ... ROLLING RESTART COMPLETE ... zero loss
 ```
 
@@ -5610,7 +5610,7 @@ the path at all:
 
 ```bash
 # 4 nodes → log stream EC 3+1 by default
-AUTUMN_DATA_ROOT=/tmp/ec ./cluster.sh reset 4
+AUTUMN_DATA_ROOT=/tmp/ec ./scripts/cluster.sh reset 4
 autumnfs --manager 127.0.0.1:9001 put big.bin /ec/big.bin      # >= 1.5 MiB
 # Seal its log extent: restart the PS at the 1 GiB floor and fill past it,
 # since there is no operator command that seals a partition's tail.
@@ -5638,7 +5638,7 @@ cp target/release/autumn-client /tmp/ac-new
 # (for UCX add --features autumn-server/ucx to BOTH builds)
 
 AUTUMN_DATA_ROOT=/tmp/autumn-bulk AUTUMN_EXTENT_BASE_PORT=20000 \
-  AUTUMN_EXTENT_SHARDS=8 ./cluster.sh reset 1
+  AUTUMN_EXTENT_SHARDS=8 ./scripts/cluster.sh reset 1
 /tmp/ac-new ... perf-check --bulk 64 --size 32768     # WARMUP, discard
 /tmp/ac-old ... perf-check --bulk 64 --size 32768     # alternate, 2+ samples each
 /tmp/ac-new ... perf-check --bulk 64 --size 32768
@@ -5678,7 +5678,7 @@ get real RDMA on ONE host, bind a RoCE NIC IP — `rc` loops back inside the HCA
 
 ```bash
 AUTUMN_BIND_HOST="[<RoCE IP>]" AUTUMN_TRANSPORT=ucx \
-  UCX_NET_DEVICES=<rdma-dev>:1 ./cluster.sh reset 1  # derives rc_mlx5,tcp,self
+  UCX_NET_DEVICES=<rdma-dev>:1 ./scripts/cluster.sh reset 1  # derives rc_mlx5,tcp,self
 # client must carry the SAME UCX_TLS + UCX_NET_DEVICES and the RoCE manager addr
 ```
 
@@ -5759,7 +5759,10 @@ cargo test -p autumn-manager --test system_gc_multiversion_same_extent
 **Write-pipeline changes (e.g. natural batching) are verified with the perf matrix**
 (`perf/perf_check.sh` builds release, starts a fresh 3-replica cluster, runs 4K and 8M
 and compares each leg against `perf/perf_baseline_<transport>_p8_d8_s<size>.json`; a leg
-passes when ops/s ≥ 80% of baseline and p99 ≤ 2×). Between a leg's write and read
+passes when ops/s ≥ 80% of baseline and p99 ≤ 1.2× of it — `2 − threshold` at
+the default `--threshold 0.8`). Baselines are per machine and not
+in the repository: the first run on a host reports "no baseline", and
+`--update-baseline` writes one from that run. Between a leg's write and read
 phases the script compacts every partition (perf-check `--before-read`, which runs
 `autumn-op compact <part> --wait`), so the reads come from SSTs. Before that, a read
 leg read whatever the write phase had left in the memtable, which moved with the
@@ -5785,7 +5788,7 @@ way the script does (it tears its own down) and run `ycsb` twice, the second tim
 keep the set under that):
 
 ```bash
-bash cluster.sh start 3
+bash scripts/cluster.sh start 3
 ao="target/release/autumn-op --cluster-secret-file $AUTUMN_DATA_ROOT/cluster.secret --manager 127.0.0.1:9001"
 $ao namespace-create --name bench && $ao presplit --namespace bench/perf --parts 8
 compact="for p in \$($ao info | awk '/^  part/{print \$2}'); do $ao compact \$p --wait || exit 1; done"
@@ -5801,7 +5804,7 @@ not. Measured (8 partitions, cluster cpuset-isolated): a set that fits reads
 from SSTs at 85% (TCP) / 98% (UCX) of the memtable rate; a set four times the cache at
 15% / 20%, the cost of fetching a ~62 KiB block from an extent node for each 4 KiB value.
 
-The committed baselines were taken this way with direct I/O on (the EN default)
+The numbers in `docs/perf_baseline.md` were taken this way with direct I/O on (the EN default)
 and the io_uring workers confined: each EN on its own 8 cores and the PS on 16,
 all on one NUMA node (for UCX, the NIC's node); each file is the median-write run
 of three. TCP 4K 54.9K write / 583K
@@ -6066,7 +6069,7 @@ the client must link **system** UCX like the daemons).
 ```bash
 # cluster bound to a RoCE NIC IP (NOT loopback), UCX positive-list env from cluster.sh
 AUTUMN_BIND_HOST="[<roce-nic-ip>]" AUTUMN_TRANSPORT=ucx \
-  AUTUMN_DATA_ROOT=/data/autumn-ucx bash cluster.sh start 4
+  AUTUMN_DATA_ROOT=/data/autumn-ucx bash scripts/cluster.sh start 4
 # client pinned to the SAME NIC (both-ends rule); run on a free GPU
 AUTUMN_MANAGER="[<roce-nic-ip>]:9001" CUDA_VISIBLE_DEVICES=<free-gpu> \
   UCX_TLS=rc_mlx5,tcp,self UCX_NET_DEVICES=<rdma-dev>:1 \

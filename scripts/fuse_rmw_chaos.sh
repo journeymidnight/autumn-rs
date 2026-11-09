@@ -62,7 +62,7 @@ for i in $(seq 1 35); do
 done
 rm -rf "$AUTUMN_DATA_ROOT" /tmp/autumn-rs
 env AUTUMN_EXTENT_BASE_PORT=20000 AUTUMN_TRANSPORT=tcp \
-    bash "$ROOT/cluster.sh" start 3 > "$WORK/cluster.log" 2>&1
+    bash "$ROOT/scripts/cluster.sh" start 3 > "$WORK/cluster.log" 2>&1
 grep -q "bootstrap succeeded" "$WORK/cluster.log" || { echo "cluster start failed"; tail -20 "$WORK/cluster.log"; exit 1; }
 sleep 3
 

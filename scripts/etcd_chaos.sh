@@ -61,7 +61,7 @@ env AUTUMN_EXTENT_BASE_PORT=20000 \
     AUTUMN_BOOTSTRAP_PRESPLIT="4:hexstring" \
     AUTUMN_TRANSPORT=tcp \
     AUTUMN_ETCD_CLUSTER="$ETCD_N" \
-    bash "$ROOT/cluster.sh" start 3 > "$WORK/cluster.log" 2>&1
+    bash "$ROOT/scripts/cluster.sh" start 3 > "$WORK/cluster.log" 2>&1
 grep -q "bootstrap succeeded" "$WORK/cluster.log" \
     || { echo "cluster start failed"; tail -10 "$WORK/cluster.log"; exit 1; }
 

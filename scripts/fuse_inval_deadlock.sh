@@ -87,7 +87,7 @@ cleanup(){
     for i in $(seq 1 20); do kill -0 "$p" 2>/dev/null || break; sleep 0.25; done
     kill -0 "$p" 2>/dev/null && echo "[inval] WARNING: daemon $p did not exit (connection not aborted?)"
   done
-  umnt "$MNT_R"; umnt "$MNT_W"; bash "$ROOT/cluster.sh" stop > /dev/null 2>&1
+  umnt "$MNT_R"; umnt "$MNT_W"; bash "$ROOT/scripts/cluster.sh" stop > /dev/null 2>&1
 }
 trap cleanup EXIT
 
@@ -102,7 +102,7 @@ mount_fuse(){ local mnt="$1" tag="$2"; shift 2
 
 say "starting cluster (3 EN; work=$WORK)"
 umnt "$MNT_R"; umnt "$MNT_W"; rm -rf "$AUTUMN_DATA_ROOT"
-env AUTUMN_EXTENT_BASE_PORT=20000 AUTUMN_TRANSPORT=tcp bash "$ROOT/cluster.sh" start 3 > "$WORK/cluster.log" 2>&1
+env AUTUMN_EXTENT_BASE_PORT=20000 AUTUMN_TRANSPORT=tcp bash "$ROOT/scripts/cluster.sh" start 3 > "$WORK/cluster.log" 2>&1
 grep -q "bootstrap succeeded" "$WORK/cluster.log" || { echo "cluster start failed"; tail -20 "$WORK/cluster.log"; exit 1; }
 sleep 3
 FUSE_R=$(mount_fuse "$MNT_R" r --read-io-threads "$READ_IO_THREADS") || { fail "mount reader"; exit 1; }

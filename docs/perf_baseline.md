@@ -119,7 +119,7 @@ AUTUMN_BIND_HOST='[<RoCE IP>]' AUTUMN_TRANSPORT=ucx \
   UCX_TLS=rc_mlx5,tcp,self UCX_NET_DEVICES=<rdma dev>:1 \
   AUTUMN_BOOTSTRAP_PRESPLIT=8:hexstring AUTUMN_EXTENT_SHARDS=4 \
   AUTUMN_EXTENT_BASE_PORT=21000 AUTUMN_DATA_ROOT=<nvme dir>/autumn-rs \
-  AUTUMN_DISKS=<d1>,<d2>,<d3> bash cluster.sh start 3 --3disk
+  AUTUMN_DISKS=<d1>,<d2>,<d3> bash scripts/cluster.sh start 3 --3disk
 # on host B (client built with --features ucx, same wire version)
 autumn-client --manager '[<RoCE IP>]:9001' --transport ucx perf-check \
   --threads 16 --duration 40 --size 8388608 --partitions 8 --pipeline-depth 8

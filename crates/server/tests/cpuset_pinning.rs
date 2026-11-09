@@ -5,7 +5,7 @@
 //! Regression target: the P-log thread and the extent-node shard threads were
 //! pinned through compio's `RuntimeBuilder::thread_affinity`, which intersects
 //! the requested core with the mask the thread inherited and binds nothing when
-//! the two are disjoint. A cluster launched as `taskset -c A,B cluster.sh start`
+//! the two are disjoint. A cluster launched as `taskset -c A,B scripts/cluster.sh start`
 //! therefore ran every EN shard and P-log thread on A,B while each logged its
 //! "assigned" core. Only P-sst, which pinned with `sched_setaffinity` directly,
 //! actually moved.

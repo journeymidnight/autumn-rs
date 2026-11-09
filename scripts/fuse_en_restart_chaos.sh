@@ -35,7 +35,7 @@ say "starting cluster (3 EN, presplit 4; work=$WORK)"; umnt
 for pid in $(ps -eo pid,comm | awk '$2 ~ /^(autumn-|etcd)/ {print $1}'); do kill -9 "$pid" 2>/dev/null; done; sleep 2
 for i in $(seq 1 35); do b=$(ss -tan 2>/dev/null|grep -cE ':(9001|9301|2000[0-9]) ')||true; [ "${b:-0}" = 0 ]&&break; sleep 2; done
 rm -rf "$AUTUMN_DATA_ROOT" /tmp/autumn-rs
-env AUTUMN_EXTENT_BASE_PORT=20000 AUTUMN_BOOTSTRAP_PRESPLIT="4:hexstring" AUTUMN_TRANSPORT=tcp bash "$ROOT/cluster.sh" start 3 > "$WORK/cluster.log" 2>&1
+env AUTUMN_EXTENT_BASE_PORT=20000 AUTUMN_BOOTSTRAP_PRESPLIT="4:hexstring" AUTUMN_TRANSPORT=tcp bash "$ROOT/scripts/cluster.sh" start 3 > "$WORK/cluster.log" 2>&1
 grep -q "bootstrap succeeded" "$WORK/cluster.log" || { echo "cluster start failed"; tail -20 "$WORK/cluster.log"; exit 1; }
 sleep 3; mnt boot || exit 1
 

@@ -9,7 +9,7 @@ directory in the shared `fs/` tree:
 
 ```sh
 cargo build --release -p autumn-server -p autumn-fuse
-./cluster.sh start 3
+./scripts/cluster.sh start 3
 ./target/release/autumnfs --manager 127.0.0.1:9001 mkdir /tables
 ./target/release/autumn-s3 --manager 127.0.0.1:9001 --port 9100 &
 ```

@@ -1,144 +1,144 @@
-# Compact 安全推进 checkpoint / GC floor 修复计划
+# Plan: let compact safely advance the checkpoint / GC floor
 
-状态：待实现。
+Status: not yet implemented.
 
-## 1. 目标与问题边界
+## 1. Goal and problem boundary
 
-目标：当一个 WAL 前缀的数据已经全部被持久化 SST 集合覆盖时，即使没有后续业务写入，也能由 compact 发布新的 checkpoint、推进 replay/GC floor，让旧 sealed log extent 最终进入正常 GC。
+Goal: when the data in a WAL prefix is fully covered by the persisted SST set, compact can publish a new checkpoint and advance the replay/GC floor even with no further user writes, so that old sealed log extents eventually go through normal GC.
 
-保留之前修复的“不回退”保证；不能为了回收空间跳过未 flush 的已确认写入，也不能直接取消 replay 保护。
+Keep the "never moves backward" guarantee from the earlier fix. Reclaiming space must not skip acknowledged writes that have not been flushed, and must not simply drop replay protection.
 
-已确认的当前行为：
+Confirmed current behavior:
 
-- `background.rs::compaction_checkpoint_cursor`：`durable_ckpt_vp != (0,0)` 时原样沿用，包括真实 compact 和无操作 compact。
-- `do_compact` 成功发布 checkpoint 后只更新 SST 集合，没有针对新的安全边界推进 `durable_ckpt_vp`。
-- flush、freeze、merged checkpoint 有成功持久化后更新该游标的路径。
-- GC 只允许删除严格位于 floor 之前的非空 extent；即使 floor offset 已到 extent 末尾，当前按 extent 位置判断仍保护该 extent。
-- `gc_debt` 的比例/字节资格判断与最终 replay 保护不是完整的同一套判断，可能触发“有 debt → GC → 无 eligible extent”的空跑。
+- `background.rs::compaction_checkpoint_cursor`: when `durable_ckpt_vp != (0,0)` it is reused unchanged, for both real compacts and no-op compacts.
+- After `do_compact` successfully publishes a checkpoint it only updates the SST set; it does not advance `durable_ckpt_vp` to a new safe boundary.
+- flush, freeze and merged checkpoint each have a path that updates this cursor after a successful persist.
+- GC only deletes non-empty extents strictly before the floor; even when the floor offset is at the end of an extent, the current extent-position check still protects that extent.
+- The ratio/byte eligibility check in `gc_debt` is not the same full check as the final replay protection, which can produce an idle run of "debt present → GC → no eligible extent".
 
-不把“compact 遍历完所有 SST”本身当作 WAL 尾部安全的证明。pending/inflight 写入、active memtable、immutable 队列、正在构建或尚未发布的 flush，以及 GC 搬迁写入都必须纳入证明。
+"compact has walked every SST" is not by itself proof that the WAL tail is safe. Pending/inflight writes, the active memtable, the immutable queue, flushes being built or not yet published, and GC relocation writes must all be part of the proof.
 
-旧版 inline WAL 没有 discard 记账是独立历史问题：本修复不会从 inline SST 反算旧 WAL 位置。旧 extent 的受控 forcegc 清理不等同于自动补账。
+The lack of discard accounting for old-format inline WAL is a separate historical issue: this fix does not reconstruct old WAL positions from inline SSTs. A controlled forcegc cleanup of old extents is not the same as automatically back-filling the accounting.
 
-## 2. 必须保持的不变量
+## 2. Invariants that must hold
 
-1. **覆盖性**：checkpoint 的游标 C 之前，所有需要恢复的 WAL 记录，均已被该 checkpoint 引用的 SST 覆盖，或已被持久化的新版本/删除记录取代。VP 指向的存活 payload 仍由 GC 的存活检查保护。
-2. **ACK 后推进**：只有 checkpoint 持久化成功后，才能发布新表集合并更新 `durable_ckpt_vp`；失败或结果不确定时不推进、不放宽 GC。
-3. **同一快照**：表集合、游标、fence floors 在 `publish_lock` 下形成一致 checkpoint；不能把旧 SST 集合与后完成的 flush 游标拼在一起。
-4. **不回退**：同一 log stream 中按实际成员位置及 offset 比较新旧边界，不按 extent ID 数值比较；已有 durable 游标不能被旧 SST header 拉回。
-5. **写入隔离**：边界 C 之后的新写不要求进入本次 compact，但不得被误认作 C 之前已经落 SST。
-6. **拓扑隔离**：split/merge、owner fencing、tail rotation、GC 等改变 log 成员关系时，旧证明必须被重新验证或废弃；不能跨 stream/owner epoch 套用游标比较。
-7. **恢复可达性**：新 checkpoint 的 anchor 必须能被重启后的 recovery 正常定位，不能先删除 anchor 再依赖全量 replay 兜底。
+1. **Coverage**: every WAL record before the checkpoint cursor C that recovery needs is covered by the SSTs referenced by that checkpoint, or has been superseded by a persisted newer version or delete record. Live payloads pointed to by a VP remain protected by GC's liveness check.
+2. **Advance after ACK**: the new table set is published and `durable_ckpt_vp` updated only after the checkpoint has been persisted successfully; on failure or an uncertain outcome, nothing advances and GC is not relaxed.
+3. **Single snapshot**: the table set, the cursor and the fence floors form one consistent checkpoint under `publish_lock`; an old SST set must not be stitched together with the cursor of a flush that finished later.
+4. **No regression**: within a log stream, old and new boundaries are compared by actual member position and offset, not by numeric extent ID; an existing durable cursor must not be pulled back by an old SST header.
+5. **Write isolation**: writes after boundary C do not have to be included in this compact, but must not be mistaken for data that landed in an SST before C.
+6. **Topology isolation**: when split/merge, owner fencing, tail rotation, GC and similar operations change log membership, an old proof must be re-validated or discarded; cursor comparisons must not be applied across streams or owner epochs.
+7. **Recovery reachability**: the anchor of a new checkpoint must be locatable by recovery after a restart; the anchor must not be deleted first with a full replay relied on as the fallback.
 
-## 3. 阶段 A：先补失败用例与时序证明
+## 3. Phase A: failing tests and ordering proof first
 
-涉及：`crates/manager/tests/`、partition-server 内部测试。
+Scope: `crates/manager/tests/`, partition-server internal tests.
 
-先建立可控回归：
+Build a controllable regression first:
 
-1. 写入并 flush 数据，随后产生只有已被 SST 覆盖记录的 sealed WAL 前缀；没有后续业务写入。
-2. 将 durable checkpoint 留在旧 sealed extent，运行 major compact 和 no-op compact。
-3. 断言 checkpoint/floor 安全推进，旧前缀可 GC；重启不依赖全量 replay，所有已确认存活 key/删除状态正确。
+1. Write and flush data, then produce a sealed WAL prefix that contains only records already covered by SSTs; no further user writes.
+2. Leave the durable checkpoint in the old sealed extent, and run a major compact and a no-op compact.
+3. Assert that the checkpoint/floor advances safely and the old prefix can be GC'd; a restart does not rely on full replay, and all acknowledged live keys and delete states are correct.
 
-增加 failpoint，将以下步骤分别停住：写入 ACK、memtable 插入、flush 上传、flush 发布、compact 发布、checkpoint ACK。先画出实际 partition loop 与 flush/compact 的锁和 await 顺序，证明 proposed barrier 不会与维护 gate、flush drain 或 GC 搬迁互相等待。
+Add failpoints that pause at each of these steps: write ACK, memtable insert, flush upload, flush publish, compact publish, checkpoint ACK. First map out the actual lock and await order of the partition loop and flush/compact, and prove that the proposed barrier cannot end up waiting on the maintenance gate, the flush drain or GC relocation (or they on it).
 
-验收：关闭新行为时用例失败；只把游标改成 live tail 的错误实现必须在未 flush 写入/崩溃用例中失败。测试不能仅断言某个字段增加。
+Acceptance: the tests fail with the new behavior disabled; a wrong implementation that merely sets the cursor to the live tail must fail the unflushed-write / crash tests. Tests must not only assert that some field increased.
 
-## 4. 阶段 B：建立“已落 SST 边界”的显式证明
+## 4. Phase B: an explicit proof of the "landed in SST" boundary
 
-涉及：`partition-server/src/lib.rs`、`rpc_handlers.rs`、partition loop / write / flush 路径。
+Scope: `partition-server/src/lib.rs`, `rpc_handlers.rs`, the partition loop / write / flush paths.
 
-实现一个内部 checkpoint barrier，不直接复用对外 split/merge freeze 状态：
+Implement an internal checkpoint barrier; do not reuse the externally visible split/merge freeze state directly:
 
-1. 在串行写入调度路径插入边界标记，排空标记之前的 pending/inflight 写入，覆盖所有 WAL 写入来源，包括 GC relocation。
-2. 在这个有序点捕获 committed WAL 边界 C，必要时旋转 active；确认不能有“WAL 已提交、memtable 尚未可见”的写入落在 C 之前。
-3. 将 C 之前的 immutable 按既有顺序 flush 并发布；如果对应数据已经全部在 SST 中，则无需制造新的非空 SST，也无需等待新的业务写入。
-4. 短暂屏障期间后来的请求排队；建立隔离后允许 C 之后写入继续，不在整个大 compact 期间冻结业务。队列必须有界。
-5. 得到包含 stream、owner epoch、边界 C 和覆盖状态的内部证明；验证失败、超时、拓扑变化则不推进，安全退回已有 durable 游标。
+1. Insert a boundary marker into the serial write dispatch path and drain the pending/inflight writes ahead of it, covering every WAL write source, including GC relocation.
+2. Capture the committed WAL boundary C at this ordered point, rotating active if needed; confirm that no write that is "committed to the WAL but not yet visible in the memtable" can fall before C.
+3. Flush and publish the immutables before C in their existing order; if the corresponding data is already all in SSTs, there is no need to produce a new non-empty SST and no need to wait for new user writes.
+4. Requests that arrive during the short barrier are queued; once isolation is established, writes after C continue, so user traffic is not frozen for the whole of a large compact. The queue must be bounded.
+5. Produce an internal proof containing the stream, owner epoch, boundary C and coverage state; on validation failure, timeout or topology change, do not advance, and fall back safely to the existing durable cursor.
 
-优先复用现有 freeze/drain 的顺序保证与 flush ACK 路径，但不能只检查 `active.is_empty()`、不能只持有 `publish_lock`，更不能在无法证明覆盖时读取 live tail 当 checkpoint。
+Prefer reusing the ordering guarantees of the existing freeze/drain and the flush ACK path, but do not just check `active.is_empty()`, do not just hold `publish_lock`, and above all do not read the live tail as the checkpoint when coverage cannot be proven.
 
-具体屏障实现由阶段 A 的时序审计确定；覆盖证明无法成立时保持旧边界，而不是使用启发式跳跃。
+The concrete barrier implementation is decided by the ordering audit in Phase A; when the coverage proof does not hold, keep the old boundary rather than jumping heuristically.
 
-## 5. 阶段 C：compact 发布新 checkpoint
+## 5. Phase C: compact publishes a new checkpoint
 
-涉及：`background.rs::do_compact`、`checkpoint_and_truncate_row_prefix`、`compaction_checkpoint_cursor`、checkpoint 发布 helper。
+Scope: `background.rs::do_compact`, `checkpoint_and_truncate_row_prefix`, `compaction_checkpoint_cursor`, the checkpoint publish helper.
 
-- 在选择 compact 输入前建立阶段 B 的已落 SST 边界。major compact 使用该边界；no-op compact 也能发布边界，不能因没有 SST 重写就提前跳过。
-- minor compact 不强制引入完整 drain；继续沿用最新安全 durable 边界，除非已有有效的新覆盖证明。
-- 在 `publish_lock` 下重新读取最新 durable 游标和当前 SST 集合；把 compact 输出替换输入，保留过程中已成功发布的新 flush SST。
-- 仅比较同一有效 log 成员顺序中的已证明边界与当前 durable 边界，选不回退的安全值。并发 flush 已经前进时不能被本次 compact 的旧 C 覆盖。
-- 表集合、边界、fence floors 一起调用 `save_table_locs_raw`。
-- checkpoint 成功后，在同一发布临界区更新 SST 集合和 `durable_ckpt_vp`；no-op 发布成功后也更新该 cell。
-- `(0,0)` fallback 保留保守恢复路径；若 fallback 新产生了有效 checkpoint，运行时 cell 也应与它一致。
-- 不为推进全局 checkpoint 而重写所有 SST header；旧 SST header 可以保留原内容边界。
+- Establish the Phase B landed-in-SST boundary before choosing compact inputs. A major compact uses that boundary; a no-op compact can also publish the boundary and must not skip early just because no SST was rewritten.
+- A minor compact does not force a full drain; it keeps using the latest safe durable boundary unless a valid new coverage proof already exists.
+- Under `publish_lock`, re-read the latest durable cursor and the current SST set; replace the inputs with the compact output, and keep any new flush SSTs that were published successfully in the meantime.
+- Compare the proven boundary and the current durable boundary only within the same valid log member order, and choose the safe value that does not regress. If a concurrent flush has already moved ahead, this compact's older C must not overwrite it.
+- Pass the table set, the boundary and the fence floors to `save_table_locs_raw` together.
+- After the checkpoint succeeds, update the SST set and `durable_ckpt_vp` in the same publish critical section; a successful no-op publish also updates that cell.
+- The `(0,0)` fallback keeps the conservative recovery path; if the fallback produces a valid new checkpoint, the runtime cell should match it.
+- Do not rewrite every SST header to advance the global checkpoint; old SST headers may keep their original content boundary.
 
-不能采用的捷径：从 SST 最大 seq 推算 WAL byte cursor；取最大的 extent ID；从尚未 flush 的 `p.vp_*` 推进；仅对游标做 `max` 而不验证表集合覆盖。
+Shortcuts that must not be taken: deriving a WAL byte cursor from the largest SST seq; taking the largest extent ID; advancing from not-yet-flushed `p.vp_*`; just taking a `max` of cursors without verifying that the table set covers them.
 
-## 6. 阶段 D：解决 extent 末尾 anchor 的保守滞留
+## 6. Phase D: resolve the conservative retention of an anchor at the end of an extent
 
-checkpoint 不回退还不够：`C=(sealed_extent, sealed_length)` 在当前严格 before-floor 规则下仍会保护整段 extent。
+A non-regressing checkpoint is not enough: `C=(sealed_extent, sealed_length)` still protects the whole extent under the current strict before-floor rule.
 
-- 若 C 的 extent 已权威 sealed，offset 恰好覆盖 sealed_length，且当前同一 stream 有经过验证的后继 extent，允许将等价重放起点规范化成 `(successor,0)`。
-- 规范化后的 anchor 与表集合一起持久化，ACK 后才能让 GC 移除旧 extent。
-- 比较和规范化均按 stream 实际顺序；必须处理 split/merge 的非单调 ID、重复成员的既有恢复语义和并发成员变更。
-- 若无后继、旧 tail 仍 open、C 未覆盖到末尾，保留原 anchor。本计划不为释放最后一个 open tail 强制新增 seal/roll 操作。
-- 明确验证 recovery 对新 anchor 的选择；不能让旧 SST header 重新拉低已经确认的 durable 边界。
+- If C's extent is authoritatively sealed, the offset exactly reaches sealed_length, and the same stream currently has a validated successor extent, the equivalent replay start may be normalized to `(successor,0)`.
+- The normalized anchor is persisted together with the table set; only after the ACK may GC remove the old extent.
+- Comparison and normalization both follow the actual stream order; non-monotonic IDs from split/merge, the existing recovery semantics for duplicate members, and concurrent membership changes must all be handled.
+- If there is no successor, the old tail is still open, or C does not reach the end, keep the original anchor. This plan does not add a forced seal/roll to release the last open tail.
+- Explicitly verify which anchor recovery picks for the new anchor; an old SST header must not pull an already confirmed durable boundary back down.
 
-## 7. 阶段 E：统一 GC debt / 候选 / 实际执行
+## 7. Phase E: unify GC debt / candidates / actual execution
 
-涉及：`background.rs` 的 debt basis、GC 候选选择；`rpc_handlers.rs` 的 forcegc advisory / diagnostics；manager policy。
+Scope: the debt basis and GC candidate selection in `background.rs`; the forcegc advisory / diagnostics in `rpc_handlers.rs`; manager policy.
 
-- 使用相同 stream 成员、authoritative seal 状态、有效 durable floor 和比例/绝对字节门槛判断“当前可选 extent”。
-- `gc_debt` 不再把已知被 replay floor 保护的字节宣称为当前可回收；如需显示垃圾总量，单独保留 raw dead / replay-protected dead，不能静默混成同一含义。
-- floor 或 stream membership 变化时同步刷新/失效 debt basis；idle refresh 不能恢复成包含受保护字节的旧值。
-- diagnostics、forcegc advisory 与执行使用同一 effective floor，包括 durable checkpoint 提升；修正当前文案将实际“at/after”写成“at/before”的歧义。
-- 当 floor 阻挡了足量垃圾时，提供可观测的原因与 checkpoint 推进需求。自动动作以边界变化和冷却控制，避免把 GC 空跑换成 checkpoint 空跑。
-- split 继承同一份既有 discard 账目是正确行为；各分区的 raw debt 不可直接相加为物理可释放空间。增加继承用例，不在此计划中改成按 refs 平分。
+- Decide "currently selectable extents" from the same stream membership, authoritative seal state, effective durable floor and ratio/absolute byte thresholds.
+- `gc_debt` no longer claims bytes known to be protected by the replay floor as currently reclaimable; if the total garbage is to be shown, keep raw dead / replay-protected dead as separate values, not silently merged into one meaning.
+- Refresh/invalidate the debt basis whenever the floor or stream membership changes; an idle refresh must not restore an old value that includes protected bytes.
+- Diagnostics, the forcegc advisory and execution use the same effective floor, including the durable checkpoint promotion; fix the current wording that describes what is actually "at/after" as "at/before".
+- When the floor blocks a significant amount of garbage, expose the reason and the need for a checkpoint advance. Automatic actions are driven by boundary changes and a cooldown, so that idle GC runs are not just replaced by idle checkpoint runs.
+- A split inheriting the same existing discard accounting is correct behavior; the raw debt of the partitions cannot be summed into physically reclaimable space. Add an inheritance test; this plan does not change it to split evenly by refs.
 
-阶段 E 不得取消执行端 replay guard；即使策略口径出错，执行端也继续 fail closed。
+Phase E must not remove the replay guard on the execution side; even if the policy's accounting is wrong, execution continues to fail closed.
 
-## 8. 独立后续：共享引用 CAS 冲突有限重试
+## 8. Separate follow-up: bounded retry on shared-reference CAS conflicts
 
-这是并发完成率问题，不是推进 floor 的前置条件，单独提交。
+This is a concurrent completion-rate issue, not a prerequisite for advancing the floor; it is committed separately.
 
-- 在元数据 mutation 层对明确的 CAS rejection 重建最新 stream/extent 快照，重新执行 owner、membership、EC/recovery/topology guard，再提交事务。
-- 有限重试和退避，不能重复使用旧 refs/eversion；不重跑整个大 extent 的扫描来解决一次 refs 更新冲突。
-- owner fencing、未知提交结果、CRC 错误、普通 timeout 不作为 CAS 冲突盲目重试。
-- 对已不属于 stream 的 extent保持幂等；保留引用计数 CAS 保护。
-- 并发多个共享持有者 GC，断言最终 `refs == in_streams`，无 ghost refs，无提前物理删除。
+- In the metadata mutation layer, on an explicit CAS rejection, rebuild the latest stream/extent snapshot, re-run the owner, membership, EC/recovery/topology guards, then submit the transaction again.
+- Bounded retries with backoff; never reuse old refs/eversion; do not re-run a scan of a whole large extent to resolve a single refs update conflict.
+- Owner fencing, unknown commit outcomes, CRC errors and ordinary timeouts are not blindly retried as CAS conflicts.
+- Stay idempotent for extents that no longer belong to the stream; keep the reference-count CAS protection.
+- Run GC concurrently from several shared holders and assert that in the end `refs == in_streams`, with no ghost refs and no premature physical deletion.
 
-## 9. 回归与验收矩阵
+## 9. Regression and acceptance matrix
 
-| 场景 | 必须验证 |
+| Scenario | Must verify |
 |---|---|
-| 无新业务写入，全部已落 SST | compact/no-op 可推进 checkpoint；eligible sealed 前缀最终回收 |
-| active / queued imm / flush inflight | 新 floor 不跨过未被 checkpoint 覆盖的数据 |
-| WAL ACK 后、memtable 可见前暂停 | barrier 等待该写入，不能错误判空 |
-| compact 中并发 flush | 表集合包含新 flush；游标不回退、不超前 |
-| checkpoint 发布失败或 ACK 不确定 | 不提前更新内存 floor、不执行越界 GC；重启数据完整 |
-| checkpoint ACK 后立即 crash | recovery 使用新边界，数据/删除状态正确 |
-| durable 位于 sealed 末尾 | 后继 anchor 规范化成功后才可移除旧 extent |
-| boundary 后仍有业务写入 | 重启完整 replay 后缀，不遗漏已确认写入 |
-| split / merge / fence / manager 切换 | 旧证明不跨拓扑/owner使用；游标比较不依赖 ID 大小 |
-| 删除全部 key、discard-only SST | discard/seq/checkpoint 保留，重启不复活 key |
-| inline 与大 VP 混合 | inline 旧账不虚构；存活 VP 在 GC 释放前完成安全迁移 |
-| replay-protected 垃圾 | debt 不驱动反复 GC 空跑，diagnostic 清楚说明阻挡原因 |
-| 50% discard 后连续 split | 子分区继承50%既有账目，物理空间不按子分区 debt简单求和 |
-| 共享 refs 并发修改 | CAS 重试有界，refs与实际stream数一致，最后引用后才删除 |
+| No new user writes, everything already in SSTs | compact/no-op can advance the checkpoint; the eligible sealed prefix is eventually reclaimed |
+| active / queued imm / flush inflight | The new floor does not cross data not covered by the checkpoint |
+| Paused after WAL ACK, before memtable visibility | The barrier waits for that write and does not wrongly conclude empty |
+| Concurrent flush during compact | The table set includes the new flush; the cursor neither regresses nor runs ahead |
+| Checkpoint publish fails or ACK is uncertain | The in-memory floor is not updated early, no out-of-bounds GC runs; data is complete after restart |
+| Crash immediately after checkpoint ACK | Recovery uses the new boundary; data and delete states are correct |
+| Durable at the end of a sealed extent | The old extent can be removed only after successor anchor normalization succeeds |
+| User writes continue after the boundary | A restart replays the full suffix and misses no acknowledged write |
+| split / merge / fence / manager switchover | Old proofs are not used across topology/owner; cursor comparison does not depend on ID magnitude |
+| All keys deleted, discard-only SST | discard/seq/checkpoint are kept; restart does not resurrect keys |
+| Mixed inline and large VP | No fabricated accounting for old inline data; live VPs are migrated safely before GC releases them |
+| replay-protected garbage | debt does not drive repeated idle GC runs; diagnostics state the blocking reason clearly |
+| Consecutive splits after 50% discard | Child partitions inherit the existing 50% accounting; physical space is not the plain sum of child-partition debt |
+| Concurrent modification of shared refs | CAS retries are bounded, refs match the actual stream count, deletion happens only after the last reference |
 
-必须跑现有相关回归：`system_compact_ckpt_cursor`、`system_restart_replay_cursor`、`system_compact_unflushed_vp_head`、`system_compact_checkpoint_fail`、`system_crash_mid_compact`、`system_compact_settles_deletes`、`system_gc_multiversion_same_extent`、`system_gc_inline_wal`、`system_merge_single_checkpoint`、`system_merge_replay_reachability`、split/fence/VP 系列。
+The existing related regressions must be run: `system_compact_ckpt_cursor`, `system_restart_replay_cursor`, `system_compact_unflushed_vp_head`, `system_compact_checkpoint_fail`, `system_crash_mid_compact`, `system_compact_settles_deletes`, `system_gc_multiversion_same_extent`, `system_gc_inline_wal`, `system_merge_single_checkpoint`, `system_merge_replay_reachability`, and the split/fence/VP series.
 
-新增测试先复现再修复，做错误实现的 ablation。系统测试按现有仓库要求使用 release 与合适的 `RUST_MIN_STACK`；不以 fmt/clippy 通过代替一致性验证。
+New tests reproduce first and fix second, with ablation against wrong implementations. System tests use release and an appropriate `RUST_MIN_STACK` as the repository already requires; passing fmt/clippy is not a substitute for consistency verification.
 
-## 10. 提交顺序与集群验证
+## 10. Commit order and cluster verification
 
-建议独立提交：A（失败用例与时序证明）→ B/C/D（安全边界与 checkpoint 推进）→ E（debt/候选一致性）→ CAS 重试。
+Suggested separate commits: A (failing tests and ordering proof) → B/C/D (safe boundary and checkpoint advance) → E (debt/candidate consistency) → CAS retry.
 
-1. 先在隔离测试集群验证，在 SST 稳定、无新写入的分区上记录：log membership、旧/新 checkpoint、raw/protected/eligible debt、refs、磁盘实际占用。
-2. 再测持续读写 + compact + GC + PS crash / manager 切换；分别验证 ACK key、删除状态、恢复 replay 起点、业务可用性。
-3. 对被多个分区共享的 extent，等待所有持有者解除引用及 EN 删除队列完成，确认物理空间下降；不能把 `reclaimed N extent(s)` 直接等同于磁盘已释放。
-4. 对跨多个 namespace 的边界分区验证存活 VP；不要用某一个 namespace 的 key 数为 0 推断整个分区/extent 为空。
-5. 新写入场景无需人工 forcegc 即可收敛；旧未记账 extent 用既定清理流程处理，单列历史欠账。
+1. Verify first on an isolated test cluster; on partitions with stable SSTs and no new writes, record: log membership, old/new checkpoint, raw/protected/eligible debt, refs, actual disk usage.
+2. Then test sustained reads/writes + compact + GC + PS crash / manager switchover; separately verify ACKed keys, delete states, the recovery replay start, and service availability.
+3. For extents shared by several partitions, wait until every holder has dropped its reference and the EN delete queue has finished, and confirm that physical space goes down; `reclaimed N extent(s)` must not be taken to mean disk space has been freed.
+4. For boundary partitions that span several namespaces, verify live VPs; do not infer from a key count of 0 in one namespace that the whole partition/extent is empty.
+5. New-write scenarios converge without manual forcegc; old unaccounted extents are handled by the established cleanup procedure and tracked separately as historical debt.
 
-遇到数据缺失、游标超前/回退、无法定位 anchor 或 refs 不一致，立即停止新增维护动作并保留元数据/日志。不能假定回滚旧二进制可以安全读取已被新 GC 删除的 WAL；回滚必须先证明旧 recovery 接受新 checkpoint，优先暂停回收并前向修复。
+On any missing data, cursor running ahead/regressing, unlocatable anchor or refs inconsistency, stop adding maintenance actions immediately and preserve metadata/logs. Do not assume that rolling back to the old binary can safely read WAL already deleted by the new GC; a rollback must first prove that the old recovery accepts the new checkpoint. Prefer pausing reclamation and fixing forward.

@@ -11,7 +11,7 @@
 .DS_Store
 Thumbs.db
 
-# Local test artefacts (cluster.sh, perf_check.sh)
+# Local test artefacts (scripts/cluster.sh, perf_check.sh)
 /tmp/
 /dev/shm/
 
@@ -25,16 +25,9 @@ python/**/__pycache__/
 python/**/*.pyc
 python/**/.pytest_cache/
 
-# Ignore all perf_baseline*.json by default (users regenerate locally via
-# `perf-check --update-baseline`). Committed exception: the KEY matched
-# TCP+UCX matrix at the canonical config (p8 d8 t16, 4K + 8M) — the
-# reference for tcp-vs-ucx regression tracking. Everything else (_shm,
-# p16/p32, other sizes) stays local scratch.
+# perf-check baselines are per machine: perf_check.sh writes one with
+# --update-baseline and compares against it on later runs.
 perf_baseline*.json
-!perf_baseline_tcp_p8_d8_s4k.json
-!perf_baseline_tcp_p8_d8_s8m.json
-!perf_baseline_ucx_p8_d8_s4k.json
-!perf_baseline_ucx_p8_d8_s8m.json
 
 # Claude Code local session state (not part of the project)
 .claude/

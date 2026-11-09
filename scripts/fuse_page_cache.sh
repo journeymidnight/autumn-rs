@@ -47,7 +47,7 @@ fail(){ echo "[page-cache $(date +%H:%M:%S)] FAIL: $*"; FAIL=1; }
 umnt(){ local m="$1" i; for i in 1 2 3 4 5 6; do grep -q " $m " /proc/mounts || return 0; umount -l "$m" 2>/dev/null; sleep 0.2; done; }
 cleanup(){
   local p; for p in $HOLDER $FUSE_A $FUSE_B; do kill -9 "$p" 2>/dev/null; done
-  umnt "$MNT_A"; umnt "$MNT_B"; bash "$ROOT/cluster.sh" stop > /dev/null 2>&1
+  umnt "$MNT_A"; umnt "$MNT_B"; bash "$ROOT/scripts/cluster.sh" stop > /dev/null 2>&1
 }
 trap cleanup EXIT
 
@@ -87,7 +87,7 @@ EOF
 
 say "starting cluster (3 EN; work=$WORK)"
 umnt "$MNT_A"; umnt "$MNT_B"; rm -rf "$AUTUMN_DATA_ROOT"
-env AUTUMN_EXTENT_BASE_PORT=20000 AUTUMN_TRANSPORT=tcp bash "$ROOT/cluster.sh" start 3 > "$WORK/cluster.log" 2>&1
+env AUTUMN_EXTENT_BASE_PORT=20000 AUTUMN_TRANSPORT=tcp bash "$ROOT/scripts/cluster.sh" start 3 > "$WORK/cluster.log" 2>&1
 grep -q "bootstrap succeeded" "$WORK/cluster.log" || { echo "cluster start failed"; tail -20 "$WORK/cluster.log"; exit 1; }
 sleep 3
 FUSE_A=$(mount_fuse "$MNT_A" a) || { fail "mount A"; exit 1; }

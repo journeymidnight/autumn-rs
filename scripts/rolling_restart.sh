@@ -39,7 +39,7 @@ export LC_ALL=C
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(dirname "$SCRIPT_DIR")"
-CLUSTER="$REPO_DIR/cluster.sh"
+CLUSTER="$REPO_DIR/scripts/cluster.sh"
 BIN="$REPO_DIR/target/release"
 
 DATA_ROOT="${AUTUMN_DATA_ROOT:-/tmp/autumn-rs}"

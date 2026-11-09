@@ -184,7 +184,7 @@ designs in `docs/*_design.md`.
 | `deploy/compose/docker-compose.yml` | trying it on one host | [Try it with docker compose](#try-it-with-docker-compose) |
 | `deploy/baremetal/autumn-deploy` | physical servers, single- or multi-host (systemd; plain processes without it) | [`docs/ops.md`](docs/ops.md) "Deployment" → Bare metal |
 | `deploy/k8s/deploy.sh` | Kubernetes — one image, kustomize base, guarded bootstrap Job; local-disk ENs, network-volume etcd | [`docs/ops.md`](docs/ops.md) "Deployment" → Kubernetes |
-| `cluster.sh` | dev / chaos / perf **testing only** (raw process kill for fault injection) | [`docs/ops.md`](docs/ops.md) |
+| `scripts/cluster.sh` | dev / chaos / perf **testing only** (raw process kill for fault injection) | [`docs/ops.md`](docs/ops.md) |
 
 Extent nodes write large appends with O_DIRECT by default (`--no-direct-io`
 turns it off; tmpfs before Linux 6.6 refuses it): "Direct I/O on the extent

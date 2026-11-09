@@ -9,13 +9,13 @@
 # systemd/pidfiles, which is wrong for chaos testing. Keep them separate.
 #
 # Usage:
-#   ./cluster.sh start [N]      # start N extent-node cluster (default 1, e.g. 3, 4, 5)
-#   ./cluster.sh stop           # kill all cluster processes (data preserved)
-#   ./cluster.sh restart [N]    # stop + start (data preserved)
-#   ./cluster.sh clean          # stop + wipe data dirs
-#   ./cluster.sh reset [N]      # clean + start (fresh cluster, all data wiped)
-#   ./cluster.sh status         # show running processes
-#   ./cluster.sh logs           # tail log files (Ctrl-C to exit)
+#   scripts/cluster.sh start [N]      # start N extent-node cluster (default 1, e.g. 3, 4, 5)
+#   scripts/cluster.sh stop           # kill all cluster processes (data preserved)
+#   scripts/cluster.sh restart [N]    # stop + start (data preserved)
+#   scripts/cluster.sh clean          # stop + wipe data dirs
+#   scripts/cluster.sh reset [N]      # clean + start (fresh cluster, all data wiped)
+#   scripts/cluster.sh status         # show running processes
+#   scripts/cluster.sh logs           # tail log files (Ctrl-C to exit)
 
 set -euo pipefail
 
@@ -32,12 +32,14 @@ set -euo pipefail
 ulimit -l unlimited 2>/dev/null || true
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BIN="$SCRIPT_DIR/target/release"
+# Resolved, not "$SCRIPT_DIR/..": the daemons' command lines carry this path,
+# and the chaos scripts find them with pgrep on "<repo>/target/release".
+BIN="$(cd "$SCRIPT_DIR/.." && pwd)/target/release"
 LOG_DIR="/tmp/autumn-rs-logs"
 DATA_ROOT="${AUTUMN_DATA_ROOT:-/tmp/autumn-rs}"
 # AUTUMN_BIND_HOST overrides the bind/advertise host. Default is IPv4 loopback.
 # For UCX/RoCE perf, set to a RoCE-attached IP, e.g.:
-#   AUTUMN_BIND_HOST="[<RoCE IP>]" AUTUMN_TRANSPORT=ucx bash cluster.sh reset 4
+#   AUTUMN_BIND_HOST="[<RoCE IP>]" AUTUMN_TRANSPORT=ucx bash scripts/cluster.sh reset 4
 BIND_HOST="${AUTUMN_BIND_HOST:-127.0.0.1}"
 MANAGER_ADDR="${BIND_HOST}:9001"
 # AUTUMN_TRANSPORT selects tcp (default) or ucx. Consumed here and passed to
@@ -814,7 +816,7 @@ save_cluster_config() {
         # `|| true`: with zero matching vars in the env, grep exits 1 and
         # pipefail+set -e would abort do_start right here (config written
         # truncated, "cluster ready" banner never printed) — only ever
-        # surfaced on a bare `bash cluster.sh restart N` with a clean env.
+        # surfaced on a bare `bash scripts/cluster.sh restart N` with a clean env.
         # UCX_* is persisted alongside AUTUMN_* so subcommands relaunch with
         # the exact same (explicit or derived) UCX env.
         env | { grep -E '^(AUTUMN_|UCX_)' || true; } | sort | while IFS='=' read -r k v; do

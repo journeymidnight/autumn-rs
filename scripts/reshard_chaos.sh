@@ -119,7 +119,7 @@ rm -rf "$AUTUMN_DATA_ROOT"
 env AUTUMN_EXTENT_BASE_PORT=20000 AUTUMN_TRANSPORT=tcp \
     AUTUMN_EXTENT_SHARDS=2 AUTUMN_EN1_CPUSET="$CPUSET2" \
     AUTUMN_DATA_ROOT="$AUTUMN_DATA_ROOT" \
-    bash "$ROOT/cluster.sh" start 1 > "$WORK/cluster.log" 2>&1
+    bash "$ROOT/scripts/cluster.sh" start 1 > "$WORK/cluster.log" 2>&1
 if ! grep -q "bootstrap succeeded" "$WORK/cluster.log"; then
   echo "cluster start FAILED"; tail -30 "$WORK/cluster.log"; exit 1
 fi

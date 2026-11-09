@@ -79,7 +79,7 @@ env AUTUMN_DATA_ROOT="$DATA_ROOT" \
     AUTUMN_NAMESPACES=bench \
     AUTUMN_TRANSPORT=tcp \
     AUTUMN_MGR_MIN_ALLOC_FREE_BYTES=0 \
-    bash "$ROOT/cluster.sh" start 4 > "$WORK/cluster.log" 2>&1
+    bash "$ROOT/scripts/cluster.sh" start 4 > "$WORK/cluster.log" 2>&1
 grep -q "bootstrap succeeded" "$WORK/cluster.log" \
     || { echo "cluster start failed"; tail -10 "$WORK/cluster.log"; cleanup_all; exit 1; }
 

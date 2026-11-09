@@ -47,7 +47,7 @@ rm -rf "$AUTUMN_DATA_ROOT" /tmp/autumn-rs
 env AUTUMN_EXTENT_BASE_PORT=20000 \
     AUTUMN_BOOTSTRAP_PRESPLIT="4:hexstring" \
     AUTUMN_TRANSPORT=tcp \
-    bash "$ROOT/cluster.sh" start 3 > "$WORK/cluster.log" 2>&1
+    bash "$ROOT/scripts/cluster.sh" start 3 > "$WORK/cluster.log" 2>&1
 grep -q "bootstrap succeeded" "$WORK/cluster.log" || { echo "cluster start failed"; tail -10 "$WORK/cluster.log"; exit 1; }
 setsid nohup "$PSBIN" --psid 2 --port 9351 --manager "$MGR" \
     --listen 127.0.0.1 --advertise 127.0.0.1:9351 --transport tcp \

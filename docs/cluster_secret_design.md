@@ -1,34 +1,39 @@
-# 集群成员认证（cluster secret）
+# Cluster membership authentication (cluster secret)
 
-整个集群共享一把密钥。manager、PS、EN 启动时必须给出它；声明为集群成员（Peer）
-或运维工具（Admin）的连接，建连时必须证明自己持有它。客户端不持有它：客户端的
-身份由数据面 capability token 证明，见 `data_plane_authz_design.md`。
+The whole cluster shares one secret. The manager, PS and EN must be given it at startup;
+a connection that declares itself a cluster member (Peer) or an operator tool (Admin)
+must prove at connect time that it holds it. Clients do not hold it: a client's identity
+is proven by the data-plane capability token, see `data_plane_authz_design.md`.
 
-## 1. 威胁模型
+## 1. Threat model
 
-- **防**：任何能连上集群端口、但不持有密钥的进程，冒充集群成员或运维工具——
-  向 EN 发 `APPEND` / `DELETE_EXTENT` / `FENCE_EXTENT`，向 manager 发
-  `TRUNCATE` / `ACQUIRE_OWNER_LOCK` / 读 `GET_AUTHZ_CONFIG`，或执行运维操作
-  （fence / remove / merge / namespace / principal / bootstrap / split / gc …）。
-- **不防**：能读或改写流量本身的攻击者（不加密、无 channel binding，不上 TLS）；
-  被攻破、因而持有密钥的集群成员（PS / EN 与运维工具持有同一把密钥，任何一方
-  沦陷都等同运维权限）。
+- **Defends against**: any process that can reach a cluster port but does not hold the
+  secret, impersonating a cluster member or an operator tool — sending `APPEND` /
+  `DELETE_EXTENT` / `FENCE_EXTENT` to an EN, sending `TRUNCATE` / `ACQUIRE_OWNER_LOCK` /
+  reading `GET_AUTHZ_CONFIG` on the manager, or running operator actions
+  (fence / remove / merge / namespace / principal / bootstrap / split / gc …).
+- **Does not defend against**: an attacker who can read or rewrite the traffic itself (no
+  encryption, no channel binding, no TLS); a compromised cluster member that therefore
+  holds the secret (PS / EN and operator tools hold the same secret, so compromising any
+  of them is equivalent to operator privileges).
 
-## 2. 三层各管什么
+## 2. What each of the three layers covers
 
-| 层 | 回答 | 在哪 |
+| Layer | Answers | Where |
 |---|---|---|
-| VERSION_HELLO（`version_hello.rs`） | 双方版本能否互通；连接说的是哪套接口（Client / Peer / Admin） | 每条连接的第一帧 |
-| PEER_AUTH（`peer_auth.rs`） | 声明 Peer / Admin 的连接是否持有集群密钥 | 紧跟 VERSION_HELLO，仅 Peer / Admin |
-| CLIENT_AUTH（capability token） | 客户端是哪个 principal、能读写哪些 key | 客户端连接上的业务帧（PS；开启 authz 时也在 EN） |
+| VERSION_HELLO (`version_hello.rs`) | Whether the two sides' versions can interoperate; which interface the connection speaks (Client / Peer / Admin) | The first frame of every connection |
+| PEER_AUTH (`peer_auth.rs`) | Whether a connection declaring Peer / Admin holds the cluster secret | Right after VERSION_HELLO, Peer / Admin only |
+| CLIENT_AUTH (capability token) | Which principal the client is, which keys it may read and write | Business frames on client connections (PS; also on EN when authz is enabled) |
 
-VERSION_HELLO 声明的身份只决定版本规则和接口范围，本身不是凭证；PEER_AUTH 让
-Peer / Admin 这两种声明需要拿出证明。
+The identity declared in VERSION_HELLO only determines the version rules and the
+interface scope; it is not a credential by itself. PEER_AUTH makes the Peer / Admin
+declarations require proof.
 
-## 3. 握手
+## 3. Handshake
 
-VERSION_HELLO 成功后，双方仍在原始字节流上（业务 reader 尚未启动），用与
-VERSION_HELLO 相同的定界帧格式（opcode `0xF1`，magic `AUPA`）交换：
+After VERSION_HELLO succeeds, both sides are still on the raw byte stream (the business
+reader has not started yet) and exchange, in the same delimited frame format as
+VERSION_HELLO (opcode `0xF1`, magic `AUPA`):
 
 ```text
 server → challenge  "AUPA" | mode u8 (0 open, 1 required) | server_nonce[32]
@@ -37,70 +42,94 @@ server → result     "AUPA" | verdict u8 (0 ok, 1 refused) | server_mac[32]
 mac = HMAC-SHA256(secret, "autumn-rs peer-auth v1" | side | service | role | server_nonce | client_nonce)
 ```
 
-- **双向**：服务端验客户端的 mac，客户端也验服务端的 mac。冒充成员地址的监听者
-  过不了客户端这一关。
-- **不传密钥**：线上只有 nonce 和 mac。每条连接的 server_nonce 都是新的，录下的
-  proof 无法重放到另一条连接。
-- **只在建连时做一次**：连接池里的连接长期复用，数据路径上每个请求没有任何新增开销。
-- **Client 连接跳过**：双方从 VERSION_HELLO 的结果知道身份，Client 连接不交换任何字节。
-- **open 模式**：没有安装密钥的服务端回 `mode = 0`，交换到此结束。只有进程内测试
-  会这样（服务端二进制没有密钥就拒绝启动）。持有密钥的客户端拒绝 open 服务端，
-  因为冒充者恰好会这样回答。
-- **拒绝要留痕**：服务端拒绝时打 WARN，带对端地址、声明的身份和服务：
-  `PEER_AUTH refused a connection holding a different cluster secret`，以及
-  `PEER_AUTH: connection gave no cluster-secret proof`（对端没有密钥，直接断开）。
+- **Mutual**: the server verifies the client's mac, and the client also verifies the
+  server's mac. A listener impersonating a member's address cannot get past the client.
+- **The secret is never sent**: only nonces and macs are on the wire. Every connection
+  gets a fresh server_nonce, so a recorded proof cannot be replayed onto another
+  connection.
+- **Done once, at connect time**: pooled connections are reused for a long time, and
+  there is no added cost per request on the data path.
+- **Client connections skip it**: both sides know the identity from the VERSION_HELLO
+  result, and a Client connection exchanges no bytes.
+- **open mode**: a server with no secret installed replies `mode = 0`, and the exchange
+  ends there. Only in-process tests do this (the server binary refuses to start without
+  a secret). A client that holds a secret refuses an open server, because that is exactly
+  how an impersonator would answer.
+- **Refusals leave a trace**: when the server refuses, it logs a WARN with the peer
+  address, the declared identity and the service:
+  `PEER_AUTH refused a connection holding a different cluster secret`, and
+  `PEER_AUTH: connection gave no cluster-secret proof` (the peer has no secret; the
+  connection is dropped).
 
-## 4. 发起方被拒绝之后
+## 4. After the initiator is refused
 
-拒绝是确定的结论：两边的密钥不同。密钥只在启动时读一次，轮换要求整集群停机，
-重试不会改变结果。该怎么办取决于谁拒绝了谁（`peer_auth::on_dial_failure`，在
-`RpcClient::from_conn_as` 里对每条 Peer / Admin 连接生效）。“谁”是本进程拨的
-地址，不是对端在 VERSION_HELLO 里自称的服务：否则占了某个 EN 地址的外人只要自称
-manager，就能让每个连它的进程退出。
+A refusal is a definite conclusion: the two sides hold different secrets. The secret is
+read only once at startup, rotation requires a full cluster shutdown, and retrying will
+not change the outcome. What to do depends on who refused whom
+(`peer_auth::on_dial_failure`, applied in `RpcClient::from_conn_as` to every Peer / Admin
+connection). "Who" is the address this process dialed, not the service the peer claims
+to be in VERSION_HELLO: otherwise an outsider occupying some EN's address could claim to
+be the manager and make every process that connects to it exit.
 
-- **被本进程的 manager 拒绝**（拨的是 `--manager` 里的地址，PS / EN 启动时用
-  `designate_managers` 登记）：manager 是成员身份的权威，被它拒绝说明本进程不是这个
-  集群的成员。服务端进程（`install_for_server` 装的密钥）打 ERROR 后以状态 1 退出。
-- **被其他地址拒绝**（EN、PS，或占了成员地址的外人）：错的是对方。打 ERROR，把错误
-  原样返回，调用方把它当成不可达的节点处理，进程继续运行。如果实际上是本进程配错了，
-  它下一次访问 manager 时被拒，按上一条退出。manager 自己不登记 manager 地址，所以
-  不会因被拒而退出。
-- 进程内测试和 autumn-op 不退出，只拿到错误。
-- 只有拒绝（`PermissionDenied`）走这条路；超时、连接断开不是拒绝，照常返回。
+- **Refused by this process's manager** (the dialed address is in `--manager`, registered
+  by PS / EN at startup with `designate_managers`): the manager is the authority on
+  membership, and being refused by it means this process is not a member of this
+  cluster. A server process (secret installed with `install_for_server`) logs an ERROR
+  and exits with status 1.
+- **Refused by any other address** (an EN, a PS, or an outsider occupying a member's
+  address): the other side is wrong. Log an ERROR and return the error as is; the caller
+  treats it as an unreachable node and the process keeps running. If it is actually this
+  process that is misconfigured, it is refused the next time it contacts the manager and
+  exits per the previous item. The manager does not register manager addresses itself,
+  so it never exits on a refusal.
+- In-process tests and autumn-op do not exit; they just get the error.
+- Only a refusal (`PermissionDenied`) takes this path; a timeout or a dropped connection
+  is not a refusal and is returned as usual.
 
-## 5. 运维操作的门
+## 5. The gate for operator actions
 
-manager 上只有 Admin 连接能发的 opcode 是 `manager_rpc::is_admin_mgr_msg` 这张表
-（fence / remove / maintenance / EC / create-stream / upsert-partition / merge /
-op-submit / principal / namespace / set-presplit / auto-policy 的 GET 与 SET）；Peer 连接发这些会被
-`check_opcode` 拒绝。Admin 连接必须先过 PEER_AUTH，所以这张表就是全部的门，
-请求体里不再携带任何 token。PS 上的 split / maintenance 不在客户端接口内，只有
-Peer / Admin 连接能发，同样由 PEER_AUTH 把关。
+The opcodes that only Admin connections may send to the manager are the table in
+`manager_rpc::is_admin_mgr_msg` (fence / remove / maintenance / EC / create-stream /
+upsert-partition / merge / op-submit / principal / namespace / set-presplit / GET and SET
+of auto-policy); a Peer connection sending these is refused by `check_opcode`. An Admin
+connection must pass PEER_AUTH first, so this table is the entire gate, and request
+bodies no longer carry any token. Split / maintenance on the PS are not part of the
+client interface; only Peer / Admin connections can send them, likewise gated by
+PEER_AUTH.
 
-manager 自己驱动的 split / flush / gc（auto-policy、merge 前的 flush）是它以
-Peer 身份连 PS 发出的，与运维工具走同一条认证路径。
+The split / flush / gc the manager drives itself (auto-policy, the flush before a merge)
+are sent by the manager connecting to the PS as a Peer, through the same authentication
+path as the operator tools.
 
-## 6. 密钥分发
+## 6. Secret distribution
 
-- **manager / PS / EN**：`--cluster-secret-file <PATH>`，必填，缺失即退出（exit 2）。
-  文件内容去掉首尾空白后至少 32 字节。`autumn-op gen-cluster-secret` 打印 64 个
-  十六进制字符。用文件而不是命令行参数，密钥不会出现在 `ps` / `/proc/<pid>/cmdline`。
-- **autumn-op**：全局 `--cluster-secret-file`（子命令前后均可）。它以 Admin 身份连接，
-  所以只读命令也需要；不连集群的命令（`gen-signing-key`、`gen-cluster-secret`）不需要。
-- **autumn-dashboard**：必填 `--cluster-secret-file`，把路径转给每次 autumn-op 调用。
-- **客户端（SDK / fuse / kvcache / S3 网关 / autumn-client）**：不持有。
-- rs 代码不读环境变量：env → flag 的翻译在 `cluster.sh` / 部署层（`cluster.sh`
-  把密钥放在 `$DATA_ROOT/cluster.secret`，首次启动生成）。
+- **manager / PS / EN**: `--cluster-secret-file <PATH>`, required; missing it exits
+  (exit 2). The file content, with leading and trailing whitespace stripped, must be at
+  least 32 bytes. `autumn-op gen-cluster-secret` prints 64 hex characters. A file is used
+  rather than a command-line argument so the secret never appears in `ps` /
+  `/proc/<pid>/cmdline`.
+- **autumn-op**: global `--cluster-secret-file` (before or after the subcommand). It
+  connects as Admin, so read-only commands need it too; commands that do not connect to
+  the cluster (`gen-signing-key`, `gen-cluster-secret`) do not.
+- **autumn-dashboard**: requires `--cluster-secret-file` and passes the path on to every
+  autumn-op invocation.
+- **Clients (SDK / fuse / kvcache / S3 gateway / autumn-client)**: do not hold it.
+- The rs code does not read environment variables: the env → flag translation is done in
+  `scripts/cluster.sh` / the deployment layer (`scripts/cluster.sh` keeps the secret in
+  `$DATA_ROOT/cluster.secret`, generated on first start).
 
-进程内的密钥是全局的（`peer_auth::install`，与 transport 选择同一形态）：一个进程
-只属于一个集群，所有 Peer / Admin 连接证明同一把密钥。
+The secret is process-global (`peer_auth::install`, the same shape as transport
+selection): a process belongs to exactly one cluster, and all Peer / Admin connections
+prove the same secret.
 
-## 7. 轮换
+## 7. Rotation
 
-一个进程只认一把密钥，轮换需要整集群停机：生成新文件，分发到所有节点和运维机器，
-全部重启。没有双密钥过渡期。
+A process recognizes only one secret, so rotation requires a full cluster shutdown:
+generate a new file, distribute it to every node and operator machine, and restart
+everything. There is no dual-secret transition period.
 
-## 8. 性能
+## 8. Performance
 
-每条 Peer / Admin 连接建立时多 1 个 RTT（challenge 与 VERSION_HELLO 的响应背靠背
-发送，proof / result 再一个往返）和两次 HMAC-SHA256。数据路径为零。
+Each Peer / Admin connection costs 1 extra RTT at setup (the challenge is sent back to
+back with the VERSION_HELLO response, and proof / result take one more round trip) and
+two HMAC-SHA256 computations. Zero on the data path.
