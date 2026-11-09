@@ -5762,7 +5762,9 @@ and compares each leg against `perf/perf_baseline_<transport>_p8_d8_s<size>.json
 passes when ops/s ≥ 80% of baseline and p99 ≤ 1.2× of it — `2 − threshold` at
 the default `--threshold 0.8`). Baselines are per machine and not
 in the repository: the first run on a host reports "no baseline", and
-`--update-baseline` writes one from that run. Between a leg's write and read
+`--update-baseline` writes one from that run. The script exits non-zero when any leg
+regressed against the baseline it found, also with `--update-baseline` (the new file is
+written either way), or when a leg, the build or a cluster start failed. Between a leg's write and read
 phases the script compacts every partition (perf-check `--before-read`, which runs
 `autumn-op compact <part> --wait`), so the reads come from SSTs. Before that, a read
 leg read whatever the write phase had left in the memtable, which moved with the

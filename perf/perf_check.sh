@@ -255,14 +255,12 @@ for t in $TRANSPORT_LIST; do
 done
 echo "[perf-check] building release binaries$([ $NEED_UCX_FEATURE -eq 1 ] && echo " (with --features autumn-server/ucx)")..."
 cd "$ROOT_DIR"
-if (( NEED_UCX_FEATURE )); then
-    cargo build --workspace --release --exclude autumn-fuse \
-        --features autumn-server/ucx 2>&1 \
-        | grep -E "^(Compiling|Finished|error)" || true
-else
-    cargo build --workspace --release --exclude autumn-fuse 2>&1 \
-        | grep -E "^(Compiling|Finished|error)" || true
-fi
+build_args=(--workspace --release --exclude autumn-fuse)
+(( NEED_UCX_FEATURE )) && build_args+=(--features autumn-server/ucx)
+# grep only trims the output; the build's own status decides. A failed build
+# would otherwise leave an older binary in target/release to be measured.
+cargo build "${build_args[@]}" 2>&1 | grep -E "^(Compiling|Finished|error)"
+(( PIPESTATUS[0] == 0 )) || { echo "[perf-check] release build failed" >&2; exit 1; }
 
 # Wait until the cluster's fixed ports — the manager (9001), the extent-node
 # grid (AUTUMN_EXTENT_BASE_PORT + node + shard*stride, 9101..9173 with the
@@ -336,7 +334,7 @@ run_perf() {
         --pipeline-depth "$depth" \
         --baseline "$baseline" \
         $UPDATE_BASELINE \
-        || echo "[perf-check] perf-check exited non-zero (mode=$mode parts=$parts depth=$depth size=$size_label)"
+        || { echo "[perf-check] perf-check exited non-zero (mode=$mode parts=$parts depth=$depth size=$size_label)"; return 1; }
 }
 
 # cluster.sh creates no application namespace, so the bench creates `bench`
