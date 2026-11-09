@@ -5339,9 +5339,16 @@ impl StreamClient {
             length
         };
 
+        // Nothing committed: asking for 0 bytes would be a to-end read.
+        if resolved == 0 {
+            return Ok((Bytes::new(), offset));
+        }
+        // The resolved length, never 0: a node serves a to-end read up to its
+        // own length, which counts bytes still being written and, on a replica
+        // that has not learned the seal, bytes past it.
         let chunk = self.config.read_chunk_bytes;
         if resolved <= chunk {
-            return self.read_replicated_with_failover(ex, offset, length).await;
+            return self.read_replicated_with_failover(ex, offset, resolved).await;
         }
 
         let mut data = BytesMut::with_capacity(resolved as usize);
@@ -7354,6 +7361,100 @@ mod merge_ec_replay_tests {
         // was the reported END only; `want` was already clamped correctly.
         assert_eq!(bytes.len(), L, "full logical payload must be returned");
         assert_eq!(bytes, payload, "decoded EC bytes must match original");
+    }
+}
+
+#[cfg(test)]
+mod to_end_read_tests {
+    use super::*;
+    use crate::extent_rpc::{
+        rkyv_decode, AllocExtentReq, AllocExtentResp, AppendPayload, AppendReq, AppendResp,
+        MSG_ALLOC_EXTENT, MSG_APPEND, PAYLOAD_LOCATION_IN_DAT,
+    };
+
+    const HELD: usize = 100;
+
+    /// A real extent node holding `HELD` bytes of an extent the client's
+    /// layout says is sealed at `sealed_length`: a seal reaches a node only
+    /// lazily. Returns the client and the bytes on the node.
+    async fn client_with_sealed_extent(
+        dir: &std::path::Path,
+        extent_id: u64,
+        sealed_length: u64,
+    ) -> (Rc<StreamClient>, Vec<u8>) {
+        let addr = autumn_test_ports::addr();
+        let node = crate::ExtentNode::new(crate::ExtentNodeConfig::new(dir.to_path_buf(), 1))
+            .await
+            .expect("create ExtentNode");
+        compio::runtime::spawn(async move {
+            let _ = node.serve(addr).await;
+        })
+        .detach();
+        compio::time::sleep(Duration::from_millis(120)).await;
+
+        let pool = Rc::new(ConnPool::new());
+        let target = addr.to_string();
+        let alloc = pool
+            .call(&target, MSG_ALLOC_EXTENT, crate::extent_rpc::rkyv_encode(&AllocExtentReq { extent_id }))
+            .await
+            .expect("alloc_extent RPC");
+        assert_eq!(rkyv_decode::<AllocExtentResp>(&alloc).expect("decode").code, CODE_OK);
+
+        let held: Vec<u8> = (0..HELD).map(|i| i as u8).collect();
+        let append = AppendReq {
+            extent_id,
+            eversion: 1,
+            commit: 0,
+            owner_epoch: 1,
+            payload: AppendPayload::One(Bytes::from(held.clone())),
+        };
+        let resp = pool.call_prepared(&target, MSG_APPEND, &append.prepared()).await.expect("append RPC");
+        assert_eq!(AppendResp::decode(resp).expect("decode").code, CODE_OK);
+
+        let sc = StreamClient::construct(
+            vec!["127.0.0.1:1".to_string()], // never contacted
+            0,
+            "to-end-read-test".to_string(),
+            0,
+            1 << 30,
+            pool,
+            StreamClientConfig::default(),
+        );
+        sc.nodes_cache.insert(1, (target, Vec::<u16>::new()));
+        sc.extent_info_cache.insert(
+            extent_id,
+            ExtentInfo {
+                extent_id,
+                replicates: vec![1],
+                parity: vec![],
+                eversion: 1,
+                refs: 1,
+                sealed_length,
+                sealed: true,
+                avali: 1,
+                replicate_disks: vec![],
+                parity_disks: vec![],
+                ec_converted: false,
+                payload_location: PAYLOAD_LOCATION_IN_DAT,
+            },
+        );
+        (sc, held)
+    }
+
+    #[compio::test]
+    async fn a_to_end_read_stops_at_the_seal() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (sc, held) = client_with_sealed_extent(dir.path(), 71_001, 60).await;
+        let (bytes, _) = sc.read_bytes_from_extent(71_001, 0, 0).await.expect("read");
+        assert_eq!(&bytes[..], &held[..60], "read past the seal: {} bytes", bytes.len());
+    }
+
+    #[compio::test]
+    async fn a_to_end_read_of_a_sealed_empty_extent_is_empty() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (sc, _) = client_with_sealed_extent(dir.path(), 71_002, 0).await;
+        let (bytes, _) = sc.read_bytes_from_extent(71_002, 0, 0).await.expect("read");
+        assert!(bytes.is_empty(), "read {} bytes of a sealed-empty extent", bytes.len());
     }
 }
 

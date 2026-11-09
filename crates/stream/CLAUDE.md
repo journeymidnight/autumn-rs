@@ -1535,7 +1535,12 @@ on replica[0] created a hotspot). Appends stay replica[0]-first
   >2 GiB don't trip the per-syscall pread ceiling (macOS INT_MAX / Linux
   0x7ffff000). EC = parallel per-shard reads with decode. `length=0` resolves
   to-end via `sealed_length` (sealed) or `commit_length_for_extent` (open)
-  before chunking.
+  before chunking, and the request carries the resolved length at every size
+  (nothing is sent when it is 0). A node serves a to-end request up to its own
+  `len`, which is reserved before the pwrite and, on a replica that has not
+  learned the seal, runs past it: such a read can fail `pread failed` against
+  an append in flight, and can return bytes past the seal. Tests:
+  `to_end_read_tests` (red with the 0 passed through).
 
 **`read_committed_bytes_from_extent`**: `length` is CLAMPED to the COMMITTED end
 (sealed → `sealed_length`; open tail → min-replica commit probe per call) before
