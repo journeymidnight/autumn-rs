@@ -21,7 +21,7 @@ file and S3 interfaces, which also serves as a KV-cache tier.
 | **What it is** | Replicated storage engine: ordered KV, with file, S3 and KV-cache interfaces on top | Distributed KV cache and transfer engine for LLM serving | KV store for KV-cache transfer and reuse in LLM inference | Distributed file system for AI training and inference |
 | **Main interface** | KV put/get/range (Rust, Python, CLI); POSIX via FUSE; S3 gateway | Object put/get by key (C++, Python, Rust, Go) | Python client: write/read cache over TCP or RDMA | POSIX via FUSE; USRBIO zero-copy native API |
 | **Where data lives** | Disk on the storage nodes; optional DRAM tier in the partition servers | DRAM segments contributed by clients; optional SSD offload, shared FS, object storage | Host DRAM pool. The design doc also lists SSD; the main branch implements DRAM only | NVMe SSD on the storage nodes |
-| **Durable across a node loss** | Yes. A write is acknowledged once every replica has it; open extents keep 3 copies by default | Best effort. Replicas are configurable per object, and placement returns fewer than asked when space is short | No replication; data on a lost server is gone | Yes. Chain replication (CRAQ), strongly consistent |
+| **Durable across a node loss** | Yes. A write is acknowledged once every replica has it; open extents keep 3 copies by default. The optional KV-cache DRAM tier acknowledges first and writes to disk right after; what a partition server holds that has not landed yet, at most the tier's budget, is lost if that server crashes | Best effort. Replicas are configurable per object, and placement returns fewer than asked when space is short | No replication; data on a lost server is gone | Yes. Chain replication (CRAQ), strongly consistent |
 | **Erasure coding** | Yes, sealed extents are converted in the background | Not documented | No | None found in the storage code; requested in [#409](https://github.com/deepseek-ai/3FS/issues/409) |
 | **Control plane** | Manager, leader-elected over etcd | Master service; single master by default, optional HA over etcd, Redis (experimental) or Kubernetes leases | None; each server stands alone | Cluster managers with an elected primary; metadata in FoundationDB |
 | **Transport** | TCP; RDMA via UCX (source build) | TCP, RDMA (IB, RoCE, eRDMA), GPUDirect RDMA, NVLink, EFA, NVMe-oF, CXL and more | TCP, RDMA via ibverbs | RDMA (IB, RoCE); TCP documented only for monitor traffic |
@@ -50,8 +50,9 @@ file and S3 interfaces, which also serves as a KV-cache tier.
   metrics), and has no releases to pin.
 - **autumn-rs** is the one to look at when the KV cache, model files and
   vector tables should share one durable, self-healing pool that runs over
-  plain TCP and needs no RDMA. Every acknowledged write is on every replica,
-  and sealed data can be erasure-coded.
+  plain TCP and needs no RDMA. Every acknowledged write is on every replica
+  (the KV-cache DRAM tier writes behind, see above), and sealed data can be
+  erasure-coded.
 
 ## KV-cache benchmark: SGLang HiCache L3
 
@@ -73,9 +74,9 @@ Each run has three steps:
 3. A fresh engine C asks all 6 at once.
 
 B and C have empty GPU and host caches, so a prefix can only come from L3.
-Each configuration ran 3 times, interleaved; the table shows the median of the
-three per-run medians. Every answer in every run was correct, and B and C
-loaded 103,616 tokens from L3 in each run.
+Each configuration ran 3 times, interleaved with the others; the table shows
+the median of the three per-run medians. Every answer in every run was
+correct, and B and C loaded 103,616 tokens from L3 in each run.
 
 **Hardware.** Xeon Platinum 8457C, H200 GPUs, 200 Gb/s RoCE NIC (mlx5),
 Intel D7-P5520 NVMe drives. autumn-rs ran 3 extent nodes on 3 drives and one
@@ -85,30 +86,29 @@ of DRAM per engine.
 | Configuration | Where the cache lives | B: time to first token, one at a time | C: time to first token, 6 at once |
 |---|---|---|---|
 | No L3 (recompute) | n/a | 2.43 s | 8.33 s |
-| autumn-rs, RDMA (UCX), DRAM tier | 3 replicas on disk, plus a DRAM copy in the partition server | 0.74 s | 1.67 s |
+| autumn-rs, RDMA (UCX), DRAM tier | DRAM in the partition server, written behind to 3 replicas on disk | 0.78 s | 1.44 s |
 | autumn-rs, RDMA (UCX), no DRAM tier | 3 replicas on disk | 1.83 s | 2.22 s |
-| autumn-rs, TCP, DRAM tier | 3 replicas on disk, plus a DRAM copy in the partition server | 1.73 s | 3.85 s |
-| Mooncake Store, RDMA | Engine DRAM, 1 copy | 0.81 s | 1.62 s |
+| autumn-rs, TCP, DRAM tier | DRAM in the partition server, written behind to 3 replicas on disk | 1.61 s | 4.12 s |
+| Mooncake Store, RDMA | Engine DRAM, 1 copy | 0.88 s | 2.11 s |
+| InfiniStore | TODO | TODO | TODO |
+| 3FS | TODO | TODO | TODO |
+
+The DRAM-tier and Mooncake rows come from one set of interleaved runs on the
+current code. The recompute and no-DRAM-tier rows come from an earlier set on
+the same machine; neither touches the DRAM tier.
 
 What this shows:
 
-- **DRAM tier vs. Mooncake.** autumn-rs's DRAM tier and Mooncake were within
-  run-to-run noise of each other. Per-run medians for B were 0.64–1.02 s and
-  0.78–1.10 s. The difference is what survives a failure: autumn-rs has already
-  written the pages to 3 disks, while Mooncake's single DRAM copy is gone with
+- **DRAM tier vs. Mooncake.** The two are close, and the spread between runs
+  is as large as the gap. Per-run medians for B were 0.70–0.88 s (autumn-rs)
+  and 0.57–1.02 s (Mooncake); for C, 1.26–2.66 s and 1.90–2.21 s. The
+  difference is what survives a failure: autumn-rs writes the pages to 3
+  disks behind the DRAM copy, while Mooncake's single DRAM copy is gone with
   its host.
 - **Without the DRAM tier.** autumn-rs is bound by NVMe reads, and is still
   1.3× (B) to 3.7× (C) faster than recomputing.
-- **Over TCP.** The client's single receive thread caps a TCP read near
-  4.5 GB/s. That is enough to beat recompute, but RDMA is worth it.
-
-**3FS is not in the table.** We deployed 3FS on the same host (3 storage
-targets, replication factor 3, FUSE and USRBIO) and ran it through SGLang's
-`hf3fs` backend. USRBIO alone read at over 12 GB/s on our setup, but SGLang
-took ~13 s per document to load from it. That points to our deployment, not
-to 3FS, and we could not find the cause in the time we had. We would rather
-show no number than a wrong one. Results from someone who runs 3FS in
-production are welcome.
+- **Over TCP.** One client thread receives every value, which caps a TCP
+  read at about 5 GB/s. That is enough to beat recompute, but RDMA is worth it.
 
 If you want to reproduce a row, open an issue and we will share the scripts.
 
