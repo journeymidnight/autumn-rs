@@ -55,6 +55,8 @@ jobs:
   publish:
     needs: build
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -82,3 +84,32 @@ jobs:
             $(jq -cr '.tags | map("-t " + .) | join(" ")' <<<"$DOCKER_METADATA_OUTPUT_JSON") \
             $(printf '${{ env.IMAGE }}@sha256:%s ' *)
           docker buildx imagetools inspect '${{ env.IMAGE }}:${{ steps.meta.outputs.version }}'
+
+  # The README's compose walkthrough against the image just published, pulled
+  # without logging in, the way a new user pulls it.
+  compose-smoke:
+    needs: publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    env:
+      AUTUMN_IMAGE: ghcr.io/${{ github.repository }}:${{ needs.publish.outputs.version }}
+      COMPOSE: docker compose -f deploy/compose/docker-compose.yml
+    steps:
+      - uses: actions/checkout@v4
+      - run: $COMPOSE up -d
+      - name: Put and get through the cli service
+        run: |
+          for i in $(seq 36); do
+            out=$($COMPOSE run --rm cli sh -c 'echo hello > /tmp/v && autumn-client --manager manager:9001 --namespace kvc put greeting /tmp/v && autumn-client --manager manager:9001 --namespace kvc get greeting' 2>&1) \
+              && grep -q hello <<<"$out" && { echo "ready on attempt $i, after $SECONDS s"; exit 0; }
+            echo "attempt $i: $(tail -n1 <<<"$out")"
+            sleep 5
+          done
+          exit 1
+      - name: Dashboard answers
+        run: curl -fsS -o /dev/null http://127.0.0.1:8799/api/overview
+      - name: Service logs
+        if: failure()
+        run: $COMPOSE logs --no-color --tail 100
