@@ -247,6 +247,9 @@ fn a_write_behind_that_failed_unsent_is_appended_again() {
         read(ps_addr, b"k0").await;
         assert_eq!(try_put(ps_addr, b"kvc/a", b"held").await, None, "held, answered at once");
         assert_eq!(read(ps_addr, b"kvc/a").await.as_deref(), Some(&b"held"[..]), "served from memory");
+        // A value at the bulk cut is held in the tier's registered arena.
+        let big = vec![0xa5u8; autumn_rpc::BULK_MIN_BYTES];
+        assert_eq!(try_put(ps_addr, b"kvc/big", &big).await, None, "large, held");
         let failed = try_put(ps_addr, b"k2", b"v2").await.expect("the log still fails");
         assert!(failed.contains("was not applied"), "{failed}");
 
@@ -266,6 +269,7 @@ fn a_write_behind_that_failed_unsent_is_appended_again() {
         let _ps = ChildPs::spawn(PS_ID, c.mgr, ps_addr, tier);
         assert_eq!(read(ps_addr, b"k3").await.as_deref(), Some(&b"v3"[..]));
         assert_eq!(read(ps_addr, b"kvc/a").await.as_deref(), Some(&b"held"[..]), "appended again, durable");
+        assert_eq!(read(ps_addr, b"kvc/big").await, Some(big), "the arena value appended again, durable");
     });
 }
 

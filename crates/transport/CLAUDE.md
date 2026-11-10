@@ -589,6 +589,17 @@ Test: `tests/ucx_send_staged.rs` (a send and a vectored send out of `.rodata`,
 which cannot be registered, arrive; red without the staging: `ibv_reg_mr`
 fails with Bad address).
 
+### `Arena`: registered memory for values held long
+
+`Arena::new(cap)` / `copy_in(value) -> Option<RegBytes>`: the pool's chunk
+type (mapping, registration on first use under UCX, offset allocator), but
+its own chunks of `MAX_CHUNK_BYTES`, made on demand up to `cap` (at least one),
+outside the pool's cap and budgets, never freed while the arena lives. A value is copied in once and leaves with its chunk's memh, so a UCX
+send of it is not staged. `None` when no chunk has room and the cap allows
+none more (or the mapping failed). Chunks are marked like overflow chunks,
+so a freed range wakes no pool memory waiter. Its user is the PS memory tier
+(partition-server CLAUDE.md, "Value memory").
+
 ### A pool buffer's value carries its memh (`RegBytes`)
 
 `PooledBuf::freeze` turns a buffer into a `RegBytes`: the filled bytes (owning

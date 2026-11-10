@@ -4743,7 +4743,7 @@ pub(crate) fn finalize_unique_user_keys(
 /// `offset` and `length` are byte offsets within the value (0/0 = full read).
 pub(crate) async fn resolve_value(
     op: u8,
-    raw_value: Bytes,
+    raw_value: autumn_transport::RegBytes,
     stream_client: &Rc<StreamClient>,
     offset: u64,
     length: u64,
@@ -4755,10 +4755,11 @@ pub(crate) async fn resolve_value(
         let vp = ValuePointer::decode(&raw_value[..VALUE_POINTER_SIZE]);
         read_value_from_log(&vp, stream_client, offset, length).await
     } else {
-        // Inline value already in a memtable Bytes — slice it zero-copy.
+        // Inline value (memtable, or the memory tier with its registration):
+        // slice it zero-copy.
         let n = raw_value.len();
         if offset == 0 && length == 0 {
-            Ok(raw_value.into())
+            Ok(raw_value)
         } else {
             let start = (offset as usize).min(n);
             let end = if length == 0 {
@@ -4766,7 +4767,7 @@ pub(crate) async fn resolve_value(
             } else {
                 (start + length as usize).min(n)
             };
-            Ok(raw_value.slice(start..end).into())
+            Ok(raw_value.slice(start..end))
         }
     }
 }

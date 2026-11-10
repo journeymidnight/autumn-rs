@@ -526,9 +526,10 @@ impl PsMetrics {
         }
         if let Some(t) = &self.mem_tier {
             use std::sync::atomic::Ordering::Relaxed;
-            let tier: [(&str, &str, f64); 10] = [
+            let tier: [(&str, &str, f64); 11] = [
                 ("autumn_ps_mem_tier_bytes", "gauge", t.used() as f64),
                 ("autumn_ps_mem_tier_capacity_bytes", "gauge", t.cap() as f64),
+                ("autumn_ps_mem_tier_arena_bytes", "gauge", t.arena_bytes() as f64),
                 ("autumn_ps_mem_tier_hits_total", "counter", t.hits.load(Relaxed) as f64),
                 ("autumn_ps_mem_tier_inserts_total", "counter", t.inserts.load(Relaxed) as f64),
                 ("autumn_ps_mem_tier_refused_total", "counter", t.refused.load(Relaxed) as f64),

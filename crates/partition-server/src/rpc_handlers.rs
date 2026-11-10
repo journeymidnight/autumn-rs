@@ -818,7 +818,7 @@ async fn get_value_inner(
     // before any await (note 15). `source` tracks where the key was found:
     // 0=miss, 1=mem, 2=imm, 3=sst.
     let mut source = 0u8;
-    let mut found: Option<(u8, Bytes, u64)> = {
+    let mut found: Option<(u8, autumn_transport::RegBytes, u64)> = {
         let p = part.borrow();
         check_region_epoch(p.part_id, p.region_epoch, req.region_epoch)?;
         if !in_range(&p.rg, &req.key) {
@@ -829,15 +829,15 @@ async fn get_value_inner(
         }
         // The memory tier holds a newer value than anything in the LSM.
         mem_tier_get(&p, &req.key)
-            .or_else(|| lookup_in_memtable(&p.active, &req.key))
+            .or_else(|| lookup_in_memtable(&p.active, &req.key).map(|(op, v, e)| (op, v.into(), e)))
             .inspect(|_r| {
                 source = 1;
             })
             .or_else(|| {
                 for imm in p.imm.iter().rev() {
-                    if let Some(r) = lookup_in_memtable(imm, &req.key) {
+                    if let Some((op, v, e)) = lookup_in_memtable(imm, &req.key) {
                         source = 2;
-                        return Some(r);
+                        return Some((op, v.into(), e));
                     }
                 }
                 None
@@ -850,9 +850,9 @@ async fn get_value_inner(
     // post-split state for the pin / redirect section — same relaxation
     // batch_get already accepts.
     if found.is_none() {
-        if let Some(r) = sst_lookup_paged_retry(part, &req.key).await? {
+        if let Some((op, v, e)) = sst_lookup_paged_retry(part, &req.key).await? {
             source = 3;
-            found = Some(r);
+            found = Some((op, v.into(), e));
         }
     }
     let p = part.borrow();
@@ -1066,7 +1066,8 @@ pub(crate) async fn handle_head(
 /// `(op, raw value)`, or None when absent, deleted or expired. Resolves no
 /// value pointer. The caller has checked epoch and range.
 /// A value the memory tier holds for `key`, shaped like a memtable hit.
-fn mem_tier_get(p: &PartitionData, key: &[u8]) -> Option<(u8, Bytes, u64)> {
+/// It keeps its registration, so a large one leaves without another copy.
+fn mem_tier_get(p: &PartitionData, key: &[u8]) -> Option<(u8, autumn_transport::RegBytes, u64)> {
     let (value, expires_at) = p.mem_tier.as_ref()?.get(key, now_secs())?;
     Some((crate::OP_PUT, value, expires_at))
 }
@@ -1078,7 +1079,7 @@ async fn lookup_live(
     // Borrow released before the SST lookup's awaits (note 15).
     let mut found = {
         let p = part.borrow();
-        mem_tier_get(&p, key).or_else(|| lookup_in_memtable(&p.active, key)).or_else(|| {
+        mem_tier_get(&p, key).map(|(op, v, e)| (op, v.into_bytes(), e)).or_else(|| lookup_in_memtable(&p.active, key)).or_else(|| {
             for imm in p.imm.iter().rev() {
                 if let Some(r) = lookup_in_memtable(imm, key) {
                     return Some(r);

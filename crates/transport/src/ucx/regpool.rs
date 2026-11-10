@@ -285,7 +285,8 @@ struct Chunk {
     used_units: AtomicUsize,
     /// A thread allocates from it (`CLAIM`).
     claimed: AtomicBool,
-    /// Outside the cap; its free room is no use to a budgeted waiter.
+    /// Outside the cap (an overflow or `Arena` chunk); its free room is no use
+    /// to a budgeted waiter.
     overflow: bool,
 }
 
@@ -845,6 +846,76 @@ fn alloc_slow(need: usize, units: u32) -> Option<PooledBuf> {
         }
     }
     None
+}
+
+/// Registered memory for values held long (the PS memory tier), apart from
+/// the pool: chunks of `MAX_CHUNK_BYTES`, made on demand up to the arena's own
+/// cap, outside the pool's cap and budgets. A value is copied in once and
+/// leaves with its chunk's memh, so a UCX send of it is not copied again
+/// (`Staged::of`). Chunks are never freed while the arena lives.
+pub struct Arena {
+    cap: usize,
+    chunks: Mutex<ArenaChunks>,
+    /// The chunk the last value went into, tried first.
+    hint: AtomicUsize,
+}
+
+struct ArenaChunks {
+    list: Vec<Arc<Chunk>>,
+    /// Bytes of `list` plus chunks being made.
+    bytes: usize,
+}
+
+impl Arena {
+    pub fn new(cap: usize) -> Self {
+        Self { cap, chunks: Mutex::new(ArenaChunks { list: Vec::new(), bytes: 0 }), hint: AtomicUsize::new(0) }
+    }
+
+    /// `value` copied into the arena, or `None` when no chunk has room for it
+    /// and the cap allows no new one (or the mapping failed).
+    pub fn copy_in(&self, value: &[u8]) -> Option<RegBytes> {
+        if value.is_empty() || value.len() > MAX_CHUNK_BYTES {
+            return None;
+        }
+        let mut pb = self.alloc(value.len())?;
+        pb.dest_mut().copy_from_slice(value);
+        Some(pb.freeze())
+    }
+
+    fn alloc(&self, need: usize) -> Option<PooledBuf> {
+        let units = need.div_ceil(UNIT) as u32;
+        let mut chunks = self.chunks.lock().unwrap();
+        let n = chunks.list.len();
+        let first = self.hint.load(Ordering::Relaxed);
+        for k in 0..n {
+            let i = (first + k) % n;
+            if let Some(a) = chunks.list[i].allocate(units) {
+                self.hint.store(i, Ordering::Relaxed);
+                return Some(pooled(&chunks.list[i], a, units, need));
+            }
+        }
+        if chunks.bytes + MAX_CHUNK_BYTES > self.cap.max(MAX_CHUNK_BYTES) {
+            return None;
+        }
+        // Reserve, then map and register without the lock.
+        chunks.bytes += MAX_CHUNK_BYTES;
+        drop(chunks);
+        let made = Chunk::new(MAX_CHUNK_BYTES, true).map(Arc::new);
+        let mut chunks = self.chunks.lock().unwrap();
+        let Some(chunk) = made else {
+            chunks.bytes -= MAX_CHUNK_BYTES;
+            return None;
+        };
+        let a = chunk.allocate(units).expect("a new chunk fits a value of at most its size");
+        chunks.list.push(chunk.clone());
+        self.hint.store(chunks.list.len() - 1, Ordering::Relaxed);
+        Some(pooled(&chunk, a, units, need))
+    }
+
+    /// Bytes of the chunks made so far.
+    pub fn mapped_bytes(&self) -> usize {
+        self.chunks.lock().unwrap().list.len() * MAX_CHUNK_BYTES
+    }
 }
 
 /// What a buffer holds. Each use has its own share of the cap, so one cannot

@@ -8635,25 +8635,25 @@ fn mem_tier_put(
         let _ = req.resp_tx.send(Err(err));
         return None;
     }
-    // Own the bytes: the value aliases a receive buffer (a pooled one, or the
-    // connection decoder's) that must not stay pinned by a held key.
-    let owned = Bytes::copy_from_slice(&value);
+    // The tier copies the value into memory of its own: it aliases a receive
+    // buffer (a pooled one, or the connection decoder's) that must not stay
+    // pinned by a held key.
     let mem = p.mem_tier.as_mut().expect("checked above");
-    if !mem.insert(&key, owned.clone(), expires_at, evict_rank, Instant::now()) {
+    let Some(held) = mem.insert(&key, &value, expires_at, evict_rank, Instant::now()) else {
         return Some(req);
-    }
+    };
     let tier = mem.budget();
     drop(p);
     let resp = PutResp { code: CODE_OK, message: String::new(), key: key.to_vec() };
     let _ = req.resp_tx.send(Ok(partition_rpc::rkyv_encode(&resp)));
-    pending.push(write_behind(key, owned, expires_at, tier));
+    pending.push(write_behind(key, held, expires_at, tier));
     None
 }
 
 /// The log append of a held value: the same bytes the tier holds, so the
 /// receive buffer is not kept and the value is not copied again.
-fn write_behind(key: Bytes, value: Bytes, expires_at: u64, tier: Arc<mem_tier::MemTierBudget>) -> WriteRequest {
-    WriteRequest::put(key, value.into(), expires_at, WriteResponder::WriteBehind { tier })
+fn write_behind(key: Bytes, value: autumn_transport::RegBytes, expires_at: u64, tier: Arc<mem_tier::MemTierBudget>) -> WriteRequest {
+    WriteRequest::put(key, value, expires_at, WriteResponder::WriteBehind { tier })
 }
 
 /// The memory tier's batched put: a `MSG_BATCH_PUT` is held in the shard
@@ -8723,17 +8723,16 @@ fn mem_tier_batch_put(
     let mem = p.mem_tier.as_mut().expect("checked above");
     let mut held = Vec::with_capacity(n);
     for (i, (key, value, expires_at, _, evict_rank)) in ops.iter().enumerate() {
-        // Own the bytes: the tail aliases a receive buffer.
-        let owned = Bytes::copy_from_slice(value);
-        if !mem.insert(key, owned.clone(), *expires_at, *evict_rank, now) {
+        // Copied by the tier: the tail aliases a receive buffer.
+        let Some(value) = mem.insert(key, value, *expires_at, *evict_rank, now) else {
             // Take back what this batch put in: until its durable write lands
             // they would be read, and that write may still fail.
             for (k, ..) in &ops[..i] {
                 mem.discard(k);
             }
             return Some(req);
-        }
-        held.push(owned);
+        };
+        held.push(value);
     }
     let tier = mem.budget();
     drop(p);

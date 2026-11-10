@@ -719,8 +719,8 @@ Size is left to the budget: every covered write is held unless it would only
 evict better entries, and eviction frees bytes. A partition whose range holds no covered key (`MemShard::overlaps`)
 skips the tier before decoding anything; in one that does, a put or batch that
 is not held has its ctrl decoded twice (the values stay in the tail). A held
-value is copied out of its receive buffer, so a small one does not pin the
-connection decoder's allocation. A fenced write
+value is copied out of its receive buffer (so it pins no connection
+decoder's allocation) into memory of the tier's own; see "Value memory". A fenced write
 (`inode_hint != 0`, a file-system lease) is never held: its floor bump is the
 durable path's. A put or batch whose key
 has an older durable write queued or in flight (`pending`, `inflight_write_keys`)
@@ -820,10 +820,35 @@ redirect declines one of 64 KiB or more, see "Direct reads" below).
   the slot holds — the key is stored once), `order` as above. The mutable part
   sits in a `RefCell` because a read reorders too (reads borrow
   `PartitionData` shared; a shard is touched only by its partition's thread).
-  An entry is charged `key + value + 128` (`ENTRY_OVERHEAD`: slot ~80 B,
+  An entry is charged `key + value + 128` (`ENTRY_OVERHEAD`: slot ~90 B,
   index and order ~30 B, the key's allocation). Removal (delete, rewrite,
-  applied, discard) leaves nothing behind. Values are still copied out of the
-  receive buffer into their own `Bytes`.
+  applied, discard) leaves nothing behind.
+- **Value memory.** A value of `BULK_MIN_BYTES` (64 KiB) and up is copied
+  into the PS's `autumn_transport::Arena` (registered 256 MiB chunks made on
+  demand up to `--mem-tier-bytes`, outside the regpool cap and budgets) and
+  held as a `RegBytes` with its chunk's memh. `insert` returns the held value
+  and its write-behind append is that same value, so the append to the
+  extent nodes carries the memh too; a hit keeps it through
+  `get_value_inner` / `resolve_value`, so `MSG_GET_AM` sends it by
+  rendezvous with no staging copy. A smaller value is held on the heap, where
+  it takes no whole 4 KiB arena unit; a `MSG_GET_AM` of one from 515 B up is
+  still staged (transport CLAUDE.md, "UCX is never handed memory"). The arena
+  can run out before the budget (unit rounding, the last partial chunk,
+  fragmentation); `insert` then evicts clean arena entries below the new
+  value's priority (heap entries free no arena room) and refuses (durable
+  path, budget given back) when none is left. `can_admit` checks the budget
+  only, so a `MSG_BATCH_PUT` with values of 64 KiB and up can evict on its
+  first ops and then go durable on the arena; the SDK sends such values as
+  single `MSG_PUT`s. Arena chunks are never unmapped, and under UCX each is
+  pinned whole when made: after large values the tier's memory stays at up
+  to `--mem-tier-bytes` (rounded up to 256 MiB) whatever it holds later, and
+  a new chunk's mapping and registration (tens of ms) runs on the partition
+  thread that needs it, at most once per 256 MiB. Measured (UCX, one host,
+  `BatchClient.get_into` of 256 pages of 2 x 8 MiB from the tier, kvc's 16
+  partitions, alternating builds, before write-behind): PS CPU per 64 GB read
+  11.0–12.6 s -> 0.15–0.31 s, read 39.8–41.4 -> 42.3–43.0 GB/s. All keys in
+  one partition: 8.7 -> 8.8 GB/s, so one partition's reads are not bound by
+  the copy.
 - **Durable writes of a held key** (delete, conditional write, fenced put, a
   put or batch that was not held) mark the entry superseded
   when queued (marked after dispatch over what the enqueue appended to
@@ -841,7 +866,7 @@ redirect declines one of 64 KiB or more, see "Direct reads" below).
 - Not covered: RANGE does not list a held key until its append lands.
 - Metrics: `autumn_ps_mem_tier_{bytes,capacity_bytes,dirty_bytes,hits_total,
   inserts_total,refused_total,evicted_entries_total,evicted_bytes_total,
-  write_behind_failed_total,write_behind_retried_total}`.
+  write_behind_failed_total,write_behind_retried_total,arena_bytes}`.
 - Tests: `mem_tier::tests` (LRU at rank 0, a chain written in two batches
   losing its tail first, a later turn keeping the first turn's head, a cold
   shallow entry going before a fresh deep one, a worse value not evicting
@@ -1117,7 +1142,7 @@ Mechanics:
   (`encode_v1_head_and_crc` builds a record's head and CRC around the value,
   which is its own segment), so the PS→EN append hands UCX the buffer's
   registration (no lookup); TCP sends the same `Bytes`. The mem tier copies
-  into plain `Bytes`, as it always did. UCX, 8 MiB writes: the PS sent ~180 GB
+  the value into memory of its own ("Value memory" under "Memory tier"). UCX, 8 MiB writes: the PS sent ~180 GB
   as active messages, all with a memh (`am_sent_bytes_memh` on its regpool
   log line; 0 without).
 - Cancel-safe on both transports: `drain_bulk_writes` hands the `PooledBuf` to each

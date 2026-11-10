@@ -44,11 +44,12 @@ use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::Arc;
 use std::time::Instant;
 
+use autumn_transport::{Arena, RegBytes};
 use bytes::Bytes;
 use hashbrown::HashTable;
 
 /// Bookkeeping charged per entry on top of its key and value bytes: its slot
-/// (~80 B), its `index` and `order` entries (~30 B), the key's allocation.
+/// (~90 B), its `index` and `order` entries (~30 B), the key's allocation.
 const ENTRY_OVERHEAD: u64 = 128;
 
 /// The PS-wide side: configuration, the shared byte budget, counters.
@@ -60,6 +61,9 @@ pub(crate) struct MemTierBudget {
     /// Each prefix's `prefix_successor`.
     successors: Vec<Option<Vec<u8>>>,
     used: AtomicU64,
+    /// Where values of `BULK_MIN_BYTES` and up are held: registered memory,
+    /// so a read sends them by rendezvous without copying them again.
+    arena: Arena,
     pub(crate) hits: AtomicU64,
     pub(crate) inserts: AtomicU64,
     pub(crate) refused: AtomicU64,
@@ -103,6 +107,7 @@ impl MemTierBudget {
             prefixes,
             successors,
             used: AtomicU64::new(0),
+            arena: Arena::new(usize::try_from(cap).unwrap_or(usize::MAX)),
             hits: AtomicU64::new(0),
             inserts: AtomicU64::new(0),
             refused: AtomicU64::new(0),
@@ -153,11 +158,26 @@ impl MemTierBudget {
     fn release(&self, n: u64) {
         self.used.fetch_sub(n, Relaxed);
     }
+
+    /// `value` copied into memory of the tier's own: the arena for a value
+    /// that leaves by rendezvous, the heap for a smaller one (in the arena it
+    /// would take a whole 4 KiB unit). None when the arena has no room.
+    fn hold(&self, value: &[u8]) -> Option<RegBytes> {
+        if value.len() < autumn_rpc::BULK_MIN_BYTES {
+            return Some(Bytes::copy_from_slice(value).into());
+        }
+        self.arena.copy_in(value)
+    }
+
+    /// Bytes of arena chunks mapped so far.
+    pub(crate) fn arena_bytes(&self) -> u64 {
+        self.arena.mapped_bytes() as u64
+    }
 }
 
 struct Slot {
     key: Box<[u8]>,
-    value: Bytes,
+    value: RegBytes,
     expires_at: u64,
     charge: u64,
     /// The `order` key: `(priority, this slot)`.
@@ -306,44 +326,58 @@ impl MemShard {
         self.budget.clone()
     }
 
-    /// Hold `value` for `key`, evicting for room the entries whose priority
-    /// is below the new one's — never a better entry for a worse one, which
-    /// would only go next, nor an equal one (a batch's other values, written
-    /// at the same instant and rank). False when that does not make room;
-    /// the caller then writes it durably, and a value held for the key is
-    /// served until that write lands.
-    pub(crate) fn insert(&mut self, key: &[u8], value: Bytes, expires_at: u64, rank: u32, now: Instant) -> bool {
+    /// Hold a copy of `value` for `key`, evicting for room the entries whose
+    /// priority is below the new one's — never a better entry for a worse
+    /// one, which would only go next, nor an equal one (a batch's other
+    /// values, written at the same instant and rank). Room is budget and, for
+    /// a large value, arena memory. Returns the held value, for its log
+    /// append; None when that does not make room, and the caller then writes
+    /// it durably, and a value held for the key is served until that write
+    /// lands.
+    pub(crate) fn insert(&mut self, key: &[u8], value: &[u8], expires_at: u64, rank: u32, now: Instant) -> Option<RegBytes> {
         let charge = charge(key.len(), value.len());
         let priority = self.priority(now, rank);
         if !self.could_fit(charge) {
-            self.budget.refused.fetch_add(1, Relaxed);
-            self.supersede(key);
-            return false;
+            return self.refuse(key);
         }
         while !self.budget.try_reserve(charge) {
             if !self.evict_below(priority) {
-                self.budget.refused.fetch_add(1, Relaxed);
-                self.supersede(key);
-                return false;
+                return self.refuse(key);
             }
         }
+        let value = loop {
+            match self.budget.hold(value) {
+                Some(v) => break v,
+                None if self.evict_arena_below(priority) => {}
+                None => {
+                    self.budget.release(charge);
+                    return self.refuse(key);
+                }
+            }
+        };
         self.remove(key);
-        let slot = Slot { key: key.into(), value, expires_at, charge, priority, rank, superseded: false, dirty: true };
+        let slot = Slot { key: key.into(), value: value.clone(), expires_at, charge, priority, rank, superseded: false, dirty: true };
         self.entries.get_mut().put(slot);
         self.held += charge;
         self.dirty += charge;
         self.budget.dirty.fetch_add(charge, Relaxed);
         self.budget.inserts.fetch_add(1, Relaxed);
-        true
+        Some(value)
+    }
+
+    fn refuse(&mut self, key: &[u8]) -> Option<RegBytes> {
+        self.budget.refused.fetch_add(1, Relaxed);
+        self.supersede(key);
+        None
     }
 
     /// The value held for `key` and its `expires_at`, if any and not
     /// expired. A hit counts as a use.
-    pub(crate) fn get(&self, key: &[u8], now_secs: u64) -> Option<(Bytes, u64)> {
+    pub(crate) fn get(&self, key: &[u8], now_secs: u64) -> Option<(RegBytes, u64)> {
         self.get_at(key, now_secs, Instant::now())
     }
 
-    fn get_at(&self, key: &[u8], now_secs: u64, now: Instant) -> Option<(Bytes, u64)> {
+    fn get_at(&self, key: &[u8], now_secs: u64, now: Instant) -> Option<(RegBytes, u64)> {
         let mut e = self.entries.borrow_mut();
         let i = e.find(key)?;
         let s = e.slot(i);
@@ -458,12 +492,32 @@ impl MemShard {
         if p >= priority {
             return false;
         }
-        let s = e.take(i);
+        self.evict(i);
+        true
+    }
+
+    /// For arena room: drop the lowest-priority entry below `priority` that
+    /// is in the arena; a heap entry frees none. False when there is none.
+    fn evict_arena_below(&mut self, priority: i64) -> bool {
+        let e = self.entries.get_mut();
+        let found = e
+            .order
+            .iter()
+            .take_while(|&&(p, _)| p < priority)
+            .find(|&&(_, i)| e.slot(i).value.len() >= autumn_rpc::BULK_MIN_BYTES)
+            .map(|&(_, i)| i);
+        let Some(i) = found else { return false };
+        self.evict(i);
+        true
+    }
+
+    /// Drop slot `i`, which is clean (in `order`).
+    fn evict(&mut self, i: u32) {
+        let s = self.entries.get_mut().take(i);
         self.budget.release(s.charge);
         self.held -= s.charge;
         self.budget.evicted_entries.fetch_add(1, Relaxed);
         self.budget.evicted_bytes.fetch_add(s.charge, Relaxed);
-        true
     }
 }
 
@@ -519,9 +573,14 @@ mod tests {
     }
 
     impl MemShard {
+        /// Whether an insert was held.
+        fn ins(&mut self, key: &[u8], value: &[u8], expires_at: u64, rank: u32, now: Instant) -> bool {
+            self.insert(key, value, expires_at, rank, now).is_some()
+        }
+
         /// An insert whose log append landed at once.
-        fn insert_clean(&mut self, key: &[u8], value: Bytes, expires_at: u64, rank: u32, now: Instant) -> bool {
-            let ok = self.insert(key, value, expires_at, rank, now);
+        fn insert_clean(&mut self, key: &[u8], value: &[u8], expires_at: u64, rank: u32, now: Instant) -> bool {
+            let ok = self.ins(key, value, expires_at, rank, now);
             if ok {
                 self.applied(key);
             }
@@ -535,17 +594,17 @@ mod tests {
     fn a_dirty_entry_is_not_evicted_until_its_append_lands() {
         let mut s = shard(2 * ENTRY);
         let t0 = Instant::now();
-        assert!(s.insert(&key("d", 0), v(1000), 0, 0, t0));
-        assert!(s.insert(&key("d", 1), v(1000), 0, 0, t0 + Duration::from_secs(1)));
+        assert!(s.ins(&key("d", 0), &v(1000), 0, 0, t0));
+        assert!(s.ins(&key("d", 1), &v(1000), 0, 0, t0 + Duration::from_secs(1)));
         assert_eq!(s.budget.dirty.load(Relaxed), 2 * ENTRY);
         let later = t0 + Duration::from_secs(10);
         assert!(!s.could_fit(ENTRY), "nothing evictable");
-        assert!(!s.insert(&key("d", 2), v(1000), 0, 0, later), "full of dirty: refused");
+        assert!(!s.ins(&key("d", 2), &v(1000), 0, 0, later), "full of dirty: refused");
         assert!(held(&s, &key("d", 0)) && held(&s, &key("d", 1)));
 
         s.applied(&key("d", 0));
         assert_eq!(s.budget.dirty.load(Relaxed), ENTRY);
-        assert!(s.insert(&key("d", 2), v(1000), 0, 0, later), "the landed one makes room");
+        assert!(s.ins(&key("d", 2), &v(1000), 0, 0, later), "the landed one makes room");
         assert!(!held(&s, &key("d", 0)), "landed: evicted");
         assert!(held(&s, &key("d", 1)), "still dirty: kept although older");
         assert_eq!(s.budget.evicted_entries.load(Relaxed), 1);
@@ -557,16 +616,14 @@ mod tests {
     fn an_entry_awaits_only_its_own_unlanded_append() {
         let mut s = shard(8 * ENTRY);
         let t0 = Instant::now();
-        let a = v(1000);
-        assert!(s.insert(b"kvc/a", a.clone(), 0, 0, t0));
+        let a = s.insert(b"kvc/a", &v(1000), 0, 0, t0).expect("held");
         assert!(s.awaits_append(b"kvc/a", &a));
         assert!(!s.awaits_append(b"kvc/a", &v(1000)), "equal bytes, another value");
         s.supersede(b"kvc/a");
         assert!(!s.awaits_append(b"kvc/a", &a), "a newer write is queued");
         assert!(s.holds_dirty(b"kvc/a", &a), "still not on disk");
 
-        let b = v(1000);
-        assert!(s.insert(b"kvc/b", b.clone(), 0, 0, t0));
+        let b = s.insert(b"kvc/b", &v(1000), 0, 0, t0).expect("held");
         s.applied(b"kvc/b");
         assert!(!s.awaits_append(b"kvc/b", &b), "landed");
         assert!(!s.holds_dirty(b"kvc/b", &b));
@@ -581,7 +638,7 @@ mod tests {
         let mut s = MemShard::new(b.clone());
         let t0 = Instant::now();
         for i in 0..3 {
-            assert!(s.insert(&key("r", i), v(1000), 0, 0, t0));
+            assert!(s.ins(&key("r", i), &v(1000), 0, 0, t0));
         }
         assert!(s.get_at(&key("r", 0), 0, t0 + Duration::from_secs(1)).is_some());
         assert!(s.entries.borrow().order.is_empty(), "a read of a dirty entry does not make it evictable");
@@ -592,6 +649,57 @@ mod tests {
         assert_eq!(b.dirty.load(Relaxed), ENTRY);
         drop(s);
         assert_eq!((b.dirty.load(Relaxed), b.used()), (0, 0));
+    }
+
+    /// A large value is held in the arena, whose room eviction frees as it
+    /// frees budget: with budget to spare and the arena full, a newer value
+    /// evicts the oldest; one that may evict nothing is refused and its
+    /// budget given back. Here the arena (one 256 MiB chunk) fills before the
+    /// 400 MiB budget does.
+    #[test]
+    fn a_full_arena_evicts_like_a_full_budget() {
+        const BIG: usize = 60 << 20;
+        let mut s = shard(400 << 20);
+        let t0 = Instant::now();
+        let at = |i: u64| t0 + Duration::from_secs(i);
+        for i in 0..4 {
+            assert!(s.insert_clean(&key("a", i), &v(BIG), 0, 0, at(i as u64)));
+        }
+        assert_eq!(s.budget.arena_bytes(), 256 << 20, "one chunk, no room for a fifth value");
+        assert!(s.ins(&key("a", 4), &v(BIG), 0, 0, at(4)));
+        assert!(!held(&s, &key("a", 0)), "the oldest made room in the arena");
+        assert!((1..5).all(|i| held(&s, &key("a", i))));
+        let used = s.budget.used();
+        assert!(!s.ins(b"kvc/late", &v(BIG), 0, 0, at(0)), "older than everything held");
+        assert_eq!(s.budget.used(), used, "the refused value's budget is back");
+        assert_eq!(s.budget.refused.load(Relaxed), 1);
+        let (got, _) = s.get(&key("a", 4), 0).unwrap();
+        assert!(got.len() == BIG && got.iter().all(|&b| b == 7));
+    }
+
+    /// Making arena room evicts only arena entries: an older small entry,
+    /// which frees no arena memory, stays.
+    #[test]
+    fn arena_room_is_made_from_arena_entries_only() {
+        const BIG: usize = 60 << 20;
+        let mut s = shard(400 << 20);
+        let t0 = Instant::now();
+        let at = |i: u64| t0 + Duration::from_secs(i);
+        assert!(s.insert_clean(b"kvc/small", &v(1000), 0, 0, at(0)));
+        for i in 0..4 {
+            assert!(s.insert_clean(&key("a", i), &v(BIG), 0, 0, at(1 + i as u64)));
+        }
+        assert!(s.ins(&key("a", 4), &v(BIG), 0, 0, at(5)));
+        assert!(held(&s, b"kvc/small"), "the oldest, but on the heap");
+        assert!(!held(&s, &key("a", 0)));
+    }
+
+    /// A value under the bulk cut is held on the heap, not in the arena.
+    #[test]
+    fn a_small_value_takes_no_arena_memory() {
+        let mut s = shard(1 << 20);
+        assert!(s.ins(b"kvc/s", &v(autumn_rpc::BULK_MIN_BYTES - 1), 0, 0, Instant::now()));
+        assert_eq!(s.budget.arena_bytes(), 0);
     }
 
     #[test]
@@ -608,10 +716,10 @@ mod tests {
         let mut s = shard(3 * ENTRY);
         let t0 = Instant::now();
         for i in 0..3 {
-            assert!(s.insert_clean(&key("k", i), v(1000), 0, 0, t0 + Duration::from_secs(i as u64)));
+            assert!(s.insert_clean(&key("k", i), &v(1000), 0, 0, t0 + Duration::from_secs(i as u64)));
         }
         assert!(s.get_at(&key("k", 0), 0, t0 + Duration::from_secs(5)).is_some(), "read k0");
-        assert!(s.insert_clean(&key("k", 3), v(1000), 0, 0, t0 + Duration::from_secs(6)));
+        assert!(s.insert_clean(&key("k", 3), &v(1000), 0, 0, t0 + Duration::from_secs(6)));
         assert!(held(&s, &key("k", 0)), "read since: kept");
         assert!(!held(&s, &key("k", 1)), "least recently used: evicted");
         assert!(held(&s, &key("k", 2)) && held(&s, &key("k", 3)));
@@ -622,14 +730,14 @@ mod tests {
     /// (128 pages of 64 tokens): 8192 tokens, worth 2 s.
     fn write_pages(s: &mut MemShard, tag: &str, first: usize, pages: usize, at: Instant) {
         for i in first..first + pages {
-            assert!(s.insert_clean(&key(tag, i), v(1000), 0, (i * 2048) as u32, at));
+            assert!(s.insert_clean(&key(tag, i), &v(1000), 0, (i * 2048) as u32, at));
         }
     }
 
     /// Room for `n` more entries: unrelated writes, rank 0, at `at`.
     fn press(s: &mut MemShard, n: usize, at: Instant) {
         for i in 0..n {
-            assert!(s.insert_clean(&key("p", i), v(1000), 0, 0, at));
+            assert!(s.insert_clean(&key("p", i), &v(1000), 0, 0, at));
         }
     }
 
@@ -675,10 +783,10 @@ mod tests {
     fn a_cold_shallow_entry_goes_before_a_fresh_deep_one() {
         let mut s = shard(2 * ENTRY);
         let t0 = Instant::now();
-        assert!(s.insert_clean(b"kvc/old0", v(1000), 0, 0, t0));
+        assert!(s.insert_clean(b"kvc/old0", &v(1000), 0, 0, t0));
         // 100K tokens deep: worth 25 s; the shallow entry is an hour older.
-        assert!(s.insert_clean(b"kvc/deep", v(1000), 0, 100_000, t0 + Duration::from_secs(3600)));
-        assert!(s.insert_clean(b"kvc/next", v(1000), 0, 0, t0 + Duration::from_secs(3601)));
+        assert!(s.insert_clean(b"kvc/deep", &v(1000), 0, 100_000, t0 + Duration::from_secs(3600)));
+        assert!(s.insert_clean(b"kvc/next", &v(1000), 0, 0, t0 + Duration::from_secs(3601)));
         assert!(!held(&s, b"kvc/old0") && held(&s, b"kvc/deep"));
     }
 
@@ -689,18 +797,18 @@ mod tests {
     fn a_worse_value_does_not_evict_better_ones() {
         let mut s = shard(2 * ENTRY);
         let t0 = Instant::now();
-        assert!(s.insert_clean(&key("a", 0), v(1000), 0, 0, t0));
-        assert!(s.insert_clean(&key("a", 1), v(1000), 0, 0, t0));
+        assert!(s.insert_clean(&key("a", 0), &v(1000), 0, 0, t0));
+        assert!(s.insert_clean(&key("a", 1), &v(1000), 0, 0, t0));
         // 8192 tokens deep, written 1 s later: worth 2 s, so worse than both.
-        assert!(!s.insert_clean(&key("d", 0), v(1000), 0, 8192, t0 + Duration::from_secs(1)));
+        assert!(!s.insert_clean(&key("d", 0), &v(1000), 0, 8192, t0 + Duration::from_secs(1)));
         assert!(held(&s, &key("a", 0)) && held(&s, &key("a", 1)));
         // A rewrite of a held key, refused: the held value stays until applied.
-        assert!(!s.insert_clean(&key("a", 0), v(1000), 0, 8192, t0 + Duration::from_secs(1)));
+        assert!(!s.insert_clean(&key("a", 0), &v(1000), 0, 8192, t0 + Duration::from_secs(1)));
         assert!(s.get_at(&key("a", 0), 0, t0).is_some());
         s.applied(&key("a", 0));
         assert!(!held(&s, &key("a", 0)));
         // Fresher still, it goes in.
-        assert!(s.insert_clean(&key("d", 0), v(1000), 0, 8192, t0 + Duration::from_secs(5)));
+        assert!(s.insert_clean(&key("d", 0), &v(1000), 0, 8192, t0 + Duration::from_secs(5)));
     }
 
     /// A batch whose deepest value could not make room evicts nothing.
@@ -709,7 +817,7 @@ mod tests {
         let mut s = shard(3 * ENTRY);
         let t0 = Instant::now();
         for i in 0..3 {
-            assert!(s.insert_clean(&key("h", i), v(1000), 0, 0, t0));
+            assert!(s.insert_clean(&key("h", i), &v(1000), 0, 0, t0));
         }
         let later = t0 + Duration::from_secs(1);
         assert!(!s.can_admit(2 * ENTRY, 8192, later), "worth 2 s: below everything held");
@@ -723,7 +831,7 @@ mod tests {
     fn a_batch_does_not_evict_itself() {
         let mut s = shard(3 * ENTRY);
         let t0 = Instant::now();
-        let fit: Vec<bool> = (0..4).map(|i| s.insert_clean(&key("b", i), v(1000), 0, 64, t0)).collect();
+        let fit: Vec<bool> = (0..4).map(|i| s.insert_clean(&key("b", i), &v(1000), 0, 64, t0)).collect();
         assert_eq!(fit, [true, true, true, false]);
         assert!((0..3).all(|i| held(&s, &key("b", i))));
     }
@@ -737,7 +845,7 @@ mod tests {
         for round in 0..50u64 {
             let at = t0 + Duration::from_secs(round);
             for i in 0..300 {
-                assert!(s.insert_clean(&key("r", i), v(10), 0, 0, at));
+                assert!(s.insert_clean(&key("r", i), &v(10), 0, 0, at));
             }
         }
         {
@@ -764,11 +872,11 @@ mod tests {
     fn a_discarded_entry_releases_its_bytes_once() {
         let mut s = shard(1 << 20);
         let now = Instant::now();
-        assert!(s.insert_clean(b"kvc/a", Bytes::from(vec![1; 1000]), 0, 0, now));
-        assert!(s.insert_clean(b"kvc/b", Bytes::from(vec![2; 1000]), 0, 0, now));
+        assert!(s.insert_clean(b"kvc/a", &Bytes::from(vec![1; 1000]), 0, 0, now));
+        assert!(s.insert_clean(b"kvc/b", &Bytes::from(vec![2; 1000]), 0, 0, now));
         let before = s.budget.used();
         s.discard(b"kvc/a");
-        assert_eq!(s.get(b"kvc/a", 0), None);
+        assert!(s.get(b"kvc/a", 0).is_none());
         assert_eq!(s.budget.used(), before - charge(5, 1000));
         assert!(s.evict_below(i64::MAX));
         assert!(!s.evict_below(i64::MAX), "empty");
@@ -784,9 +892,9 @@ mod tests {
         let mut other = MemShard::new(budget.clone());
         let mut s = MemShard::new(budget);
         let now = Instant::now();
-        assert!(other.insert(b"kvc/o", Bytes::from(vec![0; 6000]), 0, 0, now));
-        assert!(s.insert_clean(b"kvc/a", Bytes::from(vec![1; 2000]), 0, 0, now));
-        assert!(!s.insert_clean(b"kvc/big", Bytes::from(vec![2; 4000]), 0, 0, now), "4000 + overhead does not fit in 10000 - 6000");
+        assert!(other.ins(b"kvc/o", &Bytes::from(vec![0; 6000]), 0, 0, now));
+        assert!(s.insert_clean(b"kvc/a", &Bytes::from(vec![1; 2000]), 0, 0, now));
+        assert!(!s.insert_clean(b"kvc/big", &Bytes::from(vec![2; 4000]), 0, 0, now), "4000 + overhead does not fit in 10000 - 6000");
         assert!(s.get(b"kvc/a", 0).is_some(), "nothing was evicted for it");
         assert!(s.could_fit(charge(5, 1000)));
         assert!(!s.could_fit(charge(7, 4000)));
@@ -798,7 +906,7 @@ mod tests {
         let mut s = shard(200 * ENTRY);
         let t0 = Instant::now();
         let accepted =
-            (0..3000).filter(|&i| s.insert_clean(&key("n", i), v(1000), 0, 0, t0 + Duration::from_millis(i as u64))).count();
+            (0..3000).filter(|&i| s.insert_clean(&key("n", i), &v(1000), 0, 0, t0 + Duration::from_millis(i as u64))).count();
         assert_eq!(accepted, 3000);
         assert!((2800..3000).all(|i| held(&s, &key("n", i))));
     }
@@ -806,7 +914,7 @@ mod tests {
     #[test]
     fn a_value_that_cannot_fit_is_refused() {
         let mut s = shard(500);
-        assert!(!s.insert_clean(b"kvc/big", v(1000), 0, 0, Instant::now()));
+        assert!(!s.insert_clean(b"kvc/big", &v(1000), 0, 0, Instant::now()));
         assert_eq!(s.budget.used(), 0);
         assert_eq!(s.budget.refused.load(Relaxed), 1);
     }
@@ -814,7 +922,7 @@ mod tests {
     #[test]
     fn expired_entries_read_as_absent() {
         let mut s = shard(1 << 20);
-        assert!(s.insert_clean(b"kvc/t", v(10), 100, 0, Instant::now()));
+        assert!(s.insert_clean(b"kvc/t", &v(10), 100, 0, Instant::now()));
         assert!(s.get(b"kvc/t", 99).is_some());
         assert!(s.get(b"kvc/t", 100).is_none());
     }
@@ -822,13 +930,13 @@ mod tests {
     #[test]
     fn a_superseded_entry_goes_when_the_durable_write_lands() {
         let mut s = shard(1 << 20);
-        assert!(s.insert_clean(b"kvc/k", v(10), 0, 0, Instant::now()));
+        assert!(s.insert_clean(b"kvc/k", &v(10), 0, 0, Instant::now()));
         s.supersede(b"kvc/k");
         assert!(s.get(b"kvc/k", 0).is_some(), "still served until the write applies");
         s.applied(b"kvc/k");
         assert!(s.get(b"kvc/k", 0).is_none());
         // A memory put after the durable write was queued survives its apply.
-        assert!(s.insert_clean(b"kvc/k", v(10), 0, 0, Instant::now()));
+        assert!(s.insert_clean(b"kvc/k", &v(10), 0, 0, Instant::now()));
         s.applied(b"kvc/k");
         assert!(s.get(b"kvc/k", 0).is_some());
         assert_eq!(s.budget.used(), charge(5, 10));
@@ -838,7 +946,7 @@ mod tests {
     fn dropping_a_shard_returns_its_bytes() {
         let budget = MemTierBudget::new(1 << 20, &["kvc/".to_string()], RANK_US).unwrap();
         let mut s = MemShard::new(budget.clone());
-        assert!(s.insert_clean(b"kvc/x", v(100), 0, 0, Instant::now()));
+        assert!(s.insert_clean(b"kvc/x", &v(100), 0, 0, Instant::now()));
         assert!(budget.used() > 0);
         drop(s);
         assert_eq!(budget.used(), 0);
