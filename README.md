@@ -176,8 +176,10 @@ designs in `docs/*_design.md`.
   directly (on k8s, run them in-cluster).
 - The container image is TCP-only; UCX needs `hostNetwork`, an RDMA device and
   UCX ≥ 1.17 (build with `--features ucx`; "UCX library" in `docs/ops.md`).
-- The memory tier is a cache: a PS restart loses what it held. Use it only for
-  data that can be recomputed, which is what the KV-cache adapters store there.
+- The memory tier acknowledges a write from DRAM and writes it to disk behind:
+  a PS crash loses what had not landed yet, at most `--mem-tier-bytes`. Use it
+  only for data that can be recomputed, which is what the KV-cache adapters
+  store there.
 - The dashboard has no caller authentication; keep it behind `kubectl
   port-forward` or your own gateway.
 

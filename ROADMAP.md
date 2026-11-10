@@ -36,9 +36,9 @@ that is the strongest signal for what comes next.
   hundreds of milliseconds.
 - **A newer async runtime.** Move to a newer compio and use its zero-copy send
   and multishot receive where they cut kernel CPU on the TCP path.
-- **Memory tier values in registered memory.** Lets UCX serve memory-tier
-  reads without a copy and keeps the tier's memory exactly within budget.
-  Measure the copy's share first.
+- **Give the memory tier's arena back.** Large memory-tier values live in
+  registered chunks that are never unmapped, so after a burst of large values
+  the tier keeps its whole budget mapped and, under UCX, pinned.
 
 ## KV cache
 
