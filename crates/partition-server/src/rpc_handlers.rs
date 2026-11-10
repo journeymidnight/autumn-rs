@@ -647,7 +647,7 @@ pub(crate) fn decode_conditional(
 pub(crate) async fn compare_write_admit(
     req: Conditional,
     part: &Rc<RefCell<PartitionData>>,
-    pending: &mut Vec<WriteRequest>,
+    pending: &mut crate::PendingWrites,
     outer: futures::channel::oneshot::Sender<HandlerResult>,
 ) {
     let key = req.key.clone();

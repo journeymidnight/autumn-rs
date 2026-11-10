@@ -1524,11 +1524,13 @@ pub struct ChildFailpoints {
     pub compaction_hold: bool,
     /// No minor compaction is requested, so the test's table shape holds.
     pub minor_paused: bool,
+    /// A 64 MiB memory tier over `kvc/`.
+    pub mem_tier: bool,
 }
 
 /// Environment of a re-executed child PS:
 /// `<ps_id> <manager> <ps addr> <flush nth> <compaction 0|1> <merged 0|1> <hold 0|1>
-/// <minor paused 0|1>`.
+/// <minor paused 0|1> <mem tier 0|1>`.
 const CHILD_PS_ENV: &str = "AUTUMN_TEST_CHILD_PS";
 
 /// A partition server running as a re-executed copy of THIS test binary, so a
@@ -1551,12 +1553,13 @@ impl ChildPs {
             .env(
                 CHILD_PS_ENV,
                 format!(
-                    "{ps_id} {mgr_addr} {ps_addr} {} {} {} {} {}",
+                    "{ps_id} {mgr_addr} {ps_addr} {} {} {} {} {} {}",
                     fp.flush_checkpoint_nth,
                     u8::from(fp.compaction_checkpoint),
                     u8::from(fp.merged_checkpoint),
                     u8::from(fp.compaction_hold),
-                    u8::from(fp.minor_paused)
+                    u8::from(fp.minor_paused),
+                    u8::from(fp.mem_tier)
                 ),
             )
             .stdout(std::process::Stdio::null())
@@ -1616,6 +1619,10 @@ pub fn child_ps_main() {
     }
     if f[7] == "1" {
         autumn_partition_server::background::set_minor_compaction_paused(true);
+    }
+    if f[8] == "1" {
+        autumn_partition_server::params().mem_tier_bytes.set(64 << 20);
+        autumn_partition_server::params().mem_tier_prefix.set(vec!["kvc/".to_string()]);
     }
     compio::runtime::Runtime::new().unwrap().block_on(async move {
         let ps = PartitionServer::connect_with_advertise_and_port(

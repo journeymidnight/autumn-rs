@@ -526,7 +526,7 @@ impl PsMetrics {
         }
         if let Some(t) = &self.mem_tier {
             use std::sync::atomic::Ordering::Relaxed;
-            let tier: [(&str, &str, f64); 7] = [
+            let tier: [(&str, &str, f64); 10] = [
                 ("autumn_ps_mem_tier_bytes", "gauge", t.used() as f64),
                 ("autumn_ps_mem_tier_capacity_bytes", "gauge", t.cap() as f64),
                 ("autumn_ps_mem_tier_hits_total", "counter", t.hits.load(Relaxed) as f64),
@@ -534,6 +534,9 @@ impl PsMetrics {
                 ("autumn_ps_mem_tier_refused_total", "counter", t.refused.load(Relaxed) as f64),
                 ("autumn_ps_mem_tier_evicted_entries_total", "counter", t.evicted_entries.load(Relaxed) as f64),
                 ("autumn_ps_mem_tier_evicted_bytes_total", "counter", t.evicted_bytes.load(Relaxed) as f64),
+                ("autumn_ps_mem_tier_dirty_bytes", "gauge", t.dirty.load(Relaxed) as f64),
+                ("autumn_ps_mem_tier_write_behind_failed_total", "counter", t.write_behind_failed.load(Relaxed) as f64),
+                ("autumn_ps_mem_tier_write_behind_retried_total", "counter", t.write_behind_retried.load(Relaxed) as f64),
             ];
             for (name, kind, v) in tier {
                 push_type(&mut out, name, kind);

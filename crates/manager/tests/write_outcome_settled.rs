@@ -226,6 +226,49 @@ fn writes_failing_before_they_are_sent_leave_the_partition_serving() {
     });
 }
 
+/// A memory-tier write whose write-behind append failed before anything was
+/// sent is appended again with the next write once the log works, so it
+/// survives a crash although its writer was answered before the failure.
+/// Red when such an append is dropped instead of queued again.
+#[test]
+fn a_write_behind_that_failed_unsent_is_appended_again() {
+    let mut c = Cluster::start();
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        c.create_partition().await;
+        let ps_addr = pick_addr();
+        let tier = ChildFailpoints { mem_tier: true, ..Default::default() };
+        let mut ps = ChildPs::spawn(PS_ID, c.mgr, ps_addr, tier);
+        assert_eq!(try_put(ps_addr, b"k0", b"v0").await, None, "k0 with every node up");
+
+        c.stop(2);
+        // The first append with a node down was sent and reopens the
+        // partition; from then on appends fail before anything is sent.
+        try_put(ps_addr, b"k1", b"v1").await.expect("k1 acknowledged with a replica down");
+        read(ps_addr, b"k0").await;
+        assert_eq!(try_put(ps_addr, b"kvc/a", b"held").await, None, "held, answered at once");
+        assert_eq!(read(ps_addr, b"kvc/a").await.as_deref(), Some(&b"held"[..]), "served from memory");
+        let failed = try_put(ps_addr, b"k2", b"v2").await.expect("the log still fails");
+        assert!(failed.contains("was not applied"), "{failed}");
+
+        c.restart(2);
+        let mut landed = false;
+        for _ in 0..150 {
+            if try_put(ps_addr, b"k3", b"v3").await.is_none() {
+                landed = true;
+                break;
+            }
+            compio::time::sleep(Duration::from_millis(200)).await;
+        }
+        assert!(landed, "the log works again");
+
+        ps.kill();
+        let ps_addr = pick_addr();
+        let _ps = ChildPs::spawn(PS_ID, c.mgr, ps_addr, tier);
+        assert_eq!(read(ps_addr, b"k3").await.as_deref(), Some(&b"v3"[..]));
+        assert_eq!(read(ps_addr, b"kvc/a").await.as_deref(), Some(&b"held"[..]), "appended again, durable");
+    });
+}
+
 /// Through the SDK: a put whose first attempt may have been applied ends in
 /// `OutcomeUnknown` once its retries run out; a later put that the partition
 /// refused before sending anything ends in a plain connection error.

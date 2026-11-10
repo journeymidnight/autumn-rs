@@ -114,7 +114,8 @@ the cluster is the shared L3 tier behind the GPU/CPU cache levels, so prefix
 caches survive restarts and are shared across instances. Pure Python, no extra
 daemon; this repository ships the client they are built on. With the partition
 server's [memory tier](docs/ops.md#memory-tier-for-kv-cache---mem-tier-bytes---mem-tier-prefix)
-(`--mem-tier-bytes`, `--mem-tier-prefix kvc/`) pages are served from PS DRAM.
+(`--mem-tier-bytes`, `--mem-tier-prefix kvc/`) pages are acknowledged and served
+from PS DRAM and written to disk behind.
 
 **Vector tables — LanceDB over S3.** `autumn-s3` is a read/write S3 endpoint
 over the shared `fs/` tree (reads, conditional writes, copy, delete, multipart);

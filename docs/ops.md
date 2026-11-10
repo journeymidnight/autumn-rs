@@ -3547,11 +3547,16 @@ Off by default. `autumn-ps --mem-tier-bytes 256G --mem-tier-prefix kvc/` (or
 holds every put of a key under the prefix — single puts of any size, and batched
 puts (`put_many`, `BatchClient.put_from`: values under 64 KiB packed per
 partition) — in the PS's
-DRAM and acknowledges them without writing the log; reads look there first.
-**What is held is not durable**: a PS restart, a partition reopen, split, merge
-or move loses it, and a key that also had an older durable value reads that
-value afterwards. Use it only for data that can be recomputed (the KV cache);
-everything else should stay outside the prefix. The budget is for the whole PS;
+DRAM and acknowledges them before writing the log; reads look there first.
+**Write-behind**: the log append of a held value is queued at once and lands a
+group commit later; until then the value cannot be evicted, so the budget also
+caps what is acknowledged but not yet on disk, and with the tier full of such
+values puts wait for the log as without the tier. Once landed, an evicted value
+reads back from disk and a PS restart, split, merge or move keeps it (a restart
+whose drain overruns `--shutdown-timeout-ms` loses what was still queued). A crash
+or partition reopen in the window loses the values not yet landed (a key with an
+older durable value reads that one), so keep data that cannot be recomputed
+outside the prefix. The budget is for the whole PS;
 a partition that needs room evicts its own entries, least recently used first
 (a read or a write is a use), except that among entries used at about the same
 time the one with the higher eviction rank goes first: each put carries one
@@ -3567,15 +3572,23 @@ whole batch durable (an op over the 64 MiB value cap gets the batch refused, as
 without the tier).
 Fenced puts (file-system leases) are always durable, and a value over the 64 MiB
 value cap is refused as without the tier. A write that could not fit even with
-its partition's held entries all evicted goes durable without evicting them. `RANGE` does not list keys held only in memory. Watch
-`autumn_ps_mem_tier_*` on the PS `/metrics`.
+its partition's held entries all evicted goes durable without evicting them. `RANGE` does not list a held key until its
+append lands. Watch `autumn_ps_mem_tier_*` on the PS `/metrics`:
+`dirty_bytes` is what is acknowledged and not yet on disk, and
+`write_behind_retried_total` counts appends that failed before anything was
+sent and went again with the next write, and `write_behind_failed_total`
+those that will not reach disk: failed after being sent (the partition
+reopens and they are lost, as in a crash), or failed unsent and then
+overtaken by a newer write of the key that has not landed either.
 
 ```bash
 cargo test -p autumn-partition-server --lib mem_tier   # incl. a chain written in two batches losing its tail first
-cargo test -p autumn-manager --test mem_tier             # incl. a put/batch ranked below everything held going durable
-# live: start with the tier on, put a covered key, read it, restart the PS, read again
+cargo test -p autumn-manager --test mem_tier             # incl. evicted and held values read back after a PS restart
+# live: start with the tier on, put a covered key, read it, restart the PS, read
+# it again (it must be there); dirty_bytes returns to 0 once the writes stop
+# and land (an append parked after failing unsent waits for the next write)
 AUTUMN_PS_MEM_TIER_BYTES=$((64<<30)) AUTUMN_PS_MEM_TIER_PREFIX=kvc/ bash scripts/cluster.sh start 3
-curl -s http://127.0.0.1:9801/metrics | grep autumn_ps_mem_tier   # bytes / hits / evictions
+curl -s http://127.0.0.1:9801/metrics | grep autumn_ps_mem_tier   # bytes / dirty / hits / evictions
 # eviction keeps a hot set read every round: 8 GiB tier, 1 GiB hot, 2 GiB written
 # per round; run once from empty and once after --pre 6144 (steady state). Every
 # round must print 512/512 (exit 1 otherwise); evicted bytes climb meanwhile.

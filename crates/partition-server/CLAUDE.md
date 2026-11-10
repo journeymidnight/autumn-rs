@@ -693,12 +693,12 @@ a compaction moves the cursor past them. Load-bearing:
   extent's garbage reported as `open_tail_dead`, then as debt once the cursor
   moves; red when split at the tail), `background::wal_debt_tests`.
 
-## Memory tier (`mem_tier.rs`) — optional, not durable
+## Memory tier (`mem_tier.rs`) — optional, write-behind
 
 `--mem-tier-bytes N --mem-tier-prefix kvc/` (both needed; off by default). A
 put of a covered key (`MSG_PUT`, any size up to the 64 MiB
-value cap; unfenced) is held in DRAM by the partition's write actor and
-answered OK without a log append (`mem_tier_put`, after the freeze and
+value cap; unfenced) is held in DRAM by the partition's write actor,
+answered OK at once and its log append queued behind (`mem_tier_put`, after the freeze and
 epoch/range checks, so it keeps arrival order with deletes and conditional
 writes of the key). A batched put (`MSG_BATCH_PUT` — what
 `put_many` / `BatchClient.put_from` send for values under 64 KiB) is held
@@ -731,9 +731,51 @@ Reads look in the tier first: `get_value_inner` (GET, batched GET, redirects,
 inline memtable hit, so a redirect request gets the value inline (a batch
 redirect declines one of 64 KiB or more, see "Direct reads" below).
 
-- **Not durable**: a restart, reopen, split, merge or move drops the shard
-  with `PartitionData`; a key that also has a durable value reads that older
-  value afterwards. Meant for recomputable data (KV cache).
+- **Write-behind**: after the reply, `write_behind` pushes the value's own
+  log append into `pending` (the tier's `Bytes`, so neither a second copy
+  nor the receive buffer is kept; responder `WriteBehind`, which answers no
+  frame and counts a failure). The entry is dirty until `applied` sees that
+  append land: out of `order`, so not evictable, and `could_fit` counts it as
+  taken. The budget therefore bounds what is acknowledged but not on disk, and
+  a tier full of dirty entries sends puts down the durable path, whose reply
+  waits for the log. The other backpressure is the group-commit cap: the loop
+  stops reading requests while `pending` holds `max_write_batch()` of them.
+  `applied` on a dirty, unsuperseded entry can only be its own append: a put
+  that finds an older write of its key queued or in flight goes durable, and
+  every later durable write of the key supersedes; a batch with a key twice is
+  not held (its first append would clean the entry holding the second value).
+  Write-behind appends hold no connection slot, so one connection can fill
+  `pending` to the group-commit cap (3072 by default; durable puts held a slot
+  each, about 4 per connection), and the old per-put scan of it was O(cap):
+  it is a `PendingWrites`, which with the tier on counts
+  the keys it queues so "a write of this key is queued" (every held put and
+  batch, every conditional write) is a hash lookup, not a scan. Without the
+  tier it counts nothing (no hashing on the write path) and a conditional
+  write scans as before. The PS write-latency
+  histogram counts write-behind appends too, though their writers were
+  answered at once. Landed, the entry is a
+  clean copy, and eviction, split, merge, move and restart lose nothing; a
+  crash or reopen before it lands loses it (a key with an older durable
+  value reads that). An append whose batch failed before anything was sent
+  is not answered but parked in `PartitionData.write_behind_retry`;
+  `requeue_write_behind` moves it back into `pending` at the next write
+  request, a freeze drain and the shutdown drain, if its entry still
+  `awaits_append` it (dirty, not superseded, the same bytes: a newer write of
+  the key queued or landed since makes it obsolete, and appended after that
+  write it would read as the newer value). It rides along with real traffic
+  rather than relaunching itself, so a log that keeps failing that way does
+  not spin the loop (`write_behind_retried_total`) — except while a freeze
+  drain waits: then it is relaunched every round, and the freeze cannot
+  complete until it lands (or its TTL ends the freeze). A retry dropped
+  because a newer write superseded it while its entry is still dirty (that
+  write may have failed too) counts in `write_behind_failed_total`. A retry
+  that fails unsent again during the shutdown drain stays parked and is
+  dropped with the shard, uncounted. An append that failed
+  after being sent (the partition reopens) is lost with the shard
+  (`write_behind_failed_total`). Was memory-only until the user asked for this: the
+  measured write gain (UCX 2.76→8.65 GB/s) came from skipping the log, so
+  sustained writes are log-bound again; the tier now absorbs bursts and
+  serves reads.
 - **Budget** is per PS (atomic, shared by its partitions); each partition owns
   its shard on its own thread (no lock). A shard evicts only its own entries;
   an insert that cannot fit after that takes the durable path, and the value
@@ -762,7 +804,7 @@ redirect declines one of 64 KiB or more, see "Direct reads" below).
   goes before one written now 100K tokens deep (25 s). A write counts as a use
   (LRU's insert-at-newest; the CLOCK rule "a write sets no bit" has no
   counterpart).
-- **Measured** (sglang Qwen3-VL-32B TP4 ×2, 24 GiB tier, 16 two-turn
+- **Measured** before write-behind, on the memory-only tier (sglang Qwen3-VL-32B TP4 ×2, 24 GiB tier, 16 two-turn
   conversations ≈ 54 GB of KV; the second instance asks every turn 2 newest
   first): 86–88K of 208K prompt tokens hit from the tier — the newest 5 whole,
   the next 3 partly (11520, 7680, 1984: heads kept) — against 0.8–27K with the
@@ -796,16 +838,26 @@ redirect declines one of 64 KiB or more, see "Direct reads" below).
   reads it with its own `MSG_GET`, concurrently with the other items. Gathered
   into one reply (the old redirect's rkyv reply), 36 held 33 MiB layers of one
   vLLM request took 7.0 s; read on their own, 0.5 s.
-- Not covered: RANGE does not list keys held only in memory.
-- Metrics: `autumn_ps_mem_tier_{bytes,capacity_bytes,hits_total,
-  inserts_total,refused_total,evicted_entries_total,evicted_bytes_total}`.
+- Not covered: RANGE does not list a held key until its append lands.
+- Metrics: `autumn_ps_mem_tier_{bytes,capacity_bytes,dirty_bytes,hits_total,
+  inserts_total,refused_total,evicted_entries_total,evicted_bytes_total,
+  write_behind_failed_total,write_behind_retried_total}`.
 - Tests: `mem_tier::tests` (LRU at rank 0, a chain written in two batches
   losing its tail first, a later turn keeping the first turn's head, a cold
   shallow entry going before a fresh deep one, a worse value not evicting
   better ones, a batch not evicting itself, nothing left behind by removals,
-  refusal, expiry, supersede-then-apply, budget returned on drop; ablations
-  red: rank_us 0, evicting regardless of priority, evicting equal priority);
-  `crates/manager/tests/mem_tier.rs` (held keys gone after a restart, durable
+  refusal, expiry, supersede-then-apply, budget returned on drop, a dirty
+  entry not evicted until its append lands, dirty bytes returned by every
+  removal; ablations red: rank_us 0, evicting regardless of priority,
+  evicting equal priority, dirty entries in the eviction order);
+  `pending_writes_counts_the_keys_it_queues`,
+  `an_entry_awaits_only_its_own_unlanded_append`;
+  `crates/manager/tests/write_outcome_settled.rs`
+  `a_write_behind_that_failed_unsent_is_appended_again` (red when dropped);
+  `crates/manager/tests/mem_tier.rs` (held is read off the PS counters; a
+  batch with a repeated key not held (red without the check);
+  evicted and held values read back after a restart, red without the
+  write-behind push; durable
   fallbacks back, a durable write replacing the held value, delete, TTL,
   conditional write, the least recently written going first, a put and a
   batch ranked below everything held written durably while the same at rank

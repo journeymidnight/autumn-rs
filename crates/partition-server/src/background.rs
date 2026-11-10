@@ -2176,9 +2176,14 @@ pub(crate) async fn finish_write_batch(
             } else {
                 format!("log append failed before anything was written; this write was not applied: {e:#}")
             };
+            let mut retry = Vec::new();
             for entry in bd.valid {
                 if reopen {
                     entry.resp.send_outcome_unknown(msg.clone());
+                } else if matches!(entry.resp, crate::WriteResponder::WriteBehind { .. }) {
+                    // Nothing was written, so it can simply go again; its
+                    // writer was answered long ago and will not retry it.
+                    retry.push(crate::WriteRequest::put(entry.user_key, entry.value, entry.expires_at, entry.resp));
                 } else {
                     entry.resp.send_unavailable(msg.clone());
                 }
@@ -2191,6 +2196,7 @@ pub(crate) async fn finish_write_batch(
                 for kh in &bd.inflight_key_hashes {
                     release_inflight_key(&mut p.inflight_write_keys, *kh);
                 }
+                p.write_behind_retry.extend(retry);
             }
             return Err(anyhow!(msg));
         }

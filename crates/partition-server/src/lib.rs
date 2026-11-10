@@ -1078,6 +1078,11 @@ pub(crate) struct PartitionData {
     /// lost-update — `system_gc_inflight_wal_put`). A hash collision only costs a
     /// spurious GC-round abort (safe, retried). Maintained on the hot write path.
     inflight_write_keys: HashMap<u64, u32>,
+    /// Write-behind appends whose batch failed before anything was written:
+    /// queued again by the next write request (or a freeze drain), not
+    /// relaunched on their own, so an append that keeps failing that way does
+    /// not spin the loop.
+    write_behind_retry: Vec<WriteRequest>,
     log_stream_id: u64,
     row_stream_id: u64,
     meta_stream_id: u64,
@@ -1949,6 +1954,13 @@ pub(crate) enum WriteResponder {
     /// admitted write in the same/later batch fails identically and DOES
     /// surface the error to the client).
     Fence,
+    /// The log append of a value the memory tier held and already
+    /// acknowledged. A failure is counted and logged: the value stays served
+    /// from memory, pinned, until the key is written again or the partition
+    /// reopens.
+    WriteBehind {
+        tier: Arc<mem_tier::MemTierBudget>,
+    },
 }
 
 impl WriteResponder {
@@ -1988,7 +2000,7 @@ impl WriteResponder {
                 true
             }
             WriteResponder::BatchPut { accum, idx } => accum.record(idx, 0),
-            WriteResponder::Fence => false,
+            WriteResponder::Fence | WriteResponder::WriteBehind { .. } => false,
         }
     }
 
@@ -2020,6 +2032,11 @@ impl WriteResponder {
                 tracing::warn!("fence-bump WAL record: {msg}");
                 return;
             }
+            WriteResponder::WriteBehind { tier } => {
+                tier.write_behind_failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                tracing::warn!("memory tier write-behind append: {msg}");
+                return;
+            }
         };
         let _ = outer.send(Err((status, msg)));
     }
@@ -2027,6 +2044,10 @@ impl WriteResponder {
     /// Reply failure — propagate the error string as Internal to the outer
     /// resp_tx. "key is out of range" is InvalidArgument per existing semantics.
     pub(crate) fn send_err(self, msg: String) {
+        if let WriteResponder::WriteBehind { .. } = self {
+            self.send_status(StatusCode::Internal, msg);
+            return;
+        }
         if let WriteResponder::Fence = self {
             // The admitted write that rode behind this record fails the
             // same way and surfaces the error to its client; the floor
@@ -2052,7 +2073,7 @@ impl WriteResponder {
             WriteResponder::Put { outer, .. } => outer,
             WriteResponder::Delete { outer, .. } => outer,
             WriteResponder::Conflict { outer, .. } => outer,
-            WriteResponder::BatchPut { .. } | WriteResponder::Fence => {
+            WriteResponder::BatchPut { .. } | WriteResponder::Fence | WriteResponder::WriteBehind { .. } => {
                 unreachable!("handled above")
             }
         };
@@ -2065,22 +2086,106 @@ pub(crate) struct WriteRequest {
     resp: WriteResponder,
 }
 
+/// The write actor's requests not yet in a batch. With the memory tier on it
+/// also counts the user keys they write, so "is a write of this key queued"
+/// costs a lookup: the tier asks it on every held put, and its write-behind
+/// appends hold no connection slot, so one connection can fill the queue to
+/// the group-commit cap. Without the tier nothing is counted (no hashing on
+/// the write path) and the rare question, a conditional write's, scans.
+#[derive(Default)]
+pub(crate) struct PendingWrites {
+    reqs: Vec<WriteRequest>,
+    /// `inflight_key_hash` of each written key -> how many queued requests
+    /// write it; `None` when not counting. A collision only makes a held put
+    /// go durable or a conditional write drain first.
+    keys: Option<std::collections::HashMap<u64, u32>>,
+}
+
+impl PendingWrites {
+    /// A queue counting its keys (the memory tier on) or not.
+    pub(crate) fn new(count_keys: bool) -> Self {
+        PendingWrites { reqs: Vec::new(), keys: count_keys.then(Default::default) }
+    }
+
+    pub(crate) fn push(&mut self, w: WriteRequest) {
+        if let (Some(keys), Some(k)) = (self.keys.as_mut(), w.written_key()) {
+            *keys.entry(background::inflight_key_hash(k)).or_default() += 1;
+        }
+        self.reqs.push(w);
+    }
+
+    /// Whether a queued request writes `key`.
+    pub(crate) fn queues(&self, key: &[u8]) -> bool {
+        match &self.keys {
+            Some(keys) => !keys.is_empty() && keys.contains_key(&background::inflight_key_hash(key)),
+            None => self.reqs.iter().any(|w| w.written_key() == Some(key)),
+        }
+    }
+
+    /// The first `n` requests, in order.
+    fn take_front(&mut self, n: usize) -> Vec<WriteRequest> {
+        if n == self.reqs.len() {
+            if let Some(keys) = self.keys.as_mut() {
+                keys.clear();
+            }
+            return std::mem::take(&mut self.reqs);
+        }
+        let rest = self.reqs.split_off(n);
+        let taken = std::mem::replace(&mut self.reqs, rest);
+        let Some(keys) = self.keys.as_mut() else { return taken };
+        for w in &taken {
+            if let Some(k) = w.written_key() {
+                let h = background::inflight_key_hash(k);
+                if let std::collections::hash_map::Entry::Occupied(mut e) = keys.entry(h) {
+                    *e.get_mut() -= 1;
+                    if *e.get() == 0 {
+                        e.remove();
+                    }
+                }
+            }
+        }
+        taken
+    }
+
+    fn drain_all(&mut self) -> Vec<WriteRequest> {
+        self.take_front(self.reqs.len())
+    }
+}
+
+impl std::ops::Deref for PendingWrites {
+    type Target = [WriteRequest];
+    fn deref(&self) -> &[WriteRequest] {
+        &self.reqs
+    }
+}
+
+impl Extend<WriteRequest> for PendingWrites {
+    fn extend<I: IntoIterator<Item = WriteRequest>>(&mut self, iter: I) {
+        for w in iter {
+            self.push(w);
+        }
+    }
+}
+
+impl FromIterator<WriteRequest> for PendingWrites {
+    fn from_iter<I: IntoIterator<Item = WriteRequest>>(iter: I) -> Self {
+        let mut p = PendingWrites::new(true);
+        p.extend(iter);
+        p
+    }
+}
+
 impl WriteRequest {
+    pub(crate) fn put(user_key: Bytes, value: autumn_transport::RegBytes, expires_at: u64, resp: WriteResponder) -> Self {
+        WriteRequest { op: WriteOp::Put { user_key, value, expires_at }, resp }
+    }
+
     /// The key this request writes; None for a fence record.
     fn written_key(&self) -> Option<&[u8]> {
         match &self.op {
             WriteOp::Put { user_key, .. } => Some(user_key),
             WriteOp::Delete { user_key } => Some(user_key),
             WriteOp::FenceBump { .. } => None,
-        }
-    }
-
-    /// Whether this request writes the user key `key`.
-    fn writes_key(&self, key: &[u8]) -> bool {
-        match &self.op {
-            WriteOp::Put { user_key, .. } => user_key[..] == *key,
-            WriteOp::Delete { user_key } => user_key[..] == *key,
-            WriteOp::FenceBump { .. } => false,
         }
     }
 
@@ -6491,6 +6596,7 @@ async fn partition_thread_main(
         gc_tx,
         seq_number: max_seq,
         inflight_write_keys: HashMap::new(),
+        write_behind_retry: Vec::new(),
         log_stream_id,
         row_stream_id,
         meta_stream_id,
@@ -6998,7 +7104,7 @@ async fn partition_loop(
     let mut imm_full_since: Option<std::time::Instant> = None;
     let wal_gap_cap = max_wal_gap();
     let mut metrics = WriteLoopMetrics::new();
-    let mut pending: Vec<WriteRequest> = Vec::new();
+    let mut pending = PendingWrites::new(part.borrow().mem_tier.is_some());
     // The coalescing window opened by the most recent completion; see
     // `CoalesceWindow` and (B0) below. Closed by every launch.
     let mut window = CoalesceWindow::default();
@@ -7042,6 +7148,9 @@ async fn partition_loop(
         // new req_rx wakeups arrive, so blocking on req_rx.next() below would
         // prevent the parked freeze ack from ever firing. See the helper for
         // the flush-error propagation rationale.
+        if freeze_draining(&part) {
+            requeue_write_behind(&part, &mut pending);
+        }
         try_complete_freeze_drain(&part, part_id, pending.is_empty(), inflight.is_empty()).await;
 
         // (A) Opportunistic CQ drain — run Phase 3 for every completion that
@@ -7469,7 +7578,7 @@ async fn drain_and_shutdown(
     metrics: &mut WriteLoopMetrics,
     poisoned: &Rc<Cell<bool>>,
     inflight: &mut InflightQueue,
-    pending: &mut Vec<WriteRequest>,
+    pending: &mut PendingWrites,
     drain_ack: Option<DrainAck>,
 ) {
     // Each step stops at a poisoning completion, for the reason below.
@@ -7477,6 +7586,9 @@ async fn drain_and_shutdown(
         let Some(c) = inflight.next().await else { break };
         handle_completion(part, metrics, poisoned, part_id, c).await;
     }
+    // Once, after the batches in flight: a retry that fails again here is
+    // lost with the partition.
+    requeue_write_behind(part, pending);
     // Same byte bound as the main loop, and for the same reason — this is the
     // OTHER place a batch is taken, so a residual queue larger than one frame
     // would go out un-split here. Loop until the queue is empty: shutdown must
@@ -7502,7 +7614,7 @@ async fn drain_and_shutdown(
         // writers see the connection close; the reopen's seal settles them);
         // the queued ones were never sent.
         *inflight = InflightQueue::new();
-        for req in pending.drain(..) {
+        for req in pending.drain_all() {
             req.resp.send_unavailable("the partition is reopening; this write was not applied".into());
         }
         metrics.flush(part_id);
@@ -7568,6 +7680,36 @@ struct Routing {
 /// orchestrator's commit_length capture includes every pre-freeze acked write,
 /// then reply on whichever ack(s) are parked. A flush error is reported back so
 /// the orchestrator rolls back instead of committing a lossy merge/split.
+fn freeze_draining(part: &Rc<RefCell<PartitionData>>) -> bool {
+    let p = part.borrow();
+    p.merge_freeze.is_draining() || p.split_drain_ack.borrow().is_some()
+}
+
+/// Queue again the write-behind appends that failed before anything was
+/// written, those whose entry still waits on them: dirty, not superseded,
+/// the same value. A newer write of the key, queued or landed since, makes
+/// one obsolete; appended after it, it would read as the newer value.
+fn requeue_write_behind(part: &Rc<RefCell<PartitionData>>, pending: &mut PendingWrites) {
+    let mut p = part.borrow_mut();
+    if p.write_behind_retry.is_empty() {
+        return;
+    }
+    let retry = std::mem::take(&mut p.write_behind_retry);
+    let Some(mem) = p.mem_tier.as_ref() else { return };
+    for w in retry {
+        if let WriteOp::Put { user_key, value, .. } = &w.op {
+            if mem.awaits_append(user_key, value) {
+                mem.budget().write_behind_retried.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                pending.push(w);
+            } else if mem.holds_dirty(user_key, value) {
+                // Superseded by a write that has not landed, possibly one that
+                // failed too: this value will not reach disk.
+                mem.budget().write_behind_failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+}
+
 async fn try_complete_freeze_drain(
     part: &Rc<RefCell<PartitionData>>,
     part_id: u64,
@@ -7934,7 +8076,7 @@ fn check_freeze_ttls(part: &Rc<RefCell<PartitionData>>, part_id: u64) {
 /// Take the longest prefix of `pending` whose encoded bytes fit one frame,
 /// leaving the rest queued. At least one request always moves, so a queue can
 /// never stall on its head.
-fn take_byte_bounded_batch(pending: &mut Vec<WriteRequest>) -> Vec<WriteRequest> {
+fn take_byte_bounded_batch(pending: &mut PendingWrites) -> Vec<WriteRequest> {
     let mut bytes = 0usize;
     let mut take = 0usize;
     for r in pending.iter() {
@@ -7958,12 +8100,7 @@ fn take_byte_bounded_batch(pending: &mut Vec<WriteRequest>) -> Vec<WriteRequest>
             take = 2;
         }
     }
-    if take == pending.len() {
-        std::mem::take(pending)
-    } else {
-        let rest = pending.split_off(take);
-        std::mem::replace(pending, rest)
-    }
+    pending.take_front(take)
 }
 
 /// The one place that decides whether `partition_loop` launches a batch NOW
@@ -7978,7 +8115,7 @@ fn take_byte_bounded_batch(pending: &mut Vec<WriteRequest>) -> Vec<WriteRequest>
 /// halves leaves half of it durable — nothing ACKED is lost, because the
 /// accumulator answers the client only on its last op.
 fn take_launch_batch(
-    pending: &mut Vec<WriteRequest>,
+    pending: &mut PendingWrites,
     n_inflight: usize,
 ) -> Option<Vec<WriteRequest>> {
     if pending.is_empty() || (n_inflight > 0 && pending.len() < MIN_PIPELINED_BATCH) {
@@ -7989,7 +8126,7 @@ fn take_launch_batch(
 
 async fn handle_incoming_req(
     req: PartitionRequest,
-    pending: &mut Vec<WriteRequest>,
+    pending: &mut PendingWrites,
     part: &Rc<RefCell<PartitionData>>,
     routing: &Routing,
     inflight: &mut InflightQueue,
@@ -8010,6 +8147,16 @@ async fn handle_incoming_req(
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
+    if matches!(
+        req.msg_type,
+        MSG_PUT
+            | MSG_DELETE
+            | partition_rpc::MSG_BATCH_PUT
+            | partition_rpc::MSG_BATCH_DELETE
+            | partition_rpc::MSG_COMPARE_WRITE
+    ) {
+        requeue_write_behind(part, pending);
+    }
     if req.msg_type == partition_rpc::MSG_COMPARE_WRITE {
         let cond = match rpc_handlers::decode_conditional(&req.payload, req.bulk_value) {
             Ok(c) => c,
@@ -8028,7 +8175,7 @@ async fn handle_incoming_req(
         // tasks serve reads the reopen may contradict). A key nothing has
         // touched since its last commit — a new name, the common case — waits
         // for nothing and its write joins the next batch.
-        let uncommitted = pending.iter().any(|w| w.writes_key(&cond.key))
+        let uncommitted = pending.queues(&cond.key)
             || part
                 .borrow()
                 .inflight_write_keys
@@ -8151,8 +8298,9 @@ async fn handle_incoming_req(
         let p = part.borrow();
         (p.region_epoch, p.part_id, p.mem_tier.is_some())
     };
-    // Memory tier: a covered put is held in DRAM and answered here; the
-    // durable writes below mark the keys they write (`mem_tier.rs`).
+    // Memory tier: a covered put is held in DRAM and answered here, its log
+    // append queued behind; the durable writes below mark the keys they
+    // write (`mem_tier.rs`).
     let req = if tiered {
         match mem_tier_put(req, part, pending) {
             Some(req) => req,
@@ -8440,14 +8588,15 @@ pub(crate) fn check_and_bump_fence(
 }
 
 /// The memory tier's put: a `MSG_PUT` of a covered key, unfenced and within
-/// the value cap, is held in the partition's shard and answered OK without a
-/// log append; batches go to `mem_tier_batch_put`. Returns the request when it
-/// must take the durable path instead (not covered, fenced, too large, an
-/// older durable write of the key not applied yet, or no room).
+/// the value cap, is held in the partition's shard and answered OK at once,
+/// its log append queued behind (`write_behind`); batches go to
+/// `mem_tier_batch_put`. Returns the request when it must take the durable
+/// path instead (not covered, fenced, too large, an older durable write of
+/// the key not applied yet, or no room).
 fn mem_tier_put(
     req: PartitionRequest,
     part: &Rc<RefCell<PartitionData>>,
-    pending: &[WriteRequest],
+    pending: &mut PendingWrites,
 ) -> Option<PartitionRequest> {
     if !matches!(req.msg_type, MSG_PUT | partition_rpc::MSG_BATCH_PUT) {
         return Some(req);
@@ -8477,7 +8626,7 @@ fn mem_tier_put(
     // An older durable write of the key, queued or in flight, would land
     // after the held value and could drop it (`applied`) for its older value:
     // write this one durably behind it instead.
-    if pending.iter().any(|w| w.writes_key(&key))
+    if pending.queues(&key)
         || p.inflight_write_keys.contains_key(&background::inflight_key_hash(&key))
     {
         return Some(req);
@@ -8490,13 +8639,21 @@ fn mem_tier_put(
     // connection decoder's) that must not stay pinned by a held key.
     let owned = Bytes::copy_from_slice(&value);
     let mem = p.mem_tier.as_mut().expect("checked above");
-    if !mem.insert(&key, owned, expires_at, evict_rank, Instant::now()) {
+    if !mem.insert(&key, owned.clone(), expires_at, evict_rank, Instant::now()) {
         return Some(req);
     }
+    let tier = mem.budget();
     drop(p);
     let resp = PutResp { code: CODE_OK, message: String::new(), key: key.to_vec() };
     let _ = req.resp_tx.send(Ok(partition_rpc::rkyv_encode(&resp)));
+    pending.push(write_behind(key, owned, expires_at, tier));
     None
+}
+
+/// The log append of a held value: the same bytes the tier holds, so the
+/// receive buffer is not kept and the value is not copied again.
+fn write_behind(key: Bytes, value: Bytes, expires_at: u64, tier: Arc<mem_tier::MemTierBudget>) -> WriteRequest {
+    WriteRequest::put(key, value.into(), expires_at, WriteResponder::WriteBehind { tier })
 }
 
 /// The memory tier's batched put: a `MSG_BATCH_PUT` is held in the shard
@@ -8508,7 +8665,7 @@ fn mem_tier_put(
 fn mem_tier_batch_put(
     req: PartitionRequest,
     part: &Rc<RefCell<PartitionData>>,
-    pending: &[WriteRequest],
+    pending: &mut PendingWrites,
 ) -> Option<PartitionRequest> {
     // (key, value, expires_at, inode_hint, evict_rank); malformed requests
     // take the durable path, which answers them.
@@ -8528,7 +8685,6 @@ fn mem_tier_batch_put(
         })
         .collect();
     let region_epoch = b.region_epoch;
-    let queued: std::collections::HashSet<&[u8]> = pending.iter().filter_map(|w| w.written_key()).collect();
     let mut p = part.borrow_mut();
     let Some(mem) = p.mem_tier.as_ref() else { return Some(req) };
     let eligible = !ops.is_empty()
@@ -8539,8 +8695,14 @@ fn mem_tier_batch_put(
                 && value.len() <= AUTUMN_PS_MAX_INLINE_BYTES_DEFAULT as usize
                 && in_range(&p.rg, key)
                 && !p.inflight_write_keys.contains_key(&background::inflight_key_hash(key))
-                && !queued.contains(&key[..])
-        });
+                && !pending.queues(key)
+        })
+        && {
+            // A key twice in one batch: the first append landing would clean
+            // the entry holding the second value.
+            let mut seen = std::collections::HashSet::with_capacity(ops.len());
+            ops.iter().all(|(key, ..)| seen.insert(&key[..]))
+        };
     if !eligible {
         return Some(req);
     }
@@ -8559,10 +8721,11 @@ fn mem_tier_batch_put(
         return Some(req);
     }
     let mem = p.mem_tier.as_mut().expect("checked above");
+    let mut held = Vec::with_capacity(n);
     for (i, (key, value, expires_at, _, evict_rank)) in ops.iter().enumerate() {
         // Own the bytes: the tail aliases a receive buffer.
         let owned = Bytes::copy_from_slice(value);
-        if !mem.insert(key, owned, *expires_at, *evict_rank, now) {
+        if !mem.insert(key, owned.clone(), *expires_at, *evict_rank, now) {
             // Take back what this batch put in: until its durable write lands
             // they would be read, and that write may still fail.
             for (k, ..) in &ops[..i] {
@@ -8570,10 +8733,15 @@ fn mem_tier_batch_put(
             }
             return Some(req);
         }
+        held.push(owned);
     }
+    let tier = mem.budget();
     drop(p);
     let resp = partition_rpc::BatchPutResp { code: CODE_OK, message: String::new(), statuses: vec![0; n] };
     let _ = req.resp_tx.send(Ok(partition_rpc::rkyv_encode(&resp)));
+    for ((key, _, expires_at, ..), value) in ops.into_iter().zip(held) {
+        pending.push(write_behind(key, value, expires_at, tier.clone()));
+    }
     None
 }
 
@@ -8615,7 +8783,7 @@ fn admit_region_range(
 
 fn enqueue_batch_delete(
     req: PartitionRequest,
-    pending: &mut Vec<WriteRequest>,
+    pending: &mut PendingWrites,
     part_region_epoch: u64,
     part_id_for_err: u64,
     fence_floors: Option<&FenceFloors>,
@@ -8702,7 +8870,7 @@ fn enqueue_batch_delete(
 /// so the whole frame is refused.
 fn enqueue_batch_put(
     req: PartitionRequest,
-    pending: &mut Vec<WriteRequest>,
+    pending: &mut PendingWrites,
     part_region_epoch: u64,
     part_id_for_err: u64,
     fence_floors: Option<&FenceFloors>,
@@ -8812,7 +8980,7 @@ fn enqueue_batch_put(
 /// answers an rkyv `PutResp`.
 fn enqueue_put(
     req: PartitionRequest,
-    pending: &mut Vec<WriteRequest>,
+    pending: &mut PendingWrites,
     part_region_epoch: u64,
     part_id_for_err: u64,
     // Admission order: range -> size -> fence.
@@ -8897,7 +9065,7 @@ fn enqueue_put(
 
 fn enqueue_delete(
     req: PartitionRequest,
-    pending: &mut Vec<WriteRequest>,
+    pending: &mut PendingWrites,
     part_region_epoch: u64,
     part_id_for_err: u64,
     // Deletes are fenced like puts.
@@ -12260,7 +12428,7 @@ mod merged_loop_tests {
     fn enqueue_put_rejects_oversized_value() {
         let big_value = vec![0u8; AUTUMN_PS_MAX_INLINE_BYTES_DEFAULT as usize + 1];
         let (req, resp_rx) = build_put_partition_request(b"big-key", &big_value, 0);
-        let mut pending: Vec<WriteRequest> = Vec::new();
+        let mut pending = PendingWrites::default();
         enqueue_put(req, &mut pending, 0, 0, None, None);
 
         // No WriteRequest queued — the cap fires before pipeline insert.
@@ -12291,7 +12459,7 @@ mod merged_loop_tests {
             (req, resp_rx)
         };
         let floors = FenceFloors::recovered(HashMap::new());
-        let mut pending: Vec<WriteRequest> = Vec::new();
+        let mut pending = PendingWrites::default();
 
         let (big, big_rx) = put(vec![0u8; AUTUMN_PS_MAX_INLINE_BYTES_DEFAULT as usize + 1], 5);
         enqueue_put(big, &mut pending, 0, 0, Some(&floors), None);
@@ -12314,7 +12482,7 @@ mod merged_loop_tests {
     fn enqueue_put_accepts_value_at_inline_cap() {
         let exact_cap_value = vec![0u8; AUTUMN_PS_MAX_INLINE_BYTES_DEFAULT as usize];
         let (req, _resp_rx) = build_put_partition_request(b"k", &exact_cap_value, 0);
-        let mut pending: Vec<WriteRequest> = Vec::new();
+        let mut pending = PendingWrites::default();
         enqueue_put(req, &mut pending, 0, 0, None, None);
         assert_eq!(pending.len(), 1, "value at exact cap must enqueue normally");
     }
@@ -12329,14 +12497,14 @@ mod merged_loop_tests {
         let (p2, rx2) = build_put_partition_request(b"k2", b"v2", 0);
         let (d1, rx3) = build_delete_partition_request(b"k3");
 
-        let mut pending: Vec<WriteRequest> = Vec::new();
+        let mut pending = PendingWrites::default();
         enqueue_put(p1, &mut pending, 0, 0, None, None);
         enqueue_put(p2, &mut pending, 0, 0, None, None);
         enqueue_delete(d1, &mut pending, 0, 0, None, None);
 
         assert_eq!(pending.len(), 3);
         // Order preserved (FIFO).
-        for w in pending.drain(..) {
+        for w in pending.drain_all() {
             w.resp.send_ok();
         }
 
@@ -14587,7 +14755,7 @@ mod batch_delete_tests {
     fn one_frame_enqueues_every_key_into_one_batch() {
         let keys: Vec<&[u8]> = vec![b"k1", b"k2", b"k3", b"k4", b"k5"];
         let (req, _rx) = batch_delete_request(&keys, 0);
-        let mut pending: Vec<WriteRequest> = Vec::new();
+        let mut pending = PendingWrites::default();
 
         enqueue_batch_delete(req, &mut pending, 0, 0, None, None);
 
@@ -14611,7 +14779,7 @@ mod batch_delete_tests {
     #[compio::test]
     async fn an_empty_batch_answers_without_enqueuing() {
         let (req, rx) = batch_delete_request(&[], 0);
-        let mut pending: Vec<WriteRequest> = Vec::new();
+        let mut pending = PendingWrites::default();
 
         enqueue_batch_delete(req, &mut pending, 0, 0, None, None);
 
@@ -14630,7 +14798,7 @@ mod batch_delete_tests {
     async fn a_stale_epoch_refuses_the_whole_batch() {
         let keys: Vec<&[u8]> = vec![b"k1", b"k2"];
         let (req, rx) = batch_delete_request(&keys, 7);
-        let mut pending: Vec<WriteRequest> = Vec::new();
+        let mut pending = PendingWrites::default();
 
         // Partition is at epoch 9; the request claims 7.
         enqueue_batch_delete(req, &mut pending, 9, 0, None, None);
@@ -14646,7 +14814,7 @@ mod batch_delete_tests {
     fn epoch_zero_is_admitted() {
         let keys: Vec<&[u8]> = vec![b"k1"];
         let (req, _rx) = batch_delete_request(&keys, 0);
-        let mut pending: Vec<WriteRequest> = Vec::new();
+        let mut pending = PendingWrites::default();
         enqueue_batch_delete(req, &mut pending, 42, 0, None, None);
         assert_eq!(pending.len(), 1);
     }
@@ -14671,6 +14839,33 @@ mod write_batch_ceiling_tests {
         }
     }
 
+    /// The queued-key count follows pushes and taken batches, a key queued
+    /// twice staying queued until both are taken.
+    #[test]
+    fn pending_writes_counts_the_keys_it_queues() {
+        let put = |k: &'static [u8]| WriteRequest {
+            op: WriteOp::Put { user_key: Bytes::from_static(k), value: Bytes::from_static(b"v").into(), expires_at: 0 },
+            resp: WriteResponder::Fence,
+        };
+        let mut p: PendingWrites = [put(b"a"), put(b"b"), put(b"a")].into_iter().collect();
+        p.push(WriteRequest { op: WriteOp::Delete { user_key: b"c".to_vec() }, resp: WriteResponder::Fence });
+        assert!(p.queues(b"a") && p.queues(b"b") && p.queues(b"c") && !p.queues(b"d"));
+        assert_eq!(p.take_front(2).len(), 2);
+        assert!(p.queues(b"a"), "its second write is still queued");
+        assert!(!p.queues(b"b"));
+        assert_eq!(p.take_front(1).len(), 1);
+        assert!(!p.queues(b"a") && p.queues(b"c"));
+        assert_eq!(p.drain_all().len(), 1);
+        assert!(!p.queues(b"c") && p.is_empty() && p.keys.as_ref().unwrap().is_empty());
+
+        // Not counting (no memory tier): the same answers, by a scan.
+        let mut p = PendingWrites::new(false);
+        p.push(put(b"a"));
+        assert!(p.keys.is_none() && p.queues(b"a") && !p.queues(b"b"));
+        assert_eq!(p.take_front(1).len(), 1);
+        assert!(!p.queues(b"a"));
+    }
+
     /// The shape that fragmented every burst: with one batch in flight, the
     /// two connections a partition serves deliver their 4 admitted ops in two
     /// separate wake-ups. An unconditional launch ships the first 4 alone
@@ -14680,7 +14875,7 @@ mod write_batch_ceiling_tests {
     /// empty queue never launches.
     #[test]
     fn a_batch_in_flight_holds_a_partial_burst_until_it_is_whole() {
-        let mut pending: Vec<WriteRequest> = (0..4).map(|_| put_of(4096)).collect();
+        let mut pending: PendingWrites = (0..4).map(|_| put_of(4096)).collect();
         assert!(
             take_launch_batch(&mut pending, 1).is_none(),
             "one connection's 4 ops must not launch behind an in-flight batch"
@@ -14781,7 +14976,7 @@ mod write_batch_ceiling_tests {
     fn an_oversized_queue_is_split_not_sent_whole() {
         let big = 64 * 1024 * 1024;
         let n = MAX_WRITE_BATCH_BYTES / big + 2;
-        let mut pending: Vec<WriteRequest> = (0..n).map(|_| put_of(big)).collect();
+        let mut pending: PendingWrites = (0..n).map(|_| put_of(big)).collect();
         let batch = take_byte_bounded_batch(&mut pending);
 
         assert!(!batch.is_empty(), "the batch must make progress");
@@ -14801,7 +14996,7 @@ mod write_batch_ceiling_tests {
     /// group-commit behaviour under every real workload is unchanged.
     #[test]
     fn a_batch_that_fits_is_taken_whole() {
-        let mut pending: Vec<WriteRequest> = (0..256).map(|_| put_of(4096)).collect();
+        let mut pending: PendingWrites = (0..256).map(|_| put_of(4096)).collect();
         let batch = take_byte_bounded_batch(&mut pending);
         assert_eq!(batch.len(), 256);
         assert!(pending.is_empty());
@@ -14822,20 +15017,20 @@ mod write_batch_ceiling_tests {
         let big = MAX_WRITE_BATCH_BYTES / 4;
         // Three writes fill the batch to just under the cap, the fence fits
         // after them, its write does not.
-        let mut pending: Vec<WriteRequest> = vec![
+        let mut pending: PendingWrites = [
             put_of(big),
             put_of(big),
             put_of(big),
             fence_bump(),
             put_of(big),
-        ];
+        ].into_iter().collect();
         let batch = take_byte_bounded_batch(&mut pending);
         assert!(!matches!(batch.last().unwrap().op, WriteOp::FenceBump { .. }));
         assert_eq!(batch.len(), 3);
         assert!(matches!(pending[0].op, WriteOp::FenceBump { .. }));
         assert_eq!(pending.len(), 2);
         // A batch holding only the record takes its write along.
-        let mut pending = vec![fence_bump(), put_of(MAX_WRITE_BATCH_BYTES + 1), put_of(1)];
+        let mut pending: PendingWrites = [fence_bump(), put_of(MAX_WRITE_BATCH_BYTES + 1), put_of(1)].into_iter().collect();
         let batch = take_byte_bounded_batch(&mut pending);
         assert_eq!(batch.len(), 2);
         assert_eq!(pending.len(), 1);
@@ -14845,7 +15040,7 @@ mod write_batch_ceiling_tests {
     /// wedge on its head forever.
     #[test]
     fn a_single_oversized_request_still_makes_progress() {
-        let mut pending = vec![put_of(MAX_WRITE_BATCH_BYTES + 1)];
+        let mut pending: PendingWrites = [put_of(MAX_WRITE_BATCH_BYTES + 1)].into_iter().collect();
         let batch = take_byte_bounded_batch(&mut pending);
         assert_eq!(batch.len(), 1);
         assert!(pending.is_empty());
@@ -14858,7 +15053,7 @@ mod write_batch_ceiling_tests {
     fn every_take_shrinks_the_queue() {
         let big = 64 * 1024 * 1024;
         let n = MAX_WRITE_BATCH_BYTES / big * 3;
-        let mut pending: Vec<WriteRequest> = (0..n).map(|_| put_of(big)).collect();
+        let mut pending: PendingWrites = (0..n).map(|_| put_of(big)).collect();
         let mut rounds = 0;
         while !pending.is_empty() {
             let before = pending.len();
