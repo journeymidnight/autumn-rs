@@ -45,6 +45,9 @@ open http://127.0.0.1:8799                                        # the dashboar
 docker compose -f deploy/compose/docker-compose.yml down -v       # stop and wipe
 ```
 
+The cluster takes a few seconds to bootstrap after `up -d` returns. Until it
+has, the `put` fails with `routing error: key is out of range`; run it again.
+
 It is for trying things out: authz is off, there is one manager, and the
 nodes share one disk.
 
