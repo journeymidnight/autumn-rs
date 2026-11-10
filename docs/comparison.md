@@ -53,6 +53,65 @@ file and S3 interfaces, which also serves as a KV-cache tier.
   plain TCP and needs no RDMA. Every acknowledged write is on every replica,
   and sealed data can be erasure-coded.
 
+## KV-cache benchmark: SGLang HiCache L3
+
+**Single host, measured by this project.** All engines, storage processes and
+NICs were on one machine, so RDMA traffic went out and back through the same
+NIC. Cross-host numbers will differ. Treat this as one data point, not a
+ranking.
+
+**Workload.** Qwen3-VL-32B, TP1, SGLang 0.5.10 with HiCache (`write_through`,
+`page_first_direct` layout, prefetch policy `wait_complete`, 64-token pages).
+Each request is a ~17.3K-token document followed by a question whose answer is
+in the document, so a wrong cache page shows up as a wrong answer. Each
+document carries ~4.2 GiB of KV cache.
+
+Each run has three steps:
+
+1. Engine A computes 6 documents and writes their KV cache to the L3 store.
+2. A fresh engine B, on another GPU, asks the same 6 questions one at a time.
+3. A fresh engine C asks all 6 at once.
+
+B and C have empty GPU and host caches, so a prefix can only come from L3.
+Each configuration ran 3 times, interleaved; the table shows the median of the
+three per-run medians. Every answer in every run was correct, and B and C
+loaded 103,616 tokens from L3 in each run.
+
+**Hardware.** Xeon Platinum 8457C, H200 GPUs, 200 Gb/s RoCE NIC (mlx5),
+Intel D7-P5520 NVMe drives. autumn-rs ran 3 extent nodes on 3 drives and one
+partition server. Mooncake 0.3.9 ran its master with SGLang contributing 48 GB
+of DRAM per engine.
+
+| Configuration | Where the cache lives | B: time to first token, one at a time | C: time to first token, 6 at once |
+|---|---|---|---|
+| No L3 (recompute) | n/a | 2.43 s | 8.33 s |
+| autumn-rs, RDMA (UCX), DRAM tier | 3 replicas on disk, plus a DRAM copy in the partition server | 0.74 s | 1.67 s |
+| autumn-rs, RDMA (UCX), no DRAM tier | 3 replicas on disk | 1.83 s | 2.22 s |
+| autumn-rs, TCP, DRAM tier | 3 replicas on disk, plus a DRAM copy in the partition server | 1.73 s | 3.85 s |
+| Mooncake Store, RDMA | Engine DRAM, 1 copy | 0.81 s | 1.62 s |
+
+What this shows:
+
+- **DRAM tier vs. Mooncake.** autumn-rs's DRAM tier and Mooncake were within
+  run-to-run noise of each other. Per-run medians for B were 0.64–1.02 s and
+  0.78–1.10 s. The difference is what survives a failure: autumn-rs has already
+  written the pages to 3 disks, while Mooncake's single DRAM copy is gone with
+  its host.
+- **Without the DRAM tier.** autumn-rs is bound by NVMe reads, and is still
+  1.3× (B) to 3.7× (C) faster than recomputing.
+- **Over TCP.** The client's single receive thread caps a TCP read near
+  4.5 GB/s. That is enough to beat recompute, but RDMA is worth it.
+
+**3FS is not in the table.** We deployed 3FS on the same host (3 storage
+targets, replication factor 3, FUSE and USRBIO) and ran it through SGLang's
+`hf3fs` backend. USRBIO alone read at over 12 GB/s on our setup, but SGLang
+took ~13 s per document to load from it. That points to our deployment, not
+to 3FS, and we could not find the cause in the time we had. We would rather
+show no number than a wrong one. Results from someone who runs 3FS in
+production are welcome.
+
+If you want to reproduce a row, open an issue and we will share the scripts.
+
 ## What autumn-rs does not do
 
 - **No GPU-direct path.** Pages go through host memory; there is no NVLink or
