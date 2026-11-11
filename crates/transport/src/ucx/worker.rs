@@ -124,7 +124,10 @@ pub(crate) fn process_context() -> *mut ucp_context {
         assert_eq!(st, ucs_status_t::UCS_OK, "ucp_config_read");
 
         let mut ctx: ucp_context_h = ptr::null_mut();
-        let st = unsafe { ucp_init_version(UCP_API_MAJOR, UCP_API_MINOR, &params, cfg, &mut ctx) };
+        // Ask for the oldest API we accept, not the headers' (newer) one, which
+        // an older library would warn about.
+        let (major, minor) = UCX_MIN_VERSION;
+        let st = unsafe { ucp_init_version(major, minor, &params, cfg, &mut ctx) };
         unsafe { ucp_config_release(cfg) };
         assert_eq!(st, ucs_status_t::UCS_OK, "ucp_init_version");
 
@@ -215,8 +218,9 @@ fn version_has_rcache_fix(major: u32, minor: u32) -> bool {
     (major, minor) >= UCX_MIN_VERSION
 }
 
-/// Refuse a UCX library older than [`UCX_MIN_VERSION`].
+/// Refuse a missing UCX library, or one older than [`UCX_MIN_VERSION`].
 pub fn check_library() -> io::Result<()> {
+    ucx_sys_mini::load().map_err(io::Error::other)?;
     let (mut major, mut minor, mut release) = (0u32, 0u32, 0u32);
     unsafe { ucp_get_version(&mut major, &mut minor, &mut release) };
     if version_has_rcache_fix(major, minor) {

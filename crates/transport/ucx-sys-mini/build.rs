@@ -1,39 +1,31 @@
-//! Build script — runs bindgen against `<ucp/api/ucp.h>` and emits
-//! `$OUT_DIR/bindings.rs`. Whitelist matches spec §13.
-
-use std::env;
-use std::path::PathBuf;
+//! Regenerates `src/bindings.rs` from `<ucp/api/ucp.h>` when built with
+//! `--features regen` (needs libclang and the UCX headers via pkg-config).
+//! Ordinary builds use the checked-in file and need neither.
+//!
+//! The bindings load libucp at run time (`dynamic_library_name`), so nothing
+//! links against UCX: one build serves hosts with and without it.
 
 fn main() {
+    #[cfg(feature = "regen")]
+    regen();
+}
+
+#[cfg(feature = "regen")]
+fn regen() {
+    use std::path::PathBuf;
+
     println!("cargo:rerun-if-changed=wrapper.h");
     println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rerun-if-env-changed=PKG_CONFIG_PATH");
 
-    let out_path = PathBuf::from(env::var("OUT_DIR").unwrap()).join("bindings.rs");
-
-    // Probe libucx via pkg-config. If absent, emit an empty bindings.rs so the
-    // crate compiles to an effectively-empty stub. Downstream that opts into
-    // `autumn-transport/ucx` will fail loudly (unresolved symbols) — which is
-    // the correct signal: install libucx-dev. Downstream that does NOT enable
-    // the feature won't reference any symbol, so a stub is fine and keeps
-    // `cargo build --workspace` working on hosts without UCX.
-    let lib = match pkg_config::probe_library("ucx") {
-        Ok(lib) => lib,
-        Err(e) => {
-            println!(
-                "cargo:warning=libucx not found via pkg-config ({e}); ucx-sys-mini built as empty stub. Install libucx-dev to enable --features ucx."
-            );
-            std::fs::write(&out_path, b"").expect("write empty bindings.rs stub");
-            return;
-        }
-    };
+    let lib = pkg_config::Config::new()
+        .cargo_metadata(false)
+        .probe("ucx")
+        .expect("regen needs the UCX headers (pkg-config ucx)");
 
     let mut builder = bindgen::Builder::default()
         .header("wrapper.h")
-        .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
-        // Generate fewer files / less noise: only the ucp/ucs symbols we need.
-        // We keep the regex broad enough to pick up all the structs/enums those
-        // functions touch — bindgen will follow type closures automatically.
+        .dynamic_library_name("Ucp")
+        .dynamic_link_require_all(true)
         // ucp_init in the header is a static inline that bindgen skips;
         // we call ucp_init_version directly with the macro-defined version.
         .allowlist_function("ucp_init_version")
@@ -70,27 +62,22 @@ fn main() {
         .allowlist_function("ucp_request_check_status")
         .allowlist_function("ucp_request_free")
         .allowlist_function("ucs_status_string")
-        // Pull in the constants we reference (UCP_FEATURE_*, UCP_*_FIELD_*,
-        // UCP_OP_ATTR_*, UCS_OK / UCS_INPROGRESS / etc.) and any enum we need.
+        // The constants we reference (UCP_FEATURE_*, UCP_*_FIELD_*,
+        // UCP_OP_ATTR_*, UCS_OK / UCS_INPROGRESS / etc.) and the types the
+        // functions touch.
         .allowlist_var("UCP_.*")
         .allowlist_var("UCS_.*")
         .allowlist_type("ucp_.*")
         .allowlist_type("ucs_status.*")
         .allowlist_type("ucs_thread_mode.*")
-        // C bitfield enums map cleanly to a single Rust constified-enum module
-        // without needing #[repr(C)] gymnastics on the Rust side.
         .default_enum_style(bindgen::EnumVariation::ModuleConsts)
         .layout_tests(false);
 
     for inc in &lib.include_paths {
         builder = builder.clang_arg(format!("-I{}", inc.display()));
     }
-
-    // libclang on this build host doesn't ship a clang resource directory
-    // (no `clang` CLI installed, only libclang.so), so it fails to find
-    // freestanding headers like <stddef.h>. Point it at gcc's include dir
-    // explicitly. If clang is installed, this is harmless (the system clang
-    // headers take precedence anyway).
+    // A libclang without its resource directory cannot find <stddef.h>;
+    // gcc's include dir has it.
     for guess in [
         "/usr/lib/gcc/x86_64-linux-gnu/13/include",
         "/usr/lib/gcc/x86_64-linux-gnu/12/include",
@@ -102,11 +89,10 @@ fn main() {
         }
     }
 
-    let bindings = builder
+    let out = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap()).join("src/bindings.rs");
+    builder
         .generate()
-        .expect("bindgen failed against <ucp/api/ucp.h>");
-
-    bindings
-        .write_to_file(&out_path)
-        .expect("write bindings.rs");
+        .expect("bindgen failed against <ucp/api/ucp.h>")
+        .write_to_file(&out)
+        .expect("write src/bindings.rs");
 }

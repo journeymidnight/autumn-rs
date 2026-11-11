@@ -24,7 +24,7 @@ file and S3 interfaces, which also serves as a KV-cache tier.
 | **Durable across a node loss** | Yes. A write is acknowledged once every replica has it; open extents keep 3 copies by default. The optional KV-cache DRAM tier acknowledges first and writes to disk right after; what a partition server holds that has not landed yet, at most the tier's budget, is lost if that server crashes | Best effort. Replicas are configurable per object, and placement returns fewer than asked when space is short | No replication; data on a lost server is gone | Yes. Chain replication (CRAQ), strongly consistent |
 | **Erasure coding** | Yes, sealed extents are converted in the background | Not documented | No | None found in the storage code; requested in [#409](https://github.com/deepseek-ai/3FS/issues/409) |
 | **Control plane** | Manager, leader-elected over etcd | Master service; single master by default, optional HA over etcd, Redis (experimental) or Kubernetes leases | None; each server stands alone | Cluster managers with an elected primary; metadata in FoundationDB |
-| **Transport** | TCP; RDMA via UCX (source build) | TCP, RDMA (IB, RoCE, eRDMA), GPUDirect RDMA, NVLink, EFA, NVMe-oF, CXL and more | TCP, RDMA via ibverbs | RDMA (IB, RoCE); TCP documented only for monitor traffic |
+| **Transport** | TCP; RDMA via the host's UCX | TCP, RDMA (IB, RoCE, eRDMA), GPUDirect RDMA, NVLink, EFA, NVMe-oF, CXL and more | TCP, RDMA via ibverbs | RDMA (IB, RoCE); TCP documented only for monitor traffic |
 | **RDMA required** | No | No (recommended) | No | Yes, per the docs |
 | **GPU memory path** | No; data passes through host memory | Yes (GPUDirect RDMA, NVLink) | RDMA from registered GPU tensors | Not documented |
 | **Inference integrations** | SGLang HiCache L3, vLLM connector ([autumn_kvcache](https://github.com/journeymidnight/autumn_kvcache)) | vLLM, SGLang, LMCache, TensorRT-LLM, LMDeploy, NIXL, Dynamo and more | vLLM through LMCache per its README (LMCache removed the in-tree adapter in November 2026); SGLang in progress | SGLang HiCache, vLLM and LMCache adapters in those projects; Mooncake Store adapter (experimental) |
@@ -114,8 +114,8 @@ If you want to reproduce a row, open an issue and we will share the scripts.
 - **Young.** The first release is 0.1.0, the community is small, and every
   number in [`perf_baseline.md`](perf_baseline.md) was measured by the
   project itself on clusters of a few nodes.
-- **RDMA needs a source build.** The published image and Python wheel are
-  TCP-only.
+- **RDMA needs the host's UCX.** The Python wheel loads UCX >= 1.17 from the
+  host; the published server image is TCP-only.
 
 ## Sources
 

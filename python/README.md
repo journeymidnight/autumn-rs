@@ -9,8 +9,9 @@ pip install autumn-rs
 ```
 
 One abi3 wheel per architecture serves every CPython >= 3.11 on Linux
-(manylinux 2.28, x86_64 and aarch64). The published wheel uses TCP; RDMA (UCX)
-needs a build from source with `--features ucx`.
+(manylinux 2.28, x86_64 and aarch64). It speaks TCP everywhere, and RDMA
+through the host's UCX (>= 1.17, `libucp.so.0` on the loader path) after
+`autumn.set_transport("ucx")`; UCX is loaded only then.
 
 ```python
 import asyncio, autumn
@@ -38,7 +39,7 @@ Build from source, in this directory:
 ```bash
 maturin build --release --features abi3   # one wheel for CPython >= 3.11
 maturin build --release              # bound to this interpreter, any CPython >= 3.8
-maturin build --release --features ucx --auditwheel skip   # links the system UCX
+maturin build --release --features abi3,ucx   # what is published: TCP, and UCX when present
 ```
 
 License: Apache-2.0.

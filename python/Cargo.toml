@@ -9,8 +9,9 @@ name = "autumn"
 crate-type = ["cdylib"]
 
 [features]
-# Build the wheel with `maturin build --features ucx` to compile in the UCX
-# transport. At runtime call `autumn.set_transport("ucx")` before connect.
+# Compile in the UCX transport (the published wheels have it). UCX is loaded
+# from the host at run time, by `autumn.set_transport("ucx")` before connect;
+# without it the wheel still works over TCP.
 ucx = ["autumn-client/ucx", "autumn-rpc/ucx", "autumn-transport/ucx"]
 # One wheel for every CPython >= 3.11 (`maturin build --release --features abi3`
 # tags it cp311-abi3); the published wheels are built this way. 3.11 is the

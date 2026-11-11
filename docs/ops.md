@@ -193,6 +193,13 @@ $AO info                               # partitions starting fs/, kvc/, kvc/1 �
 
 ### UCX library
 
+A build with `--features ucx` (the published Python wheel is one) does not
+link UCX: it loads `libucp.so.0` with `dlopen` when a process selects UCX, so
+the same build runs over TCP on a host without UCX. Selecting UCX there fails
+at start with `cannot load libucp.so.0 (...)`; put UCX's lib directory on the
+loader path. The system install is what has the RDMA transport modules
+(`mlx5`), which a copy bundled into a wheel would not.
+
 Two UCX defects shaped this section: the first killed the PS under 4 KiB UCX
 reads, the second stalled 8 MiB UCX writes.
 
@@ -236,9 +243,8 @@ tar xzf ucx-1.20.1.tar.gz && cd ucx-1.20.1
     --without-cuda --without-rocm --without-java --without-go
 make -j"$(nproc)" && sudo make install && sudo ldconfig
 ucx_info -d | grep -E 'Connection manager: rdmacm|Transport: rc_mlx5' | sort -u
-cd <autumn-rs> && cargo clean -p ucx-sys-mini   # regenerate bindings against /usr/local
-cargo build --release -p autumn-server --features ucx
-ldd target/release/autumn-ps | grep libucs    # → /usr/local/lib/libucs.so.0
+cargo build --release -p autumn-server --features ucx   # in <autumn-rs>
+ldconfig -p | grep 'libucp.so.0 '             # first hit is the one autumn loads
 ```
 
 The regression tests need a RoCE host (`AUTUMN_UCX_TEST_BIND='[<roce-ip>]:0'`,
@@ -5749,7 +5755,7 @@ it again on fresh ports when it exits. A test on another test's etcd would wait
 forever in `claim_presence_until_held`: every test's first manager is id 1.
 
 ```bash
-cargo test --workspace --exclude ucx-sys-mini --lib         # all crate unit tests
+cargo test --workspace --lib                               # all crate unit tests
 cargo test -p autumn-stream --lib                            # stream layer only
 cargo test -p autumn-partition-server --lib                  # partition server only
 cargo test -p autumn-manager                                 # integration (needs etcd)
@@ -6075,10 +6081,9 @@ nodes (`autumn.Fs.connect(direct_read=True)`); positions resolve in ONE PS
 round-trip per partition (`MSG_BATCH_GET` with `direct`), so the ~N-extent reads
 fan across all ENs with the PS off the data path.
 
-**Build note (UCX):** binaries + wheel need `--features ucx` for
-`--transport ucx`. The wheel MUST be built `--skip-auditwheel` (bundling UCX
-libs segfaults — UCX `dlopen`s its transport modules from the system install;
-the client must link **system** UCX like the daemons).
+**Build note (UCX):** binaries need `--features ucx` for `--transport ucx`;
+the published wheel has it. Both load the system's `libucp.so.0` at run time
+(see [UCX library](#ucx-library)).
 
 **A/B vs Model Streamer (intra-host UCX, GPU host):**
 ```bash

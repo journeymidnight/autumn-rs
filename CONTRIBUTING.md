@@ -39,8 +39,8 @@ The suite runs under [cargo-nextest](https://nexte.st), one process per test:
 ```bash
 cargo install cargo-nextest --locked
 cargo build --workspace --bins           # some tests spawn target/debug/autumn-*
-cargo nextest run --workspace --exclude ucx-sys-mini
-cargo test --workspace --doc --exclude ucx-sys-mini
+cargo nextest run --workspace
+cargo test --workspace --doc
 ```
 
 CI runs the same with `--features autumn-manager/fuse-tests`, which adds the

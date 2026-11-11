@@ -24,7 +24,7 @@ jobs:
           working-directory: python
           target: ${{ matrix.target }}
           manylinux: "2_28"
-          args: --release --features abi3 --out dist
+          args: --release --features abi3,ucx --out dist
       - uses: actions/upload-artifact@v4
         with:
           name: autumn-wheel-${{ matrix.target }}

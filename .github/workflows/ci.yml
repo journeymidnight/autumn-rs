@@ -35,7 +35,7 @@ jobs:
           sudo install -m 0755 /tmp/toxiproxy-server /tmp/toxiproxy-cli /usr/local/bin/
           toxiproxy-server --version
       - name: Build
-        run: cargo build --workspace --exclude ucx-sys-mini
+        run: cargo build --workspace
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
@@ -56,6 +56,6 @@ jobs:
           sudo prlimit --pid $$ --memlock=unlimited:unlimited || true
           sudo prlimit --pid $$ --nofile=65536:65536 || true
           cat /proc/$$/limits | grep -E 'locked|files'
-          cargo nextest run --profile ci --workspace --exclude ucx-sys-mini --features autumn-manager/fuse-tests
+          cargo nextest run --profile ci --workspace --features autumn-manager/fuse-tests
       - name: Doc tests
-        run: cargo test --workspace --doc --exclude ucx-sys-mini
+        run: cargo test --workspace --doc

@@ -4,15 +4,19 @@ version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-links = "ucp"
-description = "Minimal in-tree bindgen FFI for the ~40 UCP/UCX symbols autumn-transport needs."
+description = "Minimal FFI for the ~40 UCP/UCX symbols autumn-transport needs, loaded from libucp at run time."
+
+[features]
+# Rewrite src/bindings.rs from the installed UCX headers (see build.rs).
+regen = ["dep:bindgen", "dep:pkg-config"]
 
 [dependencies]
 libc = "0.2"
+libloading = "0.8"
 
 [build-dependencies]
-bindgen = "0.69"
-pkg-config = "0.3"
+bindgen = { version = "0.69", optional = true }
+pkg-config = { version = "0.3", optional = true }
 
 [lints]
 workspace = true
