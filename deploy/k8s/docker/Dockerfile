@@ -42,6 +42,8 @@ RUN if [ -n "$CARGO_MIRROR" ]; then \
 # The mirror must answer git's fetch (the upload-pack POST) anonymously, not only
 # `info/refs`. CARGO_NET_GIT_FETCH_WITH_CLI makes cargo fetch with `git`, so the
 # `insteadOf` rewrite applies (its built-in fetcher does not read it).
+# The UCX release tarball below comes through the same mirror, so it must also
+# serve GitHub release downloads.
 ARG GITHUB_MIRROR=
 ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
 RUN if [ -n "$GITHUB_MIRROR" ]; then \
@@ -77,10 +79,28 @@ RUN if [ -n "$APT_MIRROR" ]; then \
 RUN apt-get update \
     && apt-get install -y --no-install-recommends libfuse3-dev pkg-config \
     && rm -rf /var/lib/apt/lists/*
+# UCX for `--transport ucx` (AUTUMN_TRANSPORT=ucx). The binaries load libucp
+# only when UCX is selected, so TCP uses none of this. Debian's UCX is older
+# than the 1.17 the binaries require ("UCX library" in docs/ops.md), so it is
+# built here and /opt/ucx is copied into the runtime stage. GITHUB_MIRROR
+# applies to this download too; the checksum pins it.
+ARG UCX_VERSION=1.20.1
+ARG UCX_SHA256=545c419a7b5e04643cb8bff5a19b3b5071a8f8f0605f1e8efb36f8f3d7bfb9d3
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libibverbs-dev librdmacm-dev \
+    && rm -rf /var/lib/apt/lists/* \
+    && curl -fsSL -o /tmp/ucx.tar.gz \
+      "${GITHUB_MIRROR:-https://github.com/}openucx/ucx/releases/download/v${UCX_VERSION}/ucx-${UCX_VERSION}.tar.gz" \
+    && echo "${UCX_SHA256}  /tmp/ucx.tar.gz" | sha256sum -c - \
+    && tar xzf /tmp/ucx.tar.gz -C /tmp && cd /tmp/ucx-${UCX_VERSION} \
+    && ./contrib/configure-release --prefix=/opt/ucx --disable-static --enable-mt --without-bfd \
+      --with-verbs --with-rdmacm --without-cuda --without-rocm --without-java --without-go \
+    && make -j"$(nproc)" && make install \
+    && rm -rf /tmp/ucx* /opt/ucx/include /opt/ucx/share /opt/ucx/lib/*.la /opt/ucx/lib/ucx/*.la
 COPY . .
-# -p autumn-server builds exactly the server binaries. TCP transport only — the
-# ucx feature is deliberately off (RDMA-in-k8s needs hostNetwork + device
-# plugins; see "Deployment" in docs/ops.md).
+# -p autumn-server builds exactly the server binaries, with UCX compiled in
+# (loaded at run time, see above). Selecting it in k8s still needs hostNetwork,
+# an RDMA device plugin and memlock ("Deployment" in docs/ops.md).
 # autumn-dashboard is the standalone web UI (crates/server/src/bin/autumn_dashboard); it embeds its
 # HTML via include_str!, so the binary alone is self-contained, and it drives the
 # cluster only through the autumn-op we already ship.
@@ -89,7 +109,7 @@ COPY . .
 # along with -p autumn-server); it serves model loaders and S3-native tools such
 # as LanceDB. See "S3 gateway" in docs/ops.md and examples/lancedb-s3.
 RUN cargo build --release \
-    -p autumn-server -p autumn-fuse
+    -p autumn-server -p autumn-fuse --features autumn-server/ucx,autumn-fuse/ucx
 
 # Ship the SOURCE the Python client is built from, in this image.
 #
@@ -114,7 +134,8 @@ RUN cargo build --release \
 # sidesteps that; it costs 8 MB here and a Rust toolchain in the consumer's
 # BUILD stage.
 
-# Runtime: the server binaries link only libc/libgcc; bookworm-slim provides
+# Runtime: the server binaries link only libc/libgcc (UCX is dlopened from
+# /opt/ucx, which needs libibverbs, librdmacm and the mlx5/efa providers); bookworm-slim provides
 # bash + getent (libc-bin) which entrypoint.sh needs for DNS→IP resolution. The
 # kernel comes from the k8s node and must be >= 5.15 (compio uses io_uring).
 # fuse3 is for autumn-fuse: it brings libfuse3 (the binary links it) plus the
@@ -155,7 +176,15 @@ RUN if [ -n "$APT_MIRROR" ]; then \
     fi
 RUN apt-get update \
     && apt-get install -y --no-install-recommends fuse3 ca-certificates \
+      libibverbs1 librdmacm1 ibverbs-providers \
     && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /opt/ucx/ /opt/ucx/
+# Fail the build, not the first UCX start, if a library needs something only
+# the builder has. /opt/ucx must stay at this path: the modules' RUNPATH names it.
+RUN echo /opt/ucx/lib > /etc/ld.so.conf.d/ucx.conf && ldconfig \
+    && ! ldd /opt/ucx/lib/*.so.0 /opt/ucx/lib/ucx/*.so.0 | grep 'not found' \
+    && /opt/ucx/bin/ucx_info -v
+ENV PATH=/opt/ucx/bin:$PATH
 # The Rust workspace sources a consumer needs to build the Python client, so it
 # can take the client and the binaries from ONE tag and never mismatch the wire
 # version. ~8 MB. Nothing in this image uses them; there is no toolchain here.

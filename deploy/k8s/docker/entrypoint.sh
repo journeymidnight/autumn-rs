@@ -286,7 +286,7 @@ run_extent_node() {
 }
 
 # cluster.sh AUTUMN_* env → autumn-ps flag table (subset that makes sense
-# off-host; UCX knobs excluded until a ucx-enabled image exists).
+# off-host; UCX knobs are not mapped).
 PS_TUNABLES=(
     "AUTUMN_GROUP_COMMIT_CAP:--group-commit-cap"
     "AUTUMN_PS_INFLIGHT_CAP:--ps-inflight-cap"

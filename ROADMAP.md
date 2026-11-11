@@ -20,8 +20,9 @@ that is the strongest signal for what comes next.
 - **One placement policy for allocation and recovery.** The two paths rank
   candidate nodes differently, which shows up when nodes are drained one by
   one.
-- **An RDMA (UCX) container image.** The published image is TCP-only; UCX
-  needs a source build today.
+- **UCX on Kubernetes.** The image ships UCX, but the manifests have never
+  run it: the PS advertises the pod IP, which under `hostNetwork` is the
+  node's primary address, not necessarily its RDMA one.
 - **Authentication on the dashboard.** It has none, so it has to sit behind a
   port-forward or a gateway.
 

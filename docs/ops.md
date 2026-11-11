@@ -390,8 +390,11 @@ $AC get mykey                                                     # → hello (d
 
 One image (`deploy/k8s/docker/Dockerfile`) serves every role;
 `deploy/k8s/docker/entrypoint.sh` dispatches on the first argument and does the k8s
-glue (DNS → IP, env → flags, bring-up guards). The image is TCP-only (UCX would
-need `hostNetwork`, an RDMA device plugin and memlock).
+glue (DNS → IP, env → flags, bring-up guards). The image carries UCX 1.20.1 in
+`/opt/ucx`, used only with `AUTUMN_TRANSPORT=ucx`. UCX on k8s is untested: it
+needs `hostNetwork`, an RDMA device plugin, memlock and `UCX_TLS` /
+`UCX_NET_DEVICES` in the pod env, and the PS advertises the pod IP, which under
+`hostNetwork` is the node's primary address, not necessarily the RDMA one.
 
 | Manifest | Kind(s) | Notes |
 |---|---|---|

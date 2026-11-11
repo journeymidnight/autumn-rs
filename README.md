@@ -174,8 +174,8 @@ designs in `docs/*_design.md`.
 
 - One site, one flat network: clients dial partition servers and extent nodes
   directly (on k8s, run them in-cluster).
-- The container image is TCP-only; UCX needs `hostNetwork`, an RDMA device and
-  UCX ≥ 1.17 (build with `--features ucx`; "UCX library" in `docs/ops.md`).
+- UCX needs an RDMA device and UCX ≥ 1.17 ("UCX library" in `docs/ops.md`).
+  The container image ships UCX 1.20.1; UCX on k8s is untested (`docs/ops.md`).
 - The memory tier acknowledges a write from DRAM and writes it to disk behind:
   a PS crash loses what had not landed yet, at most `--mem-tier-bytes`. Use it
   only for data that can be recomputed, which is what the KV-cache adapters
