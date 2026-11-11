@@ -5,7 +5,7 @@ build-backend = "maturin"
 [project]
 # The import name is `autumn`; `autumn` on PyPI is an unrelated project.
 name = "autumn-rs"
-version = "0.1.0"
+version = "0.1.2"
 description = "Python client for autumn-rs: KV (zero-copy batch reads and writes) and the fs/ tree"
 readme = "README.md"
 license = "Apache-2.0"
