@@ -78,37 +78,30 @@ Each configuration ran 3 times, interleaved with the others; the table shows
 the median of the three per-run medians. Every answer in every run was
 correct, and B and C loaded 103,616 tokens from L3 in each run.
 
-**Hardware.** Xeon Platinum 8457C, H200 GPUs, 200 Gb/s RoCE NIC (mlx5),
-Intel D7-P5520 NVMe drives. autumn-rs ran 3 extent nodes on 3 drives and one
-partition server. Mooncake 0.3.9 ran its master with SGLang contributing 48 GB
-of DRAM per engine.
+**Hardware.** Xeon Platinum 8457C, H200 GPUs, 200 Gb/s RoCE (mlx5), Intel
+D7-P5520 NVMe. autumn-rs: 3 extent nodes on 3 drives, 1 partition server.
+Mooncake 0.3.9: 48 GB of DRAM per engine.
 
-| Configuration | Where the cache lives | B: time to first token, one at a time | C: time to first token, 6 at once |
+Time to first token (B: one at a time, C: 6 at once):
+
+| Configuration | Cache lives in | B | C |
 |---|---|---|---|
 | No L3 (recompute) | n/a | 2.43 s | 8.33 s |
-| autumn-rs, RDMA (UCX), DRAM tier | DRAM in the partition server, written behind to 3 replicas on disk | 0.78 s | 1.44 s |
-| autumn-rs, RDMA (UCX), no DRAM tier | 3 replicas on disk | 1.83 s | 2.22 s |
-| autumn-rs, TCP, DRAM tier | DRAM in the partition server, written behind to 3 replicas on disk | 1.61 s | 4.12 s |
-| Mooncake Store, RDMA | Engine DRAM, 1 copy | 0.88 s | 2.11 s |
+| autumn-rs, RDMA, DRAM tier | DRAM, then 3 disks | 0.78 s | 1.44 s |
+| autumn-rs, RDMA, no DRAM tier | 3 disks | 1.83 s | 2.22 s |
+| autumn-rs, TCP, DRAM tier | DRAM, then 3 disks | 1.61 s | 4.12 s |
+| Mooncake Store, RDMA | DRAM, 1 copy | 0.88 s | 2.11 s |
 | InfiniStore | TODO | TODO | TODO |
 | 3FS | TODO | TODO | TODO |
 
-The DRAM-tier and Mooncake rows come from one set of interleaved runs on the
-current code. The recompute and no-DRAM-tier rows come from an earlier set on
-the same machine; neither touches the DRAM tier.
+The recompute and disk-only rows come from an earlier set of runs on the same
+machine.
 
-What this shows:
-
-- **DRAM tier vs. Mooncake.** The two are close, and the spread between runs
-  is as large as the gap. Per-run medians for B were 0.70–0.88 s (autumn-rs)
-  and 0.57–1.02 s (Mooncake); for C, 1.26–2.66 s and 1.90–2.21 s. The
-  difference is what survives a failure: autumn-rs writes the pages to 3
-  disks behind the DRAM copy, while Mooncake's single DRAM copy is gone with
-  its host.
-- **Without the DRAM tier.** autumn-rs is bound by NVMe reads, and is still
-  1.3× (B) to 3.7× (C) faster than recomputing.
-- **Over TCP.** One client thread receives every value, which caps a TCP
-  read at about 5 GB/s. That is enough to beat recompute, but RDMA is worth it.
+- **autumn-rs with the DRAM tier and Mooncake are about equally fast**; the
+  gap is within run-to-run noise. autumn-rs also keeps 3 copies on disk, so
+  the cache survives losing a host.
+- **From disk only**, autumn-rs is still 1.3–3.7× faster than recomputing.
+- **TCP** beats recomputing, but RDMA is 2–3× faster.
 
 If you want to reproduce a row, open an issue and we will share the scripts.
 
