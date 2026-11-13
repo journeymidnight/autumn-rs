@@ -199,7 +199,6 @@ nodes" in `docs/ops.md`.
 ## Documentation
 
 - [`docs/comparison.md`](docs/comparison.md) — how autumn-rs compares with Mooncake, InfiniStore and 3FS
-- [`ROADMAP.md`](ROADMAP.md) — what is planned next
 - [`CONTRIBUTING.md`](CONTRIBUTING.md) — building, testing and sending a change
 - [`docs/ops.md`](docs/ops.md) — operations and manual-verification manual
   (deployment, fuse runbook, metrics, capacity, chaos suites, rolling restart, CLI reference)
