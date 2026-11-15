@@ -2832,8 +2832,56 @@ trailing MetaBlock bytes.
 ```
 [EntryHeader: 4B = overlap:u16 LE + diff_len:u16 LE][diff_key][op:1B][val_len:4B LE][expires_at:8B LE][value]
 ```
-`overlap` = bytes shared with the block's **base key** (first key of the block, stored
-in the MetaBlock index). Only the diff suffix is stored (prefix compression).
+`overlap` = bytes shared with the block's **base key** (its index key, stored in
+the MetaBlock). Only the diff suffix is stored (prefix compression).
+
+### Block index key
+
+A block's base key is any key in `(previous block's last key, its first key]`;
+with any such choice, `find_block_for_key` (last block whose base <= target)
+followed by the in-block search and, when that runs off the block's end, the
+next block's first entry finds the first entry >= target. `builder::block_base_key` picks: when the
+boundary falls between two user keys, the first key's user key with the
+all-zero suffix (`key_with_ts(user, u64::MAX)`, exactly what a point lookup
+seeks to); inside one user key's versions, the real first key (the newer
+versions are in the block before, and the search must stay there); the first
+block, its first key.
+
+Why: with the real first key as the base, the lookup target `user ++ BE(0)`
+sorts before `user`'s every version, so a key at the head of block i+1 landed
+in block i, which was read to its end before the hop to block i+1 — two
+block accesses. Measured block accesses per 4K read at 64K / 16K / 4K blocks:
+1.067 / 1.333 / 1.996 (≈ 1 + 1 / entries per block), so the smaller the block
+the more it cost: in-cache reads at 16K were 20% below 64K. Now 1.000 at both
+(TCP, 8 partitions, 16 x 8, uniform 4K, alternating): 16K in cache 1.01–1.04M
+→ 1.19–1.23M ops/s (64K: 1.23–1.25M either way), past the cache 64K 0.260M →
+0.274M, 16K 0.309M → 0.380M (docs/ops.md, the core-path read check).
+
+The bytes did not change: the base key only steers the search and is the
+decoder's compression base, so tables built before keep working and keep the
+hop (`read_sst_entry_via`'s, mirrored by the test-only `lookup_in_sst`) until a
+compaction rewrites them. The hop is not old-format code: it is the lookup for
+any table whose base keys lie in that interval, which old tables satisfy too;
+dropping it would need every table rewritten, with nothing to detect one that
+was missed (stale reads). Before hopping, `next_block_may_hold` checks that the
+next block's base key is a version of the wanted user key — otherwise that
+block starts at a later user key and the key is absent — so an absent key
+between two blocks reads one block. In a new table no lookup takes the hop:
+the check passes only when the next block starts inside the wanted key's
+versions, and then the block before ends with one of them. A block's first entry now shares its
+user key (or its whole key) with the base, where it used to share nothing;
+later versions of that user key in the block share up to 7 fewer suffix
+bytes. Not shortened further (RocksDB / HBase store a shortest separator):
+here the index key is also the block's compression base, and a shorter base
+shrinks every entry's shared prefix.
+
+Tests: `lookup_block_boundary_tests` — each block's head key searches to that
+block (red with the real first key); the newest version is read across a
+version boundary (red with the zero suffix there); a table indexed the old way
+(`SstBuilder::with_first_key_index`) is read through the hop by both
+`lookup_in_sst` and the production `lookup_in_sst_via` (red without it);
+`reader::window_tests::an_absent_key_between_blocks_does_not_read_the_next_block`
+(the next block corrupted; red without the check).
 
 ### MetaBlock Layout (v2)
 ```

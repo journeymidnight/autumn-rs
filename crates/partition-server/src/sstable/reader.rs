@@ -214,6 +214,11 @@ impl SstReader {
         self.block_offsets.len()
     }
 
+    /// Block `idx`'s index key (in `(previous block's last key, its first key]`).
+    pub fn block_key(&self, idx: usize) -> &[u8] {
+        &self.block_offsets[idx].key
+    }
+
     pub fn seq_num(&self) -> u64 {
         self.seq_num
     }
@@ -664,6 +669,44 @@ mod window_tests {
             b.add(&ikey(user.as_bytes(), i as u64 + 1), 1, b"v", 0);
         }
         SstReader::from_bytes(b.finish().to_bytes()).expect("reader")
+    }
+
+    /// An absent key that sorts between two blocks is answered from the first
+    /// block alone: the next block's index key is another user key. That block
+    /// is corrupted here, so reading it would fail the lookup.
+    #[test]
+    fn an_absent_key_between_blocks_does_not_read_the_next_block() {
+        let r = multi_block_reader();
+        let SstSource::Resident(data) = &r.source else { unreachable!() };
+        let mut bytes = data.to_vec();
+        let b1 = &r.block_offsets[1];
+        bytes[r.sst_base as usize + b1.relative_offset as usize + 10] ^= 0xff;
+        let r = SstReader::from_bytes(Bytes::from(bytes)).expect("reader");
+        assert!(r.read_block(1).is_err(), "block 1 must be unreadable");
+
+        let b0 = r.read_block(0).unwrap();
+        let last = b0.get_key(b0.num_entries() - 1).unwrap();
+        let mut absent = crate::parse_key(&last).to_vec();
+        absent.push(0); // after block 0's last user key, before block 1's first
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let sc = autumn_stream::StreamClient::new_with_owner_epoch(
+                "127.0.0.1:1",
+                "absent-test".into(),
+                1,
+                1024 * 1024,
+                std::rc::Rc::new(autumn_stream::ConnPool::new()),
+            )
+            .await
+            .unwrap();
+            let cache = crate::sstable::BlockCache::new(1 << 20);
+            let got = crate::background::read_sst_entry_via(&r, &absent, &sc, &cache).await;
+            assert!(matches!(got, Ok(None)), "{got:?}");
+            // A key the corrupted block holds still fails: a read error is
+            // never answered as a miss.
+            let head = r.block_key(1).to_vec();
+            let got = crate::background::read_sst_entry_via(&r, crate::parse_key(&head), &sc, &cache).await;
+            assert!(got.is_err(), "{got:?}");
+        });
     }
 
     /// A key outside the table's range is never read, even when the bloom

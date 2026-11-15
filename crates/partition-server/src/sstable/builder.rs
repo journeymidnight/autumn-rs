@@ -30,7 +30,7 @@ pub struct SstBuilder {
 
     // Current block state
     entry_offsets: Vec<u32>, // byte offsets of entries in the open block
-    base_key: Vec<u8>,       // first key in current block
+    base_key: Vec<u8>,       // index key of the open block (`block_base_key`)
 
     // Bloom filter over all entries
     bloom: BloomFilterBuilder,
@@ -50,6 +50,10 @@ pub struct SstBuilder {
     min_expires_at: u64,
     num_entries: u64,
     num_deletions: u64,
+    /// Index each block by its real first key, as builders before
+    /// `block_base_key` did (tables still in service are built that way).
+    #[cfg(test)]
+    first_key_index: bool,
 }
 
 impl SstBuilder {
@@ -77,7 +81,15 @@ impl SstBuilder {
             min_expires_at: 0,
             num_entries: 0,
             num_deletions: 0,
+            #[cfg(test)]
+            first_key_index: false,
         }
+    }
+
+    #[cfg(test)]
+    pub fn with_first_key_index(mut self) -> Self {
+        self.first_key_index = true;
+        self
     }
 
     /// Segments of `n` bytes instead of `--sst-segment-bytes`.
@@ -138,6 +150,14 @@ impl SstBuilder {
             self.min_expires_at = expires_at;
         }
 
+        if self.base_key.is_empty() {
+            // `biggest_key` is still the previous block's last key here.
+            self.base_key = block_base_key(&self.biggest_key, internal_key);
+            #[cfg(test)]
+            if self.first_key_index {
+                self.base_key = internal_key.to_vec();
+            }
+        }
         if self.smallest_key.is_empty() {
             self.smallest_key = internal_key.to_vec();
         }
@@ -146,17 +166,9 @@ impl SstBuilder {
         // Bloom filter: hash on user key only (strip the fixed-width suffix)
         self.bloom.add_user_key(crate::parse_key(internal_key));
 
-        // Prefix compression
-        let overlap = if self.base_key.is_empty() {
-            0usize
-        } else {
-            common_prefix_len(&self.base_key, internal_key)
-        };
+        // Prefix compression against the base key (the decoder's hint).
+        let overlap = common_prefix_len(&self.base_key, internal_key);
         let diff_key = &internal_key[overlap..];
-
-        if self.base_key.is_empty() {
-            self.base_key = internal_key.to_vec();
-        }
 
         // Record entry offset (from start of current block)
         self.entry_offsets.push(self.block_len() as u32);
@@ -319,6 +331,22 @@ impl BuiltSst {
 /// holds a ValuePointer or a value of at most 4 KiB) and its footer. A block
 /// with one huge key can be larger; its segment then goes in two pieces.
 const MAX_BLOCK_BYTES: usize = BLOCK_SIZE_TARGET + 4 * MAX_ENTRIES_PER_BLOCK + 8;
+
+/// The index key of a block starting at `first`, after a block ending at
+/// `prev` (empty for the first block): any key in `(prev, first]` finds the
+/// block. When the boundary falls between two user keys it is `first`'s user
+/// key with the smallest suffix, the key a point lookup seeks to, so a key at
+/// the head of a block is found there without reading the block before it.
+/// A boundary inside one user key's versions keeps `first`: the newer
+/// versions are in the block before.
+fn block_base_key(prev: &[u8], first: &[u8]) -> Vec<u8> {
+    let user = crate::parse_key(first);
+    if prev.is_empty() || crate::parse_key(prev) == user {
+        first.to_vec()
+    } else {
+        crate::key_with_ts(user, u64::MAX)
+    }
+}
 
 /// Length of the common prefix of two byte slices.
 fn common_prefix_len(a: &[u8], b: &[u8]) -> usize {

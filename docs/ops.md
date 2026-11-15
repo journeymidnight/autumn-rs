@@ -5828,6 +5828,27 @@ not. Measured (8 partitions, cluster cpuset-isolated): a set that fits reads
 from SSTs at 85% (TCP) / 98% (UCX) of the memtable rate; a set four times the cache at
 15% / 20%, the cost of fetching a ~62 KiB block from an extent node for each 4 KiB value.
 
+Block accesses per read show whether a point lookup reads one block:
+`(autumn_ps_block_cache_hits_total + autumn_ps_block_cache_misses_total)` from the PS's
+`/metrics` (port + 500) after the run, divided by the run's read ops (the sets above load
+into fresh clusters, so the counters start at the run). It is 1.000 on tables built since
+a block's index key lands a key at its head in that block (partition-server guide,
+"Block index key"); tables built before read 1 + 1 / entries-per-block (1.067 at 64 KiB
+blocks with 4 KiB values) until a compaction rewrites them. Measured 2026-11-14 (TCP,
+3 disks, 8 partitions, 16 x 8, uniform 4 KiB, EN 8 shards, alternating builds; block size
+is the compile-time `BLOCK_SIZE_TARGET`):
+
+| build | in cache (262 MB) | past cache (1.64 GB) | accesses/read |
+|---|---|---|---|
+| 64 KiB, before | 1.253M / 1.234M | 0.260M, p99 1.16 ms | 1.067 |
+| 64 KiB, now | 1.239M / 1.234M | 0.274M, p99 0.93 ms | 1.000 |
+| 16 KiB, before | 1.01M / 1.04M (earlier round) | 0.309M, p99 0.95 ms | 1.333 |
+| 16 KiB, now | 1.227M / 1.188M | 0.380M, p99 0.61 ms | 1.000 |
+
+Writes (load 51-54K ops/s) and the compaction before the run (43 s for 8 partitions) were
+the same for every build. 16 KiB blocks quadruple the resident index (MetaBlock 14.0 vs
+3.6 MB for the 1.64 GB set; PS RSS +47 MiB).
+
 The numbers in `docs/perf_baseline.md` were taken this way with direct I/O on (the EN default)
 and the io_uring workers confined: each EN on its own 8 cores and the PS on 16,
 all on one NUMA node (for UCX, the NIC's node); each file is the median-write run

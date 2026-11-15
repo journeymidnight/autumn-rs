@@ -4488,6 +4488,14 @@ pub(crate) fn lookup_in_sst_seq_fullscan(reader: &SstReader, user_key: &[u8]) ->
     best
 }
 
+/// Whether the block after `block_idx` can hold `user_key`, for a lookup that
+/// ran off the end of `block_idx`: that block's index key is above the lookup
+/// target and at or below its first key, so unless it is a version of
+/// `user_key` the block starts at a later user key and `user_key` is absent.
+fn next_block_may_hold(reader: &SstReader, block_idx: usize, user_key: &[u8]) -> bool {
+    block_idx + 1 < reader.block_count() && parse_key(reader.block_key(block_idx + 1)) == user_key
+}
+
 /// async point lookup that works for paged AND resident readers —
 /// exact mirror of `lookup_in_sst` (incl. the next-block hop), with
 /// block reads going through `read_block_via` (bounded global cache; miss
@@ -4540,7 +4548,7 @@ pub(crate) async fn read_sst_entry_via(
     // next-block hop — see lookup_in_sst for the full rationale.
     let (blk, pos) = if lo < n {
         (block, lo)
-    } else if block_idx + 1 < reader.block_count() {
+    } else if next_block_may_hold(reader, block_idx, user_key) {
         let nb = reader.read_block_via(block_idx + 1, sc, cache).await?;
         if nb.num_entries() == 0 {
             return Ok(None);
@@ -4591,8 +4599,10 @@ pub(crate) fn lookup_in_sst(reader: &SstReader, user_key: &[u8]) -> Option<(u8, 
     // user_key. It is at `lo` in THIS block when `lo < n`. But when
     // `lo == n` (every key in `block_idx` sorts < target), the answer is
     // the FIRST entry of the NEXT block: `find_block_for_key` returns the
-    // last block whose base_key <= target, so `base_key[block_idx+1]` is
-    // the smallest key > target. Without this next-block hop a user_key
+    // last block whose base_key <= target, so `base_key[block_idx+1]` > target
+    // and so is that block's first key. (`block_base_key` makes a key at a
+    // block's head land in that block; tables built before it still hop
+    // there.) Without this next-block hop a user_key
     // whose newest entry happens to be the base (first entry) of a block
     // is missed entirely — the binary search runs off the end of the
     // preceding block and we return None, the read then falls through to
@@ -4601,7 +4611,7 @@ pub(crate) fn lookup_in_sst(reader: &SstReader, user_key: &[u8]) -> Option<(u8, 
     // bug, invisible until SSTs grew past one block per table.
     let (blk, pos) = if lo < n {
         (block, lo)
-    } else if block_idx + 1 < reader.block_count() {
+    } else if next_block_may_hold(reader, block_idx, user_key) {
         let nb = reader.read_block(block_idx + 1).ok()?;
         if nb.num_entries() == 0 {
             return None;
@@ -4929,13 +4939,15 @@ mod lookup_block_boundary_tests {
     /// `lookup_in_sst` must hop to the next block's first entry in that
     /// case. Invisible until SSTs grew past one block per table (>64 KiB),
     /// which is why the 64-key reproducer passed but the 1024-key one failed.
+    /// Builders now index a block so its head key lands in it; the table here
+    /// is indexed the old way, which tables still in service are.
     #[test]
     fn lookup_in_sst_finds_keys_at_block_boundaries() {
         // ~2 KiB values × 300 keys ≈ 600 KiB → many 64 KiB blocks, so
         // several keys necessarily become block base_keys.
         let val = vec![b'x'; 2048];
         let n: u32 = 300;
-        let mut b = SstBuilder::new(0, 0, 1024);
+        let mut b = SstBuilder::new(0, 0, 1024).with_first_key_index();
         for i in 0..n {
             let uk = format!("k{i:06}").into_bytes();
             // distinct seq per key so the stored ts is checkable
@@ -4950,6 +4962,11 @@ mod lookup_block_boundary_tests {
             "test must span multiple blocks (got {})",
             reader.block_count()
         );
+
+        // The search lands a block early for a block's head key: the hop is
+        // what finds it.
+        let head = reader.read_block(1).unwrap().get_key(0).unwrap();
+        assert_eq!(reader.find_block_for_key(&key_with_ts(parse_key(&head), u64::MAX)), 0);
 
         // EVERY key — including the ones sitting at block boundaries — must
         // be found via the bloom-gated point lookup the GET path uses.
@@ -4967,6 +4984,94 @@ mod lookup_block_boundary_tests {
 
         // A key that does not exist must still return None.
         assert!(lookup_in_sst(&reader, b"zzzzzz").is_none());
+
+        // The production lookup (GET, GC liveness) has its own copy of the hop.
+        // A resident reader never touches the stream client, so it points nowhere.
+        let reader = std::sync::Arc::new(reader);
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let sc = StreamClient::new_with_owner_epoch(
+                "127.0.0.1:1",
+                "hop-test".into(),
+                1,
+                1024 * 1024,
+                Rc::new(autumn_stream::ConnPool::new()),
+            )
+            .await
+            .unwrap();
+            let cache = crate::sstable::BlockCache::new(1 << 20);
+            for i in 0..n {
+                let uk = format!("k{i:06}").into_bytes();
+                let got = lookup_in_sst_via(&reader, &uk, &sc, &cache).await.unwrap();
+                let (_, value, _) = got.unwrap_or_else(|| panic!("lookup_in_sst_via missed k{i:06}"));
+                assert_eq!(value.len(), val.len(), "wrong value for k{i:06}");
+            }
+        });
+    }
+
+    fn padded(tag: &str) -> Vec<u8> {
+        let mut v = tag.as_bytes().to_vec();
+        v.resize(2048, b'x');
+        v
+    }
+
+    /// A key at the head of a block is looked up in that block alone: the
+    /// block search lands on it instead of on the block before, which a
+    /// point lookup used to read to its end before hopping over. Every entry
+    /// still decodes, and a seek to each key lands on it.
+    #[test]
+    fn a_key_at_a_block_head_is_found_in_that_block() {
+        let n: u32 = 300;
+        let mut b = SstBuilder::new(0, 0, 1024);
+        let mut keys = Vec::new();
+        for i in 0..n {
+            let ik = key_with_ts(format!("k{i:06}").as_bytes(), u64::from(i) + 1);
+            b.add(&ik, 1, &padded(&format!("v{i}")), 0);
+            keys.push(ik);
+        }
+        let reader = std::sync::Arc::new(SstReader::from_bytes(b.finish().to_bytes()).expect("reader"));
+        assert!(reader.block_count() > 4, "{} blocks", reader.block_count());
+
+        let mut decoded = Vec::new();
+        for j in 0..reader.block_count() {
+            let block = reader.read_block(j).unwrap();
+            for e in 0..block.num_entries() {
+                decoded.push(block.get_entry(e).unwrap().0);
+            }
+            let head = block.get_key(0).unwrap();
+            let target = key_with_ts(parse_key(&head), u64::MAX);
+            assert_eq!(reader.find_block_for_key(&target), j, "block {j}'s head key");
+        }
+        assert_eq!(decoded, keys);
+
+        let mut it = crate::sstable::iterator::TableIterator::new(reader.clone());
+        for (i, ik) in keys.iter().enumerate() {
+            it.seek(&key_with_ts(parse_key(ik), u64::MAX));
+            assert_eq!(it.item().map(|x| &x.key), Some(ik), "seek to key {i}");
+            let (_, v, _) = lookup_in_sst(&reader, parse_key(ik)).expect("found");
+            assert_eq!(&v[..], &padded(&format!("v{i}"))[..]);
+        }
+    }
+
+    /// One user key's versions spanning several blocks: the newest is read.
+    /// A boundary inside a key's versions keeps the block's real first key
+    /// as its index key, so the search stays on the block holding the newer
+    /// versions.
+    #[test]
+    fn a_key_whose_versions_cross_blocks_reads_its_newest() {
+        let mut b = SstBuilder::new(0, 0, 1024);
+        b.add(&key_with_ts(b"a", 1), 1, &padded("a"), 0);
+        // Newer versions sort first.
+        for seq in (2..=200u64).rev() {
+            b.add(&key_with_ts(b"hot", seq), 1, &padded(&format!("hot{seq}")), 0);
+        }
+        b.add(&key_with_ts(b"z", 1), 1, &padded("z"), 0);
+        let reader = SstReader::from_bytes(b.finish().to_bytes()).expect("reader");
+        assert!(reader.block_count() > 3, "{} blocks", reader.block_count());
+
+        let (_, v, _) = lookup_in_sst(&reader, b"hot").expect("found");
+        assert_eq!(&v[..], &padded("hot200")[..]);
+        let (_, v, _) = lookup_in_sst(&reader, b"z").expect("found");
+        assert_eq!(&v[..], &padded("z")[..]);
     }
 }
 

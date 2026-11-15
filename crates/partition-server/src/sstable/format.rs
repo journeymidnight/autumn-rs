@@ -19,7 +19,7 @@ pub const ENTRY_VALUE_HEADER: usize = 13;
 /// 4-byte per-entry header encoding prefix overlap and diff length.
 #[derive(Debug, Clone, Copy)]
 pub struct EntryHeader {
-    /// Bytes shared with the block's base key (= first key in the block).
+    /// Bytes shared with the block's base key (its index key).
     pub overlap: u16,
     /// Length of the differing suffix.
     pub diff_len: u16,
@@ -49,7 +49,8 @@ impl EntryHeader {
 
 #[derive(Debug, Clone)]
 pub struct BlockOffset {
-    /// Base key (= first key in the block; used for range filtering).
+    /// The block's index key: in `(previous block's last key, first key]`
+    /// (`builder::block_base_key`); also the base of its prefix compression.
     pub key: Vec<u8>,
     /// Byte offset of this block from the start of the SSTable bytes.
     pub relative_offset: u32,
@@ -241,7 +242,8 @@ pub struct DecodedBlock {
     pub data: Bytes,
     /// Byte offsets of each entry from the start of `data`.
     pub entry_offsets: Vec<u32>,
-    /// First (base) key in the block. Required for prefix decompression.
+    /// The block's index key (`BlockOffset.key`), the base of its prefix
+    /// compression.
     pub base_key: Vec<u8>,
 }
 
@@ -257,7 +259,7 @@ impl DecodedBlock {
     }
 
     /// Decode a raw block (bytes from SSTable, including the entry_offsets footer and CRC).
-    /// `base_key_hint` is the key from BlockOffset (= first key in block, from MetaBlock index).
+    /// `base_key_hint` is the key from BlockOffset (the block's index key, from the MetaBlock).
     /// `raw` is a `Bytes` slice from the SSTable data — the decoded block keeps a zero-copy
     /// reference to it so value lookups don't require memcpy.
     pub fn decode(raw: Bytes, base_key_hint: &[u8]) -> Result<Self> {
