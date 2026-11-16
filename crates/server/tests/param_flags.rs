@@ -214,32 +214,6 @@ fn bad_startup_arguments_exit_2() {
     }
 }
 
-/// The manager dials a PS at its advertise address literal-only, so a name
-/// exits 2 at startup instead of failing at the first split.
-#[test]
-fn ps_refuses_a_hostname_advertise() {
-    let secret = std::env::temp_dir().join(format!("param_flags_secret_{}", std::process::id()));
-    let out = Command::new(OP_BIN).arg("gen-cluster-secret").output().expect("spawn");
-    assert!(out.status.success());
-    std::fs::write(&secret, &out.stdout).unwrap();
-    let (code, text) = run(
-        PS_BIN,
-        &[
-            "--cluster-secret-file",
-            secret.to_str().unwrap(),
-            "--psid",
-            "1",
-            "--manager",
-            "127.0.0.1:1",
-            "--advertise",
-            "localhost:9201",
-        ],
-    );
-    let _ = std::fs::remove_file(&secret);
-    assert_eq!(code, 2, "{text}");
-    assert!(text.contains("--advertise must be IP:PORT"), "{text}");
-}
-
 /// `--scope` stays an accepted spelling of autumn-client's `--namespace`.
 #[test]
 fn client_accepts_scope_for_namespace() {

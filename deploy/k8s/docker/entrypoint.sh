@@ -6,24 +6,20 @@
 #
 # Everything k8s-specific lives here, not in the Rust binaries (which stay
 # env-free and take only CLI flags):
-#   - DNS→IP resolution: the server binaries parse their address flags with
-#     SocketAddr::parse (IP literals only; client tools resolve names
-#     themselves). Service names from env are resolved to ClusterIPs here,
-#     then passed as flags.
+#   - Service names are passed through as they are: the server binaries
+#     resolve the names in their address flags once at startup, and client
+#     tools resolve them per connection.
 #   - env→flag translation, mirroring cluster.sh's AUTUMN_* conventions.
 #   - bring-up ordering guards (wait-for-leader, idempotent format,
 #     streams-guarded bootstrap) — the same protocol as cluster.sh.
 #
 # Addressing model (see "Deployment" in docs/ops.md):
-#   extent-node  advertises its per-pod Service ClusterIP (Service name ==
-#                pod name). The manager keys EN
-#                identity on a stable node_uuid (persisted on the PVC), NOT
+#   extent-node  advertises its POD IP (AUTUMN_ADVERTISE_IP). The manager keys
+#                EN identity on a stable node_uuid (persisted on the PVC), NOT
 #                the address, and the EN self-registers its live address +
-#                shard ports at EVERY startup — so a naked pod IP would now
-#                also work correctness-wise. The per-pod ClusterIP is kept
-#                anyway: it avoids routing churn (a df-echo drift heal) on
-#                every pod restart and gives operators a stable target.
-#                `format` is identity-only (no address) — see cmd below.
+#                shard ports at EVERY startup, so a fresh pod IP updates the
+#                same node. `format` is identity-only (no address) — see cmd
+#                below.
 #   ps           advertises its POD IP. Safe because every partition open
 #                re-registers its address with the manager, so a rescheduled
 #                PS heals its routing automatically. Per-partition listener
@@ -72,8 +68,7 @@ first_allowed_cpus() {
     echo "${cores[*]:0:n}"
 }
 
-# Wrap bare IPv6 literals in brackets so "host:port" strings survive
-# SocketAddr::parse on the Rust side.
+# Wrap bare IPv6 literals in brackets so "host:port" strings parse.
 bracket_host() {
     local ip="$1"
     if [[ "$ip" == *:* && "$ip" != \[* ]]; then
@@ -81,37 +76,6 @@ bracket_host() {
     else
         echo "$ip"
     fi
-}
-
-# Resolve a DNS name (or pass through an IP literal) to one IP, retrying
-# until kube-dns catches up. Prints the bracketed-if-IPv6 IP.
-resolve_ip() {
-    local name="$1" tries="${2:-60}"
-    name="${name#[}"; name="${name%]}"
-    local i ip
-    for (( i = 0; i < tries; i++ )); do
-        ip="$(getent hosts "$name" 2>/dev/null | awk 'NR==1 {print $1}')" || true
-        if [[ -n "${ip:-}" ]]; then
-            bracket_host "$ip"
-            return 0
-        fi
-        (( i == 0 )) && log "waiting for DNS: $name"
-        sleep 2
-    done
-    die "cannot resolve '$name' after $tries attempts"
-}
-
-# Resolve every "name:port" in a comma-separated list to "IP:port".
-resolve_hostport_list() {
-    local list="$1" out="" item name port
-    for item in ${list//,/ }; do
-        # split on the LAST ':' so bracketed IPv6 names survive
-        port="${item##*:}"
-        name="${item%:*}"
-        [[ "$port" =~ ^[0-9]+$ ]] || die "expected host:port, got '$item'"
-        out+="${out:+,}$(resolve_ip "$name"):$port"
-    done
-    echo "$out"
 }
 
 # Leader-gated readiness: `autumn-op info` only succeeds against the elected
@@ -155,7 +119,7 @@ wait_for_manager_port() {
 run_manager() {
     local port="${AUTUMN_MANAGER_PORT:-9001}"
     local etcd
-    etcd="$(resolve_hostport_list "${AUTUMN_ETCD_ENDPOINTS:-etcd:2379}")"
+    etcd="${AUTUMN_ETCD_ENDPOINTS:-etcd:2379}"
     require_cluster_secret
     # manager id must be unique and non-zero: StatefulSet ordinal + 1.
     local mid="${AUTUMN_MANAGER_ID:-}"
@@ -203,22 +167,20 @@ run_extent_node() {
     local port="${AUTUMN_EXTENT_PORT:-9101}"
     local data="${AUTUMN_EXTENT_DATA:-/data/autumn}"
     local mgr
-    mgr="$(resolve_hostport_list "${AUTUMN_MANAGER:-autumn-manager:9001}")"
-    [[ "$mgr" == *,* ]] && die "extent-node takes a single manager address, got '$mgr'"
+    mgr="${AUTUMN_MANAGER:-autumn-manager:9001}"
     require_cluster_secret
 
     # Advertise this pod's OWN IP (Downward-API status.podIP,
     # passed as AUTUMN_ADVERTISE_IP). The EN self-registers its location under a
     # stable node_uuid at every startup, so a fresh pod IP on reschedule just
     # updates the same identity — no per-pod ClusterIP Service, no FQDN, no
-    # phantom-node trap. The pod IP is already an IP literal (no DNS), so we
-    # only bracket it for IPv6. Legacy fallback: a per-pod-Service FQDN via
-    # AUTUMN_ADVERTISE_NAME (resolved to its ClusterIP) still works if set.
+    # phantom-node trap. The pod IP is bracketed for IPv6. Legacy fallback: a
+    # per-pod-Service name via AUTUMN_ADVERTISE_NAME, which the EN resolves.
     local adv
     if [[ -n "${AUTUMN_ADVERTISE_IP:-}" ]]; then
         adv="$(bracket_host "${AUTUMN_ADVERTISE_IP}")"
     else
-        adv="$(resolve_ip "${AUTUMN_ADVERTISE_NAME:-$HOSTNAME}")"
+        adv="${AUTUMN_ADVERTISE_NAME:-$HOSTNAME}"
     fi
 
     # Sharding (AUTUMN_EXTENT_SHARDS, default 1). Shard i binds its data
@@ -316,7 +278,7 @@ PS_TUNABLES=(
 run_ps() {
     local port="${AUTUMN_PS_PORT:-9301}"
     local mgr
-    mgr="$(resolve_hostport_list "${AUTUMN_MANAGER:-autumn-manager:9001}")"
+    mgr="${AUTUMN_MANAGER:-autumn-manager:9001}"
 
     # psid must be unique and non-zero: StatefulSet ordinal + 1.
     local psid="${AUTUMN_PSID:-}"
@@ -354,7 +316,7 @@ run_bootstrap() {
     [[ "$expect" =~ ^[0-9]+$ && "$expect" -ge 1 ]] \
         || die "AUTUMN_EXPECT_NODES must be a positive integer"
     local mgr
-    mgr="$(resolve_hostport_list "${AUTUMN_MANAGER:-autumn-manager:9001}")"
+    mgr="${AUTUMN_MANAGER:-autumn-manager:9001}"
     require_cluster_secret
     wait_for_manager "$mgr"
 
@@ -423,7 +385,7 @@ Create and cut each namespace AFTER bootstrap instead (docs/ops.md):
 
 run_fuse() {
     local mgr
-    mgr="$(resolve_hostport_list "${AUTUMN_MANAGER:-autumn-manager:9001}")"
+    mgr="${AUTUMN_MANAGER:-autumn-manager:9001}"
     local mp="${AUTUMN_FUSE_MOUNTPOINT:-/mnt/autumn}"
 
     # A crashed daemon leaves the mount entry behind; the next mount on the same
@@ -471,7 +433,7 @@ run_fuse() {
 
 run_s3() {
     local mgr
-    mgr="$(resolve_hostport_list "${AUTUMN_MANAGER:-autumn-manager:9001}")"
+    mgr="${AUTUMN_MANAGER:-autumn-manager:9001}"
     wait_for_manager_port "$mgr"
 
     local -a args=(

@@ -7029,8 +7029,6 @@ async fn partition_thread_main(
         poisoned,
         Routing {
             part_sc: part_sc.clone(),
-            pool: pool.clone(),
-            manager_addr: manager_addr.clone(),
             owner_key: owner_key.clone(),
             owner_epoch,
         },
@@ -7668,8 +7666,6 @@ type InflightQueue = futures::stream::FuturesOrdered<
 /// argument churn). All fields are cheap to clone (`Rc` / `String` / `i64`).
 struct Routing {
     part_sc: Rc<StreamClient>,
-    pool: Rc<ConnPool>,
-    manager_addr: String,
     owner_key: String,
     owner_epoch: i64,
 }
@@ -8484,19 +8480,11 @@ async fn handle_incoming_req(
         MSG_SPLIT_PART => {
             let part_c = part.clone();
             let part_sc_c = routing.part_sc.clone();
-            let pool_c = routing.pool.clone();
-            let manager_addr_c = routing.manager_addr.clone();
             let payload = req.payload;
             let resp_tx = req.resp_tx;
             compio::runtime::spawn(async move {
-                let result = crate::rpc_handlers::handle_split_part(
-                    payload,
-                    &part_c,
-                    &part_sc_c,
-                    &pool_c,
-                    &manager_addr_c,
-                )
-                .await;
+                let result =
+                    crate::rpc_handlers::handle_split_part(payload, &part_c, &part_sc_c).await;
                 let _ = resp_tx.send(result);
             })
             .detach();
@@ -8530,8 +8518,6 @@ async fn handle_incoming_req(
                 req.payload,
                 part,
                 &routing.part_sc,
-                &routing.pool,
-                &routing.manager_addr,
                 &routing.owner_key,
                 routing.owner_epoch,
             )

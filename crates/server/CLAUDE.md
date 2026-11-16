@@ -26,6 +26,42 @@ autumn-fuse's `--mountpoint`, migratev1_v2's `--etcd`) or a
 removed flag exits 2; `--help` lists every flag with its default and range from
 the same declarations. No binary reads a tunable from the environment.
 
+## Host names in server address flags
+
+The manager, EN and PS take a host name wherever they take an address
+(`--listen`, `--advertise`, `--manager`, the manager's `--etcd`). Each binary's
+`resolve_address_flags` runs right after the flags are parsed and writes the
+resolved IP literals back into its params, so everything after it — the
+listeners, `designate_managers`, registration, every pool dial — sees only
+literals and pays no lookup (the hot path's `parse_addr` stays a parse). The
+resolvers are `autumn_transport::resolve_host` / `resolve_advertise` /
+`resolve_host_port_list` (blocking `getaddrinfo`, startup only):
+- `--listen`: a name's first address.
+- `--advertise`: one address, of the `--listen` family when the name has one
+  (`localhost` answers `::1` first on most hosts, which a server on `0.0.0.0`
+  does not serve). One address, because it is what others dial.
+- `--manager` / `--etcd`: every address of every name, duplicates dropped —
+  they are failover lists already, so a name with several addresses (a
+  headless Service) becomes several managers.
+- A name that does not resolve exits 2 with the name in the error. Nothing
+  retries: DNS must answer before the server starts, and a name whose address
+  changes needs a restart.
+
+`--metrics-listen` is left as given: the metrics thread binds it with
+`std::net::TcpListener`, which resolves a name itself.
+
+A `--manager` list of several addresses (now also what one name can become)
+must never be dialled whole: the PS split's range lookup (`split_part`) handed
+the joined list to `ConnPool` as one address and every split failed
+`invalid socket address syntax`. It now goes through the partition's
+`StreamClient::get_regions`, the manager rotation every other manager call
+uses.
+Test: `tests/server_host_names.rs` (manager, EN and PS given only `localhost`,
+the PS's list led by a dead manager; bootstrap, a namespace cut, put/get,
+nothing registered under a name; an unresolvable name exits 2 for each
+binary). Ablations: no startup resolution — both red; the split lookup
+dialling the whole list — the cluster test red.
+
 ## Binaries
 
 ### `autumn-manager-server` (`src/bin/manager.rs`)
@@ -54,7 +90,7 @@ autumn-extent-node --cluster-secret-file FILE --data DIR[,DIR2,...] [--port 9101
 
 - `--data`: directory holding extent files (`extent-{id}.dat` + `extent-{id}.meta`); comma-separated or repeated for a multi-disk EN.
 - **Direct I/O is on by default on Linux** (append bursts >= 1 MiB go O_DIRECT; off elsewhere): the default lives here in the binary, not in `ExtentNodeConfig` (off there). `--no-direct-io` turns it off — needed on a data dir that refuses O_DIRECT (tmpfs before Linux 6.6), which otherwise stops the EN at startup. There is no flag to turn it on: it is the Linux default, and elsewhere there is no O_DIRECT path. Covered by `tests/direct_io_default.rs`; design in `crates/stream/CLAUDE.md`.
-- `--advertise HOST:PORT` is **REQUIRED whenever `--manager` is given** (`main()` bails otherwise) — a `--manager` run that self-registered nothing would sit at an empty location forever. HOST must be an IP (DNS-free); PORT normally equals `--port` (a difference is accepted with a WARN, for a proxy/NAT). `--manager`-less offline/test runs are exempt.
+- `--advertise HOST:PORT` is **REQUIRED whenever `--manager` is given** (`main()` bails otherwise) — a `--manager` run that self-registered nothing would sit at an empty location forever. HOST may be a name (resolved at startup, see below); PORT normally equals `--port` (a difference is accepted with a WARN, for a proxy/NAT). `--manager`-less offline/test runs are exempt.
 - **Self-registration**: at startup (after cluster-id verification, before serving) the EN registers its live address + shard ports with the manager, keyed by its stable `node_uuid`. The manager updates the location IN PLACE, so a reshard or fresh pod IP is picked up on the next boot — the **EN, not `format`, is the sole source of location**. `handle_df` echoes the identity so `node_health_loop` self-heals drift.
 - **Pinning**: each shard thread (the main thread when there is one shard)
   `sched_setaffinity`s to its `--cpuset` core before building its runtime, and a
@@ -76,7 +112,7 @@ autumn-extent-node --cluster-secret-file FILE --data DIR[,DIR2,...] [--port 9101
 autumn-ps --cluster-secret-file FILE --psid <ID> --manager 127.0.0.1:9001 [--port 9201] [--advertise <ADDR>]
 ```
 
-- `--psid`: **required**, unique partition-server ID across the cluster. The PS keeps no local files (its WAL is the log stream). `--advertise`: address announced to the manager (when listening on 0.0.0.0 but the manager needs a routable address); an IP literal, a name exits 2 (the manager dials it literal-only, so a name would only fail at the first split or maintenance call).
+- `--psid`: **required**, unique partition-server ID across the cluster. The PS keeps no local files (its WAL is the log stream). `--advertise`: address announced to the manager (when listening on 0.0.0.0 but the manager needs a routable address); a name is resolved at startup (see below).
 - Startup: connect to manager → `RegisterPs(ps_id, advertise_addr)` → `GetRegions()` for assigned partitions → `open_partition()` (replay from streams) each → serve `PartitionKv` gRPC.
 - `--cpuset <SPEC>` confines the whole process, like `taskset` (`--cpu-start` was removed and exits 2): the main thread takes the mask before anything is spawned, every thread inherits it, and no thread is pinned to a core (pinning P-logs measured no gain, and lost under uneven load). The `--cpuset` length is the `slot_cap` the manager places by (`0` without one). A core outside the cgroup exits 2.
 

@@ -99,13 +99,21 @@ cluster for trying it out (see [Docker compose](#docker-compose-deploycompose)).
 
 Constraints both paths are shaped around:
 
-- **No DNS in the servers.** A manager, PS or EN address flag (`--manager`,
-  `--advertise`, `--listen`, the manager's `--etcd`) carries an IP literal
-  (IPv6 bracketed); a PS or EN given a name for `--manager` or `--advertise`
-  exits at startup. autumn-deploy resolves
-  names once for SSH; the k8s entrypoint resolves Service names with `getent`.
-  Clients (`autumn-client`, `autumn-op`, the dashboard, autumnfs, the S3
-  gateway, Python) take `host:port` and resolve it.
+- **Host names are resolved once, at startup.** A manager, PS or EN address
+  flag (`--listen`, `--advertise`, `--manager`, the manager's `--etcd`) takes an
+  IP literal (IPv6 bracketed) or a host name. The server resolves each name when
+  it starts and from then on registers and dials only IP literals: a
+  `--manager` or `--etcd` name becomes every address it has (tried in turn), an
+  `--advertise` name the one address of the `--listen` family. A name that does
+  not resolve stops the server (exit 2, the name in the error), so DNS must
+  answer before a server starts; a name whose address changes later needs a
+  restart to follow it. Neither autumn-deploy nor the k8s entrypoint resolves
+  anything for the servers. To see what a name became: the PS start line
+  (`autumn-ps starting: ... manager=..., advertise=...`) and the EN's address in
+  `autumn-op list-nodes`; `crates/server/tests/server_host_names.rs` runs a
+  cluster given only `localhost`. Clients (`autumn-client`, `autumn-op`, the
+  dashboard, autumnfs, the S3 gateway, Python) take `host:port` and resolve it
+  per connection.
 - **EN identity is the `node_uuid`** minted at `format` and kept in the data dir.
   The EN self-registers its current address and every shard port at each start,
   so an address change updates the same node.
@@ -390,7 +398,8 @@ $AC get mykey                                                     # → hello (d
 
 One image (`deploy/k8s/docker/Dockerfile`) serves every role;
 `deploy/k8s/docker/entrypoint.sh` dispatches on the first argument and does the k8s
-glue (DNS → IP, env → flags, bring-up guards). The image carries UCX 1.20.1 in
+glue (env → flags, bring-up guards); Service names go to the binaries as they
+are. The image carries UCX 1.20.1 in
 `/opt/ucx`, used only with `AUTUMN_TRANSPORT=ucx`. UCX on k8s is untested: it
 needs `hostNetwork`, an RDMA device plugin, memlock and `UCX_TLS` /
 `UCX_NET_DEVICES` in the pod env, and the PS advertises the pod IP, which under

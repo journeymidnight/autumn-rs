@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 #[cfg(unix)]
 extern crate libc;
-use autumn_params::ps::PprofParams;
+use autumn_params::ps::{PprofParams, PsParams};
 use autumn_params::{Positional, Section};
 use autumn_partition_server::PartitionServer;
 
@@ -40,6 +40,22 @@ fn parse_args() -> PprofParams {
     pprof
 }
 
+/// `--listen`, `--advertise` and `--manager` with every name resolved: the
+/// advertised one to a single address of the listen family, the managers to
+/// all of theirs.
+fn resolve_address_flags(p: &PsParams) -> Result<(), String> {
+    let listen = autumn_transport::resolve_host(&p.listen.get()).map_err(|e| format!("--listen: {e}"))?;
+    p.listen.set(listen.to_string());
+    if let Some(adv) = p.advertise.get() {
+        let sa = autumn_transport::resolve_advertise(&adv, listen).map_err(|e| format!("--advertise: {e}"))?;
+        p.advertise.set(Some(sa.to_string()));
+    }
+    let managers = autumn_transport::resolve_host_port_list(&p.manager.get())
+        .map_err(|e| format!("--manager: {e}"))?;
+    p.manager.set(managers.iter().map(|sa| sa.to_string()).collect::<Vec<_>>().join(","));
+    Ok(())
+}
+
 #[compio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -67,7 +83,9 @@ async fn main() -> Result<()> {
 
     autumn_stream::set_read_hedge_ms(params.read_hedge_ms.get());
 
-    if let Err(e) = autumn_rpc::peer_auth::install_for_server(params.cluster_secret_file.get().as_deref())
+    // Names in the address flags become IP literals here, once.
+    if let Err(e) = resolve_address_flags(params)
+        .and_then(|()| autumn_rpc::peer_auth::install_for_server(params.cluster_secret_file.get().as_deref()))
         .and_then(|()| autumn_rpc::peer_auth::designate_managers(&params.manager.get()))
     {
         eprintln!("error: {e}");
@@ -134,14 +152,6 @@ async fn main() -> Result<()> {
         .context("parse listen address")?;
     autumn_transport::check_listen_addr(addr, autumn_transport::current().kind()).ok();
 
-    // The manager dials this address literal-only (split, maintenance, merge
-    // freeze), so a name would start, serve clients, and fail at the first one.
-    if let Some(adv) = params.advertise.get() {
-        if let Err(e) = adv.parse::<std::net::SocketAddr>() {
-            eprintln!("error: --advertise must be IP:PORT (DNS-free), got {adv:?}: {e}");
-            std::process::exit(2);
-        }
-    }
     let advertise = params.advertise.get().unwrap_or_else(|| {
         autumn_transport::format_listen_addr(&listen, port)
             .map(|sa| sa.to_string())

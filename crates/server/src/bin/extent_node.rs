@@ -339,6 +339,23 @@ async fn register_with_manager(manager: &str, req: &RegisterNodeReq) -> Result<(
     anyhow::bail!("EN self-registration failed after 30 attempts: {last_err}")
 }
 
+/// `--listen`, `--advertise` and `--manager` with every name resolved: the
+/// advertised one to a single address of the listen family, the managers to
+/// all of theirs.
+fn resolve_address_flags(p: &autumn_params::en::EnParams) -> Result<(), String> {
+    let listen = autumn_transport::resolve_host(&p.listen.get()).map_err(|e| format!("--listen: {e}"))?;
+    p.listen.set(listen.to_string());
+    if let Some(adv) = p.advertise.get() {
+        let sa = autumn_transport::resolve_advertise(&adv, listen).map_err(|e| format!("--advertise: {e}"))?;
+        p.advertise.set(Some(sa.to_string()));
+    }
+    if let Some(m) = p.manager.get() {
+        let managers = autumn_transport::resolve_host_port_list(&m).map_err(|e| format!("--manager: {e}"))?;
+        p.manager.set(Some(managers.iter().map(|sa| sa.to_string()).collect::<Vec<_>>().join(",")));
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -349,6 +366,11 @@ fn main() -> Result<()> {
 
     autumn_params::parse_or_exit(USAGE, &[autumn_stream::en_params() as &dyn Section], Positional::Refuse);
     let p = autumn_stream::en_params();
+    // Names in the address flags become IP literals here, once.
+    if let Err(e) = resolve_address_flags(p) {
+        eprintln!("error: {e}");
+        std::process::exit(2);
+    }
     let (manager, advertise, data, listen) =
         (p.manager.get(), p.advertise.get(), p.data.get(), p.listen.get());
     let (port, shard_stride, control_port) = (p.port.get(), p.shard_stride.get(), p.control_port.get());
@@ -475,8 +497,7 @@ fn main() -> Result<()> {
     // NOTHING and sit at an empty location forever (df can never reach it,
     // stays Suspend, never selected for allocation). `--manager`-less runs
     // (offline / unit-test invocations) are exempt — there's no registrar to
-    // report to. HOST must be an IP (DNS-free per the repo rule — the shell
-    // resolves names). The advertise PORT is the shard-0 port AS SEEN BY PEERS
+    // report to. A name in it was resolved above. The advertise PORT is the shard-0 port AS SEEN BY PEERS
     // — normally == --port, but it MAY differ behind NAT / a proxy (the manager
     // routes to advertise_host:advertise_port + i*stride while the EN binds
     // --port + i*stride locally). We warn (not fail) on a mismatch so a bare
@@ -491,23 +512,18 @@ fn main() -> Result<()> {
             );
             std::process::exit(2);
         }
-        (_, Some(adv)) => match adv.parse::<std::net::SocketAddr>() {
-            Ok(sa) => {
-                if sa.port() != port {
-                    tracing::warn!(
-                        advertise_port = sa.port(),
-                        listen_port = port,
-                        "advertise port differs from --port — assuming NAT/proxy; \
-                         registered shard_ports derive from the advertise port"
-                    );
-                }
-                Some(sa.port())
+        (_, Some(adv)) => {
+            let sa: std::net::SocketAddr = adv.parse().expect("--advertise resolved at startup");
+            if sa.port() != port {
+                tracing::warn!(
+                    advertise_port = sa.port(),
+                    listen_port = port,
+                    "advertise port differs from --port — assuming NAT/proxy; \
+                     registered shard_ports derive from the advertise port"
+                );
             }
-            Err(e) => {
-                eprintln!("error: --advertise must be IP:PORT (DNS-free), got {adv:?}: {e}");
-                std::process::exit(2);
-            }
-        },
+            Some(sa.port())
+        }
         (None, None) => None,
     };
     // Peer-reachable (advertise-side) shard ports + control base — what the

@@ -34,6 +34,17 @@ fn parse_args() -> ManagerParams {
     params
 }
 
+/// `--listen` and `--etcd` with every name resolved to its addresses.
+fn resolve_address_flags(params: &ManagerParams) -> Result<(), String> {
+    let listen = params.listen.get();
+    let ip = autumn_transport::resolve_host(&listen).map_err(|e| format!("--listen: {e}"))?;
+    params.listen.set(ip.to_string());
+    let etcd = autumn_transport::resolve_host_port_list(&params.etcd.get().join(","))
+        .map_err(|e| format!("--etcd: {e}"))?;
+    params.etcd.set(etcd.iter().map(|sa| sa.to_string()).collect());
+    Ok(())
+}
+
 #[compio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -44,6 +55,11 @@ async fn main() -> Result<()> {
         .init();
 
     let params = parse_args();
+    // Names in the address flags become IP literals here, once.
+    if let Err(e) = resolve_address_flags(&params) {
+        eprintln!("error: {e}");
+        std::process::exit(2);
+    }
     // `params` moves into the manager; what main needs is read first.
     let etcd = params.etcd.get();
     let fast_mode = params.policy_fast_mode.get();

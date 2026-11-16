@@ -9,8 +9,7 @@ data:
   # Shared env consumed by deploy/k8s/docker/entrypoint.sh (env→flag translation
   # lives in the entrypoint; the Rust binaries take only CLI flags).
   AUTUMN_TRANSPORT: "tcp"
-  # Service names (resolved to ClusterIPs by the entrypoint — the binaries do
-  # not resolve DNS themselves).
+  # Service names: the server binaries resolve them once at startup.
   AUTUMN_ETCD_ENDPOINTS: "autumn-etcd:2379"
   AUTUMN_MANAGER: "autumn-manager:9001"
   # Bootstrap waits for this many extent nodes Online before creating streams.

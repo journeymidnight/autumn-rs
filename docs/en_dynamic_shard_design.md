@@ -83,8 +83,8 @@ reach it, so it stays `Suspend` and is never selected for allocation.
 
 `--advertise <HOST:PORT>` is **required** whenever `--manager` is given
 (validated in `main()`, covering both the multi-shard and `run_single_shard`
-paths); `--manager`-less offline/test runs are exempt. HOST must be an IP — the
-binary stays DNS-free, the shell resolves names.
+paths); `--manager`-less offline/test runs are exempt. HOST may be a name: the
+binary resolves it once at startup and registers the IP.
 
 - The advertise PORT is shard 0's port **as seen by peers**. It normally equals
   `--port`; a difference is accepted with a WARN (NAT/proxy case), and the

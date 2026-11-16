@@ -2374,7 +2374,8 @@ about it are load-bearing:
 ```
 handle_split_part(req):
   1. Reject if part.has_overlap == 1 (run major compaction first)
-  2. Fetch authoritative range from manager via MSG_GET_REGIONS — PS-local part.rg
+  2. Fetch authoritative range from manager via MSG_GET_REGIONS
+       (`StreamClient::get_regions`, the manager rotation) — PS-local part.rg
        is set at open and NOT refreshed for already-open partitions, so after a
        previous split it still spans the pre-split wide range; picking mid_key
        against the stale rg yields keys the manager's narrowed range rejects.
@@ -3056,8 +3057,8 @@ Three fixes bound the restart replay window (worst case per partition =
    `stream_client: Arc<StreamClient>` (no Mutex) via `new_with_owner_epoch`.
    StreamClient is internally concurrent via per-stream locking (`DashMap<stream_id,
    Arc<Mutex<StreamAppendState>>>`): different streams (log/row/meta) are fully
-   concurrent; the same stream is serialized. The server-level
-   `PartitionServer.stream_client` is used only in `split_part` coordination RPCs.
+   concurrent; the same stream is serialized. `split_part` makes its manager
+   calls (range lookup, commit) through this per-partition client.
 
 8. **`start_write_batch` / `finish_write_batch` lock scope** — the write lock is held
    only for seq assignment + block encoding (Phase 1), released before the

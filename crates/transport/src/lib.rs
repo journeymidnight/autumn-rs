@@ -513,6 +513,63 @@ pub fn format_listen_addr(host: &str, port: u16) -> io::Result<SocketAddr> {
         .map_err(|e| io::Error::other(format!("parse listen addr {s:?}: {e}")))
 }
 
+/// The addresses of `host:port`: an IP literal as written, a name as the system
+/// resolver answers it, in its order. Blocks: server address flags are resolved
+/// once at startup, so everything after works on IP literals.
+pub fn resolve_host_port(addr: &str) -> io::Result<Vec<SocketAddr>> {
+    use std::net::ToSocketAddrs;
+    let bare = addr
+        .trim()
+        .trim_start_matches("http://")
+        .trim_start_matches("https://");
+    let addrs: Vec<SocketAddr> = bare
+        .to_socket_addrs()
+        .map_err(|e| io::Error::new(e.kind(), format!("resolve {addr:?}: {e}")))?
+        .collect();
+    if addrs.is_empty() {
+        return Err(io::Error::other(format!("{addr:?} resolves to no address")));
+    }
+    Ok(addrs)
+}
+
+/// A comma-separated `host:port` list with each name replaced by every address
+/// it has, duplicates dropped: what a `--manager` or `--etcd` list dials, in
+/// order.
+pub fn resolve_host_port_list(list: &str) -> io::Result<Vec<SocketAddr>> {
+    let mut out = Vec::new();
+    for item in list.split(',').filter(|s| !s.trim().is_empty()) {
+        for sa in resolve_host_port(item)? {
+            if !out.contains(&sa) {
+                out.push(sa);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// A listen host as an IP: a literal as written (brackets optional), a name's
+/// first address.
+pub fn resolve_host(host: &str) -> io::Result<std::net::IpAddr> {
+    let bare = host.trim().trim_matches(['[', ']']);
+    if let Ok(ip) = bare.parse() {
+        return Ok(ip);
+    }
+    Ok(resolve_host_port(&format!("{bare}:0"))?[0].ip())
+}
+
+/// The one address an advertised `host:port` stands for: of the listen
+/// address's family when the name has one (`localhost` answers `::1` first on
+/// most hosts, which a server listening on `0.0.0.0` does not serve), else
+/// its first.
+pub fn resolve_advertise(addr: &str, listen: std::net::IpAddr) -> io::Result<SocketAddr> {
+    let addrs = resolve_host_port(addr)?;
+    Ok(addrs
+        .iter()
+        .copied()
+        .find(|a| a.is_ipv4() == listen.is_ipv4())
+        .unwrap_or(addrs[0]))
+}
+
 /// Deployment preflight: log a warning when a non-wildcard listen address is
 /// on a netdev without a RoCE GID table and `kind == Ucx`. Always returns
 /// `Ok(())` — UCX may still fall back to TCP/shm at runtime; the caller

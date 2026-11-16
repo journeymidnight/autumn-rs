@@ -14,7 +14,7 @@ use autumn_common::metrics::ns_to_ms;
 use autumn_rpc::manager_rpc;
 use autumn_rpc::partition_rpc::{self, *};
 use autumn_rpc::{HandlerResult, StatusCode};
-use autumn_stream::{ConnPool, StaleVpOffset, StreamClient};
+use autumn_stream::{StaleVpOffset, StreamClient};
 use bytes::Bytes;
 
 use crate::sstable::{AsyncMergeIterator, AsyncTableIterator, FetchMode};
@@ -169,8 +169,6 @@ pub(crate) async fn dispatch_partition_rpc(
     payload: Bytes,
     part: &Rc<RefCell<PartitionData>>,
     part_sc: &Rc<StreamClient>,
-    _pool: &Rc<ConnPool>,
-    _manager_addr: &str,
     _owner_key: &str,
     _revision: i64,
 ) -> HandlerResult {
@@ -1470,8 +1468,6 @@ pub(crate) async fn handle_split_part(
     payload: Bytes,
     part: &Rc<RefCell<PartitionData>>,
     part_sc: &Rc<StreamClient>,
-    pool: &Rc<ConnPool>,
-    manager_addr: &str,
 ) -> HandlerResult {
     let req: SplitPartReq =
         partition_rpc::rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
@@ -1483,7 +1479,7 @@ pub(crate) async fn handle_split_part(
             "split already in progress on this partition".to_string(),
         ))
     } else {
-        let r = split_part(&req, part, part_sc, pool, manager_addr).await;
+        let r = split_part(&req, part, part_sc).await;
         part.borrow().split_pending.set(false);
         r
     };
@@ -1512,8 +1508,6 @@ async fn split_part(
     req: &SplitPartReq,
     part: &Rc<RefCell<PartitionData>>,
     part_sc: &Rc<StreamClient>,
-    pool: &Rc<ConnPool>,
-    manager_addr: &str,
 ) -> HandlerResult {
     if part.borrow().has_overlap.get() != 0 {
         return Err((
@@ -1565,26 +1559,12 @@ async fn split_part(
     // rg can yield a key outside the manager's narrowed range, which
     // multi_modify_split then rejects.
     let auth_rg: Range = {
-        // 10 s — read-only manager call. Fetches authoritative range
-        // for the stale-rg fix. Bounded so split doesn't wedge
-        // on a hung manager.
-        let resp_bytes = pool
-            .call_timeout(
-                manager_addr,
-                manager_rpc::MSG_GET_REGIONS,
-                Bytes::new(),
-                Duration::from_secs(10),
-            )
+        // 10 s — read-only manager call. Fetches authoritative range for the
+        // stale-rg fix, through the partition's StreamClient (manager rotation).
+        let resp = part_sc
+            .get_regions(Duration::from_secs(10))
             .await
-            .map_err(|e| (StatusCode::Internal, format!("get_regions: {e}")))?;
-        let resp: manager_rpc::GetRegionsResp =
-            manager_rpc::rkyv_decode(&resp_bytes).map_err(|e| (StatusCode::Internal, e))?;
-        if resp.code != manager_rpc::CODE_OK {
-            return Err((
-                StatusCode::Internal,
-                format!("get_regions: {}", resp.message),
-            ));
-        }
+            .map_err(|e| (StatusCode::Internal, format!("{e:#}")))?;
         resp.regions
             .into_iter()
             .find(|(pid, _)| *pid == req.part_id)

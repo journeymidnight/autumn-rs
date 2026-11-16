@@ -579,11 +579,10 @@ bulk-only values are written after every small group (test:
   (`open_rpc_named`): an IP literal needs no lookup, a name is resolved on
   compio's blocking pool and each answer dialled in turn until one connects
   (a name can answer IPv6 first while the server listens on IPv4). Only
-  connection setup pays for it; the servers themselves still take IP
-  literals (a PS or EN `--manager` name is refused at startup by
-  `designate_managers`, a PS or EN `--advertise` name by the binary, and the
-  manager dials a PS advertise address literal-only), so EN direct-read
-  addresses are literals by construction. A name whose addresses all drop
+  connection setup pays for it. The servers resolve the names in their own
+  address flags once at startup and register literals (`crates/server/CLAUDE.md`,
+  "Host names in server address flags"), so EN direct-read addresses are
+  literals by construction. A name whose addresses all drop
   SYNs costs one connect timeout per address before the walk fails. Test: `crates/manager/tests/client_host_name.rs` (a PS that
   advertises `localhost`, a client given `localhost:<port>`; red with
   parse-only).

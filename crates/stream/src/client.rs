@@ -6445,6 +6445,19 @@ impl StreamClient {
         Ok(None)
     }
 
+    /// The manager's region table (`MSG_GET_REGIONS`), through the same
+    /// rotation as every other manager call.
+    pub async fn get_regions(&self, timeout: Duration) -> Result<manager_rpc::GetRegionsResp> {
+        let resp_data = self
+            .manager_call(manager_rpc::MSG_GET_REGIONS, Bytes::new(), timeout)
+            .await
+            .map_err(|e| e.context("get_regions"))?;
+        let resp: manager_rpc::GetRegionsResp =
+            manager_rpc::rkyv_decode(&resp_data).map_err(|e| anyhow!("{e}"))?;
+        self.check_manager_resp(resp.code, &resp.message, "get_regions")?;
+        Ok(resp)
+    }
+
     pub async fn multi_modify_split(
         &self,
         mid_key: Vec<u8>,
