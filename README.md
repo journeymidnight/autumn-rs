@@ -74,9 +74,12 @@ Authz is on by default: `start` writes one credential per namespace under
 
 ## Use it
 
-**KV.** `autumn-client put|get|ls|put-stream` against a namespace; Rust via
-`autumn_client::ClusterClient` (`crates/client`); Python via
-`pip install autumn-rs` (`autumn.Client`, see [`python/README.md`](python/README.md)).
+### KV
+
+- CLI: `autumn-client put | get | ls | put-stream` against a namespace.
+- Rust: `autumn_client::ClusterClient` in `crates/client`.
+- Python: `pip install autumn-rs`, then `autumn.Client`; see
+  [`python/README.md`](python/README.md).
 
 ```bash
 AC="./target/release/autumn-client --manager 127.0.0.1:9001 --namespace kvc \
@@ -85,41 +88,54 @@ echo hello | $AC put mykey /dev/stdin
 $AC get mykey                                       # → hello
 ```
 
-**Files.** A POSIX mount for models, datasets and checkpoints; reads go through
-the kernel page cache and the daemon's own parallel readahead. The same tree is
-reachable without a mount from Python (`autumn.Fs.connect("127.0.0.1:9001")`)
-and from the shell (`autumnfs`).
+### Files
+
+- `autumn-fuse`: a POSIX mount for models, datasets and checkpoints.
+- Reads go through the kernel page cache and the daemon's own parallel
+  readahead.
+- The same tree without a mount: `autumn.Fs.connect("127.0.0.1:9001")` in
+  Python, `autumnfs` in the shell.
 
 ```bash
 cargo build --release -p autumn-fuse           # needs libfuse3-dev
 mkdir -p /mnt/autumn
-./target/release/autumn-fuse --manager 127.0.0.1:9001 --mountpoint /mnt/autumn --transport tcp \
-    --credential-file $HOME/.autumn-deploy/authz/fs.cred &
+./target/release/autumn-fuse --manager 127.0.0.1:9001 --mountpoint /mnt/autumn \
+    --transport tcp --credential-file $HOME/.autumn-deploy/authz/fs.cred &
 cp model.safetensors /mnt/autumn/              # a regular filesystem, backed by the cluster
 ```
 
-**S3: model weights and vector tables.** `autumn-s3` serves the file tree as an
-S3 endpoint (reads, writes, copy, delete, multipart, conditional writes); a
-bucket is a first-level directory, created beforehand. Point vLLM / SGLang's
-stock `--load-format runai_streamer` at it to stream weights with no engine
-patches, or run the stock LanceDB client against it.
+### S3: model weights and vector tables
+
+- `autumn-s3` serves the file tree as an S3 endpoint: reads, writes, copy,
+  delete, multipart, conditional writes.
+- A bucket is a first-level directory, created beforehand.
+- Model weights: point vLLM / SGLang's stock `--load-format runai_streamer` at
+  it, with no engine patches.
+- Vector tables: run the stock LanceDB client against it.
 
 ```bash
-./target/release/autumnfs --manager 127.0.0.1:9001 --credential-file $HOME/.autumn-deploy/authz/fs.cred mkdir /tables
-./target/release/autumn-s3 --manager 127.0.0.1:9001 --port 9100 --credential-file $HOME/.autumn-deploy/authz/fs.cred &
+FS="--manager 127.0.0.1:9001 --credential-file $HOME/.autumn-deploy/authz/fs.cred"
+./target/release/autumnfs $FS mkdir /tables
+./target/release/autumn-s3 $FS --port 9100 &
 cd examples/lancedb-s3 && uv sync
 uv run python workload.py http://127.0.0.1:9100 tables demo    # create, append, search, optimize, verify
 ```
 
-**Inference KV cache.** For LMCache (and vLLM through it), the autumn L2
-plugin lives in [LMCache/lmcache_l2_plugins](https://github.com/LMCache/lmcache_l2_plugins):
-`pip install "lmcache-l2-plugins[autumn] @ git+https://github.com/LMCache/lmcache_l2_plugins"`.
-For SGLang HiCache, install the
-[`autumn_kvcache`](https://github.com/journeymidnight/autumn_kvcache) adapter.
-Both are pure Python on the `autumn` package, no extra daemon.
-To serve pages from DRAM, start the partition server with
-`--mem-tier-bytes <N> --mem-tier-prefix kvc/`; a crash loses only what had not
-landed on disk yet, so keep it to data that can be recomputed.
+### Inference KV cache
+
+- LMCache (and vLLM through it): the autumn L2 plugin in
+  [LMCache/lmcache_l2_plugins](https://github.com/LMCache/lmcache_l2_plugins).
+
+  ```bash
+  pip install "lmcache-l2-plugins[autumn] @ git+https://github.com/LMCache/lmcache_l2_plugins"
+  ```
+
+- SGLang HiCache: the
+  [`autumn_kvcache`](https://github.com/journeymidnight/autumn_kvcache) adapter.
+- Both are pure Python on the `autumn` package, with no extra daemon.
+- To serve pages from DRAM, start the partition server with
+  `--mem-tier-bytes <N> --mem-tier-prefix kvc/`. A crash loses only what had
+  not landed on disk yet, so keep it to data that can be recomputed.
 
 ## License
 
