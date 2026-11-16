@@ -3,55 +3,53 @@
 **One storage engine for AI data — models, datasets, vector tables and
 inference KV cache on one data plane.**
 
-Running an AI platform usually means operating separate storage systems for
-models, datasets, vector tables and inference KV cache. autumn-rs puts one
-distributed data plane underneath their native interfaces. It is a Rust
-storage engine in the shape of the **Windows Azure Storage (WAS)** paper — a
-*stream layer* of replicated, append-only extents under an ordered-KV
-*partition layer* — and every AI-facing surface is a thin client on it:
+autumn-rs is a distributed storage engine in Rust: replicated, append-only
+extents under an ordered key-value store with partition split and merge, with
+a manager on etcd. Files, KV pairs and S3 objects all land in the same extents.
 
-```
-   Files & checkpoints       Vector tables          Inference KV cache
-   ┌────────────────┐   ┌──────────────────────┐   ┌──────────────────────┐
-   │  autumn-fuse   │   │ LanceDB over S3     │   │   autumn-kvcache     │
-   │  POSIX mount   │   │ stock client        │   │ sglang / vLLM        │
-   └───────┬────────┘   └──────────┬───────────┘   │ HiCache L3 backend   │
-           │                       │               └──────────┬───────────┘
-           │        ┌──────────────┘                          │
-           ▼        ▼                                         ▼
-   ┌──────────────────────────────────────────────────────────────────┐
-   │        partition layer  (ordered KV, LSM, split/merge)          │
-   │        stream layer     (replicated extents, EC, no local WAL)  │
-   └──────────────────────────────────────────────────────────────────┘
-        autumn-client CLI/SDK · autumn-manager (etcd-backed control plane)
-```
+<p align="center">
+  <img src="assets/architecture.svg" alt="autumn-rs architecture: a POSIX mount, an S3 endpoint and KV-cache adapters over one partition layer and one stream layer" width="860">
+</p>
 
-One replication story, one capacity pool, one ops surface: model files,
-LanceDB tables and KV-cache pages all land in the same replicated,
-erasure-coded, self-healing extents.
+- **One copy of the data, three ways in:** a POSIX mount (`autumn-fuse`, or
+  `autumn.Fs` in Python), a KV client (CLI, Rust, Python) and an S3 endpoint
+  (`autumn-s3`). An object written over S3 is a file to the mount.
+- **A KV-cache tier for inference engines:** an LMCache L2 plugin and the
+  `autumn_kvcache` adapters (SGLang HiCache L3, vLLM connector), so prefix caches
+  survive restarts and are shared across instances. An optional DRAM tier in
+  the partition server acknowledges pages from memory and writes to disk behind.
+- **Fast:** thread-per-core on io_uring, zero-copy RPC, optional UCX/RDMA.
+  8 MiB writes from a client on a second host: 1,821 MB/s over UCX vs 414 MB/s
+  over TCP; UCX 8 MiB reads reach ~87% of 100 GbE. 4 KiB KV on a Kubernetes
+  cluster (3 PS, 5 EN on local NVMe, TCP, 64 keys per request): ~162K writes/s
+  at p99 0.86 ms, ~507K reads/s at p99 0.38 ms.
+- **Durable without a local WAL:** the replicated extents are the journal.
+  Sealed extents are erasure-coded in the background; `autumn-op repair` and
+  `scrub` rebuild degraded or rotted copies.
+- **Elastic and operable:** partitions split and merge under an auto-policy
+  controller; a web dashboard, `autumn-op status` / `health` / `df`, Prometheus
+  `/metrics` on every server, opt-in authorization with Ed25519 capability
+  tokens.
 
 ## Try it with docker compose
 
 A one-host cluster from the published image, on a Docker host with a Linux
-kernel ≥ 5.15: etcd, a manager, three extent nodes,
-a partition server and the dashboard.
+kernel ≥ 5.15: etcd, a manager, three extent nodes, a partition server and the
+dashboard. Authz is off, there is one manager, and the nodes share one disk.
 
 ```bash
 docker compose -f deploy/compose/docker-compose.yml up -d
 docker compose -f deploy/compose/docker-compose.yml run --rm cli \
     sh -c 'echo hello > /tmp/v && autumn-client --manager manager:9001 --namespace kvc put greeting /tmp/v \
            && autumn-client --manager manager:9001 --namespace kvc get greeting'
-open http://127.0.0.1:8799                                        # the dashboard
+# the dashboard: http://127.0.0.1:8799
 docker compose -f deploy/compose/docker-compose.yml down -v       # stop and wipe
 ```
 
-The cluster takes a few seconds to bootstrap after `up -d` returns. Until it
-has, the `put` fails with `routing error: key is out of range`; run it again.
+The cluster takes a few seconds to bootstrap after `up -d` returns; until it
+has, the `put` fails with `routing error: key is out of range`. Run it again.
 
-It is for trying things out: authz is off, there is one manager, and the
-nodes share one disk.
-
-## Quick start
+## Run it from source
 
 Linux ≥ 5.15 (io_uring), Rust ≥ 1.95, `etcd` ≥ 3.5 in PATH; on x86_64 a CPU
 with SSE4.2. Without systemd (containers, non-root) the deployer runs plain
@@ -65,62 +63,46 @@ cd deploy/baremetal
 
 # Nothing is served until its namespace exists: enable what you use.
 AO="../../target/release/autumn-op --cluster-secret-file $HOME/.autumn-deploy/cluster.secret --manager 127.0.0.1:9001"
-$AO namespace-create --name fs --parts 6     # autumnfs / FUSE / fsspec, 6 partitions
-$AO namespace-create --name kvc --parts 16   # sglang / vLLM KV cache, 16 partitions
-
-AC="../../target/release/autumn-client --manager 127.0.0.1:9001 --namespace kvc \
-    --credential-file $HOME/.autumn-deploy/authz/kvc.cred"
-echo hello | $AC put mykey /dev/stdin
-$AC get mykey                                       # → hello
+$AO namespace-create --name fs --parts 6     # files: autumn-fuse / autumnfs / autumn.Fs / autumn-s3
+$AO namespace-create --name kvc --parts 16   # KV cache: sglang / vLLM adapters
 
 ./autumn-deploy -t topology-singlehost.conf destroy --wipe   # tear down
 ```
 
-## Using it
+Authz is on by default: `start` writes one credential per namespace under
+`$HOME/.autumn-deploy/authz/`, and the clients below pass it.
 
-**KV — CLI / SDK.** `autumn-client put|get|ls|put-stream` against a namespace;
-Rust `autumn-client::ClusterClient` (`crates/client`), Python via
-`pip install autumn-rs` (`import autumn`; one abi3 wheel for every CPython ≥ 3.11
-on Linux, source in [`python/`](python/README.md)). A failed write is either not applied or
-`OutcomeUnknown` (read the key to settle it:
-[write outcomes](docs/ops.md#write-outcomes-and-the-tail-seal-on-open)). CLI
-reference: [`docs/ops.md`](docs/ops.md).
+## Use it
 
-**Files — POSIX mount** (models, datasets, checkpoints).
+**KV.** `autumn-client put|get|ls|put-stream` against a namespace; Rust via
+`autumn_client::ClusterClient` (`crates/client`); Python via
+`pip install autumn-rs` (`autumn.Client`, see [`python/README.md`](python/README.md)).
+
+```bash
+AC="./target/release/autumn-client --manager 127.0.0.1:9001 --namespace kvc \
+    --credential-file $HOME/.autumn-deploy/authz/kvc.cred"
+echo hello | $AC put mykey /dev/stdin
+$AC get mykey                                       # → hello
+```
+
+**Files.** A POSIX mount for models, datasets and checkpoints; reads go through
+the kernel page cache and the daemon's own parallel readahead. The same tree is
+reachable without a mount from Python (`autumn.Fs.connect("127.0.0.1:9001")`)
+and from the shell (`autumnfs`).
 
 ```bash
 cargo build --release -p autumn-fuse           # needs libfuse3-dev
+mkdir -p /mnt/autumn
 ./target/release/autumn-fuse --manager 127.0.0.1:9001 --mountpoint /mnt/autumn --transport tcp \
-    --credential-file $HOME/.autumn-deploy/authz/fs.cred &     # authz is on by default
+    --credential-file $HOME/.autumn-deploy/authz/fs.cred &
 cp model.safetensors /mnt/autumn/              # a regular filesystem, backed by the cluster
 ```
 
-Reads go through the kernel page cache and a parallel readahead, so a single
-reader gets the mount's parallel bandwidth. Runbook (mount verification, stale
-mounts, readahead window, RDMA env, k8s pod sidecar):
-[Fuse daemon runbook](docs/ops.md#fuse-daemon-runbook).
-
-**Files — programmatic `autumn.Fs`.** The `autumn` Python extension reads and
-writes the same inode layout without a mount (`autumn.Fs.connect("127.0.0.1:9001")`);
-large files are chunked at 8 MiB with zero-copy reads. To serve a model that
-lives in autumn from vLLM / SGLang, run `autumn-s3` as a per-node sidecar and
-point the engine's stock `--load-format runai_streamer` at it — no engine
-patches ([S3 gateway](docs/ops.md#s3-gateway--reading-and-writing-autumn-over-s3)).
-
-**Inference KV cache — sglang / vLLM.** The
-[`autumn_kvcache`](https://github.com/journeymidnight/autumn_kvcache) adapters
-implement sglang's HiCache L3 storage backend and vLLM's `KVConnectorBase_V1`:
-the cluster is the shared L3 tier behind the GPU/CPU cache levels, so prefix
-caches survive restarts and are shared across instances. Pure Python, no extra
-daemon; this repository ships the client they are built on. With the partition
-server's [memory tier](docs/ops.md#memory-tier-for-kv-cache---mem-tier-bytes---mem-tier-prefix)
-(`--mem-tier-bytes`, `--mem-tier-prefix kvc/`) pages are acknowledged and served
-from PS DRAM and written to disk behind.
-
-**Vector tables — LanceDB over S3.** `autumn-s3` is a read/write S3 endpoint
-over the shared `fs/` tree (reads, conditional writes, copy, delete, multipart);
-the stock Python LanceDB client runs against it with no patched client and no
-Autumn-specific index. A bucket is a first-level directory, created beforehand.
+**S3: model weights and vector tables.** `autumn-s3` serves the file tree as an
+S3 endpoint (reads, writes, copy, delete, multipart, conditional writes); a
+bucket is a first-level directory, created beforehand. Point vLLM / SGLang's
+stock `--load-format runai_streamer` at it to stream weights with no engine
+patches, or run the stock LanceDB client against it.
 
 ```bash
 ./target/release/autumnfs --manager 127.0.0.1:9001 --credential-file $HOME/.autumn-deploy/authz/fs.cred mkdir /tables
@@ -129,83 +111,15 @@ cd examples/lancedb-s3 && uv sync
 uv run python workload.py http://127.0.0.1:9100 tables demo    # create, append, search, optimize, verify
 ```
 
-Details and the captured request contract: [`examples/lancedb-s3/README.md`](examples/lancedb-s3/README.md).
-
-## Numbers
-
-All measured, with setup and method in [`docs/perf_baseline.md`](docs/perf_baseline.md)
-and the `autumn_kvcache` README.
-
-| What | Result |
-|---|---|
-| 4 KiB KV, batched 64 keys/request, TCP, k8s cluster (3 PS, 5 EN on local NVMe) | write ~162K ops/s (p99 0.86 ms), read ~507K ops/s (p99 0.38 ms) |
-| 8 MiB writes from a client on a second host, UCX (RDMA) vs TCP | 1,821 vs 414 MB/s (4.4×); UCX 8 MiB reads 10.9 GB/s, ~87% of 100 GbE |
-| YCSB-equivalent, 1 KB records, zipfian, 3 PS / 5 EN | B (95/5) ~172K ops/s, read p99 10.1 ms; A (50/50) ~124K ops/s |
-| vLLM cross-instance prefix hit, 1.3k tokens | ~0.3 s load vs ~2 s recompute |
-| vLLM connector cost when nothing is reused (a 32B VLM, 1k tokens, one GPU) | TTFT +≈6 ms, TPOT ≈0 |
-| sglang + a 32B VLM with the PS memory tier | per-request p50 1344 → 980 ms |
-
-## What is underneath
-
-- **Fast by construction** — thread-per-core on io_uring (compio), rkyv zero-copy
-  RPC, group commit, adaptive batching; optional **RDMA (UCX)** transport with
-  zero-copy reads and writes.
-- **The log is the database** — no local WAL files; a min-replica commit protocol
-  makes the replicated extents the journal. Open extents are 3-way replicated,
-  sealed extents are **erasure-coded** in the background.
-- **Self-healing** — WAL bit-rot heals from clean replicas at partition open;
-  disk-full recovers in ~2 s; reads route around suspected nodes; partitions
-  fail over; `autumn-op repair` / `scrub` rebuild degraded or rotted copies.
-- **Elastic** — copy-on-write partition split/merge, with an **auto-policy
-  controller** (leader-fenced, config in etcd, default-off) acting on
-  split/merge/GC/compaction/EC/repair advice.
-- **Access control** — opt-in key-prefix authorization with short-TTL Ed25519
-  capability tokens, enforced at the KV layer.
-- **Operable** — a [web dashboard](crates/server/src/bin/autumn_dashboard/README.md)
-  (keyspace, partitions, servers, nodes and disks, policy, logs, metrics),
-  `autumn-op status` / `health` / `df` fleet views, Prometheus `/metrics` on
-  every server, speed limits changeable on the running cluster, rolling restart
-  with convergence gates.
-
-Architecture: each crate's `crates/*/CLAUDE.md`; subsystem
-designs in `docs/*_design.md`.
-
-## Scope
-
-- One site, one flat network: clients dial partition servers and extent nodes
-  directly (on k8s, run them in-cluster).
-- UCX needs an RDMA device and UCX ≥ 1.17 ("UCX library" in `docs/ops.md`).
-  The container image ships UCX 1.20.1; UCX on k8s is untested (`docs/ops.md`).
-- The memory tier acknowledges a write from DRAM and writes it to disk behind:
-  a PS crash loses what had not landed yet, at most `--mem-tier-bytes`. Use it
-  only for data that can be recomputed, which is what the KV-cache adapters
-  store there.
-- The dashboard has no caller authentication; keep it behind `kubectl
-  port-forward` or your own gateway.
-
-## Deployment
-
-| Path | Use it for | Docs |
-|---|---|---|
-| `deploy/compose/docker-compose.yml` | trying it on one host | [Try it with docker compose](#try-it-with-docker-compose) |
-| `deploy/baremetal/autumn-deploy` | physical servers, single- or multi-host (systemd; plain processes without it) | [`docs/ops.md`](docs/ops.md) "Deployment" → Bare metal |
-| `deploy/k8s/deploy.sh` | Kubernetes — one image, kustomize base, guarded bootstrap Job; local-disk ENs, network-volume etcd | [`docs/ops.md`](docs/ops.md) "Deployment" → Kubernetes |
-| `scripts/cluster.sh` | dev / chaos / perf **testing only** (raw process kill for fault injection) | [`docs/ops.md`](docs/ops.md) |
-
-Extent nodes write large appends with O_DIRECT by default (`--no-direct-io`
-turns it off; tmpfs before Linux 6.6 refuses it): "Direct I/O on the extent
-nodes" in `docs/ops.md`.
-
-## Documentation
-
-- [`docs/comparison.md`](docs/comparison.md) — how autumn-rs compares with Mooncake, InfiniStore and 3FS
-- [`CONTRIBUTING.md`](CONTRIBUTING.md) — building, testing and sending a change
-- [`docs/ops.md`](docs/ops.md) — operations and manual-verification manual
-  (deployment, fuse runbook, metrics, capacity, chaos suites, rolling restart, CLI reference)
-- [`docs/perf_baseline.md`](docs/perf_baseline.md) — performance baselines and how they were measured
-- `crates/*/CLAUDE.md` — architecture: stream-layer
-  commit protocol and fencing, LSM partition server, control plane, transports
-- `docs/*_design.md` — subsystem designs (e.g. [`docs/data_plane_authz_design.md`](docs/data_plane_authz_design.md))
+**Inference KV cache.** For LMCache (and vLLM through it), the autumn L2
+plugin lives in [LMCache/lmcache_l2_plugins](https://github.com/LMCache/lmcache_l2_plugins):
+`pip install "lmcache-l2-plugins[autumn] @ git+https://github.com/LMCache/lmcache_l2_plugins"`.
+For SGLang HiCache, install the
+[`autumn_kvcache`](https://github.com/journeymidnight/autumn_kvcache) adapter.
+Both are pure Python on the `autumn` package, no extra daemon.
+To serve pages from DRAM, start the partition server with
+`--mem-tier-bytes <N> --mem-tier-prefix kvc/`; a crash loses only what had not
+landed on disk yet, so keep it to data that can be recomputed.
 
 ## License
 
