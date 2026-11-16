@@ -244,13 +244,12 @@ pub(crate) const MAX_WRITE_BATCH_BYTES: usize =
 
 /// A batch launched while another is already in flight must carry at least
 /// this many ops. The EN serializes appends to one extent, so a second batch
-/// does not overlap the first — it adds a whole append of its own. Under the
-/// perf bench a partition serves two client connections × the PS
-/// per-connection admission of 4 = 8 ops; launching on the first
-/// connection's 4 split every burst into two 4-op appends (see
-/// `partition_loop` (B)). Measured with other workloads pinned away, 4K writes
-/// over 8 partitions: average batch 4.4 without the gate, 8.00 with it, +30%
-/// write throughput. An idle partition (nothing in flight) launches whatever
+/// does not overlap the first — it adds a whole append of its own. Launching
+/// on the first connection's burst split a two-connection burst into two
+/// appends (see `partition_loop` (B)). Measured with the per-connection
+/// admission at 4 and other workloads pinned away, 4K writes over 8
+/// partitions: average batch 4.4 without the gate, 8.00 with it, +30% write
+/// throughput. An idle partition (nothing in flight) launches whatever
 /// it holds at once — the gate only ever delays an op that would have queued
 /// behind the in-flight append on the EN anyway.
 pub(crate) const MIN_PIPELINED_BATCH: usize = 8;
@@ -282,8 +281,8 @@ pub(crate) const LAUNCH_COALESCE_WINDOW: Duration = Duration::from_micros(200);
 /// landed — the window holds a launch only while `pending` is below that
 /// target and the deadline has not passed. Completions inside one window add
 /// up; a launch closes it. A lone writer's refill launches the instant it
-/// arrives (target 1), one connection refilling its 4 admitted ops in one
-/// read launches at 4, and two desynchronized connections (4 held + 4
+/// arrives (target 1), one connection refilling N admitted ops in one read
+/// launches at N, and two desynchronized connections (4 held + 4
 /// answered) wait for the second refill and re-lock at 8. Counting frames,
 /// not ops, is what keeps a batch-put stream and a fence record honest: a
 /// 50-op batch frame answered is one slot, and its writer's next frame —
