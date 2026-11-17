@@ -103,7 +103,7 @@ version = "0.1.0"
 
 [[package]]
 name = "autumn-python"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "autumn-client",
  "autumn-fs",
