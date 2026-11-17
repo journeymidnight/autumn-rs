@@ -350,6 +350,15 @@ including none.
   checksum) is decoded without copying; chunk signatures and trailing
   checksums are not verified, like SigV4. `Content-MD5` is checked only when
   sent, so an ordinary PUT pays no single-core MD5 over its bytes.
+- **Symbolic links** (a HuggingFace cache made on a mount) are followed: GET and
+  HEAD read the file a key's link leads to, and a listing shows a link to a file
+  as an object with that file's size and ETag; a dangling or looping link, or one
+  to a directory, is not listed (a looping one is a 404, never a 500), so a page
+  can hold fewer than `max-keys` entries. A listing whose prefix passes through a
+  directory link lists the target's entries under the link's name, while the
+  parent's listing leaves the link out. PUT and DELETE of a link's key act on
+  the link, so an `If-Match` with the ETag a GET reported (the target's) fails
+  412. `crates/fs/CLAUDE.md`, "Symbolic links".
 - **Keys** map to paths: parent directories are created on write; a key
   ending in `/` is a directory (an empty PUT of it creates the directory);
   empty, `.` and `..` components are `InvalidArgument`. Deleting an object
@@ -460,10 +469,12 @@ autumnfs [--manager 127.0.0.1:9001] [--transport tcp|ucx] [--credential-file FIL
 | `stat <PATH>` | Show inode metadata (size, ino, type, parent) |
 | `mkdir <PATH>` | Create a directory (parents must exist) |
 | `touch <PATH>` | Create empty file (no-op if it exists) |
-| `cat <PATH>` | Read file to stdout |
+| `cat <PATH>` | Read file to stdout (follows symbolic links, as `get` does) |
 | `put <LOCAL> <REMOTE>` | Upload local file |
 | `get <REMOTE> <LOCAL>` | Download to local file (`-` = stdout) |
-| `rm <PATH>` | Remove a file or empty directory |
+| `rm <PATH>` | Remove a file, symbolic link or empty directory |
+| `ln -s <TARGET> <PATH>` | Create a symbolic link (target stored as given) |
+| `readlink <PATH>` | Print a link's target |
 
 - **Built on an `FsState`** since v4: `ensure_root` is the core's, so the CLI
   verifies the schema stamp (its own copy never did, and a v3 CLI misreads v4

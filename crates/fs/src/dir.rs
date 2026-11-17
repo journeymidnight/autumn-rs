@@ -8,7 +8,7 @@ use anyhow::{anyhow, Result};
 
 use crate::key;
 use crate::meta::*;
-use crate::schema::{self, DirentValue, InodeMeta, ReaddirEntry, DT_DIR, DT_REG, ROOT_INO};
+use crate::schema::{self, DirentValue, InodeMeta, ReaddirEntry, DT_DIR, DT_LNK, DT_REG, ROOT_INO};
 use crate::state::FsState;
 
 /// Look up a child entry WITHOUT touching the FUSE lookup refcount, returning
@@ -83,6 +83,73 @@ pub async fn resolve_typed(state: &mut FsState, path: &str) -> Result<Option<(u6
         (ino, file_type) = (dirent.child_inode, dirent.file_type);
     }
     Ok(Some((ino, file_type)))
+}
+
+/// Symbolic links followed in one resolution before it fails ELOOP (Linux's
+/// MAXSYMLINKS).
+pub const MAX_SYMLINK_HOPS: usize = 40;
+
+/// `resolve_typed`, following every symbolic link on the way, the last
+/// component's too. A relative target is taken from the link's directory;
+/// an absolute one from the root of this tree, the only root a front-end
+/// without the mount knows (a mount's own absolute targets name the host's
+/// paths and resolve here only if the tree happens to hold them). `..` goes
+/// to the parent of the directory reached so far; the root's is the root.
+/// `Ok(None)`: a component is missing or a non-directory is walked through.
+/// `follow_last = false` returns a link in the last component itself
+/// (`lstat`); links before it are still followed, and so is a last one
+/// written `link/` or `link/.`, as POSIX does.
+pub async fn resolve_follow(state: &mut FsState, path: &str, follow_last: bool) -> Result<Option<(u64, u8)>> {
+    let follow_last = follow_last || path.ends_with('/') || path.ends_with("/.");
+    let mut todo: std::collections::VecDeque<Vec<u8>> = components(path.as_bytes()).collect();
+    // The directories walked into, so `..` can go back.
+    let mut parents: Vec<u64> = Vec::new();
+    let (mut ino, mut file_type) = (ROOT_INO, DT_DIR);
+    let mut hops = 0;
+    while let Some(comp) = todo.pop_front() {
+        if file_type != DT_DIR {
+            return Ok(None);
+        }
+        if comp == b".." {
+            ino = parents.pop().unwrap_or(ROOT_INO);
+            continue;
+        }
+        let Some(v) = state.kv_get_opt(&key::dirent_key(ino, &comp)).await? else {
+            return Ok(None);
+        };
+        let dirent: DirentValue = schema::decode_dirent(&v).map_err(|e| anyhow!("{}", e))?;
+        // Once the path's own last component is popped, nothing a link
+        // expanded into is left, so it is the one `lstat` stops at.
+        if dirent.file_type == DT_LNK && (follow_last || !todo.is_empty()) {
+            hops += 1;
+            if hops > MAX_SYMLINK_HOPS {
+                return Err(anyhow!("ELOOP: more than {MAX_SYMLINK_HOPS} symbolic links"));
+            }
+            // A link removed since its name was read leads nowhere.
+            let Some(b) = state.kv_get_opt(&key::inode_key(dirent.child_inode)).await? else {
+                return Ok(None);
+            };
+            let m = schema::decode_inode_meta(&b).map_err(|e| anyhow!("inode {}: {e}", dirent.child_inode))?;
+            let target = m.symlink_target.ok_or_else(|| anyhow!("inode {} is not a symbolic link", dirent.child_inode))?;
+            if target.first() == Some(&b'/') {
+                (ino, parents) = (ROOT_INO, Vec::new());
+            }
+            for c in components(&target).rev() {
+                todo.push_front(c);
+            }
+            continue;
+        }
+        if dirent.file_type == DT_DIR {
+            parents.push(ino);
+        }
+        (ino, file_type) = (dirent.child_inode, dirent.file_type);
+    }
+    Ok(Some((ino, file_type)))
+}
+
+/// A path's components, without empty ones and `.`.
+fn components(path: &[u8]) -> impl DoubleEndedIterator<Item = Vec<u8>> + '_ {
+    path.split(|&b| b == b'/').filter(|c| !c.is_empty() && *c != b".").map(<[u8]>::to_vec)
 }
 
 /// Dirent-key page size for directory scans.
@@ -444,6 +511,36 @@ pub async fn create(
     Ok((ino, meta))
 }
 
+/// Longest symbolic link target (Linux's PATH_MAX, counting its NUL).
+pub const MAX_SYMLINK_TARGET: usize = 4095;
+
+/// Create a symbolic link `parent/name` → `target`. The target is stored as
+/// given, never checked or resolved. Like `create`, publishing the name is
+/// create-only.
+pub async fn symlink(state: &mut FsState, parent: u64, name: &OsStr, target: &[u8]) -> Result<(u64, InodeMeta)> {
+    if target.is_empty() {
+        return Err(anyhow!("ENOENT: empty symbolic link target"));
+    }
+    if target.len() > MAX_SYMLINK_TARGET || target.contains(&0) {
+        return Err(anyhow!("ENAMETOOLONG: symbolic link target"));
+    }
+    let meta = new_symlink_meta(target, unsafe { libc::getuid() }, unsafe { libc::getgid() });
+    let read = check_parent(state, parent).await?;
+    let ino = create_child(state, parent, name, meta.clone(), DT_LNK).await?;
+    touch_dir_mtime(state, parent, read).await;
+    *state.lookup_count.entry(ino).or_insert(0) += 1;
+    Ok((ino, meta))
+}
+
+/// A symbolic link's target. EINVAL for any other inode, as readlink(2).
+pub async fn readlink(state: &mut FsState, ino: u64) -> Result<Vec<u8>> {
+    let meta = get_inode(state, ino).await?;
+    match meta.symlink_target {
+        Some(t) if meta.mode & S_IFMT == S_IFLNK => Ok(t),
+        _ => Err(anyhow!("EINVAL: inode {ino} is not a symbolic link")),
+    }
+}
+
 /// Remove a directory (must be empty).
 pub async fn rmdir(state: &mut FsState, parent: u64, name: &OsStr) -> Result<()> {
     let dk = key::dirent_key(parent, name.as_encoded_bytes());
@@ -480,7 +577,7 @@ pub async fn rmdir(state: &mut FsState, parent: u64, name: &OsStr) -> Result<()>
     Ok(())
 }
 
-/// Unlink a regular file (drop one name; reap data when it becomes
+/// Unlink a file or symbolic link (drop one name; reap data when it becomes
 /// unreachable). Single source of the file-unlink KV steps — `dispatch.rs`
 /// Unlink calls this (M2), as does the PyO3 `autumn.Fs` binding.
 ///

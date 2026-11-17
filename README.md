@@ -93,6 +93,8 @@ $AC get mykey                                       # → hello
 - `autumn-fuse`: a POSIX mount for models, datasets and checkpoints.
 - Reads go through the kernel page cache and the daemon's own parallel
   readahead.
+- A HuggingFace cache works as is, symbolic links included:
+  `hf download <repo> --cache-dir /mnt/autumn/hf`.
 - The same tree without a mount: `autumn.Fs.connect("127.0.0.1:9001")` in
   Python, `autumnfs` in the shell.
 

@@ -4,6 +4,8 @@
 //! channel, and blocks waiting for the reply from the compio thread.
 
 use std::ffi::OsStr;
+use std::os::unix::ffi::OsStrExt;
+use std::path::Path;
 use std::time::Duration;
 
 use fuser::{
@@ -80,6 +82,12 @@ impl Filesystem for AutumnFs {
         }
         if let Err(nearest) = config.set_congestion_threshold(max_background() * 3 / 4) {
             tracing::warn!(nearest, "kernel refused congestion_threshold");
+        }
+        // A link's target never changes, so the kernel may keep READLINK
+        // answers in its page cache instead of asking on every path walk
+        // through the link (a HuggingFace snapshot opens each file that way).
+        if let Err(e) = config.add_capabilities(fuser::consts::FUSE_CACHE_SYMLINKS) {
+            tracing::warn!(unsupported = e, "kernel refused FUSE_CACHE_SYMLINKS");
         }
         match self.send(|reply| FsRequest::Init { reply }) {
             Ok(()) => Ok(()),
@@ -244,6 +252,25 @@ impl Filesystem for AutumnFs {
             reply: r,
         }) {
             Ok(attr) => reply.entry(&ttl(), &attr, 0),
+            Err(e) => reply.error(err_to_errno(&e)),
+        }
+    }
+
+    fn symlink(&mut self, _req: &Request<'_>, parent: u64, link_name: &OsStr, target: &Path, reply: ReplyEntry) {
+        match self.send(|r| FsRequest::Symlink {
+            parent,
+            name: link_name.to_owned(),
+            target: target.as_os_str().as_bytes().to_vec(),
+            reply: r,
+        }) {
+            Ok(attr) => reply.entry(&ttl(), &attr, 0),
+            Err(e) => reply.error(err_to_errno(&e)),
+        }
+    }
+
+    fn readlink(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyData) {
+        match self.send(|r| FsRequest::Readlink { ino, reply: r }) {
+            Ok(target) => reply.data(&target),
             Err(e) => reply.error(err_to_errno(&e)),
         }
     }
@@ -479,6 +506,12 @@ fn err_to_errno(e: &anyhow::Error) -> i32 {
         libc::ENOTEMPTY
     } else if msg.contains("EISDIR") {
         libc::EISDIR
+    } else if msg.contains("EINVAL") {
+        libc::EINVAL
+    } else if msg.contains("ENAMETOOLONG") {
+        libc::ENAMETOOLONG
+    } else if msg.contains("ELOOP") {
+        libc::ELOOP
     } else if msg.contains("EBUSY") {
         // A writer-lease conflict surfaces as EBUSY so apps can
         // distinguish "another client holds the file" from real I/O failure.

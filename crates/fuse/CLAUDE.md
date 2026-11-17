@@ -141,6 +141,12 @@ p=1 在 700~940 之间来回，跨配置看不出趋势（是噪声，不是回�
 守卫在 `scripts/fuse_chaos.sh` 的 T3。（`RENAME_NOREPLACE` 到不了我们这儿，VFS 先返回
 EEXIST，但同样被拒。）
 
+**`FUSE_CACHE_SYMLINKS`**：`symlink` / `readlink` 实现在 `ops.rs`，核心在 `autumn_fs::dir`
+（见 fs CLAUDE.md「Symbolic links」）。链接的目标建好后不变，所以 INIT 协商了这个能力，内核把
+READLINK 的答案留在页缓存里，不必每次走过链接都问一次（HuggingFace 快照里每个文件的 open
+都要走过一个链接）。内核不给就只打 WARN，照常工作。测试 `crates/manager/tests/fuse_symlink.rs`
+（真实挂载：HF 缓存形状、`cp -a`、悬空链接、指向目录的链接，以及 `autumn-s3` 读同一棵树）。
+
 ### 页缓存：所有读都走内核页缓存，Open 决定是否跨 open 保留（`open_keeps_page_cache`）
 
 Open 不再回 `FOPEN_DIRECT_IO`。以前回它是为了"测出来的数字不被页缓存命中虚高"——那是测试

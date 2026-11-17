@@ -6,7 +6,7 @@
 #      loopback, no etcd) from this tree's debug binaries,
 #   3. drive the Fs surface from Python — create/write/flush/read byte-exact
 #      (inline + multi-extent + ranged), readdir/lookup/resolve, mkdir/rename/
-#      unlink/truncate, a lease acquire→heartbeat→release smoke, and a
+#      unlink/truncate, symlink/readlink, a lease acquire→heartbeat→release smoke, and a
 #      CROSS-INSTANCE read (write via one Fs, read byte-exact via a second),
 #   4. tear everything down.
 # Does NOT touch any system venv or any other cluster.
@@ -109,6 +109,22 @@ assert fs.read(ino, 0, len(small)) == small
 fs.truncate(f2, 100)
 assert fs.getattr(f2)["size"] == 100
 assert fs.read(f2, 0, 4096) == big[:100]
+
+# ── symbolic links: resolve follows (os.stat), follow_symlinks=False stops ──
+ln = fs.symlink(d, "link", "renamed.txt")
+assert fs.readlink(ln) == "renamed.txt"
+assert fs.getattr(ln)["type"] == "link"
+assert fs.resolve("/sub/link") == ino
+assert fs.resolve("/sub/link", follow_symlinks=False) == ln
+assert fs.resolve("/sub/../sub/link") == ino
+assert ("link", ln, 10) in fs.readdir(d)
+try:
+    fs.readlink(ino)
+    raise AssertionError("readlink of a file must raise")
+except RuntimeError:
+    pass
+fs.unlink(d, "link")
+assert fs.resolve("/sub/link") is None and fs.resolve("/sub/renamed.txt") == ino
 
 # ── unlink ───────────────────────────────────────────────────────────────
 fs.unlink(d, "renamed.txt")

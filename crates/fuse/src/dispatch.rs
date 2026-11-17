@@ -643,6 +643,15 @@ pub async fn handle_request(
                 .map(|meta| inode_to_attr(ino, &meta));
             let _ = reply.send(result);
         }
+        FsRequest::Symlink { parent, name, target, reply } => {
+            let result = dir::symlink(state, parent, &name, &target)
+                .await
+                .map(|(ino, meta)| inode_to_attr(ino, &meta));
+            let _ = reply.send(result);
+        }
+        FsRequest::Readlink { ino, reply } => {
+            let _ = reply.send(dir::readlink(state, ino).await);
+        }
         FsRequest::Unlink {
             parent,
             name,

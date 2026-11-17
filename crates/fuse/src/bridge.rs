@@ -94,6 +94,16 @@ pub enum FsRequest {
         name: OsString,
         reply: Reply<fuser::FileAttr>,
     },
+    Symlink {
+        parent: u64,
+        name: OsString,
+        target: Vec<u8>,
+        reply: Reply<fuser::FileAttr>,
+    },
+    Readlink {
+        ino: u64,
+        reply: Reply<Vec<u8>>,
+    },
     Open {
         ino: u64,
         flags: i32,

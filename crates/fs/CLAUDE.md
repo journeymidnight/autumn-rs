@@ -27,7 +27,7 @@ yet had to depend on a crate called fuse and turn off its default features.
 | `schema.rs` | InodeMeta / DirentValue / StripeLayout / ReaddirEntry / WriteBuffer + constants |
 | `geom.rs` | declared stripe geometry read/write (`[0x04]stripe_geom`) |
 | `meta.rs` | inode metadata get/put, `alloc_inode` (numbers from the manager), `ensure_root`/`ensure_schema_version`, S_IF* mode constants |
-| `dir.rs` | lookup/readdir/mkdir/rmdir/rename/create/unlink/resolve — returns `(ino, InodeMeta)` / DT_* entries |
+| `dir.rs` | lookup/readdir/mkdir/rmdir/rename/create/unlink/symlink/readlink/resolve/resolve_follow — returns `(ino, InodeMeta)` / DT_* entries |
 | `extent.rs` | variable-length extent addressing/write/RMW/truncate/delete/`clean_beyond_eof`/`remove_unreachable_inode` |
 | `read.rs` / `write.rs` | chunked read assembly / write buffer + flush |
 | `segment.rs` | segmented files: map splice/clip/read planning (pure functions), data object and map page read/write, `reclaim` |
@@ -879,3 +879,71 @@ inode reference counts and directory entries are separate KV writes, and mutatio
 serialization is per mount. A crash after the count update can leak a reference.
 It is suitable for the one-mount Lance demo; it does not establish crash-atomic
 or multi-mount namespace transactions.
+
+## Symbolic links
+
+Added for the HuggingFace cache: `hf download` makes `snapshots/<rev>/<file>` a
+relative link to `../../blobs/<hash>`. On a mount without links it falls back to
+copies (a warning, and revisions no longer share blobs), and `cp -a` of an
+existing cache fails outright.
+
+- **Storage**: a link is an `S_IFLNK|0777` inode with the target stored verbatim
+  in `InodeMeta.symlink_target` (the field existed but was never written), `size`
+  = the target's length (what `lstat` reports), dirent `DT_LNK`, no data
+  extents. `dir::symlink` goes through `create_child`, create-only like `create`;
+  the target is neither checked nor resolved. An empty target is ENOENT; over
+  4095 bytes or containing NUL is ENAMETOOLONG. `dir::readlink` of anything else
+  is EINVAL.
+- **Remove and rename need no new code**: `unlink` and rename-over go by nlink
+  through `change_links` → `remove_unreachable_inode`; a link has no extents, so
+  reclaim deletes only the inode. A hard link to a link is still EPERM
+  (`dir::link` takes regular files only); HF does not need one.
+- **Path resolution**: on a mount the kernel resolves links; front-ends without
+  one use `dir::resolve_follow(path, follow_last)`.
+  - A relative target starts from the link's directory. `..` goes back to the
+    directory actually walked before (not textually); the root's `..` is the root.
+  - An absolute target starts from **this tree's root**, the only root a
+    front-end without the mount knows. Absolute links made on a mount name host
+    paths and usually resolve to nothing here.
+  - Over 40 hops (Linux MAXSYMLINKS) is ELOOP.
+  - `follow_last = false` is `lstat`: a link in the last component is returned
+    itself; links before it are followed, and so is a last one written `link/`
+    or `link/.`, as POSIX does. The last component is the one popped when the
+    queue becomes empty: a link's expansion always goes to the front of the
+    queue, so nothing it expanded into can be popped last.
+  - A link whose inode is gone (removed after its name was read) resolves to
+    nothing, not an error.
+  - `resolve` / `resolve_typed` do not follow. The write paths (S3 directory
+    creation, publish) keep using them: a link is not a directory, and writing
+    under one is refused.
+- **Per front-end**:
+  - `autumn-s3`: GET / HEAD read the file a key's link leads to. A listing yields
+    `DT_LNK` entries as objects and `list_objects` resolves each (a few KV reads
+    per link, sequential): a link to a file is listed with **the target's** size
+    and ETag; a dangling or looping link, or one to a directory, is left out.
+    A looping link is a 404 like a dangling one, never a 500 (the gateway maps
+    ELOOP to no object). A page can therefore hold fewer than `max-keys` entries
+    and still carry a continuation token, which S3 allows. The recursive walk
+    never descends into a directory link, but a prefix that passes through one
+    is resolved like a GET, so `prefix=dirlink/` lists the target's entries under
+    `dirlink/` while the parent's listing leaves `dirlink` out. PUT / DELETE of a
+    link's key act on the link itself, as `rm` does; an `If-Match` with the ETag a
+    GET reported (the target's) therefore fails 412 (`hold_for_swap` compares the
+    dirent's inode).
+  - Python `autumn.Fs`: `symlink(parent, name, target)`, `readlink(ino)`;
+    `resolve(path)` follows (`os.stat`), `follow_symlinks=False` is `os.lstat`.
+    The data calls (`read`, `write`, `truncate`) take an inode and do not check
+    its type, as for a directory inode.
+  - `autumnfs`: `ln -s TARGET PATH`, `readlink PATH` (links before the last
+    component followed); `cat` / `get` follow; `ls` / `stat` / `rm` act on the
+    link itself and do not follow links earlier in the path.
+- **Tests**: `crates/manager/tests/system_fs_symlink.rs` (core: `..`, directory
+  links, a link in the middle of a path, trailing `/`, absolute, dangling,
+  vanished inode, ELOOP, EINVAL, EEXIST, unlink and rename-over reclaiming the
+  link inode) and `crates/manager/tests/fuse_symlink.rs` (real mount +
+  `autumn-s3`: the HF layout, `cp -a`, ELOOP on the mount, a looping link as an
+  S3 404). Ablations, each red: `..` not going back, `follow_last` ignored, a
+  trailing `/` not followed, a vanished link inode an error, S3 not following,
+  the listing skipping links, ELOOP a 500, FUSE not answering readlink. By hand:
+  `hf download` onto the mount prints no link warning, leaves 10 links, and
+  `diff -r` matches the same download on a local disk.

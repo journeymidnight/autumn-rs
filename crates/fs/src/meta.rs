@@ -66,6 +66,16 @@ pub fn new_file_meta(mode: u32, uid: u32, gid: u32) -> InodeMeta {
     }
 }
 
+/// Create a new symbolic link inode. Its size is the target's length, as
+/// `lstat` reports it.
+pub fn new_symlink_meta(target: &[u8], uid: u32, gid: u32) -> InodeMeta {
+    let mut m = new_file_meta(0, uid, gid);
+    m.mode = S_IFLNK | 0o777;
+    m.size = target.len() as u64;
+    m.symlink_target = Some(target.to_vec());
+    m
+}
+
 /// Create a new directory inode.
 pub fn new_dir_meta(mode: u32, uid: u32, gid: u32) -> InodeMeta {
     let (secs, nsecs) = now_ts();

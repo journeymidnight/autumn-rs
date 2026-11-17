@@ -58,6 +58,10 @@ fn is_dir(m: &InodeMeta) -> bool {
     m.mode & 0o170_000 == 0o040_000
 }
 
+fn is_symlink(m: &InodeMeta) -> bool {
+    m.mode & autumn_fs::meta::S_IFMT == autumn_fs::meta::S_IFLNK
+}
+
 fn stat_of(ino: u64, m: &InodeMeta) -> Stat {
     Stat { ino, size: m.size, mtime_secs: m.mtime_secs, etag: etag(ino, m.generation) }
 }
@@ -77,10 +81,25 @@ pub async fn bucket_dir(st: &mut FsState, bucket: &str) -> Result<Option<u64>> {
     Ok(dir::resolve_typed(st, &format!("/{bucket}")).await?.filter(|&(_, t)| t == DT_DIR).map(|(ino, _)| ino))
 }
 
-/// Resolve an absolute autumn path to its inode, or `None` if absent.
+/// Resolve an absolute autumn path to its inode, following symbolic links,
+/// or `None` if absent.
 async fn resolve(fs: &Fs, path: &str) -> Result<Option<u64>> {
     let mut st = fs.lock().await;
-    dir::resolve(&mut st, path).await
+    follow(&mut st, path).await
+}
+
+/// The inode a path leads to, through any symbolic links (a HuggingFace
+/// snapshot's files are links into its `blobs/`), and its type. A link that
+/// loops leads nowhere, like a dangling one: no object, not a failed request.
+async fn follow_typed(st: &mut FsState, path: &str) -> Result<Option<(u64, u8)>> {
+    match dir::resolve_follow(st, path, true).await {
+        Err(e) if e.to_string().starts_with("ELOOP") => Ok(None),
+        r => r,
+    }
+}
+
+async fn follow(st: &mut FsState, path: &str) -> Result<Option<u64>> {
+    Ok(follow_typed(st, path).await?.map(|(ino, _)| ino))
 }
 
 /// The `fs/` root's subdirectories, which are this gateway's buckets.
@@ -110,7 +129,7 @@ pub async fn bucket_exists(fs: &Fs, bucket: &str) -> Result<bool> {
 /// which is not an object).
 pub async fn stat(fs: &Fs, bucket: &str, key: &str) -> Result<Option<Stat>> {
     let mut st = fs.lock().await;
-    let Some(ino) = dir::resolve(&mut st, &format!("/{bucket}/{key}")).await? else {
+    let Some(ino) = follow(&mut st, &format!("/{bucket}/{key}")).await? else {
         return Ok(None);
     };
     Ok(inode_meta(&mut st, ino).await?.filter(|m| !is_dir(m)).map(|m| stat_of(ino, &m)))
@@ -259,7 +278,7 @@ pub async fn open_pinned(fs: &Fs, bucket: &str, key: &str) -> Result<Option<Open
     // reclaimed in that gap is simply gone: look again.
     for _ in 0..3 {
         let mut st = fs.lock().await;
-        let Some(ino) = dir::resolve(&mut st, &path).await? else {
+        let Some(ino) = follow(&mut st, &path).await? else {
             return Ok(None);
         };
         pin_locked(&mut st, ino).await?;
@@ -354,7 +373,18 @@ pub async fn list_objects(
                 let Some(bytes) = m.map_err(|e| anyhow!("KV get inode {ino}: {e}"))? else {
                     continue;
                 };
-                let m = schema::decode_inode_meta(&bytes).map_err(|e| anyhow!("inode {ino}: {e}"))?;
+                let mut m = schema::decode_inode_meta(&bytes).map_err(|e| anyhow!("inode {ino}: {e}"))?;
+                let mut ino = ino;
+                if is_symlink(&m) {
+                    // Listed as the file it leads to, as a GET of the key
+                    // reads it; a link to a directory or to nothing is no
+                    // object.
+                    let mut st = fs.lock().await;
+                    let target = follow_typed(&mut st, &format!("/{bucket}/{key}")).await?;
+                    let Some((t, schema::DT_REG)) = target else { continue };
+                    let Some(tm) = inode_meta(&mut st, t).await? else { continue };
+                    (ino, m) = (t, tm);
+                }
                 rows.push(ObjectRow { key, size: m.size, mtime_secs: m.mtime_secs, etag: etag(ino, m.generation) });
             }
         }

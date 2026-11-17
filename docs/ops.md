@@ -1733,6 +1733,27 @@ name fail and change nothing, as do `mkdir` and `touch` under a file (ENOTDIR)
 On a mount: `mkdir -p d/x s; mv -T s d` → `Directory not empty`, and `ls d/x`
 still works.
 
+**Symbolic links (HuggingFace caches).** A mount takes `ln -s`, `readlink`, and
+`cp -a` of a tree with links; `hf download --cache-dir "$MP/hf" <repo>` prints no
+"symlinks not supported" warning and leaves `snapshots/<rev>/*` as links into
+`blobs/`. Check by hand:
+
+```bash
+hf download hf-internal-testing/tiny-random-gpt2 --cache-dir "$MP/hf"
+hf download hf-internal-testing/tiny-random-gpt2 --cache-dir /tmp/hf-local
+find "$MP/hf" -type l | wc -l          # 10 links
+diff -r "$MP/hf" /tmp/hf-local && echo identical
+```
+
+Without the mount, `autumnfs ln -s TARGET PATH` / `readlink PATH` make and read
+links, `autumnfs cat|get` follow them, and `autumn-s3` serves a snapshot's files
+as the blobs they point at (GET, HEAD, listing). A relative target resolves from
+the link's directory; an absolute one from the root of the `fs/` tree, so a link
+a mount made to a host path (`/mnt/autumn/...`) resolves only on the mount.
+Automated: `cargo test -p autumn-manager --test system_fs_symlink` and
+`cargo build --workspace --bins && cargo test -p autumn-manager --features
+fuse-tests --test fuse_symlink` (needs `/dev/fuse`).
+
 `autumn.Fs` is a PyO3 binding over the **same** `autumn-fs` crate the
 `autumn-fuse` mount runs on (inode/dirent/extent layout) — it's the programmatic
 file surface (the `autumn-s3` gateway reads model weights through it). Headless

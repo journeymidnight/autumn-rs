@@ -23,7 +23,7 @@ use std::collections::{BinaryHeap, VecDeque};
 
 use anyhow::Result;
 use autumn_fs::dir::DirChild;
-use autumn_fs::schema::{DT_DIR, DT_REG};
+use autumn_fs::schema::{DT_DIR, DT_LNK, DT_REG};
 
 /// Where the walk reads directories from.
 pub trait DirSource {
@@ -164,7 +164,9 @@ impl Cursor {
                 // start (names hold no `/`, so none equals `first/`), so the
                 // scan never yields one of them a second time.
                 self.pending.push(Reverse((sort_key, c.ino)));
-            } else if c.kind == DT_REG {
+            } else if c.kind == DT_REG || c.kind == DT_LNK {
+                // A link is listed as an object; the caller drops it unless
+                // it leads to a file.
                 return Ok(Some((sort_key, false, c.ino)));
             }
         }

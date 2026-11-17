@@ -65,8 +65,12 @@ commands:
   cat <PATH>               print a file to stdout
   put <LOCAL> <REMOTE>     upload a local file
   get <REMOTE> <LOCAL>     download a file (LOCAL `-` = stdout)
-  rm <PATH>                remove a file or empty directory
-  touch <PATH>             create an empty file";
+  rm <PATH>                remove a file, link or empty directory
+  touch <PATH>             create an empty file
+  ln -s <TARGET> <PATH>    create a symbolic link PATH -> TARGET
+  readlink <PATH>          print a symbolic link's target
+
+cat and get follow symbolic links; ls, stat and rm act on the link itself.";
 
 /// Global flags land in the parameter structs; the words from the command on
 /// are the command.
@@ -93,6 +97,8 @@ enum Cmd {
     Get { remote: String, local: PathBuf },
     Rm { path: String },
     Touch { path: String },
+    Symlink { target: String, path: String },
+    Readlink { path: String },
 }
 
 impl Cmd {
@@ -122,6 +128,11 @@ impl Cmd {
             "cat" => Cmd::Cat { path: one(&rest)? },
             "rm" => Cmd::Rm { path: one(&rest)? },
             "touch" => Cmd::Touch { path: one(&rest)? },
+            "readlink" => Cmd::Readlink { path: one(&rest)? },
+            "ln" => match rest[..] {
+                ["-s", t, p] => Cmd::Symlink { target: t.to_string(), path: p.to_string() },
+                _ => return Err("ln takes -s <TARGET> <PATH> (hard links are not supported)".into()),
+            },
             "put" => match rest[..] {
                 [l, r] => Cmd::Put { local: l.into(), remote: r.to_string() },
                 _ => return Err("put takes <LOCAL> <REMOTE>".into()),
@@ -195,15 +206,17 @@ fn main() -> Result<()> {
             Cmd::Ls { path, long } => cmd_ls(&cluster, &path, long).await,
             Cmd::Stat { path } => cmd_stat(&cluster, &path).await,
             Cmd::Mkdir { path } => cmd_mkdir(&mut state, &path).await,
-            Cmd::Cat { path } => cmd_cat(&cluster, &path, p.direct_read.get()).await,
+            Cmd::Cat { path } => cmd_cat(&mut state, &path, p.direct_read.get()).await,
             Cmd::Put { local, remote } => {
                 cmd_put(&cluster, &local, &remote).await
             }
             Cmd::Get { remote, local } => {
-                cmd_get(&cluster, &remote, &local, p.direct_read.get()).await
+                cmd_get(&mut state, &remote, &local, p.direct_read.get()).await
             }
             Cmd::Rm { path } => cmd_rm(&mut state, &path).await,
             Cmd::Touch { path } => cmd_touch(&mut state, &path).await,
+            Cmd::Symlink { target, path } => cmd_symlink(&mut state, &target, &path).await,
+            Cmd::Readlink { path } => cmd_readlink(&mut state, &path).await,
         }
     })
 }
@@ -449,6 +462,8 @@ async fn cmd_stat(cluster: &ClusterClient, path: &str) -> Result<()> {
         "directory"
     } else if is_reg(&m) {
         "regular file"
+    } else if m.mode & (libc::S_IFMT as u32) == (libc::S_IFLNK as u32) {
+        "symbolic link"
     } else {
         "other"
     };
@@ -468,6 +483,9 @@ async fn cmd_stat(cluster: &ClusterClient, path: &str) -> Result<()> {
     );
     if !name.is_empty() {
         println!("  Name-in-parent: {}", String::from_utf8_lossy(&name));
+    }
+    if let Some(ref target) = m.symlink_target {
+        println!("  Target: {}", String::from_utf8_lossy(target));
     }
     if let Some(ref inline) = m.inline_data {
         println!("  inline_data: {} bytes (≤ {})", inline.len(), INLINE_THRESHOLD);
@@ -725,20 +743,29 @@ async fn read_segmented_to_writer(
     Ok(())
 }
 
-async fn cmd_cat(cluster: &ClusterClient, path: &str, direct_read: bool) -> Result<()> {
-    let (ino, _, _, meta) = resolve(cluster, path).await?;
+/// The file a path leads to, through any symbolic links.
+async fn resolve_file(state: &mut FsState, path: &str) -> Result<(u64, InodeMeta)> {
+    let (ino, _) = dir::resolve_follow(state, path, true).await?.ok_or_else(|| anyhow!("ENOENT: {path}"))?;
+    Ok((ino, meta::fetch_inode(state, ino).await?))
+}
+
+async fn cmd_cat(state: &mut FsState, path: &str, direct_read: bool) -> Result<()> {
+    let (ino, meta) = resolve_file(state, path).await?;
+    let cluster = state.client.clone();
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
-    read_file_to_writer(cluster, ino, &meta, &mut out, direct_read).await
+    read_file_to_writer(&cluster, ino, &meta, &mut out, direct_read).await
 }
 
 async fn cmd_get(
-    cluster: &ClusterClient,
+    state: &mut FsState,
     remote: &str,
     local: &PathBuf,
     direct_read: bool,
 ) -> Result<()> {
-    let (ino, _, _, meta) = resolve(cluster, remote).await?;
+    let (ino, meta) = resolve_file(state, remote).await?;
+    let client = state.client.clone();
+    let cluster = &*client;
     if local.as_os_str() == "-" {
         let stdout = std::io::stdout();
         let mut out = stdout.lock();
@@ -1023,11 +1050,24 @@ async fn cmd_rm(state: &mut FsState, path: &str) -> Result<()> {
         .ok_or_else(|| anyhow!("ENOENT: {path}"))?;
     if is_dir(&m) {
         dir::rmdir(state, parent, name).await
-    } else if is_reg(&m) {
-        dir::unlink(state, parent, name).await
     } else {
-        bail!("unsupported file type")
+        dir::unlink(state, parent, name).await
     }
+}
+
+// ─── ln -s / readlink ───────────────────────────────────────────────────────
+
+async fn cmd_symlink(state: &mut FsState, target: &str, path: &str) -> Result<()> {
+    let (parent, name) = resolve_parent_name(state, path).await?;
+    dir::symlink(state, parent, std::ffi::OsStr::from_bytes(&name), target.as_bytes()).await?;
+    Ok(())
+}
+
+async fn cmd_readlink(state: &mut FsState, path: &str) -> Result<()> {
+    let (ino, _) = dir::resolve_follow(state, path, false).await?.ok_or_else(|| anyhow!("ENOENT: {path}"))?;
+    let target = dir::readlink(state, ino).await?;
+    println!("{}", String::from_utf8_lossy(&target));
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1043,7 +1083,9 @@ mod tests {
         assert_eq!(p("ls /d --long"), Ok(Cmd::Ls { path: "/d".into(), long: true }));
         assert_eq!(p("put a /b"), Ok(Cmd::Put { local: "a".into(), remote: "/b".into() }));
         assert_eq!(p("get /b -"), Ok(Cmd::Get { remote: "/b".into(), local: "-".into() }));
-        for bad in ["", "stat", "stat a b", "ls a b", "put a", "frob x"] {
+        assert_eq!(p("ln -s ../b /a"), Ok(Cmd::Symlink { target: "../b".into(), path: "/a".into() }));
+        assert_eq!(p("readlink /a"), Ok(Cmd::Readlink { path: "/a".into() }));
+        for bad in ["", "stat", "stat a b", "ls a b", "put a", "frob x", "ln a b", "ln -s a"] {
             assert!(p(bad).is_err(), "{bad:?} accepted");
         }
     }

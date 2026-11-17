@@ -232,10 +232,16 @@ impl Fs {
     // ── path resolution + metadata ──────────────────────────────────────────
 
     /// Resolve an absolute path to its inode number, or `None` if absent.
-    fn resolve(&self, py: Python<'_>, path: String) -> PyResult<PyObject> {
+    /// Symbolic links are followed, the last component's too, as `os.stat`
+    /// does; `follow_symlinks=False` returns a last-component link itself
+    /// (`os.lstat`). A relative link target is taken from the link's
+    /// directory, an absolute one from the root of this tree.
+    #[pyo3(signature = (path, follow_symlinks=true))]
+    fn resolve(&self, py: Python<'_>, path: String, follow_symlinks: bool) -> PyResult<PyObject> {
         let r: Option<u64> = fs_blocking!(self, py, Option<u64>, |st| {
-            autumn_fs::dir::resolve(st, &path)
+            autumn_fs::dir::resolve_follow(st, &path, follow_symlinks)
                 .await
+                .map(|o| o.map(|(ino, _)| ino))
                 .map_err(|e| e.to_string())
         })?;
         Ok(match r {
@@ -360,7 +366,27 @@ impl Fs {
         })
     }
 
-    /// Unlink a regular file `name` under `parent`.
+    /// Create a symbolic link `name` under `parent` pointing at `target`
+    /// (stored as given, not checked); returns the new inode.
+    fn symlink(&self, py: Python<'_>, parent: u64, name: String, target: String) -> PyResult<u64> {
+        fs_blocking!(self, py, u64, |st| {
+            let osname = std::ffi::OsStr::new(&name);
+            autumn_fs::dir::symlink(st, parent, osname, target.as_bytes())
+                .await
+                .map(|(ino, _)| ino)
+                .map_err(|e| e.to_string())
+        })
+    }
+
+    /// A symbolic link's target. Raises for any other inode.
+    fn readlink(&self, py: Python<'_>, ino: u64) -> PyResult<String> {
+        let target: Vec<u8> = fs_blocking!(self, py, Vec<u8>, |st| {
+            autumn_fs::dir::readlink(st, ino).await.map_err(|e| e.to_string())
+        })?;
+        String::from_utf8(target).map_err(|e| PyRuntimeError::new_err(format!("link target is not UTF-8: {e}")))
+    }
+
+    /// Unlink a file or symbolic link `name` under `parent`.
     fn unlink(&self, py: Python<'_>, parent: u64, name: String) -> PyResult<()> {
         fs_blocking!(self, py, (), |st| {
             let osname = std::ffi::OsStr::new(&name);
