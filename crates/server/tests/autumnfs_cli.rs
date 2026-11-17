@@ -293,4 +293,36 @@ fn autumnfs_refuses_an_existing_name() {
     assert!(ok(&["stat", "/d/g"]).contains("nlink=1"));
     ok(&["rm", "/d/f"]);
     assert_eq!(names(ok(&["ls", "/d"])), ["g"]);
+
+    // A link to a directory: every command walks through it, and only
+    // `ls -l` / `stat` / `readlink` stop at a link named last.
+    ok(&["ln", "-s", "d", "/l"]);
+    assert_eq!(names(ok(&["ls", "/l"])), ["g"]);
+    assert!(ok(&["ls", "-l", "/l"]).starts_with('l'));
+    assert!(ok(&["ls", "-l", "/l/"]).trim_end().ends_with(" g"));
+    assert!(ok(&["stat", "/l"]).contains("symbolic link"));
+    assert!(ok(&["stat", "/l/"]).contains("directory"));
+    assert!(ok(&["stat", "/l/g"]).contains("regular file"));
+    ok(&["put", local, "/l/h"]);
+    ok(&["mkdir", "/l/sub"]);
+    ok(&["touch", "/l/sub/t"]);
+    ok(&["ln", "-s", "../g", "/l/sub/up"]);
+    assert_eq!(ok(&["readlink", "/l/sub/up"]).trim_end(), "../g");
+    assert_eq!(names(ok(&["ls", "/d"])), ["g", "h", "sub/"]);
+    assert_eq!(ok(&["cat", "/l/sub/up"]).bytes().filter(|&b| b == 9).count(), 100_000);
+    let text = refused(&["ls", "/l/nothing"]);
+    assert!(text.contains("ENOENT"), "{text}");
+    // `..` in the parent goes back the way it came; `.` / `..` name no entry.
+    ok(&["put", local, "/l/sub/../k"]);
+    assert!(ok(&["stat", "/d/k"]).contains("regular file"));
+    for args in [["mkdir", "/d/.."], ["touch", "/d/."]] {
+        let text = refused(&args);
+        assert!(text.contains("EINVAL"), "{text}");
+    }
+    // A dangling link is stat'ed itself; removing a link leaves its target.
+    ok(&["ln", "-s", "nowhere", "/dangling"]);
+    assert!(ok(&["stat", "/dangling"]).contains("Target: nowhere"));
+    ok(&["rm", "/l"]);
+    assert!(refused(&["stat", "/l"]).contains("ENOENT"));
+    assert_eq!(names(ok(&["ls", "/d"])), ["g", "h", "k", "sub/"]);
 }

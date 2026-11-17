@@ -12,7 +12,7 @@ The frontends are thin shells over it, with one implementation and no drift:
 |------|------|
 | Kernel mount | `autumn-fuse` (the only crate that depends on fuser / libfuse; see its CLAUDE.md) |
 | S3 gateway | `crates/server/src/bin/autumn_s3/` |
-| `autumnfs` CLI | `crates/server/src/bin/` (mkdir / rm through `dir`, touch of an existing file through `meta::put_inode`; the parent must be a directory, judged from its dirent (`dir::resolve_typed`) for mkdir / touch / rm and from its inode for put; a new file (put / touch) is published create-only via `dir::compare_put_settled`, its keys deleted when the publish is refused and kept when the outcome stays unknown — the same cross-session windows as rename apply) |
+| `autumnfs` CLI | `crates/server/src/bin/` (mkdir / rm through `dir`, touch of an existing file through `meta::put_inode`; every path resolves through `dir::resolve_follow`, so links along it are followed as on a mount; the parent must be a directory, judged from its dirent for mkdir / touch / rm / put; a new file (put / touch) is published create-only via `dir::compare_put_settled`, its keys deleted when the publish is refused and kept when the outcome stays unknown — the same cross-session windows as rename apply) |
 | PyO3 `autumn.Fs` + fsspec facade | `python/src/fs.rs` |
 
 This code used to be the `core` feature of `autumn-fuse`. It became its own crate because
@@ -429,7 +429,7 @@ overwrite the sub-range, write back). Then `InodeMeta.size` is updated.
   (with the check removed mkdir succeeds and it goes red).
 - **Types along a path come from dirents**: `DirentValue.file_type` is set everywhere a dirent is written,
   rename copies it unchanged, and types are immutable, so it agrees with the inode. `dir::resolve_typed` returns the type of the last
-  component; S3's `bucket_dir`, `publish::ensure_dirs` and the autumnfs CLI use it to judge directories
+  component; S3's `bucket_dir` and `publish::ensure_dirs` use it to judge directories
   without reading the inode: ensure_dirs on a 4-level existing path 13.1K → 27.2K/s.
 - **Parent directory inode** nlink and mtime are CAS'd against the bytes read (`cas_dir`): those that change nlink (mkdir,
   rmdir, rename) re-read and retry on conflict, up to 16 times without sleeping (`update_dir`); those that change only mtime (create,
@@ -913,9 +913,10 @@ existing cache fails outright.
     queue, so nothing it expanded into can be popped last.
   - A link whose inode is gone (removed after its name was read) resolves to
     nothing, not an error.
-  - `resolve` / `resolve_typed` do not follow. The write paths (S3 directory
+  - `resolve` / `resolve_typed` do not follow. The S3 write paths (directory
     creation, publish) keep using them: a link is not a directory, and writing
-    under one is refused.
+    under one is refused there. `autumnfs` behaves like a mount instead and
+    writes through it.
 - **Per front-end**:
   - `autumn-s3`: GET / HEAD read the file a key's link leads to. A listing yields
     `DT_LNK` entries as objects and `list_objects` resolves each (a few KV reads
@@ -934,9 +935,10 @@ existing cache fails outright.
     `resolve(path)` follows (`os.stat`), `follow_symlinks=False` is `os.lstat`.
     The data calls (`read`, `write`, `truncate`) take an inode and do not check
     its type, as for a directory inode.
-  - `autumnfs`: `ln -s TARGET PATH`, `readlink PATH` (links before the last
-    component followed); `cat` / `get` follow; `ls` / `stat` / `rm` act on the
-    link itself and do not follow links earlier in the path.
+  - `autumnfs`: `ln -s TARGET PATH`, `readlink PATH`. Every command follows
+    links earlier in the path. A link named last is followed by `ls`, `cat`
+    and `get`, and taken itself by `ls -l`, `stat`, `readlink`, `rm` and
+    `touch` (which moves the link's mtime, as `touch -h`).
 - **Tests**: `crates/manager/tests/system_fs_symlink.rs` (core: `..`, directory
   links, a link in the middle of a path, trailing `/`, absolute, dangling,
   vanished inode, ELOOP, EINVAL, EEXIST, unlink and rename-over reclaiming the

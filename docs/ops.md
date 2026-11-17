@@ -1746,7 +1746,8 @@ diff -r "$MP/hf" /tmp/hf-local && echo identical
 ```
 
 Without the mount, `autumnfs ln -s TARGET PATH` / `readlink PATH` make and read
-links, `autumnfs cat|get` follow them, and `autumn-s3` serves a snapshot's files
+links, every other `autumnfs` command walks through them (`ls -l` and `stat`
+show a link named last itself), and `autumn-s3` serves a snapshot's files
 as the blobs they point at (GET, HEAD, listing). A relative target resolves from
 the link's directory; an absolute one from the root of the `fs/` tree, so a link
 a mount made to a host path (`/mnt/autumn/...`) resolves only on the mount.

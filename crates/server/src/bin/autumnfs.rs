@@ -44,7 +44,7 @@ use autumn_fs::state::FsState;
 use autumn_fs::{dir, meta, segment};
 use autumn_fs::schema::{
     self, DirentValue, InodeMeta, StripeLayout, DT_DIR, DT_LNK, DT_REG, INLINE_THRESHOLD,
-    MAX_EXTENT, ROOT_INO,
+    MAX_EXTENT,
 };
 
 /// autumnfs CLI parameters (`autumn_params::autumnfs`).
@@ -193,22 +193,21 @@ fn main() -> Result<()> {
 
         // Bootstrap the fuse root inode (ino 1) if it's missing — a cluster that
         // has never mounted the fuse fs or used `autumn.Fs` has no root, so
-        // `resolve()` from ROOT_INO would fail `ENOENT inode 1`. The core's
+        // every path lookup would fail `ENOENT inode 1`. The core's
         // `ensure_root` also verifies (or stamps) the filesystem's schema
         // version, so this build refuses a layout it cannot read instead of
         // decoding it wrong — which the CLI's own copy of this step never did.
         let host = p.host.get().unwrap_or_else(autumn_fs::state::system_hostname);
         let mut state = FsState::from_client(cluster, format!("autumnfs-{host}"));
         meta::ensure_root(&mut state).await?;
-        let cluster = state.client.clone();
 
         match cmd {
-            Cmd::Ls { path, long } => cmd_ls(&cluster, &path, long).await,
-            Cmd::Stat { path } => cmd_stat(&cluster, &path).await,
+            Cmd::Ls { path, long } => cmd_ls(&mut state, &path, long).await,
+            Cmd::Stat { path } => cmd_stat(&mut state, &path).await,
             Cmd::Mkdir { path } => cmd_mkdir(&mut state, &path).await,
             Cmd::Cat { path } => cmd_cat(&mut state, &path, p.direct_read.get()).await,
             Cmd::Put { local, remote } => {
-                cmd_put(&cluster, &local, &remote).await
+                cmd_put(&mut state, &local, &remote).await
             }
             Cmd::Get { remote, local } => {
                 cmd_get(&mut state, &remote, &local, p.direct_read.get()).await
@@ -229,53 +228,13 @@ fn split_path(path: &str) -> Vec<&[u8]> {
     path.split('/').filter(|c| !c.is_empty()).map(|c| c.as_bytes()).collect()
 }
 
-/// Walk dirents from `ROOT_INO` to the inode at `path`. Returns
-/// `(ino, parent_ino, name_in_parent, meta)`. `parent_ino` = 0 and `name`
-/// empty for the root.
-async fn resolve(
-    cluster: &ClusterClient,
-    path: &str,
-) -> Result<(u64, u64, Vec<u8>, InodeMeta)> {
-    let comps = split_path(path);
-    let mut ino = ROOT_INO;
-    let mut parent_ino = 0u64;
-    let mut name: Vec<u8> = Vec::new();
-    for c in &comps {
-        let dk = key::dirent_key(ino, c);
-        let dv = cluster
-            .get(&dk)
-            .await
-            .map_err(|e| anyhow!("dirent get: {e}"))?
-            .ok_or_else(|| anyhow!("ENOENT: {}", String::from_utf8_lossy(c)))?;
-        let dirent = schema::decode_dirent(&dv).map_err(|e| anyhow!("decode dirent: {e}"))?;
-        parent_ino = ino;
-        ino = dirent.child_inode;
-        name = c.to_vec();
-    }
-    let iv = cluster
-        .get(&key::inode_key(ino))
-        .await
-        .map_err(|e| anyhow!("inode get: {e}"))?
-        .ok_or_else(|| anyhow!("ENOENT inode {ino}"))?;
-    let meta = schema::decode_inode_meta(&iv).map_err(|e| anyhow!("decode inode: {e}"))?;
-    Ok((ino, parent_ino, name, meta))
-}
-
-/// Resolve just the parent dir + the leaf name. Used for create / mkdir / rm
-/// where we need the parent to mutate but the leaf may not exist yet.
-async fn resolve_parent_leaf(
-    cluster: &ClusterClient,
-    path: &str,
-) -> Result<(u64, InodeMeta, Vec<u8>)> {
-    let comps = split_path(path);
-    let (leaf, parent_comps) = comps
-        .split_last()
-        .ok_or_else(|| anyhow!("path must name a non-root entry"))?;
-    let parent_path: Vec<u8> =
-        parent_comps.iter().flat_map(|c| [b"/" as &[u8], c]).flatten().copied().collect();
-    let parent_str = String::from_utf8_lossy(&parent_path).into_owned();
-    let (parent_ino, _, _, parent_meta) = resolve(cluster, &parent_str).await?;
-    Ok((parent_ino, parent_meta, leaf.to_vec()))
+/// The inode a path leads to. Links along the way are followed; the last
+/// one only when `follow_last` (or the path ends in `/`), as stat vs lstat.
+async fn lookup_path(state: &mut FsState, path: &str, follow_last: bool) -> Result<(u64, InodeMeta)> {
+    let (ino, _) = dir::resolve_follow(state, path, follow_last)
+        .await?
+        .ok_or_else(|| anyhow!("ENOENT: {path}"))?;
+    Ok((ino, meta::fetch_inode(state, ino).await?))
 }
 
 // ─── Inode allocation ────────────────────────────────────────────────────────
@@ -341,8 +300,12 @@ fn next_range_cursor(entries: &[autumn_client::RangeEntry], page: u32) -> Option
     Some(start)
 }
 
-async fn cmd_ls(cluster: &ClusterClient, path: &str, long: bool) -> Result<()> {
-    let (ino, _, _, meta) = resolve(cluster, path).await?;
+/// As `ls`: a link named last is listed itself under `-l`, and followed
+/// otherwise.
+async fn cmd_ls(state: &mut FsState, path: &str, long: bool) -> Result<()> {
+    let (ino, meta) = lookup_path(state, path, !long).await?;
+    let cluster = state.client.clone();
+    let cluster = &*cluster;
     if !is_dir(&meta) {
         // Single-entry ls of a regular file just prints its name.
         let name = path.rsplit('/').find(|s| !s.is_empty()).unwrap_or(path);
@@ -456,8 +419,9 @@ fn is_reg(m: &InodeMeta) -> bool {
 
 // ─── stat ───────────────────────────────────────────────────────────────────
 
-async fn cmd_stat(cluster: &ClusterClient, path: &str) -> Result<()> {
-    let (ino, parent_ino, name, m) = resolve(cluster, path).await?;
+/// As `stat`: a link named last is described itself.
+async fn cmd_stat(state: &mut FsState, path: &str) -> Result<()> {
+    let (ino, m) = lookup_path(state, path, false).await?;
     let kind = if is_dir(&m) {
         "directory"
     } else if is_reg(&m) {
@@ -468,7 +432,7 @@ async fn cmd_stat(cluster: &ClusterClient, path: &str) -> Result<()> {
         "other"
     };
     println!("  File: {}", path);
-    println!("  Size: {}\tInode: {}\tParent ino: {}", m.size, ino, parent_ino);
+    println!("  Size: {}\tInode: {}", m.size, ino);
     println!("  Type: {}", kind);
     println!(
         "  Mode: {:04o}  uid={} gid={} nlink={}",
@@ -481,9 +445,6 @@ async fn cmd_stat(cluster: &ClusterClient, path: &str) -> Result<()> {
         "  Access: {}  Modify: {}  Change: {}",
         m.atime_secs, m.mtime_secs, m.ctime_secs
     );
-    if !name.is_empty() {
-        println!("  Name-in-parent: {}", String::from_utf8_lossy(&name));
-    }
     if let Some(ref target) = m.symlink_target {
         println!("  Target: {}", String::from_utf8_lossy(target));
     }
@@ -507,8 +468,11 @@ async fn resolve_parent_name(state: &mut FsState, path: &str) -> Result<(u64, Ve
     let Some((leaf, parents)) = comps.split_last() else {
         bail!("the root has no parent");
     };
+    if *leaf == b"." || *leaf == b".." {
+        bail!("EINVAL: {path} does not name an entry");
+    }
     let parent_path: Vec<String> = parents.iter().map(|c| String::from_utf8_lossy(c).into_owned()).collect();
-    let (parent, file_type) = dir::resolve_typed(state, &format!("/{}", parent_path.join("/")))
+    let (parent, file_type) = dir::resolve_follow(state, &format!("/{}", parent_path.join("/")), true)
         .await?
         .ok_or_else(|| anyhow!("ENOENT: {path}"))?;
     if file_type != DT_DIR {
@@ -745,8 +709,7 @@ async fn read_segmented_to_writer(
 
 /// The file a path leads to, through any symbolic links.
 async fn resolve_file(state: &mut FsState, path: &str) -> Result<(u64, InodeMeta)> {
-    let (ino, _) = dir::resolve_follow(state, path, true).await?.ok_or_else(|| anyhow!("ENOENT: {path}"))?;
-    Ok((ino, meta::fetch_inode(state, ino).await?))
+    lookup_path(state, path, true).await
 }
 
 async fn cmd_cat(state: &mut FsState, path: &str, direct_read: bool) -> Result<()> {
@@ -981,11 +944,10 @@ async fn declared_stripe_geom(cluster: &ClusterClient) -> Result<StripeLayout> {
     autumn_fs::geom::read_stripe_geom(cluster).await
 }
 
-async fn cmd_put(cluster: &ClusterClient, local: &PathBuf, remote: &str) -> Result<()> {
-    let (parent_ino, parent_meta, leaf) = resolve_parent_leaf(cluster, remote).await?;
-    if !is_dir(&parent_meta) {
-        bail!("ENOTDIR: the parent of {remote} is not a directory");
-    }
+async fn cmd_put(state: &mut FsState, local: &PathBuf, remote: &str) -> Result<()> {
+    let (parent_ino, leaf) = resolve_parent_name(state, remote).await?;
+    let cluster = state.client.clone();
+    let cluster = &*cluster;
     if cluster
         .get(&key::dirent_key(parent_ino, &leaf))
         .await
@@ -1064,7 +1026,7 @@ async fn cmd_symlink(state: &mut FsState, target: &str, path: &str) -> Result<()
 }
 
 async fn cmd_readlink(state: &mut FsState, path: &str) -> Result<()> {
-    let (ino, _) = dir::resolve_follow(state, path, false).await?.ok_or_else(|| anyhow!("ENOENT: {path}"))?;
+    let (ino, _) = lookup_path(state, path, false).await?;
     let target = dir::readlink(state, ino).await?;
     println!("{}", String::from_utf8_lossy(&target));
     Ok(())

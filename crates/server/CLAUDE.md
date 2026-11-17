@@ -465,8 +465,8 @@ autumnfs [--manager 127.0.0.1:9001] [--transport tcp|ucx] [--credential-file FIL
 
 | Subcommand | Description |
 |------------|-------------|
-| `ls <PATH> [--long]` | List directory entries (default `/`) |
-| `stat <PATH>` | Show inode metadata (size, ino, type, parent) |
+| `ls <PATH> [--long]` | List directory entries (default `/`); a link named last is followed, or shown itself under `--long` |
+| `stat <PATH>` | Show inode metadata (size, ino, type; a link named last is described itself) |
 | `mkdir <PATH>` | Create a directory (parents must exist) |
 | `touch <PATH>` | Create empty file (no-op if it exists) |
 | `cat <PATH>` | Read file to stdout (follows symbolic links, as `get` does) |
@@ -482,6 +482,11 @@ autumnfs [--manager 127.0.0.1:9001] [--transport tcp|ucx] [--credential-file FIL
   reclaim, deferral while another client holds the file) instead of a third copy
   that deleted extents before the name. `cat`/`get` of a segmented file plan
   from its map and fail on a missing data extent.
+- **Paths resolve through `dir::resolve_follow`** in every command, so links
+  along a path are followed as on a mount (`put /latest/x` writes into the
+  link's target directory). Only the last component of `ls --long`, `stat` and
+  `readlink` is taken as written, as `ls -l` / `stat` / `readlink` do; a
+  trailing `/` follows it there too.
 - **Namespace-first binding**: connects via `ClusterClient::connect(mgr, "fs")`, so the binding prepends `fs/` to every relative fuse key (and strips it off range results) — the same single global keyspace a fuse mount uses, so writes here are visible to a mount. No scope flag; this CLI sees the whole `fs/` namespace.
 - **Authz**: `--credential-file` (`<principal>\n<hex>`, from `autumn-op principal-create`) is REQUIRED when the cluster protects `fs/` (connects via `connect_with_credential`, fails fast if the credential doesn't cover `fs/`); omit on an authz-off cluster.
 - **Inodes** come from the MANAGER's global counter (`alloc_inodes`) — the same crash-safe source the fuse mount and PyO3 `autumn.Fs` use, so no colliding inodes.
