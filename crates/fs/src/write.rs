@@ -297,6 +297,23 @@ fn reclaim_buffer(state: &mut FsState, ino: u64, buf: Vec<u8>) {
     }
 }
 
+/// Before a write or a grow of a file whose content is inline (a publish of
+/// at most 4 KiB: an S3 PUT, CopyObject), move that content into an extent
+/// at 0 and clear `inline_data`. A read serves `inline_data` whenever it is
+/// set, and writes land in extents, so without this a write was acknowledged
+/// and never read back. The next inode put commits the switch; until then
+/// the stored inode still names the inline bytes, and the extent is unread.
+async fn move_inline_to_extent(state: &mut FsState, ino: u64) -> Result<()> {
+    let Some(is) = state.inodes.get(&ino) else { return Ok(()) };
+    let Some(data) = is.meta.inline_data.clone() else { return Ok(()) };
+    let size = is.meta.size;
+    extent::write_region(state, ino, 0, &data, size).await?;
+    if let Some(is) = state.inodes.get_mut(&ino) {
+        is.meta.inline_data = None;
+    }
+    Ok(())
+}
+
 /// Write data to a file. Returns bytes written.
 pub async fn write(state: &mut FsState, ino: u64, offset: i64, data: &[u8]) -> Result<u32> {
     let t_total = std::time::Instant::now();
@@ -330,6 +347,7 @@ async fn write_inner(state: &mut FsState, ino: u64, offset: i64, data: &[u8]) ->
             "fuse write to a striped file (ino {ino}) is not supported yet; use autumnfs"
         ));
     }
+    move_inline_to_extent(state, ino).await?;
 
     // A write that GROWS the file past the current
     // EOF must reap crashed-shrink leftovers BEFORE the in-memory size
@@ -753,6 +771,8 @@ async fn truncate_held(state: &mut FsState, ino: u64, new_size: u64) -> Result<(
         // Runs while the leftovers are still invisible (size = old), so
         // a crash mid-sweep is safe and the next grow retries.
         extent::clean_beyond_eof(state, ino, old_size).await?;
+        // Inline bytes cover only the old size; past it a read must see zeros.
+        move_inline_to_extent(state, ino).await?;
     }
 
     // Update + persist metadata (the commit point).

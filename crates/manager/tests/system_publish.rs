@@ -16,7 +16,7 @@ use autumn_rpc::manager_rpc::LEASE_MODE_WRITE;
 use autumn_fs::publish::{self, Condition, NewFile, PublishError};
 use autumn_fs::state::FsState;
 use autumn_fs::schema::{self, SegcRecord, MAX_EXTENT};
-use autumn_fs::{dir, key, meta, read};
+use autumn_fs::{dir, key, meta, read, write};
 
 use support::*;
 
@@ -548,5 +548,50 @@ fn a_stalled_session_s_retire_is_fenced_after_its_recovery() {
         let m = meta::fetch_inode(&mut rescuer, old).await.expect("the alias's inode was deleted");
         assert_eq!(m.nlink, 1);
         assert_eq!(read_name(&mut rescuer, 1, "alias").await.unwrap(), body);
+    });
+}
+
+/// A file published at most 4 KiB keeps its bytes in the inode
+/// (`inline_data`). Written afterwards through the core write path, as a mount
+/// does — overwritten in place, appended to, grown by truncate — every change
+/// reads back from another session. They used to land in extents that no read
+/// looked at: the write was acknowledged and the old bytes kept being served.
+#[test]
+fn an_inline_file_written_afterwards_reads_back() {
+    let mgr_addr = pick_addr();
+    start_manager(mgr_addr);
+    let n1_dir = tempfile::tempdir().expect("n1");
+    let n2_dir = tempfile::tempdir().expect("n2");
+    let (n1, n2) = (pick_addr(), pick_addr());
+    start_extent_node(n1, n1_dir.path().to_path_buf(), 1);
+    start_extent_node(n2, n2_dir.path().to_path_buf(), 2);
+
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        let _admin = boot(mgr_addr, n1, n2, 156, 15601).await;
+        let mgr = mgr_addr.to_string();
+        let mut st = FsState::new(&mgr).await.expect("publisher");
+        meta::ensure_root(&mut st).await.expect("init_root");
+        let mut writer = FsState::new(&mgr).await.expect("writer");
+
+        let a = put(&mut st, 1, "inplace", &[b'A'; 100], Condition::None).await.expect("put");
+        let b = put(&mut st, 1, "append", &[b'A'; 100], Condition::None).await.expect("put");
+        let g = put(&mut st, 1, "grow", &[b'A'; 10], Condition::None).await.expect("put");
+        let m = meta::fetch_inode(&mut st, a).await.expect("inode");
+        assert_eq!(m.inline_data.as_deref(), Some(&[b'A'; 100][..]), "published inline");
+
+        write::write(&mut writer, a, 0, &[b'B'; 100]).await.expect("write");
+        write::flush_inode(&mut writer, a, write::FlushReport::ToApplication).await.expect("flush");
+        write::write(&mut writer, b, 100, b"CC").await.expect("append");
+        write::flush_inode(&mut writer, b, write::FlushReport::ToApplication).await.expect("flush");
+        write::truncate(&mut writer, g, 20).await.expect("truncate");
+
+        let mut reader = FsState::new(&mgr).await.expect("reader");
+        assert_eq!(read_name(&mut reader, 1, "inplace").await.unwrap(), vec![b'B'; 100]);
+        let mut appended = vec![b'A'; 100];
+        appended.extend_from_slice(b"CC");
+        assert_eq!(read_name(&mut reader, 1, "append").await.unwrap(), appended);
+        let mut grown = vec![b'A'; 10];
+        grown.extend_from_slice(&[0; 10]);
+        assert_eq!(read_name(&mut reader, 1, "grow").await.unwrap(), grown);
     });
 }

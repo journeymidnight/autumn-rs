@@ -109,8 +109,14 @@ hundreds of thousands of small blocks to orders of magnitude fewer extents of �
   truncate invalidates it (sets `None`).
 - **Invariant: extents never overlap**. A read requests the exact sub-range `[start, start+len)` of each overlapping
   extent; the PS get clips to the real value length and the rest of dest is zero-filled → short extents / sparse holes are both correct.
-- **Small files** ≤ `INLINE_THRESHOLD`=4KB: inline in `InodeMeta.inline_data` (no extent;
-  saves one KV operation on both read and write; growing past the threshold migrates to extent storage).
+- **Small files** ≤ `INLINE_THRESHOLD`=4KB: a publish (S3 PUT, CopyObject, `autumnfs
+  put`) stores them inline in `InodeMeta.inline_data` (no extent; one KV get reads the
+  whole file). Only a publish writes inline; the mount and `autumn.Fs` write extents. A read serves
+  `inline_data` whenever it is set, so the first write or grow of an inline file
+  (`write::move_inline_to_extent`) first puts the inline bytes at extent 0 and clears
+  the field; the next inode put commits the switch. Without it a mount's write to an
+  S3-written small file was acknowledged and never read back, and an append read short
+  (`system_publish::an_inline_file_written_afterwards_reads_back`).
 - All addressing/read/write/truncate/delete logic is in `crate::extent`.
 
 ### Lane striping (large files striped across partitions)
