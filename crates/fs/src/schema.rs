@@ -72,7 +72,7 @@ pub fn encode_dirent(dirent: &DirentValue) -> Vec<u8> {
     autumn_rpc::partition_rpc::rkyv_encode(dirent).to_vec()
 }
 
-/// Inode metadata stored in KV at key `[0x01][ino: u64 BE]`.
+/// Inode metadata stored in KV at key `key::inode_key` (`[0x06][meta_hash(ino)][0x01][ino BE]`).
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
 pub struct InodeMeta {
     /// File type + permissions (e.g. S_IFREG | 0o644).
@@ -399,7 +399,7 @@ pub(crate) fn striped_extent_count(size: u64, unit: u32) -> Result<u64, String> 
     Ok(count)
 }
 
-/// Directory entry stored in KV at key `[0x02][parent_ino: u64 BE][name]`.
+/// Directory entry stored in KV at key `key::dirent_key` (`[0x06][meta_hash(parent)][0x02][parent BE][name]`).
 #[derive(Archive, Serialize, Deserialize, Clone, Debug)]
 pub struct DirentValue {
     pub child_inode: u64,
@@ -527,8 +527,19 @@ pub const ROOT_INO: u64 = 1;
 ///   inode keeps its number, links and bytes, and gains `generation = 1` and
 ///   `segments = None` — rather than by a reset.
 ///
+/// - **v5** = metadata behind a hash byte: inodes at
+///   `[0x06][meta_hash(ino)][0x01][ino]`, directory entries at
+///   `[0x06][meta_hash(parent)][0x02][parent][name]` (they were `[0x01][ino]`
+///   and `[0x02][parent][name]`), so they spread over partitions. Values are
+///   unchanged. Converted in place by `convert_fs_v5` against a stopped
+///   filesystem.
+///
 /// BUMP this whenever the key layout / value encoding changes incompatibly.
-pub const SCHEMA_VERSION: u64 = 4;
+pub const SCHEMA_VERSION: u64 = 5;
+
+/// The stamp `convert_fs_v5` holds while it moves a v4 tree's keys: neither a
+/// v4 nor a v5 build mounts a tree in between.
+pub const SCHEMA_CONVERTING_TO_V5: u64 = 0x4000_0000_0000_0005;
 
 // File type constants (from libc)
 pub const DT_REG: u8 = 8;

@@ -31,7 +31,7 @@ wire key = {ns}/[relative]
 
 | namespace | Relative key shape | Location |
 |---|---|---|
-| `fs/` | Raw typed bytes: `[0x01][ino BE]` (inode meta), `[0x02][parent BE][name]` (dirent), `[0x03][lane][ino BE][off BE]` (stripe data), `[0x04][field]` (superblock, including `stripe_geom` and the `rmtomb/` unlink tombstones) | `crates/fuse/src/key.rs` |
+| `fs/` | Raw typed bytes: `[0x06][h][0x01][ino BE]` (inode meta), `[0x06][h][0x02][parent BE][name]` (dirent, `h` = `meta_hash`), `[0x03][lane][ino BE][off BE]` (stripe data), `[0x04][field]` (superblock, including `stripe_geom` and the `rmtomb/` unlink tombstones) | `crates/fs/src/key.rs` |
 | `kvc/` | `{h}/{model}[_{fingerprint}][_{tp}][_pp{pp}]/…/{sha256-hex}/{layer}`, `h` = first character of the hash | `autumn_kvcache/_keys.py` (the autumn_kvcache repo) |
 | Others (`mem/`, `bench/`, `gallery/`, user-created) | Defined by the application | `autumn-client` |
 
@@ -48,9 +48,9 @@ implementation and operations **must treat the two differently**:
 
 | | Path-segment ns | Binary ns |
 |---|---|---|
-| Example | `mem/{app}/…`, `gallery/…` | fuse `fs/[0x01][ino]…` |
+| Example | `mem/{app}/…`, `gallery/…` | fuse `fs/[0x06][h][0x01][ino]…` |
 | Start of relative key | ASCII segment (`agent7/…`) | Fixed-length binary record |
-| Sub-prefix grant inside the ns | **Meaningful** (`mem/app7/` really carves out a sub-space) | **Meaningless** (the `/models/` in `fs/models/` is a dirent name inside a `[0x02]` record, not a key prefix → it matches zero keys, and `validate_credential_scope` rejects it at connect time anyway) |
+| Sub-prefix grant inside the ns | **Meaningful** (`mem/app7/` really carves out a sub-space) | **Meaningless** (the `/models/` in `fs/models/` is a dirent name inside a directory-entry record, not a key prefix → it matches zero keys, and `validate_credential_scope` rejects it at connect time anyway) |
 | Means of isolation | Grant different sub-prefixes | **Only the whole ns can be granted (`fs/`); for multiple mutually isolated trees → create multiple namespaces** (`fsA`/`fsB`, each registered separately) |
 
 **The trade-off for binary namespaces (stated explicitly)**: `fs/` is one global

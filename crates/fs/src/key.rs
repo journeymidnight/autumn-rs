@@ -2,66 +2,92 @@
 //!
 //! Key layout uses a single-byte type prefix + big-endian u64 fields for natural sort order.
 //!
-//! | Prefix | Purpose       | Key format                                |
-//! |--------|---------------|-------------------------------------------|
-//! | 0x01   | Inode meta    | [0x01][ino: u64 BE]                       |
-//! | 0x02   | Dir entry     | [0x02][parent_ino: u64 BE][name bytes]    |
-//! | 0x03   | File extent   | [0x03][ino: u64 BE][logical_off: u64 BE]  |
-//! | 0x04   | FS superblock | [0x04][field bytes]                       |
-//! | 0x05   | Segment page  | [0x05][map_id: u64 BE][page: u32 BE]      |
+//! | Prefix | Purpose       | Key format                                         |
+//! |--------|---------------|----------------------------------------------------|
+//! | 0x03   | File extent   | [0x03][ino: u64 BE][logical_off: u64 BE]           |
+//! | 0x04   | FS superblock | [0x04][field bytes]                                |
+//! | 0x05   | Segment page  | [0x05][map_id: u64 BE][page: u32 BE]               |
+//! | 0x06   | Inode meta    | [0x06][meta_hash(ino)][0x01][ino: u64 BE]          |
+//! | 0x06   | Dir entry     | [0x06][meta_hash(parent)][0x02][parent BE][name]   |
+//!
+//! Metadata (v5) sits behind a hash byte so it spreads over the partitions
+//! cut at `[0x06][h]`: inode numbers only grow, and without it every new file
+//! and every recent read landed in the last range. Inodes and directory
+//! entries share the region, so a partition holding a run of hashes holds
+//! both kinds. v4 had `[0x01][ino]` and `[0x02][parent][name]`.
 //!
 //! data is stored as **variable-length extents** keyed by their logical
 //! byte offset (was fixed 256 KiB chunks keyed by chunk index). BigEndian
 //! `logical_off` keeps extents naturally sorted, so a range-scan of the
 //! `[0x03][ino]` prefix returns a file's extents in offset order.
 
-const PREFIX_INODE: u8 = 0x01;
-const PREFIX_DIRENT: u8 = 0x02;
+const PREFIX_META: u8 = 0x06;
+const META_INODE: u8 = 0x01;
+const META_DIRENT: u8 = 0x02;
 const PREFIX_EXTENT: u8 = 0x03;
 const PREFIX_SUPER: u8 = 0x04;
 const PREFIX_SEGMENT_PAGE: u8 = 0x05;
 
-/// Encode inode metadata key: `[0x01][ino BE]`
-pub fn inode_key(ino: u64) -> Vec<u8> {
-    let mut key = Vec::with_capacity(9);
-    key.push(PREFIX_INODE);
-    key.extend_from_slice(&ino.to_be_bytes());
+/// The hash byte in front of an inode's and a directory's metadata keys.
+/// FROZEN: it is part of every stored metadata key, so changing it moves
+/// every inode and every directory entry. Fibonacci hashing (the top byte of
+/// `ino * 2^64/phi`) spreads consecutive inode numbers, which is how the
+/// manager hands them out, evenly over the 256 values.
+pub fn meta_hash(ino: u64) -> u8 {
+    (ino.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 56) as u8
+}
+
+/// The start of the metadata region, `[0x06]`.
+pub fn meta_region() -> Vec<u8> {
+    vec![PREFIX_META]
+}
+
+/// The start of hash run `h` in the metadata region, `[0x06][h]`: where
+/// presplit cuts it.
+pub fn meta_hash_boundary(h: u8) -> Vec<u8> {
+    vec![PREFIX_META, h]
+}
+
+fn meta_key(owner: u64, kind: u8, extra: usize) -> Vec<u8> {
+    let mut key = Vec::with_capacity(11 + extra);
+    key.extend_from_slice(&[PREFIX_META, meta_hash(owner), kind]);
+    key.extend_from_slice(&owner.to_be_bytes());
     key
+}
+
+/// Encode inode metadata key: `[0x06][h(ino)][0x01][ino BE]`
+pub fn inode_key(ino: u64) -> Vec<u8> {
+    meta_key(ino, META_INODE, 0)
 }
 
 /// Decode inode number from an inode key.
 #[cfg(test)]
 pub fn parse_inode_key(key: &[u8]) -> Option<u64> {
-    if key.len() == 9 && key[0] == PREFIX_INODE {
-        Some(u64::from_be_bytes(key[1..9].try_into().unwrap()))
+    if key.len() == 11 && key[0] == PREFIX_META && key[2] == META_INODE {
+        let ino = u64::from_be_bytes(key[3..11].try_into().unwrap());
+        (key[1] == meta_hash(ino)).then_some(ino)
     } else {
         None
     }
 }
 
-/// Encode directory entry key: `[0x02][parent_ino BE][name]`
+/// Encode directory entry key: `[0x06][h(parent)][0x02][parent_ino BE][name]`
 pub fn dirent_key(parent_ino: u64, name: &[u8]) -> Vec<u8> {
-    let mut key = Vec::with_capacity(9 + name.len());
-    key.push(PREFIX_DIRENT);
-    key.extend_from_slice(&parent_ino.to_be_bytes());
+    let mut key = meta_key(parent_ino, META_DIRENT, name.len());
     key.extend_from_slice(name);
     key
 }
 
-/// Encode directory entry prefix for Range scan: `[0x02][parent_ino BE]`
+/// Encode directory entry prefix for Range scan: `[0x06][h(parent)][0x02][parent_ino BE]`
 pub fn dirent_prefix(parent_ino: u64) -> Vec<u8> {
-    let mut key = Vec::with_capacity(9);
-    key.push(PREFIX_DIRENT);
-    key.extend_from_slice(&parent_ino.to_be_bytes());
-    key
+    meta_key(parent_ino, META_DIRENT, 0)
 }
 
 /// Parse directory entry key → (parent_ino, name bytes).
 pub fn parse_dirent_key(key: &[u8]) -> Option<(u64, &[u8])> {
-    if key.len() >= 9 && key[0] == PREFIX_DIRENT {
-        let parent = u64::from_be_bytes(key[1..9].try_into().unwrap());
-        let name = &key[9..];
-        Some((parent, name))
+    if key.len() >= 11 && key[0] == PREFIX_META && key[2] == META_DIRENT {
+        let parent = u64::from_be_bytes(key[3..11].try_into().unwrap());
+        (key[1] == meta_hash(parent)).then_some((parent, &key[11..]))
     } else {
         None
     }
@@ -159,8 +185,8 @@ pub fn segment_page_key(map_id: u64, page: u32) -> Vec<u8> {
 
 /// The lane-partition split boundary (RELATIVE key `[0x03][lane]`). Splitting the
 /// fs partition at each of `[0x03][1]..[0x03][N]` yields N lane partitions:
-/// lane 0 = `[start, [0x03][1])` (also holds 0x01/0x02 metadata + legacy
-/// non-striped `[0x03][ino…]` data, which all sort here), lane L = the L-th slice.
+/// lane 0 = `[start, [0x03][1])` (also holds legacy non-striped
+/// `[0x03][ino…]` data, which sorts here), lane L = the L-th slice.
 pub fn stripe_lane_boundary(lane: u8) -> Vec<u8> {
     vec![PREFIX_EXTENT, lane]
 }
@@ -457,6 +483,36 @@ mod tests {
     }
 
     #[test]
+    fn the_metadata_hash_is_frozen() {
+        // Stored in every metadata key: a change here moves them all.
+        assert_eq!([meta_hash(1), meta_hash(2), meta_hash(1000)], [0x9e, 0x3c, 0x08]);
+    }
+
+    #[test]
+    fn metadata_spreads_evenly_over_hash_runs() {
+        // The manager hands inode numbers out in batches of 1000 from a
+        // counter; 8 runs of 32 hashes each get about an eighth.
+        for start in [1u64, 1_000_000, 1 << 40] {
+            let mut runs = [0usize; 8];
+            for ino in start..start + 8000 {
+                runs[meta_hash(ino) as usize / 32] += 1;
+            }
+            assert!(runs.iter().all(|&n| (900..=1100).contains(&n)), "start {start}: {runs:?}");
+        }
+    }
+
+    #[test]
+    fn dirent_keys_roundtrip_under_their_prefix() {
+        let key = dirent_key(7, b"name");
+        assert_eq!(parse_dirent_key(&key), Some((7, &b"name"[..])));
+        assert!(key.starts_with(&dirent_prefix(7)));
+        assert!(!dirent_key(8, b"name").starts_with(&dirent_prefix(7)));
+        assert_eq!(parse_dirent_key(&inode_key(7)), None);
+        assert_eq!(parse_inode_key(&dirent_prefix(7)), None);
+        assert!(key.starts_with(&meta_region()) && inode_key(7).starts_with(&meta_hash_boundary(meta_hash(7))));
+    }
+
+    #[test]
     fn inode_key_roundtrip() {
         let key = inode_key(42);
         assert_eq!(parse_inode_key(&key), Some(42));
@@ -627,12 +683,11 @@ mod tests {
     }
 
     #[test]
-    fn dirent_keys_sort_by_parent_then_name() {
-        let k1 = dirent_key(1, b"aaa");
-        let k2 = dirent_key(1, b"bbb");
-        let k3 = dirent_key(2, b"aaa");
+    fn a_directory_s_entries_sort_by_name() {
+        // Directories themselves are spread by hash, not in parent order.
+        let (k1, k2) = (dirent_key(1, b"aaa"), dirent_key(1, b"bbb"));
         assert!(k1 < k2, "same parent, name a < b");
-        assert!(k2 < k3, "parent 1 < parent 2");
+        assert!(dirent_key(1, b"zzz") < dirent_key(1, b"zzzz"));
     }
 
     #[test]
@@ -650,8 +705,8 @@ mod tests {
         let dk = dirent_key(1, b"x");
         let ck = extent_key(1, 0);
         let sk = next_inode_key();
-        assert!(ik < dk, "inode prefix 0x01 < dirent prefix 0x02");
-        assert!(dk < ck, "dirent prefix 0x02 < chunk prefix 0x03");
+        assert!(ik < dk, "same hash: inode kind 0x01 < dirent kind 0x02");
         assert!(ck < sk, "chunk prefix 0x03 < super prefix 0x04");
+        assert!(sk < ik && sk < dk, "super prefix 0x04 < metadata region 0x06");
     }
 }

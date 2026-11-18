@@ -3378,17 +3378,25 @@ Two pieces of state, different jobs:
   split/merge/rebalance leaves existing files correct.
 
 ```bash
-# Create fs cut into 6 partitions (6 divides 24 → 4 lanes each); declares 24 lanes.
+# Create fs cut into 6 lane partitions (6 divides 24 → 4 lanes each) and 6
+# metadata partitions; declares 24 lanes.
 $AO namespace-create --name fs --parts 6
 # → declared fs stripe geometry: 24 lanes × 8 MiB units
-# → presplit fs: 6/6 cut points applied   (the head fs/ + 5 lane boundaries)
+# → presplit fs: 12/12 cut points applied
+#   (the head fs/, 5 lane boundaries, the metadata region [0x06], 5 hash runs)
 
 $AO namespace-create --name fs --parts 5     # rejected:
 # fs --parts N: N must divide its 24 stripe lanes (1, 2, 3, 4, 6, 8, 12, 24), got 5
 ```
 
 The lane count is the fixed 24; `--parts` only chooses how many partitions they
-are spread over.
+are spread over. The same N cuts the file METADATA (inodes and directory
+entries, schema v5): it sits behind a hash byte at `[0x06][h][..]`, so N runs of
+hashes are N partitions that each hold an even share of all inodes and
+directories, however inode numbers grow. `--parts N` therefore makes 2N
+partitions. Small-file and S3 GET/HEAD load lands on the metadata partitions:
+4 KiB S3 GET with all metadata in one partition stopped at ~28K obj/s (that PS
+thread at 90%), and ~66K with it spread over 5.
 
 **Presplit an EMPTY keyspace, before loading data.** A data-bearing partition
 can't be re-split until major compaction clears CoW out-of-range keys, so cuts
@@ -3454,6 +3462,40 @@ $AO --wait merge 12 13
 ```
 
 Regression: `cargo test -p autumn-manager --test system_merge still_carrying`.
+
+## Converting fs from schema v4 to v5 (metadata behind a hash byte)
+
+A v5 build refuses a v4 tree (`fs/ is schema v4 ... run convert_fs_v5`). v5
+keeps inodes and directory entries at `[0x06][h][..]` instead of `[0x01]` /
+`[0x02]`; values are unchanged, so the conversion only moves keys. The cluster
+stays up; every fs client must be stopped (a client already running checked
+the stamp at its start and would keep writing v4 keys).
+
+```bash
+# 0. Stop every autumn-fuse mount, autumn-s3 gateway and autumn.Fs on fs/.
+# 1. Count, then convert. The stamp goes to a "converting" value first (no
+#    build mounts it), keys move page by page, the stamp goes to 5 last; a run
+#    that stops anywhere is simply run again.
+convert_fs_v5 --manager $M --dry-run
+#   → would move 10051 inodes and 10050 directory entries to schema v5
+convert_fs_v5 --manager $M          # add --credential-file when fs/ is protected
+#   → moved 10051 inodes and 10050 directory entries; fs/ is schema v5
+convert_fs_v5 --manager $M          # → fs/ is already schema v5
+# 2. Cut the metadata region (the converted keys sit in the last lane
+#    partition until then). Same N as the namespace was created with; the lane
+#    boundaries are already in place and are skipped. Cutting a populated range
+#    compacts and retries by itself.
+$AO presplit --namespace fs --parts 8
+#   → presplit fs: 8/15 cut points applied (7 boundaries already in place)
+# 3. Start the clients with the v5 build (rebuild the Python wheel too: an
+#    older one refuses the v5 stamp).
+```
+
+Checked on a v4 tree written by the v4 `autumnfs` and gateway (10 017 objects
+plus a 20 MB striped file): a listing and GET of every object gave the same keys
+and the same digest before and after, and the striped file compared equal. The
+`presplit` took 34 s. 4 KiB S3 GET on that tree, 64 concurrent: 35.4K obj/s
+before (one PS thread at 100%), 36.5K converted but uncut, 79.3K cut 8 ways.
 
 ## Inspecting authz: who exists and what may they touch
 

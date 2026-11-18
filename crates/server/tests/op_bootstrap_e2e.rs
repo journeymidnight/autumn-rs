@@ -297,8 +297,13 @@ fn autumn_op_bootstrap_then_put_get_roundtrip() {
         cmd.arg("--cluster-secret-file").arg(cluster_secret_file());
         cmd.args(["--manager", &mgr_addr, "namespace-create"]).args(args);
         let text = String::from_utf8_lossy(&run_or_panic("autumn-op namespace-create", cmd)).into_owned();
-        // Each namespace is cut at its head; kvc also at its 15 bucket points.
-        let want = if args.contains(&"kvc") { "16/16 cut points applied" } else { "4/4 cut points applied" };
+        // Each namespace is cut at its head; kvc also at its 15 bucket points,
+        // fs at 3 lane points and its metadata region in 4 hash runs.
+        let want = match args[1] {
+            "kvc" => "16/16 cut points applied",
+            "fs" => "8/8 cut points applied",
+            _ => "4/4 cut points applied",
+        };
         assert!(text.contains(want), "{args:?}: {text}");
     }
     {
@@ -311,7 +316,7 @@ fn autumn_op_bootstrap_then_put_get_roundtrip() {
         for ns in ["fs/", "kvc/", "mem/"] {
             assert!(starts.contains(&ns), "{ns} starts its own partition: {starts:?}");
         }
-        assert_eq!(starts.len(), 25, "\"\", fs/ + 3 lanes, kvc/ + kvc/1..kvc/f, mem/ + 3: {starts:?}");
+        assert_eq!(starts.len(), 29, "\"\", fs/ + 3 lanes + 4 metadata runs, kvc/ + kvc/1..kvc/f, mem/ + 3: {starts:?}");
     }
 
     // ── put + get round-trip via autumn-client ──────────────────────

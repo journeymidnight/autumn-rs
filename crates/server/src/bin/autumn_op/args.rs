@@ -1765,7 +1765,10 @@ pub(crate) enum PresplitRule {
     /// A striped large file's extent at offset `off` lands on lane
     /// `(off/unit)%N` under key `[0x03][lane][ino][off]`, so its extents spread
     /// across these N partitions → parallel write/read. Lane 0 (`[start,[0x03][1])`)
-    /// also holds the 0x01/0x02 metadata + any legacy non-striped `[0x03][ino…]`.
+    /// also holds any legacy non-striped `[0x03][ino…]`. The metadata region
+    /// `[0x06]` (inodes and directory entries behind a hash byte) is cut off
+    /// the last lane partition and into P runs of hashes, `[0x06][k*256/P]`:
+    /// P lane partitions and P metadata partitions in all.
     FsLanes { lanes: u8, parts: u8 },
     /// `kvc` = split by HASH BUCKET. The kvcache adapters store
     /// `{h}/{model}/{pool}/{hash}…` with `h` the first char of the sha256
@@ -1783,6 +1786,14 @@ pub(crate) enum PresplitRule {
     /// Cutting relative to the namespace prefix puts the points where the keys
     /// actually are.
     Hex { count: usize },
+}
+
+/// The fs metadata cuts for `parts` partitions: the region start `[0x06]`, then
+/// `parts - 1` evenly spaced hash boundaries `[0x06][k * 256 / parts]`.
+fn fs_meta_cuts(parts: u8) -> Vec<Vec<u8>> {
+    let mut cuts = vec![autumn_fs::key::meta_region()];
+    cuts.extend((1..parts as u16).map(|k| autumn_fs::key::meta_hash_boundary((k * 256 / parts as u16) as u8)));
+    cuts
 }
 
 /// The 16 hex digits in ASCENDING byte order (`'0'..'9'` = 0x30–0x39 then
@@ -1828,7 +1839,9 @@ pub(crate) fn presplit_suffixes(rule: &PresplitRule) -> Result<Vec<Vec<u8>>> {
                 );
             }
             let step = lanes / parts;
-            Ok((1..*parts).map(|k| vec![0x03u8, k * step]).collect())
+            let mut cuts: Vec<Vec<u8>> = (1..*parts).map(|k| vec![0x03u8, k * step]).collect();
+            cuts.extend(fs_meta_cuts(*parts));
+            Ok(cuts)
         }
         PresplitRule::Kvc { count } => {
             if *count > 16 {
@@ -1870,8 +1883,16 @@ pub(crate) fn presplit_record_suffixes(rule: &PresplitRule) -> Result<Vec<Vec<u8
             if *lanes < 2 {
                 return Ok(vec![]);
             }
-            // ALL lane boundaries `[0x03][lane]` for lane = 1..lanes.
-            Ok((1..*lanes).map(|lane| vec![0x03u8, lane]).collect())
+            // ALL lane boundaries `[0x03][lane]` for lane = 1..lanes, and the
+            // metadata cuts as made: a split of a metadata partition takes
+            // the median, and a finer recorded grid would forbid merging
+            // metadata partitions back.
+            let PresplitRule::FsLanes { parts, .. } = rule else { unreachable!() };
+            let mut grid: Vec<Vec<u8>> = (1..*lanes).map(|lane| vec![0x03u8, lane]).collect();
+            if *parts >= 2 {
+                grid.extend(fs_meta_cuts(*parts));
+            }
+            Ok(grid)
         }
         // All 15 bucket boundaries, so a later split of a multi-bucket
         // partition snaps to a bucket boundary.
@@ -2165,9 +2186,13 @@ mod tests {
     #[test]
     fn presplit_fs_lanes_cuts_at_lane_boundaries() {
         use super::PresplitRule;
-        // 4 lanes → cut at [0x03][1], [0x03][2], [0x03][3] → 4 partitions.
+        // 4 lanes → cut at [0x03][1], [0x03][2], [0x03][3] → 4 lane partitions,
+        // then the metadata region and its 4 hash runs → 4 more.
         let s = super::presplit_suffixes(&PresplitRule::FsLanes { lanes: 4, parts: 4 }).unwrap();
-        assert_eq!(s, vec![vec![0x03, 1], vec![0x03, 2], vec![0x03, 3]]);
+        assert_eq!(
+            s,
+            vec![vec![0x03, 1], vec![0x03, 2], vec![0x03, 3], vec![0x06], vec![0x06, 64], vec![0x06, 128], vec![0x06, 192]]
+        );
         // A striped extent on lane 2 (wire [0x03][2][ino][off]) sorts into the
         // partition [[0x03][2], [0x03][3]).
         let ext_lane2 = wire("fs",
@@ -2212,7 +2237,8 @@ mod lane_parts_tests {
             parts: 6,
         })
         .unwrap();
-        assert_eq!(cut.len(), 5);
+        assert_eq!(cut.iter().filter(|c| c[0] == 0x03).count(), 5);
+        assert_eq!(cut.len(), 5 + 6, "and the metadata region in 6 hash runs");
         // … but RECORD all 23 lane boundaries (M4): a partition owning lanes
         // [0,4) then holds a declared point so auto-split snaps to a lane
         // boundary instead of a median inside a lane.
@@ -2221,7 +2247,7 @@ mod lane_parts_tests {
             parts: 6,
         })
         .unwrap();
-        assert_eq!(rec.len(), 23);
+        assert_eq!(rec.len(), 23 + 6, "plus the metadata cuts as made");
         assert_eq!(rec[0], vec![0x03, 1]);
         assert_eq!(rec[22], vec![0x03, 23]);
         // The cut grid is a subset of the record grid.
@@ -2262,18 +2288,25 @@ mod lane_parts_tests {
             parts: 4,
         })
         .unwrap();
-        assert_eq!(s, vec![vec![0x03, 6], vec![0x03, 12], vec![0x03, 18]]);
-        // Every divisor of 24 works and yields parts-1 cuts, evenly spaced.
+        assert_eq!(s[..3], [vec![0x03, 6], vec![0x03, 12], vec![0x03, 18]]);
+        // Every divisor of 24 works and yields parts-1 lane cuts, evenly
+        // spaced, and parts metadata cuts: the region, then even hash runs.
         for p in [2u8, 3, 4, 6, 8, 12, 24] {
             let cuts = presplit_suffixes(&PresplitRule::FsLanes {
                 lanes: 24,
                 parts: p,
             })
             .unwrap();
-            assert_eq!(cuts.len() as u8, p - 1, "parts={p}");
+            let (lane, meta): (Vec<_>, Vec<_>) = cuts.into_iter().partition(|c| c[0] == 0x03);
+            assert_eq!(lane.len() as u8, p - 1, "parts={p}");
             let step = 24 / p;
-            for (k, c) in cuts.iter().enumerate() {
+            for (k, c) in lane.iter().enumerate() {
                 assert_eq!(c[1], (k as u8 + 1) * step, "parts={p} cut {k}");
+            }
+            assert_eq!(meta[0], vec![0x06], "parts={p}");
+            assert_eq!(meta.len() as u8, p, "parts={p}");
+            for (k, c) in meta.iter().enumerate().skip(1) {
+                assert_eq!(c[1] as usize, k * 256 / p as usize, "parts={p} meta cut {k}");
             }
         }
         // A non-divisor is REJECTED, not rounded: uneven lane runs make every

@@ -316,7 +316,7 @@ async fn cmd_ls(state: &mut FsState, path: &str, long: bool) -> Result<()> {
         }
         return Ok(());
     }
-    // Range scan over `[0x02][parent_ino BE]`. PS `handle_range` returns KEYS
+    // Range scan over `key::dirent_prefix(ino)`. PS `handle_range` returns KEYS
     // only (`value: vec![]`), so we batch-fetch the dirent values — and, in
     // long mode, the child inode metas — via `get_many` per page instead of a
     // sequential `get` per entry.
@@ -961,9 +961,8 @@ async fn cmd_put(state: &mut FsState, local: &PathBuf, remote: &str) -> Result<(
     // stripe EVERY file in a striped fs — the 64 MiB
     // threshold is gone. It protected almost nothing: with unit = MAX_EXTENT a
     // file of one extent or less has a single extent, which lands on lane 0
-    // regardless, i.e. byte-for-byte the same placement as not striping; and
-    // metadata (0x01/0x02) sorts below `[0x03][1]` so it never leaves lane 0
-    // either. Its only real effect was to REQUIRE the final size at create
+    // regardless, i.e. byte-for-byte the same placement as not striping.
+    // Its only real effect was to REQUIRE the final size at create
     // time — which is exactly what made streaming (fuse mount) writes
     // unstripeable, since the lane function itself is incremental.
     // `lanes < 2` is the explicit opt-OUT (a declared `lanes` of 1); everything

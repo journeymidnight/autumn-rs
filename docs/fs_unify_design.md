@@ -38,8 +38,8 @@ tree — `FsState` connects with `scoped("fs")`).
 
 | prefix | key | value |
 |---|---|---|
-| `0x01` | `[0x01][ino u64BE]` | `InodeMeta` (rkyv): mode/uid/gid/size/nlink/times, `inline_data` (≤4 KiB), `symlink_target`, `stripe` |
-| `0x02` | `[0x02][parent_ino u64BE][name]` | `DirentValue { child_inode, file_type }` |
+| `0x06` | `[0x06][meta_hash(ino)][0x01][ino u64BE]` | `InodeMeta` (rkyv): mode/uid/gid/size/nlink/times, `inline_data` (≤4 KiB), `symlink_target`, `stripe` |
+| `0x06` | `[0x06][meta_hash(parent)][0x02][parent_ino u64BE][name]` | `DirentValue { child_inode, file_type }` |
 | `0x03` | `[0x03][ino u64BE][logical_off u64BE]` | extent bytes, ≤ `MAX_EXTENT` = 8 MiB (non-striped file) |
 | `0x03` | `[0x03][lane u8][ino u64BE][logical_off u64BE]` | extent bytes of a lane-striped file |
 | `0x04` | `[0x04][field]` | superblock: `next_inode` (migration floor only), `schema_version`, `stripe_geom`, `rmtomb/[ino]` |

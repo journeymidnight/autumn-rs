@@ -170,6 +170,18 @@ pub async fn ensure_schema_version(state: &mut FsState) -> Result<()> {
                 })?;
             if found == schema::SCHEMA_VERSION {
                 Ok(())
+            } else if found == schema::SCHEMA_CONVERTING_TO_V5 {
+                Err(anyhow!(
+                    "fs/ is being converted to schema v5, or a conversion stopped part way: \
+                     run `convert_fs_v5 --manager <ADDR>` (again) before mounting"
+                ))
+            } else if found == 4 {
+                Err(anyhow!(
+                    "fs/ is schema v4 (inodes and directory entries under 0x01/0x02); this \
+                     build reads v{}. Stop every mount, S3 gateway and autumn.Fs on it and run \
+                     `convert_fs_v5 --manager <ADDR>` (docs/ops.md), then start them again",
+                    schema::SCHEMA_VERSION
+                ))
             } else {
                 Err(anyhow!(
                     "on-disk fs schema version {} != supported {} — refusing to mount \

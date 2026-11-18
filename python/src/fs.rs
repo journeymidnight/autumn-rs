@@ -1,8 +1,8 @@
 //! Python binding for the shared filesystem (`autumn.Fs`).
 //!
 //! A SYNCHRONOUS, blocking façade over `autumn-fs`: meta/dir/extent/read/
-//! write ops on the shared inode layout (`0x01` inode / `0x02` dirent / `0x03`
-//! extent), plus the reusable `autumn_client::lease` primitives. This is the
+//! write ops on the shared inode layout (inode and dirent under `0x06`, extents
+//! under `0x03`), plus the reusable `autumn_client::lease` primitives. This is the
 //! SAME Rust code the `autumn-fuse` kernel mount runs on — the logic is NOT reimplemented
 //! in Python, so a file created through `Fs` is byte-identical through the mount
 //! (and vice versa), with no drift.

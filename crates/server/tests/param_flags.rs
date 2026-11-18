@@ -171,6 +171,7 @@ fn config_keys_lists_every_runtime_parameter() {
 }
 
 const MIGRATE_BIN: &str = env!("CARGO_BIN_EXE_migratev1_v2");
+const CONVERT_FS_BIN: &str = env!("CARGO_BIN_EXE_convert_fs_v5");
 
 /// The CLIs' own parameter structs (the servers' are checked above): their
 /// `--help` lists every flag the parser takes.
@@ -179,6 +180,7 @@ fn cli_help_lists_every_parameter() {
     assert_help_lists_every_parameter::<autumn_params::op::OpParams>(OP_BIN);
     assert_help_lists_every_parameter::<autumn_params::client_cli::ClientCliParams>(CLIENT_BIN);
     assert_help_lists_every_parameter::<autumn_params::migrate::MigrateParams>(MIGRATE_BIN);
+    assert_help_lists_every_parameter::<autumn_params::convert::ConvertFsParams>(CONVERT_FS_BIN);
 }
 
 /// A bad startup argument exits 2 before anything starts, on every binary

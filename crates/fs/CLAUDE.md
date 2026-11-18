@@ -78,11 +78,25 @@ file are contiguous and ordered by logical offset.
 
 | Prefix | Use | Key format | Value |
 |------|------|---------|-------|
-| `0x01` | Inode metadata | `[0x01][ino: u64 BE]` | InodeMeta (rkyv) |
-| `0x02` | Directory entry | `[0x02][parent: u64 BE][name]` | DirentValue (rkyv) |
+| `0x06` | Inode metadata | `[0x06][meta_hash(ino)][0x01][ino: u64 BE]` | InodeMeta (rkyv) |
+| `0x06` | Directory entry | `[0x06][meta_hash(parent)][0x02][parent: u64 BE][name]` | DirentValue (rkyv) |
 | `0x03` | File data extent | `[0x03][ino: u64 BE][logical_off: u64 BE]` | raw bytes ≤ 8 MiB (`MAX_EXTENT`) |
 | `0x03` | Striped extent | `[0x03][lane: u8][ino BE][logical_off BE]` | raw bytes ≤ `MAX_EXTENT` |
 | `0x04` | FS superblock | `[0x04][field]` | varies (`next_inode` / `schema_version` / `stripe_geom` / `rmtomb/[ino]` / `sess/` / `pend/` / `rbase/[S][ino]`) |
+| `0x05` | Segment map page | `[0x05][map_id BE][page BE]` | segment page (rkyv) |
+
+**Metadata sits behind a hash byte** (`key::meta_hash`, Fibonacci hashing of the inode
+number, FROZEN: every metadata key carries it). Inode numbers come from one growing
+counter, so in plain `[type][ino]` order every new file and every recent read landed in the
+last partition, and a split only chased that tail; all metadata was in one partition and
+measured as the 4 KiB S3 GET limit (one PS thread at 90%). Behind the hash, consecutive
+inodes spread evenly over 256 values, and `namespace-create --name fs --parts N` cuts the
+region at `[0x06]` and `[0x06][k*256/N]`: N metadata partitions beside the N lane
+partitions. Inodes and directory entries share the region so a partition holding a run of
+hashes holds both kinds. A directory's entries stay contiguous (`dirent_prefix`), so
+readdir is one scan; one huge directory still sits in one hash run and spreads only by a
+split on names. Measured before the layout, with the same keys cut by hand into 5
+partitions: 4 KiB GET 28.4K -> 66.6K obj/s.
 
 **Namespace binding**: wire key = `fs/[type][fields]` (one global tree). `autumn-fuse` /
 `autumnfs` / PyO3 `autumn.Fs` have no scope parameter; `FsState` uses `connect(mgr, "fs")` / `scoped("fs")`. Several mutually isolated trees use different
@@ -163,12 +177,12 @@ ceiling.
 ```
 
 ```
-  [0x01][ino=1]  →  InodeMeta{ mode=S_IFDIR|0755, nlink=3, size=0, ... }
-  [0x01][ino=3]  →  InodeMeta{ mode=S_IFREG|0644, nlink=1, size=614400, inline_data=None, stripe=None }
-  [0x02][parent=1]["docs"]        →  { child_inode=2, file_type=DT_DIR }
-  [0x02][parent=2]["readme.txt"]  →  { child_inode=3, file_type=DT_REG }   (name in the key, not the value)
+  [0x06][h(1)][0x01][ino=1]  →  InodeMeta{ mode=S_IFDIR|0755, nlink=3, size=0, ... }
+  [0x06][h(3)][0x01][ino=3]  →  InodeMeta{ mode=S_IFREG|0644, nlink=1, size=614400, inline_data=None, stripe=None }
+  [0x06][h(1)][0x02][parent=1]["docs"]        →  { child_inode=2, file_type=DT_DIR }
+  [0x06][h(2)][0x02][parent=2]["readme.txt"]  →  { child_inode=3, file_type=DT_REG }   (name in the key, not the value)
   [0x03][ino=3][off=0]            →  [≤ 8 MiB raw bytes]
-  [0x04]["next_inode"] / ["schema_version"]=3 / ["stripe_geom"]=StripeLayout(rkyv)
+  [0x04]["next_inode"] / ["schema_version"]=5 / ["stripe_geom"]=StripeLayout(rkyv)
 ```
 
 `DirentValue.child_inode` points at an `InodeMeta`; the ino in an extent key is that InodeMeta's
@@ -176,14 +190,14 @@ inode number; `InodeMeta.size` bounds the visible extent range.
 
 ### InodeMeta — "what this thing is"
 
-Key `[0x01][ino BE]`, describing the file/directory's **own attributes** (corresponding to Linux `struct stat`):
+Key `[0x06][h(ino)][0x01][ino BE]`, describing the file/directory's **own attributes** (corresponding to Linux `struct stat`):
 `mode` (type + permissions), `uid`/`gid`, `size` (0 for directories), `nlink`, `atime`/`mtime`/
 `ctime`, `inline_data` (small-file data ≤4KB), `symlink_target`, `stripe` (stripe geometry or
 None). **It contains neither the file name nor the parent directory** — an inode does not know its name or location, which is what makes hard links work.
 
 ### DirentValue — "who is called what under which directory"
 
-Key `[0x02][parent_ino BE][name]`, two fields: `child_inode`, `file_type`
+Key `[0x06][h(parent)][0x02][parent_ino BE][name]`, two fields: `child_inode`, `file_type`
 (DT_REG=8 / DT_DIR=4 / DT_LNK=10). The file name is in the key, not the value. `file_type` duplicates
 `InodeMeta.mode` to **trade space for time**: `readdir` returns each entry's type directly without looking up
 InodeMeta once per entry (as in ext4's `ext4_dir_entry_2.file_type`).
@@ -205,7 +219,7 @@ Embedding one in the other would make hard links impossible (several names shari
 | FUSE operation | KV operations |
 |-----------|---------|
 | `lookup(parent, name)` | 1× Get dirent + 1× Get inode |
-| `readdir(ino)` | paginated Range(prefix=[0x02][ino BE]) + one batched get per page |
+| `readdir(ino)` | paginated Range(prefix=`dirent_prefix(ino)`) + one batched get per page |
 | `getattr(ino)` | 1× Get inode |
 | `mkdir`/`create(parent, name)` | 1× Put inode + 1× CAS dirent (create-only) + 1× Get parent + 1× CAS parent (create: at most once a second per directory); the parent's Get moves before the publish the first time this session meets that directory (`check_parent`) |
 | `link`, `unlink` (file count) | 1× Get + 1× CAS inode (`change_links`); whole-inode writes (flush, truncate, setattr) also Get + CAS (one more round trip per dirty flush than the old put; an unknown outcome is settled by re-reading) |
@@ -228,7 +242,7 @@ most repeated lookups.
 | `INLINE_THRESHOLD` | 4 KiB | small-file inline threshold (matches VALUE_THROTTLE) |
 | `DEFAULT_STRIPE_LANES` | 24 | default lane count when the fs declares no geometry |
 | `ROOT_INO` | 1 | root inode (FUSE_ROOT_ID) |
-| `SCHEMA_VERSION` | 4 | see fail-loud below |
+| `SCHEMA_VERSION` | 5 | see fail-loud below |
 | `DT_REG`/`DT_DIR`/`DT_LNK` | 8/4/10 | dirent types |
 
 Parameters (`FsParams` in `crates/params/src/fs.rs`, process-wide `autumn_fs::params()`, parsed as flags by the
@@ -247,7 +261,7 @@ binary that embeds the fs layer):
 ## Core data structures
 
 ```rust
-struct InodeMeta {          // rkyv, key [0x01][ino BE]
+struct InodeMeta {          // rkyv, key [0x06][h(ino)][0x01][ino BE]
     mode: u32, uid: u32, gid: u32, size: u64, nlink: u32,
     atime_secs: i64, atime_nsecs: u32,
     mtime_secs: i64, mtime_nsecs: u32,
@@ -257,7 +271,7 @@ struct InodeMeta {          // rkyv, key [0x01][ino BE]
     stripe: Option<StripeLayout>,     // Some = striped, None = single-partition legacy
 }
 
-struct DirentValue { child_inode: u64, file_type: u8 }  // key [0x02][parent BE][name]
+struct DirentValue { child_inode: u64, file_type: u8 }  // key [0x06][h(parent)][0x02][parent BE][name]
 
 struct StripeLayout { lanes: u8, unit_bytes: u32 }       // [0x04]stripe_geom + per-inode
 
@@ -399,7 +413,7 @@ Do not fall back on the assumption "FLUSH always comes before RELEASE anyway" ei
 "filesystems shouldn't assume that flush will always be called ... or that it will be
 called at all", which is exactly the hole this record exists to plug.
 ⚠️ The reachable shape of this is **the extent key and the inode key landing in different partitions** (`[0x03][ino][off]` and
-`[0x01][ino]` sort far apart and are necessarily separated after a split) with the extent side unavailable; lease revocation is **not** it —
+`[0x06][h][0x01][ino]` sort far apart and are necessarily separated after a split) with the extent side unavailable; lease revocation is **not** it —
 `put_inode` carries the fence too, so both sides fail together. The fsync guard in `scripts/fuse_chaos.sh` kills the whole cluster and
 **cannot isolate this one** (the meta put fails too); isolating it for real requires freezing a single partition.
 
@@ -797,7 +811,7 @@ the old cursor never advanced.
 
 ## Schema version stamp (fail-loud)
 
-`schema::SCHEMA_VERSION` = **4**, stored at `[0x04]schema_version` (relative key, i.e.
+`schema::SCHEMA_VERSION` = **5**, stored at `[0x04]schema_version` (relative key, i.e.
 `fs/[0x04]schema_version`). `meta::ensure_schema_version` at mount (the `ensure_root`
 entry) stamps it if missing, checks it if present, and **fails loud and refuses to mount on mismatch** (guarding against a future incompatible layout silently reading/writing corrupt data).
 - v1 = pre-namespace bare keys (never stamped).
@@ -808,6 +822,11 @@ entry) stamps it if missing, checks it if present, and **fails loud and refuses 
 - v4 = segmented files + content generation: `InodeMeta` gains `generation` and `segments`. The historical migration converted in place with a one-shot
   offline tool, keeping every inode's number/links/bytes, yielding `generation=1` and
   `segments=None`, changing the stamp last, with no reset; the tool has since been removed.
+- v5 = metadata behind a hash byte (`0x06` region, above). Values unchanged. `convert_fs_v5`
+  (one-shot, stopped filesystem) moves each v4 `[0x01][ino]` / `[0x02][parent][name]` key to its
+  v5 key, put then delete, page by page, under the stamp `SCHEMA_CONVERTING_TO_V5` (which
+  neither build mounts), and stamps 5 last; regions never overlap, so a stopped run is run again
+  (`crates/manager/tests/fs_convert_v5.rs`). A v4 stamp is refused naming the tool.
 - **Missing stamp ≠ new tree**: only a tree with no inode at all counts as new and gets the current version stamped; inodes without a stamp were created by
   pre-v4 tools that did not stamp (`autumnfs`, the S3 gateway), and the inodes are v3 — mount is refused, pointing to
   the standalone conversion procedure of the corresponding historical release. It used to stamp v4 directly; in an actual conversion that made a v3 tree
