@@ -100,6 +100,17 @@ pub const MAX_SYMLINK_HOPS: usize = 40;
 /// (`lstat`); links before it are still followed, and so is a last one
 /// written `link/` or `link/.`, as POSIX does.
 pub async fn resolve_follow(state: &mut FsState, path: &str, follow_last: bool) -> Result<Option<(u64, u8)>> {
+    resolve_follow_with(&state.client, path, follow_last).await
+}
+
+/// [`resolve_follow`] with only the client, so a caller can walk a path
+/// without holding its `FsState` (the S3 gateway's read path).
+pub async fn resolve_follow_with(
+    client: &autumn_client::ClusterClient,
+    path: &str,
+    follow_last: bool,
+) -> Result<Option<(u64, u8)>> {
+    let get = |k: Vec<u8>| async move { client.get(&k).await.map_err(|e| anyhow!("KV get: {e}")) };
     let follow_last = follow_last || path.ends_with('/') || path.ends_with("/.");
     let mut todo: std::collections::VecDeque<Vec<u8>> = components(path.as_bytes()).collect();
     // The directories walked into, so `..` can go back.
@@ -114,7 +125,7 @@ pub async fn resolve_follow(state: &mut FsState, path: &str, follow_last: bool) 
             ino = parents.pop().unwrap_or(ROOT_INO);
             continue;
         }
-        let Some(v) = state.kv_get_opt(&key::dirent_key(ino, &comp)).await? else {
+        let Some(v) = get(key::dirent_key(ino, &comp)).await? else {
             return Ok(None);
         };
         let dirent: DirentValue = schema::decode_dirent(&v).map_err(|e| anyhow!("{}", e))?;
@@ -126,7 +137,7 @@ pub async fn resolve_follow(state: &mut FsState, path: &str, follow_last: bool) 
                 return Err(anyhow!("ELOOP: more than {MAX_SYMLINK_HOPS} symbolic links"));
             }
             // A link removed since its name was read leads nowhere.
-            let Some(b) = state.kv_get_opt(&key::inode_key(dirent.child_inode)).await? else {
+            let Some(b) = get(key::inode_key(dirent.child_inode)).await? else {
                 return Ok(None);
             };
             let m = schema::decode_inode_meta(&b).map_err(|e| anyhow!("inode {}: {e}", dirent.child_inode))?;

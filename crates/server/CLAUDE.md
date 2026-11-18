@@ -289,8 +289,8 @@ including none.
   `If-Match` names exactly one version; a tag this gateway did not issue names
   no version (412, or 404 when there is no object).
 - **The worker's state lock is held only for metadata steps; bytes never
-  move under it.** Begin, the inode put, publish and namespace lookups take
-  it. A request body streams into its data object through the client alone
+  move under it.** Begin, the inode put, publish, a GET's pin and the write
+  and listing lookups take it. A request body streams into its data object through the client alone
   (`NewFile::start_object` + `write_streamed`, then `flush_streamed` for the
   tail before the lock is taken; UploadPart needs the lock only for its
   begin). Deleting data is handed to the reclaimer thread (below): a DELETE,
@@ -325,7 +325,8 @@ including none.
   client disconnect dropping the request future mid-await. Without it the
   pending record would stay under the worker's session, which is alive, so no
   recovery would ever look at it.
-- **A GET pins what it streams** (`objects::open_pinned`). It takes a STABLE
+- **A GET pins what it streams** (`objects::open_for_get`; an inline object
+  is not streamed and is not pinned, see the lock bullet below). It takes a STABLE
   lease before reading the metadata, so the headers and every byte are one
   version, and no other client can write it in place or reclaim its data
   until the body is done or the client goes away. A delete or overwrite still
@@ -340,7 +341,8 @@ including none.
   2 s (`--pin-linger-ms`) so the sequential ranged GETs of the streamer and of Lance
   scans share one manager acquire; a mount writer is refused EBUSY during that
   linger. A writer holding the file makes the GET a 503 `SlowDown`, which SDKs
-  retry. A pin the heartbeat finds gone ends the body with an error rather than
+  retry; a mount writing an inline object does not, and the GET returns what
+  the inode holds. A pin the heartbeat finds gone ends the body with an error rather than
   risk a changed file.
 - **Conditional reads** follow RFC 9110 order (If-Match, else
   If-Unmodified-Since; If-None-Match, else If-Modified-Since), which is what S3
@@ -376,6 +378,10 @@ including none.
   reclaimer's. For the same reason a worker hands a file over only after
   releasing its own REPLACE on it, and a file deleted while this worker streams
   it is handed over when the pin is released (~2 s after the GET, measured).
+  The GET's path walk is outside the lock, so a delete on the same worker can
+  also land between the walk and the pin, as one on another worker can: the
+  reclaimer then either finds the pin and leaves the tombstone to the sweep,
+  or reclaims first and the GET sees no object.
   A hand-off lost to a crash is found again by the sweeps, because the worker
   made it durable first. All idempotent, safe in several gateways at once.
   Every worker also runs the lease heartbeat. Without it the publishing
@@ -452,6 +458,18 @@ autumn-s3 --manager <host:port> [--listen 0.0.0.0] [--port 9000] [--workers N]
   under 64 concurrent 1 MiB PUTs some waited the whole run (p99 8.5 s, max
   40 s). FIFO: p99 0.3 s, max 0.45 s, throughput 10% lower. That lock is now
   the visible limit of a PUT: half its median time is the wait for it.
+- **HEAD and the GET lookups take no lock** (`objects::Shared.client`,
+  `dir::resolve_follow_with`): the path walk and the inode get need only the
+  client. An object whose whole content is inline in its inode (1 to 4096
+  bytes; an empty object has no inline data and is pinned) is answered from
+  that one get, with no pin: one get is one version and there is no data to
+  reclaim under it. Only a larger object takes the lock, to pin, and pays one
+  more inode get for the inline check, skipped when this worker already pins
+  it (a streamer's ranged GETs of one file). With every lookup and the pin under the lock a worker served one GET at
+  a time: 4 KiB GETs (warp, 8 workers, RF 2) were 14.5K / 15.9K / 15.8K obj/s
+  at 8 / 32 / 64 concurrent, now 22.8K / 28.7K / 28.6K. The limit is now the
+  partition holding all `fs/` metadata (90% of a core): a GET is three gets
+  there (bucket dirent, key dirent, inode).
 - **A bucket answers at `/{bucket}/` too** — minio-go (warp, mc) sends that
   form for HEAD and listing. A bucket GET takes only ListObjectsV2's
   parameters; any other (`?location`, `?versioning`, `?uploads`, a v1

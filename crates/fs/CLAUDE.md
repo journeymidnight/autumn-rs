@@ -906,6 +906,8 @@ existing cache fails outright.
     front-end without the mount knows. Absolute links made on a mount name host
     paths and usually resolve to nothing here.
   - Over 40 hops (Linux MAXSYMLINKS) is ELOOP.
+  - `resolve_follow_with` is the same walk with only a `ClusterClient`, so a
+    caller need not hold its `FsState` (the S3 gateway's GET and HEAD).
   - `follow_last = false` is `lstat`: a link in the last component is returned
     itself; links before it are followed, and so is a last one written `link/`
     or `link/.`, as POSIX does. The last component is the one popped when the

@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use autumn_client::lease::{self, AcquireResult};
+use autumn_client::ClusterClient;
 use autumn_fs::dir::DirChild;
 use autumn_fs::read::{self, ReadPlan};
 use autumn_fs::schema::{self, InodeMeta, DT_DIR};
@@ -42,8 +43,30 @@ use crate::s3::ObjectRow;
 /// The mutex is FIFO. `futures::lock::Mutex` is not: on this one thread a
 /// woken waiter runs only after requests arriving meanwhile have taken the
 /// lock again, and under 64 concurrent PUTs some waited 40 s.
-pub type Fs = Rc<FsLock<FsState>>;
+///
+/// Reads that need only the KV (HEAD, a GET of an inline object) use
+/// `client` and never queue on the lock: with every GET's lookups under it, a
+/// worker served one GET at a time, and 4 KiB GETs stopped at ~16K/s for 8
+/// workers whatever the concurrency.
+pub type Fs = Rc<Shared>;
 pub type FsLock<T> = tokio::sync::Mutex<T>;
+
+pub struct Shared {
+    state: FsLock<FsState>,
+    /// The state's own client and lease table.
+    pub client: Rc<ClusterClient>,
+    held_leases: Rc<RefCell<HashMap<u64, FuseLease>>>,
+}
+
+impl Shared {
+    pub fn new(state: FsState) -> Self {
+        Shared { client: state.client.clone(), held_leases: state.held_leases.clone(), state: FsLock::new(state) }
+    }
+
+    pub async fn lock(&self) -> tokio::sync::MutexGuard<'_, FsState> {
+        self.state.lock().await
+    }
+}
 
 /// A file's identity as S3 reports it.
 pub struct Stat {
@@ -75,7 +98,11 @@ fn stat_of(ino: u64, m: &InodeMeta) -> Stat {
 /// a mount writes files in place, so a cached copy can carry a stale
 /// generation and hand out a stale ETag.
 pub async fn inode_meta(st: &mut FsState, ino: u64) -> Result<Option<InodeMeta>> {
-    match st.kv_get_opt(&key::inode_key(ino)).await? {
+    inode_meta_with(&st.client, ino).await
+}
+
+async fn inode_meta_with(client: &ClusterClient, ino: u64) -> Result<Option<InodeMeta>> {
+    match client.get(&key::inode_key(ino)).await.map_err(|e| anyhow!("KV get: {e}"))? {
         Some(b) => Ok(Some(schema::decode_inode_meta(&b).map_err(|e| anyhow!("inode {ino}: {e}"))?)),
         None => Ok(None),
     }
@@ -97,14 +124,22 @@ async fn resolve(fs: &Fs, path: &str) -> Result<Option<u64>> {
 /// snapshot's files are links into its `blobs/`), and its type. A link that
 /// loops leads nowhere, like a dangling one: no object, not a failed request.
 async fn follow_typed(st: &mut FsState, path: &str) -> Result<Option<(u64, u8)>> {
-    match dir::resolve_follow(st, path, true).await {
+    follow_typed_with(&st.client, path).await
+}
+
+async fn follow_typed_with(client: &ClusterClient, path: &str) -> Result<Option<(u64, u8)>> {
+    match dir::resolve_follow_with(client, path, true).await {
         Err(e) if e.to_string().starts_with("ELOOP") => Ok(None),
         r => r,
     }
 }
 
 async fn follow(st: &mut FsState, path: &str) -> Result<Option<u64>> {
-    Ok(follow_typed(st, path).await?.map(|(ino, _)| ino))
+    follow_with(&st.client, path).await
+}
+
+async fn follow_with(client: &ClusterClient, path: &str) -> Result<Option<u64>> {
+    Ok(follow_typed_with(client, path).await?.map(|(ino, _)| ino))
 }
 
 /// The `fs/` root's subdirectories, which are this gateway's buckets.
@@ -133,11 +168,10 @@ pub async fn bucket_exists(fs: &Fs, bucket: &str) -> Result<bool> {
 /// Stat one object. `None` means no such key (or the key names a directory,
 /// which is not an object).
 pub async fn stat(fs: &Fs, bucket: &str, key: &str) -> Result<Option<Stat>> {
-    let mut st = fs.lock().await;
-    let Some(ino) = follow(&mut st, &format!("/{bucket}/{key}")).await? else {
+    let Some(ino) = follow_with(&fs.client, &format!("/{bucket}/{key}")).await? else {
         return Ok(None);
     };
-    Ok(inode_meta(&mut st, ino).await?.filter(|m| !is_dir(m)).map(|m| stat_of(ino, &m)))
+    Ok(inode_meta_with(&fs.client, ino).await?.filter(|m| !is_dir(m)).map(|m| stat_of(ino, &m)))
 }
 
 // ── pinning an object for a GET ─────────────────────────────────────────────
@@ -276,35 +310,100 @@ pub struct Opened {
     pub pin: Pin,
 }
 
-/// Resolve and pin an object. `None` is no such key (or a directory).
-pub async fn open_pinned(fs: &Fs, bucket: &str, key: &str) -> Result<Option<Opened>, OpenError> {
+/// What a GET reads: the bytes themselves, or a pin to stream them under.
+pub enum ForGet {
+    /// A file whose whole content is in its inode. The one KV get that read
+    /// it is one version, and there is no data to reclaim under it, so it
+    /// needs no pin and costs the manager nothing.
+    Inline { stat: Stat, data: Vec<u8> },
+    Pinned(Opened),
+}
+
+/// Whether the inode holds the file's whole content inline.
+fn whole_inline(m: &InodeMeta) -> bool {
+    m.inline_data.as_ref().is_some_and(|d| d.len() as u64 == m.size) && m.segments.is_none() && m.stripe.is_none()
+}
+
+/// Open an object for a GET. `None` is no such key (or a directory).
+pub async fn open_for_get(fs: &Fs, bucket: &str, key: &str) -> Result<Option<ForGet>, OpenError> {
     let path = format!("/{bucket}/{key}");
     // The name can move between the lookup and the pin, and an inode
     // reclaimed in that gap is simply gone: look again.
     for _ in 0..3 {
-        let mut st = fs.lock().await;
-        let Some(ino) = follow(&mut st, &path).await? else {
+        // The lookups take no lock: they need only the client, and under the
+        // lock a worker would serve one GET at a time.
+        let Some(ino) = follow_with(&fs.client, &path).await? else {
             return Ok(None);
         };
-        pin_locked(&mut st, ino).await?;
-        let m = inode_meta(&mut st, ino).await;
-        match m {
-            Ok(Some(m)) if !is_dir(&m) => {
-                let held = st.held_leases.clone();
-                return Ok(Some(Opened { stat: stat_of(ino, &m), pin: Pin { fs: fs.clone(), ino, held } }));
+        // A file this worker pins already is streamed, not inline (the
+        // ranged GETs of one large file): skip straight to sharing its pin.
+        if !fs.held_leases.borrow().contains_key(&ino) {
+            match inode_meta_with(&fs.client, ino).await? {
+                None => continue,
+                Some(m) if is_dir(&m) => return Ok(None),
+                Some(mut m) if whole_inline(&m) => {
+                    let stat = stat_of(ino, &m);
+                    let data = m.inline_data.take().expect("checked inline");
+                    return Ok(Some(ForGet::Inline { stat, data }));
+                }
+                Some(_) => {}
             }
-            Ok(Some(_)) => {
-                unpin_locked(fs, &mut st, ino);
-                return Ok(None);
-            }
-            Ok(None) => unpin_locked(fs, &mut st, ino),
-            Err(e) => {
-                unpin_locked(fs, &mut st, ino);
-                return Err(e.into());
-            }
+        }
+        match pin(fs, ino).await? {
+            Pinned::Object(o) => return Ok(Some(ForGet::Pinned(o))),
+            Pinned::NotAnObject => return Ok(None),
+            Pinned::Gone => {}
         }
     }
     Ok(None)
+}
+
+/// Resolve and pin an object. `None` is no such key (or a directory).
+pub async fn open_pinned(fs: &Fs, bucket: &str, key: &str) -> Result<Option<Opened>, OpenError> {
+    let path = format!("/{bucket}/{key}");
+    for _ in 0..3 {
+        let Some(ino) = follow_with(&fs.client, &path).await? else {
+            return Ok(None);
+        };
+        match pin(fs, ino).await? {
+            Pinned::Object(o) => return Ok(Some(o)),
+            Pinned::NotAnObject => return Ok(None),
+            Pinned::Gone => {}
+        }
+    }
+    Ok(None)
+}
+
+enum Pinned {
+    Object(Opened),
+    /// A directory.
+    NotAnObject,
+    /// Reclaimed since its name was read.
+    Gone,
+}
+
+/// Pin `ino` and read its metadata under the pin.
+async fn pin(fs: &Fs, ino: u64) -> Result<Pinned, OpenError> {
+    let mut st = fs.lock().await;
+    pin_locked(&mut st, ino).await?;
+    match inode_meta(&mut st, ino).await {
+        Ok(Some(m)) if !is_dir(&m) => {
+            let held = st.held_leases.clone();
+            Ok(Pinned::Object(Opened { stat: stat_of(ino, &m), pin: Pin { fs: fs.clone(), ino, held } }))
+        }
+        Ok(Some(_)) => {
+            unpin_locked(fs, &mut st, ino);
+            Ok(Pinned::NotAnObject)
+        }
+        Ok(None) => {
+            unpin_locked(fs, &mut st, ino);
+            Ok(Pinned::Gone)
+        }
+        Err(e) => {
+            unpin_locked(fs, &mut st, ino);
+            Err(e.into())
+        }
+    }
 }
 
 /// The result of one `ListObjectsV2` page.

@@ -3,7 +3,9 @@
 //! - a bucket addressed as `/{bucket}/`, the form minio-go (warp, mc) sends,
 //!   is the bucket;
 //! - small responses are not held back by Nagle: sequential GETs on one
-//!   keep-alive connection do not each wait for the client's delayed ACK.
+//!   keep-alive connection do not each wait for the client's delayed ACK;
+//! - a GET of an inline object reads it whole and takes no lease, while a
+//!   larger object is pinned for its body.
 
 mod support;
 
@@ -13,8 +15,10 @@ use std::net::{SocketAddr, TcpStream};
 use std::time::{Duration, Instant};
 
 use autumn_fs::state::FsState;
+use autumn_client::lease::{self, AcquireResult, DaemonClientId};
 use autumn_fs::{dir, meta};
 use autumn_rpc::client::RpcClient;
+use autumn_rpc::manager_rpc::LEASE_MODE_EXCLUSIVE;
 
 use support::*;
 
@@ -28,7 +32,7 @@ impl Drop for Gateway {
 }
 
 /// A cluster with an empty bucket `b`, and the gateway serving it.
-fn gateway(base: u16) -> (Gateway, SocketAddr, (tempfile::TempDir, tempfile::TempDir)) {
+fn gateway(base: u16) -> (Gateway, SocketAddr, SocketAddr, (tempfile::TempDir, tempfile::TempDir)) {
     let mgr_addr = pick_addr();
     start_manager(mgr_addr);
     let dirs = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
@@ -62,7 +66,7 @@ fn gateway(base: u16) -> (Gateway, SocketAddr, (tempfile::TempDir, tempfile::Tem
         assert!(Instant::now() < deadline, "autumn-s3 never listened");
         std::thread::sleep(Duration::from_millis(200));
     }
-    (gw, addr, dirs)
+    (gw, addr, mgr_addr, dirs)
 }
 
 /// One request on a fresh connection; the status code and the raw response.
@@ -100,7 +104,7 @@ fn keep_alive(c: &mut TcpStream, head: &str, body: &[u8]) -> (u16, Vec<u8>) {
 
 #[test]
 fn a_bucket_with_a_trailing_slash_is_the_bucket() {
-    let (_gw, addr, _dirs) = gateway(266);
+    let (_gw, addr, _mgr, _dirs) = gateway(266);
     for path in ["/b", "/b/"] {
         assert_eq!(http(addr, "HEAD", path).0, 200, "HEAD {path}");
         let (code, text) = http(addr, "GET", &format!("{path}?list-type=2"));
@@ -119,7 +123,7 @@ fn a_bucket_with_a_trailing_slash_is_the_bucket() {
 /// delayed ACK. The median of 20 stays far below that floor.
 #[test]
 fn small_gets_on_one_connection_are_not_delayed() {
-    let (_gw, addr, _dirs) = gateway(267);
+    let (_gw, addr, _mgr, _dirs) = gateway(267);
     let mut c = TcpStream::connect(addr).unwrap();
     let body: Vec<u8> = (0..4096u32).map(|i| i as u8).collect();
     let put = format!("PUT /b/small HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n", body.len());
@@ -136,4 +140,45 @@ fn small_gets_on_one_connection_are_not_delayed() {
         .collect();
     took.sort();
     assert!(took[10] < Duration::from_millis(25), "median small GET took {:?} ({took:?})", took[10]);
+}
+
+/// An object of at most 4096 bytes lives in its inode: the GET reads it whole
+/// in one get and pins nothing, so another client can take the file at once.
+/// One byte larger, the body is streamed under a STABLE pin that lingers
+/// after the GET (`--pin-linger-ms`, 2 s), and the same acquire is refused.
+#[test]
+fn an_inline_get_takes_no_lease() {
+    let (_gw, addr, mgr, _dirs) = gateway(268);
+    let mut c = TcpStream::connect(addr).unwrap();
+    for (name, n) in [("small", 4096usize), ("big", 4097)] {
+        let body: Vec<u8> = (0..n).map(|i| (i * 7) as u8).collect();
+        let put = format!("PUT /b/{name} HTTP/1.1\r\nHost: x\r\nContent-Length: {n}\r\n\r\n");
+        assert_eq!(keep_alive(&mut c, &put, &body).0, 200, "PUT {name}");
+        let get = format!("GET /b/{name} HTTP/1.1\r\nHost: x\r\n\r\n");
+        assert_eq!(keep_alive(&mut c, &get, b""), (200, body.clone()), "GET {name}");
+        let ranged = format!("GET /b/{name} HTTP/1.1\r\nHost: x\r\nRange: bytes=4090-\r\n\r\n");
+        assert_eq!(keep_alive(&mut c, &ranged, b""), (206, body[4090..].to_vec()), "ranged GET {name}");
+        let suffix = format!("GET /b/{name} HTTP/1.1\r\nHost: x\r\nRange: bytes=-5\r\n\r\n");
+        assert_eq!(keep_alive(&mut c, &suffix, b""), (206, body[n - 5..].to_vec()), "suffix GET {name}");
+        let past = format!("GET /b/{name} HTTP/1.1\r\nHost: x\r\nRange: bytes={n}-\r\n\r\n");
+        assert_eq!(keep_alive(&mut c, &past, b"").0, 416, "unsatisfiable GET {name}");
+    }
+
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        let mut st = FsState::new(&mgr.to_string()).await.unwrap();
+        let other = DaemonClientId::new("other");
+        for (name, free) in [("small", true), ("big", false)] {
+            let get = format!("GET /b/{name} HTTP/1.1\r\nHost: x\r\n\r\n");
+            assert_eq!(keep_alive(&mut c, &get, b"").0, 200);
+            let ino = dir::resolve(&mut st, &format!("/b/{name}")).await.unwrap().unwrap();
+            let granted = match lease::acquire(&st.client, &other, ino, LEASE_MODE_EXCLUSIVE).await.unwrap() {
+                AcquireResult::Granted(_) => true,
+                AcquireResult::Conflict { .. } | AcquireResult::RevokePending { .. } => false,
+            };
+            assert_eq!(granted, free, "EXCLUSIVE on {name} right after its GET");
+            if granted {
+                lease::release(&st.client, &other, ino).await.unwrap();
+            }
+        }
+    });
 }

@@ -44,7 +44,7 @@ use send_wrapper::SendWrapper;
 
 use autumn_params::s3::S3Params;
 use autumn_params::{Positional, Section};
-use objects::{Fs, OpenError};
+use objects::{ForGet, Fs, OpenError};
 use s3::{CondOutcome, RangeSpec, ReadConditions, S3Error};
 
 /// Body chunk for a streamed GET. Matches the fs layer's max extent, so each
@@ -179,10 +179,11 @@ async fn head_object(fs: &Fs, bucket: String, key: String, headers: HeaderMap) -
 /// `GET /{bucket}/{key}`, with or without a `Range`.
 async fn get_object(fs: &Fs, bucket: String, key: String, headers: HeaderMap) -> Response {
     let resource = format!("{bucket}/{key}");
-    // Pinned before its metadata is read, so the headers and every byte of
-    // the body are one version, and no other client can change or reclaim it
-    // until the body is done (or the client goes away).
-    let opened = match objects::open_pinned(fs, &bucket, &key).await {
+    // An inline object is read whole in one get. Any other is pinned before
+    // its metadata is read, so the headers and every byte of the body are one
+    // version, and no other client can change or reclaim it until the body is
+    // done (or the client goes away).
+    let opened = match objects::open_for_get(fs, &bucket, &key).await {
         Ok(Some(o)) => o,
         Ok(None) => return S3Error::no_such_key(resource).into_response(),
         Err(OpenError::Busy(m)) => {
@@ -190,7 +191,10 @@ async fn get_object(fs: &Fs, bucket: String, key: String, headers: HeaderMap) ->
         }
         Err(OpenError::Other(e)) => return S3Error::internal(e.to_string(), resource).into_response(),
     };
-    let stat = &opened.stat;
+    let stat = match &opened {
+        ForGet::Inline { stat, .. } => stat,
+        ForGet::Pinned(o) => &o.stat,
+    };
     if let Some(r) = conditional(&headers, stat, &resource) {
         return r;
     }
@@ -235,13 +239,19 @@ async fn get_object(fs: &Fs, bucket: String, key: String, headers: HeaderMap) ->
         }
     }
 
-    // Stream rather than buffer: a `Range` from the streamer is chunk-sized,
-    // but a plain `aws s3 cp` of a shard is gigabytes.
     let ino = stat.ino;
+    let pin = match opened {
+        ForGet::Inline { data, .. } => {
+            let body = Bytes::from(data).slice(start as usize..(start + len) as usize);
+            return (status, resp_headers, Body::from(body)).into_response();
+        }
+        ForGet::Pinned(o) => o.pin,
+    };
+    // Stream rather than buffer: a `Range` from the streamer is chunk-sized,
+    // but a plain `aws s3 cp` of a shard is gigabytes. The pin travels with
+    // the stream and is dropped with it — at the end of the body, or when
+    // the client disconnects.
     let fs = fs.clone();
-    // The pin travels with the stream and is dropped with it — at the end of
-    // the body, or when the client disconnects.
-    let pin = opened.pin;
     let stream = futures::stream::unfold(
         (fs, ino, start, len, pin),
         |(fs, ino, off, remaining, pin)| async move {
@@ -365,7 +375,7 @@ fn serve_worker(
                 tracing::warn!(?r, "the reclaimer is gone; the next sweep reclaims this");
             }
         }));
-        let fs: Fs = Rc::new(objects::FsLock::new(state));
+        let fs: Fs = Rc::new(objects::Shared::new(state));
 
         let listener = compio::net::TcpListener::from_std(reuseport_listener(addr)?)?;
         cyper_axum::serve(NoDelay(listener), router(fs)).await?;
