@@ -264,7 +264,10 @@ async fn get_object(fs: &Fs, bucket: String, key: String, headers: HeaderMap) ->
                     (fs, ino, off, 0, pin),
                 ));
             }
-            let want = remaining.min(CHUNK) as u32;
+            // Chunks end on CHUNK boundaries of the object, so after an
+            // unaligned Range start each one is a whole extent of a striped
+            // file, which `run_read` sends without a copy.
+            let want = remaining.min(CHUNK - off % CHUNK) as u32;
             let read = async {
                 let plan = objects::plan_read(&fs, ino, off, want).await?;
                 objects::run_read(plan).await
@@ -276,7 +279,7 @@ async fn get_object(fs: &Fs, bucket: String, key: String, headers: HeaderMap) ->
                 Ok(buf) => {
                     let n = buf.len() as u64;
                     Some((
-                        Ok::<Bytes, std::io::Error>(Bytes::from(buf)),
+                        Ok::<Bytes, std::io::Error>(buf),
                         (fs, ino, off + n, remaining - n.min(remaining), pin),
                     ))
                 }

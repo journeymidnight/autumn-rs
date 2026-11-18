@@ -2,7 +2,8 @@
 
 ## Direct reads: `MSG_GET` / `MSG_BATCH_GET` with `direct`, then `MSG_READ`
 
-`get_direct`, `get_range_direct_into` and `get_many_direct` send the ordinary
+`get_direct`, `get_range_direct` (a range of the value, returned as the `Bytes`
+it was received into), `get_range_direct_into` and `get_many_direct` send the ordinary
 read with `direct` set. The PS answers a ValuePointer range of 64 KiB or more
 whose extent a client can read with its position (`CODE_POSITION` and a
 `ValuePosition` in ctrl; in a batch, `BATCH_GET_POSITION` and the next entry of

@@ -3736,6 +3736,28 @@ impl ClusterClient {
         }
     }
 
+    /// [`get_direct`](Self::get_direct) for bytes `[offset, offset+length)` of
+    /// the value (`length == 0` = to its end): the bytes come back in the
+    /// buffer they were received into, with no copy.
+    pub async fn get_range_direct(
+        &self,
+        key: &[u8],
+        offset: u32,
+        length: u32,
+    ) -> std::result::Result<Option<bytes::Bytes>, AutumnError> {
+        let key_v = self.binding.bind_key(key)?;
+        match self.get_direct_bound(&key_v, offset, length).await? {
+            None => Ok(None),
+            Some(DirectGet::Value(v)) => Ok(Some(v.freeze().into_bytes())),
+            Some(DirectGet::Position(pos)) => {
+                if let Some(v) = self.read_position_with_stale_heal(&key_v, offset, length, &pos, None).await? {
+                    return Ok(Some(v.unlanded()));
+                }
+                Ok(self.get_range_pooled_bound(&key_v, offset, length).await?.map(|v| v.freeze().into_bytes()))
+            }
+        }
+    }
+
     /// `MSG_GET` with `direct` over an ALREADY-bound key: the value, or where
     /// to read it. A position that does not decode is logged and the key read
     /// again without `direct`, so a reply this build cannot read costs a round

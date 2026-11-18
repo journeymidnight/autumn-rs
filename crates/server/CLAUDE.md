@@ -472,6 +472,27 @@ autumn-s3 --manager <host:port> [--listen 0.0.0.0] [--port 9000] [--workers N]
   of it sat in one partition): a GET is three gets there (bucket dirent, key
   dirent, inode). Schema v5 spreads metadata over `--parts N` partitions
   (`crates/fs/CLAUDE.md`): 4 KiB GET 79K obj/s with 8 (c 64).
+- **A GET's body chunks are the receive buffers** (`objects::run_read` →
+  `read::execute_bytes`): chunks end on 8 MiB boundaries of the object (a
+  Range's first chunk is cut short to the next one), so each is one extent of
+  a striped object, read into a client pool buffer that becomes the response's
+  `Bytes`, from an extent node when the PS answers with a position, else the
+  PS's own reply. A segmented object's chunk is one extent only when its data
+  object's units line up with the object's (parts that are multiples of
+  8 MiB); otherwise it takes the copying path. Profiled before (16 MiB GET, c 32, 8 workers at 90-100%
+  CPU): half the gateway's CPU in syscalls (kernel copies and the zeroing of
+  fresh pages), the rest in userspace memcpy and memset, from three places: the
+  zero fill of a new `Vec` per chunk, the copy of the pool buffer into it, and
+  compio's stream adapter copying the body into its own buffer under hyper. The
+  first two are gone (+11-12%, CPU -30% at c 64); the third is hyper's
+  borrowed-slice write over io_uring and remains. Each GET holds its in-flight
+  chunk of the client's reply budget until the socket has taken it: 40% of
+  `--ucx-regpool-cap-bytes` (16 GiB by default), half of that per worker, so
+  about 400 chunks per worker. The copy it replaces returned the buffer at once
+  and held an unbudgeted heap `Vec` instead. A full budget is not waited on:
+  the large reads of that worker then fail after their retries (~9 s), so about
+  400 stalled downloads on one worker would stall its large GETs; small
+  replies are unbudgeted past it and unaffected.
 - **Each worker caches the directories GET, HEAD and CopyObject walk through**
   (`objects::lookup`, `dir::DirCache`): only the components before the last,
   and only directories; the key's own entry is read every time. Nothing

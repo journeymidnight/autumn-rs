@@ -595,3 +595,46 @@ fn an_inline_file_written_afterwards_reads_back() {
         assert_eq!(read_name(&mut reader, 1, "grow").await.unwrap(), grown);
     });
 }
+
+/// `read::execute_bytes` returns what `execute` does for every shape of
+/// read: one whole extent (handed back in its receive buffer), a range
+/// inside an extent, the short last extent, and a read over two extents.
+#[test]
+fn execute_bytes_reads_what_execute_reads() {
+    let mgr_addr = pick_addr();
+    start_manager(mgr_addr);
+    let n1_dir = tempfile::tempdir().expect("n1");
+    let n2_dir = tempfile::tempdir().expect("n2");
+    let (n1, n2) = (pick_addr(), pick_addr());
+    start_extent_node(n1, n1_dir.path().to_path_buf(), 1);
+    start_extent_node(n2, n2_dir.path().to_path_buf(), 2);
+
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        let _admin = boot(mgr_addr, n1, n2, 157, 15701).await;
+        let mut st = FsState::new(&mgr_addr.to_string()).await.expect("mount");
+        // As the gateway runs: the fast path reads from the extent nodes.
+        st.direct_read = true;
+        meta::ensure_root(&mut st).await.expect("init_root");
+        let data = pattern(MAX_EXTENT + (1 << 20), 9);
+        let ino = put(&mut st, 1, "big", &data, Condition::None).await.expect("put");
+        let unit = MAX_EXTENT as i64;
+        for (off, len) in [(0, MAX_EXTENT as u32), (4096, 65536), (unit, 1 << 20), (unit - 4096, 8192)] {
+            let want = read::execute(read::prepare(&mut st, ino, off, len).await.unwrap()).await.unwrap();
+            let got = read::execute_bytes(read::prepare(&mut st, ino, off, len).await.unwrap()).await.unwrap();
+            assert_eq!(got.as_ref(), want.as_slice(), "read [{off}, +{len})");
+            assert_eq!(got.as_ref(), &data[off as usize..off as usize + len as usize], "read [{off}, +{len})");
+        }
+        // A published file is segmented: its bytes are a data object, written
+        // densely, so a stored value shorter than the read is lost data and
+        // the read fails. Cut the last unit to half: `execute_bytes` must
+        // fail as `execute` does, not answer with the short value.
+        let m = meta::fetch_inode(&mut st, ino).await.unwrap();
+        let seg = m.segments.expect("segmented").inline[0].clone();
+        let tail = autumn_fs::key::data_extent_key(seg.data_ino, seg.data_off + MAX_EXTENT as u64, seg.lanes, seg.unit);
+        st.kv_put(&tail, &data[MAX_EXTENT..MAX_EXTENT + (512 << 10)]).await.unwrap();
+        let want = read::execute(read::prepare(&mut st, ino, unit, 1 << 20).await.unwrap()).await;
+        assert!(want.is_err(), "execute refuses the short data object");
+        let got = read::execute_bytes(read::prepare(&mut st, ino, unit, 1 << 20).await.unwrap()).await;
+        assert!(got.is_err(), "execute_bytes answered {:?} bytes for a short data object", got.map(|b| b.len()));
+    });
+}

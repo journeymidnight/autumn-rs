@@ -319,6 +319,15 @@ Open of an inode the first mount wrote and closed does not read a stale `meta`).
    sub-range = the exact overlap, holes between extents are zero-filled (sparse semantics).
 5. One batched read fetches every extent slice, multiple extents concurrently (compio spawn; the spawned `execute`
    does not hold `&FsState`).
+6. `execute_bytes` (the S3 gateway's GET) returns `Bytes`: with `direct_read` on, a plan that is one
+   whole slice of one value (an aligned 8 MiB chunk of a striped file; an unaligned range spans two)
+   is read with `get_range_direct` and handed back in the
+   buffer it arrived in, so no `Vec` is allocated, zero-filled and copied into. A short or absent slice,
+   or any other plan, goes through `execute`. The receive buffer comes from the client's pool and is held
+   until the caller drops the `Bytes` (for the gateway: until the chunk is written to the socket), at most
+   one chunk per GET in flight. 16 MiB GET through the gateway, alternating binaries: +11-12% at c 8/32/64,
+   gateway CPU 710% -> 430-500% at c 64; the profile before it had a third of the gateway's CPU in the
+   zero fill, page faults on fresh buffers and the pool-to-`Vec` copy.
 
 **`--direct-read` (default ON)**: `read::execute` uses `get_many_direct` instead of
 `get_many_into`; whole-extent reads ≥ 64 KiB **bypass the PS and read the EN directly** (PS NIC egress leaves the data

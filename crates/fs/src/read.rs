@@ -407,6 +407,27 @@ pub async fn execute(plan: ReadPlan) -> Result<Vec<u8>> {
     Ok(result)
 }
 
+/// [`execute`] returning `Bytes`. A plan that is one whole slice of one value
+/// (an aligned chunk of a striped file: one 8 MiB extent) is read as the
+/// buffer the value arrived in: no allocation, no zero fill, no copy. A
+/// gateway streaming large objects spent a third of its CPU on those three.
+/// Anything else, or a slice that comes back short or absent (sparse, or lost
+/// data in a segmented file), goes through [`execute`].
+pub async fn execute_bytes(plan: ReadPlan) -> Result<bytes::Bytes> {
+    if plan.direct_read && plan.inline_result.is_none() {
+        if let [c] = plan.chunks.as_slice() {
+            if c.dest_offset == 0 && c.length as usize == plan.actual_size {
+                let got = plan.client.get_range_direct(&c.key, c.offset, c.length).await;
+                match got.map_err(|e| anyhow!("extent read failed: {e}"))? {
+                    Some(b) if b.len() == plan.actual_size => return Ok(b),
+                    _ => {}
+                }
+            }
+        }
+    }
+    Ok(bytes::Bytes::from(execute(plan).await?))
+}
+
 /// Zero-copy variant of `execute`: fill a CALLER-PROVIDED buffer (e.g. a
 /// CUDA-pinned host buffer) instead of allocating a `Vec`. Writes the read span
 /// into `dest[0..actual_size]` — pre-zeroing it for sparse / short-extent

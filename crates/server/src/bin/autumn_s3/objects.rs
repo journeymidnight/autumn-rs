@@ -11,6 +11,7 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
+use bytes::Bytes;
 use autumn_client::lease::{self, AcquireResult};
 use autumn_client::ClusterClient;
 use autumn_fs::dir::DirChild;
@@ -542,9 +543,10 @@ pub async fn plan_read(fs: &Fs, ino: u64, offset: u64, len: u32) -> Result<ReadP
 }
 
 /// Execute a planned read. Takes no state, so concurrent GETs fan out in
-/// parallel across extents.
-pub async fn run_read(plan: ReadPlan) -> Result<Vec<u8>> {
-    read::execute(plan).await
+/// parallel across extents. A chunk that is one whole extent comes back in
+/// the buffer it was received into (`read::execute_bytes`).
+pub async fn run_read(plan: ReadPlan) -> Result<Bytes> {
+    read::execute_bytes(plan).await
 }
 
 #[cfg(test)]
