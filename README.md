@@ -11,25 +11,31 @@ a manager on etcd. Files, KV pairs and S3 objects all land in the same extents.
   <img src="assets/architecture.svg" alt="autumn-rs architecture: a POSIX mount, an S3 endpoint and KV-cache adapters over one partition layer and one stream layer" width="860">
 </p>
 
-- **One copy of the data, three ways in:** a POSIX mount (`autumn-fuse`, or
-  `autumn.Fs` in Python), a KV client (CLI, Rust, Python) and an S3 endpoint
-  (`autumn-s3`). An object written over S3 is a file to the mount.
-- **A KV-cache tier for inference engines:** an LMCache L2 plugin and the
-  `autumn_kvcache` adapters (SGLang HiCache L3, vLLM connector), so prefix caches
-  survive restarts and are shared across instances. An optional DRAM tier in
-  the partition server acknowledges pages from memory and writes to disk behind.
-- **Fast:** thread-per-core on io_uring, zero-copy RPC, optional UCX/RDMA.
-  8 MiB writes from a client on a second host: 1,821 MB/s over UCX vs 414 MB/s
-  over TCP; UCX 8 MiB reads reach ~87% of 100 GbE. 4 KiB KV on a Kubernetes
-  cluster (3 PS, 5 EN on local NVMe, TCP, 64 keys per request): ~162K writes/s
-  at p99 0.86 ms, ~507K reads/s at p99 0.38 ms.
-- **Durable without a local WAL:** the replicated extents are the journal.
-  Sealed extents are erasure-coded in the background; `autumn-op repair` and
-  `scrub` rebuild degraded or rotted copies.
-- **Elastic and operable:** partitions split and merge under an auto-policy
-  controller; a web dashboard, `autumn-op status` / `health` / `df`, Prometheus
-  `/metrics` on every server, opt-in authorization with Ed25519 capability
-  tokens.
+- **One copy of the data, three ways in.** An object written over S3 is a file
+  to the mount.
+  - POSIX mount: `autumn-fuse`, or `autumn.Fs` in Python
+  - KV client: CLI, Rust, Python
+  - S3 endpoint: `autumn-s3`
+- **A KV-cache tier for inference engines.** Prefix caches survive restarts and
+  are shared across instances.
+  - an LMCache L2 plugin
+  - `autumn_kvcache` adapters: SGLang HiCache L3, vLLM connector
+  - an optional DRAM tier in the partition server: pages are acknowledged from
+    memory and written to disk behind
+- **Fast.** Thread-per-core on io_uring, zero-copy RPC, optional UCX/RDMA.
+  - 8 MiB writes from a client on a second host: 1,821 MB/s over UCX, 414 MB/s
+    over TCP
+  - 8 MiB reads over UCX: ~87% of 100 GbE
+  - 4 KiB KV on Kubernetes (3 PS, 5 EN on local NVMe, TCP, 64 keys per
+    request): ~162K writes/s at p99 0.86 ms, ~507K reads/s at p99 0.38 ms
+- **Durable without a local WAL.** The replicated extents are the journal.
+  - sealed extents are erasure-coded in the background
+  - `autumn-op repair` and `scrub` rebuild degraded or rotted copies
+- **Elastic and operable.**
+  - partitions split and merge under an auto-policy controller
+  - a web dashboard; `autumn-op status` / `health` / `df`
+  - Prometheus `/metrics` on every server
+  - opt-in authorization with Ed25519 capability tokens
 
 ## Try it with docker compose
 
