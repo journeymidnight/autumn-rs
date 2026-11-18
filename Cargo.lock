@@ -303,6 +303,7 @@ dependencies = [
  "serde_json",
  "socket2 0.5.10",
  "tikv-jemallocator",
+ "tokio",
  "tracing",
  "tracing-subscriber",
  "uuid",

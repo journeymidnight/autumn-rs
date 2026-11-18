@@ -1,0 +1,139 @@
+//! `autumn-s3` at the HTTP level, against the real binary
+//! (`target/debug/autumn-s3`) and an in-process cluster:
+//! - a bucket addressed as `/{bucket}/`, the form minio-go (warp, mc) sends,
+//!   is the bucket;
+//! - small responses are not held back by Nagle: sequential GETs on one
+//!   keep-alive connection do not each wait for the client's delayed ACK.
+
+mod support;
+
+use std::ffi::OsStr;
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpStream};
+use std::time::{Duration, Instant};
+
+use autumn_fs::state::FsState;
+use autumn_fs::{dir, meta};
+use autumn_rpc::client::RpcClient;
+
+use support::*;
+
+struct Gateway(std::process::Child);
+
+impl Drop for Gateway {
+    fn drop(&mut self) {
+        let _killed = self.0.kill();
+        let _reaped = self.0.wait();
+    }
+}
+
+/// A cluster with an empty bucket `b`, and the gateway serving it.
+fn gateway(base: u16) -> (Gateway, SocketAddr, (tempfile::TempDir, tempfile::TempDir)) {
+    let mgr_addr = pick_addr();
+    start_manager(mgr_addr);
+    let dirs = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (n1, n2) = (pick_addr(), pick_addr());
+    start_extent_node(n1, dirs.0.path().to_path_buf(), 1);
+    start_extent_node(n2, dirs.1.path().to_path_buf(), 2);
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        let mgr = RpcClient::connect(mgr_addr).await.unwrap();
+        register_two_nodes(&mgr, n1, n2, base).await;
+        let (log, row, meta_stream) = create_three_streams(&mgr).await;
+        upsert_partition(&mgr, base as u64 * 100 + 1, log, row, meta_stream, b"", b"\xff\xff\xff\xff").await;
+        start_partition_server(base as u64, mgr_addr, pick_addr());
+        compio::time::sleep(Duration::from_millis(1500)).await;
+        create_namespaces(mgr_addr, &["fs"]).await;
+        let mut st = FsState::new(&mgr_addr.to_string()).await.unwrap();
+        meta::ensure_root(&mut st).await.unwrap();
+        dir::mkdir(&mut st, 1, OsStr::new("b"), 0o755).await.unwrap();
+    });
+
+    let addr = pick_addr();
+    let gw = Gateway(
+        std::process::Command::new(support_binary_path("autumn-s3"))
+            .args(["--manager", &mgr_addr.to_string(), "--listen", "127.0.0.1", "--port", &addr.port().to_string(), "--workers", "1"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn autumn-s3"),
+    );
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while TcpStream::connect(addr).is_err() {
+        assert!(Instant::now() < deadline, "autumn-s3 never listened");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    (gw, addr, dirs)
+}
+
+/// One request on a fresh connection; the status code and the raw response.
+fn http(addr: SocketAddr, method: &str, path: &str) -> (u16, String) {
+    let mut c = TcpStream::connect(addr).unwrap();
+    write!(c, "{method} {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").unwrap();
+    let mut raw = Vec::new();
+    c.read_to_end(&mut raw).unwrap();
+    let text = String::from_utf8_lossy(&raw).into_owned();
+    let code = text.split_whitespace().nth(1).unwrap().parse().unwrap();
+    (code, text)
+}
+
+/// One request on a kept-alive connection; the status code and the body
+/// (read by its `Content-Length`).
+fn keep_alive(c: &mut TcpStream, head: &str, body: &[u8]) -> (u16, Vec<u8>) {
+    c.write_all(head.as_bytes()).unwrap();
+    c.write_all(body).unwrap();
+    let mut raw = Vec::new();
+    let mut byte = [0u8; 1];
+    while !raw.ends_with(b"\r\n\r\n") {
+        c.read_exact(&mut byte).unwrap();
+        raw.push(byte[0]);
+    }
+    let head = String::from_utf8_lossy(&raw).to_ascii_lowercase();
+    let code = head.split_whitespace().nth(1).unwrap().parse().unwrap();
+    let len = head
+        .lines()
+        .find_map(|l| l.strip_prefix("content-length:"))
+        .map_or(0, |v| v.trim().parse().unwrap());
+    let mut out = vec![0u8; len];
+    c.read_exact(&mut out).unwrap();
+    (code, out)
+}
+
+#[test]
+fn a_bucket_with_a_trailing_slash_is_the_bucket() {
+    let (_gw, addr, _dirs) = gateway(266);
+    for path in ["/b", "/b/"] {
+        assert_eq!(http(addr, "HEAD", path).0, 200, "HEAD {path}");
+        let (code, text) = http(addr, "GET", &format!("{path}?list-type=2"));
+        assert_eq!(code, 200, "GET {path}: {text}");
+        assert!(text.contains("<ListBucketResult"), "GET {path}: {text}");
+    }
+    assert_eq!(http(addr, "HEAD", "/missing/").0, 404);
+    // A bucket subresource is refused, not answered with a listing.
+    for q in ["location=", "versioning=", "uploads=", "marker=a", "list-type=1"] {
+        let (code, text) = http(addr, "GET", &format!("/b/?{q}"));
+        assert_eq!(code, 501, "GET /b/?{q}: {text}");
+    }
+}
+
+/// With Nagle on, each small GET's response waited ~40 ms for the client's
+/// delayed ACK. The median of 20 stays far below that floor.
+#[test]
+fn small_gets_on_one_connection_are_not_delayed() {
+    let (_gw, addr, _dirs) = gateway(267);
+    let mut c = TcpStream::connect(addr).unwrap();
+    let body: Vec<u8> = (0..4096u32).map(|i| i as u8).collect();
+    let put = format!("PUT /b/small HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n", body.len());
+    assert_eq!(keep_alive(&mut c, &put, &body).0, 200);
+
+    let get = "GET /b/small HTTP/1.1\r\nHost: x\r\n\r\n";
+    assert_eq!(keep_alive(&mut c, get, b""), (200, body.clone()));
+    let mut took: Vec<Duration> = (0..20)
+        .map(|_| {
+            let started = Instant::now();
+            assert_eq!(keep_alive(&mut c, get, b""), (200, body.clone()));
+            started.elapsed()
+        })
+        .collect();
+    took.sort();
+    assert!(took[10] < Duration::from_millis(25), "median small GET took {:?} ({took:?})", took[10]);
+}

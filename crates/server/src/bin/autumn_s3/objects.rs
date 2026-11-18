@@ -38,7 +38,12 @@ use crate::s3::ObjectRow;
 /// a write into begin/finish (need the state) and the body's data writes
 /// (client only). Only the stateful halves take the lock, so the data I/O of
 /// concurrent requests still overlaps.
-pub type Fs = Rc<futures::lock::Mutex<FsState>>;
+///
+/// The mutex is FIFO. `futures::lock::Mutex` is not: on this one thread a
+/// woken waiter runs only after requests arriving meanwhile have taken the
+/// lock again, and under 64 concurrent PUTs some waited 40 s.
+pub type Fs = Rc<FsLock<FsState>>;
+pub type FsLock<T> = tokio::sync::Mutex<T>;
 
 /// A file's identity as S3 reports it.
 pub struct Stat {
@@ -404,4 +409,34 @@ pub async fn plan_read(fs: &Fs, ino: u64, offset: u64, len: u32) -> Result<ReadP
 /// parallel across extents.
 pub async fn run_read(plan: ReadPlan) -> Result<Vec<u8>> {
     read::execute(plan).await
+}
+
+#[cfg(test)]
+mod fs_lock_tests {
+    use std::rc::Rc;
+    use std::time::Duration;
+
+    use futures::FutureExt;
+
+    use super::FsLock;
+
+    /// A request queued on the lock gets it before one that arrives after the
+    /// release; otherwise a steady stream of arrivals starves it.
+    #[test]
+    fn a_queued_waiter_is_served_before_a_later_arrival() {
+        compio::runtime::Runtime::new().unwrap().block_on(async {
+            let lock = Rc::new(FsLock::new(()));
+            let held = lock.lock().await;
+            let waiter = {
+                let lock = lock.clone();
+                compio::runtime::spawn(async move {
+                    let _g = lock.lock().await;
+                })
+            };
+            compio::time::sleep(Duration::from_millis(10)).await;
+            drop(held);
+            assert!(lock.lock().now_or_never().is_none(), "a later arrival took the lock ahead of the queued waiter");
+            waiter.await.unwrap();
+        });
+    }
 }

@@ -83,6 +83,16 @@ async fn head_bucket(fs: &Fs, bucket: String) -> Response {
 /// answered with the same body; the fields v2 adds are additive and no client
 /// we serve asks for v1.
 async fn list_objects(fs: &Fs, bucket: String, q: HashMap<String, String>) -> Response {
+    // Every other bucket GET (`?location`, `?versioning`, `?uploads`, a v1
+    // `?marker` listing) is refused rather than answered with a listing.
+    const LIST_V2: [&str; 8] =
+        ["list-type", "prefix", "delimiter", "encoding-type", "max-keys", "continuation-token", "start-after", "fetch-owner"];
+    if let Some(k) = q.keys().find(|k| !LIST_V2.contains(&k.as_str())) {
+        return S3Error::not_implemented(&format!("bucket GET with '{k}'")).into_response();
+    }
+    if q.get("list-type").is_some_and(|t| t != "2") {
+        return S3Error::not_implemented("ListObjects v1").into_response();
+    }
     let prefix = q.get("prefix").map(String::as_str).unwrap_or("");
     let delimiter = q.get("delimiter").map(String::as_str).filter(|d| !d.is_empty());
     let url_encoded = q.get("encoding-type").map(String::as_str) == Some("url");
@@ -301,6 +311,27 @@ fn reuseport_listener(addr: SocketAddr) -> Result<std::net::TcpListener> {
     Ok(sock.into())
 }
 
+/// Accepts with TCP_NODELAY. Without it a small response waits for the
+/// client's delayed ACK: every 4 KiB GET took 40 ms.
+struct NoDelay(compio::net::TcpListener);
+
+impl cyper_axum::Listener for NoDelay {
+    type Io = compio::net::TcpStream;
+    type Addr = SocketAddr;
+
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        let (stream, peer) = cyper_axum::Listener::accept(&mut self.0).await;
+        if let Err(e) = stream.set_nodelay(true) {
+            tracing::warn!(%peer, error = %e, "set_nodelay failed");
+        }
+        (stream, peer)
+    }
+
+    fn local_addr(&self) -> std::io::Result<Self::Addr> {
+        self.0.local_addr()
+    }
+}
+
 /// This process's `FsState`, under the daemon identity `host`.
 async fn connect_state(host: String, credential: Option<(String, Vec<u8>)>) -> Result<FsState> {
     let mut state = match credential {
@@ -334,10 +365,10 @@ fn serve_worker(
                 tracing::warn!(?r, "the reclaimer is gone; the next sweep reclaims this");
             }
         }));
-        let fs: Fs = Rc::new(futures::lock::Mutex::new(state));
+        let fs: Fs = Rc::new(objects::FsLock::new(state));
 
         let listener = compio::net::TcpListener::from_std(reuseport_listener(addr)?)?;
-        cyper_axum::serve(listener, router(fs)).await?;
+        cyper_axum::serve(NoDelay(listener), router(fs)).await?;
         Ok::<_, anyhow::Error>(())
     })
 }
@@ -550,6 +581,8 @@ fn router(fs: Fs) -> Router {
     // cannot decode.
     Router::new()
         .route("/", buckets_route)
+        // minio-go (warp, mc) addresses a bucket as `/{bucket}/`.
+        .route("/{bucket}/", bucket_route.clone())
         .route("/{bucket}", bucket_route)
         .route("/{bucket}/{*key}", object_route)
         .fallback(|| async { S3Error::not_implemented("this operation").into_response() })

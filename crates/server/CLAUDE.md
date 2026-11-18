@@ -442,6 +442,22 @@ autumn-s3 --manager <host:port> [--listen 0.0.0.0] [--port 9000] [--workers N]
 - `--workers` (default 0 = `min(cores, 8)`) accept threads, each with its own compio
   runtime, its own `FsState` and an SO_REUSEPORT listener on the same port. One
   thread caps an AWS-CRT client at ~40% of the read path; the knee is at 4.
+- **Accepted sockets get TCP_NODELAY** (`NoDelay`, around the listener;
+  `cyper_axum::serve` sets nothing). Without it a small response waited for the
+  client's delayed ACK: 4 KiB GETs at 8 concurrent ran 44 ms each, 175 obj/s;
+  with it 0.4 ms, 13 000 obj/s (warp, loopback).
+- **A worker's `FsState` lock is FIFO** (`objects::FsLock`, tokio's runtime-free
+  mutex). `futures::lock::Mutex` is not: on the worker's one thread the waiter
+  it wakes runs only after requests arriving meanwhile took the lock again, so
+  under 64 concurrent 1 MiB PUTs some waited the whole run (p99 8.5 s, max
+  40 s). FIFO: p99 0.3 s, max 0.45 s, throughput 10% lower. That lock is now
+  the visible limit of a PUT: half its median time is the wait for it.
+- **A bucket answers at `/{bucket}/` too** — minio-go (warp, mc) sends that
+  form for HEAD and listing. A bucket GET takes only ListObjectsV2's
+  parameters; any other (`?location`, `?versioning`, `?uploads`, a v1
+  `?marker` listing) is 501 NotImplemented instead of a listing body that a
+  client would decode as the wrong document. minio-go asks `?location` unless
+  it is given a region.
 - `--host` names the daemon identity each worker registers under (the entrypoint
   passes `s3-$HOSTNAME`); workers append their index and the sweeper `-sweep`.
 - Being a binary of this package rather than an example also means a plain

@@ -96,6 +96,9 @@ uuid.workspace = true
 libc = "0.2"
 compio = { workspace = true, features = ["macros", "time", "net"] }
 futures = "0.3"
+# For autumn-s3's FIFO mutex, which needs no tokio runtime; tokio is already
+# in the build through axum.
+tokio = { version = "1", default-features = false, features = ["sync"] }
 pprof = { version = "0.14", features = ["flamegraph"], optional = true }
 # Allocator hygiene: tikv-jemallocator returns dirty pages to the
 # OS within `dirty_decay_ms` (default 10 s in upstream jemalloc; we
