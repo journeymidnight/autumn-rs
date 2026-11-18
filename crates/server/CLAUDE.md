@@ -470,6 +470,18 @@ autumn-s3 --manager <host:port> [--listen 0.0.0.0] [--port 9000] [--workers N]
   at 8 / 32 / 64 concurrent, now 22.8K / 28.7K / 28.6K. The limit is now the
   partition holding all `fs/` metadata (90% of a core): a GET is three gets
   there (bucket dirent, key dirent, inode).
+- **Each worker caches the directories GET, HEAD and CopyObject walk through**
+  (`objects::lookup`, `dir::DirCache`): only the components before the last,
+  and only directories; the key's own entry is read every time. Nothing
+  invalidates it; a walk trusting it that finds nothing, or whose inode is
+  gone, is redone reading every entry, which caches the directories it passes
+  and drops the names that no longer are one. A 404 therefore costs one more
+  walk. A directory renamed from a mount, with another directory created under
+  its old name, keeps being followed by the old name until a lookup there
+  fails: fs and S3 should not serve one tree at once (docs/ops.md). A warp GET of `/b/<prefix>/<object>`
+  reads 2 keys instead of 4; 4 KiB GET with all metadata in one partition
+  went 29.1K / 28.9K -> 35.6K / 35.9K obj/s (c 64, alternating binaries): the
+  inode get, which carries the 4 KiB, is the remaining cost there.
 - **A bucket answers at `/{bucket}/` too** — minio-go (warp, mc) sends that
   form for HEAD and listing. A bucket GET takes only ListObjectsV2's
   parameters; any other (`?location`, `?versioning`, `?uploads`, a v1

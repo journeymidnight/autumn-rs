@@ -110,6 +110,82 @@ pub async fn resolve_follow_with(
     path: &str,
     follow_last: bool,
 ) -> Result<Option<(u64, u8)>> {
+    walk(client, path, follow_last, None).await
+}
+
+/// Directory entries that name directories, for a front end that walks paths
+/// with no kernel dentry cache (the S3 gateway, where every GET reads its
+/// bucket's and its prefixes' entries). Only components with more of the path
+/// after them are cached or taken from it, never the last one, which is read
+/// every time. Nothing invalidates it: a walk that trusts it and finds nothing
+/// is redone with [`DirCacheUse::Refresh`], which reads every entry, caches the
+/// directories and drops the names that no longer are one. A directory renamed
+/// elsewhere, with another created under its old name, is therefore still
+/// followed by the old name until a lookup under it fails.
+#[derive(Default)]
+pub struct DirCache {
+    /// parent → name → child directory.
+    map: std::cell::RefCell<std::collections::HashMap<u64, std::collections::HashMap<Box<[u8]>, u64>>>,
+    len: std::cell::Cell<usize>,
+}
+
+/// Entries past which the cache starts over, as `FsState::known_dirs` does.
+const DIR_CACHE_CAP: usize = 65536;
+
+impl DirCache {
+    fn get(&self, parent: u64, name: &[u8]) -> Option<u64> {
+        self.map.borrow().get(&parent)?.get(name).copied()
+    }
+
+    fn put(&self, parent: u64, name: &[u8], child: u64) {
+        let mut map = self.map.borrow_mut();
+        if self.len.get() >= DIR_CACHE_CAP {
+            map.clear();
+            self.len.set(0);
+        }
+        if map.entry(parent).or_default().insert(name.into(), child).is_none() {
+            self.len.set(self.len.get() + 1);
+        }
+    }
+
+    fn forget(&self, parent: u64, name: &[u8]) {
+        let mut map = self.map.borrow_mut();
+        let Some(names) = map.get_mut(&parent) else { return };
+        if names.remove(name).is_some() {
+            self.len.set(self.len.get() - 1);
+        }
+        if names.is_empty() {
+            map.remove(&parent);
+        }
+    }
+}
+
+/// How a walk uses a [`DirCache`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum DirCacheUse {
+    /// Take cached directories without reading their entries.
+    Trust,
+    /// Read every entry and rewrite the cache with what is found.
+    Refresh,
+}
+
+/// [`resolve_follow_with`] through a [`DirCache`].
+pub async fn resolve_follow_cached(
+    client: &autumn_client::ClusterClient,
+    path: &str,
+    follow_last: bool,
+    cache: &DirCache,
+    usage: DirCacheUse,
+) -> Result<Option<(u64, u8)>> {
+    walk(client, path, follow_last, Some((cache, usage))).await
+}
+
+async fn walk(
+    client: &autumn_client::ClusterClient,
+    path: &str,
+    follow_last: bool,
+    cache: Option<(&DirCache, DirCacheUse)>,
+) -> Result<Option<(u64, u8)>> {
     let get = |k: Vec<u8>| async move { client.get(&k).await.map_err(|e| anyhow!("KV get: {e}")) };
     let follow_last = follow_last || path.ends_with('/') || path.ends_with("/.");
     let mut todo: std::collections::VecDeque<Vec<u8>> = components(path.as_bytes()).collect();
@@ -125,10 +201,30 @@ pub async fn resolve_follow_with(
             ino = parents.pop().unwrap_or(ROOT_INO);
             continue;
         }
-        let Some(v) = get(key::dirent_key(ino, &comp)).await? else {
+        // Only a component with more of the path after it must be a
+        // directory; the last one is read every time.
+        let cache = cache.filter(|_| !todo.is_empty());
+        if let Some((c, DirCacheUse::Trust)) = cache {
+            if let Some(child) = c.get(ino, &comp) {
+                parents.push(ino);
+                (ino, file_type) = (child, DT_DIR);
+                continue;
+            }
+        }
+        let found = get(key::dirent_key(ino, &comp)).await?;
+        let dirent = match found {
+            Some(v) => Some(schema::decode_dirent(&v).map_err(|e| anyhow!("{}", e))?),
+            None => None,
+        };
+        if let Some((c, _)) = cache {
+            match &dirent {
+                Some(d) if d.file_type == DT_DIR => c.put(ino, &comp, d.child_inode),
+                _ => c.forget(ino, &comp),
+            }
+        }
+        let Some(dirent): Option<DirentValue> = dirent else {
             return Ok(None);
         };
-        let dirent: DirentValue = schema::decode_dirent(&v).map_err(|e| anyhow!("{}", e))?;
         // Once the path's own last component is popped, nothing a link
         // expanded into is left, so it is the one `lstat` stops at.
         if dirent.file_type == DT_LNK && (follow_last || !todo.is_empty()) {

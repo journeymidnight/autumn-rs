@@ -56,11 +56,18 @@ pub struct Shared {
     /// The state's own client and lease table.
     pub client: Rc<ClusterClient>,
     held_leases: Rc<RefCell<HashMap<u64, FuseLease>>>,
+    /// The bucket and prefix directories GET and HEAD walk through.
+    dirs: dir::DirCache,
 }
 
 impl Shared {
     pub fn new(state: FsState) -> Self {
-        Shared { client: state.client.clone(), held_leases: state.held_leases.clone(), state: FsLock::new(state) }
+        Shared {
+            client: state.client.clone(),
+            held_leases: state.held_leases.clone(),
+            dirs: dir::DirCache::default(),
+            state: FsLock::new(state),
+        }
     }
 
     pub async fn lock(&self) -> tokio::sync::MutexGuard<'_, FsState> {
@@ -142,6 +149,29 @@ async fn follow_with(client: &ClusterClient, path: &str) -> Result<Option<u64>> 
     Ok(follow_typed_with(client, path).await?.map(|(ino, _)| ino))
 }
 
+/// The inode an object's path leads to, through this worker's directory
+/// cache. A walk trusting the cache that finds nothing is redone reading every
+/// entry, which refreshes the cache (the only way it is updated); `fresh`
+/// goes straight to that, for a retry after the inode vanished. A directory
+/// renamed elsewhere is therefore still followed by its old name until a
+/// lookup under it fails, which is why fs and S3 should not serve one tree at
+/// once (docs/ops.md).
+async fn lookup(fs: &Fs, path: &str, fresh: bool) -> Result<Option<u64>> {
+    if !fresh {
+        if let Some(ino) = follow_cached(fs, path, dir::DirCacheUse::Trust).await? {
+            return Ok(Some(ino));
+        }
+    }
+    follow_cached(fs, path, dir::DirCacheUse::Refresh).await
+}
+
+async fn follow_cached(fs: &Fs, path: &str, usage: dir::DirCacheUse) -> Result<Option<u64>> {
+    match dir::resolve_follow_cached(&fs.client, path, true, &fs.dirs, usage).await {
+        Err(e) if e.to_string().starts_with("ELOOP") => Ok(None),
+        r => Ok(r?.map(|(ino, _)| ino)),
+    }
+}
+
 /// The `fs/` root's subdirectories, which are this gateway's buckets.
 pub async fn list_buckets(fs: &Fs) -> Result<Vec<String>> {
     let Some(root) = resolve(fs, "/").await? else {
@@ -168,10 +198,17 @@ pub async fn bucket_exists(fs: &Fs, bucket: &str) -> Result<bool> {
 /// Stat one object. `None` means no such key (or the key names a directory,
 /// which is not an object).
 pub async fn stat(fs: &Fs, bucket: &str, key: &str) -> Result<Option<Stat>> {
-    let Some(ino) = follow_with(&fs.client, &format!("/{bucket}/{key}")).await? else {
-        return Ok(None);
-    };
-    Ok(inode_meta_with(&fs.client, ino).await?.filter(|m| !is_dir(m)).map(|m| stat_of(ino, &m)))
+    let path = format!("/{bucket}/{key}");
+    for attempt in 0..2 {
+        let Some(ino) = lookup(fs, &path, attempt > 0).await? else {
+            return Ok(None);
+        };
+        match inode_meta_with(&fs.client, ino).await? {
+            None => continue,
+            m => return Ok(m.filter(|m| !is_dir(m)).map(|m| stat_of(ino, &m))),
+        }
+    }
+    Ok(None)
 }
 
 // ── pinning an object for a GET ─────────────────────────────────────────────
@@ -329,10 +366,10 @@ pub async fn open_for_get(fs: &Fs, bucket: &str, key: &str) -> Result<Option<For
     let path = format!("/{bucket}/{key}");
     // The name can move between the lookup and the pin, and an inode
     // reclaimed in that gap is simply gone: look again.
-    for _ in 0..3 {
+    for attempt in 0..3 {
         // The lookups take no lock: they need only the client, and under the
         // lock a worker would serve one GET at a time.
-        let Some(ino) = follow_with(&fs.client, &path).await? else {
+        let Some(ino) = lookup(fs, &path, attempt > 0).await? else {
             return Ok(None);
         };
         // A file this worker pins already is streamed, not inline (the
@@ -361,8 +398,8 @@ pub async fn open_for_get(fs: &Fs, bucket: &str, key: &str) -> Result<Option<For
 /// Resolve and pin an object. `None` is no such key (or a directory).
 pub async fn open_pinned(fs: &Fs, bucket: &str, key: &str) -> Result<Option<Opened>, OpenError> {
     let path = format!("/{bucket}/{key}");
-    for _ in 0..3 {
-        let Some(ino) = follow_with(&fs.client, &path).await? else {
+    for attempt in 0..3 {
+        let Some(ino) = lookup(fs, &path, attempt > 0).await? else {
             return Ok(None);
         };
         match pin(fs, ino).await? {

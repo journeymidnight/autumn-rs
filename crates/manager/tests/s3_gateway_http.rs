@@ -182,3 +182,62 @@ fn an_inline_get_takes_no_lease() {
         }
     });
 }
+
+/// The worker caches the directories a GET walks through and never
+/// invalidates them; a lookup under a cached directory that finds nothing is
+/// redone reading every entry. A prefix directory removed and created again
+/// behind the gateway (a new inode under the same name) is therefore found
+/// on the first GET after it.
+#[test]
+fn a_directory_replaced_behind_the_gateway_is_found_again() {
+    let (_gw, addr, mgr, _dirs) = gateway(269);
+    let mut c = TcpStream::connect(addr).unwrap();
+    let put = |c: &mut TcpStream, key: &str, body: &[u8]| {
+        let head = format!("PUT /b/{key} HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n", body.len());
+        assert_eq!(keep_alive(c, &head, body).0, 200, "PUT {key}");
+    };
+    let get = |c: &mut TcpStream, key: &str| keep_alive(c, &format!("GET /b/{key} HTTP/1.1\r\nHost: x\r\n\r\n"), b"");
+
+    put(&mut c, "d/x", b"old");
+    assert_eq!(get(&mut c, "d/x"), (200, b"old".to_vec()), "caches b/ and d/");
+    assert_eq!(keep_alive(&mut c, "DELETE /b/d/x HTTP/1.1\r\nHost: x\r\n\r\n", b"").0, 204);
+
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        let mut st = FsState::new(&mgr.to_string()).await.unwrap();
+        let b = dir::resolve(&mut st, "/b").await.unwrap().unwrap();
+        dir::rmdir(&mut st, b, OsStr::new("d")).await.unwrap();
+    });
+    put(&mut c, "d/y", b"new");
+    assert_eq!(get(&mut c, "d/y"), (200, b"new".to_vec()), "found under the new d/");
+    assert_eq!(http(addr, "HEAD", "/b/d/y").0, 200, "HEAD too");
+}
+
+/// A cached directory's name taken over by a file: the directory renamed
+/// away behind the gateway (it still exists), then a file put under the old
+/// name. The last component is never taken from the cache, so the key is the
+/// file — it used to resolve to the renamed directory and answer 404 for
+/// good, since a directory is no object and nothing ever refreshed it.
+#[test]
+fn a_cached_directory_name_taken_by_a_file_is_the_file() {
+    let (_gw, addr, mgr, _dirs) = gateway(270);
+    let mut c = TcpStream::connect(addr).unwrap();
+    let put = |c: &mut TcpStream, key: &str, body: &[u8]| {
+        let head = format!("PUT /b/{key} HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n", body.len());
+        assert_eq!(keep_alive(c, &head, body).0, 200, "PUT {key}");
+    };
+    let get = |c: &mut TcpStream, key: &str| keep_alive(c, &format!("GET /b/{key} HTTP/1.1\r\nHost: x\r\n\r\n"), b"");
+
+    put(&mut c, "d/x", b"in d");
+    assert_eq!(get(&mut c, "d/x").0, 200, "caches b/ and d/");
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        let mut st = FsState::new(&mgr.to_string()).await.unwrap();
+        let b = dir::resolve(&mut st, "/b").await.unwrap().unwrap();
+        dir::rename(&mut st, b, OsStr::new("d"), b, OsStr::new("old")).await.unwrap();
+    });
+    put(&mut c, "d", b"a file");
+    for _ in 0..2 {
+        assert_eq!(get(&mut c, "d"), (200, b"a file".to_vec()));
+    }
+    assert_eq!(http(addr, "HEAD", "/b/d").0, 200);
+    assert_eq!(get(&mut c, "old/x"), (200, b"in d".to_vec()), "the renamed directory");
+}

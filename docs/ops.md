@@ -6446,6 +6446,29 @@ against it too. An object written through it is a file to a fuse mount and to
 Buckets are the first level under `fs/`: `s3://models/llama/x.safetensors` is
 autumn `fs/models/llama/x.safetensors`.
 
+**Do not serve one tree from fs and S3 at the same time.** Each gateway worker
+caches the bucket and prefix directories its GETs and HEADs walk through, and
+nothing invalidates that cache: it is updated only lazily, when a lookup under
+a cached directory finds nothing (the walk is then redone from the KV). The
+object's own name is never cached. A directory removed and created again from
+a mount or `autumn.Fs` is therefore picked up on the next GET that misses. A
+directory RENAMED from there, with another directory created under its old
+name, is not: the gateway keeps serving the old directory's objects under the
+old name until a lookup there fails or the gateway restarts. Writes through the gateway itself never rename or remove a
+directory, so a tree written and read only over S3 is always consistent. To
+switch a tree between the two, restart the gateway after the fs-side changes.
+
+```bash
+# Check that a directory replaced behind the gateway is found again:
+autumnfs --manager 127.0.0.1:9001 mkdir /models/tmp
+curl -s -T /etc/hostname http://127.0.0.1:9100/models/tmp/a        # PUT
+curl -s http://127.0.0.1:9100/models/tmp/a >/dev/null               # GET: caches tmp/
+curl -s -X DELETE http://127.0.0.1:9100/models/tmp/a
+autumnfs --manager 127.0.0.1:9001 rm /models/tmp                     # behind the gateway
+curl -s -T /etc/hostname http://127.0.0.1:9100/models/tmp/b        # a new tmp/
+curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:9100/models/tmp/b   # → 200
+```
+
 ```bash
 # 1. Run it next to the engine (per-GPU-node sidecar keeps the RDMA hop long
 #    and the HTTP hop on loopback).

@@ -914,6 +914,13 @@ existing cache fails outright.
   - Over 40 hops (Linux MAXSYMLINKS) is ELOOP.
   - `resolve_follow_with` is the same walk with only a `ClusterClient`, so a
     caller need not hold its `FsState` (the S3 gateway's GET and HEAD).
+    `resolve_follow_cached` walks through a `DirCache` (directory entries
+    naming directories, capped at 65536 then cleared). Only a component with
+    more of the path after it is cached or taken from it; the last one is read
+    every time. `Trust` takes cached directories without reading them;
+    `Refresh` reads every entry, caches the directories and drops the names
+    that are no longer one. The caller redoes a failed `Trust` walk with
+    `Refresh`; nothing else invalidates it.
   - `follow_last = false` is `lstat`: a link in the last component is returned
     itself; links before it are followed, and so is a last one written `link/`
     or `link/.`, as POSIX does. The last component is the one popped when the
