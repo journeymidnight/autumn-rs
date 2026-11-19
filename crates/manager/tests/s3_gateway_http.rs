@@ -5,7 +5,8 @@
 //! - small responses are not held back by Nagle: sequential GETs on one
 //!   keep-alive connection do not each wait for the client's delayed ACK;
 //! - a GET of an inline object reads it whole and takes no lease, while a
-//!   larger object is pinned for its body.
+//!   larger object is pinned for its body;
+//! - a tree of another fs schema is refused at start.
 
 mod support;
 
@@ -31,8 +32,8 @@ impl Drop for Gateway {
     }
 }
 
-/// A cluster with an empty bucket `b`, and the gateway serving it.
-fn gateway(base: u16) -> (Gateway, SocketAddr, SocketAddr, (tempfile::TempDir, tempfile::TempDir)) {
+/// A cluster whose `fs/` namespace holds only the root and an empty bucket `b`.
+fn fs_cluster(base: u16) -> (SocketAddr, (tempfile::TempDir, tempfile::TempDir)) {
     let mgr_addr = pick_addr();
     start_manager(mgr_addr);
     let dirs = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
@@ -51,16 +52,25 @@ fn gateway(base: u16) -> (Gateway, SocketAddr, SocketAddr, (tempfile::TempDir, t
         meta::ensure_root(&mut st).await.unwrap();
         dir::mkdir(&mut st, 1, OsStr::new("b"), 0o755).await.unwrap();
     });
+    (mgr_addr, dirs)
+}
 
-    let addr = pick_addr();
-    let gw = Gateway(
+fn spawn_gateway(mgr_addr: SocketAddr, addr: SocketAddr, stderr: std::process::Stdio) -> Gateway {
+    Gateway(
         std::process::Command::new(support_binary_path("autumn-s3"))
             .args(["--manager", &mgr_addr.to_string(), "--listen", "127.0.0.1", "--port", &addr.port().to_string(), "--workers", "1"])
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stderr(stderr)
             .spawn()
             .expect("spawn autumn-s3"),
-    );
+    )
+}
+
+/// A cluster with an empty bucket `b`, and the gateway serving it.
+fn gateway(base: u16) -> (Gateway, SocketAddr, SocketAddr, (tempfile::TempDir, tempfile::TempDir)) {
+    let (mgr_addr, dirs) = fs_cluster(base);
+    let addr = pick_addr();
+    let gw = spawn_gateway(mgr_addr, addr, std::process::Stdio::null());
     let deadline = Instant::now() + Duration::from_secs(60);
     while TcpStream::connect(addr).is_err() {
         assert!(Instant::now() < deadline, "autumn-s3 never listened");
@@ -240,4 +250,31 @@ fn a_cached_directory_name_taken_by_a_file_is_the_file() {
     }
     assert_eq!(http(addr, "HEAD", "/b/d").0, 200);
     assert_eq!(get(&mut c, "old/x"), (200, b"in d".to_vec()), "the renamed directory");
+}
+
+/// The gateway checks the fs schema stamp at start, as every fs client does:
+/// a tree stamped with another version is refused before anything serves.
+#[test]
+fn the_gateway_refuses_a_tree_of_another_schema() {
+    let (mgr_addr, _dirs) = fs_cluster(271);
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        let mut st = FsState::new(&mgr_addr.to_string()).await.unwrap();
+        let other = (autumn_fs::schema::SCHEMA_VERSION - 1).to_be_bytes();
+        st.kv_put(&autumn_fs::key::schema_version_key(), &other).await.unwrap();
+    });
+    let addr = pick_addr();
+    let mut gw = spawn_gateway(mgr_addr, addr, std::process::Stdio::piped());
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let status = loop {
+        if let Some(s) = gw.0.try_wait().unwrap() {
+            break s;
+        }
+        assert!(TcpStream::connect(addr).is_err(), "autumn-s3 serves a tree of another schema");
+        assert!(Instant::now() < deadline, "autumn-s3 neither exited nor listened");
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    let mut err = String::new();
+    gw.0.stderr.take().unwrap().read_to_string(&mut err).unwrap();
+    assert!(!status.success(), "{err}");
+    assert!(err.contains("!= supported"), "{err}");
 }

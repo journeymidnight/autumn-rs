@@ -345,12 +345,17 @@ impl cyper_axum::Listener for NoDelay {
     }
 }
 
+/// A bare `FsState` under the daemon identity `host`.
+async fn new_state(host: String, credential: Option<(String, Vec<u8>)>) -> Result<FsState> {
+    match credential {
+        Some((who, secret)) => FsState::new_with_host_credential(&params().manager.get(), host, &who, secret).await,
+        None => FsState::new_with_host(&params().manager.get(), host).await,
+    }
+}
+
 /// This process's `FsState`, under the daemon identity `host`.
 async fn connect_state(host: String, credential: Option<(String, Vec<u8>)>) -> Result<FsState> {
-    let mut state = match credential {
-        Some((who, secret)) => FsState::new_with_host_credential(&params().manager.get(), host, &who, secret).await?,
-        None => FsState::new_with_host(&params().manager.get(), host).await?,
-    };
+    let mut state = new_state(host, credential).await?;
     state.direct_read = params().direct_read.get();
     // Renews every lease this state holds: the publishing session (which
     // lapses after 30 s without it, and a sweeper would then recover the
@@ -652,6 +657,13 @@ fn main() -> Result<()> {
         sweep_interval_secs = params().sweep_interval_secs.get(),
         "autumn-s3 (unauthenticated) on http://{addr}"
     );
+
+    // Check the fs schema stamp (a fresh tree: stamp it) and the root once,
+    // before any worker serves, as every other fs client does at start.
+    compio::runtime::Runtime::new().context("compio runtime")?.block_on(async {
+        let mut st = new_state(format!("{}-init", p.host.get()), credential.clone()).await?;
+        autumn_fs::meta::ensure_root(&mut st).await
+    })?;
 
     let (reclaim_tx, reclaim_rx) = mpsc::unbounded();
     let (exit_tx, exit_rx) = std::sync::mpsc::channel();

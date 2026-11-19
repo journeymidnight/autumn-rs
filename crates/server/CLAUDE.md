@@ -443,6 +443,11 @@ autumn-s3 --manager <host:port> [--listen 0.0.0.0] [--port 9000] [--workers N]
 - Reads go through `autumn-fs` — the same crate the fuse mount and the PyO3
   `autumn.Fs` binding use — so lane striping, EN-direct reads and authz apply
   unchanged. An adapter over the partition layer, not a second data plane.
+- At start, before any worker serves, `meta::ensure_root` checks the fs schema
+  stamp (stamps a fresh tree) like every other fs client; another version
+  exits non-zero (`s3_gateway_http::the_gateway_refuses_a_tree_of_another_schema`).
+  So start needs `fs/` created and a PS answering, as a fuse mount does (a k8s
+  gateway pod restarts until `namespace-create` has run).
 - Tunables come from `crates/params/src/s3.rs` plus the shared `fs` and `client`
   sets (`autumn-s3 --help`): `--workers`, `--sweep-interval-secs`, `--pin-linger-ms`.
 - `--workers` (default 0 = `min(cores, 8)`) accept threads, each with its own compio
