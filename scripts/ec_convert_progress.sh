@@ -62,7 +62,7 @@ sleep 5
 
 # Layer-A namespace registry is active whenever it is non-empty, and bootstrap
 # always seeds fs/kvc/mem — so an unregistered first key segment is rejected
-# even with authz off. perf-check writes under `bench/perf`.
+# even with authz off. perf-check writes under `bench`.
 $AO namespace-create --name bench >"$W/ns.log" 2>&1 || true
 
 # Only a ROLL seals an extent — a PS restart replays and keeps appending to the

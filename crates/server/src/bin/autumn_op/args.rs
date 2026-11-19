@@ -1752,7 +1752,7 @@ pub(crate) enum PresplitRule {
     /// N:hexstring`. That flag cut the RAW keyspace, so under Option 3 its points
     /// (`2aaaaaaa`, `aaaaaaa8`, …) sat nowhere near a namespaced key and the
     /// presplit silently did nothing — for the benches, `bench_user_starts` kept
-    /// only partitions starting with `bench/perf/` and got none, so every
+    /// only partitions starting with the bench scope and got none, so every
     /// `--partitions N` run measured ONE partition.
     /// Cutting relative to the namespace prefix puts the points where the keys
     /// actually are.

@@ -1105,20 +1105,27 @@ do_start() {
         done
         # `bootstrap --presplit` is RETIRED (it cut the RAW
         # keyspace, which misses every `{ns}/`-prefixed key). AUTUMN_BOOTSTRAP_PRESPLIT
-        # is now interpreted as "create the BENCH namespace in N partitions",
-        # applied after bootstrap + namespace registration below.
+        # is now interpreted as "create the BENCH namespace in N partitions"
+        # (cut at bench/<hex>, where the bench keys are), below.
         "$AO" --cluster-secret-file "$CLUSTER_SECRET_FILE" --manager "$MANAGER_ADDR" --transport "$TRANSPORT" bootstrap "${bootstrap_args[@]}"
         touch "$bootstrap_marker"
         wait_ps_ready 120
         # Nothing is registered by default; a dev cluster serves fs and kvc
         # (docs/ops.md "Enabling fs / kvc"). AUTUMN_NAMESPACES="" registers none.
-        local _ns _rule
+        local _ns _rule _bench_done=0
+        local _bp="${AUTUMN_BOOTSTRAP_PRESPLIT:-}"; local _bparts="${_bp%%:*}"
+        [[ "$_bparts" =~ ^[0-9]+$ ]] && (( _bparts > 1 )) || _bparts=1
         for _ns in ${AUTUMN_NAMESPACES-fs kvc}; do
             _rule=()
             [[ "$_ns" == kvc ]] && _rule=(--parts 16)
+            [[ "$_ns" == bench ]] && { _rule=(--parts "$_bparts"); _bench_done=1; }
             "$AO" --cluster-secret-file "$CLUSTER_SECRET_FILE" --manager "$MANAGER_ADDR" --transport "$TRANSPORT" \
                 namespace-create --name "$_ns" "${_rule[@]}" || die "namespace-create $_ns failed"
         done
+        if (( _bparts > 1 && _bench_done == 0 )); then
+            "$AO" --cluster-secret-file "$CLUSTER_SECRET_FILE" --manager "$MANAGER_ADDR" --transport "$TRANSPORT" \
+                namespace-create --name bench --parts "$_bparts" || die "namespace-create bench --parts $_bparts failed"
+        fi
         wait_ps_ready 120
     fi
 
@@ -1134,15 +1141,6 @@ do_start() {
         echo "[cluster] namespaces are not created automatically; create them as needed:"
         echo "[cluster]   $AO --cluster-secret-file $CLUSTER_SECRET_FILE --manager $MANAGER_ADDR --transport $TRANSPORT namespace-create --name bench --parts N"
         echo "[cluster]   $AO --cluster-secret-file $CLUSTER_SECRET_FILE --manager $MANAGER_ADDR --transport $TRANSPORT namespace-create --name gallery"
-        # AUTUMN_BOOTSTRAP_PRESPLIT=N creates `bench` in N partitions, cut at
-        # bench/<hex> where the bench keys are.
-        local _bp="${AUTUMN_BOOTSTRAP_PRESPLIT:-}"; local _bparts="${_bp%%:*}"
-        if [[ "$_bparts" =~ ^[0-9]+$ ]] && (( _bparts > 1 )); then
-            "$AO" --cluster-secret-file "$CLUSTER_SECRET_FILE" --manager "$MANAGER_ADDR" --transport "$TRANSPORT" \
-                namespace-create --name bench --parts "$_bparts" \
-                || echo "[cluster] warning: namespace-create bench --parts $_bparts failed"
-            wait_ps_ready 120
-        fi
     }
 
     if [[ "${AUTUMN_AUTH:-0}" == "1" ]]; then

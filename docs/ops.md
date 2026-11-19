@@ -197,6 +197,7 @@ $AO info                               # partitions starting fs/, kvc/, kvc/1 â€
   GC busy for hours.
 - `cluster.sh` creates `fs` and `kvc` (`--parts 16`) on its first start;
   `AUTUMN_NAMESPACES="fs kvc bench"` picks the list, `AUTUMN_NAMESPACES=""` none.
+  `AUTUMN_BOOTSTRAP_PRESPLIT=N` creates `bench` in N partitions (listed or not).
 - A cluster from an earlier release keeps the namespace rows it had (`fs`,
   `kvc`, `mem` were registered automatically then); `namespace-delete --name mem`
   drops one nothing uses.
@@ -3834,7 +3835,7 @@ cargo bench -p autumn-transport --features ucx --bench am_memh --no-run
 AUTUMN_UCX_TEST_BIND='[<roce-ip>]:0' UCX_TLS=rc_mlx5,tcp,self UCX_NET_DEVICES=<dev>:1 \
   AM_MEMH_SENDERS=8 taskset -c <16 idle cores> cargo bench -p autumn-transport --features ucx --bench am_memh
 # live (UCX cluster up, namespace bench created): sizes around the 64 KiB cut, compared byte for byte
-AC=(target/release/autumn-client --manager "[<roce-ip>]:9001" --transport ucx --namespace bench/perf)
+AC=(target/release/autumn-client --manager "[<roce-ip>]:9001" --transport ucx --namespace bench)
 for n in 1000 65535 65536 100000 1048583 8388608 34603017; do
   head -c $n /dev/urandom > /tmp/v$n; "${AC[@]}" put fv$n /tmp/v$n >/dev/null
   "${AC[@]}" get fv$n | cmp - /tmp/v$n && echo "ok $n"; done
@@ -4223,7 +4224,7 @@ $AC del KEY                              # delete
 $AC ls --prefix p/ --limit 100           # scan
 $AC put-stream KEY /path/to/big.bin      # chunked stripe-put for large values
 $AC perf-check --threads 16 --size 4096 --duration 10 --partitions 8
-$AC perf-clean --dry-run                 # count what perf-check / ycsb left (bench/perf)
+$AC perf-clean --dry-run                 # count what perf-check / ycsb left (bench)
 $AC perf-clean [--parallel 8]            # delete it; each bench partition range in
                                          # parallel, one delete_many per 4096-key page.
 $AC perf-clean --dry-run                 # expect 0 afterwards
@@ -4245,7 +4246,7 @@ $AO scrub EXT_ID... | --part PART_ID | --all [--wait]
 # Eviction is CLOCK; a sequential read must not fall off once the cache fills.
 # Manual check: cluster.sh with AUTUMN_SST_BLOCK_CACHE_BYTES=33554432,
 #   AUTUMN_PS_FLUSH_MEM_BYTES=8388608, AUTUMN_BOOTSTRAP_PRESPLIT=4 (cores
-#   pinned away from other workloads); write 1M 200 B keys under bench/perf in
+#   pinned away from other workloads); write 1M 200 B keys under bench in
 #   RANDOM order, then read them in key order with 8 readers and print ops/s
 #   per 5% of each reader's slice. Expect a flat rate (~3.5K/reader from one
 #   Python client); before the fix it fell from ~3.4K to ~210 after ~15%.

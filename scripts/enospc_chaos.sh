@@ -25,8 +25,8 @@ WORK="$(mktemp -d /tmp/enospc_chaos.XXXXXX)"
 IMG="$WORK/disk1.img"
 DATA_ROOT="${AUTUMN_DATA_ROOT:-/tmp/autumn-rs}"
 MNT="$DATA_ROOT/d1"
-# cluster.sh creates bench and spreads `bench/perf/<hex>` over 8 partitions, so
-# keys are `perf/<2 hex>-...` under namespace bench.
+# cluster.sh creates bench in 8 partitions cut at `bench/<hex>`, so keys are
+# `<2 hex>-...` under namespace bench.
 AC=("$ROOT/target/release/autumn-client" --manager "$MGR" --namespace bench)
 SECRET="${AUTUMN_CLUSTER_SECRET_FILE:-$DATA_ROOT/cluster.secret}"
 AO=(timeout 20 "$ROOT/target/release/autumn-op" --cluster-secret-file "$SECRET" --manager "$MGR" --transport tcp)
@@ -101,7 +101,7 @@ dd if=/dev/urandom of="$WORK/val1m" bs=1M count=1 status=none
 n=0 full_seen=0
 while [ $n -lt 600 ]; do
     n=$((n+1))
-    key="perf/$(printf '%02x' $(( RANDOM % 256 )))-ek-$n"
+    key="$(printf '%02x' $(( RANDOM % 256 )))-ek-$n"
     if timeout 20 "${AC[@]}" put "$key" "$WORK/val1m" >/dev/null 2>&1; then
         echo "$key" >> "$WORK/acked.txt"
     fi
@@ -119,7 +119,7 @@ fi
 say "E2: post-full write availability (20 keys, transient errors tolerated)"
 ok2=0
 for i in $(seq 1 20); do
-    key="perf/$(printf '%02x' $(( RANDOM % 256 )))-post-full-$i"
+    key="$(printf '%02x' $(( RANDOM % 256 )))-post-full-$i"
     if timeout 30 "${AC[@]}" put "$key" "$WORK/val1m" >/dev/null 2>&1; then
         echo "$key" >> "$WORK/acked.txt"
         ok2=$((ok2+1))
@@ -142,7 +142,7 @@ done
 say "E3b: 10 more writes after heal"
 ok3=0
 for i in $(seq 1 10); do
-    key="perf/$(printf '%02x' $(( RANDOM % 256 )))-post-heal-$i"
+    key="$(printf '%02x' $(( RANDOM % 256 )))-post-heal-$i"
     if timeout 30 "${AC[@]}" put "$key" "$WORK/val1m" >/dev/null 2>&1; then
         echo "$key" >> "$WORK/acked.txt"
         ok3=$((ok3+1))
