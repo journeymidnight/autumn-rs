@@ -75,8 +75,8 @@ pub const MSG_RECONCILE_EXTENTS: u8 = 0x31;
 // any sealed extents in that stream and convert them on the next tick (~5s).
 pub const MSG_UPDATE_STREAM_EC: u8 = 0x32;
 
-// 0x33 retired with the vp_table_refs removal (was
-// MSG_SYNC_PARTITION_VP_REFS, partition→manager VP-dependency sync).
+// 0x33 retired (was MSG_SYNC_PARTITION_VP_REFS, partition→manager
+// VP-dependency sync).
 
 // 0x34 retired: was MSG_MULTI_MODIFY_MERGE, the raw merge txn. It has no
 // freeze drain, so a source's unflushed writes were lost; merges go through
@@ -356,22 +356,10 @@ pub struct MgrExtentInfo {
     pub replicates: Vec<u64>,
     pub parity: Vec<u64>,
     pub eversion: u64,
+    /// Streams listing this extent (a CoW split shares it). At 0 it is
+    /// deleted: GC relocates every live value off an extent before dropping it
+    /// from a stream, so no ValuePointer reaches an extent at 0.
     pub refs: u64,
-    /// Count of live SSTables whose ValuePointers referenced this extent — an
-    /// indirect-retention "net" on top of `refs`.
-    ///
-    /// vp_table_refs-removal STAGING (Stage 1): the *maintenance* machinery
-    /// that bumped/decremented this (the PS sync/pull RPCs + manager
-    /// aggregation) is gone, so the field is now WRITE-FROZEN — every extent
-    /// allocated under this build leaves it 0. It is still READ by
-    /// `extent_can_delete` (which keeps `refs == 0 && vp_table_refs == 0`) as an
-    /// UPGRADE-SAFETY GUARD: a cluster upgraded from a pre-removal build may
-    /// hold legacy extents legitimately retained at `refs == 0 && vp_table_refs
-    /// > 0`, and reaping them would lose live data (see manager
-    /// `extent_can_delete`). Kept in the persisted `extents/<id>` rkyv layout so
-    /// existing records decode unchanged. Stage 2's migration clears it and
-    /// removes the field (collapsing the gate to `refs == 0`).
-    pub vp_table_refs: u64,
     pub sealed_length: u64,
     /// True once this extent has been SEALED (immutable; no more appends).
     /// The explicit flag — NOT `sealed_length > 0` — is the authoritative

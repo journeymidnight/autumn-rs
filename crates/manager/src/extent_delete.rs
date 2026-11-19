@@ -174,34 +174,23 @@ impl AutumnManager {
         Ok(())
     }
 
-    /// EXTENT10-AUTORECLAIM: reclaim extents that reached both-zero
-    /// (`refs == 0 && vp_table_refs == 0`, per `extent_can_delete`) but are in
-    /// NO stream. The refs-side delete trigger lives in `punch_holes` /
-    /// `truncate`, which only inspect CURRENT stream members. An extent that
-    /// lost its last membership out-of-band sits at `refs == 0` with no path
-    /// firing its delete — the extent-10 orphan class. Without this sweep it
-    /// leaks on disk until manual reclaim.
-    ///
-    /// SAFETY — deleting on both-zero is sound:
-    /// - `refs == 0` ⇒ every log_stream relocated its live values out before
-    ///   dropping the extent (relocate-then-punch, made correct by
-    ///   GC-VP-IDENTITY), so no LIVE ValuePointer points here;
-    /// - `vp_table_refs == 0` ⇒ no live SST physically references it.
-    /// The `vp_table_refs == 0` half is now an UPGRADE-SAFETY GUARD (see
-    /// `extent_can_delete`): the maintenance machinery is gone, so for extents
-    /// managed under this build it is always 0, but a legacy `vp_table_refs > 0`
-    /// extent (live VPs the old net protected) is correctly NOT reclaimed here
-    /// until Stage 2's migration clears the field.
+    /// Reclaim extents at `refs == 0` (`extent_can_delete`) that are in NO
+    /// stream. The delete trigger lives in `punch_holes` / `truncate`, which
+    /// only inspect CURRENT stream members; an extent that lost its last
+    /// membership out-of-band sits at `refs == 0` with no path firing its
+    /// delete, and would leak on disk. Sound because GC relocates every live
+    /// value off an extent before dropping it (relocate-then-punch), so no
+    /// ValuePointer reaches it.
     ///
     /// Mirrors `punch_holes`: fenced `extents/<id>` etcd delete → in-memory
     /// remove → `enqueue_pending_deletes` (acquires the Delete marker;
     /// `extent_delete_loop` fans out the physical unlink). Returns the count
     /// reclaimed this pass.
-    pub(crate) async fn extent_both_zero_sweep_once(&self) -> usize {
+    pub(crate) async fn orphan_extent_sweep_once(&self) -> usize {
         if !self.leader.get() {
             return 0;
         }
-        // Collect both-zero candidates not already in the inflight ledger or
+        // Collect candidates not already in the inflight ledger or
         // the delete-progress map. Snapshot replica addrs AND the full extent
         // record (the value-CAS baseline) under the same borrow.
         let candidates: Vec<(PendingDelete, Vec<u8>)> = {
@@ -229,8 +218,8 @@ impl AutumnManager {
                 if stream_members.contains(eid) {
                     tracing::error!(
                         extent_id = *eid,
-                        "both-zero sweep: extent is refs==0 && vp_table_refs==0 yet STILL listed \
-                         in a stream's extent_ids (refs accounting bug) — skipping reclaim, investigate"
+                        "orphan sweep: extent is at refs==0 yet STILL listed in a stream's \
+                         extent_ids (refs accounting bug) — skipping reclaim, investigate"
                     );
                     continue;
                 }
@@ -279,7 +268,7 @@ impl AutumnManager {
                     tracing::warn!(
                         extent_id = eid,
                         error = %e,
-                        "both-zero sweep: CAS extent delete refused (concurrent change) \
+                        "orphan sweep: CAS extent delete refused (concurrent change) \
                          or etcd error; retry next tick"
                     );
                     continue;
@@ -290,7 +279,7 @@ impl AutumnManager {
                 tracing::warn!(
                     extent_id = eid,
                     error = %e,
-                    "both-zero sweep: could not drop the extent's payload-location key"
+                    "orphan sweep: could not drop the extent's payload-location key"
                 );
             }
             // Same lifetime as the payload location: the extent is gone, so the
@@ -309,14 +298,14 @@ impl AutumnManager {
                 tracing::warn!(
                     extent_id = eid,
                     error = %e,
-                    "both-zero sweep: enqueue_pending_deletes failed (node-startup \
+                    "orphan sweep: enqueue_pending_deletes failed (node-startup \
                      reconcile is the backstop)"
                 );
             }
             reclaimed += 1;
         }
         if reclaimed > 0 {
-            tracing::info!(reclaimed, "both-zero sweep reclaimed orphan extent(s)");
+            tracing::info!(reclaimed, "orphan sweep reclaimed orphan extent(s)");
         }
         reclaimed
     }
@@ -523,13 +512,13 @@ impl AutumnManager {
         }
     }
 
-    /// EXTENT10-AUTORECLAIM background loop (leader-only via the gate inside
-    /// `extent_both_zero_sweep_once`; supervised by `start_runtime_tasks`).
-    pub(crate) async fn extent_both_zero_sweep_loop(self) {
+    /// The orphan sweep's loop (leader-only via the gate inside
+    /// `orphan_extent_sweep_once`; supervised by `start_runtime_tasks`).
+    pub(crate) async fn orphan_extent_sweep_loop(self) {
         loop {
             let every = self.params().orphan_sweep_interval_secs.get();
             compio::time::sleep(Duration::from_secs(every)).await;
-            self.extent_both_zero_sweep_once().await;
+            self.orphan_extent_sweep_once().await;
         }
     }
 

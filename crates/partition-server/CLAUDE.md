@@ -223,16 +223,14 @@ back not-found) and old WAL keys mis-split (9-byte vs 8-byte suffix). There
 is deliberately NO migration (a cluster holding data in the old encoding must be
 rebuilt from empty).
 
-## SST VP dependency tracking (`vp_deps`)
+## Value pointers and log-extent retention
 
-Each SST `MetaBlock` still carries `vp_deps: Vec<u64>` (the distinct log extent
-ids referenced by live `ValuePointer`s), and `SstReader.vp_deps` mirrors it, but
-both are **INERT**: the builder writes it, the reader decodes it, nothing reads
-it. The PS does NOT compute or sync any per-partition VP-ref snapshot. Retention
-is `refs`-based; it is safe because GC's relocate-then-punch invariant guarantees
-`refs == 0 ⇒ no live VP`. Split-lifetime correctness (shared SSTs still holding
-old `ValuePointer`s after a child truncated the log) is upheld by GC relocating
-live values out before `punch_holes` drops `refs`
+An SST records no per-table list of the log extents its `ValuePointer`s reach
+(MetaBlock v2's `vp_deps`, gone in v3), and the manager keeps no such count.
+Retention is `refs`-based; it is safe because GC's relocate-then-punch moves
+every live value off a log extent before `punch_holes` drops it, so `refs == 0 ⇒
+no live VP`. Split-lifetime correctness (shared SSTs still holding old
+`ValuePointer`s after a child truncated the log) rests on the same rule
 (`crates/manager/tests/system_vp_after_split_gc.rs`).
 
 ## Write Path: Put / Delete (Batched, Pipelined Log Appends)
@@ -2822,11 +2820,13 @@ compatibility code in the servers.
 These bytes live inside every extent, at terabyte scale, so rewriting them is a
 decision of its own, made only for one specific need.
 
-It has been taken once: MetaBlock **v2** added `num_entries` / `num_deletions`
-(the tombstone count) for the deletion-triggered compaction, which needs them. The one-off conversion tool has been
-removed. The server reads **only v2**: a v1 MetaBlock fails to decode with the
-actual and supported versions, so an unconverted partition does not open.
-The data blocks did not change. The `VERSION` field is the
+It has been taken twice: MetaBlock v2 added `num_entries` / `num_deletions`
+(the tombstone count) for the deletion-triggered compaction, and v3 dropped the
+inert `vp_deps` list. The server reads **only v3**: another version fails to
+decode with the actual and supported versions, so an unconverted partition does
+not open. `autumn-convert sst` rewrites v2 tables (`sst_convert.rs`: the data
+blocks are kept byte for byte, the MetaBlock re-encoded, every entry read back
+before the table is written; `crates/manager/tests/convert_sst.rs`). The `VERSION` field is the
 tripwire that makes a mismatch loud; the decoder also refuses missing or
 trailing MetaBlock bytes.
 
@@ -2885,9 +2885,9 @@ version boundary (red with the zero suffix there); a table indexed the old way
 `reader::window_tests::an_absent_key_between_blocks_does_not_read_the_next_block`
 (the next block corrupted; red without the check).
 
-### MetaBlock Layout (v2)
+### MetaBlock Layout (v3)
 ```
-MAGIC "AU7B" (4B) | VERSION (2B) = 2
+MAGIC "AU7B" (4B) | VERSION (2B) = 3
 num_blocks (4B)
   per block: [key_len:2B][base_key][relative_offset:4B][block_len:4B]
 bloom_len (4B) | bloom_data
@@ -2896,7 +2896,6 @@ biggest_key_len (2B) | biggest_key
 estimated_size (8B)
 seq_num (8B)
 vp_extent_id (8B) | vp_offset (8B)
-vp_dep_count (4B) | vp_deps (8B each, inert)
 compression_type (1B, always 0)
 discard_count (4B)
   per entry: [extent_id:8B][size:i64 8B]

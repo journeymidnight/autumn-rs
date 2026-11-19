@@ -17,6 +17,7 @@ mod op_log;
 mod cluster_status;
 mod manager_members;
 mod persist;
+pub mod upgrade;
 mod placement;
 pub mod policy;
 #[cfg(test)]
@@ -1666,13 +1667,12 @@ impl AutumnManager {
             mgr.clone().extent_delete_retry_loop()
         });
 
-        // EXTENT10-AUTORECLAIM: reclaim both-zero orphan extents (refs==0 &&
-        // vp_table_refs==0, in no stream) that the punch/truncate refs-side
-        // delete path never sees because they lost their last membership
-        // out-of-band (extent-10 class).
+        // Reclaim orphan extents (refs == 0, in no stream) that the
+        // punch/truncate delete path never sees because they lost their last
+        // membership out-of-band.
         let mgr = self.clone();
-        Self::spawn_supervised("extent_both_zero_sweep", move || {
-            mgr.clone().extent_both_zero_sweep_loop()
+        Self::spawn_supervised("orphan_extent_sweep", move || {
+            mgr.clone().orphan_extent_sweep_loop()
         });
 
         // Backstop for sealed-empty non-tail stream members: a punch that failed,
@@ -4552,28 +4552,11 @@ impl AutumnManager {
         ))
     }
 
-    /// Extent retention predicate. Reclaimable iff no stream lists it
-    /// (`refs == 0`) AND no live SST ValuePointer is recorded against it
-    /// (`vp_table_refs == 0`).
-    ///
-    /// vp_table_refs-removal STAGING NOTE: the vp_table_refs *maintenance*
-    /// machinery (the PS sync/pull RPCs, the manager-side aggregation) is gone,
-    /// so the field is now write-FROZEN — every extent allocated/managed under
-    /// this build has `vp_table_refs == 0`, making this gate effectively
-    /// `refs == 0` for them. The `&& vp_table_refs == 0` clause is RETAINED as
-    /// an UPGRADE-SAFETY GUARD: a cluster upgraded from a pre-removal build may
-    /// hold legacy extents legitimately retained at `refs == 0 && vp_table_refs
-    /// > 0` (live VPs that the old net protected, e.g. extent 10). Collapsing
-    /// to `refs == 0` here would reap them and lose data, because the
-    /// `refs == 0 ⇒ no live VP` invariant only holds for extents that reached
-    /// `refs == 0` under the post-GC-VP-IDENTITY relocate-then-punch path — not
-    /// for state frozen in etcd by an older buggy GC. Stage 2's migration
-    /// (re-confirm no live VP / major-compact, then clear the field) is what
-    /// lets this collapse to `refs == 0`. Until then the guard stays; such
-    /// legacy extents are simply not reclaimed (a bounded space leak, never a
-    /// loss). See manager/CLAUDE.md "VP lifetime after split".
+    /// Reclaimable iff no stream lists it. GC relocates every live value off
+    /// an extent before dropping it from a stream (relocate-then-punch), so at
+    /// `refs == 0` no ValuePointer reaches it.
     fn extent_can_delete(extent: &ExtentRecord) -> bool {
-        extent.refs == 0 && extent.vp_table_refs == 0
+        extent.refs == 0
     }
 
     /// Apply computed split mutations to the in-memory store.
@@ -5250,14 +5233,13 @@ mod tests {
         assert!(!namespace_prefix_conflicts(b"anything/", &[]));
     }
 
-    fn test_extent(extent_id: u64, refs: u64, vp_table_refs: u64) -> ExtentRecord {
+    fn test_extent(extent_id: u64, refs: u64) -> ExtentRecord {
         ExtentRecord {
             extent_id,
             replicates: vec![],
             parity: vec![],
             eversion: 1,
             refs,
-            vp_table_refs,
             sealed_length: 0,
             sealed: false,
             avali: 0,
@@ -5434,7 +5416,7 @@ mod tests {
         let extent_id = 42;
         {
             let mut s = m.store.inner.borrow_mut();
-            let mut ex = test_extent(extent_id, 1, 0);
+            let mut ex = test_extent(extent_id, 1);
             ex.replicates = vec![1, 3, 5];
             ex.sealed = true;
             ex.sealed_length = 100;
@@ -5468,7 +5450,7 @@ mod tests {
         let extent_id = 43;
         {
             let mut s = m.store.inner.borrow_mut();
-            let mut ex = test_extent(extent_id, 1, 0);
+            let mut ex = test_extent(extent_id, 1);
             ex.replicates = vec![1, 3, 5];
             ex.sealed = true;
             ex.sealed_length = 100;
@@ -5513,7 +5495,7 @@ mod tests {
         // Extent 5 exists and node 7 is NOT one of its members.
         {
             let mut s = m.store.inner.borrow_mut();
-            let mut ex = test_extent(5, 1, 0);
+            let mut ex = test_extent(5, 1);
             ex.replicates = vec![1, 2, 3];
             s.extents.insert(5, ex);
         }
@@ -5552,7 +5534,7 @@ mod tests {
         let m = AutumnManager::new();
         {
             let mut s = m.store.inner.borrow_mut();
-            let mut ex = test_extent(5, 1, 0);
+            let mut ex = test_extent(5, 1);
             ex.replicates = vec![1, 2, 3];
             s.extents.insert(5, ex);
         }
@@ -5586,7 +5568,7 @@ mod tests {
         {
             let mut s = m.store.inner.borrow_mut();
             s.nodes.get_mut(&7).unwrap().node_uuid = "uuid-of-7".to_string();
-            let mut ex = test_extent(5, 1, 0);
+            let mut ex = test_extent(5, 1);
             ex.replicates = vec![1, 7, 3]; // node 7 IS a member, at slot 1
             s.extents.insert(5, ex);
         }
@@ -5622,7 +5604,7 @@ mod tests {
         {
             let mut s = m.store.inner.borrow_mut();
             for eid in [5u64, 6] {
-                let mut ex = test_extent(eid, 1, 0);
+                let mut ex = test_extent(eid, 1);
                 ex.replicates = vec![1, 2, 3]; // node 7 is a member of neither
                 s.extents.insert(eid, ex);
             }
@@ -5659,7 +5641,7 @@ mod tests {
         add_node_and_disk(&m, 7, 70);
         {
             let mut s = m.store.inner.borrow_mut();
-            let mut ex = test_extent(5, 1, 0);
+            let mut ex = test_extent(5, 1);
             ex.replicates = vec![1, 7, 3]; // node 7 IS a member
             s.extents.insert(5, ex);
         }
@@ -5691,7 +5673,7 @@ mod tests {
         add_node_and_disk(&m, 7, 70);
         {
             let mut s = m.store.inner.borrow_mut();
-            let mut ex = test_extent(5, 1, 0);
+            let mut ex = test_extent(5, 1);
             ex.replicates = vec![1, 7, 3]; // node 7 IS a member
             s.extents.insert(5, ex);
         }
@@ -5752,7 +5734,7 @@ mod tests {
         add_node_and_disk(&m, 7, 70);
         {
             let mut s = m.store.inner.borrow_mut();
-            let mut ex = test_extent(5, 1, 0);
+            let mut ex = test_extent(5, 1);
             ex.replicates = vec![1, 2, 3];
             s.extents.insert(5, ex);
         }
@@ -5916,15 +5898,13 @@ mod tests {
         assert!(disk.online, "duplicate reporter must not trip quorum");
     }
 
-    // EXTENT10-AUTORECLAIM: a both-zero orphan (refs==0 && vp_table_refs==0,
-    // in no stream) must be auto-reclaimed by the sweep; a retained orphan
-    // (vp_table_refs>0 — the upgrade-safety guard, see extent_can_delete) and a
-    // stream member (refs>0) must be kept. Reproduces the extent-10 leak:
-    // pre-sweep nothing reclaims a both-zero non-member.
+    // An orphan (refs == 0, in no stream) is reclaimed by the sweep; a stream
+    // member (refs > 0) is kept, and so is an extent at refs == 0 that a stream
+    // still lists (a refs under-count must not dangle the membership).
     #[test]
-    fn extent10_both_zero_orphan_is_auto_reclaimed_referenced_kept() {
+    fn an_orphan_extent_is_reclaimed_and_a_referenced_one_kept() {
         let m = AutumnManager::new();
-        let mk = |id: u64, refs: u64, vp: u64| ExtentRecord {
+        let mk = |id: u64, refs: u64| ExtentRecord {
             extent_id: id,
             replicates: vec![],
             parity: vec![],
@@ -5935,17 +5915,15 @@ mod tests {
             avali: 0,
             eversion: 0,
             refs,
-            vp_table_refs: vp,
             ec_converted: false,
         };
         {
             let mut s = m.store.inner.borrow_mut();
-            s.extents.insert(10, mk(10, 0, 0)); // both-zero orphan, no stream → reclaim
-            s.extents.insert(11, mk(11, 0, 1)); // retained by vp_table_refs (legacy guard) → keep
-            s.extents.insert(12, mk(12, 1, 0)); // stream member (refs>0) → keep
-            // both-zero BUT still listed in a stream (refs under-count bug):
+            s.extents.insert(10, mk(10, 0)); // orphan, no stream → reclaim
+            s.extents.insert(12, mk(12, 1)); // stream member (refs>0) → keep
+            // refs == 0 BUT still listed in a stream (refs under-count bug):
             // must NOT be reclaimed (would dangle the membership).
-            s.extents.insert(13, mk(13, 0, 0));
+            s.extents.insert(13, mk(13, 0));
             s.streams.insert(
                 500,
                 StreamRecord {
@@ -5957,22 +5935,17 @@ mod tests {
                 },
             );
         }
-        // The leak: today no path reclaims a both-zero non-member extent.
         assert!(m.store.inner.borrow().extents.contains_key(&10));
 
-        let n = run(async { m.extent_both_zero_sweep_once().await });
-        assert_eq!(n, 1, "exactly the both-zero non-member orphan must be reclaimed");
+        let n = run(async { m.orphan_extent_sweep_once().await });
+        assert_eq!(n, 1, "exactly the orphan must be reclaimed");
 
         let s = m.store.inner.borrow();
-        assert!(!s.extents.contains_key(&10), "both-zero orphan must be removed");
-        assert!(
-            s.extents.contains_key(&11),
-            "vp_table_refs>0 must be retained (upgrade-safety guard for legacy live VPs)"
-        );
+        assert!(!s.extents.contains_key(&10), "the orphan must be removed");
         assert!(s.extents.contains_key(&12), "refs>0 (stream member) must be retained");
         assert!(
             s.extents.contains_key(&13),
-            "both-zero but still in a stream must NOT be reclaimed (would dangle membership)"
+            "refs == 0 but still in a stream must NOT be reclaimed (would dangle membership)"
         );
         drop(s);
         assert!(
@@ -6577,10 +6550,6 @@ mod tests {
         })
     }
 
-    // (removed: partition_vp_refs_diff_updates_extent_counters — the
-    // vp_table_refs maintenance path it exercised was deleted; extent
-    // retention is now `refs`-only.)
-
     #[test]
     fn compute_merge_streams_extent_ids_order_and_refs() {
         let mut state = crate::store::MetadataState::default();
@@ -6595,7 +6564,6 @@ mod tests {
             avali: 1,
             eversion: 0,
             refs,
-            vp_table_refs: 0,
             ec_converted: false,
         };
         state.extents.insert(10, mk(10, 1, 1024));
@@ -6676,7 +6644,6 @@ mod tests {
             avali: 1,
             eversion: 0,
             refs,
-            vp_table_refs: 0,
             ec_converted: false,
         };
         // Shared ancestor extent 10 is CoW-shared by both children of a prior
@@ -6750,7 +6717,6 @@ mod tests {
             avali: 1,
             eversion: 0,
             refs,
-            vp_table_refs: 0,
             ec_converted: false,
         };
         state.extents.insert(30, mk(30, 2)); // CoW-shared by both
@@ -6821,7 +6787,6 @@ mod tests {
             avali: 1,
             eversion: 0,
             refs,
-            vp_table_refs: 0,
             ec_converted: false,
         };
 
@@ -6974,10 +6939,6 @@ mod tests {
         );
     }
 
-    // (removed: merged_partition_vp_refs_sums_per_extent and
-    // split_partition_vp_snapshot_clones_parent_refs — both exercised the
-    // deleted partition_vp_refs maintenance fns.)
-
     #[test]
     fn compute_region_keeps_existing_ps_for_left_partition() {
         let mut state = crate::store::MetadataState::default();
@@ -7090,9 +7051,6 @@ mod tests {
         assert_eq!(moves.len(), 5, "capped at max_moves");
     }
 
-    // (removed: merge_extent_updates_preserves_ref_and_vp_changes —
-    // merge_extent_updates was deleted with the vp_table_refs machinery.)
-
     #[test]
     fn rebalance_noop_when_already_balanced() {
         // 11/11/10 across ps 1/2/3 — gap already 1, nothing to do.
@@ -7171,7 +7129,6 @@ mod tests {
                         parity: vec![],
                         eversion: 1,
                         refs: 1,
-                        vp_table_refs: 0,
                         sealed_length: 0,
                         sealed: false,
                         avali: 0,
@@ -7290,7 +7247,6 @@ mod tests {
                             parity: vec![],
                             eversion: 1,
                             refs: 1,
-                            vp_table_refs: 0,
                             sealed_length: 100,
                             sealed: true,
                             avali: 1,
@@ -7319,7 +7275,6 @@ mod tests {
                         parity: vec![],
                         eversion: 1,
                         refs: 1,
-                        vp_table_refs: 0,
                         sealed_length: 200,
                         sealed: true,
                         avali: 1,
@@ -7355,8 +7310,7 @@ mod tests {
             assert_eq!(ext20.refs, 1, "non-member extent 20 refs must not change");
 
             // Extent 10 was the only member punched.
-            // With refs=1 and no vp_table_refs, it should have been deleted
-            // from the extents map.
+            // With refs=1 it should have been deleted from the extents map.
             assert!(
                 !s.extents.contains_key(&10),
                 "extent 10 should be removed (refs was 1)"
@@ -7383,7 +7337,6 @@ mod tests {
                 parity: vec![7],
                 eversion: 3,
                 refs: 1,
-                vp_table_refs: 0,
                 sealed_length: 100_000,
                 sealed: true,
                 avali: 0xF, // all 4 slots available before
@@ -7454,7 +7407,6 @@ mod tests {
                 parity: vec![7],
                 eversion: 3,
                 refs: 1,
-                vp_table_refs: 0,
                 sealed_length: 100_000,
                 sealed: true,
                 avali: 0xE, // slot 0 marked unavailable
@@ -7521,7 +7473,6 @@ mod tests {
                     parity: vec![7],
                     eversion: 3,
                     refs: 1,
-                    vp_table_refs: 0,
                     sealed_length: 100_000,
                     sealed: true,
                     avali: 0xE,
@@ -7590,7 +7541,6 @@ mod tests {
                     parity: vec![7],
                     eversion: 3,
                     refs: 1,
-                    vp_table_refs: 0,
                     sealed_length: 100_000,
                     sealed: true,
                     avali: 0xE,
@@ -7719,7 +7669,6 @@ mod tests {
                     parity: vec![],
                     eversion: 3,
                     refs: 1,
-                    vp_table_refs: 0,
                     sealed_length: 100_000,
                     sealed: true,
                     avali: 0b111,
@@ -7786,7 +7735,6 @@ mod tests {
                 parity: vec![],
                 eversion: 3,
                 refs: 1,
-                vp_table_refs: 0,
                 sealed_length: 100_000,
                 sealed: true,
                 avali,
@@ -7979,7 +7927,6 @@ mod tests {
             parity: vec![],
             eversion,
             refs: 1,
-            vp_table_refs: 0,
             sealed_length: 100_000,
             sealed: true,
             avali: 0x7,
@@ -8268,7 +8215,6 @@ mod tests {
                             parity: vec![],
                             eversion: 1,
                             refs: 1,
-                            vp_table_refs: 0,
                             sealed_length: 1000,
                             sealed: true,
                             avali: 0x7,
@@ -8477,7 +8423,6 @@ mod tests {
                                 parity: vec![],
                                 eversion: 1,
                                 refs: 1,
-                                vp_table_refs: 0,
                                 sealed_length: 1000,
                                 sealed: true,
                                 avali: 1,
@@ -8574,7 +8519,6 @@ mod tests {
                                 parity: vec![],
                                 eversion: 1,
                                 refs: 1,
-                                vp_table_refs: 0,
                                 sealed_length: 1000,
                                 sealed: true,
                                 avali: 1,
@@ -8679,7 +8623,6 @@ mod tests {
                                 parity: vec![],
                                 eversion: 1,
                                 refs: 1,
-                                vp_table_refs: 0,
                                 sealed_length: 1000,
                                 sealed: true,
                                 avali: 1,
@@ -9053,7 +8996,7 @@ mod tests {
     ///
     /// `retain` drops every occurrence while the refs mutation decrements once,
     /// so sweeping it would leave `refs > 0, in no stream` — precisely the
-    /// orphan the sibling both-zero sweep refuses to reap and logs for
+    /// orphan the sibling orphan sweep refuses to reap and logs for
     /// investigation. Duplicates cannot be created any more, but this sweep
     /// exists FOR the clusters that predate that fix.
     #[test]
@@ -9231,7 +9174,6 @@ mod tests {
                 s.extents.insert(399, make_ec_extent(399, 1));
                 let mut ex = make_ec_extent(extent_id, 1);
                 ex.refs = 1;
-                ex.vp_table_refs = 0;
                 s.extents.insert(extent_id, ex);
             }
 
@@ -9311,7 +9253,6 @@ mod tests {
                 for &eid in &[extent_a, extent_b, extent_c] {
                     let mut ex = make_ec_extent(eid, 1);
                     ex.refs = 1;
-                    ex.vp_table_refs = 0;
                     s.extents.insert(eid, ex);
                 }
             }
@@ -9386,7 +9327,6 @@ mod tests {
                 );
                 let mut ex = make_ec_extent(extent_id, 1);
                 ex.refs = 1;
-                ex.vp_table_refs = 0;
                 s.extents.insert(extent_id, ex);
                 s.extents.insert(keep_id, make_ec_extent(keep_id, 1));
             }
@@ -9484,7 +9424,6 @@ mod tests {
                     .insert(extent_keep, make_ec_extent(extent_keep, 1));
                 let mut ex = make_ec_extent(extent_id, 1);
                 ex.refs = 1;
-                ex.vp_table_refs = 0;
                 s.extents.insert(extent_id, ex);
             }
 
@@ -9581,7 +9520,6 @@ mod tests {
                 for &eid in &[extent_a, extent_b, extent_c] {
                     let mut ex = make_ec_extent(eid, 1);
                     ex.refs = 1;
-                    ex.vp_table_refs = 0;
                     s.extents.insert(eid, ex);
                 }
             }
@@ -9663,7 +9601,6 @@ mod tests {
                         parity: vec![],
                         eversion: 5,
                         refs: 1,
-                        vp_table_refs: 0,
                         sealed_length: 0,
                         sealed: false,
                         avali: 0,
@@ -9803,7 +9740,6 @@ mod tests {
                         parity: vec![],
                         eversion: 7,
                         refs: 1,
-                        vp_table_refs: 0,
                         sealed_length: 0,
                         sealed: false,
                         avali: 0,
@@ -9902,7 +9838,6 @@ mod tests {
                             parity: vec![],
                             eversion: 1,
                             refs: 1,
-                            vp_table_refs: 0,
                             sealed_length: 1000,
                             sealed: true,
                             avali: 0x7,
@@ -10095,7 +10030,6 @@ mod tests {
                 parity: vec![],
                 eversion: 3,
                 refs: 1,
-                vp_table_refs: 0,
                 sealed_length: 2_961_566_856,
                 sealed: true,
                 avali: 0x7,

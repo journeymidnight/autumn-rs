@@ -1123,8 +1123,8 @@ impl AutumnManager {
         // blind put on extents/<id>, not a value-CAS, so a concurrent extent-
         // state mutator (recovery/EC/seal/split) landing during this await can
         // be rolled back in etcd by our stale clone. A5 is in the SAME deferred
-        // class as apply_recovery_done / apply_ec_conversion_done / split-seal /
-        // sync_vp_refs — all blind-put + verify-at-apply (the pattern
+        // class as apply_recovery_done / apply_ec_conversion_done / split-seal
+        // — all blind-put + verify-at-apply (the pattern
         // below), accepting the etcd-RTT residual that note 33's reproduce-first
         // investigation found "not reproducible and structurally near-precluded"
         // (recovery/EC serialize per extent via the inflight ledger; A5 only fires
@@ -1718,7 +1718,6 @@ impl AutumnManager {
             parity: vec![],
             eversion: 1,
             refs: 1,
-            vp_table_refs: 0,
             sealed_length: 0,
             sealed: false,
             avali: 0,
@@ -1881,12 +1880,8 @@ impl AutumnManager {
         // Observability: on a full cluster dump (`stream_ids` empty), also
         // surface extents that exist in the store but are referenced by NO
         // stream's `extent_ids` — orphan / non-member extents. The loop above
-        // only walks stream membership, so these are otherwise invisible. A
-        // non-member at `refs==0 && vp_table_refs==0` is reclaimable (the
-        // EXTENT10-AUTORECLAIM sweep reaps it); one with `vp_table_refs>0` is a
-        // legacy extent retained by the upgrade-safety guard (live VPs, Stage-2
-        // migration target). `vp_table_refs` is on the wire (ExtentRecord) so
-        // the CLI can show WHY a non-member is retained. Targeted stream_ids
+        // only walks stream membership, so these are otherwise invisible; one
+        // at `refs == 0` is reclaimed by the orphan sweep. Targeted stream_ids
         // queries (hot path, client.rs) keep the membership-only behaviour.
         if full_dump {
             for (eid, e) in s.extents.iter() {
@@ -2921,7 +2916,6 @@ impl AutumnManager {
             parity: node_ids[data..].to_vec(),
             eversion: 1,
             refs: 1,
-            vp_table_refs: 0,
             sealed_length: 0,
             sealed: false,
             avali: 0,
@@ -3132,7 +3126,7 @@ impl AutumnManager {
         // delete (refs would hit 0).
         for &eid in removed {
             if let Some(extent) = s.extents.get(&eid) {
-                if extent.refs == 1 && extent.vp_table_refs == 0 {
+                if extent.refs == 1 {
                     let pending_targets = Self::snapshot_replica_targets(&s.nodes, eid, extent);
                     pending_deletes.push(PendingDelete {
                         extent_id: eid,
@@ -4049,7 +4043,6 @@ impl AutumnManager {
                     avali: 0,
                     eversion: 1,
                     refs: 1,
-                    vp_table_refs: 0,
                     ec_converted: false,
                 };
 
@@ -5489,7 +5482,7 @@ impl AutumnManager {
         // is frozen until our `apply_ec_conversion_done` runs —
         // every other mutator (apply_recovery_done, handle_*_punch_holes,
         // handle_truncate, handle_multi_modify_split / merge,
-        // handle_sync_partition_vp_refs, handle_stream_alloc_extent)
+        // handle_stream_alloc_extent)
         // checks `extent_inflight_op` and refuses on ConvertToEc.
         // Recovery cannot even start (its `acquire_extent_inflight` CAS
         // would fail against our marker). So no verify-after is needed.
@@ -8002,7 +7995,6 @@ mod selfheal_a5_tests {
                 parity: vec![],
                 eversion: 7,
                 refs: 1,
-                vp_table_refs: 0,
                 sealed_length: 20_000_000,
                 sealed: true,
                 avali: 0b111,

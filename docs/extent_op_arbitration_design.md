@@ -118,7 +118,7 @@ When none is in flight, the first rule that applies may start:
 
 0. **Nothing** if the extent is unsealed, or a split/merge holds its partition
    (`topology_gate.rs`).
-1. **Removal** — GC punch / truncate, the both-zero and sealed-empty sweeps.
+1. **Removal** — GC punch / truncate, the orphan and sealed-empty sweeps.
 2. **Rebuild a corrupt copy.** Ahead of any EC conversion: the coordinator
    encodes from its own full copy, and a corrupt copy is full length.
 3. **Rebuild a copy whose disk class is fence** — on a fence node or a Faulted

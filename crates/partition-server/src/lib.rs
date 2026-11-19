@@ -6,6 +6,7 @@ pub mod background;
 mod rpc_handlers;
 mod sstable;
 pub mod compact_policy;
+pub mod sst_convert;
 mod wal_record;
 pub mod metrics;
 mod plog_load;

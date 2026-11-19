@@ -48,7 +48,6 @@ fn pre_ec_extent(extent_id: u64) -> ExtentRecord {
         parity: vec![],
         eversion: 3,
         refs: 1,
-        vp_table_refs: 0,
         sealed_length: 4096,
         sealed: true,
         avali: 0x7,

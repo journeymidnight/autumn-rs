@@ -43,13 +43,6 @@ pub struct SstReader {
     seq_num: u64,
     pub vp_extent_id: u64,
     pub vp_offset: u64,
-    /// DEPRECATED / INERT (vp_table_refs removal, Stage 1). Mirrors the
-    /// on-disk `MetaBlock.vp_deps`; formerly read by `collect_partition_vp_refs`
-    /// to report each SST's VP extent dependencies to the manager. Nothing
-    /// reads it now — kept so the SST format decode stays byte-identical (no
-    /// migration yet). Removed with the format bump in Stage 2.
-    #[allow(dead_code)]
-    pub vp_deps: Vec<u64>,
     estimated_size: u64,
     pub discards: HashMap<u64, i64>,
     /// Earliest non-zero expires_at across all entries (0 = no expiring keys).
@@ -125,7 +118,6 @@ impl SstReader {
             seq_num: meta.seq_num,
             vp_extent_id: meta.vp_extent_id,
             vp_offset: meta.vp_offset,
-            vp_deps: meta.vp_deps,
             estimated_size: meta.estimated_size,
             discards: meta.discards,
             min_expires_at: meta.min_expires_at,
@@ -169,7 +161,6 @@ impl SstReader {
             seq_num: meta.seq_num,
             vp_extent_id: meta.vp_extent_id,
             vp_offset: meta.vp_offset,
-            vp_deps: meta.vp_deps,
             estimated_size: meta.estimated_size,
             discards: meta.discards,
             min_expires_at: meta.min_expires_at,

@@ -660,7 +660,6 @@ mod tests {
             parity,
             eversion: 4,
             refs: 1,
-            vp_table_refs: 0,
             sealed_length: sealed,
             sealed: sealed > 0,
             avali,

@@ -783,7 +783,7 @@ overflows the frame.
 
 ## Wire version, and the two checks over it
 
-`WIRE_VERSION` (currently **87**: `evict_rank` on `PutReq` and `BatchPutOp`) is the schema this binary speaks.
+`WIRE_VERSION` (currently **88**: `MgrExtentInfo` without `vp_table_refs`) is the schema this binary speaks.
 `MIN_CLIENT_WIRE_VERSION` (**87**: that change was made in place, so every client is rebuilt — chosen
 over a second form of each write; `client_surface_freeze.rs` re-recorded those two forms)
 is the oldest CLIENT it serves. Both are maintained
@@ -811,15 +811,16 @@ is routine rather than exotic — a client built from newer sources often runs
 ahead of a cluster nobody has upgraded yet. The refusal says which way round it is,
 because the fix differs (deploy the cluster vs rebuild the client).
 
-**The window is `[83, 86]`.** It was open from 43 to 78, widened by raising
+**The window is `[87, 88]`.** It was open from 43 to 78, widened by raising
 the CEILING; wire 79 replaced the read messages every older client sends
 (`GET_BULK`, `GET_REDIRECT`, `GET_REDIRECT_MANY`, `BATCH_GET_BULK`, the extent
 node's `READ_BYTES_BULK`) with `MSG_GET`, `MSG_BATCH_GET` and `MSG_READ`, and
 wire 81 deleted the inline write forms (rkyv `PUT`, `BATCH_PUT`,
 `COMPARE_PUT`, `COMPARE_WRITE`, `COMPARE_PUT_BULK`) a wire-80 client sends for
-small values, wire 82 made the put ctrl rkyv, and wire 83 added block crcs to
-the read; the floor rose with each and every embedded client was rebuilt with
-the cluster.
+small values, wire 82 made the put ctrl rkyv, wire 83 added block crcs to the
+read, and wire 87 added `evict_rank` to the puts in place; the floor rose with
+each and every embedded client was rebuilt with the cluster. Wire 88 (internal
+only) raised the ceiling.
 
 Lowering the floor to 42 instead was implemented, verified green, and REVERTED — it is
 unsafe, and `FIRST_WIRE_VERSION_WITH_PEER_EQUALITY` is the rule that came out of it.
@@ -1136,6 +1137,13 @@ the bytes of the bulk forms they replace (`client_surface_freeze.rs` records
 `CompareWriteReq` and `BatchPutReq` with the bytes of `CompareWriteBulkReq` and
 `BatchPutBulkReq`), so only names changed on them; the floor rose because a
 wire-80 client sends the deleted forms for small values.
+
+## `MgrExtentInfo` without `vp_table_refs` (wire 88)
+
+The count of SSTs whose ValuePointers reached an extent is gone from the wire
+extent info (and from the manager's persisted record, format 2): retention is
+`refs` alone. Manager, PS, EN and autumn-op only; not on the client surface, so
+the floor stays 87.
 
 ## An extent read whose value lands in the reader's memory (wire 86)
 

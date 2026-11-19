@@ -242,17 +242,10 @@ struct InfoExtentView {
     replicas: Vec<u64>,
     parity: Vec<u64>,
     refs: u64,
-    /// vp_table_refs-removal note: the maintenance machinery is gone, so for
-    /// extents managed under this build this is always 0. A non-zero value is a
-    /// LEGACY extent carried over from a pre-removal build — retained by the
-    /// upgrade-safety guard (`refs==0 && vp_table_refs>0` is NOT reclaimed) and
-    /// a Stage-2 migration target. Removed from the schema in Stage 2.
-    vp_table_refs: u64,
     eversion: u64,
-    /// How many live streams list this extent in `extent_ids`. 0 = orphan
-    /// (not in any stream): either retained-by-vp_table_refs legacy live data,
-    /// or a both-zero reclaimable extent (the EXTENT10-AUTORECLAIM sweep reaps
-    /// it). `refs` should equal this; a gap is a refcount leak (MERGE-REFS-LEAK).
+    /// How many live streams list this extent in `extent_ids`. 0 = orphan (not
+    /// in any stream), which the manager's orphan sweep reclaims. `refs` should
+    /// equal this; a gap is a refcount leak.
     in_streams: usize,
     /// The partitions holding a reference, ascending. More than one means a CoW
     /// split left them sharing this extent: the file is unlinked at `refs == 0`,
@@ -4155,7 +4148,6 @@ async fn run_info(
                     replicas: e.replicates.clone(),
                     parity: e.parity.clone(),
                     refs: e.refs,
-                    vp_table_refs: e.vp_table_refs,
                     eversion: e.eversion,
                     in_streams: stream_member_count.get(eid).copied().unwrap_or(0),
                     shared_by_parts: sharers_by_extent.get(eid).cloned().unwrap_or_default(),
@@ -4294,17 +4286,10 @@ async fn run_info(
                 if open_extents.contains(eid) {
                     tag.push_str(" (open)");
                 }
-                // Orphan = in no live stream. Distinguish a LEGACY extent still
-                // retained by the upgrade-safety guard (vp_table_refs>0 — live
-                // VPs from a pre-removal build, a Stage-2 migration target) from
-                // a both-zero reclaimable extent (the EXTENT10-AUTORECLAIM sweep
-                // reaps it). Also flag a refs vs membership gap (MERGE-REFS-LEAK).
+                // Orphan = in no live stream; the orphan sweep reclaims it.
+                // Also flag a refs vs membership gap.
                 if in_streams == 0 {
-                    tag.push_str(if e.vp_table_refs > 0 {
-                        " (ORPHAN: no stream, retained by vp_table_refs — legacy live data, Stage-2 migrate)"
-                    } else {
-                        " (ORPHAN: no stream, vp_table_refs=0 — reclaimable, pending sweep)"
-                    });
+                    tag.push_str(" (ORPHAN: no stream — reclaimable, pending sweep)");
                 } else if e.refs as usize != in_streams {
                     tag.push_str(" (refs-leak)");
                 }
@@ -4344,14 +4329,13 @@ async fn run_info(
                     String::new()
                 };
                 println!(
-                    "  extent {}: size={}{}, {}, refs={} (streams={}), vp_table_refs={}, eversion={}{}",
+                    "  extent {}: size={}{}, {}, refs={} (streams={}), eversion={}{}",
                     eid,
                     human_size(e.sealed_length),
                     tag,
                     layout,
                     e.refs,
                     in_streams,
-                    e.vp_table_refs,
                     e.eversion,
                     shared
                 );

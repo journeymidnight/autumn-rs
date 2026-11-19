@@ -102,9 +102,8 @@ pub const MSG_MERGE_PART: u8 = 0x4D;
 //                  if the manager-side merge txn rejects the request).
 pub const MSG_MERGE_FREEZE: u8 = 0x4E;
 
-// 0x4F retired with the vp_table_refs removal (was MSG_PULL_VP_REFS,
-// manager→PS vp_refs pull). Extent retention is now driven by
-// `refs` (stream membership) alone — see manager `extent_can_delete`.
+// 0x4F retired (was MSG_PULL_VP_REFS). Extent retention is `refs` (stream
+// membership) alone — see manager `extent_can_delete`.
 
 /// The point read: the value, or where to read it. Request `GetReq`; the reply
 /// is a bulk frame: ctrl = `[code: CODE_*][message]` (CRC'd with the header),

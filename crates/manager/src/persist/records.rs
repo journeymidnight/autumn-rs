@@ -326,7 +326,6 @@ mod tests {
             parity: vec![3],
             eversion: 4,
             refs: 5,
-            vp_table_refs: 6,
             sealed_length: 7,
             // Opposite bools: equal ones hide a swap.
             sealed: true,
@@ -339,7 +338,7 @@ mod tests {
         assert_eq!(back.extent_id, 10);
         assert_eq!(back.replicates, vec![1, 2]);
         assert_eq!(back.parity, vec![3]);
-        assert_eq!((back.eversion, back.refs, back.vp_table_refs), (4, 5, 6));
+        assert_eq!((back.eversion, back.refs), (4, 5));
         assert_eq!(back.sealed_length, 7);
         assert!(back.sealed);
         assert_eq!(back.avali, 8);
@@ -767,10 +766,6 @@ pub(crate) struct ExtentRecord {
     pub parity: Vec<u64>,
     pub eversion: u64,
     pub refs: u64,
-    /// WRITE-FROZEN at 0 for anything this build manages. Kept because a legacy
-    /// extent stuck at `refs == 0 && vp_table_refs > 0` must not be reaped
-    /// until a migration re-confirms it — see `extent_can_delete`.
-    pub vp_table_refs: u64,
     pub sealed_length: u64,
     /// The authoritative "is sealed" STATE. NOT `sealed_length > 0`: an
     /// authoritative EMPTY seal is `sealed = true, sealed_length = 0`.
@@ -783,7 +778,8 @@ pub(crate) struct ExtentRecord {
 
 impl PersistRecord for ExtentRecord {
     const RECORD_TYPE: u8 = RECORD_TYPE_EXTENT;
-    const FORMAT_VERSION: u8 = 1;
+    /// 2 dropped `vp_table_refs` after `refs` (`autumn-convert extent-records`).
+    const FORMAT_VERSION: u8 = 2;
     const NAME: &'static str = "extent";
 }
 
@@ -795,7 +791,6 @@ impl From<&MgrExtentInfo> for ExtentRecord {
             parity,
             eversion,
             refs,
-            vp_table_refs,
             sealed_length,
             sealed,
             avali,
@@ -809,7 +804,6 @@ impl From<&MgrExtentInfo> for ExtentRecord {
             parity: parity.clone(),
             eversion: *eversion,
             refs: *refs,
-            vp_table_refs: *vp_table_refs,
             sealed_length: *sealed_length,
             sealed: *sealed,
             avali: *avali,
@@ -828,7 +822,6 @@ impl From<&ExtentRecord> for MgrExtentInfo {
             parity,
             eversion,
             refs,
-            vp_table_refs,
             sealed_length,
             sealed,
             avali,
@@ -842,7 +835,6 @@ impl From<&ExtentRecord> for MgrExtentInfo {
             parity: parity.clone(),
             eversion: *eversion,
             refs: *refs,
-            vp_table_refs: *vp_table_refs,
             sealed_length: *sealed_length,
             sealed: *sealed,
             avali: *avali,

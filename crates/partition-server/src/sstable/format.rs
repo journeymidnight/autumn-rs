@@ -7,8 +7,9 @@ pub const BLOCK_SIZE_TARGET: usize = 64 * 1024; // 64 KB
 pub const MAX_ENTRIES_PER_BLOCK: usize = 1000;
 pub const MAGIC: u32 = 0x4155_3742; // "AU7B"
 /// The only MetaBlock version this build reads or writes. v2 added
-/// `num_entries` / `num_deletions`; older SST formats are refused.
-pub const FORMAT_VERSION: u16 = 2;
+/// `num_entries` / `num_deletions`; v3 dropped `vp_deps` (`autumn-convert
+/// sst` rewrites v2 tables). Older SST formats are refused.
+pub const FORMAT_VERSION: u16 = 3;
 /// 13 bytes per SST entry's value section: op(1) + val_len(4) + expires_at(8).
 pub const ENTRY_VALUE_HEADER: usize = 13;
 
@@ -74,9 +75,6 @@ pub struct MetaBlock {
     pub seq_num: u64,
     pub vp_extent_id: u64,
     pub vp_offset: u64,
-    /// Distinct old log extents still referenced by live ValuePointer
-    /// entries in this SST.
-    pub vp_deps: Vec<u64>,
     /// Per-logStream-extent discard stats: extentID -> reclaimable bytes.
     /// Persisted in rowStream as part of the SSTable MetaBlock.
     pub discards: HashMap<u64, i64>,
@@ -114,10 +112,6 @@ impl MetaBlock {
         buf.extend_from_slice(&self.seq_num.to_le_bytes());
         buf.extend_from_slice(&self.vp_extent_id.to_le_bytes());
         buf.extend_from_slice(&self.vp_offset.to_le_bytes());
-        buf.extend_from_slice(&(self.vp_deps.len() as u32).to_le_bytes());
-        for &eid in &self.vp_deps {
-            buf.extend_from_slice(&eid.to_le_bytes());
-        }
         buf.push(0u8); // compression_type = None
                        // Discard map: [count: u32 LE][extent_id: u64 LE][size: i64 LE] * count
         buf.extend_from_slice(&(self.discards.len() as u32).to_le_bytes());
@@ -188,11 +182,6 @@ impl MetaBlock {
         let seq_num = read_u64(payload, &mut c)?;
         let vp_extent_id = read_u64(payload, &mut c)?;
         let vp_offset = read_u64(payload, &mut c)?;
-        let vp_dep_count = read_u32(payload, &mut c)? as usize;
-        let mut vp_deps = Vec::with_capacity(vp_dep_count);
-        for _ in 0..vp_dep_count {
-            vp_deps.push(read_u64(payload, &mut c)?);
-        }
         // skip compression_type byte
         read_bytes(payload, &mut c, 1)?;
         let discard_count = read_u32(payload, &mut c)? as usize;
@@ -221,7 +210,6 @@ impl MetaBlock {
             seq_num,
             vp_extent_id,
             vp_offset,
-            vp_deps,
             discards,
             min_expires_at,
             num_entries,
@@ -445,7 +433,6 @@ mod tests {
             seq_num: 99,
             vp_extent_id: 52,
             vp_offset: 4096,
-            vp_deps: vec![21, 48, 52],
             discards,
             min_expires_at: 1234,
             num_entries: 5000,
@@ -456,7 +443,6 @@ mod tests {
     #[test]
     fn meta_block_round_trip_preserves_every_field() {
         let decoded = MetaBlock::decode(&sample_meta().encode()).unwrap();
-        assert_eq!(decoded.vp_deps, vec![21, 48, 52]);
         assert_eq!(decoded.vp_extent_id, 52);
         assert_eq!(decoded.vp_offset, 4096);
         assert_eq!(decoded.discards.get(&11), Some(&123));
@@ -465,32 +451,35 @@ mod tests {
         assert_eq!(decoded.num_deletions, 1700);
     }
 
-    /// The same MetaBlock as v1 wrote it: version 1 and no counts. The CRC is
-    /// valid, so only the version can refuse it.
-    fn as_v1(v2: &[u8]) -> Vec<u8> {
-        let mut payload = v2[..v2.len() - 4 - 16].to_vec();
-        payload[4..6].copy_from_slice(&1u16.to_le_bytes());
+    /// The same MetaBlock under another version number, CRC valid, so only the
+    /// version can refuse it.
+    fn with_version(v: u16) -> Vec<u8> {
+        let enc = sample_meta().encode();
+        let mut payload = enc[..enc.len() - 4].to_vec();
+        payload[4..6].copy_from_slice(&v.to_le_bytes());
         let crc = crc32c::crc32c(&payload);
         payload.extend_from_slice(&crc.to_le_bytes());
         payload
     }
 
     #[test]
-    fn a_v1_meta_block_is_refused_with_the_supported_version() {
-        let err = MetaBlock::decode(&as_v1(&sample_meta().encode()))
-            .err()
-            .expect("a v1 MetaBlock must not decode")
-            .to_string();
-        assert!(err.contains("v1") && err.contains("reads only v2"), "{err}");
+    fn another_meta_block_version_is_refused_with_the_supported_one() {
+        for v in [1u16, 2, 4] {
+            let err = MetaBlock::decode(&with_version(v))
+                .err()
+                .expect("another MetaBlock version must not decode")
+                .to_string();
+            assert!(err.contains(&format!("v{v}")) && err.contains("reads only v3"), "{err}");
+        }
     }
 
     #[test]
-    fn a_v2_meta_block_missing_its_counts_is_refused() {
-        let mut bytes = as_v1(&sample_meta().encode());
-        let n = bytes.len();
-        bytes[4..6].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
-        let crc = crc32c::crc32c(&bytes[..n - 4]);
-        bytes[n - 4..].copy_from_slice(&crc.to_le_bytes());
-        assert!(MetaBlock::decode(&bytes).is_err());
+    fn a_meta_block_with_a_trailing_field_is_refused() {
+        let enc = sample_meta().encode();
+        let mut payload = enc[..enc.len() - 4].to_vec();
+        payload.extend_from_slice(&0u64.to_le_bytes());
+        let crc = crc32c::crc32c(&payload);
+        payload.extend_from_slice(&crc.to_le_bytes());
+        assert!(MetaBlock::decode(&payload).is_err());
     }
 }

@@ -402,7 +402,6 @@ mod isolation_tests {
             parity: vec![],
             eversion: 7,
             refs: 1,
-            vp_table_refs: 0,
             sealed_length: 4096,
             sealed: true,
             avali,

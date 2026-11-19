@@ -254,6 +254,16 @@ the split/merge path: real etcd + manager + EN + PS, 12 values written,
 `autumn-op split` then `merge` both succeeded with every value byte-correct
 afterwards, and a manager restart replayed all nine record kinds clean.
 
+**Converting a record (`upgrade.rs`).** A format bump comes with its
+conversion in `upgrade.rs`, which `autumn-convert` runs against a stopped
+cluster's etcd: it holds the old form (vendored) and writes the new one through
+this crate's own `persist::encode`, so the bytes are what replay decodes. Now:
+`extents/<id>` format 1 → 2 (`vp_table_refs` dropped; an extent at `refs == 0`
+whose count is not 0 is refused, since only the count kept it and under format 2
+the orphan sweep deletes it). `meta_streams` is the pre-flight `autumn-convert
+extent-records` runs before writing: a partition whose meta stream may hold
+two checkpoint records is refused while the old release can still fix it.
+
 `persist/freeze.rs` records each encoding byte for byte. It is the deliberate
 replacement for a guard that was ACCIDENTAL: while a record shared a file with
 the wire schema, editing it forced a `WIRE_VERSION` bump. That was far too blunt
@@ -752,7 +762,7 @@ truncate, the PS GC before it relocates (`MSG_EXTENTS_IN_FLIGHT`, peer,
 leader-gated: which of the given extents have an op in flight), the sealed-empty
 sweep (`removal_refused`), and recovery dispatch
 (`Rebuild`; a refusal is `Deferred` — not a dispatch, which would clear the
-slot's backoff, and not a failure). The both-zero sweep skips any extent in the
+slot's backoff, and not a failure). The orphan sweep skips any extent in the
 ledger, the same rule. A pass over many extents takes one `ArbiterView` (node and
 disk classes, extent → held partition) so the topology check is a lookup, not a
 stream scan per extent.
@@ -2238,35 +2248,29 @@ Two of its fields exist because a ROLL-UP CANNOT ANSWER THE QUESTION THEY ANSWER
   lists a heartbeating PS that is not ready as "not serving every partition
   assigned".
 
-## GC lifetime, VP retention, both-zero reclaim
+## GC lifetime, VP retention, orphan reclaim
 
-**`refs`-only retention (with an upgrade guard).** The load-bearing invariant: **GC
+**`refs`-only retention.** The load-bearing invariant: **GC
 relocates every live in-range value off a log extent BEFORE `punch_holes` drops its
 `refs`** (relocate-then-punch; liveness is full VP identity, not just `extent_id`), so
 `refs == 0 ⇒ no live ValuePointer`. CoW split keeps both children pointing at the
 shared log extents via `refs`; the extent is freed once BOTH children GC it to
-`refs == 0`. `extent_can_delete` keeps `refs == 0 && vp_table_refs == 0` as an
-**upgrade-safety guard**: the `vp_table_refs` maintenance machinery is gone (frozen at
-0 for every extent managed under this build), but a legacy extent frozen in etcd at
-`refs == 0 && vp_table_refs > 0` (a live VP the old buggy GC left) must not be reaped
-until a Stage-2 migration re-confirms + clears it. Collapsing the gate to `refs == 0`
-in the same release that removes the net would cause data loss on the first
-post-upgrade sweep.
+`refs == 0`. `extent_can_delete` is exactly `refs == 0`.
 
-**Both-zero orphan sweep** (`extent_both_zero_sweep_loop`, leader-only, 60 s). An
-extent that lost its last stream membership out-of-band sits at both-zero with no
+**Orphan sweep** (`orphan_extent_sweep_loop`, leader-only, 60 s). An
+extent that lost its last stream membership out-of-band sits at `refs == 0` with no
 `punch_holes`/`truncate` path to fire its delete. The sweep reclaims it. **Candidate
 gate:** `extent_can_delete(ex)` AND the extent is **absent from every stream's
 `extent_ids`** (the membership check is NOT redundant with `refs == 0` — a refs
 under-count must never let the sweep delete a still-membered extent; a
-both-zero-but-in-a-stream extent is ERROR-logged + skipped). Delete is etcd-first
+`refs == 0`-but-in-a-stream extent is ERROR-logged + skipped). Delete is etcd-first
 value-CAS on the snapshot, then in-memory remove + `enqueue_pending_deletes`.
 
 **Sealed-empty member sweep** (`sealed_empty_sweep_loop`, leader-only, 60 s, 64
 extents/tick). The other leak shape: an extent that IS a stream member, at
 `sealed == true && sealed_length == 0`, refs ≥ 1, referenced by no VP/SST/
 checkpoint. Nothing else looks at it — GC keys on discard bytes, truncate on the
-head extent, the both-zero sweep on non-membership — which is why a 5-node cluster was
+head extent, the orphan sweep on non-membership — which is why a 5-node cluster was
 observed holding about 47× its logical size in such extents. The writer punches its own
 abandoned tail on roll-away (`reclaim_abandoned_empty_tail`), but that is
 client-side and best-effort; this is the backstop for a failed punch, a writer
@@ -2292,7 +2296,7 @@ INVARIANTS, each with a reason it is not optional:
   and refuses inside one synchronous borrow); this sweep must re-read to match.
 - **A stream listing an extent twice is refused and ERROR-logged**, never swept:
   `retain` drops every occurrence while the refs mutation decrements once, which
-  would manufacture the `refs > 0, in no stream` orphan the both-zero sweep
+  would manufacture the `refs > 0, in no stream` orphan the orphan sweep
   refuses to reap.
 
 Scope worth knowing: PS GC already punches `sealed_length == 0` unconditionally
@@ -2334,7 +2338,7 @@ minor-version bump, with or without a conversion.
 built inside the single `node_health_loop`: RAW + `physical_used` are summed from each
 EN's self-reported `DiskStatus.extent_bytes` every tick (owner reports, control plane
 sums — no manager-side counters); `logical_stored` is a periodic (~30 s) read-only scan
-of `s.extents` (`Σ distinct sealed_length` skipping both-zero). The wire carries only
+of `s.extents` (`Σ distinct sealed_length` skipping `refs == 0`). The wire carries only
 raw u64 facts; raw-used/logical-size amplification and the EC-dependent writable range
 are computed by the consumer. `physical_used` remains a diagnostic sum of extent file
 lengths, not the amplification numerator.
