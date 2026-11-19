@@ -392,15 +392,13 @@ There is no `--bulk` / `bulk=` flag — call `bulk_worthwhile(size)`. The const 
 - `compact(part_id)` — trigger compaction.
 - `gc(part_id)` — trigger automatic GC.
 - `force_gc(part_id, extent_ids)` — force GC on specific extents.
-- `flush(part_id)` — trigger memtable flush.
-- `merge_partitions(survivor, victim)` — partition merge (CLI orchestration).
 - `policy_candidates() → Vec<PolicyCandidate>` — advisory engine output.
 - `submit_op(OpSubmitReq) → OpSubmitResp` / `op_query(OpQueryReq) → OpQueryResp` —
   the async op-ledger (MSG_OP_SUBMIT/QUERY): submit a long-running op (split/merge/
   rebalance/compact/gc/forcegc/ec-convert) and get an `op_id` back, then poll for
   its terminal state + failure reason. `autumn-op`'s op triggers + `ops status`/
   `ops list` route through these; the low-level blocking methods above
-  (`split`/`compact`/`gc`/`force_gc`/`merge_partitions`/`rebalance_regions`) stay
+  (`split`/`compact`/`gc`/`force_gc`/`rebalance_regions`) stay
   as the direct path (tests + internal callers).
 
 ## Per-call timeout
@@ -408,7 +406,7 @@ There is no `--bulk` / `bulk=` flag — call `bulk_worthwhile(size)`. The const 
 - `set_rpc_timeout(Duration)` / `clear_rpc_timeout()` / `rpc_timeout() → Option<Duration>`.
 
 Default is **None (wait forever)**. When set, every `ps_call` (`put`/`get`/`delete`/`head`/
-`range`/ stream-op chunks / `merge_partitions`'s FLUSH + downstream PS calls / PutChunk /
+`range`/ stream-op chunks / downstream PS calls / PutChunk /
 etc.) is raced against `compio::time::sleep(timeout)`. Expiry surfaces as
 `AutumnError::ConnectionError` so the caller's routing-miss retry path triggers a
 `refresh_regions` + one retry.

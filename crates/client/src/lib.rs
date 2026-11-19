@@ -5900,62 +5900,6 @@ impl ClusterClient {
             .await
     }
 
-    /// Trigger flush on a partition.
-    pub async fn flush(&self, part_id: u64) -> std::result::Result<(), AutumnError> {
-        self.maintenance(part_id, MAINTENANCE_FLUSH, vec![])
-            .await
-            .map(|_| ())
-    }
-
-    /// merge two adjacent partitions. Survivor keeps its part_id;
-    /// victim is deleted from the manager.
-    ///
-    /// Thin wrapper around the manager-orchestrated `MSG_MERGE_PARTITIONS`.
-    ///
-    /// The manager (which is leader-fenced and crash-recoverable via etcd)
-    /// owns the full sequence:
-    ///   - acquire admin owner-lock for the partition pair
-    ///   - send `MSG_MERGE_FREEZE` to both PSes (drains pending+inflight,
-    ///     flushes all imm, halts new writes with `CODE_UNAVAILABLE`)
-    ///   - capture `commit_length` × 6 under the freeze (closes the
-    ///     ~5 % loss window)
-    ///   - run the atomic etcd merge txn
-    ///   - on success: leave PSes frozen — region_sync_loop drops the
-    ///     frozen `PartitionData` on its next ~2 s tick
-    ///   - on failure: send `freeze=false` rollback to both PSes
-    ///
-    /// CLI crashes mid-call are now benign: the manager continues
-    /// serving the orchestrated merge, and a 30 s `FREEZE_TTL` on the
-    /// PS side is the final backstop for an orchestrator crash.
-    /// `force` overrides the sacred-boundary refusal: merging erases the
-    /// boundary between the two partitions, and when
-    /// that boundary is a recorded presplit point the manager refuses unless
-    /// forced.
-    pub async fn merge_partitions(
-        &self,
-        survivor_part_id: u64,
-        victim_part_id: u64,
-        force: bool,
-    ) -> std::result::Result<(), AutumnError> {
-        self.flush(survivor_part_id).await?;
-        self.flush(victim_part_id).await?;
-        let req = rkyv_encode(&MergePartitionsReq {
-            survivor_part_id,
-            victim_part_id,
-            force,
-        });
-        let resp_bytes = self
-            .mgr_call(MSG_MERGE_PARTITIONS, req)
-            .await
-            .map_err(|e| AutumnError::ServerError(e.to_string()))?;
-        let resp: MergePartitionsResp =
-            rkyv_decode(&resp_bytes).map_err(AutumnError::ServerError)?;
-        if resp.code != autumn_rpc::manager_rpc::CODE_OK {
-            return Err(AutumnError::ServerError(resp.message));
-        }
-        Ok(())
-    }
-
     /// actively re-spread partitions across the PS fleet
     /// (most-loaded → least-loaded), bounded by `max_moves` (`0` = as many as
     /// needed to balance). Returns the reassignments the manager applied.

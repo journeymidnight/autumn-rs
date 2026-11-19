@@ -2,7 +2,7 @@
 mod support;
 
 use autumn_client::{AutumnError, ClusterClient};
-use autumn_rpc::{client::RpcClient, partition_rpc::*};
+use autumn_rpc::{client::RpcClient, manager_rpc, partition_rpc::*};
 use bytes::Bytes;
 use compio::io::{AsyncRead, AsyncWriteExt};
 use std::{cell::Cell, rc::Rc, time::Duration};
@@ -122,7 +122,7 @@ fn split_merge_status_refusals_reuse_healthy_connections() {
                 .unwrap();
             admin.put(b"c/key", b"left", autumn_client::WriteOptions::default()).await.unwrap();
             admin.put(b"r/key", b"right", autumn_client::WriteOptions::default()).await.unwrap();
-            admin.flush(1801).await.unwrap();
+            ps_flush(&RpcClient::connect(ps_addr).await.unwrap(), 1801).await;
             create_namespaces(mgr_addr, &["c"]).await;
             let observer = ClusterClient::connect_raw(&mgr_addr.to_string())
                 .await
@@ -160,16 +160,34 @@ fn split_merge_status_refusals_reuse_healthy_connections() {
             // `compact` only enqueues; the merge refuses until both children's
             // major compactions have separated them from the parent's tables.
             let deadline = std::time::Instant::now() + Duration::from_secs(15);
+            let admin_mgr =
+                RpcClient::connect_as(mgr_addr, autumn_rpc::version_hello::Role::Admin, None)
+                    .await
+                    .unwrap();
             loop {
-                match admin.merge_partitions(1801, right, true).await {
-                    Ok(()) => break,
-                    Err(AutumnError::ServerError(m))
-                        if m.contains("overlapping keys") && std::time::Instant::now() < deadline =>
-                    {
-                        compio::time::sleep(Duration::from_millis(200)).await;
-                    }
-                    Err(e) => panic!("merge: {e}"),
+                let bytes = admin_mgr
+                    .call(
+                        manager_rpc::MSG_MERGE_PARTITIONS,
+                        manager_rpc::rkyv_encode(&manager_rpc::MergePartitionsReq {
+                            survivor_part_id: 1801,
+                            victim_part_id: right,
+                            force: true,
+                        }),
+                    )
+                    .await
+                    .expect("merge call");
+                let resp: manager_rpc::MergePartitionsResp =
+                    manager_rpc::rkyv_decode(&bytes).expect("merge resp");
+                if resp.code == manager_rpc::CODE_OK {
+                    break;
                 }
+                assert!(
+                    resp.message.contains("overlapping keys")
+                        && std::time::Instant::now() < deadline,
+                    "merge: {}",
+                    resp.message
+                );
+                compio::time::sleep(Duration::from_millis(200)).await;
             }
             // Merge returns before the PS unfreezes; a put refused as frozen
             // refreshes routing and retries until the partition takes it.
