@@ -1214,7 +1214,14 @@ the manager reschedules. There is no in-thread fallback (see row_stream
 single-writer invariant).
 
 After flush, `save_table_locs_raw` writes `TableLocations` to `meta_stream` and
-**truncates meta_stream to 1 extent** — only the latest checkpoint is kept. The
+**truncates meta_stream before the extent that checkpoint landed in**
+(`AppendResult.extent_id`) — only the latest checkpoint is kept. Not before the
+stream's last extent: a meta-tail roll (`MSG_ROLL_TAILS`, the fence drain, which
+takes no `publish_lock`) between the append and the truncate makes the last
+extent an empty one, and that cut dropped the only checkpoint; the next open
+loaded no tables and GC had already punched the log those SSTs covered
+(`crates/manager/tests/system_meta_truncate_roll_race.rs`, sync point
+`set_ckpt_truncate_pause`; red with the cut at the last extent). The
 truncate is reclamation, not part of publishing: the manager refuses it while
 another op (a recovery, an EC conversion) is in flight on one of the old extents
 — nothing preempts (manager CLAUDE.md, "Extent arbiter") — and that refusal is a

@@ -201,6 +201,20 @@ pub(crate) fn note_roll_tails_parked() {
     ROLL_TAILS_PARKED.fetch_add(1, Ordering::Relaxed);
 }
 
+/// Test sync-point: parks `save_table_locs_raw` AFTER its checkpoint append
+/// acked, BEFORE it reads the meta stream to truncate it. Only tests set it.
+static CKPT_TRUNCATE_PAUSE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static CKPT_TRUNCATE_PARKED: AtomicU64 = AtomicU64::new(0);
+/// Test sync-point control — see `CKPT_TRUNCATE_PAUSE`. Only tests call this.
+pub fn set_ckpt_truncate_pause(paused: bool) {
+    CKPT_TRUNCATE_PAUSE.store(paused, Ordering::Relaxed);
+}
+/// Count of checkpoints that have PARKED on `CKPT_TRUNCATE_PAUSE`.
+pub fn ckpt_truncate_parked_count() -> u64 {
+    CKPT_TRUNCATE_PARKED.load(Ordering::Relaxed)
+}
+
 /// Test sync-point control — see `WRITE_PHASE3_PAUSE`. Only tests call this.
 pub fn set_write_phase3_pause(paused: bool) {
     WRITE_PHASE3_PAUSE.store(paused, Ordering::Relaxed);
@@ -10309,14 +10323,30 @@ pub(crate) async fn save_table_locs_raw(
         ckpt_end = ckpt_result.end,
         "checkpoint published"
     );
+    if CKPT_TRUNCATE_PAUSE.load(Ordering::Relaxed) {
+        CKPT_TRUNCATE_PARKED.fetch_add(1, Ordering::Relaxed);
+        while CKPT_TRUNCATE_PAUSE.load(Ordering::Relaxed) {
+            compio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+    }
+    // Cut before the extent this checkpoint landed in, never before the
+    // stream's last one: a roll of the meta tail (`MSG_ROLL_TAILS`) between
+    // the append and this read makes the last extent an empty one, and
+    // cutting before it dropped the only checkpoint.
     let info = stream_client.get_stream_info(meta_stream_id).await?;
-    if info.extent_ids.len() > 1 {
-        let last = *info.extent_ids.last().unwrap();
+    let ckpt_pos = info
+        .extent_ids
+        .iter()
+        .position(|&eid| eid == ckpt_result.extent_id);
+    if ckpt_pos.is_some_and(|pos| pos > 0) {
         // Reclaiming the extents before this checkpoint is not part of
         // publishing it. The manager refuses it while another op (a recovery,
         // an EC conversion) is in flight on one of them; the next checkpoint
         // asks again.
-        if let Err(e) = stream_client.truncate(meta_stream_id, last).await {
+        if let Err(e) = stream_client
+            .truncate(meta_stream_id, ckpt_result.extent_id)
+            .await
+        {
             if !manager_says_retry_later(&e) {
                 return Err(e);
             }
