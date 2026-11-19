@@ -50,11 +50,10 @@
 //!
 //! # How a format change is delivered
 //!
-//! Bump that record's `FORMAT_VERSION`, put the conversion in `crate::upgrade`
-//! and a subcommand for it in `autumn-convert`, run ONCE by hand against a
-//! STOPPED cluster and deleted later; such
-//! a release is a minor-version bump. The tool is in the tree; the
-//! compatibility is not. See `crates/manager/CLAUDE.md`, "Cluster identity,
+//! Bump that record's `FORMAT_VERSION` and deliver a conversion: a subcommand
+//! of one conversion binary (created with the first one needed), run ONCE by hand against a STOPPED cluster and deleted later; such
+//! a release is a minor-version bump. A conversion lives in the tree while it
+//! is needed; compatibility code in the servers never does. See `crates/manager/CLAUDE.md`, "Cluster identity,
 //! version, and capacity".
 //!
 //! A stored version that is not this binary's is therefore never something to

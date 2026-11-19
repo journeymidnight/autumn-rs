@@ -203,7 +203,6 @@ COPY --from=builder \
     /build/target/release/autumn-dashboard \
     /build/target/release/autumn-fuse \
     /build/target/release/autumn-s3 \
-    /build/target/release/autumn-convert \
     /usr/local/bin/
 COPY deploy/k8s/docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh

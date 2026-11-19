@@ -7,7 +7,7 @@
 //! It is:
 //!
 //! 1. bump that record's `FORMAT_VERSION` in `persist/records.rs`;
-//! 2. add a subcommand to the conversion binary (`autumn-convert`) that
+//! 2. add a subcommand to the conversion binary that
 //!    rewrites existing values into the new shape (a minor-version release);
 //! 3. re-record the bytes IN THE SAME COMMIT as those two, so the recorded
 //!    value and the version it belongs to move together.

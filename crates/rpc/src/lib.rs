@@ -443,7 +443,7 @@ mod wire_version_tests {
     /// The window is `[87, 88]`: wire 87 added `evict_rank` to `PutReq` and
     /// `BatchPutOp` in place, which every client sends (a deliberate choice:
     /// a stop-world upgrade with every embedded client rebuilt rather than a
-    /// second form of each write); wire 88 dropped `vp_table_refs` from
+    /// second form of each write); wire 88 dropped a retired count from
     /// `MgrExtentInfo`, which no client decodes.
     ///
     /// Pinned to literals so neither constant moves by accident. **If this

@@ -254,16 +254,6 @@ the split/merge path: real etcd + manager + EN + PS, 12 values written,
 `autumn-op split` then `merge` both succeeded with every value byte-correct
 afterwards, and a manager restart replayed all nine record kinds clean.
 
-**Converting a record (`upgrade.rs`).** A format bump comes with its
-conversion in `upgrade.rs`, which `autumn-convert` runs against a stopped
-cluster's etcd: it holds the old form (vendored) and writes the new one through
-this crate's own `persist::encode`, so the bytes are what replay decodes. Now:
-`extents/<id>` format 1 → 2 (`vp_table_refs` dropped; an extent at `refs == 0`
-whose count is not 0 is refused, since only the count kept it and under format 2
-the orphan sweep deletes it). `meta_streams` is the pre-flight `autumn-convert
-extent-records` runs before writing: a partition whose meta stream may hold
-two checkpoint records is refused while the old release can still fix it.
-
 `persist/freeze.rs` records each encoding byte for byte. It is the deliberate
 replacement for a guard that was ACCIDENTAL: while a record shared a file with
 the wire schema, editing it forced a `WIRE_VERSION` bump. That was far too blunt
@@ -2330,8 +2320,8 @@ rules remain necessary; Hello alone is not a data-safety proof.
 Persisted formats change rarely. Analyze each actual change separately and
 supply its required conversion/recovery procedure. Do not rely on rkyv validation
 or a global wire number to prove persisted compatibility. A conversion is a
-subcommand of the one conversion binary (`autumn-convert`) and deleted later;
-none ships now. A release that changes a persisted format incompatibly is a
+subcommand of one conversion binary (created with the first one needed) and
+deleted later; none ships now. A release that changes a persisted format incompatibly is a
 minor-version bump, with or without a conversion.
 
 **`cluster_df`** (`MSG_CLUSTER_DF`, leader-gated). Ceph-style aggregate, in-memory only,

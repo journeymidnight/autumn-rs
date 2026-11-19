@@ -7,8 +7,8 @@ pub const BLOCK_SIZE_TARGET: usize = 64 * 1024; // 64 KB
 pub const MAX_ENTRIES_PER_BLOCK: usize = 1000;
 pub const MAGIC: u32 = 0x4155_3742; // "AU7B"
 /// The only MetaBlock version this build reads or writes. v2 added
-/// `num_entries` / `num_deletions`; v3 dropped `vp_deps` (`autumn-convert
-/// sst` rewrites v2 tables). Older SST formats are refused.
+/// `num_entries` / `num_deletions`; v3 dropped a per-table list nothing read.
+/// Other SST formats are refused.
 pub const FORMAT_VERSION: u16 = 3;
 /// 13 bytes per SST entry's value section: op(1) + val_len(4) + expires_at(8).
 pub const ENTRY_VALUE_HEADER: usize = 13;

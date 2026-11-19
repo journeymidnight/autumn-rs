@@ -52,12 +52,6 @@ path = "src/bin/autumnfs.rs"
 name = "autumn-s3"
 path = "src/bin/autumn_s3/main.rs"
 
-# The persisted-format conversions a release needs, one subcommand each,
-# deleted in a later release.
-[[bin]]
-name = "autumn-convert"
-path = "src/bin/autumn_convert.rs"
-
 [dependencies]
 # The `fs/` tree (the same layer the fuse mount and the PyO3 `autumn.Fs`
 # binding use): `autumnfs`, `autumn-s3` and `autumn-op`'s
@@ -81,8 +75,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 autumn-common = { path = "../common" }
 autumn-manager = { path = "../manager" }
 autumn-params = { path = "../params" }
-# `autumn-convert extent-records` only: it rewrites etcd with the managers down.
-autumn-etcd = { path = "../etcd" }
 autumn-stream = { path = "../stream" }
 autumn-partition-server = { path = "../partition-server" }
 autumn-rpc = { path = "../rpc" }

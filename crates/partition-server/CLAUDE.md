@@ -225,8 +225,8 @@ rebuilt from empty).
 
 ## Value pointers and log-extent retention
 
-An SST records no per-table list of the log extents its `ValuePointer`s reach
-(MetaBlock v2's `vp_deps`, gone in v3), and the manager keeps no such count.
+An SST records no per-table list of the log extents its `ValuePointer`s reach,
+and the manager keeps no such count.
 Retention is `refs`-based; it is safe because GC's relocate-then-punch moves
 every live value off a log extent before `punch_holes` drops it, so `refs == 0 ⇒
 no live VP`. Split-lifetime correctness (shared SSTs still holding old
@@ -2815,18 +2815,16 @@ parser for the old shape".
 
 The reason is the migration rule for persisted data (`crates/manager/CLAUDE.md`,
 "Cluster identity, version, and capacity"): a persisted format change is delivered by a conversion (a
-subcommand of `autumn-convert`) run once against a stopped cluster, never by
+subcommand of the one conversion binary) run once against a stopped cluster, never by
 compatibility code in the servers.
 These bytes live inside every extent, at terabyte scale, so rewriting them is a
 decision of its own, made only for one specific need.
 
 It has been taken twice: MetaBlock v2 added `num_entries` / `num_deletions`
-(the tombstone count) for the deletion-triggered compaction, and v3 dropped the
-inert `vp_deps` list. The server reads **only v3**: another version fails to
-decode with the actual and supported versions, so an unconverted partition does
-not open. `autumn-convert sst` rewrites v2 tables (`sst_convert.rs`: the data
-blocks are kept byte for byte, the MetaBlock re-encoded, every entry read back
-before the table is written; `crates/manager/tests/convert_sst.rs`). The `VERSION` field is the
+(the tombstone count) for the deletion-triggered compaction, and v3 dropped a
+per-table list nothing read. The server reads **only v3**: another version
+fails to decode with the actual and supported versions, so such a partition
+does not open. The `VERSION` field is the
 tripwire that makes a mismatch loud; the decoder also refuses missing or
 trailing MetaBlock bytes.
 

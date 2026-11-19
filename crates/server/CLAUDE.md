@@ -566,37 +566,14 @@ autumnfs [--manager 127.0.0.1:9001] [--transport tcp|ucx] [--credential-file FIL
 
 ### Format conversions
 
-Servers and fs clients read only the current version of each versioned
-persisted format and refuse any other. A conversion is a subcommand of one
-binary, `autumn-convert` (`src/bin/autumn_convert.rs`, flags in
-`autumn_params::convert`), run once against a stopped cluster; a release that
-changes a persisted format incompatibly is a minor-version bump, and the
-subcommand is deleted later (docs/ops.md, "Persisted formats and conversions").
-The binary is the CLI and the cluster plumbing; each conversion lives beside the
-format it produces and holds the old form itself, because the tree only has the
-new one: `autumn_manager::upgrade` (etcd records, written with the manager's own
-encoder), `autumn_partition_server::sst_convert` (SSTs).
-
-- `extent-records --etcd …`: `extents/<id>` format 1 → 2 (`vp_table_refs`
-  dropped). Refuses, before writing anything, while any manager holds the
-  leader key or a `managerAlive/<id>`; for an extent in no stream kept only by
-  `vp_table_refs`; and for a partition whose meta stream may hold two
-  checkpoint records (`upgrade::meta_streams`; a region whose meta stream has
-  no `streams/` record is refused too), which `sst` cannot convert and the old
-  release can still fix. That check is skipped once every record is format 2
-  (a stopped `sst` run may then leave its own two-record pair; a rerun after
-  the upgrade is a no-op). Value-CAS'd txns of 64 keys, each also
-  requiring the leader key absent. Test:
-  `crates/manager/tests/convert_extent_records.rs`.
-- `sst --manager … --cluster-secret-file …`: MetaBlock v2 → v3, per partition
-  (owner lock, fence + seal tails, rewrite, publish one checkpoint, read it back
-  from its extent, cut meta then row); waits until no PS heartbeats; a dry run
-  only reads. A rerun after a stop between the publish and the cuts finds the
-  record pair and finishes. Truncates retry while the manager answers a
-  transient conflict: split siblings share row and meta extents, and converted
-  in parallel their cuts race on those extents' `refs` (seen on a real
-  upgrade: 3 of 18 partitions). Tests: `crates/manager/tests/convert_sst.rs` (incl.
-  the stopped-after-publish rerun via `sst_convert::FAIL_AFTER_PUBLISH`).
+No conversion tool ships in this build: servers and fs clients read only the
+current version of each versioned persisted format and refuse any other. A
+conversion is a subcommand of one binary (created with the first one
+needed), run once against a stopped cluster and deleted in a later
+release; a release that changes a persisted format incompatibly is a
+minor-version bump (docs/ops.md, "Persisted formats and conversions"). A
+conversion holds the old form itself and writes the new one through the
+owning crate's encoder, because the tree only has the new one.
 
 ### `autumn-stream-cli` (`src/bin/stream_cli.rs`)
 

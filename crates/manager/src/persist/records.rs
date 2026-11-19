@@ -778,7 +778,6 @@ pub(crate) struct ExtentRecord {
 
 impl PersistRecord for ExtentRecord {
     const RECORD_TYPE: u8 = RECORD_TYPE_EXTENT;
-    /// 2 dropped `vp_table_refs` after `refs` (`autumn-convert extent-records`).
     const FORMAT_VERSION: u8 = 2;
     const NAME: &'static str = "extent";
 }

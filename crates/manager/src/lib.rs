@@ -17,7 +17,6 @@ mod op_log;
 mod cluster_status;
 mod manager_members;
 mod persist;
-pub mod upgrade;
 mod placement;
 pub mod policy;
 #[cfg(test)]

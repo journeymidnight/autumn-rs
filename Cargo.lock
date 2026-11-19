@@ -277,7 +277,6 @@ dependencies = [
  "anyhow",
  "autumn-client",
  "autumn-common",
- "autumn-etcd",
  "autumn-fs",
  "autumn-manager",
  "autumn-params",

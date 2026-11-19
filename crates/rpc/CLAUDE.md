@@ -783,7 +783,7 @@ overflows the frame.
 
 ## Wire version, and the two checks over it
 
-`WIRE_VERSION` (currently **88**: `MgrExtentInfo` without `vp_table_refs`) is the schema this binary speaks.
+`WIRE_VERSION` (currently **88**: `MgrExtentInfo` without its retired SST count) is the schema this binary speaks.
 `MIN_CLIENT_WIRE_VERSION` (**87**: that change was made in place, so every client is rebuilt — chosen
 over a second form of each write; `client_surface_freeze.rs` re-recorded those two forms)
 is the oldest CLIENT it serves. Both are maintained
@@ -1138,12 +1138,12 @@ the bytes of the bulk forms they replace (`client_surface_freeze.rs` records
 `BatchPutBulkReq`), so only names changed on them; the floor rose because a
 wire-80 client sends the deleted forms for small values.
 
-## `MgrExtentInfo` without `vp_table_refs` (wire 88)
+## `MgrExtentInfo`: retention is `refs` alone (wire 88)
 
-The count of SSTs whose ValuePointers reached an extent is gone from the wire
-extent info (and from the manager's persisted record, format 2): retention is
-`refs` alone. Manager, PS, EN and autumn-op only; not on the client surface, so
-the floor stays 87.
+The per-extent count of SSTs whose ValuePointers reached the extent is gone
+from the wire extent info (and from the manager's persisted record, format 2).
+Manager, PS, EN and autumn-op only; not on the client surface, so the floor
+stays 87.
 
 ## An extent read whose value lands in the reader's memory (wire 86)
 

@@ -5424,54 +5424,10 @@ There is no dual-read.
 
 A release that changes a persisted format incompatibly is a minor-version bump
 (`0.1.x` → `0.2.0`), whether existing data is converted or has to be
-re-created. A conversion ships as a subcommand of one binary, `autumn-convert`
-(in the image), run once against a STOPPED cluster; the subcommand is deleted in
-a later release.
-
-#### Upgrading from 0.1.x: extent records format 2, SST MetaBlock v3
-
-`vp_table_refs` is gone from the manager's `extents/<id>` record (format 1 → 2)
-and `vp_deps` from the SST MetaBlock (v2 → v3). A new manager refuses to lead on
-a format-1 record (`extents/N: extent record is at format version 1, this
-binary speaks 2`); a new PS does not open a partition holding a v2 table (`SST
-MetaBlock format v2, this build reads only v3`). Both convert in place; nothing
-else changes. (An fs tree from 0.1.x is schema v4 and is not convertible: see
-"FS schema version".)
-
-```bash
-# 0. On the old release, with every partition open (a merged partition must
-#    have opened once since its merge), stop the policy, then stop every PS
-#    (its drain flushes), then every manager. Extent nodes and etcd stay up.
-# 1. Extent records (refused while any manager is alive; wait for its lease).
-autumn-convert extent-records --etcd http://ETCD:2379 --dry-run
-#   → extents/: N to convert, 0 already format 2 (dry run: nothing written)
-autumn-convert extent-records --etcd http://ETCD:2379
-autumn-convert extent-records --etcd http://ETCD:2379   # → 0 to convert, N already
-#    Refused before anything is written: a partition whose meta stream has
-#    more than one open or non-empty extent (it may hold two checkpoint
-#    records, which `sst` does not convert: open it on the old release, stop
-#    it, rerun), and an extent in no stream kept only by vp_table_refs (none is
-#    expected: no release since 0.1.0 sets it).
-# 2. Start the new managers and extent nodes, not the PS.
-# 3. SSTs (waits until no PS has heartbeated for 10 s).
-autumn-convert sst --manager MGR:9001 --cluster-secret-file F --dry-run
-autumn-convert sst --manager MGR:9001 --cluster-secret-file F [--parallel 4]
-#   → part P: converted K SSTs (B bytes), 0 already v3, dropped D row extents
-autumn-convert sst --manager MGR:9001 --cluster-secret-file F   # → converted 0
-# 4. Start the new PS; rebalance (below); restore the policy.
-```
-
-`sst` takes each partition's owner lock (fencing a PS that still holds it),
-fences and seals its tails, rewrites each v2 table with its data blocks kept and
-the MetaBlock re-encoded (every entry is read back first), appends them to the
-row stream, publishes one checkpoint naming them, reads it back from its extent,
-then cuts the old checkpoint and the row prefix nothing references. A run
-stopped anywhere is run again (one stopped between the publish and the cuts
-finds both records and finishes the cuts). `--dry-run` only reads. A table is
-held in memory about twice while converted, so `--parallel` × 2 × the largest
-SST must fit.
-A split child that shares tables with its sibling gets its own copy; the shared
-extents go once both are cut.
+re-created. A conversion ships as a subcommand of one binary (created with the
+first one needed), run once against a STOPPED cluster; the
+subcommand is deleted in a later release. None ships now: clusters older than
+0.2.0 are not readable by this build.
 
 **After any stop-the-world restart, rebalance.** `handle_register_ps` runs
 `rebalance_regions` when the FIRST PS registers, and with one PS in `ps_nodes`
@@ -6704,8 +6660,7 @@ node the slot landed on.
 ## SST format and deletion-triggered compaction
 
 The current PS reads only MetaBlock v3, which records entry and tombstone
-counts. Other formats are rejected with the actual and supported versions;
-`autumn-convert sst` converts v2 (see "Upgrading from 0.1.x").
+counts. Other formats are rejected with the actual and supported versions.
 
 Each PS schedules a major compaction when SSTs hold >= 10 000 tombstones
 and tombstones are >= 30% of entries, checked every
