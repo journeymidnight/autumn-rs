@@ -69,7 +69,7 @@ spec:
             # stream/partition/region rewrites). etcd's default --max-txn-ops=128
             # therefore caps a splittable partition at only ~40 extents — e.g. a
             # partition merged down from 32 (127 extents) refuses EVERY split with `etcdserver: too many operations in txn request`,
-            # which surfaces as a confusing `precondition failed` on presplit.
+            # which surfaces as a confusing `precondition failed` on a split.
             - --max-txn-ops=1024
           env:
             - name: POD_NAME

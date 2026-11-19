@@ -189,10 +189,12 @@ $AO info                               # partitions starting fs/, kvc/, kvc/1 �
 - If a cut still fails (no PS serving yet, a compaction failed), the command fails
   and the namespace is registered and empty: `namespace-delete --name <NS>`, then
   create it again once the cause is fixed.
-- Choose the cuts at creation. `presplit --namespace <NS> --parts N` can still cut
-  further (it compacts and retries the same way; over a populated range that is
-  one major compaction per extra cut, ~5 s each), but it never cuts the head;
-  namespaces created before head cuts keep their layout.
+- Choose the cuts at creation: `namespace-create` is the only presplit, and
+  `autumn-op presplit` was removed. A namespace that already exists grows by
+  `split` (the auto-policy, or `autumn-op split`). Cutting a range that holds
+  data makes children that share its log extents, and each re-reads every
+  shared extent before GC frees it: one 314 GB fs partition cut seven ways kept
+  GC busy for hours.
 - `cluster.sh` creates `fs` and `kvc` (`--parts 16`) on its first start;
   `AUTUMN_NAMESPACES="fs kvc bench"` picks the list, `AUTUMN_NAMESPACES=""` none.
 - A cluster from an earlier release keeps the namespace rows it had (`fs`,
@@ -829,7 +831,7 @@ autumn-op gc 7 --wait --timeout 300         # block until terminal; non-zero exi
 ```
 
 - **`--wait [--timeout SECS]`** (global, default 600) blocks until the op reaches
-  a terminal state and exits on its real outcome — for scripts (and `presplit`
+  a terminal state and exits on its real outcome — for scripts (and `namespace-create`
   internally) that need the blocking error. Without it, poll `ops status`.
 - **Where outcomes come from**: merge/rebalance close in-process on the
   leader; a split closes on its PS's reply or on its commit (see "A split whose
@@ -3381,7 +3383,7 @@ Two pieces of state, different jobs:
 # metadata partitions; declares 24 lanes.
 $AO namespace-create --name fs --parts 6
 # → declared fs stripe geometry: 24 lanes × 8 MiB units
-# → presplit fs: 12/12 cut points applied
+# → namespace-create fs: 12/12 cut points applied
 #   (the head fs/, 5 lane boundaries, the metadata region [0x06], 5 hash runs)
 
 $AO namespace-create --name fs --parts 5     # rejected:
@@ -3403,7 +3405,7 @@ land only partially (`has_overlap`) if you load first.
 
 ### Declared boundaries: split there first, never merge there
 
-`presplit` records the intended cut points on the namespace registry row. That record drives BOTH halves of a symmetric rule:
+`namespace-create` records the intended cut points on the namespace registry row. That record drives BOTH halves of a symmetric rule:
 
 * **merge refuses** to erase a declared boundary (`--force` to override). This
   matters because an EMPTY lane partition is a perfect auto-merge candidate
@@ -3416,11 +3418,11 @@ land only partially (`has_overlap`) if you load first.
   boundary, it falls back to median — an intra-lane inode split, which is the
   right cut at that point.
 
-So you don't strictly have to run presplit at all: declare the points and the
+So you don't strictly have to cut many partitions at creation: declare the points and the
 cluster walks itself toward that layout as load grows. (Auto-split is local and
 reactive, so it converges on "each partition owns a run of whole lanes", not on a
 perfectly even parts-divides-lanes split — that evenness is a planned,
-presplit-time property.)
+creation-time property.)
 
 ```bash
 $AO merge 12 13
@@ -4394,42 +4396,43 @@ $AO --json info | jq -r '.partitions[].range_start'  # one range starts at kvc/a
 $AO split <PART> --namespace zzz/zzz --at "" ; echo "exit=$?"  # non-zero
 ```
 
-## Namespace-aware presplit — `autumn-op presplit`
+## Namespace-aware cuts — `namespace-create --parts N`
 
-`namespace-create --name <NS> [--parts N]` takes the same `--parts` and cuts right
-after registering ([Enabling fs / kvc](#enabling-fs--kvc)); `presplit --namespace
-<NS[/SUB]> --parts N` cuts an existing namespace further. `namespace-create` also
-cuts at the namespace's head `{ns}/` first and records it, so each namespace starts
-its own partition and merge never joins two namespaces; `presplit` never cuts the head.
+`namespace-create --name <NS> [--parts N]` cuts right after registering
+([Enabling fs / kvc](#enabling-fs--kvc)): first at the namespace's head `{ns}/`,
+recorded, so each namespace starts its own partition and merge never joins two;
+then N partitions along the namespace's natural dimension. There is no command
+that cuts an existing namespace this way (`autumn-op presplit` was removed); it
+grows by `split`.
 
 A raw-byte uniform split is **namespace-blind**: after key-namespacing every real key
 sits in the `fs/…` / `kvc/…` / `<app>/…` byte sliver,
 so uniform splitting over the whole 0x00..0xff space collapses everything into
 one or two partitions (e.g. 19 GB of fs on a single partition, 30 empty). That is
-why `bootstrap --presplit` was retired. `presplit` instead splits a `{scope}/`
-keyspace along the namespace's **natural high-entropy dimension** (built on the
-`split --at` primitive). `--namespace` takes a scope as in `split`: the FIRST
-segment picks how `--parts N` cuts (`fs` lanes | `kvc` buckets | anything else =
-uniform hex), the whole scope is the cut prefix, and the declared points are
-recorded on the first segment's namespace row. `fs` and `kvc` refuse a sub-scope.
+why `bootstrap --presplit` was retired. The name picks how `--parts N` cuts (`fs`
+lanes and metadata | `kvc` buckets | anything else = uniform hex under `{ns}/`),
+and the declared points are recorded on the namespace row.
 
 ```bash
-# --parts N; the namespace picks how the N partitions are cut.
-# fs: over its 24 stripe lanes (N divides 24). LANES is the key layout (a
-# permanent constant), --parts how many partitions they are spread over. See the
-# "fs stripe geometry: lanes vs partitions" section above for the full model +
-# the sacred-boundary merge guard. The boundaries are RECORDED (protected).
-$AO presplit --namespace fs --parts 6
+# fs: data over its 24 stripe lanes (N divides 24) and the metadata region
+# [0x06] in N hash runs, 2N partitions. LANES is the key layout (a permanent
+# constant), --parts how many partitions they are spread over. See the "fs
+# stripe geometry: lanes vs partitions" section above for the full model + the
+# sacred-boundary merge guard. The boundaries are RECORDED (protected).
+$AO namespace-create --name fs --parts 6
 
 # kvc: at its HASH BUCKETS. The kvcache adapters store
 #   kvc/{h}/{model_scope}/{pool}/{hash}…   (h = first char of the sha256 hexdigest)
 # so the cuts are kvc/<hex>, the same for every model. N <= 16; the full
 # 15-point grid is recorded.
-$AO presplit --namespace kvc --parts 16
+$AO namespace-create --name kvc --parts 16
 
-# any other namespace (or sub-scope): uniform hex under the scope; this is what
-# cluster.sh / perf_check.sh run for the bench keyspace.
-$AO presplit --namespace bench/perf --parts 8
+# any other namespace: uniform hex under {ns}/; this is what cluster.sh /
+# perf_check.sh run for the bench keys (bench/<hex>...).
+$AO namespace-create --name bench --parts 8
+
+# the removed command says where to go instead and exits 2:
+$AO presplit --namespace fs --parts 6; echo "exit=$?"   # -> exit=2
 ```
 
 ### Stripe one large file across lanes (break the single-partition ceiling)
@@ -4477,11 +4480,11 @@ autumnfs --manager <mgr> get /ckpt ./out   # reader reads the file's own stamp
   (streaming writes don't know the final size up front, so fuse can't decide the
   stripe geometry at create) — use `autumnfs put` to (re)write large striped files.
 
-**CRITICAL — presplit the EMPTY keyspace BEFORE loading data.** A data-bearing
+**CRITICAL — cut the EMPTY keyspace BEFORE loading data.** A data-bearing
 partition can't be split repeatedly: after the first CoW split, parent+child
 share extents and the child's SSTs hold out-of-range keys, so the PS rejects the
 next split with `precondition failed: cannot split: partition has overlapping
-keys` until a major compaction clears them. `presplit` (and `namespace-create`)
+keys` until a major compaction clears them. `namespace-create`
 then major-compacts that partition, waits for it and cuts again; a point still not
 cut fails the command. Over a populated range that is one compaction per cut and
 rewrites the data each time, so the correct order is **cut first, then ingest.**
@@ -5792,7 +5795,7 @@ keep the set under that):
 ```bash
 bash scripts/cluster.sh start 3
 ao="target/release/autumn-op --cluster-secret-file $AUTUMN_DATA_ROOT/cluster.secret --manager 127.0.0.1:9001"
-$ao namespace-create --name bench && $ao presplit --namespace bench/perf --parts 8
+$ao namespace-create --name bench --parts 8
 compact="for p in \$($ao info | awk '/^  part/{print \$2}'); do $ao compact \$p --wait || exit 1; done"
 for hook in "" "$compact"; do
   target/release/autumn-client --manager 127.0.0.1:9001 ycsb --threads 16 --duration 15 \
@@ -6566,7 +6569,7 @@ first; a single stream is bounded by receiving its body plus writing its last
 ```bash
 autumn-op --manager 127.0.0.1:9001 info        # how many partitions own fs/[0x03][lane]?
 # On a fresh cluster, BEFORE loading data (cuts over data rewrite it):
-autumn-op --manager 127.0.0.1:9001 --wait presplit --namespace fs --parts 4 \
+autumn-op --manager 127.0.0.1:9001 namespace-create --name fs --parts 4 \
     --cluster-secret-file $DATA_ROOT/cluster.secret
 autumnfs --manager 127.0.0.1:9001 mkdir /bench
 RUST_LOG=info,autumn_s3::write=debug autumn-s3 --manager 127.0.0.1:9001 --port 9100 > s3.log 2>&1 &

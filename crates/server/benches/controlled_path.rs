@@ -135,7 +135,7 @@ fn main() {
         threads.push(std::thread::spawn(move || {
             autumn_common::cpu_pin::pin_current(Some(40 + part)).unwrap();
             compio::runtime::Runtime::new().unwrap().block_on(async {
-                let client = ClusterClient::connect(&manager, "bench/controlled")
+                let client = ClusterClient::connect(&manager, "bench")
                     .await
                     .unwrap();
                 client.set_rpc_timeout(Duration::from_secs(30));

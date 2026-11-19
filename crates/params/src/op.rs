@@ -14,7 +14,7 @@ crate::params! {
         /// refuses an operator connection without it.
         cluster_secret_file: Option<std::path::PathBuf>;
         /// Data-plane credential (`<principal>\n<hex>`) for the commands that
-        /// read or write partition keys (e.g. `presplit --namespace fs`).
+        /// read or write partition keys (e.g. `namespace-create --name fs`).
         credential_file: Option<String>;
         /// Async op commands (split, merge, rebalance, compact, gc, forcegc,
         /// force-ec-convert): wait for the op to finish and exit on its outcome.

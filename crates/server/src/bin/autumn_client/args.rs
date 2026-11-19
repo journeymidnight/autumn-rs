@@ -94,7 +94,7 @@ pub(crate) enum Command {
         before_read: Option<String>,
     },
     /// Delete every key the benchmarks wrote (everything under the
-    /// `bench/perf` scope: perf-check and ycsb data). `dry_run` only counts.
+    /// `bench` namespace: perf-check and ycsb data). `dry_run` only counts.
     PerfClean {
         dry_run: bool,
         /// Bench partitions cleaned concurrently.
@@ -135,7 +135,7 @@ pub(crate) struct Args {
     /// (put/get/del/head/ls/put-stream/get-stream) writes/reads within — a whole
     /// namespace (`fs`, `gallery`) or an in-namespace sub-prefix (`mem/agent7`).
     /// REQUIRED for those commands (a write must declare its scope); perf-check/
-    /// ycsb bind the `bench/perf` scope internally and don't need it.
+    /// ycsb bind the `bench` namespace internally and don't need it.
     pub(crate) namespace: Option<String>,
     /// path to a file holding this client's authz credential
     /// (`<principal>\n<hex>`, from `autumn-op principal-create`). REQUIRED for KV
@@ -162,7 +162,7 @@ Data-plane commands (KV + bench):
   perf-check [--threads 256] [--duration 10] [--size 4096] [--baseline perf_baseline.json] [--threshold 0.8] [--update-baseline] [--partitions N] [--pipeline-depth K] [--before-read CMD]   (zero-copy auto on --transport ucx)
                                     Quick write+read bench; warns if >threshold regression vs baseline
   perf-clean [--dry-run] [--parallel 8]
-                                    Delete everything perf-check / ycsb wrote (the bench/perf scope)
+                                    Delete everything perf-check / ycsb wrote (the bench namespace)
   ycsb [--threads 32] [--duration 30] [--size 1024] [--partitions N] [--pipeline-depth 16] [--read-ratio 0.5] [--key-dist zipfian|uniform] [--records 100000] [--rmw] [--before-run CMD]
                                     YCSB-equivalent mixed workload (A=0.5 B=0.95 C=1.0 D=0.95 F=--rmw); LOAD then mixed RUN
 

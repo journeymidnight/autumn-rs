@@ -69,12 +69,6 @@ cluster / partition admin commands (moved from autumn-client):
                                check sealed copies against their checksums on the
                                nodes that hold them; rot is isolated and rebuilt
   split <PARTID> [--namespace <NS[/SUB]> [--at <SUFFIX> | --at-hex <HEX>]] [--at-raw-hex <HEX>]
-  presplit --namespace <NS[/SUB]> --parts <N> [--force]
-                               cut more later (namespace-create cuts first); presplit EMPTY
-                               keyspace before loading. --parts N by NS:
-      fs:    over its 24 stripe lanes, N divides 24   (--force to narrow a wider declared stripe)
-      kvc:   at its hash buckets kvc/<hex>, N <= 16
-      other: uniformly over hex under the scope
   merge <SURVIVOR_PARTID> <VICTIM_PARTID>
   rebalance [MAX_MOVES]        actively re-spread partitions across PS (0/absent = balance fully)
   compact <PARTID>
@@ -88,9 +82,13 @@ cluster / partition admin commands (moved from autumn-client):
 
 namespace registry (admin):
   namespace-create --name <NS> [--parts <N>]
-                               register a namespace, cut at <NS>/ and into N partitions (as
-                               presplit; none = 1, auto-split needs auto-policy aggressive);
-                               needs the PS up
+                               register a namespace, cut at <NS>/ and into N partitions;
+                               none = 1, auto-split needs auto-policy aggressive; needs the PS
+                               up. The only presplit: cut before loading. --parts N by NS:
+      fs:    data over its 24 stripe lanes (N divides 24) and metadata into N hash runs
+             (--force to narrow a wider declared stripe)
+      kvc:   at its hash buckets kvc/<hex>, N <= 16
+      other: uniformly over hex under <NS>/
   namespace-delete --name <NS> [--force]
                                remove the registry row (refuses non-empty unless --force)
   namespace-list [--json]      list registered namespaces (name/prefix/presplit/created)
@@ -178,7 +176,7 @@ pub(crate) struct Args {
     /// data-plane credential (`--credential-file`), as
     /// `(principal, secret)`. The cluster secret authorizes CONTROL-plane RPCs;
     /// it does nothing for a partition-server key check. Some admin subcommands do touch
-    /// the data plane — `presplit --namespace fs` reads the declared stripe
+    /// the data plane — `namespace-create --name fs` reads the declared stripe
     /// geometry before overwriting it — and under PROTECT-EVERYTHING every key
     /// needs a capability token, so those need a credential too. `None` = connect
     /// without one (fine on an authz-off cluster, and for every command that
@@ -393,18 +391,6 @@ pub(crate) enum Command {
         part_id: u64,
         /// (D4): where to cut. See `SplitPoint`.
         point: SplitPoint,
-    },
-    /// presplit a `{scope}/` keyspace by its namespace's natural dimension.
-    /// `scope` is a namespace or an in-namespace sub-scope (`bench/perf`).
-    /// Explicit op (NOT bootstrap — the namespace must exist first).
-    Presplit {
-        scope: String,
-        rule: PresplitRule,
-        /// UX-fix (M5): required to NARROW an fs's declared stripe
-        /// geometry (24 lanes is less than a wider declaration an older fs may
-        /// carry). Without it, a redeclare that lowers the lane count is refused:
-        /// it would silently narrow every future file's stripe width fs-wide.
-        force: bool,
     },
     Merge {
         survivor_part_id: u64,
@@ -1314,29 +1300,15 @@ pub(crate) fn parse() -> Args {
             Command::Split { part_id, point }
         }
         "presplit" => {
-            // presplit --namespace <NS[/SUB]> --parts N  (the ns picks how)
-            let mut namespace: Option<String> = None;
-            let mut flags = RuleFlags::default();
-            while i < raw.len() {
-                if flags.take("presplit", &raw, &mut i) {
-                    continue;
-                }
-                match raw[i].as_str() {
-                    "--namespace" => { i += 1; namespace = Some(val(&raw, i).to_owned()); i += 1; }
-                    other => { eprintln!("presplit: unknown flag {other}"); std::process::exit(1); }
-                }
-            }
-            let scope = namespace.unwrap_or_else(|| {
-                eprintln!("presplit requires --namespace <NS[/SUB]>"); std::process::exit(1);
-            });
-            reject_bad_scope("presplit", &scope);
-            let force = flags.force;
-            if flags.parts.is_none_or(|n| n < 2) {
-                eprintln!("presplit --namespace {scope} needs --parts <N>, N >= 2");
-                std::process::exit(1);
-            }
-            let rule = presplit_rule("presplit", &scope, flags).expect("--parts >= 2 gives a rule");
-            Command::Presplit { scope, rule, force }
+            // Removed: cuts are made when a namespace is created. Re-cutting a
+            // namespace that holds data made CoW children that each re-read
+            // every shared log extent in GC.
+            eprintln!(
+                "autumn-op presplit was removed. A namespace is cut when it is created:\n\
+                 \x20 autumn-op namespace-create --name fs --parts 6   (data lanes and metadata)\n\
+                 A namespace that already exists grows by split (auto-policy, or autumn-op split)."
+            );
+            std::process::exit(2);
         }
         "merge" => {
             if raw.get(i).map(|s| s == "--help" || s == "-h").unwrap_or(false) {
@@ -1678,16 +1650,15 @@ pub(crate) fn parse_hex_key(s: &str) -> Vec<u8> {
 // ---------------------------------------------------------------------------
 
 // ── Per-namespace presplit rules ─────────────────────────────────────────────
-// Presplit a `{namespace}/` keyspace by the namespace's NATURAL
+// `namespace-create` cuts a `{namespace}/` keyspace by the namespace's NATURAL
 // high-entropy dimension (a raw-byte uniform split is namespace-blind — after
 // SD-2/SD-3 all real keys sit in the `fs/`/`kvc/`/`mem/` byte sliver, so uniform
 // splitting collapses everything into a couple of partitions). Each rule returns
-// SUFFIXES relative to `{namespace}/`, ASCENDING; `cmd_presplit` prepends the
+// SUFFIXES relative to `{namespace}/`, ASCENDING; `cut_namespace` prepends the
 // `{namespace}/` prefix to get raw wire cut points and splits the owning
 // partition at each.
 
-/// The flags that pick a presplit rule, shared by `presplit` and
-/// `namespace-create`: how many partitions (`--parts`), and `--force` to
+/// The flags of `namespace-create` that pick its presplit rule: how many partitions (`--parts`), and `--force` to
 /// narrow an fs's declared stripe width.
 #[derive(Default)]
 struct RuleFlags {
@@ -1875,7 +1846,7 @@ pub(crate) fn presplit_suffixes(rule: &PresplitRule) -> Result<Vec<Vec<u8>>> {
 /// breaking the whole-lane-ownership invariant. Recording all 24-lane
 /// boundaries makes auto-split SNAP to the next lane boundary instead, and makes
 /// the merge guard protect the lane grid an operator actually declared. This is
-/// the same "record INTENT, not just applied" philosophy `cmd_presplit` already
+/// the same "record INTENT, not just applied" philosophy `cut_namespace` already
 /// applies to the parts grid. For non-fs rules the record grid == the cut grid.
 pub(crate) fn presplit_record_suffixes(rule: &PresplitRule) -> Result<Vec<Vec<u8>>> {
     match rule {
@@ -1902,19 +1873,16 @@ pub(crate) fn presplit_record_suffixes(rule: &PresplitRule) -> Result<Vec<Vec<u8
     }
 }
 
-/// The absolute points a presplit cuts and records for `scope`. With `head`
-/// (namespace-create) the namespace's head `{ns}/` comes first, so the
-/// namespace starts its own partition; the next namespace's head ends it.
+/// The absolute points `namespace-create` cuts and records for `namespace`:
+/// its head `{ns}/` first, so the namespace starts its own partition (the next
+/// namespace's head ends it), then the rule's points under it.
 pub(crate) fn presplit_plan(
-    scope: &str,
-    head: bool,
+    namespace: &str,
     rule: Option<&PresplitRule>,
 ) -> Result<(Vec<Vec<u8>>, Vec<Vec<u8>>)> {
-    let namespace = scope.split('/').next().unwrap_or(scope);
-    let prefix = format!("{scope}/").into_bytes();
+    let prefix = format!("{namespace}/").into_bytes();
     let in_scope = |suffixes: Vec<Vec<u8>>| suffixes.into_iter().map(|s| [prefix.as_slice(), &s].concat());
-    let head: Vec<Vec<u8>> = if head { vec![format!("{namespace}/").into_bytes()] } else { vec![] };
-    let (mut cut, mut record) = (head.clone(), head);
+    let (mut cut, mut record) = (vec![prefix.clone()], vec![prefix.clone()]);
     if let Some(rule) = rule {
         cut.extend(in_scope(presplit_suffixes(rule)?));
         record.extend(in_scope(presplit_record_suffixes(rule)?));
@@ -2131,26 +2099,24 @@ mod tests {
     #[test]
     fn namespace_create_cuts_its_head_first() {
         use super::{presplit_plan, PresplitRule};
-        let (cut, rec) = presplit_plan("fs", true, None).unwrap();
+        let (cut, rec) = presplit_plan("fs", None).unwrap();
         assert_eq!((cut, rec), (vec![b"fs/".to_vec()], vec![b"fs/".to_vec()]));
-        let (cut, rec) = presplit_plan("kvc", true, Some(&PresplitRule::Kvc { count: 16 })).unwrap();
+        let (cut, rec) = presplit_plan("kvc", Some(&PresplitRule::Kvc { count: 16 })).unwrap();
         assert_eq!(cut.len(), 16);
         assert_eq!(cut[0], b"kvc/".to_vec());
         assert_eq!(cut[1], b"kvc/1".to_vec());
         assert_eq!(rec, cut);
-        // A sub-scope is cut at its namespace's head, then under the scope.
-        let (cut, _) = presplit_plan("bench/perf", true, Some(&PresplitRule::Hex { count: 2 })).unwrap();
-        assert_eq!(cut[0], b"bench/".to_vec());
-        assert!(cut[1].starts_with(b"bench/perf/"));
-        assert!(cut.windows(2).all(|w| w[0] < w[1]), "ascending: {cut:?}");
-        // `presplit` cuts only by its rule.
-        let (cut, rec) = presplit_plan("kvc", false, Some(&PresplitRule::Kvc { count: 2 })).unwrap();
-        assert_eq!(cut, vec![b"kvc/8".to_vec()]);
-        assert_eq!(rec.len(), 15);
+        // Hex points land under the head, where the bench keys are.
+        let (cut, _) = presplit_plan("bench", Some(&PresplitRule::Hex { count: 2 })).unwrap();
+        assert_eq!(cut, vec![b"bench/".to_vec(), b"bench/7fffffff".to_vec()]);
+        // Two kvc parts cut one bucket and record all fifteen.
+        let (cut, rec) = presplit_plan("kvc", Some(&PresplitRule::Kvc { count: 2 })).unwrap();
+        assert_eq!(cut, vec![b"kvc/".to_vec(), b"kvc/8".to_vec()]);
+        assert_eq!(rec.len(), 16);
     }
 
     #[test]
-    fn namespace_create_and_presplit_read_the_same_rule_flags() {
+    fn namespace_create_reads_its_rule_flags() {
         use super::{presplit_rule, PresplitRule, RuleFlags};
         let flags = |args: &[&str]| {
             let raw: Vec<String> = args.iter().map(|a| a.to_string()).collect();
@@ -2168,9 +2134,9 @@ mod tests {
         assert!(matches!(presplit_rule("t", "fs", flags(&["--parts", "1"])), Some(PresplitRule::FsLanes { lanes: 24, parts: 1 })));
         assert!(presplit_rule("t", "gallery", flags(&[])).is_none());
         assert!(presplit_rule("t", "gallery", flags(&["--parts", "1"])).is_none());
-        let (cut, rec) = super::presplit_plan("kvc", true, Some(&PresplitRule::Kvc { count: 1 })).unwrap();
+        let (cut, rec) = super::presplit_plan("kvc", Some(&PresplitRule::Kvc { count: 1 })).unwrap();
         assert_eq!((cut.len(), rec.len()), (1, 16), "head only cut, head + 15 buckets recorded");
-        let (cut, rec) = super::presplit_plan("fs", true, Some(&PresplitRule::FsLanes { lanes: 24, parts: 1 })).unwrap();
+        let (cut, rec) = super::presplit_plan("fs", Some(&PresplitRule::FsLanes { lanes: 24, parts: 1 })).unwrap();
         assert_eq!((cut.len(), rec.len()), (1, 24), "head only cut, head + 23 lanes recorded");
         assert!(matches!(presplit_rule("t", "kvc", flags(&["--parts", "16"])), Some(PresplitRule::Kvc { count: 16 })));
         assert!(matches!(presplit_rule("t", "bench", flags(&["--parts", "8"])), Some(PresplitRule::Hex { count: 8 })));
@@ -2348,8 +2314,8 @@ mod lane_parts_tests {
             let (g, rest) = parse(line);
             assert_eq!((g.cluster_secret_file.get(), rest.as_str()), (f.clone(), "principal-create --principal p"));
         }
-        let (g, rest) = parse("--json presplit --force --namespace fs --cluster-secret-file F");
-        assert_eq!((g.json.get(), g.cluster_secret_file.get(), rest.as_str()), (true, f, "presplit --force --namespace fs"));
+        let (g, rest) = parse("--json namespace-create --force --name fs --cluster-secret-file F");
+        assert_eq!((g.json.get(), g.cluster_secret_file.get(), rest.as_str()), (true, f, "namespace-create --force --name fs"));
         let (g, rest) = parse("compact 7 --wait --timeout 30 --json");
         assert_eq!((g.wait.get(), g.timeout.get(), g.json.get(), rest.as_str()), (true, 30, true, "compact 7"));
         // The last --credential-file wins, wherever each stands.

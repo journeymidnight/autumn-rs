@@ -208,6 +208,7 @@ fn bad_startup_arguments_exit_2() {
         (CONVERT_BIN, &[], "no subcommand"),
         (CONVERT_BIN, &["frob"], "unknown subcommand"),
         (CONVERT_BIN, &["sst", "--parallel", "0"], "--parallel 0"),
+        (OP_BIN, &["presplit", "--namespace", "fs", "--parts", "6"], "autumn-op presplit was removed"),
     ] {
         let (code, text) = run(bin, args);
         assert_eq!(code, 2, "{bin} {args:?}: {text}");

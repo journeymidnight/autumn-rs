@@ -399,7 +399,7 @@ async fn run(args: Args) -> Result<()> {
     let client = ClusterClient::connect_admin(&args.manager).await?;
     // The cluster secret authorizes CONTROL-plane RPCs; it does not satisfy a
     // partition server's key checks. Subcommands that touch partition keys need a data-plane capability
-    // too — `presplit --namespace fs` reads the declared stripe geometry before
+    // too — `namespace-create --name fs` reads the declared stripe geometry before
     // overwriting it, and under PROTECT-EVERYTHING that read is denied on a
     // connection that never sent CLIENT_AUTH. The binding stays Raw (autumn-op
     // spans namespaces and passes whole keys); `validate_credential_scope` is a
@@ -560,9 +560,6 @@ async fn run(args: Args) -> Result<()> {
             since_unix,
             limit,
         } => cmd_ops_history(&client, args.json, &kind, since_unix, limit).await?,
-        Command::Presplit { scope, rule, force } => {
-            cmd_presplit(&client, args.json, &scope, false, Some(&rule), force).await?
-        }
         Command::Merge {
             survivor_part_id,
             victim_part_id,
@@ -768,8 +765,7 @@ async fn cmd_mint_token(
     Ok(())
 }
 
-/// D2: register a namespace, then cut it at its head `{name}/` and by `rule`
-/// (what `presplit` does).
+/// Register a namespace, then cut it at its head `{name}/` and by `rule`.
 async fn cmd_namespace_create(
     client: &ClusterClient,
     json: bool,
@@ -781,7 +777,7 @@ async fn cmd_namespace_create(
     if !json {
         println!("namespace '{name}' created");
     }
-    cmd_presplit(client, json, &name, true, rule.as_ref(), force).await.with_context(|| {
+    cut_namespace(client, json, &name, rule.as_ref(), force).await.with_context(|| {
         format!(
             "namespace '{name}' is registered but namespace-create did not finish; unless \
              something wrote to it meanwhile (namespace-delete refuses one holding data), \
@@ -2600,7 +2596,7 @@ async fn compact_and_wait(client: &ClusterClient, part_id: u64) -> Result<()> {
         .submit_op(OpSubmitReq {
             kind: OP_KIND_COMPACT,
             part_id,
-            requested_by: "presplit".to_string(),
+            requested_by: "namespace-create".to_string(),
             ..Default::default()
         })
         .await
@@ -2628,21 +2624,18 @@ async fn compact_and_wait(client: &ClusterClient, part_id: u64) -> Result<()> {
     }
 }
 
-/// presplit a `{scope}/` keyspace (a namespace or an in-namespace sub-scope) —
-/// with `head` (namespace-create) at its namespace head first — by its natural
-/// dimension (fs = stripe lane, kvc = hash bucket, others = uniform hex). Splits the owning partition at each point,
-/// highest first, re-resolving the owner each time (see the loop).
-async fn cmd_presplit(
+/// Cut a new namespace at its head `{ns}/`, then by its natural dimension (fs =
+/// stripe lane plus metadata hash runs, kvc = hash bucket, others = uniform
+/// hex). Splits the owning partition at each point, highest first,
+/// re-resolving the owner each time (see the loop).
+async fn cut_namespace(
     client: &ClusterClient,
     json: bool,
-    scope: &str,
-    head: bool,
+    namespace: &str,
     rule: Option<&PresplitRule>,
     force: bool,
 ) -> Result<()> {
-    // The registry row the declared points are recorded on.
-    let namespace = scope.split('/').next().unwrap_or(scope);
-    let (points, record_points) = args::presplit_plan(scope, head, rule)?;
+    let (points, record_points) = args::presplit_plan(namespace, rule)?;
 
     // An fs `--parts` DECLARES the fs stripe geometry (24 lanes), in the same command that
     // cuts the boundaries. Writers read this key; they no longer
@@ -2672,7 +2665,7 @@ async fn cmd_presplit(
             if let Some(existing_bytes) = client
                 .get(&k)
                 .await
-                .map_err(|e| anyhow!("presplit: read existing stripe geometry: {e}"))?
+                .map_err(|e| anyhow!("namespace-create: read existing stripe geometry: {e}"))?
             {
                 if let Ok(existing) = autumn_fs::schema::decode_stripe_geom(&existing_bytes) {
                     if *lanes < existing.lanes && !force {
@@ -2691,7 +2684,7 @@ async fn cmd_presplit(
     };
 
     let mut applied = 0usize;
-    let mut already = 0usize; // boundaries a prior run / presplit already put in place
+    let mut already = 0usize; // boundaries a prior run already put in place
     let mut skipped: Vec<String> = Vec::new();
     // Highest point first: every cut then lands in the partition that is
     // already open (the left keeps its id) instead of a right child the PS
@@ -2704,23 +2697,23 @@ async fn cmd_presplit(
         // Re-fetch the region map each iteration — a prior split created a new
         // child that may own this point. `all_partitions_with_range` reads the
         // client's REGION CACHE (it only auto-refreshes when empty), so force a
-        // refresh first: without it the 2nd+ cut of a multi-point presplit
+        // refresh first: without it the 2nd+ cut of a multi-point cut
         // resolves against the PRE-split map and tries to split the wrong (now
         // narrowed) partition → "at or above partition end" (hit live on
-        // an fs presplit, where all cuts land in one small
+        // an fs cut, where all cuts land in one small
         // range so every later cut needs the fresh child).
         // Do NOT swallow the refresh error — a failed refresh falls back
         // to the STALE cache and mis-resolves the owner, and since the run reports
-        // ok when applied>0 the operator could load into a partially-presplit
-        // keyspace. Fail the whole presplit instead.
+        // ok when applied>0 the operator could load into a partially-cut
+        // keyspace. Fail the whole command instead.
         client
             .refresh_regions()
             .await
-            .map_err(|e| anyhow!("presplit: refresh regions before cut: {e}"))?;
+            .map_err(|e| anyhow!("namespace-create: refresh regions before cut: {e}"))?;
         let parts = client
             .all_partitions_with_range()
             .await
-            .map_err(|e| anyhow!("presplit: list partitions: {e}"))?;
+            .map_err(|e| anyhow!("namespace-create: list partitions: {e}"))?;
         let owner = parts.iter().find(|(_, _, start, end)| {
             point.as_slice() >= start.as_slice()
                 && (end.is_empty() || point.as_slice() < end.as_slice())
@@ -2730,7 +2723,7 @@ async fn cmd_presplit(
             continue;
         };
         // UX-fix (S2): a point that IS a partition's start_key is
-        // already a boundary (a prior presplit, or this being a re-run). That is
+        // already a boundary (this being a re-run). That is
         // success, not a skip — the old code let split_at reject it ("at or below
         // partition start"), leaving `applied` low and (if all points were
         // already cut) bailing with a misleading "0 applied, check the scope"
@@ -2796,7 +2789,7 @@ async fn cmd_presplit(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
                 "ok": ok,
-                "namespace": scope,
+                "namespace": namespace,
                 "points": points.len(),
                 "applied": applied,
                 "already_in_place": already,
@@ -2807,7 +2800,7 @@ async fn cmd_presplit(
         );
     } else {
         println!(
-            "presplit {scope}: {applied}/{} cut points applied{}",
+            "namespace-create {namespace}: {applied}/{} cut points applied{}",
             points.len(),
             if already > 0 { format!(" ({already} boundaries already in place)") } else { String::new() }
         );
@@ -2817,14 +2810,14 @@ async fn cmd_presplit(
     }
     if !skipped.is_empty() {
         bail!(
-            "presplit {scope}: {} of {} cut point(s) not made (see the skips above){}",
+            "namespace-create {namespace}: {} of {} cut point(s) not made (see the skips above){}",
             skipped.len(),
             points.len(),
             if stripe_geom.is_some() { "; the fs stripe geometry was not declared" } else { "" }
         );
     }
     if let Some(e) = geometry_err {
-        bail!("presplit {scope}: {e}");
+        bail!("namespace-create {namespace}: {e}");
     }
     Ok(())
 }

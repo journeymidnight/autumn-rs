@@ -38,9 +38,9 @@ fn key_for_partition(start_key: &[u8], tag: &str, tid: usize, seq: u64) -> Strin
     String::from_utf8(key).expect("ASCII bench key")
 }
 
-/// the benchmarks bind the scope `bench/perf`
-/// (Prepend `bench/perf/`), so their keys are USER keys.
-const BENCH_SCOPE: &str = "bench/perf";
+/// The benchmarks bind the namespace `bench` (Prepend `bench/`), so their keys
+/// are USER keys and `namespace-create --name bench --parts N` cuts at them.
+const BENCH_SCOPE: &str = "bench";
 
 /// Connect one bench worker, carrying the CLI's credential if it was given.
 ///
@@ -76,13 +76,13 @@ async fn bench_connect(
 
 /// D7: derive the USER-space partition start keys covering the bench
 /// namespace. `all_partitions_with_range` returns WIRE ranges; the client
-/// prepends `perf/bench/`, so a bench key built off a partition's wire start
+/// prepends `bench/`, so a bench key built off a partition's wire start
 /// would route into the WRONG namespace. Instead, take each partition whose wire
-/// start lies under `perf/bench/`, strip that prefix, and feed the remainder to
-/// `key_for_partition` — the binding re-prepends `perf/bench/`, landing the key
-/// back in that partition. Requires the `bench` namespace to be presplit for
-/// multi-partition spread; a non-presplit bench yields a single empty start (one
-/// partition), so the perf run measures one partition (documented in ops.md).
+/// start lies under `bench/`, strip that prefix, and feed the remainder to
+/// `key_for_partition` — the binding re-prepends `bench/`, landing the key
+/// back in that partition. Spreading over N partitions needs `bench` created
+/// with `--parts N`; without, it yields a single empty start (one partition),
+/// so the perf run measures one partition (documented in ops.md).
 fn bench_user_starts(partitions: &[(u64, String, Vec<u8>, Vec<u8>)]) -> Vec<Vec<u8>> {
     let prefix = format!("{BENCH_SCOPE}/").into_bytes();
     let mut starts: Vec<Vec<u8>> = Vec::new();
@@ -92,7 +92,7 @@ fn bench_user_starts(partitions: &[(u64, String, Vec<u8>, Vec<u8>)]) -> Vec<Vec<
         }
     }
     // Always cover the namespace's lower bound (the first bench partition may
-    // start at/below `bench/perf/`, whose stripped start is empty).
+    // start at `bench/`, whose stripped start is empty).
     if !starts.iter().any(|s| s.is_empty()) {
         starts.push(Vec::new());
     }
@@ -329,7 +329,7 @@ async fn cmd_ycsb(
 
     // Each thread owns one partition's key range and its own [0,records) keyspace.
     // D7: user-space starts within the bench namespace (see
-    // `bench_user_starts`); the client re-prepends `bench/perf/`.
+    // `bench_user_starts`); the client re-prepends `bench/`.
     let bench_starts = bench_user_starts(&partitions);
     let start_keys: Vec<Vec<u8>> = (0..threads)
         .map(|tid| bench_starts[tid % bench_starts.len()].clone())
@@ -494,7 +494,7 @@ async fn cmd_ycsb(
 }
 
 /// `perf-clean`: delete every key the benchmarks wrote, i.e. everything under
-/// the `bench/perf` scope (perf-check and ycsb keys alike).
+/// the `bench` namespace (perf-check and ycsb keys alike).
 ///
 /// Each bench partition's user range is cleaned on its own, `parallel` at a
 /// time: a page of keys from `range_until` (which never walks into the next
@@ -632,7 +632,7 @@ async fn cmd_perf_check(client: &ClusterClient, threads: usize, duration_secs: u
     // future is one `kv_put` (a `put`) — kv_put is the unit
     // the fan-out composes. The SDK routes per key; no per-partition striping.
     // D7: user-space starts within the bench namespace (see
-    // `bench_user_starts`); the client re-prepends `bench/perf/`.
+    // `bench_user_starts`); the client re-prepends `bench/`.
     let bench_starts = bench_user_starts(&partitions);
     let start_keys: Vec<Vec<u8>> = (0..threads)
         .map(|tid| bench_starts[tid % bench_starts.len()].clone())

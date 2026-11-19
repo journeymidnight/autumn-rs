@@ -960,7 +960,7 @@ do_start() {
     # disables pinning and the PS falls back to all-core auto-detect (a wide
     # budget), so this never over-constrains. NOTE: only fires when
     # AUTUMN_BOOTSTRAP_PRESPLIT is in the env (fresh start/reset); a bare
-    # `restart` without it needs AUTUMN_PS_PARTS_HINT (or re-pass presplit).
+    # `restart` without it needs AUTUMN_PS_PARTS_HINT (or re-pass the variable).
     if [[ -z "${AUTUMN_PS_PARTS_HINT:-}" && -n "${AUTUMN_BOOTSTRAP_PRESPLIT:-}" ]]; then
         local _presplit_n="${AUTUMN_BOOTSTRAP_PRESPLIT%%:*}"
         if [[ "$_presplit_n" =~ ^[0-9]+$ ]] && (( _presplit_n > 8 )); then
@@ -1105,7 +1105,7 @@ do_start() {
         done
         # `bootstrap --presplit` is RETIRED (it cut the RAW
         # keyspace, which misses every `{ns}/`-prefixed key). AUTUMN_BOOTSTRAP_PRESPLIT
-        # is now interpreted as "presplit the BENCH namespace into N partitions",
+        # is now interpreted as "create the BENCH namespace in N partitions",
         # applied after bootstrap + namespace registration below.
         "$AO" --cluster-secret-file "$CLUSTER_SECRET_FILE" --manager "$MANAGER_ADDR" --transport "$TRANSPORT" bootstrap "${bootstrap_args[@]}"
         touch "$bootstrap_marker"
@@ -1132,17 +1132,15 @@ do_start() {
     # stays with the operator.
     {
         echo "[cluster] namespaces are not created automatically; create them as needed:"
-        echo "[cluster]   $AO --cluster-secret-file $CLUSTER_SECRET_FILE --manager $MANAGER_ADDR --transport $TRANSPORT namespace-create --name bench"
+        echo "[cluster]   $AO --cluster-secret-file $CLUSTER_SECRET_FILE --manager $MANAGER_ADDR --transport $TRANSPORT namespace-create --name bench --parts N"
         echo "[cluster]   $AO --cluster-secret-file $CLUSTER_SECRET_FILE --manager $MANAGER_ADDR --transport $TRANSPORT namespace-create --name gallery"
-        # Presplit the bench scope `bench/perf/` so the cut points
-        # are where the bench keys actually are. The retired bootstrap presplit cut
-        # raw hex points that `bench_user_starts` filtered out entirely, so every
-        # `--partitions N` run silently measured one partition.
+        # AUTUMN_BOOTSTRAP_PRESPLIT=N creates `bench` in N partitions, cut at
+        # bench/<hex> where the bench keys are.
         local _bp="${AUTUMN_BOOTSTRAP_PRESPLIT:-}"; local _bparts="${_bp%%:*}"
         if [[ "$_bparts" =~ ^[0-9]+$ ]] && (( _bparts > 1 )); then
             "$AO" --cluster-secret-file "$CLUSTER_SECRET_FILE" --manager "$MANAGER_ADDR" --transport "$TRANSPORT" \
-                presplit --namespace bench/perf --parts "$_bparts" \
-                || echo "[cluster] warning: bench presplit into $_bparts failed (bench will use 1 partition)"
+                namespace-create --name bench --parts "$_bparts" \
+                || echo "[cluster] warning: namespace-create bench --parts $_bparts failed"
             wait_ps_ready 120
         fi
     }

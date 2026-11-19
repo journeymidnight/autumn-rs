@@ -332,7 +332,7 @@ ways to pick the point:
 - **explicit (`at_key = Some(k)`)**: the PS checks that `k` falls strictly inside
   the partition's `(start_key, end_key)` and then **adopts it byte for byte**,
   skipping median selection and the `>= 2 keys` gate — so **an empty partition
-  can be split too**, which is exactly what an after-the-fact presplit needs.
+  can be split too**, which is exactly what cutting a new, empty namespace needs.
 
 `mid_key` is a **complete arbitrary-byte user key**; there is no "can only cut at
 byte K" restriction: the split point can be as deep as needed. sha256-hex is
@@ -368,37 +368,35 @@ time, when no real keys existed yet, so the points landed in no-man's-land and
 achieved nothing; passing it now fails loudly and prints the replacement
 command). A presplit is anchored to **the namespace + its own dimension** and
 runs while the keyspace is still empty: `namespace-create --name <NS> [--parts <N>]`
-splits right after registering; `presplit --parts <N>` adds splits after the
-fact.
+splits right after registering. It is the only presplit: the `presplit`
+command that cut an existing namespace was removed, because cutting a range
+that holds data makes children that share its log extents, and each one
+re-reads every shared extent before GC can free it.
 
 `namespace-create` also first cuts at the start of the namespace, `{ns}/`, and
 records it as a declared boundary: every namespace starts in its own partition,
 the start of the next namespace is its end, and merge never combines two
 namespaces into one partition. Only the start is cut, not the end, because
 another cut at `{ns}0` would leave a permanently empty gap partition between
-adjacent namespaces. The start is cut only when a namespace is created, and
-`presplit` cuts only by rule; namespaces created before this are left as they
-are.
+adjacent namespaces. The start is cut only when a namespace is created; namespaces created before
+this are left as they are.
 
 ```
 autumn-op namespace-create --name <NS> [--parts <N>]    # omitted = 1 partition
-autumn-op presplit --namespace <NS[/SUB]> --parts <N>
 ```
 
-There is a single parameter, `--parts N` (create N partitions), and **the first
-segment decides how to split**: `fs` splits on its 24 stripe lane boundaries
-(N divides 24); `kvc` splits on the hash buckets `kvc/<hex>` (N ≤ 16); other
-namespaces split hex evenly under the scope. The whole scope is the split-point
-prefix, and the declared split points are recorded on the registry row of the
-namespace named by the first segment. `fs` is one tree and `kvc` splits only by
-bucket, so both reject sub-scopes. Example:
-`presplit --namespace bench/perf --parts 8` (this is what cluster.sh /
-perf_check.sh use). A namespace without `--parts` has a single partition and is
+There is a single parameter, `--parts N` (create N partitions), and **the name
+decides how to split**: `fs` splits on its 24 stripe lane boundaries (N
+divides 24) and its metadata region `[0x06]` into N hash runs; `kvc` splits on
+the hash buckets `kvc/<hex>` (N ≤ 16); other namespaces split hex evenly under
+`{ns}/`. The declared split points are recorded on the namespace's registry
+row. Example: `namespace-create --name bench --parts 8` (this is what
+cluster.sh / perf_check.sh use; the bench keys are `bench/<hex>...`). A namespace without `--parts` has a single partition and is
 later split under load only if the auto-policy allows splits (`aggressive`; the
 deployment default `balanced` does not split).
 
 `presplit_suffixes(rule)` produces **relative** split-point suffixes;
-`cmd_presplit` prepends `{scope}/` to get absolute split points and calls the
+`cut_namespace` prepends `{ns}/` to get absolute split points and calls the
 explicit split of §6.1 for each point. The rules are in `PresplitRule`:
 `FsLanes` / `Kvc` / `Hex`. Without `--parts`, fs and kvc still use their own
 rules: nothing is split, but the lane / bucket boundaries are recorded, and later
@@ -429,7 +427,7 @@ Every child partition produced by a split shares its parent's SSTs; as long as
 any of them contains keys outside its range (has_overlap), the PS refuses to
 split it again until a major compaction, and the policy compacts only the
 partitions it is about to split / merge, so new small partitions never get one.
-So when the PS rejects a cut with `PreconditionFailed`, presplit first
+So when the PS rejects a cut with `PreconditionFailed`, namespace-create first
 major-compacts that partition through the op ledger, waits for it to finish,
 and cuts again (the same as the policy's unblocking compaction); if any split
 point is still not cut, the command fails.
@@ -445,7 +443,7 @@ about 1–3.5 s, versus 7–30 s low to high).
 
 ### 6.3 Sacred boundaries: operator-declared split points cannot be merged away
 
-After `autumn-op presplit` finishes cutting, it records the actual split points
+After `namespace-create` finishes cutting, it records the actual split points
 back into `MgrNamespace.presplit` via `MSG_NAMESPACE_SET_PRESPLIT`. From these
 the manager provides three **deliberately generic** predicates (the manager never
 knows what a "lane" is):
