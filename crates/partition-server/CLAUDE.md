@@ -853,8 +853,8 @@ redirect declines one of 64 KiB or more, see "Direct reads" below).
   `pending`; conditional writes by key); `finish_write_batch` drops a marked
   entry once a write of its key reaches the memtable. A read therefore never
   falls back to a value older than the held one; a later memory put clears
-  the mark. GC relocation writes the memtable through its own path, so it
-  never drops an entry.
+  the mark. A GC relocation never drops an entry: it rewrites the key's
+  current value, and `finish_write_batch` skips `applied` for it.
 - **Direct reads.** A held value has no extent to point a client at, so
   `get_value_inner` returns the value itself; a `direct` `MSG_BATCH_GET`
   declines one at or past the bulk cut (`BATCH_GET_DECLINED`) and the client
@@ -2037,14 +2037,15 @@ lookup sees only the memtable + SSTs, but the write pipeline is 3-phase — Phas
 `append_batch` makes it durable, Phase 3 `finish_write_batch` inserts it into the
 memtable. A Put/Delete between Phase 1 and Phase 3 is seq-ASSIGNED but NOT yet in
 the memtable → invisible to the lookup. Because Phase 1 already bumped
-`seq_number`, GC's relocation seq (`seq_number += 1`) would be HIGHER and shadow
+`seq_number`, GC's relocation seq would be HIGHER and shadow
 that write (silent lost-update / a Delete would resurrect the value). So the write
 path maintains `PartitionData.inflight_write_keys` (a refcounted set of 64-bit
 `inflight_key_hash(user_key)`, add in Phase 1 under the seq-assign borrow, release
 in Phase 3 under the memtable-insert borrow — no await between insert and release,
-so every key is always in EITHER the memtable OR the set), and `process_gc_chunk`,
-after the VP-identity match and before the seq allocation, ABORTS the extent's GC
-round (Err — no relocation, no punch; retried next tick) if the key is in the set.
+so every key is always in EITHER the memtable OR the set), and a relocation's own
+Phase 1 (`relocation_verdict`, under the borrow that would assign its seq) ABORTS
+the extent's GC round (no relocation, no punch; retried next tick) if the key is
+in the set.
 Aborting (not skipping) is required: the in-flight write may never commit, so the
 scanned value could stay live and must not be punched. A hash collision only costs
 a spurious abort (safe). Cost is ~a couple HashMap ops + one FNV hash per key on
@@ -2063,8 +2064,9 @@ Case A — Put still in the WAL pipeline → the in-flight SET fires:
                                                  Phase 2: append (durable); Phase 3 PENDING
   T3 resume; re-check: appeared_in_mem = FALSE   (K not in the memtable yet)
      VP-identity: live VP == (E,O,L) → MATCH
-  T4 in-flight guard: set.has(hash K) → YES
-     ⇒ Err, ABORT the extent round               Phase 3: insert K@6=V_new; set.remove(hash K)
+  T4 relocation queued; its Phase 1:
+     relocation_verdict: set.has(hash K) → YES
+     ⇒ Abort, the extent round ends              Phase 3: insert K@6=V_new; set.remove(hash K)
      (no seq alloc, no relocate, no punch; retried next tick)
 
 Case B — Put finished during the await → the RE-CHECK fires:
@@ -2079,37 +2081,62 @@ NO await between them, so at every instant K is in EITHER the set (Phase 1→3) 
 the memtable (post-Phase 3) — never neither. A GC verdict landing before Phase 3
 is caught by the set (Case A); one landing after is caught by the re-check
 (Case B). Deleting the re-check re-opens Case B; the set alone can't (it's cleared
-at Phase 3). The pre-fix bug was the missing Case A: at T4, GC did
-`seq_number += 1 → 7` and relocated `V_old` at seq 7, shadowing `K@6 = V_new`.
+at Phase 3). Without the set, at T4 the relocation took seq 7 and moved `V_old`
+over `K@6 = V_new`.
+
+### GC relocations go through the write pipeline
+
+INVARIANT: a relocation is a `WriteOp::Relocate` in `partition_loop`'s pending
+writes, never an append GC makes itself. GC (`flush_gc_batch` →
+`submit_relocations`) queues a batch in `PartitionData.gc_relocations` and wakes
+the loop (`split_wake_tx`); the loop moves it into `pending` behind the writes
+already there (`take_gc_relocations`; refused while frozen for split/merge). Phase 1
+runs `relocation_verdict` under the seq-assign borrow: out of range or shadowed
+in the memtable → `Dead` (nothing to move), the key in `inflight_write_keys` →
+`Abort`, not in the memtable and either a table GC's lookup read was replaced
+since (a compaction can drop a newer delete together with the value) or a table
+appended since (a flush) may hold the key (range + bloom,
+`SstReader::may_contain`) → `Retry` (`newer_table_may_hold`; with an empty
+snapshot any table is a `Retry`, as an empty prefix survives a compaction). GC found the value newest among the
+tables it read, so with only appends a newer version can only be in an
+appended one. Today GC and compaction share the maintenance gate, so only
+flushes append during a GC round; the replaced-table rule does not rely on it (GC looks again, up to 4 rounds, then aborts), else it takes a seq and
+rides the batch like a Put. Phase 3 inserts it in log order and answers
+`Moved`. GC punches only after every relocation of the extent answered `Moved`
+or `Dead`. Relocations are paced by GC's own rate limit, not counted as
+foreground bytes, and never touch the memory tier (`applied` is not called).
+A relocation's key enters `inflight_write_keys` like any write's, so while it is
+in flight a memory-tier put of that key goes durable and a conditional write of
+it drains first.
+
+Why: GC appended its batch itself and inserted the new ValuePointers after the
+append returned. That return can wait (the append that fills an extent quiesces
+the stream and allocates the next one), while foreground batches leased after
+it are acked, inserted and rotated. The frozen memtable's cursor was then past
+records it did not hold; its flush published that cursor, GC punched the
+source, and a reopen replayed from the cursor and lost every moved value
+(`crates/manager/tests/system_gc_relocate_rotate_race.rs`, 8/8 lost with the
+old path; sync point `set_gc_relocated_pause`). Seqs had the same flaw: GC took
+its seq at the verdict, so a later-launched batch could commit higher seqs
+first, and replay skips records at or below the loaded tables' max seq.
 
 **`run_gc` for one extent (streaming)**:
 ```
-  0. Multi-frag rewrite pre-pass
-     (rewrite_multi_frag_for_extent): walk active memtable + imm queue for
-     OP_VALUE_POINTER_MULTI entries whose mfvp has any fragment on `eid`. Dedup by
-     user_key (newest seq wins; SST-only mfvps deferred to compaction's discard
-     path). For each candidate: read every fragment via read_bytes_from_extent
-     (full-value rewrite), append each as a fresh OP_CHUNK_BLOB record, build new
-     MultiFragVp, allocate seq + append OP_VALUE_POINTER_MULTI|1 commit record,
-     insert memtable entry. A foreground Put on the same user_key wins via a strictly
-     newer seq (single-threaded P-log); rewrite chunks become orphan, reclaimed next
-     GC pass. Without this, OP_CHUNK_BLOB records of live multi-frag values would be
-     silently orphaned by punch_holes (the single-VP scan skips OP_CHUNK_BLOB).
   1. Single-VP loop (streaming): until cur >= sealed_length:
        a. read_bytes_from_extent(eid, cur, --gc-read-chunk-bytes)
        b. concatenate carry + chunk → buf
        c. process_gc_chunk(buf):
           - decode complete records left-to-right; on partial record at tail stop,
             save buf[consumed..] as carry for the next chunk
-          - per record (single-VP, in_range): lookup current live version
-            (active → imm → SSTables); if live VP still points to (eid, offset, len):
-            re-write value via stream_client.append, DROP borrow_mut BEFORE awaiting
-            the RPC, re-acquire to insert the updated VP
-          - OP_CHUNK_BLOB skipped (handled by the pre-pass); OP_VALUE_POINTER_MULTI
-            commit records skipped (tiny; pre-pass covers their semantic content)
+          - per record (single-VP, in_range): `gc_live_readers` looks up the
+            current live version (active → imm → SSTables); if the live VP still
+            points to (eid, offset, len), the value joins the batch as a
+            relocation, sent through the write pipeline when the batch fills
+            (see "GC relocations go through the write pipeline")
        d. cur += chunk.len()
   2. carry must be empty at end (sealed records are byte-aligned); non-empty carry →
-     refuse to punch and return error
+     refuse to punch and return error; otherwise the last batch is sent and
+     every relocation answered
   3. punch_holes([eid]) on log_stream → manager decrements refs; extent physically
      freed when refs → 0 across all CoW-shared streams
 ```

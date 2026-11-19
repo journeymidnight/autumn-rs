@@ -215,6 +215,28 @@ pub fn ckpt_truncate_parked_count() -> u64 {
     CKPT_TRUNCATE_PARKED.load(Ordering::Relaxed)
 }
 
+/// Test sync-point: parks `flush_gc_batch` AFTER its relocations are written
+/// and in the memtable, BEFORE GC goes on to the punch. Only tests set it.
+static GC_RELOCATED_PAUSE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static GC_RELOCATED_PARKED: AtomicU64 = AtomicU64::new(0);
+/// Test sync-point control — see `GC_RELOCATED_PAUSE`. Only tests call this.
+pub fn set_gc_relocated_pause(paused: bool) {
+    GC_RELOCATED_PAUSE.store(paused, Ordering::Relaxed);
+}
+/// Count of GC batches that have PARKED on `GC_RELOCATED_PAUSE`.
+pub fn gc_relocated_parked_count() -> u64 {
+    GC_RELOCATED_PARKED.load(Ordering::Relaxed)
+}
+pub(crate) async fn gc_relocated_sync_point() {
+    if GC_RELOCATED_PAUSE.load(Ordering::Relaxed) {
+        GC_RELOCATED_PARKED.fetch_add(1, Ordering::Relaxed);
+        while GC_RELOCATED_PAUSE.load(Ordering::Relaxed) {
+            compio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+    }
+}
+
 /// Test sync-point control — see `WRITE_PHASE3_PAUSE`. Only tests call this.
 pub fn set_write_phase3_pause(paused: bool) {
     WRITE_PHASE3_PAUSE.store(paused, Ordering::Relaxed);
@@ -735,7 +757,7 @@ const FREEZE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 // `put_stream_begin` (client-side striping).
 pub(crate) const AUTUMN_PS_MAX_INLINE_BYTES_DEFAULT: u32 = 64 * 1024 * 1024;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ValuePointer {
     extent_id: u64,
     offset: u64,
@@ -1096,6 +1118,9 @@ pub(crate) struct PartitionData {
     /// relaunched on their own, so an append that keeps failing that way does
     /// not spin the loop.
     write_behind_retry: Vec<WriteRequest>,
+    /// GC relocations waiting to join `partition_loop`'s pending writes;
+    /// GC queues them and wakes the loop with `split_wake_tx`.
+    pub(crate) gc_relocations: Vec<WriteRequest>,
     log_stream_id: u64,
     row_stream_id: u64,
     meta_stream_id: u64,
@@ -1176,6 +1201,7 @@ pub(crate) struct PartitionData {
     /// Specific to SPLIT — MSG_MERGE_FREEZE runs inline in
     /// `handle_incoming_req`, so its parking happens on the loop's
     /// active stack and the next iteration's top check fires naturally.
+    /// GC sends `()` here too after queueing `gc_relocations`.
     pub(crate) split_wake_tx: mpsc::UnboundedSender<()>,
     /// Per-partition maintenance gate (max_parallel=1) — split-vs-background
     /// *synchronization*, NOT a resource cap (PS-wide compact/gc concurrency
@@ -1849,6 +1875,68 @@ pub(crate) enum WriteOp {
         ino: u64,
         epoch: u64,
     },
+    /// GC moving a live large value off the log extent it collects. It goes
+    /// through the write pipeline like a Put, so its record and its memtable
+    /// insert keep log order with every other write. Applied only if, when its
+    /// seq is assigned, the scanned record is still the key's live version
+    /// (`background::relocation_verdict`). Boxed: every queued write is moved
+    /// through `pending`, and these fields would grow them all.
+    Relocate(Box<Relocation>),
+}
+
+pub(crate) struct Relocation {
+    pub(crate) user_key: Bytes,
+    pub(crate) value: autumn_transport::RegBytes,
+    pub(crate) expires_at: u64,
+    /// The scanned value; the key's live ValuePointer must still be it.
+    pub(crate) scanned: ValuePointer,
+    /// The tables GC's liveness lookup read.
+    pub(crate) readers: Vec<Arc<SstReader>>,
+}
+
+/// What became of one GC relocation sent through the write pipeline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RelocateStatus {
+    /// Written and in the memtable.
+    Moved,
+    /// A newer version exists; the scanned value is dead and needs no move.
+    Dead,
+    /// A table written since GC's lookup may hold the key: look again.
+    Retry,
+    /// The round must stop without a punch (the scanned value may be live
+    /// and could not be moved now).
+    Abort(String),
+}
+
+/// One GC batch's relocations: each records its status, and the last one
+/// sends them all to GC. Dropped unanswered (the loop exited), GC's receiver
+/// sees the channel closed and aborts the round.
+pub(crate) struct RelocateAccum {
+    outer: RefCell<Option<oneshot::Sender<Vec<RelocateStatus>>>>,
+    /// `Dead` until recorded; every relocation records exactly once.
+    statuses: RefCell<Vec<RelocateStatus>>,
+    remaining: Cell<usize>,
+}
+
+impl RelocateAccum {
+    pub(crate) fn new(outer: oneshot::Sender<Vec<RelocateStatus>>, n: usize) -> Rc<Self> {
+        Rc::new(Self {
+            outer: RefCell::new(Some(outer)),
+            statuses: RefCell::new(vec![RelocateStatus::Dead; n]),
+            remaining: Cell::new(n),
+        })
+    }
+
+    pub(crate) fn record(&self, idx: usize, status: RelocateStatus) {
+        self.statuses.borrow_mut()[idx] = status;
+        self.remaining.set(self.remaining.get() - 1);
+        if self.remaining.get() == 0 {
+            if let Some(outer) = self.outer.borrow_mut().take() {
+                // A closed receiver is a GC task that is gone: nobody to tell.
+                outer.send(std::mem::take(&mut *self.statuses.borrow_mut())).ok();
+            }
+        }
+    }
 }
 
 /// Shared accumulator for `MSG_BATCH_PUT`. The dispatcher creates ONE
@@ -1974,6 +2062,11 @@ pub(crate) enum WriteResponder {
     WriteBehind {
         tier: Arc<mem_tier::MemTierBudget>,
     },
+    /// A GC relocation; answers GC, never a client.
+    Relocate {
+        accum: Rc<RelocateAccum>,
+        idx: usize,
+    },
 }
 
 impl WriteResponder {
@@ -2013,6 +2106,10 @@ impl WriteResponder {
                 true
             }
             WriteResponder::BatchPut { accum, idx } => accum.record(idx, 0),
+            WriteResponder::Relocate { accum, idx } => {
+                accum.record(idx, RelocateStatus::Moved);
+                false
+            }
             WriteResponder::Fence | WriteResponder::WriteBehind { .. } => false,
         }
     }
@@ -2050,6 +2147,10 @@ impl WriteResponder {
                 tracing::warn!("memory tier write-behind append: {msg}");
                 return;
             }
+            WriteResponder::Relocate { accum, idx } => {
+                accum.record(idx, RelocateStatus::Abort(msg));
+                return;
+            }
         };
         let _ = outer.send(Err((status, msg)));
     }
@@ -2057,7 +2158,7 @@ impl WriteResponder {
     /// Reply failure — propagate the error string as Internal to the outer
     /// resp_tx. "key is out of range" is InvalidArgument per existing semantics.
     pub(crate) fn send_err(self, msg: String) {
-        if let WriteResponder::WriteBehind { .. } = self {
+        if let WriteResponder::WriteBehind { .. } | WriteResponder::Relocate { .. } = self {
             self.send_status(StatusCode::Internal, msg);
             return;
         }
@@ -2086,7 +2187,10 @@ impl WriteResponder {
             WriteResponder::Put { outer, .. } => outer,
             WriteResponder::Delete { outer, .. } => outer,
             WriteResponder::Conflict { outer, .. } => outer,
-            WriteResponder::BatchPut { .. } | WriteResponder::Fence | WriteResponder::WriteBehind { .. } => {
+            WriteResponder::BatchPut { .. }
+            | WriteResponder::Fence
+            | WriteResponder::WriteBehind { .. }
+            | WriteResponder::Relocate { .. } => {
                 unreachable!("handled above")
             }
         };
@@ -2193,12 +2297,13 @@ impl WriteRequest {
         WriteRequest { op: WriteOp::Put { user_key, value, expires_at }, resp }
     }
 
-    /// The key this request writes; None for a fence record.
+    /// The key this request writes a new value to; None for a fence record
+    /// and for a GC relocation, which rewrites the key's current value.
     fn written_key(&self) -> Option<&[u8]> {
         match &self.op {
             WriteOp::Put { user_key, .. } => Some(user_key),
             WriteOp::Delete { user_key } => Some(user_key),
-            WriteOp::FenceBump { .. } => None,
+            WriteOp::FenceBump { .. } | WriteOp::Relocate(_) => None,
         }
     }
 
@@ -2219,6 +2324,7 @@ impl WriteRequest {
             WriteOp::Put {
                 user_key, value, ..
             } => fixed + user_key.len() + value.len(),
+            WriteOp::Relocate(r) => fixed + r.user_key.len() + r.value.len(),
             WriteOp::Delete { user_key } => fixed + user_key.len(),
             WriteOp::FenceBump { .. } => fixed + 8,
         }
@@ -2232,11 +2338,13 @@ impl WriteRequest {
         let (outer, _rx) = oneshot::channel();
         let key = match &op {
             WriteOp::Put { user_key, .. } => user_key.to_vec(),
+            WriteOp::Relocate(r) => r.user_key.to_vec(),
             WriteOp::Delete { user_key } => user_key.clone(),
             WriteOp::FenceBump { ino, .. } => ino.to_be_bytes().to_vec(),
         };
         let resp = match &op {
             WriteOp::Put { .. } => WriteResponder::Put { outer, key },
+            WriteOp::Relocate(_) => unreachable!("a relocation is built with its own responder"),
             WriteOp::Delete { .. } => WriteResponder::Delete { outer, key },
             WriteOp::FenceBump { .. } => WriteResponder::Fence,
         };
@@ -6610,6 +6718,7 @@ async fn partition_thread_main(
         seq_number: max_seq,
         inflight_write_keys: HashMap::new(),
         write_behind_retry: Vec::new(),
+        gc_relocations: Vec::new(),
         log_stream_id,
         row_stream_id,
         meta_stream_id,
@@ -7197,6 +7306,9 @@ async fn partition_loop(
         // are harmless (the drain check itself is idempotent) but
         // draining them keeps the wait branches from spuriously waking.
         while let Some(Some(())) = split_wake_rx.next().now_or_never() {}
+        // After the wake drain: a wake GC sends after this line is still
+        // there for the idle select below.
+        take_gc_relocations(&part, &mut pending);
 
         let n_inflight = inflight.len();
         let at_cap = n_inflight >= cap;
@@ -7567,6 +7679,7 @@ async fn partition_loop(
 
     // Shutdown: drain in-flight batches, flush residual pending, then (if the
     // loop exited via `drain_rx`) run the graceful imm drain + ack.
+    take_gc_relocations(&part, &mut pending);
     drain_and_shutdown(
         &part,
         part_id,
@@ -7692,6 +7805,31 @@ struct Routing {
 fn freeze_draining(part: &Rc<RefCell<PartitionData>>) -> bool {
     let p = part.borrow();
     p.merge_freeze.is_draining() || p.split_drain_ack.borrow().is_some()
+}
+
+/// Move GC's queued relocations into `pending`, behind every write already
+/// there.
+fn take_gc_relocations(part: &Rc<RefCell<PartitionData>>, pending: &mut PendingWrites) {
+    if part.borrow().gc_relocations.is_empty() {
+        return;
+    }
+    let (relocations, frozen) = {
+        let mut p = part.borrow_mut();
+        (
+            std::mem::take(&mut p.gc_relocations),
+            p.merge_freeze.is_halted() || p.frozen_for_split.get().is_some(),
+        )
+    };
+    // Not expected: a freeze takes the maintenance gate GC runs under. If a
+    // relocation got here anyway it must not reach the log past the freeze
+    // checkpoint; refused, GC ends its round without a punch.
+    if frozen {
+        for w in relocations {
+            w.resp.send_unavailable("partition frozen for split/merge".to_string());
+        }
+    } else {
+        pending.extend(relocations);
+    }
 }
 
 /// Queue again the write-behind appends that failed before anything was

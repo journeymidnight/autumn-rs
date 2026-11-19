@@ -1926,6 +1926,166 @@ pub(crate) struct InFlightBatch {
 /// the spawn overhead.
 const PHASE1_OFFLOAD_THRESHOLD: u64 = 4 * 1024 * 1024;
 
+/// Whether a GC relocation may take its seq now (`None`), or what to tell GC.
+/// Runs in Phase 1 under the borrow that assigns the seq, so nothing changes
+/// between this check and the seq; writes queued ahead of the relocation have
+/// their seqs already, writes behind it get higher ones.
+pub(crate) fn relocation_verdict(
+    p: &PartitionData,
+    user_key: &[u8],
+    scanned: &ValuePointer,
+    readers: &[Arc<SstReader>],
+) -> Option<RelocateStatus> {
+    let mem = p
+        .active
+        .seek_user_key(user_key)
+        .or_else(|| p.imm.iter().rev().find_map(|m| m.seek_user_key(user_key)));
+    decide_relocation(
+        in_range(&p.rg, user_key),
+        p.inflight_write_keys.contains_key(&inflight_key_hash(user_key)),
+        mem.as_ref().map(|e| (e.op, e.value.as_slice())),
+        || newer_table_may_hold(&p.sst_readers, readers, user_key),
+        scanned,
+    )
+}
+
+/// Whether a table in `live` that GC's lookup did not read (`snapshot`) may
+/// hold `user_key`. GC found the scanned value newest among `snapshot`.
+/// Flushes only append: with `live` = `snapshot` + appended tables, a newer
+/// version can only be in an appended one, and range + bloom say whether it
+/// may be. A replaced table (a compaction) may have dropped a newer delete
+/// together with the value, so then the answer is yes. An empty snapshot is a
+/// prefix of every list, even one a major compaction rewrote, so any table
+/// at all is a yes.
+fn newer_table_may_hold(live: &[Arc<SstReader>], snapshot: &[Arc<SstReader>], user_key: &[u8]) -> bool {
+    if snapshot.is_empty() {
+        return !live.is_empty();
+    }
+    let appended_only = snapshot.len() <= live.len()
+        && snapshot.iter().zip(live.iter()).all(|(s, t)| Arc::ptr_eq(s, t));
+    !appended_only || live[snapshot.len()..].iter().any(|t| t.may_contain(user_key))
+}
+
+/// `relocation_verdict` over the facts it reads: whether the key is in range,
+/// whether a write of it holds a seq but is not in the memtable, its newest
+/// memtable entry, and whether a table written since GC's lookup may hold it.
+fn decide_relocation(
+    in_range: bool,
+    write_in_flight: bool,
+    newest_in_memtable: Option<(u8, &[u8])>,
+    newer_table_may_hold: impl FnOnce() -> bool,
+    scanned: &ValuePointer,
+) -> Option<RelocateStatus> {
+    if !in_range {
+        return Some(RelocateStatus::Dead);
+    }
+    // The in-flight write may still fail and leave the scanned value live, so
+    // the value can be neither moved under it nor left behind for the punch.
+    if write_in_flight {
+        return Some(RelocateStatus::Abort(
+            "key has an in-flight (seq-assigned, not-yet-committed) write".to_string(),
+        ));
+    }
+    if let Some((op, value)) = newest_in_memtable {
+        let live = op & OP_VALUE_POINTER != 0
+            && value.len() >= VALUE_POINTER_SIZE
+            && ValuePointer::decode(value) == *scanned;
+        return if live { None } else { Some(RelocateStatus::Dead) };
+    }
+    if newer_table_may_hold() {
+        return Some(RelocateStatus::Retry);
+    }
+    None
+}
+
+#[cfg(test)]
+mod relocation_verdict_tests {
+    use super::*;
+
+    const VP: ValuePointer = ValuePointer { extent_id: 9, offset: 100, len: 70_000 };
+
+    fn decide(
+        in_range: bool,
+        in_flight: bool,
+        mem: Option<(u8, &[u8])>,
+        changed: bool,
+    ) -> Option<RelocateStatus> {
+        decide_relocation(in_range, in_flight, mem, || changed, &VP)
+    }
+
+    #[test]
+    fn the_scanned_value_still_live_is_moved() {
+        let same = VP.encode();
+        assert_eq!(decide(true, false, Some((1 | OP_VALUE_POINTER, &same)), false), None);
+        assert_eq!(decide(true, false, None, false), None);
+    }
+
+    fn table(keys: &[&[u8]]) -> Arc<SstReader> {
+        let mut b = crate::sstable::SstBuilder::new(0, 0, 64);
+        for k in keys {
+            b.add(&crate::key_with_ts(k, 1), 1, b"v", 0);
+        }
+        Arc::new(SstReader::from_bytes(b.finish().to_bytes()).expect("reader"))
+    }
+
+    #[test]
+    fn only_tables_gc_did_not_read_can_hold_a_newer_version() {
+        let (t1, t2) = (table(&[b"a", b"k"]), table(&[b"b"]));
+        let snapshot = vec![t1.clone(), t2.clone()];
+        // Unchanged: nothing new to look at, even though t1 holds the key.
+        assert!(!newer_table_may_hold(&snapshot, &snapshot, b"k"));
+        // A flush appended a table without the key.
+        let flushed = vec![t1.clone(), t2.clone(), table(&[b"x", b"z"])];
+        assert!(!newer_table_may_hold(&flushed, &snapshot, b"k"));
+        // ... or one that may hold it.
+        let flushed_k = vec![t1.clone(), t2.clone(), table(&[b"k"])];
+        assert!(newer_table_may_hold(&flushed_k, &snapshot, b"k"));
+        // A compaction replaced tables: its output may lack the key because it
+        // dropped a newer delete with the value.
+        let compacted = vec![table(&[b"a", b"b"])];
+        assert!(newer_table_may_hold(&compacted, &snapshot, b"k"));
+        let compacted_tail = vec![t1.clone(), table(&[b"b"])];
+        assert!(newer_table_may_hold(&compacted_tail, &snapshot, b"k"));
+        // GC read no table (the value was in the memtable): a major
+        // compaction of tables flushed since keeps that empty prefix.
+        assert!(newer_table_may_hold(&[table(&[b"x"])], &[], b"k"));
+        assert!(!newer_table_may_hold(&[], &[], b"k"));
+    }
+
+    #[test]
+    fn a_newer_version_makes_it_dead() {
+        let other = ValuePointer { offset: 5000, ..VP }.encode();
+        assert_eq!(
+            decide(true, false, Some((1 | OP_VALUE_POINTER, &other)), false),
+            Some(RelocateStatus::Dead)
+        );
+        assert_eq!(decide(true, false, Some((1, b"inline")), false), Some(RelocateStatus::Dead));
+        assert_eq!(
+            decide(true, false, Some((crate::OP_TOMBSTONE, b"")), false),
+            Some(RelocateStatus::Dead)
+        );
+        assert_eq!(decide(false, false, None, false), Some(RelocateStatus::Dead));
+    }
+
+    #[test]
+    fn a_write_in_flight_aborts_even_over_a_live_memtable_entry() {
+        let same = VP.encode();
+        assert!(matches!(
+            decide(true, true, Some((1 | OP_VALUE_POINTER, &same)), false),
+            Some(RelocateStatus::Abort(_))
+        ));
+        assert!(matches!(decide(true, true, None, false), Some(RelocateStatus::Abort(_))));
+    }
+
+    #[test]
+    fn a_newer_table_that_may_hold_the_key_asks_for_another_lookup() {
+        assert_eq!(decide(true, false, None, true), Some(RelocateStatus::Retry));
+        // The memtable answers first: its entry is newer than any table.
+        let same = VP.encode();
+        assert_eq!(decide(true, false, Some((1 | OP_VALUE_POINTER, &same)), true), None);
+    }
+}
+
 /// Phase 1: validate + encode + launch Phase2 future.
 ///
 /// **Async + conditional spawn_blocking on big batches.**
@@ -1980,6 +2140,16 @@ pub(crate) async fn start_write_batch(
                     Bytes::copy_from_slice(&epoch.to_le_bytes()).into(),
                     0u64,
                 ),
+                WriteOp::Relocate(r) => match relocation_verdict(&p, &r.user_key, &r.scanned, &r.readers) {
+                    None => (r.user_key, 1u8, r.value, r.expires_at),
+                    Some(status) => {
+                        let crate::WriteResponder::Relocate { accum, idx } = req.resp else {
+                            unreachable!("a relocation is answered through its own responder")
+                        };
+                        accum.record(idx, status);
+                        continue;
+                    }
+                },
             };
             if op != crate::OP_FENCE_BUMP && !in_range(&p.rg, &user_key) {
                 req.resp.send_err("key is out of range".to_string());
@@ -2029,13 +2199,22 @@ pub(crate) async fn start_write_batch(
     // by total batch payload. Each ValidatedEntry contributes
     // `value.len()` bytes to the CRC compute (the dominant cost); keys
     // and headers are tens of bytes per record, negligible.
-    let total_value_bytes: u64 = valid.iter().map(|e| e.value.len() as u64).sum();
+    // GC relocations are paced by GC's own rate limit, not as foreground writes.
+    let (mut total_value_bytes, mut fg_value_bytes, mut fg_ops) = (0u64, 0u64, 0u64);
+    for e in &valid {
+        let n = e.value.len() as u64;
+        total_value_bytes += n;
+        if !matches!(e.resp, crate::WriteResponder::Relocate { .. }) {
+            fg_value_bytes += n;
+            fg_ops += 1;
+        }
+    }
     // Write-throughput accounting: accumulate value bytes once per batch (P-log
     // thread, no contention). report_load_loop swaps this for write_bytes_per_sec.
     part.borrow()
         .metrics
         .write_bytes
-        .fetch_add(total_value_bytes, std::sync::atomic::Ordering::Relaxed);
+        .fetch_add(fg_value_bytes, std::sync::atomic::Ordering::Relaxed);
 
     // The batch's crc32c is computed record by record as it is encoded, while
     // each record is in cache, and rides the append ctrl to every replica.
@@ -2104,9 +2283,7 @@ pub(crate) async fn start_write_batch(
     // P-log long before bytes hit the cap). EITHER cap reached → fg
     // sleeps. With both caps at 0 (unlimited) returns immediately —
     // hot path stays cheap.
-    admission
-        .account_fg(total_value_bytes, valid.len() as u64)
-        .await;
+    admission.account_fg(fg_value_bytes, fg_ops).await;
 
     // Launch Phase 2 as a future (not awaited yet).
     let phase2_started_at = Instant::now();
@@ -2317,7 +2494,11 @@ pub(crate) async fn finish_write_batch(
             };
 
             if let Some(keys) = applied_keys_ref.as_mut() {
-                if mem_covers(&entry.user_key) {
+                // A relocation rewrites the value the key already had; a
+                // value the tier holds is newer and must stay.
+                if mem_covers(&entry.user_key)
+                    && !matches!(entry.resp, crate::WriteResponder::Relocate { .. })
+                {
                     keys.push(entry.user_key.clone());
                 }
             }
@@ -3684,25 +3865,18 @@ fn gc_rate_bytes_per_sec() -> u64 {
     crate::params().gc_rate_bytes_per_sec.get()
 }
 
-/// Per-record metadata kept alongside the encoded segments for memtable
-/// post-processing once `append_segments` returns the batch's offset.
-struct GcRecord {
+/// One live value GC moves: sent through the write pipeline as a
+/// `WriteOp::Relocate`.
+struct GcRelocation {
     user_key: Vec<u8>,
-    internal_key: Vec<u8>,
-    value_len: u32,
+    value: Bytes,
     expires_at: u64,
-    /// Total bytes the record occupies in log_stream: 17 + key_len + value_len.
-    record_size: u32,
+    scanned: ValuePointer,
+    readers: Vec<Arc<SstReader>>,
 }
 
-/// accumulates a batch of GC rewrites. Records are encoded into
-/// `segments` (alternating header+key / value Bytes per record). The
-/// per-record metadata in `pending` is consumed when the batch flushes
-/// into the memtable, walking the tail offset returned by
-/// `append_segments`.
 struct GcWriteBatch {
-    segments: Vec<autumn_transport::RegBytes>,
-    pending: Vec<GcRecord>,
+    items: Vec<GcRelocation>,
     bytes: u64,
     record_cap: usize,
     byte_cap: u64,
@@ -3711,8 +3885,7 @@ struct GcWriteBatch {
 impl GcWriteBatch {
     fn new() -> Self {
         Self {
-            segments: Vec::new(),
-            pending: Vec::new(),
+            items: Vec::new(),
             bytes: 0,
             record_cap: gc_batch_records(),
             byte_cap: gc_batch_bytes() as u64,
@@ -3720,11 +3893,11 @@ impl GcWriteBatch {
     }
 
     fn is_empty(&self) -> bool {
-        self.pending.is_empty()
+        self.items.is_empty()
     }
 
     fn is_full(&self) -> bool {
-        self.pending.len() >= self.record_cap || self.bytes >= self.byte_cap
+        self.items.len() >= self.record_cap || self.bytes >= self.byte_cap
     }
 }
 
@@ -3816,8 +3989,7 @@ async fn gc_yield_now() {
 /// the rate limiter and yield run.
 async fn flush_gc_batch(
     part: &Rc<RefCell<PartitionData>>,
-    log_stream_id: u64,
-    part_sc: &Rc<StreamClient>,
+    extent_id: u64,
     batch: &mut GcWriteBatch,
     rate_limiter: &mut GcRateLimiter,
     rate_ctrl: &std::sync::Arc<crate::RateController>,
@@ -3826,51 +3998,45 @@ async fn flush_gc_batch(
     if batch.is_empty() {
         return Ok(());
     }
-    let segments = std::mem::take(&mut batch.segments);
-    let pending = std::mem::take(&mut batch.pending);
+    let mut items = std::mem::take(&mut batch.items);
     let batch_bytes = std::mem::replace(&mut batch.bytes, 0);
-    let n = pending.len();
 
-    let result = part_sc.append_segments(log_stream_id, segments).await?;
-
-    let mut cur_offset = result.offset;
-    let mut insert_items: Vec<(Vec<u8>, MemEntry, u64)> = Vec::with_capacity(n);
-    let mut vp_value_bytes = 0u64;
-    for r in pending {
-        // fix: V1 envelope adds 5 bytes (sentinel+length) before the
-        // V0 inner header, so value bytes start at +22 not +17. See
-        // `finish_write_batch` for the full layout discussion.
-        let new_vp = ValuePointer {
-            extent_id: result.extent_id,
-            offset: cur_offset + 22 + r.internal_key.len() as u64,
-            len: r.value_len as u64,
-        };
-        let mem_entry = MemEntry {
-            op: 1 | OP_VALUE_POINTER,
-            value: new_vp.encode().to_vec(),
-            expires_at: r.expires_at,
-        };
-        vp_value_bytes += r.value_len as u64;
-        let write_size = (r.user_key.len() + r.value_len as usize + 32) as u64;
-        insert_items.push((r.internal_key, mem_entry, write_size));
-        cur_offset = cur_offset.saturating_add(r.record_size as u64);
+    // A relocation told to retry may have a newer version in a table written
+    // since its lookup; look again and resend. If that keeps happening, give
+    // up the round (no punch) rather than chase it.
+    let mut attempts = 0u32;
+    while !items.is_empty() {
+        attempts += 1;
+        if attempts > 4 {
+            return Err(anyhow::anyhow!(
+                "gc relocation: the table list kept changing ({} values left); \
+                 aborting round on extent {extent_id}",
+                items.len()
+            ));
+        }
+        let statuses = submit_relocations(part, &items).await?;
+        let mut retry = Vec::new();
+        for (item, status) in items.into_iter().zip(statuses) {
+            match status {
+                RelocateStatus::Moved => *moved += 1,
+                RelocateStatus::Dead => {}
+                RelocateStatus::Retry => retry.push(item),
+                RelocateStatus::Abort(msg) => {
+                    return Err(anyhow::anyhow!(
+                        "gc relocation on extent {extent_id}: {msg}; aborting round (retry next tick)"
+                    ));
+                }
+            }
+        }
+        items = Vec::new();
+        for mut item in retry {
+            if let Some(readers) = gc_live_readers(part, &item.user_key, &item.scanned).await? {
+                item.readers = readers;
+                items.push(item);
+            }
+        }
     }
-
-    {
-        let mut p = part.borrow_mut();
-        p.vp_extent_id = result.extent_id;
-        p.vp_offset = result.end;
-        p.active.insert_batch(insert_items);
-        p.publish_lsm_gauges();
-        // BUG1: the GC multi-frag rewrite re-appends live
-        // values to log_stream and seeds them into the active memtable, so they
-        // join the un-flushed LOG window that recovery would replay. Track the
-        // appended bytes for an accurate force-rotate gap.
-        p.active.add_log_bytes(batch_bytes);
-        p.active
-            .add_wal_dead(result.extent_id, batch_bytes.saturating_sub(vp_value_bytes));
-    }
-    *moved += n;
+    crate::gc_relocated_sync_point().await;
 
     // Cooperative yield: even if the rate limiter has no budget to
     // burn, give partition_loop / ps-conn a turn before the
@@ -3884,6 +4050,43 @@ async fn flush_gc_batch(
     rate_ctrl.account_gc(batch_bytes).await;
 
     Ok(())
+}
+
+/// Queue `items` for `partition_loop` and wait for every one's outcome. They
+/// go behind the writes already pending, take their seqs in Phase 1 and reach
+/// the memtable in Phase 3 in log order with every other write, so a rotation
+/// never freezes a memtable whose cursor is past a relocation it lacks.
+async fn submit_relocations(
+    part: &Rc<RefCell<PartitionData>>,
+    items: &[GcRelocation],
+) -> Result<Vec<RelocateStatus>> {
+    let (tx, rx) = futures::channel::oneshot::channel();
+    let accum = RelocateAccum::new(tx, items.len());
+    {
+        let mut p = part.borrow_mut();
+        for (idx, it) in items.iter().enumerate() {
+            p.gc_relocations.push(crate::WriteRequest {
+                op: crate::WriteOp::Relocate(Box::new(crate::Relocation {
+                    user_key: Bytes::copy_from_slice(&it.user_key),
+                    value: it.value.clone().into(),
+                    expires_at: it.expires_at,
+                    scanned: it.scanned,
+                    readers: it.readers.clone(),
+                })),
+                resp: crate::WriteResponder::Relocate {
+                    accum: accum.clone(),
+                    idx,
+                },
+            });
+        }
+        if p.split_wake_tx.unbounded_send(()).is_err() {
+            p.gc_relocations.clear();
+            return Err(anyhow::anyhow!("gc relocation: the write loop has exited"));
+        }
+    }
+    drop(accum);
+    rx.await
+        .map_err(|_| anyhow::anyhow!("gc relocation: the write loop dropped the batch"))
 }
 
 /// when compaction drops an entry (dedup, range filter,
@@ -4069,10 +4272,8 @@ pub(crate) async fn run_gc(
 
         let consumed = process_gc_chunk(
             part,
-            log_stream_id,
             extent_id,
             &rg,
-            &part_sc,
             buf_base_offset,
             &buf,
             &mut moved,
@@ -4103,20 +4304,10 @@ pub(crate) async fn run_gc(
 
     ensure_gc_scan_complete(extent_id, cur, sealed_length, carry.len())?;
 
-    // Final flush: every append is made durable via the per-extent
-    // coalescer, so by the time `flush_gc_batch` returns, the moved
-    // values are durable on a quorum of replicas. punch_holes is safe
-    // to fire after this.
-    flush_gc_batch(
-        part,
-        log_stream_id,
-        &part_sc,
-        &mut batch,
-        &mut rate_limiter,
-        &rate_ctrl,
-        &mut moved,
-    )
-    .await?;
+    // Last batch: once `flush_gc_batch` returns, every live value is in the
+    // log on all replicas and in the memtable, or was found dead; the punch
+    // is safe after this.
+    flush_gc_batch(part, extent_id, &mut batch, &mut rate_limiter, &rate_ctrl, &mut moved).await?;
 
     // (MED-2): try-acquire writer pin on this extent BEFORE punch_holes.
     // If a `handle_get → resolve_value` reader is currently in-flight on this
@@ -4146,10 +4337,8 @@ pub(crate) async fn run_gc(
 /// that must be carried into the next chunk.
 async fn process_gc_chunk(
     part: &Rc<RefCell<PartitionData>>,
-    log_stream_id: u64,
     extent_id: u64,
     rg: &Range,
-    part_sc: &Rc<StreamClient>,
     // Absolute offset in `extent_id` where `buf[0]` sits (carry-tail of the
     // previous chunk ++ this chunk). Used to compute each scanned record's
     // absolute value offset for full VP-identity liveness matching.
@@ -4199,7 +4388,6 @@ async fn process_gc_chunk(
         let key = key_owned.as_slice();
         let value = value_owned.as_slice();
         let val_len = value.len();
-        let _ = expires_at; // used downstream by GcRecord builder
 
         // Same predicate the replay uses — see `record_carries_value_pointer`.
         // GC relocates from this scan and then punches the extent, so a record
@@ -4213,51 +4401,79 @@ async fn process_gc_chunk(
             continue;
         }
 
-        // The paged-SST liveness lookup AWAITS, so the
-        // sst_readers snapshot it ran against can go STALE mid-lookup — a
-        // concurrent Put for this key can land in active AND be flushed all
-        // the way into a NEW SST within the await window, where neither the
-        // snapshot lookup nor an active/imm re-check sees it. Acting on the
-        // stale verdict would rewrite the OLD value at a fresh (higher) seq
-        // — resurrecting it over the new write. The dual hazard makes
-        // "just skip on any change" wrong too: if the old value WAS still
-        // live, skipping its rewrite and then punching the extent destroys
-        // it. So: VALIDATE the snapshot after the await (P-log is single-
-        // threaded — interleaving happens only at awaits, and there is no
-        // await between this validation, the verdict use, and the seq
-        // allocation below). If sst_readers changed, REDO the lookup
-        // against a fresh snapshot; on repeated churn, abort this extent's
-        // round (no punch — safe, retried next tick).
-        let mut lookup_attempts = 0u32;
-        let current: Option<(u8, Bytes, u64)> = loop {
-            lookup_attempts += 1;
-            if lookup_attempts > 4 {
-                return Err(anyhow::anyhow!(
-                    "gc liveness lookup: sst_readers changed on {} consecutive \
-                     attempts (heavy flush/compact churn); aborting extent round",
-                    lookup_attempts - 1
-                ));
-            }
-            let p = part.borrow();
-            let mem = p
-                .active
-                .seek_user_key(&user_key)
-                .or_else(|| p.imm.iter().rev().find_map(|m| m.seek_user_key(&user_key)))
-                .map(|e| (e.op, Bytes::from(e.value), e.expires_at));
-            if mem.is_some() {
-                break mem;
-            }
+        let scanned = ValuePointer {
+            extent_id,
+            offset: buf_base_offset + record_start as u64 + val_off as u64,
+            len: val_len as u64,
+        };
+        let Some(readers) = gc_live_readers(part, &user_key, &scanned).await? else {
+            continue;
+        };
+        batch.bytes = batch
+            .bytes
+            .saturating_add((crate::wal_record::V1_ENVELOPE_OVERHEAD
+                + crate::wal_record::PAYLOAD_HEADER
+                + 8
+                + user_key.len()
+                + val_len) as u64);
+        batch.items.push(GcRelocation {
+            user_key,
+            value: Bytes::from(value_owned),
+            expires_at,
+            scanned,
+            readers,
+        });
+
+        if batch.is_full() {
+            flush_gc_batch(part, extent_id, batch, rate_limiter, rate_ctrl, moved).await?;
+        }
+    }
+    Ok(cursor)
+}
+
+/// Whether the scanned value is still its key's live version: `Some` with the
+/// tables the lookup read when it is, `None` when a newer version shadows it.
+/// The paged-SST lookup AWAITS, so the table snapshot can go stale under it —
+/// a Put for this key can land in active AND be flushed into a new SST within
+/// the await, where neither the snapshot lookup nor an active/imm re-check
+/// sees it. So the snapshot is validated after the await and the lookup
+/// redone on a change; on repeated churn the extent's round is aborted (no
+/// punch — retried next tick). Phase 1 checks once more when the relocation
+/// takes its seq (`relocation_verdict`).
+async fn gc_live_readers(
+    part: &Rc<RefCell<PartitionData>>,
+    user_key: &[u8],
+    scanned: &ValuePointer,
+) -> Result<Option<Vec<Arc<SstReader>>>> {
+    let mut lookup_attempts = 0u32;
+    loop {
+        lookup_attempts += 1;
+        if lookup_attempts > 4 {
+            return Err(anyhow::anyhow!(
+                "gc liveness lookup: sst_readers changed on {} consecutive \
+                 attempts (heavy flush/compact churn); aborting extent round",
+                lookup_attempts - 1
+            ));
+        }
+        let p = part.borrow();
+        let readers: Vec<Arc<SstReader>> = p.sst_readers.to_vec();
+        let mem = p
+            .active
+            .seek_user_key(user_key)
+            .or_else(|| p.imm.iter().rev().find_map(|m| m.seek_user_key(user_key)))
+            .map(|e| (e.op, Bytes::from(e.value), e.expires_at));
+        let current = if mem.is_some() {
+            mem
+        } else {
             // paged SST lookup awaits — snapshot + drop borrow.
-            let readers: Vec<Arc<SstReader>> = p.sst_readers.to_vec();
             let sc = p.stream_client.clone();
             let cache = p.block_cache.clone();
             drop(p);
             let mut found = None;
             for r in readers.iter().rev() {
-                // A read ERROR must abort this extent's GC
-                // round (no punch) — folding it into "miss" deleted
-                // still-referenced VP data.
-                match lookup_in_sst_via(r, &user_key, &sc, &cache).await {
+                // A read ERROR must abort this extent's GC round (no punch) —
+                // folding it into "miss" deleted still-referenced VP data.
+                match lookup_in_sst_via(r, user_key, &sc, &cache).await {
                     Ok(Some(e)) => {
                         found = Some(e);
                         break;
@@ -4277,135 +4493,32 @@ async fn process_gc_chunk(
                     compio::time::sleep(std::time::Duration::from_millis(2)).await;
                 }
             }
-            // Post-await validation under one borrow:
-            // (a) did the key appear in active/imm during the await (a
-            //     concurrent Put)? → the SST verdict is superseded; loop —
-            //     the next iteration takes the mem branch and judges
-            //     against the NEW version.
-            // (b) did sst_readers change (flush push / compact swap)? →
-            //     the snapshot lookup may have missed a newer flushed
-            //     version; loop with a fresh snapshot.
-            // There is NO await between this validation, the verdict use,
-            // and the seq allocation below (single-threaded P-log), so a
-            // verdict that passes here cannot go stale before the rewrite
-            // is staged.
+            // Post-await validation: a key that appeared in active/imm, or a
+            // table list that changed, may hide a newer version — look again.
             let p = part.borrow();
-            let appeared_in_mem = p.active.seek_user_key(&user_key).is_some()
-                || p.imm
-                    .iter()
-                    .rev()
-                    .any(|m| m.seek_user_key(&user_key).is_some());
-            let snapshot_stale = crate::sst_readers_changed(&p.sst_readers, &readers);
-            drop(p);
-            if appeared_in_mem || snapshot_stale {
+            let appeared_in_mem = p.active.seek_user_key(user_key).is_some()
+                || p.imm.iter().rev().any(|m| m.seek_user_key(user_key).is_some());
+            if appeared_in_mem || crate::sst_readers_changed(&p.sst_readers, &readers) {
                 continue;
             }
-            break found;
+            found
         };
-
         let Some((cur_op, cur_val, _)) = current else {
-            continue;
+            return Ok(None);
         };
-        if cur_op & OP_VALUE_POINTER == 0 || cur_val.len() < VALUE_POINTER_SIZE {
-            continue;
-        }
-        // Full VP-identity liveness. The scanned record is the LIVE version of
-        // its key ONLY if the current live VP points at THIS record's exact
-        // bytes — extent_id AND absolute offset AND len. Comparing extent_id
-        // alone (the pre-fix bug) misclassifies a SUPERSEDED older version of
-        // the same key that happens to live in the same extent as "live"; GC
-        // then relocates the OLD value with a fresh (higher) seq, reviving it
-        // over the newer version and dropping the newer one on the next punch
-        // (regression: tests/system_gc_multiversion_same_extent).
-        let scanned_value_offset = buf_base_offset + record_start as u64 + val_off as u64;
-        let vp = ValuePointer::decode(&cur_val);
-        if vp.extent_id != extent_id
-            || vp.offset != scanned_value_offset
-            || vp.len != val_len as u64
+        // Full VP identity: the live version must point at THIS record's
+        // exact bytes — extent, offset and length. Comparing the extent alone
+        // took a superseded older version in the same extent for live, and
+        // relocating it revived the old value over the newer one
+        // (tests/system_gc_multiversion_same_extent).
+        if cur_op & OP_VALUE_POINTER == 0
+            || cur_val.len() < VALUE_POINTER_SIZE
+            || ValuePointer::decode(&cur_val) != *scanned
         {
-            continue;
+            return Ok(None);
         }
-
-        // In-flight-write guard. The liveness lookup above sees only the
-        // memtable + SSTs, but a Put/Delete for this key can be seq-assigned
-        // (Phase 1, `start_write_batch`) yet not yet committed to the memtable
-        // (Phase 3 pending) — invisible above. Since Phase 1 already bumped
-        // `seq_number`, the relocation seq allocated below would be HIGHER than
-        // that in-flight write and shadow it (a silent lost-update,
-        // `system_gc_inflight_wal_put`); and we cannot safely `punch_holes` (the
-        // in-flight write may never commit, leaving THIS scanned value live). So
-        // ABORT this extent's GC round — no relocation, no punch. It retries next
-        // tick, by when the write has settled into the memtable where the
-        // active/imm guards above catch it. Hash key ⇒ a collision only costs a
-        // spurious abort (safe).
-        if part
-            .borrow()
-            .inflight_write_keys
-            .contains_key(&inflight_key_hash(&user_key))
-        {
-            return Err(anyhow::anyhow!(
-                "gc: key has an in-flight (seq-assigned, not-yet-committed) write \
-                 on extent {extent_id}; aborting round (retry next tick)"
-            ));
-        }
-
-        // Stage the WAL record into the batch under a brief borrow_mut
-        // (seq assignment + internal_key encode). No await happens
-        // inside the borrow.
-        // Stale-verdict protection lives in the validation loop ABOVE (the
-        // post-await active/imm + sst_readers re-check) — NOT here. A naive
-        // "skip if key present in active/imm" check at this point would be
-        // WRONG: the mem branch finds the live VP in the memtable (the
-        // normal recently-written case), and skipping its rewrite before
-        // the punch would destroy live data.
-        let internal_key = {
-            let mut p = part.borrow_mut();
-            p.seq_number += 1;
-            let seq = p.seq_number;
-            key_with_ts(&user_key, seq)
-        };
-
-        // `value` borrows the chunk read buffer, so it is copied; GC
-        // batches are bounded (`gc_batch_bytes()`), a cold path.
-        let value_bytes = Bytes::copy_from_slice(value);
-        // Mark the record as carrying a ValuePointer, matching the memtable
-        // entry this same relocation inserts. Leaving it bare made GC's own
-        // output invisible to GC's next scan.
-        let (hdr_seg, val_seg, crc_seg) = crate::wal_record::encode_v1_segments(
-            1u8 | crate::OP_VALUE_POINTER,
-            &internal_key,
-            value_bytes,
-            expires_at,
-        );
-        let record_size = (hdr_seg.len() + val_seg.len() + crc_seg.len()) as u32;
-        batch.segments.push(hdr_seg.into());
-        if !value.is_empty() {
-            batch.segments.push(val_seg.into());
-        }
-        batch.segments.push(crc_seg.into());
-        batch.bytes = batch.bytes.saturating_add(record_size as u64);
-        batch.pending.push(GcRecord {
-            user_key,
-            internal_key,
-            value_len: val_len as u32,
-            expires_at,
-            record_size,
-        });
-
-        if batch.is_full() {
-            flush_gc_batch(
-                part,
-                log_stream_id,
-                part_sc,
-                batch,
-                rate_limiter,
-                rate_ctrl,
-                moved,
-            )
-            .await?;
-        }
+        return Ok(Some(readers));
     }
-    Ok(cursor)
 }
 
 // ---------------------------------------------------------------------------
