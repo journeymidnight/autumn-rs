@@ -505,41 +505,13 @@ pub const ROOT_INO: u64 = 1;
 
 /// the on-disk layout version stamped in the superblock
 /// (`[0x04]schema_version`, so it lands at `fs/[0x04]schema_version`).
-///
-/// - **v1** = the pre-namespace layout (raw `0x01`–`0x04` keys under a Raw client
-///   binding). Never actually stamped — v1 filesystems carry NO schema_version
-///   key.
-/// - **v2** = the namespaced layout: keys are RELATIVE to `fs/` (the client
-///   prepends it), with a cluster-unique GLOBAL inode counter.
-///
-/// `meta::ensure_schema_version` stamps a fresh filesystem with this value and
-/// FAILS LOUD if an existing stamp differs — a future incompatible layout (v3+)
-/// then refuses to mount rather than silently corrupting data.
-/// - **v3** = lane striping: `InodeMeta` gains the `stripe: Option<StripeLayout>`
-///   field (rkyv layout change — v2 inode bytes can't decode), and large files
-///   store data extents under the lane-striped key `[0x03][lane][ino][off]`.
-///   Stop-world reset from v2 (no in-place migration; old files would decode
-///   wrong). Small / legacy files keep `stripe=None` + the `[0x03][ino][off]` key.
-///
-/// - **v4** = segmented files and content generations: `InodeMeta` gains
-///   `generation` and `segments` (rkyv layout change). Converted in place by
-///   a one-shot converter against a stopped filesystem (tool since removed) — every
-///   inode keeps its number, links and bytes, and gains `generation = 1` and
-///   `segments = None` — rather than by a reset.
-///
-/// - **v5** = metadata behind a hash byte: inodes at
-///   `[0x06][meta_hash(ino)][0x01][ino]`, directory entries at
-///   `[0x06][meta_hash(parent)][0x02][parent][name]` (they were `[0x01][ino]`
-///   and `[0x02][parent][name]`), so they spread over partitions. Values are
-///   unchanged. Converted in place by `convert_fs_v5` against a stopped
-///   filesystem.
+/// `meta::ensure_schema_version` stamps a fresh filesystem with it and refuses
+/// to mount any other stamp. The layout it names is the one in `key` (metadata
+/// behind a hash byte) with the `InodeMeta` / `DirentValue` encodings here.
+/// Earlier versions (up to 4, released through v0.1.3) are not readable.
 ///
 /// BUMP this whenever the key layout / value encoding changes incompatibly.
 pub const SCHEMA_VERSION: u64 = 5;
-
-/// The stamp `convert_fs_v5` holds while it moves a v4 tree's keys: neither a
-/// v4 nor a v5 build mounts a tree in between.
-pub const SCHEMA_CONVERTING_TO_V5: u64 = 0x4000_0000_0000_0005;
 
 // File type constants (from libc)
 pub const DT_REG: u8 = 8;

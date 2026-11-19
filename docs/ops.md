@@ -1064,9 +1064,8 @@ per-policy; there is no separate process-wide flag). What a policy would act on
 is the advisory list (`autumn-op policy-candidates`, the dashboard's
 advisories), shown in either mode; there is no observe mode. Config is
 persisted to etcd (`autoPolicy/config` + `autoPolicy/cooldowns`, leader-fenced)
-so the active policy survives leader failover. A `mode = 1` left by a build
-that had observe mode makes the manager refuse to lead
-(`autoPolicy/config mode 1 ... run migratev1_v2`); `migratev1_v2` turns it off.
+so the active policy survives leader failover. Any other stored mode (1 was the
+removed observe mode) makes the manager refuse to lead.
 
 **Boot default.** The DEPLOY layer (entrypoint / autumn-deploy / k8s) seeds
 `--auto-policy-default balanced`, which is seeded **Armed** — so a deployed
@@ -3463,40 +3462,6 @@ $AO --wait merge 12 13
 
 Regression: `cargo test -p autumn-manager --test system_merge still_carrying`.
 
-## Converting fs from schema v4 to v5 (metadata behind a hash byte)
-
-A v5 build refuses a v4 tree (`fs/ is schema v4 ... run convert_fs_v5`). v5
-keeps inodes and directory entries at `[0x06][h][..]` instead of `[0x01]` /
-`[0x02]`; values are unchanged, so the conversion only moves keys. The cluster
-stays up; every fs client must be stopped (a client already running checked
-the stamp at its start and would keep writing v4 keys).
-
-```bash
-# 0. Stop every autumn-fuse mount, autumn-s3 gateway and autumn.Fs on fs/.
-# 1. Count, then convert. The stamp goes to a "converting" value first (no
-#    build mounts it), keys move page by page, the stamp goes to 5 last; a run
-#    that stops anywhere is simply run again.
-convert_fs_v5 --manager $M --dry-run
-#   → would move 10051 inodes and 10050 directory entries to schema v5
-convert_fs_v5 --manager $M          # add --credential-file when fs/ is protected
-#   → moved 10051 inodes and 10050 directory entries; fs/ is schema v5
-convert_fs_v5 --manager $M          # → fs/ is already schema v5
-# 2. Cut the metadata region (the converted keys sit in the last lane
-#    partition until then). Same N as the namespace was created with; the lane
-#    boundaries are already in place and are skipped. Cutting a populated range
-#    compacts and retries by itself.
-$AO presplit --namespace fs --parts 8
-#   → presplit fs: 8/15 cut points applied (7 boundaries already in place)
-# 3. Start the clients with the v5 build (rebuild the Python wheel too: an
-#    older one refuses the v5 stamp).
-```
-
-Checked on a v4 tree written by the v4 `autumnfs` and gateway (10 017 objects
-plus a 20 MB striped file): a listing and GET of every object gave the same keys
-and the same digest before and after, and the striped file compared equal. The
-`presplit` took 34 s. 4 KiB S3 GET on that tree, 64 concurrent: 35.4K obj/s
-before (one PS thread at 100%), 36.5K converted but uncut, 79.3K cut 8 ways.
-
 ## Inspecting authz: who exists and what may they touch
 
 `principal-create` / `principal-delete` shipped without a listing, so until now
@@ -4511,8 +4476,6 @@ autumnfs --manager <mgr> get /ckpt ./out   # reader reads the file's own stamp
   cluster). fuse WRITE/TRUNCATE of a striped file is refused fail-loud for now
   (streaming writes don't know the final size up front, so fuse can't decide the
   stripe geometry at create) — use `autumnfs put` to (re)write large striped files.
-  Schema is **v3** (`InodeMeta.stripe`) — a stop-world reset from v2 (no in-place
-  migration).
 
 **CRITICAL — presplit the EMPTY keyspace BEFORE loading data.** A data-bearing
 partition can't be split repeatedly: after the first CoW split, parent+child
@@ -5443,141 +5406,38 @@ rolling-upgrade verification: version rejection before decode, reconnection,
 mismatch waiting, leader failover, request failures and recovered acknowledged
 data.
 
-#### Converting the manager's persisted records — DONE, converter deleted
+#### Persisted formats and conversions
 
-The manager's own etcd records were split out of the wire schema so they carry
-their own version instead of borrowing `WIRE_VERSION`
-(`crates/manager/CLAUDE.md`, "Persisted records"). Each split record is stored
-inside an envelope, `[AUMG][record_type][format_version]`, and the servers speak
-exactly one shape: **a value without the envelope is refused and the manager will
-not take leadership.** There is no dual-read, by design.
+The versioned persisted formats are read in exactly one shape: the manager's
+enveloped etcd records (`[AUMG][record_type][format_version]`,
+`crates/manager/CLAUDE.md` "Persisted records"), the fs schema stamp,
+SST/WAL/checkpoint and the extent node's `.meta`/`.ck`. A value in another shape
+is refused: the manager will not take leadership, a fs client will not mount, a
+partition will not open. The manager's bare keys (`opLog/`, `extent_inflight/`,
+`autoPolicy/*`, …) carry no version; an undecodable one is skipped with a
+warning, so a layout change there must be handled explicitly by its release.
+There is no dual-read and no conversion tool in the current build.
 
-Nine prefixes were covered: `mgr_audit_log/`, `tenantAccount/` (the principal
-DB, since moved to `principal/` by `migratev1_v2`), `namespace/`,
-`extents/`, `streams/`, `nodes/`, `disks/`, `partitions/`, `regions/`. Every
-other persisted key (`opLog/`, `extent_inflight/`, `extentLayout/`,
-`extentCorrupt/`, `node_override/`, `inode_leases/`, `autoPolicy/*`, …) is NOT
-enveloped and stays bare.
+A release that changes a persisted format incompatibly is a minor-version bump
+(`0.1.x` → `0.2.0`), whether existing data is converted or has to be
+re-created. A conversion ships as a subcommand of one binary, `autumn-convert`,
+run once against a STOPPED cluster (stop every manager, PS, EN and fs client;
+convert; start the new release); the subcommand is deleted in a later release.
 
-**The one-shot converter `migratev0_v1` has been DELETED, along with the
-`autumn-etcd` dependency it had added to `crates/server`.** That is the contract
-a converter is held to — it leaves no residue, because a converter kept around
-is how a one-time migration turns back into the permanent compatibility code the
-rule exists to avoid. It is no longer available.
-
-**There is nothing left to run here.** A cluster restored from an etcd snapshot
-taken before the conversion would need the converter again, and it is no longer
-available: convert such a cluster with an older release first. What it did, for whoever
-has to: `migratev0_v1 --etcd <http://host:2379> [--dry-run]`, walking the nine
-prefixes and printing a per-prefix `converted=/already=` summary. It is
-idempotent (an already-enveloped value is skipped), so an interrupted run is
-simply re-run, and `--dry-run` writes nothing. The section below calls those the
-"steps above".
-
-
-#### Lessons from a stop-the-world conversion
-
-Three things cost time that the steps above do not warn about.
-
-**Count the keys BEFORE the dry-run.** The summary line only tells you the tool
-converted something; it cannot tell you it converted the right cluster's
-something. `etcdctl get <prefix> --prefix --keys-only | grep -c` over the nine
-prefixes predicts the total, the dry-run must report the same number, and the two
-agreeing is the check. Afterwards the re-run says `0 converted / N already`, and
-an enveloped value such as `regions/<id>` begins `41554d47 09 01` — `AUMG`,
-type 9, format 1.
-
-**Wiping `opLog/` is conditional, not automatic.** The advice above assumes the
-wire bump moved `OpRecord`. Diff it first: if it is byte-identical across the
-bump, leave the prefix alone and check that `ops history` afterwards decodes every
-record with no skip warnings. Diff the other bare-persisted types the same way —
-`MgrExtentInflightRecord` and `MgrAutoPolicyEntry` are rkyv; `extentLayout/` and
-`extentCorrupt/` are raw bytes and can never be affected.
-
-**A stop-the-world restart concentrates every partition on one PS.** This is
-structural: `handle_register_ps` runs `rebalance_regions` when the FIRST PS
-registers, and with one PS in `ps_nodes` every region whose owner has not come
-back yet is reassigned to it — an even 8/9/7 becomes 24/0/0. The cure is
-`autumn-op rebalance`, which moves at most 4 regions per op, so it takes several
-passes to even out.
+**After any stop-the-world restart, rebalance.** `handle_register_ps` runs
+`rebalance_regions` when the FIRST PS registers, and with one PS in `ps_nodes`
+every region whose owner has not come back yet is reassigned to it — an even
+8/9/7 becomes 24/0/0. `autumn-op rebalance` moves at most 4 regions per op:
 
 ```bash
 # repeat until it reports "moved 0"
 autumn-op --manager $MGR:9001 --cluster-secret-file F --wait rebalance 0
 ```
 
-**Read the spread from `--json`, not from `info`.** A rebalance DELETES the
-stale per-partition listener addr and the new PS re-registers it a little later,
-so the text view lags behind `--json info`. The same lag makes partition SIZES
-read low for a few minutes after the partition servers come up. Neither is data
-loss; do not act on either until the numbers settle.
-
-One more, for whoever compares namespaces afterwards: a bare `autumn-client ls`
-scans from the namespace head and does not continue into later partitions, so it
-returns nothing when the head is empty even though keys exist further on. Use
-`ls --prefix` before concluding a namespace was emptied.
-
-#### `migratev1_v2` — the tenant removal and the observe mode (to wire 60, stop the world)
-
-Three etcd changes ship with it (the tenant removal was wire 59, the observe
-mode's removal wire 60):
-
-- the principal account DB moves from `tenantAccount/<name>` to `principal/<name>`.
-  The value is copied unchanged (same record type 2, format 1).
-- `namespace/<name>` goes from format 1 to 2: `owner_tenant` is dropped. It fed
-  only the protected-prefix list, which no PS read.
-- `autoPolicy/config` in mode 1 (observe) goes to mode 0 (off), the active
-  policy still selected. A wire-60 manager refuses to lead on mode 1
-  (`autoPolicy/config mode 1 is not a mode this build has ... run
-  migratev1_v2`). After the restart, `auto-policy start <name>` runs it if it
-  should run.
-
-A manager from wire 59 on refuses to lead while any namespace record is still v1, with
-`namespace/fs: namespace record is at format version 1, this binary speaks 2.
-The converter has not run`. The `fs`/`kvc`/`mem` rows exist on every cluster
-bootstrapped by those releases (they were registered automatically), so an
-unconverted cluster always stops there instead of starting with principals
-missing. Wire 58 and 60 cannot run together, so stop
-everything.
-
-```bash
-# 1. pause policy, wait for dispatched ops (general procedure above), then stop
-#    every manager, PS and EN.
-# 2. count what will be converted, then dry-run; on a first run the counts match
-#    moved= and converted= (after an interrupted run some show as already=).
-etcdctl get tenantAccount/ --prefix --keys-only | grep -c .
-etcdctl get namespace/ --prefix --keys-only | grep -c .
-cargo run --release --bin migratev1_v2 -- --etcd http://ETCD:2379 --dry-run
-#    tenantAccount/ -> principal/  moved=N already=0
-#    namespace/<name>: dropping owner_tenant "..."   (one line per owned namespace)
-#    autoPolicy/config: observe mode -> off      (or: nothing to convert)
-#    namespace/ v1 -> v2  converted=M already=0
-# 3. convert, then re-run: the re-run must report moved=0 and converted=0, with
-#    already=M for namespaces.
-cargo run --release --bin migratev1_v2 -- --etcd http://ETCD:2379
-cargo run --release --bin migratev1_v2 -- --etcd http://ETCD:2379
-# 4. start the wire-60 binaries and check:
-autumn-op --cluster-secret-file F --manager MGR:9001 principal-list   # same names + grants
-autumn-op --cluster-secret-file F --manager MGR:9001 namespace-list   # no OWNER column
-autumn-op --cluster-secret-file F --manager MGR:9001 auto-policy status   # mode off or armed
-autumn-op --cluster-secret-file F --manager MGR:9001 mint-token --principal P --credential HEX
-```
-
-The tool refuses while any manager is up (the leader key or any
-`managerAlive/<id>` is present); a manager that just exited leaves its keys for
-up to 10 s until its lease expires — wait and re-run. It moves
-accounts first (one txn per account: create `principal/<n>` if absent, delete
-`tenantAccount/<n>`) and namespaces last, each write a compare-and-put, so a run
-interrupted anywhere is simply re-run. Credentials keep working: the account
-bytes, and so the credential hash, are unchanged. Once every cluster has
-converted, delete `crates/server/src/bin/migratev1_v2.rs`, its `[[bin]]`
-entry and the `autumn-etcd` dependency in `crates/server/Cargo.toml`.
-
-Operator-visible changes in the same release: `namespace-create`, `split` and
-`presplit` no longer take `--tenant` (`split`/`presplit --namespace` take a scope
-such as `bench/perf`), `mint-token` takes only `--principal`, the manager no
-longer takes `--auth-protected-prefix`, and the kvcache `auth_tenant` config key
-is gone (use `auth_credential_file` and optionally `auth_principal`).
+Read the spread from `--json info`, not `info`: a rebalance deletes the stale
+per-partition listener addr and the new PS re-registers it a little later, so the
+text view lags, and partition sizes read low for a few minutes. Neither is data
+loss.
 
 #### Rolling BACK onto data a newer binary wrote
 
@@ -6467,12 +6327,11 @@ Three traps this script exists to encode, all of which cost a run to find:
 
 ## FS schema version
 
-The current filesystem schema is v4 (segmented files and content generations).
-Clients refuse a mismatched stamp or a populated tree with no stamp. The
-one-off v3 → v4 converter has been removed from the current build and image;
-legacy data needs the migration procedure from the corresponding historical
-release before a current client can mount it. Never overwrite the stamp to
-bypass this check.
+The current filesystem schema is v5 (`fs/[0x04]schema_version`). A client
+stamps a fresh tree and refuses any other stamp ("on-disk fs schema version N !=
+supported 5 — refusing to mount"). Trees written by v0.1.0–v0.1.3 (schema v4)
+are not readable by this build and there is no converter: re-create them. Never
+overwrite the stamp to bypass this check.
 
 ## S3 gateway — reading and writing autumn over S3
 
@@ -6797,9 +6656,7 @@ node the slot landed on.
 
 The current PS reads only MetaBlock v2, which records entry and tombstone
 counts. Older formats are rejected with the actual and supported versions.
-The one-off v1 → v2 converter has been removed from the build and image.
-Legacy data needs the conversion procedure from the corresponding historical
-release before a current PS can open it.
+There is no converter for older SSTs in this build.
 
 Each PS schedules a major compaction when SSTs hold >= 10 000 tombstones
 and tombstones are >= 30% of entries, checked every
@@ -7356,9 +7213,8 @@ the flattened message.
 
 Stop all manager/PS/EN roles before upgrading from wire 45, then restart them
 with wire 46. Existing client binaries in the 43..46 window remain compatible.
-Existing manager record formats are unchanged; do not wipe etcd or run the old
-record converter. New Recovery markers atomically create recoveryAttempt/<id>
-(type 10, format 1). A pre-upgrade Recovery marker without this snapshot is
+Existing manager record formats are unchanged; do not wipe etcd. New Recovery
+markers atomically create recoveryAttempt/<id> (type 10, format 1). A pre-upgrade Recovery marker without this snapshot is
 cancelled and re-derived on the next dispatch tick. An unreadable snapshot or
 snapshot/marker revision mismatch refuses replay; restore a consistent backup
 and investigate instead of deleting individual keys.

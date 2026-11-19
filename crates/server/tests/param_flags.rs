@@ -170,17 +170,12 @@ fn config_keys_lists_every_runtime_parameter() {
     assert_eq!(listed, want, "{text}");
 }
 
-const MIGRATE_BIN: &str = env!("CARGO_BIN_EXE_migratev1_v2");
-const CONVERT_FS_BIN: &str = env!("CARGO_BIN_EXE_convert_fs_v5");
-
 /// The CLIs' own parameter structs (the servers' are checked above): their
 /// `--help` lists every flag the parser takes.
 #[test]
 fn cli_help_lists_every_parameter() {
     assert_help_lists_every_parameter::<autumn_params::op::OpParams>(OP_BIN);
     assert_help_lists_every_parameter::<autumn_params::client_cli::ClientCliParams>(CLIENT_BIN);
-    assert_help_lists_every_parameter::<autumn_params::migrate::MigrateParams>(MIGRATE_BIN);
-    assert_help_lists_every_parameter::<autumn_params::convert::ConvertFsParams>(CONVERT_FS_BIN);
 }
 
 /// A bad startup argument exits 2 before anything starts, on every binary
@@ -207,8 +202,6 @@ fn bad_startup_arguments_exit_2() {
         (CLIENT_BIN, &["--transport", "x", "get", "k"], "not tcp or ucx"),
         (OP_BIN, &["status", "--timeout", "soon"], "--timeout soon"),
         (OP_BIN, &["--admin-token", "t", "status"], "--admin-token was removed"),
-        (MIGRATE_BIN, &["--dry-run"], "--etcd is required"),
-        (MIGRATE_BIN, &["--etcd", "e", "--bogus"], "unknown argument"),
     ] {
         let (code, text) = run(bin, args);
         assert_eq!(code, 2, "{bin} {args:?}: {text}");

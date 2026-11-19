@@ -33,8 +33,6 @@ pub mod fs;
 pub mod fuse;
 pub mod gallery;
 pub mod manager;
-pub mod convert;
-pub mod migrate;
 pub mod op;
 pub mod ps;
 pub mod s3;

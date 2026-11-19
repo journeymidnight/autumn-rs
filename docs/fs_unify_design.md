@@ -47,7 +47,7 @@ tree — `FsState` connects with `scoped("fs")`).
 Files: inline ≤ `INLINE_THRESHOLD` = 4 KiB in `InodeMeta.inline_data`; larger →
 variable extents keyed by logical offset (a range-scan of the extent prefix
 yields them in order). `ROOT_INO = 1`, `--inode-alloc-batch = 1000`,
-`SCHEMA_VERSION = 3` (stamped in `[0x04]schema_version`; mismatch fails the
+`SCHEMA_VERSION = 5` (stamped in `[0x04]schema_version`; mismatch fails the
 mount loud).
 
 A file is stamped `InodeMeta.stripe = Some(StripeLayout { lanes, unit_bytes })`

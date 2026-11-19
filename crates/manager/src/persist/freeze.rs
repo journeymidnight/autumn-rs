@@ -7,8 +7,8 @@
 //! It is:
 //!
 //! 1. bump that record's `FORMAT_VERSION` in `persist/records.rs`;
-//! 2. add a step to the converter bin (`migratev<from>_v<to>`) that rewrites
-//!    existing values into the new shape;
+//! 2. add a subcommand to the conversion binary (`autumn-convert`) that
+//!    rewrites existing values into the new shape (a minor-version release);
 //! 3. re-record the bytes IN THE SAME COMMIT as those two, so the recorded
 //!    value and the version it belongs to move together.
 //!
@@ -45,7 +45,7 @@
 //! crate turns on (Cargo unifies features, and several crates depend on rkyv
 //! independently). No per-record fix expresses that. The answer is the same
 //! machinery at a larger size — every record's `FORMAT_VERSION` moves, one
-//! converter pass rewrites everything, all of it in one commit — and NOT a
+//! conversion rewrites everything, all of it in one commit — and NOT a
 //! re-record.
 
 use super::records::{
@@ -239,7 +239,7 @@ fn the_persisted_encodings_are_frozen() {
         assert_eq!(
             actual, frozen,
             "the persisted encoding of the {name} record MOVED. Read this file's \
-             header: bump its FORMAT_VERSION and add a converter step, then \
+             header: bump its FORMAT_VERSION and add a conversion, then \
              re-record — never re-record alone.\n  actual: {actual}"
         );
     }

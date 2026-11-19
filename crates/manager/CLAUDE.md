@@ -247,7 +247,7 @@ Other persisted keys stay BARE and must not be wrapped: `opLog/`,
 `inode_leases/`, `autoPolicy/*`, `extentLayout/`, `extentCorrupt/`,
 `partitionLastOp/`, `psNodes/`, `ownerLocks/`, and the three `autumn-rs/*`
 singletons. Their types already live inside this crate; wrapping one without
-adding it to the converter would make the manager unable to read it.
+a conversion of its stored values would make the manager unable to read it.
 
 Verified end to end, because no automated test executes `Cmp::value` on
 the split/merge path: real etcd + manager + EN + PS, 12 values written,
@@ -1772,7 +1772,7 @@ process-wide flag. What a policy would act on is the advisory list
 (`policy-candidates`, the dashboard's advisories), which is computed whatever
 the mode; there is no observe mode. Its byte `1` (between Off = 0 and Armed = 2)
 is refused: `SET_MODE` answers InvalidArgument, and a persisted `1` refuses
-leadership until `migratev1_v2` turns it off.
+leadership.
 
 **An armed policy's action is an op-ledger op**, the one the operator's
 `autumn-op` command would submit (`candidate_to_submit`, `requested_by =
@@ -2325,8 +2325,10 @@ rules remain necessary; Hello alone is not a data-safety proof.
 
 Persisted formats change rarely. Analyze each actual change separately and
 supply its required conversion/recovery procedure. Do not rely on rkyv validation
-or a global wire number to prove persisted compatibility. One-time migration
-code is removed after its migration; old SST/FS converters have been deleted.
+or a global wire number to prove persisted compatibility. A conversion is a
+subcommand of the one conversion binary (`autumn-convert`) and deleted later;
+none ships now. A release that changes a persisted format incompatibly is a
+minor-version bump, with or without a conversion.
 
 **`cluster_df`** (`MSG_CLUSTER_DF`, leader-gated). Ceph-style aggregate, in-memory only,
 built inside the single `node_health_loop`: RAW + `physical_used` are summed from each

@@ -147,7 +147,6 @@ pub(crate) struct NamespaceRecord {
 
 impl PersistRecord for NamespaceRecord {
     const RECORD_TYPE: u8 = RECORD_TYPE_NAMESPACE;
-    /// v2 dropped an `Option<String>` owner after `prefix`; `migratev1_v2` converts.
     const FORMAT_VERSION: u8 = 2;
     const NAME: &'static str = "namespace";
 }
@@ -758,8 +757,8 @@ impl From<&RegionRecord> for MgrRegionInfo {
 /// validation on replay, which refuses leadership rather than degrading.
 /// `extentLayout/<id>` holds the payload location (absent ⇒ `InDat`) and
 /// `extentCorrupt/<id>` the corrupt-slot bitmap. That constraint is softer now
-/// that this record has its own `FORMAT_VERSION` and a converter — widening it
-/// is a version bump plus a converter step rather than an impossibility — but
+/// that this record has its own `FORMAT_VERSION` — widening it is a version
+/// bump plus a conversion rather than an impossibility — but
 /// neither key is worth folding in without a reason.
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
 pub(crate) struct ExtentRecord {

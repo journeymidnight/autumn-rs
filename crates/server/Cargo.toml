@@ -52,18 +52,6 @@ path = "src/bin/autumnfs.rs"
 name = "autumn-s3"
 path = "src/bin/autumn_s3/main.rs"
 
-# One-shot converter for the tenant removal; delete with `autumn-etcd` below
-# after the conversion has run.
-[[bin]]
-name = "migratev1_v2"
-path = "src/bin/migratev1_v2.rs"
-
-# One-shot converter of the fs/ tree from schema v4 to v5 (metadata keys
-# behind a hash byte); delete once every cluster has been converted.
-[[bin]]
-name = "convert_fs_v5"
-path = "src/bin/convert_fs_v5.rs"
-
 [dependencies]
 # The `fs/` tree (the same layer the fuse mount and the PyO3 `autumn.Fs`
 # binding use): `autumnfs`, `autumn-s3` and `autumn-op`'s
@@ -87,8 +75,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 autumn-common = { path = "../common" }
 autumn-manager = { path = "../manager" }
 autumn-params = { path = "../params" }
-# Used only by the one-shot `migratev1_v2` converter bin; remove both together.
-autumn-etcd = { path = "../etcd" }
 autumn-stream = { path = "../stream" }
 autumn-partition-server = { path = "../partition-server" }
 autumn-rpc = { path = "../rpc" }

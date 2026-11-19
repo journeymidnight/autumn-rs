@@ -14,7 +14,7 @@
 //! cut at `[0x06][h]`: inode numbers only grow, and without it every new file
 //! and every recent read landed in the last range. Inodes and directory
 //! entries share the region, so a partition holding a run of hashes holds
-//! both kinds. v4 had `[0x01][ino]` and `[0x02][parent][name]`.
+//! both kinds.
 //!
 //! data is stored as **variable-length extents** keyed by their logical
 //! byte offset (was fixed 256 KiB chunks keyed by chunk index). BigEndian

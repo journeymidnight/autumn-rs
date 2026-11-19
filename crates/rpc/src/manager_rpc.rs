@@ -2850,8 +2850,7 @@ pub struct MgrAutoPolicyEntry {
 pub struct MgrAutoPolicyConfig {
     pub ver: u32,
     /// 0=Off 2=Armed (`auto_policy::AutoPolicyMode`). 1 was the removed
-    /// observe mode: a persisted 1 refuses leadership until `migratev1_v2`
-    /// converts it to 0.
+    /// observe mode: a persisted 1 refuses leadership.
     pub mode: u8,
     /// Active policy name ("" = none selected).
     pub active: String,

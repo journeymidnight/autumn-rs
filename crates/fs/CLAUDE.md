@@ -567,7 +567,7 @@ periodic sync may overwrite B's 100 bytes; fsync reports an error).
 - **Read consistency**: relies on fresh reads + Q1 write-only leases (the binding caches only on write; release
   `forget`s and evicts the inode cache).
 
-## Segmented files (v4)
+## Segmented files
 
 S3 multipart Complete must **read, copy and rewrite no part bodies**, so a file's content can be
 a map of "logical range → data object" (`InodeMeta.segments`, `segment.rs`):
@@ -823,23 +823,10 @@ the old cursor never advanced.
 `schema::SCHEMA_VERSION` = **5**, stored at `[0x04]schema_version` (relative key, i.e.
 `fs/[0x04]schema_version`). `meta::ensure_schema_version` at mount (the `ensure_root`
 entry) stamps it if missing, checks it if present, and **fails loud and refuses to mount on mismatch** (guarding against a future incompatible layout silently reading/writing corrupt data).
-- v1 = pre-namespace bare keys (never stamped).
-- v2 = namespaced relative layout + global inode counter.
-- v3 = lane striping: `InodeMeta` gains the `stripe` field (rkyv layout changes; v2 inode bytes do not decode),
-  large files use lane-striped keys. v2→v3 is a stop-world reset with no in-place migration; small/legacy files
-  stay `stripe=None` + `[0x03][ino][off]`. BUMP whenever the layout/encoding changes incompatibly.
-- v4 = segmented files + content generation: `InodeMeta` gains `generation` and `segments`. The historical migration converted in place with a one-shot
-  offline tool, keeping every inode's number/links/bytes, yielding `generation=1` and
-  `segments=None`, changing the stamp last, with no reset; the tool has since been removed.
-- v5 = metadata behind a hash byte (`0x06` region, above). Values unchanged. `convert_fs_v5`
-  (one-shot, stopped filesystem) moves each v4 `[0x01][ino]` / `[0x02][parent][name]` key to its
-  v5 key, put then delete, page by page, under the stamp `SCHEMA_CONVERTING_TO_V5` (which
-  neither build mounts), and stamps 5 last; regions never overlap, so a stopped run is run again
-  (`crates/manager/tests/fs_convert_v5.rs`). A v4 stamp is refused naming the tool.
-- **Missing stamp ≠ new tree**: only a tree with no inode at all counts as new and gets the current version stamped; inodes without a stamp were created by
-  pre-v4 tools that did not stamp (`autumnfs`, the S3 gateway), and the inodes are v3 — mount is refused, pointing to
-  the standalone conversion procedure of the corresponding historical release. It used to stamp v4 directly; in an actual conversion that made a v3 tree
-  entirely unreadable (`an_unstamped_populated_tree_is_refused_not_stamped`).
+- Any other stamp (including v4, written by v0.1.0–v0.1.3) is refused; there is no converter.
+- A missing stamp means a fresh tree and is stamped. Every current writer (fuse, `autumnfs`,
+  autumn-s3, `autumn.Fs`) stamps through `ensure_root`, so an unstamped tree with inodes can
+  only come from a pre-v4 tool, which is not supported.
 
 ## Key dependency files
 

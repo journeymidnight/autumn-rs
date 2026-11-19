@@ -50,15 +50,16 @@
 //!
 //! # How a format change is delivered
 //!
-//! Bump that record's `FORMAT_VERSION` and add a step to a converter bin named
-//! `migratev<from>_v<to>`, run ONCE by hand against a STOPPED cluster and then
-//! deleted. The tool is in the tree; the compatibility is not. See
-//! `crates/manager/CLAUDE.md`, "Upgrade safety".
+//! Bump that record's `FORMAT_VERSION` and add a subcommand to the one
+//! conversion binary (`autumn-convert`, created with the first conversion
+//! needed), run ONCE by hand against a STOPPED cluster and deleted later; such
+//! a release is a minor-version bump. The tool is in the tree; the
+//! compatibility is not. See `crates/manager/CLAUDE.md`, "Cluster identity,
+//! version, and capacity".
 //!
 //! A stored version that is not this binary's is therefore never something to
-//! cope with — it means the converter has not run (lower) or a newer binary
-//! wrote it and was rolled back (higher). Both refuse, and the message names
-//! the tool.
+//! cope with — it means the conversion has not run (lower) or a newer binary
+//! wrote it and was rolled back (higher). Both refuse.
 
 pub(crate) mod records;
 
@@ -90,8 +91,8 @@ pub(crate) trait PersistRecord {
     /// Stable, frozen. See the warning above.
     const RECORD_TYPE: u8;
     /// This record's OWN version. Moves only when this record's layout or the
-    /// meaning of one of its fields changes, and only together with a converter
-    /// step. Independent of `WIRE_VERSION`.
+    /// meaning of one of its fields changes, and only together with a
+    /// conversion. Independent of `WIRE_VERSION`.
     const FORMAT_VERSION: u8;
     /// For error messages, so a refusal names the record a human recognises.
     const NAME: &'static str;
@@ -152,11 +153,8 @@ where
     }
     if raw[0..4] != PERSIST_MAGIC {
         return Err(format!(
-            "{key}: not a persisted manager record (no {} envelope). This is what \
-             a value written before the records got the persist envelope looks \
-             like. The one-off converter that handled such records \
-             (`migratev0_v1`) is no longer shipped; convert this cluster with an \
-             older release first",
+            "{key}: not a persisted manager record (no {} envelope) — refusing \
+             to read it",
             String::from_utf8_lossy(&PERSIST_MAGIC)
         ));
     }
@@ -178,8 +176,8 @@ where
             T::NAME,
             T::FORMAT_VERSION,
             if format_version < T::FORMAT_VERSION {
-                "The converter has not run — run the migratev<from>_v<to> bin \
-                 against the STOPPED cluster"
+                "An older release wrote this record and its conversion has not \
+                 run against the STOPPED cluster"
             } else {
                 "A NEWER binary wrote this record and was then rolled back. This \
                  binary cannot read it; go forward to the one that wrote it"
@@ -201,9 +199,9 @@ mod tests {
     use super::*;
 
     /// A free-text value whose own bytes spell a valid envelope: the magic,
-    /// then the record type, then the format version. This is the shape the
-    /// converter's six-byte "already done" check cannot tell from a real
-    /// envelope, and the reason `decode` must still refuse it.
+    /// then the record type, then the format version. A six-byte "already
+    /// enveloped" check cannot tell it from a real envelope, which is why
+    /// `decode` must still refuse it.
     fn impersonating_name(record_type: u8, format_version: u8, tail: &str) -> String {
         let mut v = PERSIST_MAGIC.to_vec();
         v.push(record_type);
@@ -236,21 +234,14 @@ mod tests {
         assert_eq!(back.ts_ns, 1_700_000_000_000_000_000);
     }
 
-    /// The case the whole module is built around: a value written before the
-    /// records were split out of the wire schema. It must REFUSE, and the
-    /// refusal must send the reader to the converter — not fall back to a bare
+    /// A bare value (no envelope) must REFUSE — not fall back to a bare
     /// decode, which is the silent-misread path.
     #[test]
-    fn a_bare_unmigrated_value_is_refused_and_names_the_converter() {
+    fn a_bare_value_is_refused() {
         let bare = autumn_rpc::manager_rpc::rkyv_encode(&audit()).to_vec();
         let err = decode::<AuditRecord>("mgr_audit_log/x", &bare)
             .expect_err("a bare value carries no envelope");
         assert!(err.contains("no AUMG envelope"), "{err}");
-        assert!(
-            err.contains("migratev0_v1"),
-            "names the BIN to run, not just the idea of one — the no-envelope \
-             state is by definition v0, so this name cannot go stale: {err}"
-        );
     }
 
     /// Sniffing cannot save us, and this is the fixture that proves it: a
@@ -275,8 +266,7 @@ mod tests {
     }
 
     /// A bare value can impersonate the WHOLE six-byte envelope, not just the
-    /// magic — and when it does, the converter skips it and this decoder is the
-    /// only thing left. It must refuse.
+    /// magic — and when it does, this decoder must still refuse it.
     ///
     /// Reachable because two of the three records have an unvalidated free-text
     /// field at offset 0: a principal name (nothing validates one beyond
@@ -285,7 +275,7 @@ mod tests {
     /// byte 0 is never `A`.
     ///
     /// The refusal is STRUCTURAL rather than lucky, which is worth knowing
-    /// before anyone tries to "improve" the converter into guessing. rkyv pads
+    /// before anyone tries to "improve" a decoder into guessing. rkyv pads
     /// an archive so its root sits at an aligned offset from the START of the
     /// buffer; these records archive to alignment 4 or 8, so stripping a
     /// six-byte header always leaves the root at offset ≡ 2, and `from_bytes`
@@ -351,7 +341,7 @@ mod tests {
         let mut older = encode(&audit());
         older[5] = AuditRecord::FORMAT_VERSION - 1;
         let err = decode::<AuditRecord>("mgr_audit_log/x", &older).expect_err("older");
-        assert!(err.contains("converter has not run"), "{err}");
+        assert!(err.contains("conversion has not run"), "{err}");
 
         let mut newer = encode(&audit());
         newer[5] = AuditRecord::FORMAT_VERSION + 1;

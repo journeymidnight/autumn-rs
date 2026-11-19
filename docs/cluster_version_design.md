@@ -210,7 +210,7 @@ Opaque application values are not part of Autumn's schema; eversion/ownership ge
 
 1. State the specific layout or semantics changed, the affected readers/writers, and the actual read/write compatibility of old and new builds with the related data.
 2. Decide whether old and new processes can run together for this change; if not, state which writers must stop, the drain/fencing scope and whether stopworld is needed; do not rely on Hello retry.
-3. If conversion is needed, give this change's converter, execution order, service start/stop conditions and required resources; if not, state why.
+3. If conversion is needed, give this change's conversion (an `autumn-convert` subcommand; the release is a minor-version bump), execution order, service start/stop conditions and required resources; if not, state why.
 4. Verify historical data reads and recovery, the conversion result and the consistency of related references for the affected formats. When offset/VP/checkpoint/ownership are involved, verify the corresponding relationships; where old and new formats are distinguished, a failed check must not be mistaken for a bad tail or missing data and then overwrite state.
 5. State how to resume or recover after a failure, and whether direct binary rollback is allowed; when a backup or reverse conversion is needed, write out the concrete steps.
 6. Write the executable upgrade and acceptance steps for that change into docs/ops.md or that change's migration document.

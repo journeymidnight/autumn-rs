@@ -135,28 +135,10 @@ pub async fn ensure_root(state: &mut FsState) -> Result<bool> {
 pub async fn ensure_schema_version(state: &mut FsState) -> Result<()> {
     let k = key::schema_version_key();
     match state.kv_get_opt(&k).await? {
-        None => {
-            // "No stamp" must mean a genuinely fresh filesystem, not a tree
-            // some other writer populated without ever stamping it: the `autumnfs` CLI and the S3 gateway did not stamp
-            // before v4, so a tree they alone built holds v3 inodes and no
-            // stamp. Stamping the current version over those would declare
-            // them readable as a layout they are not.
-            let inodes = state.kv_range_keys(&[0x01], &[0x01], 1).await?;
-            if !inodes.is_empty() {
-                return Err(anyhow!(
-                    "fs/ holds inodes but no schema stamp — it was built by a tool that \
-                     did not stamp (autumnfs or the S3 gateway before v4), so its \
-                     inodes are v3. Refusing to stamp v{} over them; use the \
-                     migration procedure for the release that wrote this data.",
-                    schema::SCHEMA_VERSION
-                ));
-            }
-            state
-                .kv_put(&k, &schema::SCHEMA_VERSION.to_be_bytes())
-                .await
-                .context("stamp schema_version on fresh filesystem")?;
-            Ok(())
-        }
+        None => state
+            .kv_put(&k, &schema::SCHEMA_VERSION.to_be_bytes())
+            .await
+            .context("stamp schema_version on fresh filesystem"),
         Some(v) => {
             let found: u64 = v
                 .as_slice()
@@ -170,18 +152,6 @@ pub async fn ensure_schema_version(state: &mut FsState) -> Result<()> {
                 })?;
             if found == schema::SCHEMA_VERSION {
                 Ok(())
-            } else if found == schema::SCHEMA_CONVERTING_TO_V5 {
-                Err(anyhow!(
-                    "fs/ is being converted to schema v5, or a conversion stopped part way: \
-                     run `convert_fs_v5 --manager <ADDR>` (again) before mounting"
-                ))
-            } else if found == 4 {
-                Err(anyhow!(
-                    "fs/ is schema v4 (inodes and directory entries under 0x01/0x02); this \
-                     build reads v{}. Stop every mount, S3 gateway and autumn.Fs on it and run \
-                     `convert_fs_v5 --manager <ADDR>` (docs/ops.md), then start them again",
-                    schema::SCHEMA_VERSION
-                ))
             } else {
                 Err(anyhow!(
                     "on-disk fs schema version {} != supported {} — refusing to mount \

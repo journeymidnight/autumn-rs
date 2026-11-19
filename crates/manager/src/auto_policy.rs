@@ -119,13 +119,12 @@ impl AutoPolicyState {
             .or_else(|| self.custom.iter().find(|p| p.name == name).cloned())
     }
 
-    /// Errs on a mode this build does not have (`1`, the removed observe
-    /// mode): `migratev1_v2` converts it to Off.
+    /// Errs on a mode this build does not have (`1` was the removed observe
+    /// mode).
     pub fn load_config(&mut self, c: MgrAutoPolicyConfig) -> Result<(), String> {
         self.mode = AutoPolicyMode::from_u8(c.mode).ok_or_else(|| {
             format!(
-                "autoPolicy/config mode {} is not a mode this build has (1 was the \
-                 removed observe mode); run migratev1_v2, which converts it to off",
+                "autoPolicy/config mode {} is not a mode this build has (0 off, 2 armed)",
                 c.mode
             )
         })?;
@@ -772,6 +771,6 @@ mod tests {
         let mut st = AutoPolicyState::default();
         let cfg = MgrAutoPolicyConfig { ver: 1, mode: 1, active: "gc-only".into(), policies: vec![] };
         let e = st.load_config(cfg).unwrap_err();
-        assert!(e.contains("migratev1_v2"), "{e}");
+        assert!(e.contains("not a mode this build has"), "{e}");
     }
 }

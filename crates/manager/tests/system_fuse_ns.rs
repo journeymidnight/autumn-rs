@@ -199,12 +199,10 @@ fn readdir_pages_past_one_range_page() {
     });
 }
 
-/// A tree that holds inodes but no schema stamp was built by a pre-v4 tool
-/// that never stamped (autumnfs, the S3 gateway); its inodes are v3. The core
-/// must refuse it rather than stamp the current version over them, which it
-/// did before this check.
+/// A tree stamped with another schema version is refused, and the stamp is
+/// left as it was.
 #[test]
-fn an_unstamped_populated_tree_is_refused_not_stamped() {
+fn a_tree_stamped_with_another_version_is_refused() {
     let mgr_addr = pick_addr();
     start_manager(mgr_addr);
     let n1_dir = tempfile::tempdir().expect("n1");
@@ -217,16 +215,13 @@ fn an_unstamped_populated_tree_is_refused_not_stamped() {
     compio::runtime::Runtime::new().unwrap().block_on(async {
         let _admin = boot_cluster(mgr_addr, n1_addr, n2_addr, 140, 14001).await;
         let mut state = FsState::new(&mgr_addr.to_string()).await.expect("mount");
-        // Some inode, as an unstamping tool (pre-v4) would have left it: the
-        // pre-v5 layout, `[0x01][ino BE]`.
-        let v3_inode = [&[0x01u8][..], &1u64.to_be_bytes()].concat();
-        state.kv_put(&v3_inode, b"v3 bytes").await.unwrap();
+        let k = autumn_fs::key::schema_version_key();
+        let other = (autumn_fs::schema::SCHEMA_VERSION - 1).to_be_bytes();
+        state.kv_put(&k, &other).await.unwrap();
         let err = meta::ensure_root(&mut state).await.expect_err("must refuse");
-        assert!(err.to_string().contains("no schema stamp"), "{err}");
-        assert_eq!(
-            state.kv_get_opt(&autumn_fs::key::schema_version_key()).await.unwrap(),
-            None,
-            "nothing stamped"
-        );
+        assert!(err.to_string().contains("!= supported"), "{err}");
+        assert_eq!(state.kv_get_opt(&k).await.unwrap().as_deref(), Some(&other[..]), "stamp untouched");
+        let root = autumn_fs::key::inode_key(autumn_fs::schema::ROOT_INO);
+        assert_eq!(state.kv_get_opt(&root).await.unwrap(), None, "no root created");
     });
 }

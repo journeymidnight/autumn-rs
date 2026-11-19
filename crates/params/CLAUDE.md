@@ -5,7 +5,7 @@ reads them. One file per role: `manager.rs`, `ps.rs`, `en.rs` (servers),
 `client.rs` (the SDK, shared by every binary that embeds `ClusterClient`),
 `fs.rs` (the file-system layer, shared by autumn-fuse / autumnfs / autumn-s3),
 `fuse.rs`, `autumnfs.rs`, `s3.rs`, `gallery.rs`, `dashboard.rs`, and for the
-CLIs `op.rs`, `client_cli.rs` (autumn-client), `migrate.rs` (migratev1_v2), `convert.rs` (convert_fs_v5).
+CLIs `op.rs`, `client_cli.rs` (autumn-client).
 A binary's struct holds every flag it takes, its ports, addresses, files,
 ids and switches as well as its tunables. `lib.rs` holds the `params!` macro
 and the helpers built on it; `args.rs` the flag value types and the argv

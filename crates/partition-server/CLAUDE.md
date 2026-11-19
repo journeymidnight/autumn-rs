@@ -2816,8 +2816,9 @@ work.** Not "change them with a `VERSION` bump", not "keep a
 parser for the old shape".
 
 The reason is the migration rule for persisted data (`crates/manager/CLAUDE.md`,
-Upgrade safety): a persisted format change is delivered by a converter tool run
-once against a stopped cluster, never by compatibility code in the servers.
+"Cluster identity, version, and capacity"): a persisted format change is delivered by a conversion (a
+subcommand of `autumn-convert`) run once against a stopped cluster, never by
+compatibility code in the servers.
 These bytes live inside every extent, at terabyte scale, so rewriting them is a
 decision of its own, made only for one specific need.
 

@@ -22,7 +22,7 @@ hands it (plus the shared `fs` / `client` structs it embeds) to
 `autumn_params::parse_or_exit`, one pass over argv. An unknown argument,
 a bad or out-of-range value, a missing required flag (`--psid`, the EN's
 `--data`, autumn-s3's `--manager`, the dashboard's `--cluster-secret-file`,
-autumn-fuse's `--mountpoint`, migratev1_v2's `--etcd`) or a
+autumn-fuse's `--mountpoint`) or a
 removed flag exits 2; `--help` lists every flag with its default and range from
 the same declarations. No binary reads a tunable from the environment.
 
@@ -473,8 +473,8 @@ autumn-s3 --manager <host:port> [--listen 0.0.0.0] [--port 9000] [--workers N]
   it (a streamer's ranged GETs of one file). With every lookup and the pin under the lock a worker served one GET at
   a time: 4 KiB GETs (warp, 8 workers, RF 2) were 14.5K / 15.9K / 15.8K obj/s
   at 8 / 32 / 64 concurrent, now 22.8K / 28.7K / 28.6K. The limit is now the
-  partition holding the `fs/` metadata (90% of a core on a v4 tree, where all
-  of it sat in one partition): a GET is three gets there (bucket dirent, key
+  partition holding the `fs/` metadata (90% of a core while all of it sat in
+  one partition): a GET is three gets there (bucket dirent, key
   dirent, inode). Schema v5 spreads metadata over `--parts N` partitions
   (`crates/fs/CLAUDE.md`): 4 KiB GET 79K obj/s with 8 (c 64).
 - **A GET's body chunks are the receive buffers** (`objects::run_read` →
@@ -550,11 +550,9 @@ autumnfs [--manager 127.0.0.1:9001] [--transport tcp|ucx] [--credential-file FIL
 | `ln -s <TARGET> <PATH>` | Create a symbolic link (target stored as given) |
 | `readlink <PATH>` | Print a link's target |
 
-- **Built on an `FsState`** since v4: `ensure_root` is the core's, so the CLI
-  verifies the schema stamp (its own copy never did, and a v3 CLI misreads v4
-  inodes), and `rm` is the core's `unlink`/`rmdir` (tombstoned removal, segment
-  reclaim, deferral while another client holds the file) instead of a third copy
-  that deleted extents before the name. `cat`/`get` of a segmented file plan
+- **Built on an `FsState`**: `ensure_root` is the core's, so the CLI
+  verifies the schema stamp, and `rm` is the core's `unlink`/`rmdir` (tombstoned
+  removal, segment reclaim, deferral while another client holds the file). `cat`/`get` of a segmented file plan
   from its map and fail on a missing data extent.
 - **Paths resolve through `dir::resolve_follow`** in every command, so links
   along a path are followed as on a mount (`put /latest/x` writes into the
@@ -566,63 +564,16 @@ autumnfs [--manager 127.0.0.1:9001] [--transport tcp|ucx] [--credential-file FIL
 - **Inodes** come from the MANAGER's global counter (`alloc_inodes`) — the same crash-safe source the fuse mount and PyO3 `autumn.Fs` use, so no colliding inodes.
 - **ls / cat**: PS `handle_range` returns key-only entries, so both do a per-key `cluster.get` after the range scan (fine for one-shot CLI use). **Sizes**: files ≤4 KiB inline in the `InodeMeta`; larger go through the extent path (8 MiB chunks, `extent_key([0x03][ino BE][off BE])`).
 
-### Retired one-off format converters
+### Format conversions
 
-The fs schema v3 → v4 and SST MetaBlock v1 → v2 converters have been removed
-from this tree and the container image. Historical releases retain their
-conversion implementations; current servers retain strict format checks.
-
-### `migratev0_v1` — run and deleted
-
-The one-shot converter that wrapped the manager's persisted etcd records in
-their `persist` envelope. It was run once and then deleted with
-the `autumn-etcd` dependency it had added here, which is the whole point of a
-converter: it leaves no residue. It is no longer available.
-
-Two things from it are worth carrying forward, because the next converter will
-need them and will NOT get the first one for free:
-
-- **Naming is `migratev<from>_v<to>` over the PERSIST format generation**, not
-  the wire version. A persist change need not move `WIRE_VERSION` and usually
-  should not.
-- **That one decoded nothing.** Splitting a record out of the wire schema is a
-  rename, and rkyv's layout does not depend on the type name (measured:
-  `MgrExtentInfo` and an identically shaped `ExtentRecord` both encode to the
-  same 152 bytes), so it was a pure prefix insertion. A later conversion that
-  changes a record's FIELDS has to vendor the old definition itself, because by
-  then the tree only has the new one.
-
-The rule it served stands: a persisted-format change is delivered by a
-converter, never by compatibility code in the servers (`crates/manager/CLAUDE.md`,
-"Upgrade safety").
-
-### `migratev1_v2` (`src/bin/migratev1_v2.rs`)
-
-One-shot converter for the manager's etcd records, run against a STOPPED cluster
-(it refuses while any manager is up: the leader key or any `managerAlive/<id>`
-present, since a surviving follower could win the election mid-run). It moves
-each `tenantAccount/<name>` to `principal/<name>` byte for byte (the record was
-only renamed; envelope type 2 / version 1 checked, body not decoded), turns an
-`autoPolicy/config` in mode 1 (the removed observe mode) to mode 0 (off; a new
-manager refuses to lead on mode 1), then re-encodes every `namespace/<name>`
-from format 1 to 2 (drops `owner_tenant`, printing any owner it drops). Namespaces go last because a new manager refuses
-to lead while any namespace row is v1; every step skips finished work, so an
-interrupted run is simply re-run. `--dry-run` reports without writing. Delete
-this bin and the `autumn-etcd` dependency once the deployments that need it
-have run it.
-
-### `convert_fs_v5` (`src/bin/convert_fs_v5.rs`)
-
-One-shot converter of the `fs/` tree from schema v4 to v5 (metadata keys behind
-a hash byte, `crates/fs/CLAUDE.md`), run with every mount, gateway and
-`autumn.Fs` stopped; the cluster itself stays up. It stamps
-`SCHEMA_CONVERTING_TO_V5` (neither build mounts that), moves each `[0x01]` and
-`[0x02]` key to its v5 key page by page (put, then delete the old key), and
-stamps 5 last; an interrupted run is run again. `--dry-run` counts. Then
-`autumn-op presplit --namespace fs --parts N` cuts the metadata region. Flags in
-`autumn_params::convert`. Test: `crates/manager/tests/fs_convert_v5.rs` (a whole
-tree and a half-converted one read back byte for byte). Delete the bin and its
-params once the deployments that need it have run it.
+No conversion tool ships in this build: servers and fs clients read only the
+current version of each versioned persisted format and refuse any other. A
+future conversion is a subcommand of one binary, `autumn-convert` (created with
+the first one), run once against a stopped cluster; a release that changes a
+persisted format incompatibly is a minor-version bump, and the subcommand is
+deleted later (docs/ops.md, "Persisted formats and
+conversions"). A conversion that changes a record's fields vendors the old
+definition itself, because the tree only has the new one.
 
 ### `autumn-stream-cli` (`src/bin/stream_cli.rs`)
 
