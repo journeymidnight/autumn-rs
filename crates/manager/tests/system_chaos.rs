@@ -5748,6 +5748,7 @@ fn checkpoint_check_reports_an_sst_outside_the_row_stream() {
         let write = |extent_id: u64| {
             let locs = partition_rpc::TableLocations {
                 locs: vec![partition_rpc::SstLocation { extent_id, offset: 0, len: 10 }],
+                kind: partition_rpc::CHECKPOINT_KIND_NORMAL,
                 ..Default::default()
             };
             let payload = partition_rpc::rkyv_encode(&locs);

@@ -474,7 +474,16 @@ freeze reply carries the log position its drain checkpointed
 (`MergeFreezeResp.log_tail_extent_id/log_end`, wire 61) and the merge refuses
 unless the captured log ends exactly there ("partition N took writes after its
 freeze drain"). Every acked write goes through the log, so the log alone
-suffices.
+suffices for writes. Checkpoints are the other thing a lifted freeze lets a
+source publish without moving the log (a compaction), and the merged open
+loads one freeze record per source, the run after the newest normal record
+(partition-server CLAUDE.md, "Checkpoint kind"): a normal record after a
+source's freeze record supersedes the other source's. So the reply also
+carries where the freeze record ends in the meta stream
+(`meta_tail_extent_id/meta_end`, wire 89), and the merge refuses unless the
+captured meta stream ends exactly there ("partition N published a checkpoint
+after its freeze drain"; `a_checkpoint_after_the_freeze_before_the_takeover`:
+5 of 5 survivor keys lost after a restart without it).
 
 A failed merge leaves the sources fenced: the partition's next append is
 refused (that one write fails, not acked), it poisons itself and reopens under a

@@ -566,14 +566,26 @@ autumnfs [--manager 127.0.0.1:9001] [--transport tcp|ucx] [--credential-file FIL
 
 ### Format conversions
 
-No conversion tool ships in this build: servers and fs clients read only the
-current version of each versioned persisted format and refuse any other. A
-conversion is a subcommand of one binary (created with the first one
-needed), run once against a stopped cluster and deleted in a later
-release; a release that changes a persisted format incompatibly is a
-minor-version bump (docs/ops.md, "Persisted formats and conversions"). A
-conversion holds the old form itself and writes the new one through the
-owning crate's encoder, because the tree only has the new one.
+Servers and fs clients read only the current version of each versioned
+persisted format and refuse any other. A conversion is a subcommand of one
+binary, `autumn-convert` (`src/bin/autumn_convert.rs`, flags in
+`autumn_params::convert`), run once against a stopped cluster; a release that
+changes a persisted format incompatibly is a minor-version bump, and the
+subcommand is deleted later (docs/ops.md, "Persisted formats and conversions").
+The binary is the CLI and the cluster plumbing; each conversion lives beside the
+format it produces and holds the old form itself:
+`autumn_partition_server::checkpoint_convert`.
+
+- `checkpoint-kind --manager … --cluster-secret-file …` (0.2.x → 0.3.0): a
+  kind-0 checkpoint record becomes a normal one, per partition (owner lock,
+  fence + seal the meta tail, append, read it back from its extent, cut the
+  meta stream before it); waits until no PS heartbeats; a dry run only reads.
+  A partition holding more than one record is refused (the kind is what would
+  say which supersedes which) unless named in `--keep-newest` (the operator's
+  word that they are its own, from a deferred cut: the newest is converted).
+  A dry run reports a stopped run's pending cut. A rerun after a stop before the cut finds the
+  new record last and makes the cut. Test:
+  `crates/manager/tests/convert_checkpoint_kind.rs`.
 
 ### `autumn-stream-cli` (`src/bin/stream_cli.rs`)
 

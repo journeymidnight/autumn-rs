@@ -190,6 +190,8 @@ async fn run(args: Args) -> Result<()> {
         println!("dry run: no checkpoint appended");
         return Ok(());
     }
+    // It lists every table the partition keeps.
+    ckpt.kind = autumn_rpc::partition_rpc::CHECKPOINT_KIND_NORMAL;
     let encoded = rkyv_encode(&ckpt);
     let mut record = Vec::with_capacity(4 + encoded.len());
     record.extend_from_slice(&(encoded.len() as u32).to_le_bytes());

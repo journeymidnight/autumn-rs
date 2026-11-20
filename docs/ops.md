@@ -5423,11 +5423,46 @@ warning, so a layout change there must be handled explicitly by its release.
 There is no dual-read.
 
 A release that changes a persisted format incompatibly is a minor-version bump
-(`0.1.x` → `0.2.0`), whether existing data is converted or has to be
-re-created. A conversion ships as a subcommand of one binary (created with the
-first one needed), run once against a STOPPED cluster; the
-subcommand is deleted in a later release. None ships now: clusters older than
-0.2.0 are not readable by this build.
+(`0.2.x` → `0.3.0`), whether existing data is converted or has to be
+re-created. A conversion ships as a subcommand of one binary, `autumn-convert`
+(in the image), run once against a STOPPED cluster; the subcommand is deleted in
+a later release. Clusters older than 0.2.0 are not readable by this build.
+
+#### Upgrading from 0.2.x: checkpoint kind
+
+A meta-stream checkpoint (`TableLocations`) now says what it is (`kind`, the
+old unused `log_extent_count`): a normal record supersedes every record before
+it, a freeze record (a split or merge drain) is one per merge source. A 0.2.x
+partition left two records of its own when a cut was deferred, and its open
+loaded both; a major compaction in between made that open ask for tables whose
+row extents were gone. A 0.3.0 PS does not open a partition whose records are
+kind 0 (`checkpoint record of kind 0 ... run autumn-convert checkpoint-kind`).
+
+```bash
+# 0. On 0.2.x, with every partition open (a merged partition must have opened
+#    once since its merge), stop the policy, then every PS. Managers, extent
+#    nodes and etcd stay up.
+# 1. Start the 0.3.0 managers and extent nodes, not the PS.
+# 2. Checkpoints (waits until no PS has heartbeated for 10 s).
+autumn-convert checkpoint-kind --manager MGR:9001 --cluster-secret-file F --dry-run
+autumn-convert checkpoint-kind --manager MGR:9001 --cluster-secret-file F [--parallel 4]
+#   → part P: converted ... checkpoint-kind: N converted, 0 already done or empty, 0 failed
+autumn-convert checkpoint-kind --manager MGR:9001 --cluster-secret-file F   # → 0 converted
+# 3. Start the 0.3.0 PS; rebalance (below); restore the policy.
+```
+
+Per partition it takes the owner lock, fences and seals the meta tail, appends
+the last record again as a normal one (every other field unchanged), reads it
+back from its extent and cuts the meta stream before it. A partition holding
+more than one record is refused, each record's meta extent, cursor and table
+count printed. A merge's sources (the survivor has not opened since the merge):
+open it once on 0.2.x (that open replaces them with one record), stop it, rerun.
+Records of one partition alone, left by a deferred cut (0.2.x would load
+both): rerun with `--keep-newest P`, which converts the newest and cuts the
+rest. Which case it is, the operator decides: a merge's records are each a
+source's, and the merge's history (`autumn-op ops history --kind merge`)
+names the partition. A run
+stopped anywhere is run again; `--dry-run` only reads.
 
 **After any stop-the-world restart, rebalance.** `handle_register_ps` runs
 `rebalance_regions` when the FIRST PS registers, and with one PS in `ps_nodes`

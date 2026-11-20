@@ -2987,7 +2987,7 @@ async fn checkpoint_and_truncate_row_prefix(
     // Under the lock: no publisher can change the tables or the cursor.
     let seals = anchor_seals(&sc, base, &log_ids).await;
     let vp = advance_sealed_anchor(base, &log_ids, &seals);
-    save_table_locs_raw(&sc, meta_id, &tables, vp.0, vp.1, floors).await?;
+    save_table_locs_raw(&sc, meta_id, &tables, vp.0, vp.1, floors, CHECKPOINT_KIND_NORMAL).await?;
     part.borrow().durable_ckpt_vp.set(vp);
     drop(publish);
     truncate_unreferenced_row_prefix(part, part_id).await
@@ -3499,6 +3499,7 @@ pub(crate) async fn do_compact(
         ckpt_vp_eid,
         ckpt_vp_off,
         floors_snapshot,
+        CHECKPOINT_KIND_NORMAL,
     )
     .await?;
     {

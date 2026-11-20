@@ -398,6 +398,66 @@ fn stale_unfreeze_before_the_takeover() {
     });
 }
 
+/// A stale `freeze=false` before the takeover, and no write, but a
+/// compaction on one source: it publishes a normal checkpoint after that
+/// source's freeze record, and the log does not move, so the drained-cursor
+/// check passes. A merged open that took that record alone, as a partition's
+/// own newest, dropped the other source's tables (5 of 5 survivor keys after
+/// a restart). The merge must refuse: the meta stream no longer ends at the
+/// freeze record.
+#[test]
+fn a_checkpoint_after_the_freeze_before_the_takeover() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        let c = cluster(142, None).await;
+        let mut ps = start_partition_server_killable(PS_ID + 7, c.mgr_addr, c.ps_addr);
+        wait_both_open(&c).await;
+        baseline(&c).await;
+
+        set_takeover_pause(7_000);
+        let merge = spawn_merge(c.mgr.clone());
+        compio::time::sleep(Duration::from_millis(1500)).await;
+        unfreeze_both(&c).await;
+        psr_compact(&c.router, VICTIM).await;
+        while merge.borrow().is_none() {
+            compio::time::sleep(Duration::from_millis(100)).await;
+        }
+        set_takeover_pause(0);
+        let resp = merge.borrow_mut().take().unwrap();
+        eprintln!("merge: code={} msg={}", resp.code, resp.message);
+        let merged = resp.code == CODE_OK;
+        assert!(
+            !merged && resp.message.contains("published a checkpoint after its freeze drain"),
+            "expected the meta-position refusal, got code={} {}",
+            resp.code,
+            resp.message
+        );
+        // Let the compaction land, then open from the meta stream alone.
+        compio::time::sleep(Duration::from_secs(2)).await;
+        ps.kill();
+        let _ps2 = start_partition_server_killable(PS_ID + 7, c.mgr_addr, c.ps_addr);
+        let mut lost = Vec::new();
+        let home = |part: u64| if merged { SURVIVOR } else { part };
+        let t0 = std::time::Instant::now();
+        for (part, prefix) in [(SURVIVOR, "a"), (VICTIM, "m")] {
+            for i in 0..5 {
+                let key = format!("{prefix}/pre-{i:02}");
+                loop {
+                    match try_psr_get(&c.router, home(part), key.as_bytes()).await {
+                        Ok(r) if r.code == partition_rpc::CODE_OK && r.value == b"pre" => break,
+                        r if t0.elapsed() > Duration::from_secs(60) => {
+                            lost.push(format!("{key}: {:?}", r.map(|r| (r.code, r.message))));
+                            break;
+                        }
+                        _ => compio::time::sleep(Duration::from_millis(250)).await,
+                    }
+                }
+            }
+        }
+        assert!(lost.is_empty(), "baseline lost after the merge (merged={merged}): {lost:?}");
+    });
+}
+
 /// A freeze OK lost on its way back: the merge gives up, and the side it
 /// does not know is frozen must take writes again at once, not after
 /// `FREEZE_TTL` (30 s). Once for each side.

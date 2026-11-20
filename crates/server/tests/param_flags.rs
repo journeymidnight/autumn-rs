@@ -170,12 +170,15 @@ fn config_keys_lists_every_runtime_parameter() {
     assert_eq!(listed, want, "{text}");
 }
 
+const CONVERT_BIN: &str = env!("CARGO_BIN_EXE_autumn-convert");
+
 /// The CLIs' own parameter structs (the servers' are checked above): their
 /// `--help` lists every flag the parser takes.
 #[test]
 fn cli_help_lists_every_parameter() {
     assert_help_lists_every_parameter::<autumn_params::op::OpParams>(OP_BIN);
     assert_help_lists_every_parameter::<autumn_params::client_cli::ClientCliParams>(CLIENT_BIN);
+    assert_help_lists_every_parameter::<autumn_params::convert::ConvertParams>(CONVERT_BIN);
 }
 
 /// A bad startup argument exits 2 before anything starts, on every binary
@@ -202,6 +205,9 @@ fn bad_startup_arguments_exit_2() {
         (CLIENT_BIN, &["--transport", "x", "get", "k"], "not tcp or ucx"),
         (OP_BIN, &["status", "--timeout", "soon"], "--timeout soon"),
         (OP_BIN, &["--admin-token", "t", "status"], "--admin-token was removed"),
+        (CONVERT_BIN, &[], "no subcommand"),
+        (CONVERT_BIN, &["frob"], "unknown subcommand"),
+        (CONVERT_BIN, &["checkpoint-kind", "--parallel", "0"], "--parallel 0"),
         (OP_BIN, &["presplit", "--namespace", "fs", "--parts", "6"], "autumn-op presplit was removed"),
     ] {
         let (code, text) = run(bin, args);

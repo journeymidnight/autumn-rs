@@ -110,7 +110,7 @@ pub fn shard_for_extent(extent_id: u64, shard_count: u32) -> u32 {
 /// Bump it on every wire change. There is no separate "oldest cluster peer"
 /// constant: peers compare for EQUALITY, so a floor pinned to this value would
 /// say nothing.
-pub const WIRE_VERSION: u32 = 88;
+pub const WIRE_VERSION: u32 = 89;
 
 /// The oldest CLIENT this binary serves — the floor of the client window
 /// `[MIN_CLIENT_WIRE_VERSION, WIRE_VERSION]`.
@@ -440,11 +440,12 @@ mod wire_version_tests {
         assert!(client_compat_check(3, 2).is_err());
     }
 
-    /// The window is `[87, 88]`: wire 87 added `evict_rank` to `PutReq` and
+    /// The window is `[87, 89]`: wire 87 added `evict_rank` to `PutReq` and
     /// `BatchPutOp` in place, which every client sends (a deliberate choice:
     /// a stop-world upgrade with every embedded client rebuilt rather than a
     /// second form of each write); wire 88 dropped a retired count from
-    /// `MgrExtentInfo`, which no client decodes.
+    /// `MgrExtentInfo`, and wire 89 added the meta position to
+    /// `MergeFreezeResp`, neither of which a client decodes.
     ///
     /// Pinned to literals so neither constant moves by accident. **If this
     /// fails because you bumped `WIRE_VERSION`: that is correct and expected.**
@@ -453,7 +454,7 @@ mod wire_version_tests {
     #[test]
     fn the_client_window_and_its_floor_are_where_they_belong() {
         assert_eq!(MIN_CLIENT_WIRE_VERSION, 87, "read this test's comment");
-        assert_eq!(WIRE_VERSION, 88, "read this test's comment");
+        assert_eq!(WIRE_VERSION, 89, "read this test's comment");
     }
 
     /// The check that actually decides whether a stale SERVER joins is the one

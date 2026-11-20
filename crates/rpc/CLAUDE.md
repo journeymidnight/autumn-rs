@@ -783,7 +783,7 @@ overflows the frame.
 
 ## Wire version, and the two checks over it
 
-`WIRE_VERSION` (currently **88**: `MgrExtentInfo` without its retired SST count) is the schema this binary speaks.
+`WIRE_VERSION` (currently **89**: `MergeFreezeResp` carries the freeze checkpoint's meta position) is the schema this binary speaks.
 `MIN_CLIENT_WIRE_VERSION` (**87**: that change was made in place, so every client is rebuilt — chosen
 over a second form of each write; `client_surface_freeze.rs` re-recorded those two forms)
 is the oldest CLIENT it serves. Both are maintained
@@ -1137,6 +1137,13 @@ the bytes of the bulk forms they replace (`client_surface_freeze.rs` records
 `CompareWriteReq` and `BatchPutReq` with the bytes of `CompareWriteBulkReq` and
 `BatchPutBulkReq`), so only names changed on them; the floor rose because a
 wire-80 client sends the deleted forms for small values.
+
+## `MergeFreezeResp` carries the meta position (wire 89)
+
+`meta_tail_extent_id` / `meta_end`: where the freeze drain's checkpoint ends
+in the meta stream. The merge refuses unless the meta stream it captures under
+the takeover still ends there, as it does for the log (manager CLAUDE.md,
+"Merge"). PS and manager only; the floor stays 87.
 
 ## `MgrExtentInfo`: retention is `refs` alone (wire 88)
 

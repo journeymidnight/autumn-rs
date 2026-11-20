@@ -764,6 +764,12 @@ pub struct MergeFreezeResp {
     /// otherwise.
     pub log_tail_extent_id: u64,
     pub log_end: u64,
+    /// Where the drain's freeze checkpoint ends in the meta stream
+    /// (`(extent, end)`, `(0, 0)` otherwise). A normal checkpoint published
+    /// after it (a compaction once the freeze was lifted) supersedes it in
+    /// the merged open, so the capture must measure exactly this.
+    pub meta_tail_extent_id: u64,
+    pub meta_end: u64,
 }
 
 // manager → PS "seal + roll these open tails" (see MSG_ROLL_TAILS).
@@ -899,16 +905,24 @@ pub struct SstLocation {
     pub len: u64,
 }
 
+/// A checkpoint that lists every table of its partition: it supersedes
+/// every record before it in the meta stream.
+pub const CHECKPOINT_KIND_NORMAL: u32 = 1;
+/// The checkpoint a split or merge freeze drain writes. The only record left
+/// in its meta stream once written, so a merge splices exactly one per source.
+pub const CHECKPOINT_KIND_FREEZE: u32 = 2;
+
 /// Checkpoint written to metaStream after each flush/compaction.
 #[derive(Archive, Serialize, Deserialize, Clone, Debug, Default)]
 pub struct TableLocations {
     pub locs: Vec<SstLocation>,
     pub vp_extent_id: u64,
     pub vp_offset: u64,
-    /// Unused; written as 0. (It once let recovery split a merged log into
-    /// per-source regions; a merged open now starts at the latest source
-    /// cursor and needs none.) Kept because the checkpoint format is frozen.
-    pub log_extent_count: u32,
+    /// `CHECKPOINT_KIND_NORMAL` or `CHECKPOINT_KIND_FREEZE`. Recovery takes
+    /// the newest normal record alone, or the run of freeze records after it
+    /// (a merge's sources). 0 is a record from before 0.3.0, which recovery
+    /// refuses (`autumn-convert checkpoint-kind`).
+    pub kind: u32,
     /// Snapshot of the partition's per-ino fence
     /// floors `(ino, lease_epoch)` at checkpoint time. Recovery seeds
     /// `PartitionData.fence_floors` from this, then WAL replay max-merges

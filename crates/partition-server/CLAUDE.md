@@ -502,7 +502,7 @@ Persistence — floors survive restart / reschedule:
 - **Checkpoint**: `TableLocations.fence_floors` snapshot, captured under the SAME
   borrow as the tables snapshot at all three publish sites (metadata-publish
   ordering invariant intact).
-- **Recovery**: seeds floors by max-merge over ALL meta records, then replay
+- **Recovery**: seeds floors by max-merge over the records it loads, then replay
   max-merges every OP_FENCE_BUMP (idempotent — deliberately bypasses ts-dedup;
   re-applying a checkpoint-covered bump is a no-op).
 
@@ -1227,8 +1227,10 @@ another op (a recovery, an EC conversion) is in flight on one of the old extents
 — nothing preempts (manager CLAUDE.md, "Extent arbiter") — and that refusal is a
 transient conflict (`manager_says_retry_later`), so the checkpoint stands and the
 next one truncates. Any other refusal (the owner fence) still fails it. Until
-then a restart replays from the earliest record left, which is correct, only
-slower. The row-stream prefix cut after a compaction
+then the older records stay beside the new one, and recovery must not load
+them: they can name tables a major compaction has replaced since, whose row
+extents its row cut then dropped (the open retried forever on a missing SST,
+`crates/manager/tests/system_meta_two_records_reopen.rs`). The row-stream prefix cut after a compaction
 (`truncate_unreferenced_row_prefix`) defers the same way, and the partition
 keeps `row_cut_deferred` set until a cut lands or there is nothing to cut (also
 through a manager error or a split/merge hold): the compaction loop's tick
@@ -1236,6 +1238,50 @@ through a manager error or a split/merge hold): the compaction loop's tick
 compaction, which an idle partition never runs, so the replaced row extents
 stayed (`system_row_truncate_live_refs::a_deferred_prefix_cut_is_made_on_an_idle_partition`,
 deferral injected with the manager's `TRUNCATE_TEST_DEFER_STREAM`).
+
+### Checkpoint kind: which records recovery loads
+
+Each record carries `TableLocations.kind` (the field was the unused
+`log_extent_count`; renamed in 0.3.0, same bytes): `CHECKPOINT_KIND_NORMAL`
+from flush, compaction (real or no-op) and the merged open, which list every
+table of the partition; `CHECKPOINT_KIND_FREEZE` from the split/merge freeze
+drain (`publish_freeze_checkpoint`). Recovery reads the last record of each
+non-empty meta extent and `select_checkpoint_records` keeps the newest normal
+one alone, or the run of freeze records after it: a merge's sources (the
+splice is `[survivor meta][victim meta]`), or one for a split child or an
+aborted freeze. Kind 0 (before 0.3.0) or any other value refuses the open
+(`autumn-convert checkpoint-kind`, docs/ops.md).
+
+INVARIANT: a freeze that succeeds leaves its record the only record of its
+meta stream. Its cut after the append is never deferred: a deferral or a
+missing extent fails the freeze, and the split or merge is retried. A victim
+holding an older normal record beside its freeze record would splice as
+`F_survivor, N_victim_old, F_victim`, and recovery would take `F_victim` alone
+— every survivor table gone (`crates/manager/tests/system_merge_freeze_meta_cut.rs`:
+40 of 40 survivor keys lost with the deferral allowed).
+
+A freeze that FAILS after its append (the cut refused, a crash) still leaves
+its record, so before appending it cuts the stream back to the extent holding
+the newest record (`cut_before_newest_record`; a refusal fails the freeze with
+nothing written). What precedes the freeze record is then that record alone:
+a normal one, where recovery's run stops, or a freeze record listing the same
+tables (only normal records change them). Without it, `[A: F_old]` after an
+aborted freeze, then a major's `N` in B with its cut deferred, then the next
+freeze's `F2` behind `N` in B with its cut refused, read as the run
+`F_old, F2`: `N` hidden, the open loaded the tables the major replaced, whose
+row extent was gone (`crates/manager/tests/system_freeze_failed_cut_reopen.rs`,
+red without the pre-cut). The newest record is the newest extent whose last
+record decodes, recovery's predicate; a newer non-empty extent that does not
+decode fails the freeze rather than be cut past (until the next normal
+checkpoint lands behind it).
+
+A merge source whose freeze is lifted before the takeover (TTL, a stale
+unfreeze, a restart) can still publish a normal record (a compaction) without
+moving its log; it would supersede the other source's freeze record in the
+merged open. The freeze reply carries where its record ends in the meta stream
+(`MergeFreezeResp.meta_tail_extent_id/meta_end`) and the manager refuses the
+merge unless the captured meta stream still ends there (manager CLAUDE.md,
+"Merge").
 
 INVARIANT (checkpoint publication): only P-log may publish `metaStream`
 checkpoints. P-sst may upload the SST and build the `SstReader`, but it must not
@@ -1760,7 +1806,8 @@ to the position of `PartitionData.durable_ckpt_vp` when it resolves.
 meta_stream checkpoint — set in `commit_flush_outcome_inner` AFTER
 `save_table_locs_raw` returns Ok, and seeded at open from the recovered
 checkpoint's cursor when there is exactly ONE checkpoint record (it is durable
-and recovery replays from it). With several (a merge's sources) the open
+and recovery replays from it). With several (a merge's sources, see
+"Checkpoint kind") the open
 publishes one merged record before serving and sets it from that; until the
 append acks it is `(0,0)` — the MIN. Freeze checkpoints (merge/split) set it to
 the frozen log tail. Every publisher holds `publish_lock`, so it is always the
@@ -1843,8 +1890,8 @@ merge ever needs replay:
   failed compare-write that raised the floor, split, restart — the revoked
   epoch must stay fenced on both children; red when this checkpoint carries no
   floors).
-- A merged survivor loads one record per source (the last record of each
-  meta extent) and starts at the LATEST cursor by stream position. The log is
+- A merged survivor loads one freeze record per source (see "Checkpoint
+  kind") and starts at the LATEST cursor by stream position. The log is
   `[survivor][victim][new tail]` and each record covers its own source up to
   its end, so what follows is only the merged partition's own writes, whose
   seqs start above both sources' maximum — one max-seq skip is sound. Starting
@@ -2479,8 +2526,8 @@ stay gate-first to match split, else `acquire_compact ↔ maintenance_gate` cycl
        `crates/manager/tests/write_outcome_settled.rs` without the seal. The seal
        comes AFTER the fence: sealed first, the previous owner could still append
        past the seal and be acknowledged.
-  1. Read last TableLocations checkpoint from metaStream (iterate extents backward,
-     find first non-empty)
+  1. Read the last TableLocations record of each non-empty metaStream extent;
+     load the ones `select_checkpoint_records` keeps (see "Checkpoint kind")
   2. For each location: read SST bytes from rowStream (META TAIL only), open SstReader
   3. Compute max seq_number + VP head from SSTables
   4. Replay logStream from VP head forward (committed-clamped, 64 MB chunked-carry):

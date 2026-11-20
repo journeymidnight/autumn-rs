@@ -35,10 +35,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("records={count} bytes={offset}/{}", data.len());
     let record = last.ok_or("no checkpoint")?;
     println!(
-        "vp={}:{} log_extent_count={} locs={}",
+        "vp={}:{} kind={} locs={}",
         record.vp_extent_id,
         record.vp_offset,
-        record.log_extent_count,
+        record.kind,
         record.locs.len()
     );
     let mut by_extent = BTreeMap::<u64, Vec<(u64, u64)>>::new();

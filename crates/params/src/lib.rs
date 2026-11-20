@@ -27,6 +27,7 @@ mod args;
 pub mod autumnfs;
 pub mod client;
 pub mod client_cli;
+pub mod convert;
 pub mod dashboard;
 pub mod en;
 pub mod fs;

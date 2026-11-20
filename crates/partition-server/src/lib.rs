@@ -6,6 +6,7 @@ pub mod background;
 mod rpc_handlers;
 mod sstable;
 pub mod compact_policy;
+pub mod checkpoint_convert;
 mod wal_record;
 pub mod metrics;
 mod plog_load;
@@ -1158,6 +1159,9 @@ pub(crate) struct PartitionData {
     /// several records (a merge's sources) are replaced by a merged record
     /// before serving. `(0,0)` = none resolved: GC keeps the MIN-over-SST floor.
     durable_ckpt_vp: Cell<(u64, u64)>,
+    /// Where the last freeze checkpoint ended in the meta stream (`(extent,
+    /// end)`), for the merge freeze reply.
+    freeze_meta_end: Cell<(u64, u64)>,
     stream_client: Rc<StreamClient>,
     /// This partition's SST block cache, owned by the `PartitionServer` and
     /// shared by all of its partitions (see `PartitionServer::block_cache`).
@@ -6733,6 +6737,7 @@ async fn partition_thread_main(
         // else (0,0) = the conservative MIN floor until this incarnation's
         // first flush commit acks (see the field doc).
         durable_ckpt_vp: Cell::new(recovered_ckpt_vp.unwrap_or((0, 0))),
+        freeze_meta_end: Cell::new((0, 0)),
         stream_client: part_sc.clone(),
         block_cache: block_cache.clone(),
         mem_tier: mem_tier.map(mem_tier::MemShard::new),
@@ -7924,9 +7929,15 @@ async fn try_complete_freeze_drain(
     if need_merge_drain {
         let state = part.borrow().merge_freeze.clone();
         if let Some((attempt, drained_tx)) = state.take_draining() {
-            // `publish_freeze_checkpoint` just set it to the drained log end.
+            // `publish_freeze_checkpoint` just set both.
             let outcome = match &drain_err {
-                None => Ok(part.borrow().durable_ckpt_vp.get()),
+                None => {
+                    let p = part.borrow();
+                    Ok(DrainedAt {
+                        log: p.durable_ckpt_vp.get(),
+                        meta: p.freeze_meta_end.get(),
+                    })
+                }
                 Some(e) => Err(e.clone()),
             };
             let succeeded = outcome.is_ok();
@@ -7989,7 +8000,7 @@ enum MergeFreeze {
     /// Dropping the sender (unfreeze, TTL) cancels the freeze.
     Draining {
         attempt: u64,
-        drained: oneshot::Sender<Result<(u64, u64), String>>,
+        drained: oneshot::Sender<Result<DrainedAt, String>>,
     },
     /// Drained and answered; writes stay halted until unfreeze, TTL or reopen.
     Drained { attempt: u64 },
@@ -8060,7 +8071,7 @@ impl MergeFreezeState {
 
     /// Halt writes and hand the drain to `partition_loop`, unless `attempt`
     /// was ended meanwhile.
-    fn start_draining(&self, attempt: u64) -> Option<oneshot::Receiver<Result<(u64, u64), String>>> {
+    fn start_draining(&self, attempt: u64) -> Option<oneshot::Receiver<Result<DrainedAt, String>>> {
         if !self.holds(attempt) {
             return None;
         }
@@ -8072,7 +8083,7 @@ impl MergeFreezeState {
 
     /// The drain's attempt and answer channel; the caller then calls
     /// `set_drained` or `end`.
-    fn take_draining(&self) -> Option<(u64, oneshot::Sender<Result<(u64, u64), String>>)> {
+    fn take_draining(&self) -> Option<(u64, oneshot::Sender<Result<DrainedAt, String>>)> {
         let mut stage = self.stage.borrow_mut();
         match std::mem::take(&mut *stage) {
             MergeFreeze::Draining { attempt, drained } => Some((attempt, drained)),
@@ -8117,12 +8128,22 @@ impl MergeFreezeState {
     }
 }
 
-fn merge_freeze_resp(code: u8, message: impl Into<String>, cursor: (u64, u64)) -> HandlerResult {
+/// Where a merge freeze drain left its source: the log end its checkpoint
+/// names, and where that checkpoint ends in the meta stream.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct DrainedAt {
+    pub(crate) log: (u64, u64),
+    pub(crate) meta: (u64, u64),
+}
+
+fn merge_freeze_resp(code: u8, message: impl Into<String>, at: DrainedAt) -> HandlerResult {
     Ok(partition_rpc::rkyv_encode(&partition_rpc::MergeFreezeResp {
         code,
         message: message.into(),
-        log_tail_extent_id: cursor.0,
-        log_end: cursor.1,
+        log_tail_extent_id: at.log.0,
+        log_end: at.log.1,
+        meta_tail_extent_id: at.meta.0,
+        meta_end: at.meta.1,
     }))
 }
 
@@ -8145,27 +8166,27 @@ async fn merge_freeze_task(
     let permit = match select(acquire, cancelled).await {
         Either::Left((permit, _)) => permit,
         Either::Right(_) => {
-            let _ = resp_tx.send(merge_freeze_resp(partition_rpc::CODE_PRECONDITION, CANCELLED_WAITING, (0, 0)));
+            let _ = resp_tx.send(merge_freeze_resp(partition_rpc::CODE_PRECONDITION, CANCELLED_WAITING, DrainedAt::default()));
             return;
         }
     };
     let Some(drained_rx) = state.start_draining(attempt) else {
-        let _ = resp_tx.send(merge_freeze_resp(partition_rpc::CODE_PRECONDITION, CANCELLED_WAITING, (0, 0)));
+        let _ = resp_tx.send(merge_freeze_resp(partition_rpc::CODE_PRECONDITION, CANCELLED_WAITING, DrainedAt::default()));
         return;
     };
     let _ = wake_loop.unbounded_send(());
     let drained = drained_rx.await;
     let resp = match &drained {
-        Ok(Ok(cursor)) => merge_freeze_resp(partition_rpc::CODE_OK, "", *cursor),
+        Ok(Ok(at)) => merge_freeze_resp(partition_rpc::CODE_OK, "", *at),
         Ok(Err(e)) => merge_freeze_resp(
             partition_rpc::CODE_UNAVAILABLE,
             format!("freeze drain flush failed: {e}"),
-            (0, 0),
+            DrainedAt::default(),
         ),
         Err(_) => merge_freeze_resp(
             partition_rpc::CODE_PRECONDITION,
             "merge freeze cancelled (unfreeze or TTL) before its drain finished",
-            (0, 0),
+            DrainedAt::default(),
         ),
     };
     if resp_tx.send(resp).is_err() && matches!(drained, Ok(Ok(_))) {
@@ -8536,6 +8557,8 @@ async fn handle_incoming_req(
                     message: String::new(),
                     log_tail_extent_id: 0,
                     log_end: 0,
+                    meta_tail_extent_id: 0,
+                    meta_end: 0,
                 };
                 let _ = req.resp_tx.send(Ok(partition_rpc::rkyv_encode(&resp)));
                 return;
@@ -8559,6 +8582,8 @@ async fn handle_incoming_req(
                             .to_string(),
                         log_tail_extent_id: 0,
                         log_end: 0,
+                        meta_tail_extent_id: 0,
+                        meta_end: 0,
                     };
                     let _ = req.resp_tx.send(Ok(partition_rpc::rkyv_encode(&resp)));
                     return;
@@ -8567,11 +8592,14 @@ async fn handle_incoming_req(
                     // Already fully drained-frozen — reply OK immediately, with
                     // the cursor that drain checkpointed.
                     let ckpt = p.durable_ckpt_vp.get();
+                    let meta = p.freeze_meta_end.get();
                     let resp = MergeFreezeResp {
                         code: CODE_OK,
                         message: String::new(),
                         log_tail_extent_id: ckpt.0,
                         log_end: ckpt.1,
+                        meta_tail_extent_id: meta.0,
+                        meta_end: meta.1,
                     };
                     let _ = req.resp_tx.send(Ok(partition_rpc::rkyv_encode(&resp)));
                     return;
@@ -8582,6 +8610,8 @@ async fn handle_incoming_req(
                         message: "freeze already in progress".to_string(),
                         log_tail_extent_id: 0,
                         log_end: 0,
+                        meta_tail_extent_id: 0,
+                        meta_end: 0,
                     };
                     let _ = req.resp_tx.send(Ok(partition_rpc::rkyv_encode(&resp)));
                     return;
@@ -8602,6 +8632,8 @@ async fn handle_incoming_req(
                             .to_string(),
                         log_tail_extent_id: 0,
                         log_end: 0,
+                        meta_tail_extent_id: 0,
+                        meta_end: 0,
                     };
                     let _ = req.resp_tx.send(Ok(partition_rpc::rkyv_encode(&resp)));
                     return;
@@ -9466,17 +9498,14 @@ async fn recover_partition(
     // replay below max-merges any later OP_FENCE_BUMP records.
     let mut fence_floors: HashMap<u64, u64> = HashMap::new();
 
-    // union the LAST TableLocations record from EACH meta_stream
-    // extent (instead of just the last extent's last record). Pre-merge
-    // partitions have a single non-empty meta_stream extent with one
-    // canonical record — single-extent path is unchanged. Post-merge,
-    // the splice puts both survivor's and victim's old meta_stream
-    // extents into the merged stream; reading just the last extent
-    // would lose half the table set.
-    let meta_records: Vec<TableLocations> =
+    // The newest normal record alone, or a merge's freeze records (one per
+    // source) — see `select_checkpoint_records`.
+    let meta_records: Vec<TableLocations> = select_checkpoint_records(
         read_all_table_locations(meta_stream_id, part_sc)
             .await
-            .context("union TableLocations from metaStream extents")?;
+            .context("read TableLocations from metaStream extents")?,
+    )
+    .with_context(|| format!("meta stream {meta_stream_id}"))?;
     for r in &meta_records {
         for &(ino, epoch) in &r.fence_floors {
             let f = fence_floors.entry(ino).or_insert(0);
@@ -9518,8 +9547,9 @@ async fn recover_partition(
     let mut cursorless_locs: HashSet<(u64, u64, u64)> = HashSet::new();
 
     if !meta_records.is_empty() {
-        // More than one record = a merge's sources (the survivor's open
-        // publishes one merged record before it serves). Each was written by
+        // More than one record = a merge's sources, or a failed freeze's
+        // record beside the one before it (same tables); the open publishes
+        // one merged record before it serves. Each was written by
         // the merge freeze drain with writes stopped and the memtable flushed:
         // its cursor is its source's committed log end and its SSTs hold
         // everything before it. So nothing in either source's extents needs
@@ -10287,14 +10317,9 @@ pub(crate) fn decode_records_chunk(
     Ok((out, cursor))
 }
 
-/// Walk all extents in a meta_stream and collect the LAST checkpoint from each
-/// non-empty extent. Used by
-/// recovery to gather both survivor's and victim's checkpoints
-/// after a partition merge spliced their meta_streams together.
-///
-/// Pre-merge partitions have one non-empty extent → single record →
-/// behaviour identical to the legacy `read_last_extent_data +
-/// decode_last_table_checkpoint`. Post-merge they have N extents.
+/// The last checkpoint of each non-empty meta extent, in stream order: a
+/// merge splices one per source, and a deferred cut leaves older ones.
+/// Recovery picks from them with `select_checkpoint_records`.
 pub(crate) async fn read_all_table_locations(
     stream_id: u64,
     sc: &Rc<StreamClient>,
@@ -10321,6 +10346,88 @@ pub(crate) async fn read_all_table_locations(
         }
     }
     Ok(out)
+}
+
+/// The records recovery loads, from the last record of each meta extent in
+/// stream order. A normal record lists every table of the partition, so the
+/// newest one supersedes everything before it: a checkpoint whose cut of the
+/// older extents was deferred, or never made before a crash, leaves the older
+/// records behind, and they can name tables a compaction has since replaced
+/// and whose row extents are gone. Freeze records come one per merge source
+/// (each is the only record of its stream when written), so the run of them
+/// after the newest normal record is the merge's sources; a split child or
+/// an aborted freeze has a run of one.
+pub(crate) fn select_checkpoint_records(
+    records: Vec<TableLocations>,
+) -> Result<Vec<TableLocations>> {
+    if let Some(r) = records
+        .iter()
+        .find(|r| r.kind != CHECKPOINT_KIND_NORMAL && r.kind != CHECKPOINT_KIND_FREEZE)
+    {
+        return Err(anyhow!(
+            "checkpoint record of kind {} (vp {}:{}): written before 0.3.0 or by a newer \
+             build; run `autumn-convert checkpoint-kind` with every PS stopped",
+            r.kind,
+            r.vp_extent_id,
+            r.vp_offset
+        ));
+    }
+    let start = records
+        .iter()
+        .rposition(|r| r.kind == CHECKPOINT_KIND_NORMAL)
+        .map_or(0, |i| {
+            if i + 1 == records.len() {
+                i
+            } else {
+                i + 1
+            }
+        });
+    let mut records = records;
+    Ok(records.split_off(start))
+}
+
+#[cfg(test)]
+mod select_checkpoint_records_tests {
+    use super::*;
+
+    fn rec(kind: u32, vp: u64) -> TableLocations {
+        TableLocations {
+            vp_extent_id: vp,
+            kind,
+            ..Default::default()
+        }
+    }
+
+    fn vps(rs: Vec<TableLocations>) -> Vec<u64> {
+        select_checkpoint_records(rs).unwrap().iter().map(|r| r.vp_extent_id).collect()
+    }
+
+    const N: u32 = CHECKPOINT_KIND_NORMAL;
+    const F: u32 = CHECKPOINT_KIND_FREEZE;
+
+    #[test]
+    fn the_newest_normal_record_supersedes_the_older_ones() {
+        assert_eq!(vps(vec![rec(N, 1)]), vec![1]);
+        assert_eq!(vps(vec![rec(N, 1), rec(N, 2)]), vec![2]);
+        // A merged open's record, its sources' cut deferred.
+        assert_eq!(vps(vec![rec(F, 1), rec(F, 2), rec(N, 3)]), vec![3]);
+        assert_eq!(vps(vec![]), Vec::<u64>::new());
+    }
+
+    #[test]
+    fn the_freeze_records_after_it_are_a_merge_s_sources() {
+        assert_eq!(vps(vec![rec(F, 1), rec(F, 2)]), vec![1, 2]);
+        // A split child whose parent's earlier record was not cut.
+        assert_eq!(vps(vec![rec(N, 1), rec(F, 2)]), vec![2]);
+        assert_eq!(vps(vec![rec(N, 1), rec(F, 2), rec(F, 3)]), vec![2, 3]);
+    }
+
+    #[test]
+    fn a_record_from_before_the_kind_is_refused() {
+        assert!(select_checkpoint_records(vec![rec(0, 1)]).is_err());
+        assert!(select_checkpoint_records(vec![rec(0, 1), rec(N, 2)]).is_err());
+        assert!(select_checkpoint_records(vec![rec(3, 1)]).is_err());
+    }
 }
 
 /// Decode the last valid checkpoint record in a meta extent.
@@ -10428,7 +10535,8 @@ pub(crate) async fn save_table_locs_raw(
     // Lease write fencing: fence-floor snapshot, captured by the caller
     // under the SAME borrow as `tables`, both under `publish_lock`.
     fence_floors: Vec<(u64, u64)>,
-) -> Result<()> {
+    kind: u32,
+) -> Result<(u64, u64)> {
     let locs = TableLocations {
         locs: tables
             .iter()
@@ -10440,11 +10548,12 @@ pub(crate) async fn save_table_locs_raw(
             .collect(),
         vp_extent_id,
         vp_offset,
-        // Unused: recovery starts a merged open at the latest source cursor
-        // and needs no per-source regions. The field stays in the format.
-        log_extent_count: 0,
+        kind,
         fence_floors,
     };
+    if kind == CHECKPOINT_KIND_FREEZE {
+        cut_before_newest_record(stream_client, meta_stream_id).await?;
+    }
     let payload = rkyv_encode(&locs);
     let mut data = Vec::with_capacity(4 + payload.len());
     data.extend_from_slice(&(payload.len() as u32).to_le_bytes());
@@ -10476,6 +10585,13 @@ pub(crate) async fn save_table_locs_raw(
         .extent_ids
         .iter()
         .position(|&eid| eid == ckpt_result.extent_id);
+    if kind == CHECKPOINT_KIND_FREEZE && ckpt_pos.is_none() {
+        return Err(anyhow!(
+            "meta stream {meta_stream_id}: the freeze checkpoint's extent {} is not in {:?}",
+            ckpt_result.extent_id,
+            info.extent_ids
+        ));
+    }
     if ckpt_pos.is_some_and(|pos| pos > 0) {
         // Reclaiming the extents before this checkpoint is not part of
         // publishing it. The manager refuses it while another op (a recovery,
@@ -10485,11 +10601,59 @@ pub(crate) async fn save_table_locs_raw(
             .truncate(meta_stream_id, ckpt_result.extent_id)
             .await
         {
-            if !manager_says_retry_later(&e) {
-                return Err(e);
+            // A freeze record must be its stream's only record: a merge
+            // splices one per source, and recovery takes the run of freeze
+            // records back to the first normal one.
+            if kind == CHECKPOINT_KIND_FREEZE || !manager_says_retry_later(&e) {
+                return Err(e).context("truncate the meta stream before the checkpoint");
             }
             tracing::info!(meta_stream_id, "meta stream truncate deferred: {e}");
         }
+    }
+    Ok((ckpt_result.extent_id, ckpt_result.end as u64))
+}
+
+/// Before a freeze record is appended: drop every meta extent before the one
+/// holding the newest record, so the freeze lands where only that record (or
+/// an empty extent) precedes it. Its own cut after the append may still fail,
+/// and then what is left is harmless: the newest record before it is a normal
+/// one, which recovery's run of freeze records stops at, or a freeze record
+/// listing the same tables (only normal records change them). Without this, a
+/// stale freeze record in an older extent and a normal one hidden behind the
+/// new freeze record in the same extent read as one run of freeze records,
+/// and the open loaded the stale tables
+/// (`crates/manager/tests/system_freeze_failed_cut_reopen.rs`). Any refusal
+/// fails the freeze before anything is written.
+async fn cut_before_newest_record(sc: &Rc<StreamClient>, meta_stream_id: u64) -> Result<()> {
+    let info = sc.get_stream_info(meta_stream_id).await?;
+    let mut newest = None;
+    for &eid in info.extent_ids.iter().rev() {
+        let (payload, _) = sc.read_bytes_from_extent(eid, 0, 0).await?;
+        if payload.is_empty() {
+            continue;
+        }
+        // Recovery skips an extent with no valid record; cutting before one
+        // would drop the record it falls back to.
+        decode_last_table_checkpoint(&payload)
+            .with_context(|| format!("meta extent {eid}: no valid checkpoint record"))?;
+        newest = Some(eid);
+        break;
+    }
+    let Some(newest) = newest else {
+        return Ok(());
+    };
+    if info.extent_ids.first() == Some(&newest) {
+        return Ok(());
+    }
+    let after = sc
+        .truncate(meta_stream_id, newest)
+        .await
+        .context("cut the meta stream before a freeze checkpoint")?;
+    if after.extent_ids.first() != Some(&newest) {
+        return Err(anyhow!(
+            "meta stream {meta_stream_id}: cut before extent {newest} left {:?}",
+            after.extent_ids
+        ));
     }
     Ok(())
 }
@@ -10557,18 +10721,19 @@ async fn publish_freeze_checkpoint(part: &Rc<RefCell<PartitionData>>) -> Result<
         let p = part.borrow();
         (p.tables.clone(), snapshot_fence_floors(&p))
     };
-    save_table_locs_raw(
+    let meta_end = save_table_locs_raw(
         &sc,
         meta_stream_id,
         &tables,
         tail_extent_id,
         committed_end,
         floors,
+        CHECKPOINT_KIND_FREEZE,
     )
     .await?;
-    part.borrow()
-        .durable_ckpt_vp
-        .set((tail_extent_id, committed_end));
+    let p = part.borrow();
+    p.durable_ckpt_vp.set((tail_extent_id, committed_end));
+    p.freeze_meta_end.set(meta_end);
     Ok(())
 }
 
@@ -10821,6 +10986,7 @@ async fn commit_flush_outcome_inner(
         outcome.vp_eid,
         outcome.vp_off,
         floors_snapshot,
+        CHECKPOINT_KIND_NORMAL,
     )
     .await?;
     {
@@ -10980,7 +11146,7 @@ async fn publish_merged_checkpoint(part: &Rc<RefCell<PartitionData>>) -> Result<
             snapshot_fence_floors(&p),
         )
     };
-    save_table_locs_raw(&sc, meta_stream_id, &tables, vp.0, vp.1, floors).await?;
+    save_table_locs_raw(&sc, meta_stream_id, &tables, vp.0, vp.1, floors, CHECKPOINT_KIND_NORMAL).await?;
     part.borrow().durable_ckpt_vp.set(vp);
     Ok(())
 }
@@ -12291,7 +12457,7 @@ mod tests {
             ],
             vp_extent_id: 42,
             vp_offset: 512,
-            log_extent_count: 0,
+            kind: CHECKPOINT_KIND_NORMAL,
         };
         let payload = rkyv_encode(&locs);
         let mut data = Vec::new();
@@ -12317,7 +12483,7 @@ mod tests {
             }],
             vp_extent_id: 10,
             vp_offset: 0,
-            log_extent_count: 0,
+            kind: CHECKPOINT_KIND_NORMAL,
         };
         let locs2 = TableLocations {
             fence_floors: vec![],
@@ -12335,7 +12501,7 @@ mod tests {
             ],
             vp_extent_id: 20,
             vp_offset: 50,
-            log_extent_count: 0,
+            kind: CHECKPOINT_KIND_NORMAL,
         };
 
         let mut data = Vec::new();
@@ -12368,7 +12534,7 @@ mod tests {
             locs: vec![],
             vp_extent_id: 12,
             vp_offset: 900,
-            log_extent_count: 3,
+            kind: CHECKPOINT_KIND_NORMAL,
         };
         let table_payload = rkyv_encode(&locs);
         let boundary = LegacyMergeSourceBoundary {
@@ -12416,7 +12582,7 @@ mod tests {
             }],
             vp_extent_id: 10,
             vp_offset: 0,
-            log_extent_count: 0,
+            kind: CHECKPOINT_KIND_NORMAL,
         };
         let locs3 = TableLocations {
             fence_floors: vec![],
@@ -12439,7 +12605,7 @@ mod tests {
             ],
             vp_extent_id: 30,
             vp_offset: 100,
-            log_extent_count: 0,
+            kind: CHECKPOINT_KIND_NORMAL,
         };
 
         let mut data = Vec::new();
@@ -15341,11 +15507,12 @@ mod merge_freeze_tests {
             let a = start(&state, &gate);
             until(|| state.is_halted()).await;
             let (attempt, tx) = state.take_draining().expect("draining");
-            assert!(tx.send(Ok((7, 4096))).is_ok());
+            assert!(tx.send(Ok(DrainedAt { log: (7, 4096), meta: (9, 68) })).is_ok());
             state.set_drained(attempt);
             let r = answer(a).await;
             assert_eq!(r.code, partition_rpc::CODE_OK);
             assert_eq!((r.log_tail_extent_id, r.log_end), (7, 4096));
+            assert_eq!((r.meta_tail_extent_id, r.meta_end), (9, 68));
             assert!(state.is_drained() && state.is_halted());
         });
     }
@@ -15362,14 +15529,14 @@ mod merge_freeze_tests {
             drop(a.resp);
             until(|| state.is_halted()).await;
             let (attempt, tx) = state.take_draining().expect("draining");
-            assert!(tx.send(Ok((7, 4096))).is_ok());
+            assert!(tx.send(Ok(DrainedAt { log: (7, 4096), meta: (9, 68) })).is_ok());
             state.set_drained(attempt);
             state.end();
             let b = start(&state, &gate);
             until(|| state.is_halted()).await;
             assert!(state.is_draining(), "B was ended by A's cleanup");
             let (attempt, tx) = state.take_draining().expect("B draining");
-            assert!(tx.send(Ok((8, 1))).is_ok());
+            assert!(tx.send(Ok(DrainedAt { log: (8, 1), meta: (9, 1) })).is_ok());
             state.set_drained(attempt);
             assert_eq!(answer(b).await.code, partition_rpc::CODE_OK);
         });

@@ -4595,7 +4595,10 @@ impl AutumnManager {
                         resp.message
                     )));
                 }
-                Ok((resp.log_tail_extent_id, resp.log_end))
+                Ok((
+                    (resp.log_tail_extent_id, resp.log_end),
+                    (resp.meta_tail_extent_id, resp.meta_end),
+                ))
             }
         };
 
@@ -4745,8 +4748,8 @@ impl AutumnManager {
         // moved it; the capture includes such a write, but the merged
         // partition would never replay it.
         for ((part_id, log_stream, drained), measured_end) in [
-            (req.survivor_part_id, s_info.log_stream, s_drained),
-            (req.victim_part_id, v_info.log_stream, v_drained),
+            (req.survivor_part_id, s_info.log_stream, s_drained.0),
+            (req.victim_part_id, v_info.log_stream, v_drained.0),
         ]
         .into_iter()
         .zip(log_lens)
@@ -4784,6 +4787,31 @@ impl AutumnManager {
                 return Err((code, msg));
             }
         };
+        // The merged open loads one freeze record per source, the run after
+        // the newest normal record. A normal checkpoint a source published
+        // after its freeze (a compaction once the freeze was lifted, with the
+        // log unmoved) would supersede the other source's record, so each
+        // meta stream must still end at its freeze record.
+        for ((part_id, meta_stream, drained), measured_end) in [
+            (req.survivor_part_id, s_info.meta_stream, s_drained.1),
+            (req.victim_part_id, v_info.meta_stream, v_drained.1),
+        ]
+        .into_iter()
+        .zip(meta_lens)
+        {
+            let measured = (sources.for_stream(meta_stream).2, measured_end);
+            if measured != drained {
+                rollback(to_unfreeze.clone(), self.conn_pool.clone()).await;
+                return Ok(rkyv_encode(&MergePartitionsResp {
+                    code: CODE_PRECONDITION,
+                    message: format!(
+                        "partition {part_id} published a checkpoint after its freeze drain \
+                         (meta drained at {drained:?}, now {measured:?}); retry merge"
+                    ),
+                    new_log_tail_extent_id: 0,
+                }));
+            }
+        }
 
         // Test failpoint (always 0 in production): a slow/paused coordinator
         // between the capture and the txn.
