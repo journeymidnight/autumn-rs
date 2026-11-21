@@ -1224,8 +1224,9 @@ loaded no tables and GC had already punched the log those SSTs covered
 `set_ckpt_truncate_pause`; red with the cut at the last extent). The
 truncate is reclamation, not part of publishing: the manager refuses it while
 another op (a recovery, an EC conversion) is in flight on one of the old extents
-— nothing preempts (manager CLAUDE.md, "Extent arbiter") — and that refusal is a
-transient conflict (`manager_says_retry_later`), so the checkpoint stands and the
+— nothing preempts (manager CLAUDE.md, "Extent arbiter") — or while a split
+sibling sharing one of them is held by a split/merge (manager CLAUDE.md,
+"Topology gate"), and either refusal is a transient conflict (`manager_says_retry_later`), so the checkpoint stands and the
 next one truncates. Any other refusal (the owner fence) still fails it. Until
 then the older records stay beside the new one, and recovery must not load
 them: they can name tables a major compaction has replaced since, whose row

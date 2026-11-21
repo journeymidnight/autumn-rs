@@ -520,7 +520,10 @@ From before that wait until the op ends, the partitions are in
 (checked after its alloc awaits, right before the marker), recovery dispatch
 and in-place catch-up (the need and its backoff are kept, the dispatch waits),
 scrub (counted as not scrubbed), GC `punch_holes` / `truncate` from another
-partition sharing the extents (Precondition, the PS's 30 s soft cooldown; a
+partition sharing the extents (Precondition, built by `inflight_defer_message`
+so it reads as "retry later": a normal checkpoint's meta cut and the row prefix
+cut defer to the next one, a freeze's cut still fails the freeze, GC takes its
+30 s soft cooldown; a
 held partition's own streams are exempt from its own hold — its PS takes the
 maintenance gate before freezing, so its own GC and compaction cannot overlap
 the commit, and any other own-stream punch meets the commit's per-extent

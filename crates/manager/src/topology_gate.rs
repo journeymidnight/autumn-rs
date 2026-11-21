@@ -112,16 +112,19 @@ impl AutumnManager {
             if streams.contains(&stream_id) {
                 continue;
             }
-            let holds = streams.iter().any(|sid| {
+            let held_extent = streams.iter().find_map(|sid| {
                 s.streams
                     .get(sid)
-                    .is_some_and(|st| st.extent_ids.iter().any(|e| removed.contains(e)))
+                    .and_then(|st| st.extent_ids.iter().copied().find(|e| removed.contains(e)))
             });
-            if holds {
-                return Err(autumn_common::AppError::Precondition(format!(
-                    "{op}: partition {pid} holding these extents is being split or merged; \
-                     retry after it"
-                )));
+            if let Some(eid) = held_extent {
+                return Err(autumn_common::AppError::Precondition(
+                    autumn_common::alloc_conflict::inflight_defer_message(
+                        eid,
+                        &format!("split/merge of partition {pid}"),
+                        op,
+                    ),
+                ));
             }
         }
         Ok(())
@@ -323,6 +326,10 @@ mod tests {
             .err()
             .expect("sibling refused");
         assert!(e.to_string().contains("partition 5"), "{e}");
+        assert!(
+            autumn_common::alloc_conflict::is_transient_alloc_conflict_message(&e.to_string()),
+            "a hold is waited out, not final: {e}"
+        );
         assert!(
             m.refuse_if_topology_holds(&removed, 100, "truncate").is_ok(),
             "the held partition's own stream"
