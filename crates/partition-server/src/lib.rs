@@ -10327,22 +10327,8 @@ pub(crate) async fn read_all_table_locations(
     let info = sc.get_stream_info(stream_id).await?;
     let mut out: Vec<TableLocations> = Vec::new();
     for &eid in &info.extent_ids {
-        let (payload, _end) = sc.read_bytes_from_extent(eid, 0, 0).await?;
-        if payload.is_empty() {
-            continue;
-        }
-        // Empty extents (carry no records) are common — skipped above. An
-        // extent with no valid record is skipped with a warning; bit rot
-        // mid-stream keeps the newer valid records (see the decoder).
-        match decode_last_table_checkpoint(&payload) {
-            Ok(locs) => out.push(locs),
-            Err(e) => {
-                tracing::warn!(
-                    extent_id = eid,
-                    error = %e,
-                    "meta_stream extent has no valid TableLocations; skipping"
-                );
-            }
+        if let Some(locs) = read_last_checkpoint(sc, eid).await? {
+            out.push(locs);
         }
     }
     Ok(out)
@@ -10430,60 +10416,57 @@ mod select_checkpoint_records_tests {
     }
 }
 
-/// Decode the last valid checkpoint record in a meta extent.
-pub(crate) fn decode_last_table_checkpoint(data: &[u8]) -> Result<TableLocations> {
-    // Format: sequence of [len: u32 LE][rkyv payload] records. We want the last
-    // successfully decoded record.
-    //
-    // Previously a decode failure mid-stream caused `break`, returning the
-    // PRIOR record. Once rkyv decoding became strict (bytecheck), any bit
-    // rot in a record's payload trips this break-and-fall-back path, silently
-    // discarding all valid records that came AFTER the corrupted one — the
-    // partition restarts on stale state without a single error logged.
-    //
-    // changes the decode-failure handling to: log a WARN with offset +
-    // error, advance past the corrupted record using its declared msg_len, and
-    // continue scanning. This preserves the legitimate partial-tail-write
-    // behaviour (the `total > buf.len()` check still breaks at the end) while
-    // surfacing mid-stream corruption loudly and refusing to silently drop
-    // newer valid records. If `msg_len` itself is corrupt to point into
-    // garbage, we still bound the damage: the next record's length-prefix will
-    // almost certainly fail decode too, and we'll skip it; eventually we either
-    // find a valid record or exit with `last` populated by the last good one.
-    let mut last: Option<TableLocations> = None;
+/// The last complete record of a meta extent: `None` when there is none (an
+/// empty extent, or only an append torn before it was acked: its length
+/// prefix runs past the end), `Err` when that record does not decode. An
+/// older record never stands in for it.
+pub(crate) fn decode_last_table_checkpoint(data: &[u8]) -> Result<Option<TableLocations>> {
+    let mut last = None;
     let mut buf = data;
-    let mut offset = 0usize;
-    let mut skipped: usize = 0;
     while buf.len() >= 4 {
         let msg_len = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
-        let total = 4 + msg_len;
-        if total > buf.len() {
-            // Legitimate partial-tail-write: stop here.
+        let Some(payload) = buf.get(4..4 + msg_len) else {
             break;
-        }
-        let payload = &buf[4..4 + msg_len];
-        match rkyv_decode::<TableLocations>(payload) {
-            Ok(locs) => last = Some(locs),
-            Err(e) => {
-                tracing::warn!(
-                    offset,
-                    msg_len,
-                    error = %e,
-                    "TableLocations record decode failed (likely bit rot); skipping and continuing"
-                );
-                skipped += 1;
-            }
-        }
-        buf = &buf[total..];
-        offset += total;
+        };
+        last = Some(payload);
+        buf = &buf[4 + msg_len..];
     }
-    if skipped > 0 {
-        tracing::warn!(
-            skipped,
-            "skipped {skipped} corrupted TableLocations record(s); newer valid records preserved"
-        );
+    last.map(|p| {
+        rkyv_decode::<TableLocations>(p)
+            .map_err(|e| anyhow!("the last checkpoint record ({} bytes) does not decode: {e}", p.len()))
+    })
+    .transpose()
+}
+
+/// The last record of meta extent `eid`. When the copy read does not decode,
+/// the first copy on another replica that does.
+pub(crate) async fn read_last_checkpoint(
+    sc: &StreamClient,
+    eid: u64,
+) -> Result<Option<TableLocations>> {
+    let (payload, _) = sc.read_bytes_from_extent(eid, 0, 0).await?;
+    let why = match decode_last_table_checkpoint(&payload) {
+        Ok(t) => return Ok(t),
+        Err(e) => e,
+    };
+    let found = sc
+        .read_range_copies(eid, 0, payload.len() as u64)
+        .await
+        .with_context(|| format!("meta extent {eid}: {why:#}; no other copy could be read"))?;
+    let mut tried = Vec::new();
+    for copy in found.copies {
+        tried.push(copy.source);
+        if let Ok(Some(t)) = decode_last_table_checkpoint(&copy.bytes) {
+            tracing::error!(
+                extent_id = eid,
+                served_from = ?copy.source,
+                first_read = %format_args!("{why:#}"),
+                "meta extent checkpoint failed to decode; read from another copy"
+            );
+            return Ok(Some(t));
+        }
     }
-    last.ok_or_else(|| anyhow!("decode TableLocations: no valid record"))
+    Err(why.context(format!("meta extent {eid}: no copy decodes (tried {tried:?})")))
 }
 
 pub(crate) fn in_range(rg: &Range, key: &[u8]) -> bool {
@@ -10628,16 +10611,10 @@ async fn cut_before_newest_record(sc: &Rc<StreamClient>, meta_stream_id: u64) ->
     let info = sc.get_stream_info(meta_stream_id).await?;
     let mut newest = None;
     for &eid in info.extent_ids.iter().rev() {
-        let (payload, _) = sc.read_bytes_from_extent(eid, 0, 0).await?;
-        if payload.is_empty() {
-            continue;
+        if read_last_checkpoint(sc, eid).await?.is_some() {
+            newest = Some(eid);
+            break;
         }
-        // Recovery skips an extent with no valid record; cutting before one
-        // would drop the record it falls back to.
-        decode_last_table_checkpoint(&payload)
-            .with_context(|| format!("meta extent {eid}: no valid checkpoint record"))?;
-        newest = Some(eid);
-        break;
     }
     let Some(newest) = newest else {
         return Ok(());
@@ -12464,7 +12441,7 @@ mod tests {
         data.extend_from_slice(&(payload.len() as u32).to_le_bytes());
         data.extend_from_slice(&payload);
 
-        let decoded = decode_last_table_checkpoint(&data).unwrap();
+        let decoded = decode_last_table_checkpoint(&data).unwrap().unwrap();
         assert_eq!(decoded.locs.len(), 2);
         assert_eq!(decoded.locs[0].extent_id, 1);
         assert_eq!(decoded.locs[1].len, 2000);
@@ -12512,65 +12489,50 @@ mod tests {
         data.extend_from_slice(&(p2.len() as u32).to_le_bytes());
         data.extend_from_slice(&p2);
 
-        let decoded = decode_last_table_checkpoint(&data).unwrap();
+        let decoded = decode_last_table_checkpoint(&data).unwrap().unwrap();
         // Should return the LAST valid record
         assert_eq!(decoded.locs.len(), 2);
         assert_eq!(decoded.vp_extent_id, 20);
         assert_eq!(decoded.vp_offset, 50);
     }
 
-    #[test]
-    fn decode_legacy_unknown_companion_keeps_preceding_checkpoint() {
-        #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
-        struct LegacyMergeSourceBoundary {
-            log_stream_id: u64,
-            vp_extent_id: u64,
-            vp_offset: u64,
-            log_extent_ids: Vec<u64>,
-        }
-
-        let locs = TableLocations {
-            fence_floors: vec![],
-            locs: vec![],
-            vp_extent_id: 12,
-            vp_offset: 900,
-            kind: CHECKPOINT_KIND_NORMAL,
-        };
-        let table_payload = rkyv_encode(&locs);
-        let boundary = LegacyMergeSourceBoundary {
-            log_stream_id: 44,
-            vp_extent_id: 12,
-            vp_offset: 900,
-            log_extent_ids: vec![10, 11, 12],
-        };
-        let boundary_encoded = rkyv_encode(&boundary);
-        let mut boundary_payload = b"AUMSB001".to_vec();
-        boundary_payload.extend_from_slice(&boundary_encoded);
-        assert!(
-            rkyv_decode::<TableLocations>(&boundary_payload).is_err(),
-            "the real legacy companion payload must not decode as TableLocations"
-        );
-        let mut data = Vec::new();
-        data.extend_from_slice(&(table_payload.len() as u32).to_le_bytes());
-        data.extend_from_slice(&table_payload);
-        data.extend_from_slice(&(boundary_payload.len() as u32).to_le_bytes());
-        data.extend_from_slice(&boundary_payload);
-
-        let decoded = decode_last_table_checkpoint(&data).unwrap();
-        assert_eq!(decoded.vp_extent_id, 12);
-        assert_eq!(decoded.vp_offset, 900);
+    fn frame(t: &TableLocations) -> Vec<u8> {
+        let p = rkyv_encode(t);
+        let mut v = (p.len() as u32).to_le_bytes().to_vec();
+        v.extend_from_slice(&p);
+        v
     }
 
-    #[test]
-    fn decode_table_locations_empty_fails() {
-        assert!(decode_last_table_checkpoint(&[]).is_err());
-        assert!(decode_last_table_checkpoint(&[0, 0, 0]).is_err());
+    fn ckpt(vp: u64) -> TableLocations {
+        TableLocations { vp_extent_id: vp, kind: CHECKPOINT_KIND_NORMAL, ..Default::default() }
     }
 
-    /// a corrupted record in the MIDDLE of the stream must not silently
-    /// drop subsequent valid records. The loop previously broke on the first
-    /// decode failure and returned the prior record — losing the newer (valid)
-    /// records entirely. Now the loop logs + skips and continues.
+    /// No complete record: empty, a torn length prefix, or a torn append whose
+    /// length runs past the end. Never acked, so read as no record.
+    #[test]
+    fn a_torn_tail_is_no_record() {
+        assert!(decode_last_table_checkpoint(&[]).unwrap().is_none());
+        assert!(decode_last_table_checkpoint(&[0, 0, 0]).unwrap().is_none());
+        let mut torn = frame(&ckpt(1));
+        torn.truncate(torn.len() - 1);
+        assert!(decode_last_table_checkpoint(&torn).unwrap().is_none());
+        // A torn append after a record leaves that record the last one.
+        let mut data = frame(&ckpt(1));
+        data.extend_from_slice(&torn);
+        assert_eq!(decode_last_table_checkpoint(&data).unwrap().unwrap().vp_extent_id, 1);
+    }
+
+    /// A complete last record that does not decode is an error: the record
+    /// before it is stale, not a fallback.
+    #[test]
+    fn an_undecodable_last_record_is_an_error() {
+        let mut data = frame(&ckpt(1));
+        data.extend_from_slice(&64u32.to_le_bytes());
+        data.extend_from_slice(&[0xAB; 64]);
+        assert!(decode_last_table_checkpoint(&data).is_err());
+    }
+
+    /// An older record that does not decode is superseded by the newer one.
     #[test]
     fn decode_table_locations_skips_mid_stream_corruption() {
         let locs1 = TableLocations {
@@ -12623,7 +12585,7 @@ mod tests {
         data.extend_from_slice(&(p3.len() as u32).to_le_bytes());
         data.extend_from_slice(&p3);
 
-        let decoded = decode_last_table_checkpoint(&data).unwrap();
+        let decoded = decode_last_table_checkpoint(&data).unwrap().unwrap();
         // Must return record 3, NOT record 1.
         assert_eq!(
             decoded.locs.len(),

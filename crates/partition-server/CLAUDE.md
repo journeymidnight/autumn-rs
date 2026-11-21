@@ -1253,6 +1253,22 @@ splice is `[survivor meta][victim meta]`), or one for a split child or an
 aborted freeze. Kind 0 (before 0.3.0) or any other value refuses the open
 (`autumn-convert checkpoint-kind`, docs/ops.md).
 
+The last record of an extent is its last COMPLETE frame
+(`decode_last_table_checkpoint`; `read_last_checkpoint` reads it). An extent
+with none — empty, or only an append torn before it was acked (its length
+prefix runs past the end, and the open's seal-over-reachable can keep it) —
+holds no record and is skipped. A complete last frame that does not decode is
+read from the other copies (`read_range_copies`), the first that decodes used;
+with none the open fails, naming the extent. An older record never stands in
+for it: the open used to skip such an extent, or fall back to the record
+before it, and with the only checkpoint rotted it opened with no tables and
+the next flush published that empty list
+(`crates/manager/tests/system_meta_record_rot_reopen.rs`: the only copy rotted
+fails the open; the copy read first rotted opens from another — red without
+the fallback). Records carry no CRC: any record's length prefix rotted to
+point past the end reads as a torn tail there, and the record before it is
+taken, with no other copy asked.
+
 INVARIANT: a freeze that succeeds leaves its record the only record of its
 meta stream. Its cut after the append is never deferred: a deferral or a
 missing extent fails the freeze, and the split or merge is retried. A victim
@@ -1271,10 +1287,9 @@ aborted freeze, then a major's `N` in B with its cut deferred, then the next
 freeze's `F2` behind `N` in B with its cut refused, read as the run
 `F_old, F2`: `N` hidden, the open loaded the tables the major replaced, whose
 row extent was gone (`crates/manager/tests/system_freeze_failed_cut_reopen.rs`,
-red without the pre-cut). The newest record is the newest extent whose last
-record decodes, recovery's predicate; a newer non-empty extent that does not
-decode fails the freeze rather than be cut past (until the next normal
-checkpoint lands behind it).
+red without the pre-cut). The newest record is found as recovery finds it
+(`read_last_checkpoint`): an extent holding no complete frame is passed over,
+and one whose last record no copy decodes fails the freeze.
 
 A merge source whose freeze is lifted before the takeover (TTL, a stale
 unfreeze, a restart) can still publish a normal record (a compaction) without
@@ -2527,8 +2542,9 @@ stay gate-first to match split, else `acquire_compact ↔ maintenance_gate` cycl
        `crates/manager/tests/write_outcome_settled.rs` without the seal. The seal
        comes AFTER the fence: sealed first, the previous owner could still append
        past the seal and be acknowledged.
-  1. Read the last TableLocations record of each non-empty metaStream extent;
-     load the ones `select_checkpoint_records` keeps (see "Checkpoint kind")
+  1. Read the last TableLocations record of each metaStream extent holding one
+     (another copy when it does not decode, else the open fails); load the ones
+     `select_checkpoint_records` keeps (see "Checkpoint kind")
   2. For each location: read SST bytes from rowStream (META TAIL only), open SstReader
   3. Compute max seq_number + VP head from SSTables
   4. Replay logStream from VP head forward (committed-clamped, 64 MB chunked-carry):

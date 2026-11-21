@@ -36,20 +36,15 @@ pub enum Outcome {
     Cut,
 }
 
-/// The last valid record of each non-empty meta extent, with that extent, in
-/// stream order. A non-empty extent with no valid record is refused.
+/// The last record of each meta extent holding one, with that extent, in
+/// stream order, read the way recovery reads it.
 async fn read_records(sc: &StreamClient, meta_stream: u64) -> Result<Vec<(u64, TableLocations)>> {
     let info = sc.get_stream_info(meta_stream).await?;
     let mut out = Vec::new();
     for &eid in &info.extent_ids {
-        let (payload, _) = sc.read_bytes_from_extent(eid, 0, 0).await?;
-        if payload.is_empty() {
-            continue;
+        if let Some(t) = crate::read_last_checkpoint(sc, eid).await? {
+            out.push((eid, t));
         }
-        let t = crate::decode_last_table_checkpoint(&payload).with_context(|| {
-            format!("meta extent {eid} holds {} bytes and no valid checkpoint record", payload.len())
-        })?;
-        out.push((eid, t));
     }
     Ok(out)
 }
@@ -164,7 +159,9 @@ pub async fn convert_partition(
     let r = sc.append(meta_stream, &encode(&new)).await.context("publish checkpoint")?;
     // Read it back from its extent, the way recovery will, before cutting.
     let (got, _) = sc.read_bytes_from_extent(r.extent_id, 0, 0).await?;
-    let back = crate::decode_last_table_checkpoint(&got).context("re-read checkpoint")?;
+    let back = crate::decode_last_table_checkpoint(&got)
+        .context("re-read checkpoint")?
+        .context("re-read checkpoint: no complete record")?;
     if !same(&back, &new) {
         bail!("meta extent {} does not read back as the record just published; nothing was cut", r.extent_id);
     }

@@ -5461,7 +5461,8 @@ Records of one partition alone, left by a deferred cut (0.2.x would load
 both): rerun with `--keep-newest P`, which converts the newest and cuts the
 rest. Which case it is, the operator decides: a merge's records are each a
 source's, and the merge's history (`autumn-op ops history --kind merge`)
-names the partition. A run
+names the partition. A meta extent whose last record does not decode on any
+copy is refused, naming the extent (a 0.3.0 PS refuses to open it too). A run
 stopped anywhere is run again; `--dry-run` only reads.
 
 **After any stop-the-world restart, rebalance.** `handle_register_ps` runs
