@@ -257,6 +257,207 @@ fn getattr_reports_an_append_made_by_another_mount_while_an_fd_is_open() {
     });
 }
 
+/// A mount holding no lease on a file hears of no writes to it, so what it
+/// cached while it had the file open must not answer GETATTR once it closed
+/// it. A `cat` of a file another mount was still writing left its size behind,
+/// and `stat` reported it until the kernel forgot the inode.
+#[test]
+fn getattr_reports_a_write_another_mount_made_after_this_one_closed_the_file() {
+    let mgr_addr = pick_addr();
+    start_manager(mgr_addr);
+    let n1_dir = tempfile::tempdir().expect("n1");
+    let n2_dir = tempfile::tempdir().expect("n2");
+    let n1_addr = pick_addr();
+    let n2_addr = pick_addr();
+    start_extent_node(n1_addr, n1_dir.path().to_path_buf(), 1);
+    start_extent_node(n2_addr, n2_dir.path().to_path_buf(), 2);
+
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        boot_cluster(mgr_addr, n1_addr, n2_addr, 194, 19401).await;
+        let mut reader = mount(mgr_addr).await;
+        dispatch::spawn_lease_background_tasks(&reader, None);
+        let mut writer = mount(mgr_addr).await;
+        let ino = 1940u64;
+        seed_file(&mut writer, b"late.bin", ino).await;
+
+        // The reader's kernel looks the name up (and keeps the inode) and
+        // reads the file while it is still empty.
+        let (tx, rx) = bridge::reply_channel::<(autumn_fuse::fuser::FileAttr, u64)>();
+        let req = bridge::FsRequest::Lookup { parent: ROOT_INO, name: "late.bin".into(), reply: tx };
+        dispatch::handle_request(&mut reader, req, None).await;
+        let (attr, found) = rx.recv_timeout(Duration::from_secs(10)).expect("lookup reply").expect("lookup");
+        assert_eq!((found, attr.size), (ino, 0));
+        open(&mut reader, ino, O_RDONLY).await;
+        release(&mut reader, ino, O_RDONLY).await;
+
+        rewrite(&mut writer, ino, 0xAA).await;
+        assert!(reader.inodes.contains_key(&ino), "non-vacuity: the close left the inode cached");
+        assert_eq!(
+            getattr_size(&mut reader, ino).await,
+            4096,
+            "GETATTR answered the size cached while the file was open"
+        );
+    });
+}
+
+/// `open(O_TRUNC)` arrives as a SETATTR before the OPEN, with no lease held
+/// yet: the truncate must start from the file's size, not from what an
+/// earlier open cached. From a cached 0, `echo x > file` was a no-op truncate
+/// and the write landed over the other mount's bytes.
+#[test]
+fn a_truncate_without_a_lease_starts_from_the_current_size() {
+    let mgr_addr = pick_addr();
+    start_manager(mgr_addr);
+    let n1_dir = tempfile::tempdir().expect("n1");
+    let n2_dir = tempfile::tempdir().expect("n2");
+    let n1_addr = pick_addr();
+    let n2_addr = pick_addr();
+    start_extent_node(n1_addr, n1_dir.path().to_path_buf(), 1);
+    start_extent_node(n2_addr, n2_dir.path().to_path_buf(), 2);
+
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        boot_cluster(mgr_addr, n1_addr, n2_addr, 195, 19501).await;
+        let mut a = mount(mgr_addr).await;
+        dispatch::spawn_lease_background_tasks(&a, None);
+        let mut b = mount(mgr_addr).await;
+        let ino = 1950u64;
+        seed_file(&mut b, b"trunc.bin", ino).await;
+
+        let (tx, rx) = bridge::reply_channel::<(autumn_fuse::fuser::FileAttr, u64)>();
+        let req = bridge::FsRequest::Lookup { parent: ROOT_INO, name: "trunc.bin".into(), reply: tx };
+        dispatch::handle_request(&mut a, req, None).await;
+        rx.recv_timeout(Duration::from_secs(10)).expect("lookup reply").expect("lookup");
+        open(&mut a, ino, O_RDWR).await;
+        release(&mut a, ino, O_RDWR).await;
+        rewrite(&mut b, ino, 0xAA).await;
+        let written = meta::fetch_inode(&mut b, ino).await.expect("fetch").generation;
+
+        // `echo x > trunc.bin` on A: SETATTR(size 0), OPEN, WRITE, RELEASE.
+        let (tx, rx) = bridge::reply_channel::<autumn_fuse::fuser::FileAttr>();
+        let req = bridge::FsRequest::SetAttr {
+            ino,
+            mode: None,
+            uid: None,
+            gid: None,
+            size: Some(0),
+            atime: None,
+            mtime: None,
+            reply: tx,
+        };
+        dispatch::handle_request(&mut a, req, None).await;
+        rx.recv_timeout(Duration::from_secs(10)).expect("setattr reply").expect("setattr");
+        let m = meta::fetch_inode(&mut b, ino).await.expect("fetch");
+        assert_eq!(m.size, 0);
+        assert!(m.generation > written, "the truncate was a no-op: the SETATTR put back the meta A cached");
+        open(&mut a, ino, O_RDWR).await;
+        write(&mut a, ino, 0, b"x\n".to_vec()).await;
+        release(&mut a, ino, O_RDWR).await;
+
+        let m = meta::fetch_inode(&mut b, ino).await.expect("fetch");
+        assert_eq!(m.size, 2, "the truncate started from the cached size: B's bytes survive past A's write");
+    });
+}
+
+/// A SETATTR that changes no size (`chmod`, `touch`) puts the whole meta it
+/// read back, so with no lease it must read the current one: from what an
+/// earlier open cached, `touch` set the file back to that size.
+#[test]
+fn a_chmod_without_a_lease_keeps_another_mount_s_write() {
+    let mgr_addr = pick_addr();
+    start_manager(mgr_addr);
+    let n1_dir = tempfile::tempdir().expect("n1");
+    let n2_dir = tempfile::tempdir().expect("n2");
+    let n1_addr = pick_addr();
+    let n2_addr = pick_addr();
+    start_extent_node(n1_addr, n1_dir.path().to_path_buf(), 1);
+    start_extent_node(n2_addr, n2_dir.path().to_path_buf(), 2);
+
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        boot_cluster(mgr_addr, n1_addr, n2_addr, 197, 19701).await;
+        let mut a = mount(mgr_addr).await;
+        let mut b = mount(mgr_addr).await;
+        let ino = 1970u64;
+        seed_file(&mut b, b"chmod.bin", ino).await;
+        let (tx, rx) = bridge::reply_channel::<(autumn_fuse::fuser::FileAttr, u64)>();
+        let req = bridge::FsRequest::Lookup { parent: ROOT_INO, name: "chmod.bin".into(), reply: tx };
+        dispatch::handle_request(&mut a, req, None).await;
+        rx.recv_timeout(Duration::from_secs(10)).expect("lookup reply").expect("lookup");
+        open(&mut a, ino, O_RDONLY).await;
+        release(&mut a, ino, O_RDONLY).await;
+        assert!(a.inodes.contains_key(&ino), "non-vacuity: the close left the inode cached");
+        rewrite(&mut b, ino, 0xAA).await;
+        let written = meta::fetch_inode(&mut b, ino).await.expect("fetch");
+
+        let (tx, rx) = bridge::reply_channel::<autumn_fuse::fuser::FileAttr>();
+        let req = bridge::FsRequest::SetAttr {
+            ino,
+            mode: Some(0o600),
+            uid: None,
+            gid: None,
+            size: None,
+            atime: None,
+            mtime: None,
+            reply: tx,
+        };
+        dispatch::handle_request(&mut a, req, None).await;
+        rx.recv_timeout(Duration::from_secs(10)).expect("setattr reply").expect("setattr");
+
+        let m = meta::fetch_inode(&mut b, ino).await.expect("fetch");
+        assert_eq!(m.mode & 0o7777, 0o600);
+        assert_eq!(
+            (m.size, m.generation),
+            (written.size, written.generation),
+            "the chmod put back the meta A cached before B's write"
+        );
+    });
+}
+
+/// An fd left without a lease (a lost poll drops READ slots) re-reads the
+/// meta on every read, and keeps its extent map only while the content is
+/// unchanged. A write into a hole changes neither the size nor any extent the
+/// map already lists, so a map kept past it reads the new bytes as zeros.
+#[test]
+fn a_read_without_a_lease_sees_a_write_into_a_hole() {
+    let mgr_addr = pick_addr();
+    start_manager(mgr_addr);
+    let n1_dir = tempfile::tempdir().expect("n1");
+    let n2_dir = tempfile::tempdir().expect("n2");
+    let n1_addr = pick_addr();
+    let n2_addr = pick_addr();
+    start_extent_node(n1_addr, n1_dir.path().to_path_buf(), 1);
+    start_extent_node(n2_addr, n2_dir.path().to_path_buf(), 2);
+
+    compio::runtime::Runtime::new().unwrap().block_on(async {
+        boot_cluster(mgr_addr, n1_addr, n2_addr, 196, 19601).await;
+        let mut a = mount(mgr_addr).await;
+        let mut b = mount(mgr_addr).await;
+        let ino = 1960u64;
+        seed_file(&mut b, b"sparse.bin", ino).await;
+        const MIB: i64 = 1 << 20;
+        open(&mut b, ino, O_RDWR).await;
+        write(&mut b, ino, 0, vec![0xAA; MIB as usize]).await;
+        write(&mut b, ino, 16 * MIB - 4096, vec![0xAA; 4096]).await;
+        release(&mut b, ino, O_RDWR).await;
+
+        open(&mut a, ino, O_RDONLY).await;
+        let hole = autumn_fs::read::read(&mut a, ino, 8 * MIB, 4096).await.expect("read hole");
+        assert!(hole.iter().all(|&x| x == 0), "precondition: a hole reads as zeros");
+        assert!(
+            a.inodes.get(&ino).and_then(|is| is.extents.as_ref()).is_some(),
+            "non-vacuity: the read cached the extent map"
+        );
+        a.held_leases.borrow_mut().remove(&ino);
+
+        open(&mut b, ino, O_RDWR).await;
+        write(&mut b, ino, 8 * MIB, vec![0xBB; 4096]).await;
+        release(&mut b, ino, O_RDWR).await;
+        assert_eq!(meta::fetch_inode(&mut b, ino).await.expect("fetch").size, 16 * MIB as u64);
+
+        let got = autumn_fs::read::read(&mut a, ino, 8 * MIB, 4096).await.expect("read");
+        assert!(got.iter().all(|&x| x == 0xBB), "the read used the extent map from before the write");
+    });
+}
+
 /// Bytes this mount wrote are in its page cache under its own write lease:
 /// the next open must keep them rather than read them all back.
 #[test]

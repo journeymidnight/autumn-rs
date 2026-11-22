@@ -4512,10 +4512,13 @@ within 5 s), TAIL (A holds an fd read to EOF; B appends; A's same fd reads past
 the old EOF within 5 s — the kernel learns the size only from GETATTR), LOCAL (two fds and a mapping on one mount agree), MMAPW (bytes stored
 through A's writable shared mapping are what B reads), PREFETCH (A reads 16 MiB
 of a 64 MiB file in sequence so the daemon prefetches ahead; B rewrites it; A's
-same fd reads the new bytes past 16 MiB within 3 s). To see it discriminate,
+same fd reads the new bytes past 16 MiB within 3 s), CLOSED (A reads a file while
+it is empty and closes it; B appends; 35 s later, past the attr TTL, A's `stat` and
+`cat` see 4096 bytes). To see it discriminate,
 point `FUSE_BIN` at a build whose `open_keeps_page_cache` ignores the generation
 (`lease_was_held || recorded.is_some()`): REOPEN and MMAPW fail with old bytes;
 on one whose `meta::get_inode` ignores `meta_invalidated`, TAIL stays at the old EOF;
+on one whose `get_inode` uses the cached meta without a lease, CLOSED stays at 0;
 on one whose `PrefetchCache` ignores the generation in both `admit` and `lookup`,
 PREFETCH reads the old bytes (either check alone still passes: the other one
 drops the old blocks first).

@@ -709,6 +709,11 @@ pub async fn truncate(state: &mut FsState, ino: u64, new_size: u64) -> Result<()
 }
 
 async fn truncate_held(state: &mut FsState, ino: u64, new_size: u64) -> Result<()> {
+    // `open(O_TRUNC)` arrives before the OPEN, with no lease: a cached size
+    // from an earlier open may be behind another mount's writes.
+    if state.inodes.contains_key(&ino) && !crate::meta::cache_trusted(state, ino) {
+        get_inode(state, ino).await?;
+    }
     ensure_inode_cached(state, ino).await?;
     // fuse truncate of a striped file would run the legacy
     // range-scan extent cleanup, which finds no `[0x03][lane]…` keys → leaks the

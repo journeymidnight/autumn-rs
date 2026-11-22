@@ -193,8 +193,8 @@ GETATTR 一直答旧 size）。
 那里答的是缓存的旧 meta。实测（真挂载 TAIL：A 持 fd 读到 EOF，B 追加并关闭）：A 永远停在
 旧 EOF，`fstat` 也是旧值；HEAD 上同一步通过。修法：invalidation 轮询循环把每个事件的 ino
 （以及 poll 失败 / overflow 时的全部 held ino）放进 `FsState.meta_invalidated`，
-`meta::get_inode`（GetAttr、Lookup 都经过它）遇到标记时从 KV 重读一次、丢掉按 size 算的
-extent map、清标记。不用 `invalidations` 的版本下限做比较：poll 失败 / overflow 时本来就不知道
+`meta::get_inode`（GetAttr、Lookup 都经过它）遇到标记时从 KV 重读一次（size 或
+generation 变了就丢掉 extent map）、清标记。不用 `invalidations` 的版本下限做比较：poll 失败 / overflow 时本来就不知道
 漏了哪个版本的事件，只能整体标记。**本挂载持写 lease（未撤销）或 inode 脏时不重读**：那时别人改不了文件，
 标记（发给我们的 WillRevokeIn）不说明内容变了，而缓存的 size 可能领先 KV（flush 在 put
 落地前清 `dirty`，put 失败就停在那里）——收下 KV 的更小 size 就是 `get_inode_uncached`
@@ -204,11 +204,29 @@ extent map、清标记。不用 `invalidations` 的版本下限做比较：poll 
 await 期间到来的新事件会重新标记，不会被随后的清除抹掉），读失败放回并报错（GETATTR 以前
 答缓存，现在报错直到读成功）；FORGET 时也清掉。
 
+**没持 lease 时缓存的 meta 不作数。** 失效事件只推给持有 lease 的挂载，而最后一个 fd
+关闭就还 lease；只要内核还引用着 inode（lookup 计数不为 0），`InodeState` 就留在缓存里。
+所以 `get_inode` 只在本挂载对该 inode 持有未撤销的 lease（且未被标记）、持写 lease 或 inode
+脏时用缓存（`meta::cache_trusted`），否则从 KV 现读并刷新缓存。用旧缓存会：`stat` 停在上次打开时的
+大小、再 `cat` 读不到超出部分（内核的 `i_size` 来自 GETATTR，超出部分不发 READ），直到 FORGET；
+`chmod` / `touch` 把整份旧 meta 写回（`put_inode` 写调用方的整份 meta），文件缩回旧大小。
+truncate（`write::truncate_held`）也用这个判定：`open(O_TRUNC)` 的 SETATTR 先于 OPEN、没有 lease，
+从旧缓存大小算起就把 `echo x > f` 当成空操作，留下别的挂载写的尾巴。普通 write 不重读：FUSE 写一定持写
+lease；不持 lease 的写只有测试和 Python 裸接口。重读后 size 与 generation 都没变就保留 extent map。
+代价（都只在没持 lease 时，与从未打开过的文件相同）：GETATTR / LOOKUP / 不改 size 的 SETATTR 各多一次
+KV get（频率受内核 30 s attr/entry TTL 限制）；OPEN 多一次（存在性检查重读，随后 acquire 后再读一次）；
+改 size 的 SETATTR 多两次（truncate 一次、随后 SETATTR 自己的 `get_inode` 一次）；丢失一次轮询后
+开着的 fd 没有 lease，每次 READ 多一次，直到重开。B 关闭后 30 s TTL 内 A 的内核仍可能用自己缓存的
+旧属性，这是 TTL 本身的语义。
+
 守卫：`crates/manager/tests/fuse_page_cache.rs`（派发层；消融各红一条：不校验 generation /
 忽略 sticky / FORGET 不删记录 / `get_inode` 无视标记 / Release 不记 generation / 持写 lease
-时仍重读）+
+时仍重读 / 没持 lease 仍用缓存：`getattr_reports_a_write_another_mount_made_after_this_one_closed_the_file`、
+`a_truncate_without_a_lease_starts_from_the_current_size`、`a_chmod_without_a_lease_keeps_another_mount_s_write`
+/ 内容变了仍留 extent map：
+`a_read_without_a_lease_sees_a_write_into_a_hole`）+
 `dispatch.rs::page_cache_tests`（判定表，默认 `cargo test` 就跑）+ `scripts/fuse_page_cache.sh`
-（真挂载，SHARED/KEEP/REOPEN/HELD/TAIL/LOCAL/MMAPW；不校验 generation 的构建上 REOPEN 与
+（真挂载，SHARED/KEEP/REOPEN/HELD/TAIL/PREFETCH/CLOSED/LOCAL/MMAPW；没持 lease 仍用缓存的构建上 CLOSED 变红；不校验 generation 的构建上 REOPEN 与
 MMAPW 变红，`get_inode` 无视标记的构建上 TAIL 变红）。
 
 ### 预读窗口（守护进程不碰）与 `max_background`

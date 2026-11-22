@@ -23,6 +23,9 @@
 #           within 3 s (under the prefetch cache's 5 s idle expiry, so expiry
 #           cannot pass it) A's same fd must read the NEW bytes past 16 MiB, not
 #           the blocks fetched before the rewrite.
+#   CLOSED: A reads a file while it is empty and closes it (no lease left); B
+#           appends and closes; past the kernel attr TTL (ATTR_WAIT, 35 s) A's
+#           stat and read must see the new size, not what A's open cached.
 #   LOCAL:  on A alone, bytes written through one fd are what another fd and a
 #           shared mapping read.
 #   MMAPW:  on A, a store through a writable shared mapping, then munmap and
@@ -38,7 +41,7 @@ ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 BIN="$ROOT/target/release"; FUSE_BIN="${FUSE_BIN:-$BIN/autumn-fuse}"
 MGR="127.0.0.1:9001"
 MNT_A="${MNT_A:-/mnt/autumn-fuse-pc-a}"; MNT_B="${MNT_B:-/mnt/autumn-fuse-pc-b}"
-FILE_MIB="${FILE_MIB:-16}"; HELD_SECS="${HELD_SECS:-5}"
+FILE_MIB="${FILE_MIB:-16}"; HELD_SECS="${HELD_SECS:-5}"; ATTR_WAIT="${ATTR_WAIT:-35}"
 WORK="$(mktemp -d /tmp/fuse_pc.XXXXXX)"; FAIL=0
 FUSE_A=""; FUSE_B=""; HOLDER=""
 export AUTUMN_DATA_ROOT="${AUTUMN_DATA_ROOT:-/tmp/autumn-pc}"
@@ -183,6 +186,15 @@ for i in $(seq 1 100); do [ -e "$WORK/pf.ready" ] && break; sleep 0.1; done
 rewrite "$MNT_B/p.bin" "$WORK/p2"; touch "$WORK/pf.written"
 wait "$HOLDER" && say "PREFETCH ok ($(cat "$WORK/pf.log"))" || fail "PREFETCH: $(cat "$WORK/pf.log")"
 HOLDER=""
+
+# CLOSED
+: > "$MNT_B/c.bin"
+cat "$MNT_A/c.bin" > /dev/null
+head -c 4096 /dev/urandom >> "$MNT_B/c.bin"
+sleep "$ATTR_WAIT"
+s=$(stat -c %s "$MNT_A/c.bin"); n=$(cat "$MNT_A/c.bin" | wc -c)
+[ "$s" = 4096 ] && [ "$n" = 4096 ] && say "CLOSED ok" \
+  || fail "CLOSED: A's stat says $s and reads $n bytes after B's append (want 4096)"
 
 # LOCAL
 python3 - "$MNT_A/f.bin" <<'EOF' > "$WORK/local.log" 2>&1 && say "LOCAL ok" || fail "LOCAL: $(cat "$WORK/local.log")"

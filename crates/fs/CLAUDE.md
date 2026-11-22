@@ -310,7 +310,7 @@ Open of an inode the first mount wrote and closed does not read a stale `meta`).
    - Why the "smaller" direction is refused: it may well be stale — another mount truncating the file leaves the same shape.
      The asymmetry is in the **consequence**, not the evidence. Smaller is also the normal state of a file this mount is writing (extents landed early, size not yet
      published); the two cannot be told apart here, so the only choice is to lean toward the side that destroys nothing: refusing smaller only makes `getattr` stale for a while
-     (until a lease version reload or FORGET), and **cannot change the answer of any read** (entering this branch already means
+     (while a lease is held; without one the next `get_inode` reads KV), and **cannot change the answer of any read** (entering this branch already means
      `offset >= size`, and the clamp returns empty anyway); adopting smaller would make the next write see `cur_size < offset` →
      `clean_beyond_eof` → **delete every extent it has already landed**.
 3. Small file `inline_data` → return it directly.
@@ -536,6 +536,12 @@ refused by the fence. If it were deleted, `write_lease_for` would fall back to A
 (the two cases in `crates/manager/tests/fuse_lease_loss.rs`). This handling is in `lease_tasks::lease_not_held`,
 shared by the background heartbeat and the binding's manual `heartbeat()`. No re-read while this session holds the write lease or the inode is dirty (the cached size may be ahead of the KV; accepting a smaller one
 is the data deletion `get_inode_uncached` describes). Both the mount and the binding go through here.
+
+Events reach a session only while it holds a lease on the ino, and an inode stays cached after the last close while the kernel still
+references it. So `get_inode` uses the cached meta only under a held (not revoked) lease that is not marked, its own write lease, or a
+dirty inode (`meta::cache_trusted`), and otherwise reads the KV. `write::truncate_held` applies the same rule, so a lease-less truncate
+(`open(O_TRUNC)`) starts from KV's size; a plain write does not (a FUSE write always holds the write lease). A re-read that finds size
+and generation unchanged keeps the extent map (see "Page cache" in `crates/fuse/CLAUDE.md` for what the stale copy broke and the cost).
 
 Poll failure or overflow (`lease_tasks::drop_after_lost_poll`): invalidation events may have been missed, so every cache is invalidated and
 READ slots are deleted and released; WRITE slots stay and are not released — a poll failure says nothing about whether the write lease was lost; the heartbeat keeps renewing,

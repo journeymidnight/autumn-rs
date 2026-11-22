@@ -164,8 +164,13 @@ pub async fn ensure_schema_version(state: &mut FsState) -> Result<()> {
     }
 }
 
-/// Fetch inode metadata from the cache, or from KV when it is not cached or
-/// an invalidation has overtaken the cached copy (`FsState::meta_invalidated`).
+/// Fetch inode metadata from the cache, or from KV when it is not cached, when
+/// this session holds no lease on it, or when an invalidation has overtaken
+/// the cached copy (`FsState::meta_invalidated`).
+///
+/// Writes elsewhere reach this session only while it holds a lease on the
+/// inode (an open fd), so without one the cached copy is whatever the last
+/// open saw, kept until the kernel forgets the inode.
 ///
 /// The cached copy stays authoritative while this session holds the inode's
 /// write lease (not revoked) or has it dirty: nobody else can change the file
@@ -176,15 +181,8 @@ pub async fn ensure_schema_version(state: &mut FsState) -> Result<()> {
 /// the read, so an event arriving during it marks the inode again; a failed
 /// read puts it back and returns the error.
 pub async fn get_inode(state: &mut FsState, ino: u64) -> Result<InodeMeta> {
-    if let Some(is) = state.inodes.get(&ino) {
-        let own_writer = state
-            .held_leases
-            .borrow()
-            .get(&ino)
-            .is_some_and(|l| l.mode == autumn_rpc::manager_rpc::LEASE_MODE_WRITE && !l.revoked);
-        if is.dirty || own_writer || !state.meta_invalidated.borrow().contains(&ino) {
-            return Ok(is.meta.clone());
-        }
+    if cache_trusted(state, ino) {
+        return Ok(state.inodes[&ino].meta.clone());
     }
     let marked = state.meta_invalidated.borrow_mut().remove(&ino);
     let fresh = match fetch_inode(state, ino).await {
@@ -197,11 +195,25 @@ pub async fn get_inode(state: &mut FsState, ino: u64) -> Result<InodeMeta> {
         }
     };
     if let Some(is) = state.inodes.get_mut(&ino) {
+        // The extent map follows the content: keep it while it is unchanged.
+        if (is.meta.size, is.meta.generation) != (fresh.size, fresh.generation) {
+            is.extents = None;
+        }
         is.meta = fresh.clone();
-        // The striped extent map is computed from size; drop it with the meta.
-        is.extents = None;
     }
     Ok(fresh)
+}
+
+/// Whether the cached meta of `ino` may be answered without a KV read (the
+/// rule `get_inode` describes). False when it is not cached.
+pub(crate) fn cache_trusted(state: &FsState, ino: u64) -> bool {
+    let Some(is) = state.inodes.get(&ino) else {
+        return false;
+    };
+    let held = state.held_leases.borrow().get(&ino).filter(|l| !l.revoked).map(|l| l.mode);
+    is.dirty
+        || held == Some(autumn_rpc::manager_rpc::LEASE_MODE_WRITE)
+        || (held.is_some() && !state.meta_invalidated.borrow().contains(&ino))
 }
 
 /// Read inode metadata from KV, ignoring and not touching the cache.
@@ -239,8 +251,8 @@ pub async fn get_inode_uncached(state: &mut FsState, ino: u64) -> Result<(InodeM
         // because extents land long before the size covering them is published
         // (fsync / release) — so the two cases are indistinguishable here, and
         // the tie must break toward the one that cannot destroy anything.
-        // Refusing a shrink costs a stale `getattr` until the lease-version
-        // reload or FORGET, and cannot change what any read answers: the only
+        // Refusing a shrink costs a stale `getattr` while a lease is held
+        // (without one the next `get_inode` reads KV), and cannot change what any read answers: the only
         // caller is the EOF confirm, which already established
         // `offset >= size`, so the clamp returns empty either way. Adopting a
         // shrink, by contrast, does this:
