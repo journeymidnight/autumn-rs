@@ -4979,6 +4979,14 @@ AUTUMN_CHAOS_SEED=583 AUTUMN_CHAOS_DURATION_SECS=45 AUTUMN_CHAOS_NEMESIS_INTERVA
 #   ~5 s in (the marker is acquired before encoding starts, so `--` first),
 #   advance one 64 MiB stripe at a time, and land on 100% at SUCCEEDED. The
 #   denominator is THIS node's shard, ceil(extent / K), not the whole extent.
+#   The script's ENs have one shard each (`--cpuset $((i-1))`). For 4 shards
+#   per EN, give each EN 4 cores, e.g. `--cpuset $((96+4*(i-1)))-$((99+4*(i-1)))`,
+#   and add the shard ports 221{1,2,3}{1..4} to its port-cleanup list (shard s
+#   binds --port + 10·s). The op runs on the extent's shard and its progress
+#   reaches the manager through shard 0's `df`; measured: an extent of shard 2
+#   stepped 16.7% → 100% the same way. An op that stays `--` / `0/0` until it
+#   ends, on a multi-shard EN, means shard 0 is not carrying the other shards'
+#   samples.
 #   EC REBUILD progress (a recovery whose extent is ec_converted; the kind is
 #   still `recovery` — it is one RecoveryTask, so it lands on the same ledger
 #   entry a replica rebuild would): the EN samples once per 64 MiB stripe,

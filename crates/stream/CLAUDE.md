@@ -2097,8 +2097,13 @@ it — peak `(K + 1) × stripe`. The walk takes the fetch as a closure so a test
 can drive it without peers.
 
 **Op progress rides `df` (`DfResp.op_progress`, keyed by extent, no op id).**
-`note_op_progress` overwrites one `(kind, done, total)` sample per extent;
-`OpProgressGuard` owns the slot for the life of a task and empties it on
+`note_op_progress` overwrites one `(kind, done, total)` sample per extent in
+the node-wide `DoneQueues.op_progress`: the manager sends the op to the
+extent's shard but asks only shard 0 for `df`, so a per-shard map would hide
+every other shard's progress (`shard_zero_df_carries_a_rebuild_running_on_another_shard`,
+red when `df` reports only the shard's own extents). Unlike the extent bytes it
+is read live, not published: an update is one short lock, once per stripe or
+chunk. `OpProgressGuard` owns the slot for the life of a task and empties it on
 `Drop`, so an abandoned task cannot keep reporting (the recovery retry loop
 holds one across all attempts; its give-up path has no explicit clear and
 needs none). Rules the samples follow: **counts in bytes, never per byte** —

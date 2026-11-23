@@ -385,6 +385,11 @@ pub(crate) struct DoneQueues {
     /// (`spawn_extent_bytes_publisher`).
     extent_bytes:
         std::sync::Arc<std::sync::Mutex<HashMap<u32, HashMap<u64, u64>>>>,
+    /// Live progress of the extent-scoped ops (recovery, EC conversion) any
+    /// shard of the node is executing, extent_id -> `(kind, done, total)`.
+    /// The manager sends the op to the extent's shard but asks shard 0 for
+    /// `df`. A sample, overwritten per update, removed when the op ends.
+    op_progress: std::sync::Arc<std::sync::Mutex<HashMap<u64, (u8, u64, u64)>>>,
 }
 
 impl DoneQueues {
@@ -449,6 +454,32 @@ impl DoneQueues {
     }
     fn push_ec(&self, d: crate::extent_rpc::EcConvertDone) {
         self.ec.lock().expect("ec_done").push(d);
+    }
+    fn set_op_progress(&self, extent_id: u64, kind: u8, done: u64, total: u64) {
+        self.op_progress
+            .lock()
+            .expect("op_progress")
+            .insert(extent_id, (kind, done, total));
+    }
+    fn clear_op_progress(&self, extent_id: u64) {
+        self.op_progress.lock().expect("op_progress").remove(&extent_id);
+    }
+    #[cfg(test)]
+    fn op_progress_of(&self, extent_id: u64) -> Option<(u8, u64, u64)> {
+        self.op_progress.lock().expect("op_progress").get(&extent_id).copied()
+    }
+    fn op_progress_snapshot(&self) -> Vec<crate::extent_rpc::ExtentOpProgress> {
+        self.op_progress
+            .lock()
+            .expect("op_progress")
+            .iter()
+            .map(|(extent_id, (kind, done, total))| crate::extent_rpc::ExtentOpProgress {
+                extent_id: *extent_id,
+                kind: *kind,
+                done: *done,
+                total: *total,
+            })
+            .collect()
     }
     fn take_recovery(&self) -> Vec<RecoveryTaskDone> {
         std::mem::take(&mut *self.recovery.lock().expect("recovery_done"))
@@ -1996,15 +2027,6 @@ pub struct ExtentNode {
     /// stayed blocked behind it. Carrying the reason back on the next accept
     /// costs nothing on the wire — the response already has a message field.
     ec_last_error: Rc<DashMap<u64, (u64, EcConvertError)>>,
-    /// Live progress for the extent-scoped ops this node EXECUTES, keyed by
-    /// extent_id → `(kind, done, total)`.
-    ///
-    /// EC conversion and recovery run in the background for minutes to hours
-    /// and used to report only their terminal outcome, so `ops status` showed
-    /// a bare RUNNING for the whole time. `handle_df` samples this map, which
-    /// is why it is a plain overwrite per update and not a queue: a lost
-    /// sample costs nothing, the next `df` carries a fresher one.
-    op_progress: Rc<DashMap<u64, (u8, u64, u64)>>,
     /// Highest conversion-attempt nonce this shard has staged a stripe for,
     /// per extent. Nonces are etcd revisions and therefore MONOTONIC, so a
     /// `WriteShard` carrying a LOWER one provably belongs to an attempt that
@@ -2100,7 +2122,6 @@ impl Clone for ExtentNode {
             recovery_attempts: self.recovery_attempts.clone(),
             ec_convert_inflight: self.ec_convert_inflight.clone(),
             ec_last_error: self.ec_last_error.clone(),
-            op_progress: self.op_progress.clone(),
             ec_stage_nonce: self.ec_stage_nonce.clone(),
             ec_stage_tick: self.ec_stage_tick.clone(),
             shard_idx: self.shard_idx,
@@ -4035,7 +4056,6 @@ impl ExtentNode {
             recovery_attempts: Rc::new(DashMap::new()),
             ec_convert_inflight: Rc::new(DashMap::new()),
             ec_last_error: Rc::new(DashMap::new()),
-            op_progress: Rc::new(DashMap::new()),
             ec_stage_nonce: Rc::new(DashMap::new()),
             ec_stage_tick: Rc::new(Cell::new(0)),
             shard_idx: config.shard_idx,
@@ -7939,7 +7959,8 @@ impl ExtentNode {
     /// denominator known, ratio honest — instead of "no sample" (which the
     /// ledger cannot tell from "not started").
     ///
-    /// Cost: one `Rc<DashMap>` write per stripe, 64 MiB by default.
+    /// Cost: one short lock of the node-wide progress map per stripe, 64 MiB by
+    /// default.
     async fn rebuild_ec_shard_by_stripes<F, Fut>(
         &self,
         extent_id: u64,
@@ -8131,14 +8152,14 @@ impl ExtentNode {
     /// Publish how far an extent-scoped op has got, for the next `df` to carry.
     /// Overwrite, not append: only the newest sample is worth sending.
     fn note_op_progress(&self, extent_id: u64, kind: u8, done: u64, total: u64) {
-        self.op_progress.insert(extent_id, (kind, done, total));
+        self.done.set_op_progress(extent_id, kind, done, total);
     }
 
     /// Stop reporting progress for an op that ended, whichever way it ended.
     /// A stale sample would leave `ops status` showing a repair frozen at 60%
     /// long after it finished or was abandoned.
     fn clear_op_progress(&self, extent_id: u64) {
-        self.op_progress.remove(&extent_id);
+        self.done.clear_op_progress(extent_id);
     }
 }
 
@@ -8155,16 +8176,16 @@ impl ExtentNode {
 /// over by a corpse.
 ///
 /// Same shape as the partition server's `MaintenancePhaseGuard`: an owned
-/// `Rc` rather than a borrow of the node, because the guard lives across
-/// every await in the task.
+/// handle to the node's `DoneQueues` rather than a borrow of the node, because
+/// the guard lives across every await in the task.
 struct OpProgressGuard {
-    slots: Rc<DashMap<u64, (u8, u64, u64)>>,
+    slots: DoneQueues,
     extent_id: u64,
     kind: u8,
 }
 
 impl OpProgressGuard {
-    fn new(slots: Rc<DashMap<u64, (u8, u64, u64)>>, extent_id: u64, kind: u8) -> Self {
+    fn new(slots: DoneQueues, extent_id: u64, kind: u8) -> Self {
         Self {
             slots,
             extent_id,
@@ -8176,13 +8197,13 @@ impl OpProgressGuard {
     /// the right thing to say at the start of an attempt whose size is not
     /// yet known.
     fn set(&self, done: u64, total: u64) {
-        self.slots.insert(self.extent_id, (self.kind, done, total));
+        self.slots.set_op_progress(self.extent_id, self.kind, done, total);
     }
 }
 
 impl Drop for OpProgressGuard {
     fn drop(&mut self) {
-        self.slots.remove(&self.extent_id);
+        self.slots.clear_op_progress(self.extent_id);
     }
 }
 
@@ -9050,19 +9071,7 @@ impl ExtentNode {
             advertise_addr: self.registration.advertise_addr.clone(),
             shard_ports: self.registration.shard_ports.clone(),
             metrics_addr: self.registration.metrics_addr.clone(),
-            op_progress: self
-                .op_progress
-                .iter()
-                .map(|e| {
-                    let (kind, done, total) = *e.value();
-                    crate::extent_rpc::ExtentOpProgress {
-                        extent_id: *e.key(),
-                        kind,
-                        done,
-                        total,
-                    }
-                })
-                .collect(),
+            op_progress: self.done.op_progress_snapshot(),
         }))
     }
 
@@ -9396,7 +9405,7 @@ impl ExtentNode {
             // Held until this task returns, by whichever branch. The
             // give-up path below has no explicit clear and needs none.
             let progress = OpProgressGuard::new(
-                node.op_progress.clone(),
+                node.done.clone(),
                 extent_id,
                 autumn_rpc::manager_rpc::OP_KIND_RECOVERY,
             );
@@ -14242,12 +14251,9 @@ mod ec_rebuild_progress_tests {
         seen: Rc<RefCell<Vec<Option<(u64, u64)>>>>,
         fail_at: Option<u64>,
     ) -> impl Fn(u64, u64) -> FetchFut {
-        let slots = node.op_progress.clone();
+        let slots = node.done.clone();
         move |offset, span| {
-            let sample = slots.get(&EID).map(|e| {
-                let (_, done, total) = *e.value();
-                (done, total)
-            });
+            let sample = slots.op_progress_of(EID).map(|(_, done, total)| (done, total));
             seen.borrow_mut().push(sample);
             if fail_at == Some(offset) {
                 return Box::pin(std::future::ready(Err(format!(
@@ -14272,7 +14278,7 @@ mod ec_rebuild_progress_tests {
     }
 
     fn final_sample(node: &ExtentNode) -> Option<(u8, u64, u64)> {
-        node.op_progress.get(&EID).map(|e| *e.value())
+        node.done.op_progress_of(EID)
     }
 
     #[compio::test]
@@ -14466,7 +14472,7 @@ mod ec_rebuild_progress_tests {
         let kind = autumn_rpc::manager_rpc::OP_KIND_RECOVERY;
 
         {
-            let progress = OpProgressGuard::new(node.op_progress.clone(), EID, kind);
+            let progress = OpProgressGuard::new(node.done.clone(), EID, kind);
             // An attempt starting: size unknown, so `0/0` — the ledger's "not
             // reported" shape — and not the previous attempt's last ratio.
             progress.set(0, 0);
@@ -14479,6 +14485,82 @@ mod ec_rebuild_progress_tests {
             df().await.is_empty(),
             "a task that ended must stop reporting; a stale 3/8 outlives the task otherwise"
         );
+    }
+
+    /// The manager sends a rebuild to the shard that owns the extent but asks
+    /// only shard 0 for `df`, so shard 0's answer has to carry the other
+    /// shards' progress.
+    #[compio::test]
+    async fn shard_zero_df_carries_a_rebuild_running_on_another_shard() {
+        const SHARDS: u32 = 2;
+        let eid = (EID..)
+            .find(|e| autumn_rpc::shard_for_extent(*e, SHARDS) == 1)
+            .expect("an extent of shard 1");
+        let dir = tempfile::tempdir().expect("tmp");
+        let siblings: Vec<String> = (0..SHARDS).map(|_| "127.0.0.1:1".to_string()).collect();
+        let shard_node = |idx: u32| {
+            ExtentNode::new(
+                ExtentNodeConfig::new(dir.path().to_path_buf(), 1).with_shard(idx, SHARDS, siblings.clone()),
+            )
+        };
+        let shard0 = shard_node(0).await.expect("shard 0");
+        let shard1 = shard_node(1).await.expect("shard 1");
+        let dst = Rc::new(
+            OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(dir.path().join("rebuilt"))
+                .await
+                .expect("dst"),
+        );
+        let shards = shards();
+        let want = ExtentNode::ec_shard_read_len(PAYLOAD as u64, K);
+
+        async fn progress(node: &ExtentNode) -> Vec<(u64, u8, u64, u64)> {
+            let resp = node
+                .handle_df(rkyv_encode(&DfReq {
+                    tasks: vec![],
+                    disk_ids: vec![],
+                }))
+                .await
+                .expect("df");
+            let r: DfResp = rkyv_decode(&resp).expect("decode DfResp");
+            r.op_progress
+                .into_iter()
+                .map(|p| (p.extent_id, p.kind, p.done, p.total))
+                .collect()
+        }
+
+        // Mid-rebuild, when the second stripe is asked for: what each shard's
+        // df says at that moment.
+        let seen = Rc::new(RefCell::new(None));
+        let fetch = {
+            let (shard0, shard1, seen, shards) = (shard0.clone(), shard1.clone(), seen.clone(), shards.clone());
+            move |offset: u64, span: u64| -> FetchFut {
+                let (shard0, shard1, seen, shards) = (shard0.clone(), shard1.clone(), seen.clone(), shards.clone());
+                Box::pin(async move {
+                    if offset == STRIPE {
+                        *seen.borrow_mut() = Some((progress(&shard0).await, progress(&shard1).await));
+                    }
+                    let (lo, hi) = (offset as usize, (offset + span) as usize);
+                    Ok(shards
+                        .iter()
+                        .enumerate()
+                        .map(|(i, s)| (i != MISSING).then(|| s[lo..hi].to_vec()))
+                        .collect())
+                })
+            }
+        };
+        shard1
+            .rebuild_ec_shard_by_stripes(eid, want, STRIPE, K, M, MISSING, &dst, fetch)
+            .await
+            .expect("rebuild");
+
+        let (on0, on1) = seen.borrow_mut().take().expect("sampled mid-rebuild");
+        let sample = (eid, autumn_rpc::manager_rpc::OP_KIND_RECOVERY, STRIPE, want);
+        assert_eq!(on1, vec![sample], "the shard running it reports it");
+        assert_eq!(on0, vec![sample], "shard 0, the one the manager asks, must report it too");
     }
 }
 
