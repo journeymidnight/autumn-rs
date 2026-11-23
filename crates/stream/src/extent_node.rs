@@ -380,6 +380,11 @@ pub(crate) struct DoneQueues {
     /// entry, not ten.
     op_failures:
         std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<(u64, u8), (u8, String)>>>,
+    /// Each shard's extent bytes per disk (shard index -> disk -> bytes), so
+    /// shard 0's `df` covers every shard's extents
+    /// (`spawn_extent_bytes_publisher`).
+    extent_bytes:
+        std::sync::Arc<std::sync::Mutex<HashMap<u32, HashMap<u64, u64>>>>,
 }
 
 impl DoneQueues {
@@ -451,6 +456,39 @@ impl DoneQueues {
     fn take_ec(&self) -> Vec<crate::extent_rpc::EcConvertDone> {
         std::mem::take(&mut *self.ec.lock().expect("ec_done"))
     }
+    fn publish_extent_bytes(&self, shard_idx: u32, by_disk: HashMap<u64, u64>) {
+        self.extent_bytes
+            .lock()
+            .expect("extent_bytes")
+            .insert(shard_idx, by_disk);
+    }
+    /// The other shards' last published bytes, added into `by_disk`.
+    fn add_other_shards_extent_bytes(&self, shard_idx: u32, by_disk: &mut HashMap<u64, u64>) {
+        let all = self.extent_bytes.lock().expect("extent_bytes");
+        for (_, theirs) in all.iter().filter(|(s, _)| **s != shard_idx) {
+            for (disk_id, bytes) in theirs {
+                *by_disk.entry(*disk_id).or_insert(0) += bytes;
+            }
+        }
+    }
+}
+
+/// How stale another shard's bytes in shard 0's `df` can be. Placement bands
+/// are 5% of a node, which a minute of writes rarely crosses.
+const EXTENT_BYTES_PUBLISH_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Live footprint per disk of one shard's extents: `.dat` length plus shard
+/// files.
+fn extent_bytes_by_disk(extents: &DashMap<u64, Rc<ExtentEntry>>) -> HashMap<u64, u64> {
+    let mut by_disk = HashMap::new();
+    for e in extents.iter() {
+        let entry = e.value();
+        *by_disk.entry(entry.disk_id).or_insert(0) += entry
+            .len
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .saturating_add(entry.shard_bytes());
+    }
+    by_disk
 }
 
 /// One set of queues per NODE, keyed by its data directories.
@@ -4014,6 +4052,7 @@ impl ExtentNode {
 
         // Load existing extents from all disks.
         node.load_extents().await?;
+        node.spawn_extent_bytes_publisher();
 
         // reconcile loaded extents against the manager. Any
         // `extent_id` the manager no longer knows about (refs went to
@@ -4067,6 +4106,29 @@ impl ExtentNode {
         }
 
         Ok(node)
+    }
+
+    /// Publishes this shard's extent bytes for shard 0's `df`: once as soon as
+    /// its extents are loaded, then every `EXTENT_BYTES_PUBLISH_INTERVAL`.
+    /// Shard 0 counts its own at `df` time.
+    fn spawn_extent_bytes_publisher(&self) {
+        if self.shard_idx == 0 {
+            return;
+        }
+        self.done
+            .publish_extent_bytes(self.shard_idx, extent_bytes_by_disk(&self.extents));
+        let extents = Rc::downgrade(&self.extents);
+        let (done, shard_idx) = (self.done.clone(), self.shard_idx);
+        compio::runtime::spawn(async move {
+            loop {
+                compio::time::sleep(EXTENT_BYTES_PUBLISH_INTERVAL).await;
+                let Some(extents) = extents.upgrade() else {
+                    return;
+                };
+                done.publish_extent_bytes(shard_idx, extent_bytes_by_disk(&extents));
+            }
+        })
+        .detach();
     }
 
     /// Keeps `client_authz` and the runtime overrides current: every
@@ -8879,21 +8941,13 @@ impl ExtentNode {
     async fn handle_df(&self, payload: Bytes) -> HandlerResult {
         let req: DfReq = rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
 
-        // Cluster-df: per-disk live extent footprint = Σ ExtentEntry.len
-        // (the EN is the data owner; this is the REAL on-disk autumn byte
-        // count — replicas count their full copy, EC shards count shard
-        // size, open tails count live appended bytes — no amplification
-        // formula needed). O(local extents), µs. The manager sums these
-        // across all nodes into `physical_used`.
-        let mut extent_bytes_by_disk: std::collections::HashMap<u64, u64> =
-            std::collections::HashMap::new();
-        for e in self.extents.iter() {
-            let entry = e.value();
-            *extent_bytes_by_disk.entry(entry.disk_id).or_insert(0) += entry
-                .len
-                .load(std::sync::atomic::Ordering::Relaxed)
-                .saturating_add(entry.shard_bytes());
-        }
+        // Cluster-df: per-disk live extent footprint (replicas count their
+        // full copy, EC shards their shard, open tails their appended bytes).
+        // The manager dials only shard 0, so it adds what the other shards
+        // last published. The manager sums nodes into `physical_used`.
+        let mut by_disk = extent_bytes_by_disk(&self.extents);
+        self.done
+            .add_other_shards_extent_bytes(self.shard_idx, &mut by_disk);
 
         let mut disk_status: Vec<(u64, DiskStatus)> = Vec::new();
         if req.disk_ids.is_empty() {
@@ -8907,7 +8961,7 @@ impl ExtentNode {
                         free,
                         online: disk.online(),
                         full: disk.health() == DiskHealth::Full,
-                        extent_bytes: extent_bytes_by_disk
+                        extent_bytes: by_disk
                             .get(&disk.disk_id)
                             .copied()
                             .unwrap_or(0),
@@ -8925,7 +8979,7 @@ impl ExtentNode {
                             free,
                             online: disk.online(),
                             full: disk.health() == DiskHealth::Full,
-                            extent_bytes: extent_bytes_by_disk.get(disk_id).copied().unwrap_or(0),
+                            extent_bytes: by_disk.get(disk_id).copied().unwrap_or(0),
                         },
                     ));
                 }

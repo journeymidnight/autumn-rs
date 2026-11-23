@@ -641,3 +641,77 @@ fn a_read_addressed_to_the_wrong_shard_is_refused() {
             assert_eq!(&bytes[..], payload);
         });
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// df counts the extents of every shard
+// ─────────────────────────────────────────────────────────────────────────
+
+async fn df_extent_bytes(addr: SocketAddr) -> u64 {
+    use autumn_stream::extent_rpc::{DfReq, DfResp, MSG_DF};
+    let req = DfReq {
+        tasks: vec![],
+        disk_ids: vec![],
+    };
+    let resp = ConnPool::new()
+        .call(&addr.to_string(), MSG_DF, rkyv_encode(&req))
+        .await
+        .expect("df");
+    let df: DfResp = rkyv_decode(&resp).expect("decode df");
+    df.disk_status.iter().map(|(_, s)| s.extent_bytes).sum()
+}
+
+/// The manager dials only shard 0 for `df`, so its `extent_bytes` must cover
+/// the extents every shard of the node holds, not just shard 0's — from the
+/// first `df` after a restart on.
+#[test]
+fn df_extent_bytes_counts_every_shard() {
+    const SHARDS: u32 = 4;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let addrs = spawn_sharded_node(tmp.path(), 1, SHARDS);
+
+    let total = compio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(async move {
+            let pool = ConnPool::new();
+            // Two extents per shard, each with its own length.
+            let mut per_shard = vec![0usize; SHARDS as usize];
+            let mut total = 0u64;
+            let mut eid = 1000u64;
+            while per_shard.iter().any(|&n| n < 2) {
+                eid += 1;
+                let shard = autumn_rpc::shard_for_extent(eid, SHARDS) as usize;
+                if per_shard[shard] == 2 {
+                    continue;
+                }
+                per_shard[shard] += 1;
+                let addr = addrs[shard];
+                assert_eq!(alloc_on(addr, eid).await.code, CODE_OK);
+                let len = 4096 * (1 + eid as usize % 7);
+                let append = AppendReq {
+                    extent_id: eid,
+                    eversion: 1,
+                    commit: 0,
+                    owner_epoch: 1,
+                    payload: Bytes::from(vec![0xA5u8; len]).into(),
+                };
+                let r = pool
+                    .call_prepared(&addr.to_string(), MSG_APPEND, &append.prepared())
+                    .await
+                    .expect("append");
+                assert_eq!(AppendResp::decode(r).expect("decode").code, CODE_OK);
+                total += len as u64;
+            }
+            total
+        });
+
+    // Restart on the same dir: every shard loads its extents and publishes
+    // them before serving.
+    let addrs = spawn_sharded_node(tmp.path(), 1, SHARDS);
+    let reported = compio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(df_extent_bytes(addrs[0]));
+    assert_eq!(
+        reported, total,
+        "df on shard 0 must count the extent bytes of all {SHARDS} shards"
+    );
+}

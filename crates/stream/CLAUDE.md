@@ -879,8 +879,17 @@ the full seal with the record only the fenced member had).
 - `heartbeat`: streams a "beat" every second (keep-alive for the manager).
 - `df`: returns per-disk `statvfs` + `extent_bytes` (EN self-reported per-disk
   extent footprint, summed by `disk_id`; the manager aggregates it into cluster
-  `physical_used`), and drains BOTH `recovery_done` (completed recoveries) and
-  `ec_done` (completed EC conversions). **`df` is the completion channel for
+  `physical_used` and placement ranks nodes by it). The manager dials only
+  shard 0, so `extent_bytes` is shard 0's own extents counted at `df` time plus
+  what every other shard last published into `DoneQueues.extent_bytes`
+  (`spawn_extent_bytes_publisher`: once as soon as that shard's extents are
+  loaded — shards start independently, so a `df` during start-up can miss a
+  shard still loading — then every 60 s, off the append path). Shard 0's own
+  map alone is ~1/N of an N-shard node, which skews every placement band. Only
+  shard 0's `df` is whole (shard 0 never publishes). Test:
+  `tests/shards.rs::df_extent_bytes_counts_every_shard` (red without the sum
+  and without the start-up publish). It also drains BOTH `recovery_done`
+  (completed recoveries) and `ec_done` (completed EC conversions). **`df` is the completion channel for
   every long-running EN task** — both are at-most-once (`mem::take`), and both
   converge after a lost report via manager re-dispatch + the EN's adopt guard.
 - `handle_df` **ECHOES the EN's own identity** (`DfResp.node_uuid` /

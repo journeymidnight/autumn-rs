@@ -1827,6 +1827,12 @@ autumn-op --manager 127.0.0.1:9001 --json df   # for scripts
 #   PHYS_USED       ≈  Σ `du -sb` of each EN extent dir
 ```
 
+On an EN with several shards (`--cpuset` / `AUTUMN_EXTENT_SHARDS`), the manager
+asks shard 0 only; the other shards hand it their bytes once their extents are
+loaded and then every 60 s, so PHYS_USED trails writes on those shards by up to a minute. A
+PHYS_USED near 1/N of `du -sb` on an N-shard node means shard 0 is not getting
+them.
+
 The same snapshot backs FUSE `statfs`: `df -h <mountpoint>` reflects real
 backend capacity (conservatively, at the 3-replica factor) instead of a fixed
 placeholder.
