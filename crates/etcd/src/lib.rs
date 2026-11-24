@@ -1,85 +1,345 @@
 //! autumn-etcd: compio-native etcd v3 client.
 //!
-//! Minimal etcd v3 gRPC client built on compio + hyper HTTP/2 (h2c cleartext).
+//! Minimal etcd v3 gRPC client built on compio + hyper HTTP/2 (cleartext h2c,
+//! or TLS), optionally authenticating as an etcd user.
 //! Only implements the subset of APIs needed by autumn-manager:
 //! - KV: Get (with prefix), Put, Txn (CAS, batch put/delete)
-//! - Lease: Grant, KeepAlive (streaming)
+//! - Lease: Grant, KeepAlive, Revoke
 
 pub mod proto;
 
 mod transport;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+use std::future::Future;
+use std::path::Path;
 use std::rc::Rc;
+use std::sync::Arc;
+use std::time::Duration;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
+use bytes::Bytes;
 use prost::Message;
 
 use proto::*;
-use transport::{call_with_sender, GrpcChannel};
+use transport::{call_with_sender, is_stale_token, Dialer, GrpcChannel};
+pub use transport::GrpcStatus;
+
+/// One etcd endpoint: the address dialed, and the name its TLS certificate
+/// is checked against (the host as the operator wrote it, before resolving).
+#[derive(Clone, Debug)]
+pub struct EtcdEndpoint {
+    pub addr: String,
+    pub server_name: String,
+}
+
+impl EtcdEndpoint {
+    /// `"host:port"` (an optional `http://` / `https://` is dropped); the
+    /// host is also the TLS server name.
+    pub fn new(endpoint: &str) -> Self {
+        let addr = normalize_endpoint(endpoint);
+        let host = addr.rsplit_once(':').map_or(addr.as_str(), |(h, _)| h);
+        let server_name = host.trim_matches(['[', ']']).to_string();
+        Self { addr, server_name }
+    }
+}
+
+/// The etcd user the client authenticates as.
+#[derive(Clone)]
+pub struct Credentials {
+    pub user: String,
+    pub password: String,
+}
+
+/// TLS to etcd: the CA that signs its certificates, and optionally this
+/// client's certificate.
+#[derive(Clone)]
+pub struct TlsConfig(Arc<rustls::ClientConfig>);
+
+impl TlsConfig {
+    /// PEM files: `ca` holds one or more CA certificates; `client` is a
+    /// certificate chain and its private key.
+    pub fn from_pem_files(ca: &Path, client: Option<(&Path, &Path)>) -> Result<Self> {
+        use rustls::pki_types::pem::PemObject;
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+
+        let mut roots = rustls::RootCertStore::empty();
+        for cert in CertificateDer::pem_file_iter(ca)
+            .with_context(|| format!("read CA file {}", ca.display()))?
+        {
+            let cert = cert.with_context(|| format!("parse CA file {}", ca.display()))?;
+            roots
+                .add(cert)
+                .with_context(|| format!("load CA certificate from {}", ca.display()))?;
+        }
+        if roots.is_empty() {
+            bail!("CA file {} holds no certificate", ca.display());
+        }
+        let builder = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .context("TLS protocol versions")?
+        .with_root_certificates(roots);
+        let mut config = match client {
+            None => builder.with_no_client_auth(),
+            Some((cert, key)) => {
+                let chain = CertificateDer::pem_file_iter(cert)
+                    .with_context(|| format!("read certificate file {}", cert.display()))?
+                    .collect::<Result<Vec<_>, _>>()
+                    .with_context(|| format!("parse certificate file {}", cert.display()))?;
+                if chain.is_empty() {
+                    bail!("certificate file {} holds no certificate", cert.display());
+                }
+                let key = PrivateKeyDer::from_pem_file(key)
+                    .with_context(|| format!("read private key file {}", key.display()))?;
+                builder
+                    .with_client_auth_cert(chain, key)
+                    .context("client certificate and key")?
+            }
+        };
+        // etcd serves gRPC over TLS only on HTTP/2, which it picks by ALPN.
+        config.alpn_protocols = vec![b"h2".to_vec()];
+        Ok(Self(Arc::new(config)))
+    }
+}
+
+/// Everything needed to reach etcd.
+#[derive(Clone)]
+pub struct EtcdConfig {
+    pub endpoints: Vec<EtcdEndpoint>,
+    pub tls: Option<TlsConfig>,
+    pub credentials: Option<Credentials>,
+}
+
+impl EtcdConfig {
+    /// Cleartext, no authentication.
+    pub fn plain(endpoints: &[String]) -> Self {
+        Self {
+            endpoints: endpoints.iter().map(|e| EtcdEndpoint::new(e)).collect(),
+            tls: None,
+            credentials: None,
+        }
+    }
+}
+
+/// A connection that moves to the next endpoint when the current one fails.
+/// Shared shape of the client and of a lease keeper's own connection.
+struct Conn {
+    channel: RefCell<GrpcChannel>,
+    endpoints: Vec<EtcdEndpoint>,
+    /// Index of the currently connected endpoint.
+    current_ep: Cell<usize>,
+    dialer: Rc<Dialer>,
+}
+
+impl Conn {
+    async fn open_at(endpoints: Vec<EtcdEndpoint>, idx: usize, dialer: Rc<Dialer>) -> Result<Self> {
+        let channel = GrpcChannel::connect(&endpoints[idx], &dialer).await?;
+        Ok(Self {
+            channel: RefCell::new(channel),
+            endpoints,
+            current_ep: Cell::new(idx),
+            dialer,
+        })
+    }
+
+    /// `resend`: whether a request whose first attempt failed or timed out is
+    /// sent again on the new connection. Reads and leases are; a txn is not.
+    /// A refused token is the exception: etcd rejected the request before
+    /// applying it, so it is sent again after authenticating, txn included.
+    async fn call(
+        &self,
+        path: &str,
+        body: Bytes,
+        timeout: Option<Duration>,
+        resend: bool,
+    ) -> Result<Bytes> {
+        // clone the call handle out of the RefCell, then drop the borrow
+        // before awaiting. Holding `RefMut<GrpcChannel>` across `.await` would
+        // panic the next concurrent caller on the same single-threaded runtime
+        // (e.g. 4 partitions racing on `handle_stream_punch_holes`).
+        //
+        // (1A): bound the call with `compio::time::timeout`. Without this
+        // a stuck server / half-open TCP hangs the caller forever (and with it
+        // the manager's `node_health_loop`). A timeout falls through to the
+        // reconnect + retry path, same as a connection error.
+        let mut call = self.channel.borrow().call();
+        let cause = match within(timeout, call_with_sender(&mut call, path, body.clone())).await {
+            Some(Ok(resp)) => return Ok(resp),
+            Some(Err(e)) if is_stale_token(&e) => {
+                let Some(creds) = &self.dialer.credentials else {
+                    return Err(e);
+                };
+                tracing::info!(path, error = %e, "etcd refused the token, authenticating again");
+                // Boxed, like the reconnect: rare paths kept out of every call's future.
+                return Box::pin(reauth_and_resend(call, creds, path, body, timeout, resend)).await;
+            }
+            Some(Err(e)) => {
+                // Connection might be dead. Try reconnecting to another endpoint.
+                tracing::warn!(path, error = %e, "etcd call failed, attempting reconnect");
+                e.to_string()
+            }
+            None => {
+                tracing::warn!(path, ?timeout, "etcd call timed out, attempting reconnect");
+                format!("timed out after {timeout:?}")
+            }
+        };
+
+        // Reconnect: try each endpoint once (round-robin from the next one).
+        // (1A): also bounded — a hung connect must not wedge the loop.
+        within(timeout, Box::pin(self.reconnect()))
+            .await
+            .ok_or_else(|| anyhow::anyhow!("etcd reconnect timed out after {timeout:?}"))??;
+        if !resend {
+            return Err(UncertainOutcome { path: path.to_string(), cause }.into());
+        }
+
+        // Retry on the new connection (re-clone after the channel was swapped).
+        let mut call = self.channel.borrow().call();
+        match within(timeout, call_with_sender(&mut call, path, body)).await {
+            Some(r) => r,
+            None => Err(anyhow::anyhow!(
+                "etcd call '{path}' timed out after retry ({timeout:?})"
+            )),
+        }
+    }
+
+    async fn reconnect(&self) -> Result<()> {
+        let n = self.endpoints.len();
+        let start = self.current_ep.get();
+        let mut errors = Vec::new();
+        for i in 1..=n {
+            let idx = (start + i) % n;
+            let ep = &self.endpoints[idx];
+            match GrpcChannel::connect(ep, &self.dialer).await {
+                Ok(new_channel) => {
+                    *self.channel.borrow_mut() = new_channel;
+                    self.current_ep.set(idx);
+                    tracing::info!(endpoint = %ep.addr, "etcd reconnected");
+                    return Ok(());
+                }
+                Err(e) => {
+                    tracing::warn!(endpoint = %ep.addr, error = %e, "etcd reconnect failed");
+                    errors.push(format!("{}: {e:#}", ep.addr));
+                }
+            }
+        }
+        bail!("failed to reconnect to any etcd endpoint: {}", errors.join("; "))
+    }
+}
+
+/// Authenticate the call's connection again and send the request once more.
+/// etcd refused the token before the request reached raft, so even a txn
+/// may go again. Only a second refusal of the token is a definite failure
+/// for a txn; anything else may have committed.
+async fn reauth_and_resend(
+    mut call: transport::Call,
+    creds: &Credentials,
+    path: &str,
+    body: Bytes,
+    timeout: Option<Duration>,
+    resend: bool,
+) -> Result<Bytes> {
+    match within(timeout, transport::authenticate(&mut call, creds)).await {
+        Some(r) => r.context("authenticate to etcd again")?,
+        None => bail!("etcd authenticate timed out after {timeout:?}"),
+    }
+    let outcome = within(timeout, call_with_sender(&mut call, path, body)).await;
+    resend_outcome(path, timeout, resend, outcome)
+}
+
+/// The result of the send after a re-authentication. For a txn
+/// (`!resend`), only a token refused again proves it did not apply.
+fn resend_outcome(
+    path: &str,
+    timeout: Option<Duration>,
+    resend: bool,
+    outcome: Option<Result<Bytes>>,
+) -> Result<Bytes> {
+    match outcome {
+        Some(Ok(resp)) => Ok(resp),
+        Some(Err(e)) if resend || is_stale_token(&e) => Err(e),
+        Some(Err(e)) => Err(UncertainOutcome { path: path.to_string(), cause: e.to_string() }.into()),
+        None if resend => bail!("etcd call '{path}' timed out after {timeout:?}"),
+        None => Err(UncertainOutcome {
+            path: path.to_string(),
+            cause: format!("timed out after {timeout:?}"),
+        }
+        .into()),
+    }
+}
+
+/// `fut` bounded by `timeout` when there is one; `None` = timed out.
+async fn within<F: Future>(timeout: Option<Duration>, fut: F) -> Option<F::Output> {
+    match timeout {
+        Some(t) => compio::time::timeout(t, fut).await.ok(),
+        None => Some(fut.await),
+    }
+}
 
 /// Minimal etcd v3 client for compio runtime (single-threaded, Rc-based).
 ///
 /// Supports etcd clusters: stores all endpoints and automatically reconnects
 /// to the next endpoint when the current connection fails.
 ///
-/// All methods take `&self` (the inner `channel` is `Rc<RefCell<GrpcChannel>>`
-/// and is the only mutable state — swapped on reconnect; concurrent calls are
-/// safe via the sender-clone-out-of-cell pattern). Callers therefore hold
-/// it as a plain `Rc<EtcdClient>` (no outer `RefCell`), so a manager etcd RPC
-/// never holds a borrow across `.await`.
+/// All methods take `&self` (the connection's channel is a `RefCell` and is
+/// the only mutable state — swapped on reconnect; concurrent calls are safe
+/// via the handle-clone-out-of-cell pattern). Callers therefore hold it as a
+/// plain `Rc<EtcdClient>` (no outer `RefCell`), so a manager etcd RPC never
+/// holds a borrow across `.await`.
 pub struct EtcdClient {
-    channel: Rc<RefCell<GrpcChannel>>,
-    endpoints: Vec<String>,
-    /// Index of the currently connected endpoint.
-    current_ep: Rc<RefCell<usize>>,
-    /// Bound on every unary call (and on its reconnect). etcd over h2c has no
-    /// request deadline of its own, so a half-open connection would hang the
-    /// caller forever; a timeout turns it into the reconnect-and-retry path.
-    request_timeout: std::time::Duration,
+    conn: Conn,
+    /// Bound on every unary call (and on its reconnect). etcd over HTTP/2 has
+    /// no request deadline of its own, so a half-open connection would hang
+    /// the caller forever; a timeout turns it into the reconnect-and-retry path.
+    request_timeout: Duration,
 }
 
-const DEFAULT_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 impl EtcdClient {
     /// Connect to an etcd endpoint (plaintext HTTP/2, h2c).
     ///
     /// `endpoint` is `"host:port"` or `"http://host:port"`.
     pub async fn connect(endpoint: &str) -> Result<Self> {
-        let addr = normalize_endpoint(endpoint);
-        let channel = GrpcChannel::connect(&addr).await?;
-        Ok(Self {
-            channel: Rc::new(RefCell::new(channel)),
-            endpoints: vec![addr],
-            current_ep: Rc::new(RefCell::new(0)),
-            request_timeout: DEFAULT_REQUEST_TIMEOUT,
-        })
+        let conn = Conn::open_at(
+            vec![EtcdEndpoint::new(endpoint)],
+            0,
+            Rc::new(Dialer { tls: None, credentials: None }),
+        )
+        .await?;
+        Ok(Self { conn, request_timeout: DEFAULT_REQUEST_TIMEOUT })
     }
 
-    /// Connect to multiple etcd endpoints (tries each in order, uses the first
-    /// that succeeds). On connection failure during operation, automatically
-    /// reconnects to the next endpoint in round-robin order.
+    /// [`connect_with`](Self::connect_with) over cleartext, no authentication.
     pub async fn connect_many(endpoints: &[String]) -> Result<Self> {
-        let endpoints: Vec<String> = endpoints.iter().map(|e| normalize_endpoint(e)).collect();
-        for (i, addr) in endpoints.iter().enumerate() {
-            match GrpcChannel::connect(addr).await {
-                Ok(channel) => {
-                    return Ok(Self {
-                        channel: Rc::new(RefCell::new(channel)),
-                        endpoints,
-                        current_ep: Rc::new(RefCell::new(i)),
-                        request_timeout: DEFAULT_REQUEST_TIMEOUT,
-                    });
-                }
+        Self::connect_with(EtcdConfig::plain(endpoints)).await
+    }
+
+    /// Connect to the first endpoint that accepts (TLS handshake and
+    /// authentication included). On connection failure during operation,
+    /// automatically reconnects to the next endpoint in round-robin order.
+    pub async fn connect_with(config: EtcdConfig) -> Result<Self> {
+        let dialer = Rc::new(Dialer {
+            tls: config.tls.map(|t| compio::tls::TlsConnector::from(t.0)),
+            credentials: config.credentials,
+        });
+        let mut errors = Vec::new();
+        for i in 0..config.endpoints.len() {
+            match Conn::open_at(config.endpoints.clone(), i, dialer.clone()).await {
+                Ok(conn) => return Ok(Self { conn, request_timeout: DEFAULT_REQUEST_TIMEOUT }),
                 Err(e) => {
+                    let addr = &config.endpoints[i].addr;
                     tracing::warn!(endpoint = %addr, error = %e, "etcd connect failed, trying next");
+                    errors.push(format!("{addr}: {e:#}"));
                 }
             }
         }
-        bail!("failed to connect to any etcd endpoint: {:?}", endpoints)
+        bail!("failed to connect to any etcd endpoint: {}", errors.join("; "))
     }
 
-    pub fn with_request_timeout(mut self, timeout: std::time::Duration) -> Self {
+    pub fn with_request_timeout(mut self, timeout: Duration) -> Self {
         self.request_timeout = timeout;
         self
     }
@@ -184,19 +444,18 @@ impl EtcdClient {
             .await
     }
 
-    /// Start a lease keep-alive stream.
+    /// A keeper that renews the lease.
     /// Returns a `LeaseKeeper` with its **own** dedicated connection to avoid
     /// `RefCell` borrow conflicts with concurrent `EtcdClient` calls.
     pub async fn lease_keep_alive(&self, lease_id: i64) -> Result<LeaseKeeper> {
         // Open a dedicated connection for keepalive (same endpoint as current).
-        let addr = &self.endpoints[*self.current_ep.borrow()];
-        let channel = GrpcChannel::connect(addr).await?;
-        Ok(LeaseKeeper {
-            channel: Rc::new(RefCell::new(channel)),
-            endpoints: self.endpoints.clone(),
-            current_ep: Rc::new(RefCell::new(*self.current_ep.borrow())),
-            lease_id,
-        })
+        let conn = Conn::open_at(
+            self.conn.endpoints.clone(),
+            self.conn.current_ep.get(),
+            self.conn.dialer.clone(),
+        )
+        .await?;
+        Ok(LeaseKeeper { conn, lease_id })
     }
 
     /// Revoke a lease, releasing all keys attached to it.
@@ -208,10 +467,20 @@ impl EtcdClient {
 
     /// Return the currently connected endpoint address.
     pub fn current_endpoint(&self) -> String {
-        self.endpoints[*self.current_ep.borrow()].clone()
+        self.conn.endpoints[self.conn.current_ep.get()].addr.clone()
     }
 
     // ── Internal ─────────────────────────────────────────────────────────
+
+    /// A unary RPC this client has no method for (etcd administration in
+    /// tests: users, roles, enabling auth). Sent again after a failure.
+    pub async fn unary<Req: Message, Resp: Message + Default>(
+        &self,
+        path: &str,
+        req: &Req,
+    ) -> Result<Resp> {
+        self.unary_call(path, req).await
+    }
 
     async fn unary_call<Req: Message, Resp: Message + Default>(
         &self,
@@ -221,102 +490,27 @@ impl EtcdClient {
         self.unary_call_with(path, req, true).await
     }
 
-    /// `resend`: whether a request whose first attempt failed or timed out is
-    /// sent again on the new connection. Reads and leases are; a txn is not.
     async fn unary_call_with<Req: Message, Resp: Message + Default>(
         &self,
         path: &str,
         req: &Req,
         resend: bool,
     ) -> Result<Resp> {
-        let body = grpc_encode(req);
-        let timeout = self.request_timeout;
-
-        // clone the SendRequest out of the RefCell, then drop the borrow
-        // before awaiting. Holding `RefMut<GrpcChannel>` across `.await` would
-        // panic the next concurrent caller on the same single-threaded runtime
-        // (e.g. 4 partitions racing on `handle_stream_punch_holes`).
-        //
-        // (1A): bound the call with `compio::time::timeout`. Without this
-        // a stuck server / half-open TCP hangs the caller forever (and with it
-        // the manager's `node_health_loop`). A timeout falls through to the
-        // reconnect + retry path, same as a connection error.
-        let mut sender = self.channel.borrow().sender();
-        let cause = match compio::time::timeout(timeout, call_with_sender(&mut sender, path, body.clone()))
-            .await
-        {
-            Ok(Ok(resp_bytes)) => return grpc_decode::<Resp>(&resp_bytes),
-            Ok(Err(e)) => {
-                // Connection might be dead. Try reconnecting to another endpoint.
-                tracing::warn!(path, error = %e, "etcd call failed, attempting reconnect");
-                e.to_string()
-            }
-            Err(_elapsed) => {
-                tracing::warn!(path, ?timeout, "etcd call timed out, attempting reconnect");
-                format!("timed out after {timeout:?}")
-            }
-        };
-
-        // Reconnect: try each endpoint once (round-robin from the next one).
-        // (1A): also bounded — a hung connect must not wedge the loop.
-        compio::time::timeout(timeout, self.reconnect())
-            .await
-            .map_err(|_| anyhow::anyhow!("etcd reconnect timed out after {timeout:?}"))??;
-        if !resend {
-            return Err(UncertainOutcome { path: path.to_string(), cause }.into());
-        }
-
-        // Retry on the new connection (re-clone after the channel was swapped).
-        let mut sender = self.channel.borrow().sender();
-        match compio::time::timeout(timeout, call_with_sender(&mut sender, path, body)).await {
-            Ok(Ok(resp_bytes)) => grpc_decode::<Resp>(&resp_bytes),
-            Ok(Err(e)) => Err(e),
-            Err(_elapsed) => Err(anyhow::anyhow!(
-                "etcd call '{path}' timed out after retry ({timeout:?})"
-            )),
-        }
+        let resp = self
+            .conn
+            .call(path, grpc_encode(req), Some(self.request_timeout), resend)
+            .await?;
+        grpc_decode::<Resp>(&resp)
     }
-
-    /// Reconnect to the next available etcd endpoint (round-robin).
-    async fn reconnect(&self) -> Result<()> {
-        reconnect_shared(&self.channel, &self.endpoints, &self.current_ep).await
-    }
-}
-
-async fn reconnect_shared(
-    channel: &Rc<RefCell<GrpcChannel>>,
-    endpoints: &[String],
-    current_ep: &Rc<RefCell<usize>>,
-) -> Result<()> {
-    let n = endpoints.len();
-    let start = *current_ep.borrow();
-    for i in 1..=n {
-        let idx = (start + i) % n;
-        let addr = &endpoints[idx];
-        match GrpcChannel::connect(addr).await {
-            Ok(new_channel) => {
-                *channel.borrow_mut() = new_channel;
-                *current_ep.borrow_mut() = idx;
-                tracing::info!(endpoint = %addr, "etcd reconnected");
-                return Ok(());
-            }
-            Err(e) => {
-                tracing::warn!(endpoint = %addr, error = %e, "etcd reconnect failed");
-            }
-        }
-    }
-    bail!("failed to reconnect to any etcd endpoint: {:?}", endpoints)
 }
 
 /// Lease keep-alive handle.
 ///
 /// Sends periodic keep-alive requests to etcd for a specific lease.
 /// Each `keep_alive()` call sends one request and reads one response.
-/// On connection failure, the underlying EtcdClient reconnects transparently.
+/// On connection failure, it reconnects to the next endpoint transparently.
 pub struct LeaseKeeper {
-    channel: Rc<RefCell<GrpcChannel>>,
-    endpoints: Vec<String>,
-    current_ep: Rc<RefCell<usize>>,
+    conn: Conn,
     lease_id: i64,
 }
 
@@ -325,71 +519,16 @@ impl LeaseKeeper {
     /// Returns the remaining TTL. Returns Err if the lease has expired or etcd is unreachable.
     pub async fn keep_alive(&self) -> Result<LeaseKeepAliveResponse> {
         let req = LeaseKeepAliveRequest { id: self.lease_id };
-        let body = grpc_encode(&req);
-        let path = "/etcdserverpb.Lease/LeaseKeepAlive";
-
-        // same fix as `EtcdClient::unary_call` — clone the sender out
-        // of the RefCell before await, so concurrent keepalives (or any
-        // future shared use of LeaseKeeper) don't panic on borrow_mut.
-        let mut sender = self.channel.borrow().sender();
-        match call_with_sender(&mut sender, path, body.clone()).await {
-            Ok(resp_bytes) => return grpc_decode::<LeaseKeepAliveResponse>(&resp_bytes),
-            Err(e) => {
-                tracing::warn!(error = %e, "lease keepalive failed, reconnecting");
-            }
-        }
-
-        // Reconnect round-robin.
-        reconnect_shared(&self.channel, &self.endpoints, &self.current_ep).await?;
-
-        let mut sender = self.channel.borrow().sender();
-        let resp_bytes = call_with_sender(&mut sender, path, body).await?;
-        grpc_decode::<LeaseKeepAliveResponse>(&resp_bytes)
+        let resp = self
+            .conn
+            .call("/etcdserverpb.Lease/LeaseKeepAlive", grpc_encode(&req), None, true)
+            .await?;
+        grpc_decode::<LeaseKeepAliveResponse>(&resp)
     }
 
     /// Get the lease ID this keeper is managing.
     pub fn lease_id(&self) -> i64 {
         self.lease_id
-    }
-}
-
-// ── Watch ───────────────────────────────────────────────────────────────────
-
-/// Watch a single key on etcd and return when a DELETE event is received.
-///
-/// Opens a dedicated HTTP/2 connection (independent of [EtcdClient]'s
-/// shared connection) so it does not block other etcd operations. Useful for
-/// leader election: watch the leader key and wake up the moment the old
-/// leader's lease expires.
-pub async fn watch_key_until_delete(endpoint: &str, key: &[u8]) -> Result<()> {
-    let watch_req = WatchRequest {
-        request_union: Some(WatchRequestUnion::CreateRequest(WatchCreateRequest {
-            key: key.to_vec(),
-            ..Default::default()
-        })),
-    };
-    let body = grpc_encode(&watch_req);
-
-    let mut reader =
-        transport::open_streaming_call(endpoint, "/etcdserverpb.Watch/Watch", body).await?;
-
-    loop {
-        match reader.next_message::<WatchResponse>().await? {
-            Some(resp) => {
-                if resp.canceled {
-                    bail!("watch canceled: {}", resp.cancel_reason);
-                }
-                for event in &resp.events {
-                    // type 1 = DELETE
-                    if event.r#type == 1 {
-                        return Ok(());
-                    }
-                }
-            }
-            None => {
-                bail!("watch stream ended unexpectedly");
-            }
-        }
     }
 }
 
@@ -571,5 +710,23 @@ mod tests {
             compare.target_union,
             Some(TargetUnion::ModRevision(42))
         ));
+    }
+
+    /// After a re-authentication, a txn fails definitely only when the token
+    /// is refused again (rejected before raft); any other status may follow a
+    /// commit ("request timed out" is answered after the proposal).
+    #[test]
+    fn txn_after_reauth_is_uncertain_unless_the_token_is_refused_again() {
+        let status = |code, message: &str| -> Option<Result<Bytes>> {
+            Some(Err(GrpcStatus { path: "txn".into(), code, message: message.into() }.into()))
+        };
+        let uncertain = |r: Result<Bytes>| {
+            r.err().expect("an error").downcast_ref::<UncertainOutcome>().is_some()
+        };
+        let txn = |outcome| resend_outcome("txn", None, false, outcome);
+        assert!(uncertain(txn(status(14, "etcdserver: request timed out"))));
+        assert!(uncertain(txn(None)));
+        assert!(!uncertain(txn(status(16, "etcdserver: invalid auth token"))));
+        assert!(!uncertain(resend_outcome("get", None, true, status(14, "timed out"))));
     }
 }

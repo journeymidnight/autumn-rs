@@ -25,18 +25,6 @@ pub struct KeyValue {
     pub lease: i64,
 }
 
-/// mvccpb.Event
-#[derive(Clone, Message)]
-pub struct Event {
-    /// 0 = PUT, 1 = DELETE
-    #[prost(int32, tag = "1")]
-    pub r#type: i32,
-    #[prost(message, optional, tag = "2")]
-    pub kv: Option<KeyValue>,
-    #[prost(message, optional, tag = "3")]
-    pub prev_kv: Option<KeyValue>,
-}
-
 /// etcdserverpb.ResponseHeader
 #[derive(Clone, Message)]
 pub struct ResponseHeader {
@@ -286,68 +274,24 @@ pub struct LeaseRevokeResponse {
     pub header: Option<ResponseHeader>,
 }
 
-// ── Watch ──────────────────────────────────────────────────────────────────
+// ── Auth ───────────────────────────────────────────────────────────────────
 
-/// etcdserverpb.WatchCreateRequest
+/// etcdserverpb.AuthenticateRequest
 #[derive(Clone, Message)]
-pub struct WatchCreateRequest {
-    #[prost(bytes = "vec", tag = "1")]
-    pub key: Vec<u8>,
-    #[prost(bytes = "vec", tag = "2")]
-    pub range_end: Vec<u8>,
-    #[prost(int64, tag = "3")]
-    pub start_revision: i64,
-    #[prost(bool, tag = "4")]
-    pub progress_notify: bool,
-    #[prost(bool, tag = "6")]
-    pub prev_kv: bool,
-    #[prost(int64, tag = "7")]
-    pub watch_id: i64,
-    #[prost(bool, tag = "8")]
-    pub fragment: bool,
+pub struct AuthenticateRequest {
+    #[prost(string, tag = "1")]
+    pub name: String,
+    #[prost(string, tag = "2")]
+    pub password: String,
 }
 
-/// etcdserverpb.WatchCancelRequest
+/// etcdserverpb.AuthenticateResponse
 #[derive(Clone, Message)]
-pub struct WatchCancelRequest {
-    #[prost(int64, tag = "1")]
-    pub watch_id: i64,
-}
-
-/// etcdserverpb.WatchRequest (wrapper with oneof)
-#[derive(Clone, Message)]
-pub struct WatchRequest {
-    #[prost(oneof = "WatchRequestUnion", tags = "1, 2")]
-    pub request_union: Option<WatchRequestUnion>,
-}
-
-#[derive(Clone, ::prost::Oneof)]
-pub enum WatchRequestUnion {
-    #[prost(message, tag = "1")]
-    CreateRequest(WatchCreateRequest),
-    #[prost(message, tag = "2")]
-    CancelRequest(WatchCancelRequest),
-}
-
-/// etcdserverpb.WatchResponse
-#[derive(Clone, Message)]
-pub struct WatchResponse {
+pub struct AuthenticateResponse {
     #[prost(message, optional, tag = "1")]
     pub header: Option<ResponseHeader>,
-    #[prost(int64, tag = "2")]
-    pub watch_id: i64,
-    #[prost(bool, tag = "3")]
-    pub created: bool,
-    #[prost(bool, tag = "4")]
-    pub canceled: bool,
-    #[prost(int64, tag = "5")]
-    pub compact_revision: i64,
-    #[prost(string, tag = "6")]
-    pub cancel_reason: String,
-    #[prost(bool, tag = "7")]
-    pub fragment: bool,
-    #[prost(message, repeated, tag = "11")]
-    pub events: Vec<Event>,
+    #[prost(string, tag = "2")]
+    pub token: String,
 }
 
 // ── gRPC framing helpers ────────────────────────────────────────────────────

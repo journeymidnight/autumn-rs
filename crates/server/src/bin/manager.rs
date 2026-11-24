@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use autumn_manager::AutumnManager;
 use autumn_params::manager::ManagerParams;
 use autumn_params::Positional;
+use autumn_etcd::{Credentials, EtcdConfig, EtcdEndpoint, TlsConfig};
 
 // allocator hygiene — see crates/server/src/bin/extent_node.rs for
 // the rationale and the MALLOC_CONF tuning explanation. Manager's peak
@@ -34,15 +35,49 @@ fn parse_args() -> ManagerParams {
     params
 }
 
-/// `--listen` and `--etcd` with every name resolved to its addresses.
-fn resolve_address_flags(params: &ManagerParams) -> Result<(), String> {
+/// `--listen` with its name resolved, and the `--etcd` endpoints: every name
+/// replaced by its addresses, each keeping the name for TLS to check.
+fn resolve_address_flags(params: &ManagerParams) -> Result<Vec<EtcdEndpoint>, String> {
     let listen = params.listen.get();
     let ip = autumn_transport::resolve_host(&listen).map_err(|e| format!("--listen: {e}"))?;
     params.listen.set(ip.to_string());
-    let etcd = autumn_transport::resolve_host_port_list(&params.etcd.get().join(","))
-        .map_err(|e| format!("--etcd: {e}"))?;
-    params.etcd.set(etcd.iter().map(|sa| sa.to_string()).collect());
-    Ok(())
+    let mut endpoints: Vec<EtcdEndpoint> = Vec::new();
+    for item in params.etcd.get().join(",").split(',').filter(|s| !s.trim().is_empty()) {
+        let name = EtcdEndpoint::new(item).server_name;
+        for sa in autumn_transport::resolve_host_port(item).map_err(|e| format!("--etcd: {e}"))? {
+            let addr = sa.to_string();
+            if !endpoints.iter().any(|e| e.addr == addr) {
+                endpoints.push(EtcdEndpoint { addr, server_name: name.clone() });
+            }
+        }
+    }
+    params.etcd.set(endpoints.iter().map(|e| e.addr.clone()).collect());
+    Ok(endpoints)
+}
+
+/// TLS and the etcd user from their flags; a file that does not load stops
+/// the start.
+fn etcd_config(params: &ManagerParams, endpoints: Vec<EtcdEndpoint>) -> Result<EtcdConfig> {
+    let tls = match params.etcd_cacert.get() {
+        None => None,
+        Some(ca) => {
+            let cert = params.etcd_cert.get();
+            let key = params.etcd_key.get();
+            let client = cert.as_deref().zip(key.as_deref());
+            Some(TlsConfig::from_pem_files(&ca, client).context("etcd TLS")?)
+        }
+    };
+    let credentials = match (params.etcd_user.get(), params.etcd_password_file.get()) {
+        (Some(user), Some(path)) => {
+            let text = std::fs::read_to_string(&path)
+                .with_context(|| format!("read --etcd-password-file {}", path.display()))?;
+            let password = text.trim_end_matches(['\n', '\r']).to_string();
+            anyhow::ensure!(!password.is_empty(), "--etcd-password-file {} is empty", path.display());
+            Some(Credentials { user, password })
+        }
+        _ => None,
+    };
+    Ok(EtcdConfig { endpoints, tls, credentials })
 }
 
 #[compio::main]
@@ -56,10 +91,13 @@ async fn main() -> Result<()> {
 
     let params = parse_args();
     // Names in the address flags become IP literals here, once.
-    if let Err(e) = resolve_address_flags(&params) {
-        eprintln!("error: {e}");
-        std::process::exit(2);
-    }
+    let etcd_endpoints = match resolve_address_flags(&params) {
+        Ok(endpoints) => endpoints,
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(2);
+        }
+    };
     // `params` moves into the manager; what main needs is read first.
     let etcd = params.etcd.get();
     let fast_mode = params.policy_fast_mode.get();
@@ -85,7 +123,13 @@ async fn main() -> Result<()> {
             id: params.manager_id.get(),
             address: addr.to_string(),
         };
-        AutumnManager::new_with_etcd_params(etcd, identity, params)
+        let config = etcd_config(&params, etcd_endpoints)?;
+        tracing::info!(
+            tls = config.tls.is_some(),
+            user = config.credentials.as_ref().map(|c| c.user.as_str()),
+            "etcd connection"
+        );
+        AutumnManager::new_with_etcd_config(config, identity, params)
             .await
             .context("connect to etcd")?
     };

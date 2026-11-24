@@ -80,6 +80,7 @@ tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 autumn-common = { path = "../common" }
 autumn-manager = { path = "../manager" }
+autumn-etcd = { path = "../etcd" }
 autumn-params = { path = "../params" }
 autumn-stream = { path = "../stream" }
 autumn-partition-server = { path = "../partition-server" }

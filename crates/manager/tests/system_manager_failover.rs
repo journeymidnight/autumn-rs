@@ -58,7 +58,9 @@ fn start_etcd_manager(mgr_addr: SocketAddr, etcd_endpoint: String) {
 }
 
 /// Stop M1 and wait until M2 serves routing as the leader. M1's lease has a
-/// 10 s TTL, so the handover takes about that long.
+/// 10 s TTL, renewed every 2 s; the standby reads the leader key once a
+/// second. Worst case ~12 s (lease, etcd's expiry tick, the poll, replay), so
+/// 15 s: a bound on takeover, which a standby that never polls again misses.
 async fn fail_over(
     m1: (ShutdownFlag, std::thread::JoinHandle<()>),
     mgr2: &RpcClient,
@@ -66,7 +68,7 @@ async fn fail_over(
     let (flag, handle) = m1;
     flag.shutdown();
     handle.join().expect("join M1");
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
     loop {
         let regions = get_regions(mgr2).await;
         if regions.code == CODE_OK {
@@ -79,7 +81,7 @@ async fn fail_over(
         );
         assert!(
             std::time::Instant::now() < deadline,
-            "M2 did not take over within 30 s of M1 stopping"
+            "M2 did not take over within 15 s of M1 stopping"
         );
         compio::time::sleep(Duration::from_millis(200)).await;
     }

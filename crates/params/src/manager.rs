@@ -14,6 +14,16 @@ crate::params! {
         listen: String = "0.0.0.0".into();
         /// etcd endpoints (none = in memory only, lost on restart).
         etcd: Vec<String>;
+        /// etcd user to authenticate as (with --etcd-password-file).
+        etcd_user: Option<String>;
+        /// File holding the etcd user's password (trailing newline dropped).
+        etcd_password_file: Option<std::path::PathBuf>;
+        /// CA certificate(s) of etcd's TLS; setting it turns TLS on.
+        etcd_cacert: Option<std::path::PathBuf>;
+        /// Client certificate for etcd's TLS (with --etcd-key).
+        etcd_cert: Option<std::path::PathBuf>;
+        /// Private key of --etcd-cert.
+        etcd_key: Option<std::path::PathBuf>;
         /// This manager's id in the membership; non-zero, required with --etcd.
         manager_id: u64;
         transport: crate::Transport;
@@ -243,6 +253,15 @@ impl crate::CrossCheck for ManagerParams {
     fn cross_check(&self) -> Result<(), String> {
         if !self.etcd.get().is_empty() && self.manager_id.get() == 0 {
             return Err("--manager-id <N> (non-zero) is required with --etcd".into());
+        }
+        if self.etcd_user.get().is_some() != self.etcd_password_file.get().is_some() {
+            return Err("--etcd-user and --etcd-password-file go together".into());
+        }
+        if self.etcd_cert.get().is_some() != self.etcd_key.get().is_some() {
+            return Err("--etcd-cert and --etcd-key go together".into());
+        }
+        if self.etcd_cert.get().is_some() && self.etcd_cacert.get().is_none() {
+            return Err("--etcd-cert needs --etcd-cacert".into());
         }
         if self.policy_required_buckets.get() > self.policy_window_buckets.get() {
             return Err(format!(

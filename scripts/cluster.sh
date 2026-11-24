@@ -691,6 +691,10 @@ launch_ps() {
 # etcd is already running and only the manager needs relaunching. Must
 # mirror the port grid in do_start's etcd section (2379 + m*10).
 compute_etcd_endpoints() {
+    if [[ -n "${AUTUMN_ETCD_ENDPOINTS:-}" ]]; then
+        ETCD_ENDPOINTS="$AUTUMN_ETCD_ENDPOINTS"
+        return
+    fi
     local etcd_n="${AUTUMN_ETCD_CLUSTER:-1}"
     [[ "$etcd_n" =~ ^[0-9]+$ ]] && (( etcd_n >= 1 )) || etcd_n=1
     if (( etcd_n == 1 )); then
@@ -773,9 +777,18 @@ launch_manager() {
             mgr_extra="$mgr_extra --auth-token-ttl-secs $AUTUMN_AUTH_TOKEN_TTL_SECS"
         fi
     fi
+    # etcd with TLS (CA set = TLS on; cert+key = client certificate) and/or
+    # password auth (user + password file); usually with AUTUMN_ETCD_ENDPOINTS.
+    local -a etcd_auth=()
+    [[ -n "${AUTUMN_ETCD_USER:-}" ]] && etcd_auth+=(--etcd-user "$AUTUMN_ETCD_USER")
+    [[ -n "${AUTUMN_ETCD_PASSWORD_FILE:-}" ]] && etcd_auth+=(--etcd-password-file "$AUTUMN_ETCD_PASSWORD_FILE")
+    [[ -n "${AUTUMN_ETCD_CACERT:-}" ]] && etcd_auth+=(--etcd-cacert "$AUTUMN_ETCD_CACERT")
+    [[ -n "${AUTUMN_ETCD_CERT:-}" ]] && etcd_auth+=(--etcd-cert "$AUTUMN_ETCD_CERT")
+    [[ -n "${AUTUMN_ETCD_KEY:-}" ]] && etcd_auth+=(--etcd-key "$AUTUMN_ETCD_KEY")
     start_proc manager \
         "$MANAGER" --port 9001 --manager-id 1 --etcd "$ETCD_ENDPOINTS" --listen "$BIND_HOST" \
-        --transport "$TRANSPORT" $mgr_extra --cluster-secret-file "$CLUSTER_SECRET_FILE"
+        --transport "$TRANSPORT" $mgr_extra --cluster-secret-file "$CLUSTER_SECRET_FILE" \
+        ${etcd_auth[@]+"${etcd_auth[@]}"}
     # A restart binds only after it holds manager id 1, which can wait out
     # the predecessor's 10 s presence lease.
     wait_port 9001 manager 60
@@ -882,13 +895,17 @@ do_start() {
 
     # etcd — AUTUMN_ETCD_CLUSTER=N (default 1) starts an N-member etcd
     # cluster on client ports 2379/2389/2399... (peer ports +1). The
-    # manager gets the full endpoint list; autumn-etcd's reconnect_shared
-    # round-robins across members on failure (validated by
+    # manager gets the full endpoint list; autumn-etcd moves to the next
+    # member on failure (validated by
     # scripts/etcd_chaos.sh D0 member-kill).
     local etcd_n="${AUTUMN_ETCD_CLUSTER:-1}"
     [[ "$etcd_n" =~ ^[0-9]+$ ]] && (( etcd_n >= 1 )) || die "AUTUMN_ETCD_CLUSTER must be a positive integer"
     ETCD_ENDPOINTS=""
-    if (( etcd_n == 1 )); then
+    if [[ -n "${AUTUMN_ETCD_ENDPOINTS:-}" ]]; then
+        # An etcd this script does not run (e.g. one with TLS and auth).
+        ETCD_ENDPOINTS="$AUTUMN_ETCD_ENDPOINTS"
+        echo "[cluster] external etcd: $ETCD_ENDPOINTS"
+    elif (( etcd_n == 1 )); then
         start_proc etcd \
             etcd \
             --data-dir "$ETCD_DIR" \
@@ -1002,15 +1019,21 @@ do_start() {
     launch_ps
 
     # bootstrap (create streams + partitions) — only when the cluster has never
-    # been bootstrapped. AUTHORITATIVE check = does etcd already hold cluster
-    # metadata (`streams/` keys, written by bootstrap). The local marker file
-    # alone is unreliable: a `restart` whose marker was lost must NOT
-    # re-bootstrap on top of live etcd data (that would create duplicate
-    # streams/partitions over the preserved data). etcd is the source of truth;
-    # the marker is just a fast-path hint we self-heal here.
-    local etcd_bootstrapped=0
-    if etcdctl get "streams/" --prefix --keys-only 2>/dev/null | grep -q .; then
+    # been bootstrapped. AUTHORITATIVE check = does the leader manager (replayed
+    # from whichever etcd it uses, TLS/auth included) already hold a partition. The
+    # local marker file alone is unreliable: a `restart` whose marker was lost,
+    # or `clean` against an external etcd, must NOT re-bootstrap on top of live
+    # metadata (bootstrap would create a second set of streams/partitions). The
+    # marker is just a fast-path hint we self-heal here. No answer = stop.
+    local etcd_bootstrapped info_json
+    info_json="$("$AO" --json --cluster-secret-file "$CLUSTER_SECRET_FILE" --manager "$MANAGER_ADDR" --transport "$TRANSPORT" info 2>&1)" \
+        || die "cannot ask the manager whether the cluster is bootstrapped: $info_json"
+    if grep -q '^  "part_count": 0,' <<<"$info_json"; then
+        etcd_bootstrapped=0
+    elif grep -qE '^  "part_count": [1-9]' <<<"$info_json"; then
         etcd_bootstrapped=1
+    else
+        die "autumn-op info gave no part_count: $info_json"
     fi
     if [[ -f "$bootstrap_marker" || "$etcd_bootstrapped" == "1" ]]; then
         if [[ ! -f "$bootstrap_marker" ]]; then
@@ -1418,7 +1441,11 @@ case "$CMD" in
     stop)         do_stop ;;
     restart)      resolve_replicas; do_stop; do_start "$EFF_REPLICAS" 0 ;;
     clean)        do_clean ;;
-    reset)        do_clean; do_start "$REPLICAS" 1 ;;
+    reset)
+        # The local wipe would leave an external etcd's metadata in place.
+        [[ -z "${AUTUMN_ETCD_ENDPOINTS:-}" ]] \
+            || die "reset does not clear an external etcd (AUTUMN_ETCD_ENDPOINTS); clear it yourself, then clean + start"
+        do_clean; do_start "$REPLICAS" 1 ;;
     status)       do_status ;;
     logs)         do_logs ;;
     # per-process control for recovery testing. Args inherit the

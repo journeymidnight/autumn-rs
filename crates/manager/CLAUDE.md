@@ -22,6 +22,16 @@ parameters may be copied once at construction: `connect_timeout_ms` (the two
 tests replace it whole with `set_policy_config`). Setting one of those through
 `params()` after construction changes nothing.
 
+**etcd TLS and auth.** `--etcd-cacert` (TLS on), `--etcd-cert`/`--etcd-key`
+(client certificate), `--etcd-user`/`--etcd-password-file` are loaded by the
+binary (`crates/server/src/bin/manager.rs::etcd_config`) into an
+`autumn_etcd::EtcdConfig` handed to `new_with_etcd_config`; a file that does not
+load, a wrong password or an untrusted certificate stops the start.
+`new_with_etcd_params` is the cleartext form the tests use. `--etcd` names are
+resolved to IPs once at startup; each address keeps the name as written for the
+certificate check. Token expiry, re-authentication and the per-connection token
+are the etcd client's (crates/etcd/CLAUDE.md "TLS and auth").
+
 **Runtime overrides (`runtime_config.rs`).** `autumn-op config set <role>.<flag>
 <value>` → `MSG_SET_RUNTIME_CONFIG` (leader, admin): the key must be a `[runtime]`
 parameter of `manager`, `ps` or `en` and the value inside its range
@@ -164,11 +174,21 @@ Invariants that came with it:
 Preceded by holding `--manager-id` (see "Manager identity and membership").
 
 Lease-based (10 s TTL):
-1. Create lease; CAS-write `autumn-rs/stream-manager/leader = instance_id` if absent.
-2. On win: `replay_from_etcd` rebuilds all in-memory state, set `leader = true`,
+1. A standby reads `autumn-rs/stream-manager/leader` once a second. A holder
+   other than itself marks it `displaced`; its own id (a stale key from a
+   step-down, lease still live) is waited out.
+2. Key gone (the holder's lease expired): grant a lease, CAS-write
+   `leader = instance_id` if absent. Losing the CAS = another standby won.
+3. On win: `replay_from_etcd` rebuilds all in-memory state, set `leader = true`,
    start a keepalive loop (every 2 s).
-3. Lease expiry / keepalive failure → `leader = false` (step down).
-4. A background loop retries election every 2 s when not leader.
+4. Lease expiry / keepalive failure → `leader = false` (step down).
+
+Polling, not an etcd watch: every step is a bounded unary call (a dead etcd
+member only moves the client to another), and a read cannot miss a delete
+that a watch opened after it would. It costs at most 1 s on top of the
+lease's expiry. `tests/system_manager_failover.rs` bounds the takeover at
+15 s (measured ~9.6 s, worst case ~12 s); a slower poll is caught only some
+of the time.
 
 Each election grants a new leader lease, and that lease names the term
 (`EtcdMirror::term`). Only the current term steps the process down: a fence
@@ -176,8 +196,7 @@ diagnosis whose read of the key is answered after this process won it again
 refuses its txn and leaves `leader` alone, and the keepalive loop of an old
 lease ends quietly once a newer term exists. Either used to step the new term
 down while its own key stayed alive, and then the process never ran for leader
-again (the election CAS found its key; it waited for a deletion that never
-came). `tests/leader_step_down_stale_term.rs` (failpoint
+again (it found its own key and waited for a deletion that never came). `tests/leader_step_down_stale_term.rs` (failpoint
 `DIAGNOSE_FENCE_TEST_HOLD`; ablations red: no term check in the diagnosis; no
 term check in the keepalive loop nor in `step_down_from` — each of those two
 alone is enough there, the loop's also stops renewing a lease nobody uses).
@@ -2536,8 +2555,8 @@ ex-leader inside its leaderless window still answers them, as stale as its
 routing; the epoch fences, not this gate, are what keep data safe. During an etcd outage the ex-leader's in-memory routing is
 the freshest in existence and nothing can supersede it (no election, no mutation), so
 strict-gating would black-hole every fresh client for the whole outage. `displaced`
-(default TRUE, cleared on winning the election, set when the election CAS or a leader-fence
-fence diagnosis observes a DIFFERENT instance in the leader key — a *missing* key is
+(default TRUE, cleared on winning the election, set when the standby's read of the leader key or a leader-fence
+diagnosis observes a DIFFERENT instance in it — a *missing* key is
 lease-expiry, not displacement) keeps a rejoined FOLLOWER from serving replay-stale
 regions. Bounded by `--routable-stale-ttl-secs` (15 min from `leaderless_since`): in an
 asymmetric partition a peer may have taken over, and after the TTL PSes get NOT_LEADER

@@ -19,7 +19,7 @@
 #
 # Cluster mode (./scripts/etcd_chaos.sh cluster): 3-member etcd; adds
 #   D0: kill ONE member → the manager's lease keepalive must fail over
-#       (autumn-etcd reconnect_shared round-robin) with NO step-down —
+#       (autumn-etcd moves to the next member) with NO step-down —
 #       control plane stays fully available, not just the data plane.
 # D1-D3 then kill/restart the REMAINING members (full outage as before).
 #

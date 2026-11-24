@@ -610,6 +610,59 @@ $C up -d                                          # a second up changes nothing;
 $C down -v                                        # stops and wipes every volume
 ```
 
+### etcd with TLS and password auth
+
+The manager reaches an etcd that requires TLS, client certificates or a
+password with these flags (all optional; none = cleartext, no user). The
+files are read once, at start: a rotated certificate or password takes a
+manager restart.
+
+| Flag | Env (entrypoint.sh, cluster.sh) | |
+|---|---|---|
+| `--etcd-cacert <pem>` | `AUTUMN_ETCD_CACERT` | CA of etcd's certificate; setting it turns TLS on |
+| `--etcd-cert <pem>` `--etcd-key <pem>` | `AUTUMN_ETCD_CERT` `AUTUMN_ETCD_KEY` | client certificate (`--client-cert-auth` etcd) |
+| `--etcd-user <name>` `--etcd-password-file <file>` | `AUTUMN_ETCD_USER` `AUTUMN_ETCD_PASSWORD_FILE` | etcd user; the file's trailing newline is dropped |
+
+- The certificate is checked against the host as written in `--etcd`
+  (`etcd-0.etcd:2379` → `etcd-0.etcd`; an IP against the certificate's IP SANs);
+  the connection goes to the resolved address.
+- A wrong password, an untrusted or misnamed certificate, or a file that does
+  not load stops the manager at start (exit 1, each endpoint's cause in the
+  message).
+- Each connection authenticates for itself (a simple token's expiry runs on
+  each member separately). An expired or refused token is replaced and the
+  request sent once more; etcd refuses those before applying them, so this
+  holds for txns too. The log shows `etcd refused the token, authenticating
+  again` each time — with JWT tokens about once per TTL.
+- The user needs read/write on every key autumn writes, which sit under many
+  top-level prefixes (`nodes/`, `streams/`, `extents/`, `autumn-rs/`, …): give it
+  a whole-keyspace role, or `root`. Use an etcd that serves only autumn.
+- `cluster.sh` with `AUTUMN_ETCD_ENDPOINTS=host:port` uses that etcd instead of
+  starting one, and refuses `reset` (it would wipe the node data and leave that
+  etcd's metadata). Whether a `start` bootstraps is the manager's answer
+  (`autumn-op --json info`, `part_count`), so it never bootstraps over metadata
+  already there; after `clean` with that etcd still holding it, `start` stops
+  with the PS unable to open. `autumn-deploy` (bare metal) starts cleartext etcd only.
+
+**Verify** (needs `etcd` and `openssl` on `PATH`; ~1 min):
+
+```bash
+cargo test -p autumn-etcd --test auth_tls
+#   tls_and_password_auth_carry_every_call, wrong_password_or_certificate_fails_the_connect,
+#   expired_token_is_replaced ... ok
+cargo build --workspace
+bash scripts/etcd_tls_auth.sh
+#   wrong password: rc=1  status=3 message=etcdserver: authentication failed, invalid user ID or password
+#   untrusted CA  : rc=1  invalid peer certificate: UnknownIssuer
+#   written and read back; running 30 s on expiring tokens
+#   PASS: key read back after the manager restart; re-authentications: 9
+```
+
+The script runs etcd with mutual TLS, a root password and JWT tokens that
+expire every 5 s, then a manager, 3 ENs and a PS on it: a write, 30 s of
+expiring tokens, a manager restart (replay), and a read. A failure shows a
+manager that exits, `FAIL-…`, or `re-authentications: 0`.
+
 ## Parameters (flags)
 
 Every flag of every binary is declared in `crates/params/src/<role>.rs`, in

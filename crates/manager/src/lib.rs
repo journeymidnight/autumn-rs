@@ -276,13 +276,13 @@ enum Fence {
 
 impl EtcdMirror {
     async fn connect(
-        endpoints: Vec<String>,
+        config: autumn_etcd::EtcdConfig,
         instance_id: Rc<String>,
         leader: Rc<Cell<bool>>,
         displaced: Rc<Cell<bool>>,
         request_timeout: Duration,
     ) -> Result<Self> {
-        let client = autumn_etcd::EtcdClient::connect_many(&endpoints)
+        let client = autumn_etcd::EtcdClient::connect_with(config)
             .await?
             .with_request_timeout(request_timeout);
         Ok(Self {
@@ -303,7 +303,7 @@ impl EtcdMirror {
     }
 
     /// run a fenced txn. Always prepends a
-    /// `Cmp::value(LEADER_KEY) == instance_id` compare to `extra_cmp`.
+    /// `Cmp::mod_revision(LEADER_KEY) == fence_rev` compare to `extra_cmp`.
     ///
     /// Returns:
     ///   - `Ok(true)` — the txn (fence + extra) succeeded; success ops applied.
@@ -1478,13 +1478,23 @@ impl AutumnManager {
         identity: manager_members::ManagerIdentity,
         params: ManagerParams,
     ) -> Result<Self> {
+        Self::new_with_etcd_config(autumn_etcd::EtcdConfig::plain(&endpoints), identity, params)
+            .await
+    }
+
+    /// `new_with_etcd_params` for an etcd reached over TLS or as a user.
+    pub async fn new_with_etcd_config(
+        etcd: autumn_etcd::EtcdConfig,
+        identity: manager_members::ManagerIdentity,
+        params: ManagerParams,
+    ) -> Result<Self> {
         anyhow::ensure!(identity.id != 0, "the manager id must be non-zero");
         let mut s = Self::new_with_params(params);
         s.leader.set(false);
         s.identity = Some(Rc::new(identity));
         s.etcd = Some(
             EtcdMirror::connect(
-                endpoints,
+                etcd,
                 s.instance_id.clone(),
                 s.leader.clone(),
                 s.displaced.clone(),
@@ -2809,41 +2819,44 @@ impl AutumnManager {
 
     // ── Leader election ────────────────────────────────────────────────
 
+    /// A standby reads the leader key once a second and campaigns only when
+    /// it is gone (its holder's lease expired). Every step is a bounded unary
+    /// call, so a dead etcd member only moves the client to another one.
     async fn leader_election_loop(self) {
         const RETRY: Duration = Duration::from_secs(2);
+        const POLL: Duration = Duration::from_secs(1);
         loop {
-            if self.leader.get() {
+            let Some(etcd) = self.etcd.as_ref().filter(|_| !self.leader.get()) else {
                 compio::time::sleep(RETRY).await;
                 continue;
-            }
-            match self.try_become_leader().await {
-                Ok(true) => continue,
-                Ok(false) => {
-                    // CAS failed — another leader holds the key.
-                    // Watch for deletion instead of blind polling.
-                    if let Some(etcd) = &self.etcd {
-                        let addr = etcd.client.current_endpoint();
-                        tracing::info!("watching leader key for deletion");
-                        match autumn_etcd::watch_key_until_delete(&addr, LEADER_KEY.as_bytes())
-                            .await
-                        {
-                            Ok(()) => {
-                                tracing::info!("leader key deleted, retrying election");
-                                continue;
-                            }
-                            Err(e) => {
-                                tracing::warn!(error = %e, "watch leader key failed");
-                                compio::time::sleep(RETRY).await;
-                            }
-                        }
-                    } else {
+            };
+            let holder = match etcd.client.get(LEADER_KEY.as_bytes()).await {
+                Ok(got) => got.kvs.into_iter().next().map(|kv| kv.value),
+                Err(e) => {
+                    tracing::warn!(error = %e, "read leader key failed");
+                    compio::time::sleep(POLL).await;
+                    continue;
+                }
+            };
+            match holder {
+                // etcd-chaos D1: another instance leads, so our state can go
+                // stale under us: displaced gates the stale-while-leaderless
+                // serving. Our OWN id (a stale key from a spurious step-down,
+                // lease still live) is not displacement.
+                Some(id) => {
+                    if id != self.instance_id.as_bytes() {
+                        self.displaced.set(true);
+                    }
+                    compio::time::sleep(POLL).await;
+                }
+                None => match self.try_become_leader().await {
+                    Ok(true) => {}
+                    Ok(false) => tracing::info!("another manager won the election"),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "leader election error");
                         compio::time::sleep(RETRY).await;
                     }
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "leader election error");
-                    compio::time::sleep(RETRY).await;
-                }
+                },
             }
         }
     }
@@ -2887,23 +2900,7 @@ impl AutumnManager {
             etcd.seed_fence(Self::commit_revision_of(&resp)?, lease_id);
         }
         if !resp.succeeded {
-            // etcd-chaos D1: the CAS failing proves etcd is ALIVE and the
-            // key exists — read the holder. A DIFFERENT instance holding
-            // leadership means our state can go stale under us: mark
-            // displaced (gates the stale-while-leaderless serving). Our
-            // OWN id (stale key from a spurious step-down, lease still
-            // live) is not displacement.
-            let holder = {
-                let c = etcd.client.clone();
-                c.get(LEADER_KEY.as_bytes()).await
-            };
-            if let Ok(got) = holder {
-                if let Some(kv) = got.kvs.first() {
-                    if kv.value.as_slice() != self.instance_id.as_bytes() {
-                        self.displaced.set(true);
-                    }
-                }
-            }
+            // Another standby won; the next read of the key sees its holder.
             return Ok(false);
         }
 

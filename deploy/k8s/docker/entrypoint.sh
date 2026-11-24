@@ -134,6 +134,13 @@ run_manager() {
         --port "$port" --manager-id "$mid" --etcd "$etcd" --listen 0.0.0.0 --transport "$TRANSPORT"
     )
     [[ "${AUTUMN_POLICY_FAST_MODE:-0}" == "1" ]] && args+=(--policy-fast-mode)
+    # etcd with TLS (CA set = TLS on; cert+key = client certificate) and/or
+    # password auth (user + password file).
+    [[ -n "${AUTUMN_ETCD_USER:-}" ]] && args+=(--etcd-user "$AUTUMN_ETCD_USER")
+    [[ -n "${AUTUMN_ETCD_PASSWORD_FILE:-}" ]] && args+=(--etcd-password-file "$AUTUMN_ETCD_PASSWORD_FILE")
+    [[ -n "${AUTUMN_ETCD_CACERT:-}" ]] && args+=(--etcd-cacert "$AUTUMN_ETCD_CACERT")
+    [[ -n "${AUTUMN_ETCD_CERT:-}" ]] && args+=(--etcd-cert "$AUTUMN_ETCD_CERT")
+    [[ -n "${AUTUMN_ETCD_KEY:-}" ]] && args+=(--etcd-key "$AUTUMN_ETCD_KEY")
     # Leader-fenced auto-policy controller. Production deploy defaults to ARMED
     # steady-state maintenance — the `balanced` policy (gc + compaction + EC +
     # rebalance) is seeded Armed on a fresh cluster and actuates on its own (no

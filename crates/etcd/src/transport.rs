@@ -1,42 +1,54 @@
-//! HTTP/2 cleartext (h2c) transport for gRPC calls to etcd.
+//! HTTP/2 transport for gRPC calls to etcd: cleartext (h2c), or TLS with ALPN
+//! `h2`.
 //!
 //! Architecture:
 //!   compio::net::TcpStream
-//!     → cyper_core::HyperStream (compio→hyper I/O adapter)
-//!       → hyper::client::conn::http2 handshake (h2c, no TLS)
-//!         → SendRequest for gRPC POST calls
+//!     → [compio::tls::TlsStream] (when TLS is configured)
+//!       → cyper_core::HyperStream (compio→hyper I/O adapter)
+//!         → hyper::client::conn::http2 handshake
+//!           → SendRequest for gRPC POST calls
 
-use std::convert::Infallible;
+use std::cell::RefCell;
 use std::net::SocketAddr;
-use std::pin::Pin;
-use std::task::{Context, Poll};
+use std::rc::Rc;
 
 use anyhow::{bail, Result};
-use bytes::{Buf, Bytes, BytesMut};
+use bytes::Bytes;
+use compio::tls::TlsConnector;
 use cyper_core::{CompioExecutor, HyperStream};
-use http::{Request, Version};
+use http::{HeaderValue, Request, Version};
 use http_body_util::{BodyExt, Full};
 use hyper::client::conn::http2;
-use prost::Message;
 
-/// A single HTTP/2 connection to etcd for gRPC unary calls.
-///
-/// Holds an `http2::SendRequest` handle. The handle is `Clone` (cheaply —
-/// internally just an mpsc sender + Arc), which is hyper's canonical idiom
-/// for multiplexing concurrent requests over one HTTP/2 connection.
-///
-/// Callers should obtain a clone via [`GrpcChannel::sender`] and invoke
-/// [`call_with_sender`] **without** holding a borrow of the channel across
-/// `.await`. This is essential for `EtcdClient`, which is wrapped in
-/// `Rc<RefCell<GrpcChannel>>` for swap-on-reconnect: holding `RefMut` across
-/// an awaited gRPC call would panic the second concurrent caller.
-pub struct GrpcChannel {
-    sender: http2::SendRequest<Full<Bytes>>,
+use crate::proto::{grpc_decode, grpc_encode, AuthenticateRequest, AuthenticateResponse};
+use crate::{Credentials, EtcdEndpoint};
+
+const AUTHENTICATE: &str = "/etcdserverpb.Auth/Authenticate";
+
+/// Boxed: the h2 connection holds its stream by value in several layers, and
+/// the TLS variant is over a KB.
+type Stream = Box<HyperStream<compio::net::TcpStream>>;
+
+/// How every connection of one client is made: TLS or not, and the user it
+/// authenticates as.
+pub(crate) struct Dialer {
+    pub(crate) tls: Option<TlsConnector>,
+    pub(crate) credentials: Option<Credentials>,
 }
 
-impl GrpcChannel {
-    /// Establish an HTTP/2 cleartext (h2c) connection.
-    pub async fn connect(addr: &str) -> Result<Self> {
+impl Dialer {
+    fn scheme(&self) -> &'static str {
+        if self.tls.is_some() {
+            "https"
+        } else {
+            "http"
+        }
+    }
+
+    /// TCP, then TLS when configured. The certificate is checked against the
+    /// endpoint's name as written, the connection goes to its address.
+    async fn dial(&self, ep: &EtcdEndpoint) -> Result<Stream> {
+        let addr = &ep.addr;
         let sock_addr: SocketAddr = addr
             .parse()
             .map_err(|e| anyhow::anyhow!("invalid address '{}': {}", addr, e))?;
@@ -51,12 +63,56 @@ impl GrpcChannel {
             .map_err(|e| anyhow::anyhow!("tcp connect to {addr}: {e}"))?;
         tcp.set_nodelay(true)
             .map_err(|e| anyhow::anyhow!("set_nodelay on {addr}: {e}"))?;
+        match &self.tls {
+            None => Ok(Box::new(HyperStream::new_plain(tcp))),
+            Some(tls) => {
+                let name = &ep.server_name;
+                let stream = tls
+                    .connect(name, tcp)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("tls handshake with {addr} as {name:?}: {e}"))?;
+                Ok(Box::new(HyperStream::new_tls(stream)))
+            }
+        }
+    }
+}
 
-        let stream = HyperStream::new_plain(tcp);
+/// A single HTTP/2 connection to etcd for gRPC unary calls.
+///
+/// Holds an `http2::SendRequest` handle. The handle is `Clone` (cheaply —
+/// internally just an mpsc sender + Arc), which is hyper's canonical idiom
+/// for multiplexing concurrent requests over one HTTP/2 connection.
+///
+/// Callers should obtain a [`Call`] via [`GrpcChannel::call`] and invoke
+/// [`call_with_sender`] **without** holding a borrow of the channel across
+/// `.await`. This is essential for `EtcdClient`, which keeps the channel in a
+/// `RefCell` for swap-on-reconnect: holding `RefMut` across an awaited gRPC
+/// call would panic the second concurrent caller.
+pub struct GrpcChannel {
+    sender: http2::SendRequest<Full<Bytes>>,
+    /// This connection's auth token. Each connection authenticates for itself:
+    /// a simple token's expiry runs on each member separately, so a token
+    /// still live where it was issued can already be gone on another.
+    token: Rc<RefCell<Option<HeaderValue>>>,
+    scheme: &'static str,
+}
+
+/// What one request needs from its connection, taken out of the channel's
+/// `RefCell` before the await.
+pub struct Call {
+    sender: http2::SendRequest<Full<Bytes>>,
+    token: Rc<RefCell<Option<HeaderValue>>>,
+    scheme: &'static str,
+}
+
+impl GrpcChannel {
+    /// Establish the HTTP/2 connection and, with credentials, authenticate.
+    pub(crate) async fn connect(ep: &EtcdEndpoint, dialer: &Dialer) -> Result<Self> {
+        let stream = dialer.dial(ep).await?;
 
         let (sender, conn) = http2::handshake::<
             CompioExecutor,
-            HyperStream<compio::net::TcpStream>,
+            Stream,
             Full<Bytes>,
         >(CompioExecutor, stream)
         .await
@@ -71,36 +127,109 @@ impl GrpcChannel {
         })
         .detach();
 
-        tracing::debug!(addr = %addr, "etcd h2c connection established");
-        Ok(Self { sender })
+        let mut call = Call {
+            sender,
+            token: Rc::new(RefCell::new(None)),
+            scheme: dialer.scheme(),
+        };
+        if let Some(creds) = &dialer.credentials {
+            authenticate(&mut call, creds)
+                .await
+                .map_err(|e| anyhow::anyhow!("authenticate to etcd {} as {:?}: {e}", ep.addr, creds.user))?;
+        }
+        tracing::debug!(addr = %ep.addr, tls = dialer.tls.is_some(), "etcd connection established");
+        Ok(Self {
+            sender: call.sender,
+            token: call.token,
+            scheme: call.scheme,
+        })
     }
 
-    /// Cheap clone of the underlying HTTP/2 sender handle.
+    /// Cheap clone of the sender handle and the token slot.
     ///
     /// Use this to drop the [`GrpcChannel`] borrow before `.await`-ing a call,
     /// so concurrent in-flight RPCs on the same client don't panic on
     /// `RefCell::borrow_mut`.
-    pub fn sender(&self) -> http2::SendRequest<Full<Bytes>> {
-        self.sender.clone()
+    pub fn call(&self) -> Call {
+        Call {
+            sender: self.sender.clone(),
+            token: self.token.clone(),
+            scheme: self.scheme,
+        }
     }
 }
 
-/// Send a unary gRPC call on the given sender clone and return the response body bytes.
+/// Exchange the user's password for a token and store it in the call's
+/// connection, where every later request on that connection reads it.
+pub(crate) async fn authenticate(call: &mut Call, creds: &Credentials) -> Result<()> {
+    let req = AuthenticateRequest {
+        name: creds.user.clone(),
+        password: creds.password.clone(),
+    };
+    let resp = send(&mut call.sender, call.scheme, None, AUTHENTICATE, grpc_encode(&req)).await?;
+    let resp: AuthenticateResponse = grpc_decode(&resp)?;
+    let token = HeaderValue::from_str(&resp.token)
+        .map_err(|e| anyhow::anyhow!("etcd returned an unusable token: {e}"))?;
+    *call.token.borrow_mut() = Some(token);
+    Ok(())
+}
+
+/// A non-OK gRPC status etcd answered with.
+#[derive(Debug)]
+pub struct GrpcStatus {
+    pub path: String,
+    pub code: u32,
+    pub message: String,
+}
+
+impl std::fmt::Display for GrpcStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "etcd gRPC {}: status={} message={}", self.path, self.code, self.message)
+    }
+}
+
+impl std::error::Error for GrpcStatus {}
+
+/// etcd refused the request's token: expired, or older than the last
+/// user/role change. An invalid token is refused before the request reaches
+/// raft, an old one at apply before any write, so even a txn may be sent
+/// again after authenticating.
+pub(crate) fn is_stale_token(e: &anyhow::Error) -> bool {
+    const UNAUTHENTICATED: u32 = 16;
+    const INVALID_ARGUMENT: u32 = 3;
+    e.downcast_ref::<GrpcStatus>().is_some_and(|s| {
+        s.code == UNAUTHENTICATED
+            || (s.code == INVALID_ARGUMENT && s.message.contains("revision of auth store is old"))
+    })
+}
+
+/// Send a unary gRPC call on the given call handle and return the response body bytes.
 ///
 /// Free function (not a method on `GrpcChannel`) so callers can clone the
-/// sender out of a `RefCell`, drop the borrow, then await — the canonical
-/// fix for borrow-across-await on a shared `Rc<RefCell<GrpcChannel>>`.
-pub async fn call_with_sender(
+/// handle out of a `RefCell`, drop the borrow, then await — the canonical
+/// fix for borrow-across-await on a shared `RefCell<GrpcChannel>`.
+pub async fn call_with_sender(call: &mut Call, path: &str, body: Bytes) -> Result<Bytes> {
+    let token = call.token.borrow().clone();
+    send(&mut call.sender, call.scheme, token, path, body).await
+}
+
+async fn send(
     sender: &mut http2::SendRequest<Full<Bytes>>,
+    scheme: &str,
+    token: Option<HeaderValue>,
     path: &str,
     body: Bytes,
 ) -> Result<Bytes> {
-    let req = Request::builder()
+    let mut req = Request::builder()
         .method("POST")
-        .uri(format!("http://etcd{path}"))
+        .uri(format!("{scheme}://etcd{path}"))
         .version(Version::HTTP_2)
         .header("content-type", "application/grpc")
-        .header("te", "trailers")
+        .header("te", "trailers");
+    if let Some(token) = token {
+        req = req.header("token", token);
+    }
+    let req = req
         .body(Full::new(body))
         .map_err(|e| anyhow::anyhow!("build request: {e}"))?;
 
@@ -114,163 +243,35 @@ pub async fn call_with_sender(
         bail!("etcd gRPC {path}: HTTP {status}");
     }
 
-    // Check gRPC status from trailers if available
     let (parts, body) = resp.into_parts();
-    let body_bytes = body
+    let collected = body
         .collect()
         .await
-        .map_err(|e| anyhow::anyhow!("read response body for {path}: {e}"))?
-        .to_bytes();
+        .map_err(|e| anyhow::anyhow!("read response body for {path}: {e}"))?;
+    check_grpc_status(path, &parts.headers)?;
+    if let Some(trailers) = collected.trailers() {
+        check_grpc_status(path, trailers)?;
+    }
+    Ok(collected.to_bytes())
+}
 
-    // Check for gRPC error status in headers or trailers
-    if let Some(grpc_status) = parts.headers.get("grpc-status") {
+/// The gRPC status sits in the headers of a "trailers-only" response, else
+/// in the trailers.
+fn check_grpc_status(path: &str, headers: &http::HeaderMap) -> Result<()> {
+    if let Some(grpc_status) = headers.get("grpc-status") {
         let code = grpc_status.to_str().unwrap_or("?");
         if code != "0" {
-            let msg = parts
-                .headers
+            let message = headers
                 .get("grpc-message")
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("unknown");
-            bail!("etcd gRPC {path}: status={code} message={msg}");
-        }
-    }
-
-    Ok(body_bytes)
-}
-
-// ── Streaming support ──────────────────────────────────────────────────────
-
-/// Body that sends one initial gRPC frame then keeps the HTTP/2 stream open.
-///
-/// Used for streaming RPCs (e.g. Watch) where the client sends one request
-/// and the server streams back multiple responses.
-struct StreamingBody {
-    data: Option<Bytes>,
-}
-
-impl http_body::Body for StreamingBody {
-    type Data = Bytes;
-    type Error = Infallible;
-
-    fn poll_frame(
-        mut self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<http_body::Frame<Bytes>, Infallible>>> {
-        if let Some(data) = self.data.take() {
-            Poll::Ready(Some(Ok(http_body::Frame::data(data))))
-        } else {
-            // Return Pending to keep the client stream open — the server
-            // continues sending responses on its half of the HTTP/2 stream.
-            Poll::Pending
-        }
-    }
-}
-
-/// Reader for gRPC server-side streaming responses.
-///
-/// Reads individual protobuf messages from the HTTP/2 response body,
-/// handling gRPC frame boundaries that may not align with HTTP/2 DATA frames.
-pub struct GrpcStreamReader {
-    body: hyper::body::Incoming,
-    buf: BytesMut,
-}
-
-impl GrpcStreamReader {
-    /// Read the next protobuf message from the stream.
-    /// Returns `Ok(None)` when the stream has ended.
-    pub async fn next_message<M: Message + Default>(&mut self) -> Result<Option<M>> {
-        loop {
-            // Try to decode a complete gRPC frame from buffer.
-            // Frame format: [compress:1][length:4 BE][message]
-            if self.buf.len() >= 5 {
-                let msg_len =
-                    u32::from_be_bytes([self.buf[1], self.buf[2], self.buf[3], self.buf[4]])
-                        as usize;
-                if self.buf.len() >= 5 + msg_len {
-                    self.buf.advance(5);
-                    let msg_data = self.buf.split_to(msg_len);
-                    return Ok(Some(
-                        M::decode(&msg_data[..])
-                            .map_err(|e| anyhow::anyhow!("prost decode: {e}"))?,
-                    ));
-                }
+            return Err(GrpcStatus {
+                path: path.to_string(),
+                code: code.parse().unwrap_or(u32::MAX),
+                message: message.to_string(),
             }
-
-            // Need more data from the HTTP/2 stream.
-            match self.body.frame().await {
-                Some(Ok(frame)) => {
-                    if let Some(data) = frame.data_ref() {
-                        self.buf.extend_from_slice(data);
-                    }
-                    // Trailers frames are ignored.
-                }
-                Some(Err(e)) => return Err(anyhow::anyhow!("stream read error: {e}")),
-                None => return Ok(None),
-            }
+            .into());
         }
     }
-}
-
-/// Open a gRPC streaming call on a **new** HTTP/2 connection.
-///
-/// Sends `initial_body` as the first (and only) request frame, then keeps
-/// the client stream open so the server can stream responses back.
-/// Returns a [`GrpcStreamReader`] for reading response messages.
-pub async fn open_streaming_call(
-    addr: &str,
-    path: &str,
-    initial_body: Bytes,
-) -> Result<GrpcStreamReader> {
-    let sock_addr: SocketAddr = addr
-        .parse()
-        .map_err(|e| anyhow::anyhow!("invalid address '{addr}': {e}"))?;
-
-    let tcp = compio::net::TcpStream::connect(sock_addr)
-        .await
-        .map_err(|e| anyhow::anyhow!("tcp connect to {addr}: {e}"))?;
-    tcp.set_nodelay(true)
-        .map_err(|e| anyhow::anyhow!("set_nodelay on {addr}: {e}"))?;
-    let stream = HyperStream::new_plain(tcp);
-
-    let (mut sender, conn) = http2::handshake::<
-        CompioExecutor,
-        HyperStream<compio::net::TcpStream>,
-        StreamingBody,
-    >(CompioExecutor, stream)
-    .await
-    .map_err(|e| anyhow::anyhow!("h2 handshake failed: {e}"))?;
-
-    compio::runtime::spawn(async move {
-        if let Err(e) = conn.await {
-            tracing::debug!(error = %e, "streaming h2 connection ended");
-        }
-    })
-    .detach();
-
-    let req = Request::builder()
-        .method("POST")
-        .uri(format!("http://etcd{path}"))
-        .version(Version::HTTP_2)
-        .header("content-type", "application/grpc")
-        .header("te", "trailers")
-        .body(StreamingBody {
-            data: Some(initial_body),
-        })
-        .map_err(|e| anyhow::anyhow!("build request: {e}"))?;
-
-    let resp = sender
-        .send_request(req)
-        .await
-        .map_err(|e| anyhow::anyhow!("send streaming request to {path}: {e}"))?;
-
-    let status = resp.status();
-    if !status.is_success() {
-        bail!("gRPC streaming {path}: HTTP {status}");
-    }
-
-    let (_, body) = resp.into_parts();
-    Ok(GrpcStreamReader {
-        body,
-        buf: BytesMut::new(),
-    })
+    Ok(())
 }

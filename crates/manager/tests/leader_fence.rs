@@ -67,7 +67,7 @@ fn deposed_leader_etcd_writes_are_fenced() {
         );
 
         // Externally overwrite the leader key so the fence compare
-        // (`Cmp::value(LEADER_KEY) == M1.instance_id`) starts failing
+        // (`Cmp::mod_revision(LEADER_KEY) == M1's fence_rev`) starts failing
         // for any subsequent etcd write from M1. This simulates a clean
         // failover where a new leader has taken the slot before M1's
         // keepalive notices, which is exactly the split-brain
