@@ -663,6 +663,32 @@ expire every 5 s, then a manager, 3 ENs and a PS on it: a write, 30 s of
 expiring tokens, a manager restart (replay), and a read. A failure shows a
 manager that exits, `FAIL-…`, or `re-authentications: 0`.
 
+### Leader lease when etcd stops answering
+
+The leader lease is `--leader-lease-ttl-secs` (default 10 s: about the
+failover time after a leader dies). The leader renews it every TTL/5; each
+renewal step gives up after TTL/5 and tries the next `--etcd` member (a
+mid-call reconnect waits at most min(TTL/5, 2 s) per member). If no renewal lands before the lease
+could expire, it steps down (log: `leader lease not renewed before it could
+expire; stepping down`) and campaigns again as a standby. One frozen or
+unreachable member of a 3-member etcd does not move leadership. Several
+frozen members in a row of a larger etcd (e.g. 3 of 7) can outlast the lease:
+the leader then steps down although a quorum is alive, and a standby takes over.
+
+At startup the manager waits up to `--etcd-request-timeout-ms` (default 10 s)
+for each `--etcd` member in turn; with auth on, that includes waiting for etcd
+to elect a leader. If none connects, the manager exits.
+
+**Verify** (needs `etcd` on `PATH`; ~1 min):
+
+```bash
+cargo nextest run -p autumn-manager --test leader_keepalive_half_open --test leader_lease_renewed_from_the_win
+#   leader_steps_down_when_etcd_stops_answering    (stderr: stepped down ~10 s after etcd froze)
+#   leader_rides_out_one_frozen_member             PASS (3 members, one frozen)
+#   leader_reconnects_past_a_frozen_member         PASS (5 members with auth: its member dead, the next frozen)
+#   the_lease_is_renewed_while_the_takeover_finishes  PASS
+```
+
 ## Parameters (flags)
 
 Every flag of every binary is declared in `crates/params/src/<role>.rs`, in

@@ -122,6 +122,13 @@ use bytes::Bytes;
 /// Etcd path for the manager leader-key. Also used as the fence target
 /// for every manager etcd write txn.
 pub(crate) const LEADER_KEY: &str = "autumn-rs/stream-manager/leader";
+
+/// Renewal period of a lease of `ttl_secs`, and the bound on one renewal step
+/// (open, send, reconnect, resend, authenticate): TTL/5, so a renewal has
+/// about four tries, and other etcd members, before the lease runs out.
+pub(crate) fn renew_period(ttl_secs: u64) -> Duration {
+    Duration::from_millis(ttl_secs * 1000 / 5)
+}
 /// `psMembers/<ps_id>` → `MemberRecord`.
 pub(crate) const PS_MEMBERS_PREFIX: &str = "psMembers/";
 
@@ -282,9 +289,7 @@ impl EtcdMirror {
         displaced: Rc<Cell<bool>>,
         request_timeout: Duration,
     ) -> Result<Self> {
-        let client = autumn_etcd::EtcdClient::connect_with(config)
-            .await?
-            .with_request_timeout(request_timeout);
+        let client = autumn_etcd::EtcdClient::connect_with(config, request_timeout).await?;
         Ok(Self {
             client: Rc::new(client),
             instance_id,
@@ -2875,11 +2880,13 @@ impl AutumnManager {
             None => return Ok(false),
         };
 
+        let granted_at = Instant::now();
         let lease = {
             let c = etcd.client.clone();
             c.lease_grant(self.params.leader_lease_ttl_secs.get() as i64).await?
         };
         let lease_id = lease.id;
+        let confirmed_until = granted_at + Duration::from_secs(lease.ttl.max(0) as u64);
 
         let cmp = autumn_etcd::Cmp::create_revision(LEADER_KEY.as_bytes(), 0);
         let put = autumn_etcd::Op::put_with_lease(
@@ -2918,18 +2925,21 @@ impl AutumnManager {
         // CODE_NOT_LEADER; client retries land after replay completes and
         // the handler runs with a fully-rebuilt store.
         //
-        // Lease TTL is 10 s. Typical replay is sub-second; if etcd is so
-        // big replay exceeds 10 s, the lease expires before set_leader
-        // and the next mutating RPC's leader fence flips us back to
-        // non-leader — the election loop retries. The deeper fix (start
-        // keepalive between CAS and replay so the lease stays alive
-        // through arbitrarily long replays) is filed as a P3 follow-up
-        // — it needs a stop-signal to revoke the lease on replay error.
+        // The lease is not renewed during the replay: one that outlasts it
+        // leaves the keepalive loop past its deadline, and it steps down at
+        // its first check.
         self.replay_from_etcd().await?;
         self.reserve_lease_versions().await?;
         self.set_leader(true);
         self.displaced.set(false);
         self.leaderless_since.set(None);
+        // Renewed from the moment it leads: the rest of the takeover makes
+        // etcd calls of up to 10 s each, longer than the lease could wait.
+        let mgr = self.clone();
+        compio::runtime::spawn(async move {
+            mgr.leader_keepalive_loop(lease_id, confirmed_until).await;
+        })
+        .detach();
 
         // Seed the op-ledger with the in-flight EC conversions just replayed from
         // etcd (see the method doc).
@@ -2948,12 +2958,6 @@ impl AutumnManager {
         if let Err(err) = self.imprint_cluster_id().await {
             tracing::warn!(error = %err, "imprint_cluster_id failed");
         }
-
-        let mgr = self.clone();
-        compio::runtime::spawn(async move {
-            mgr.leader_keepalive_loop(lease_id).await;
-        })
-        .detach();
 
         Ok(true)
     }
@@ -3025,31 +3029,60 @@ impl AutumnManager {
         }
     }
 
-
-    /// Keeps the leader lease of one term alive; steps down when it fails.
+    /// Keeps the leader lease of one term alive; steps down once it can no
+    /// longer be confirmed. `confirmed_until` is how long the lease surely
+    /// lives: its TTL from when the grant or the last successful renewal was
+    /// sent. A renewal goes every `renew_period` (TTL/5); a failed or
+    /// unanswered one is retried until the deadline, each step within
+    /// `renew_period` (a frozen etcd neither answers nor errors); past
+    /// it etcd may have expired the lease and another manager may lead.
     /// Once this process leads a later term (it stepped down for another
     /// reason and won again) the loop ends without stepping down: its lease
     /// is not what that term stands on.
-    async fn leader_keepalive_loop(self, lease_id: i64) {
+    async fn leader_keepalive_loop(self, lease_id: i64, mut confirmed_until: Instant) {
+        const RETRY: Duration = Duration::from_millis(500);
+        let period = renew_period(self.params.leader_lease_ttl_secs.get());
         let Some(etcd) = self.etcd.clone() else {
             self.step_down_from(lease_id);
             return;
         };
-        let keeper = match etcd.client.lease_keep_alive(lease_id).await {
-            Ok(k) => k,
-            Err(_) => {
-                self.step_down_from(lease_id);
-                return;
-            }
-        };
+        let mut keeper = None;
         loop {
-            compio::time::sleep(Duration::from_secs(2)).await;
             if etcd.term() != lease_id {
                 return;
             }
-            match keeper.keep_alive().await {
-                Ok(r) if r.ttl > 0 => {}
-                _ => break,
+            let left = confirmed_until.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                tracing::warn!(
+                    lease_id,
+                    "leader lease not renewed before it could expire; stepping down"
+                );
+                break;
+            }
+            let sent = Instant::now();
+            let renewed = compio::time::timeout(left, async {
+                if keeper.is_none() {
+                    keeper = Some(etcd.client.lease_keep_alive(lease_id, period).await?);
+                }
+                keeper.as_ref().expect("opened above").keep_alive().await
+            })
+            .await;
+            match renewed {
+                Ok(Ok(r)) if r.ttl > 0 => {
+                    confirmed_until = sent + Duration::from_secs(r.ttl as u64);
+                    compio::time::sleep(period).await;
+                }
+                // etcd answered: the lease is gone.
+                Ok(Ok(_)) => break,
+                Ok(Err(e)) => {
+                    tracing::warn!(lease_id, error = %e, "leader lease renewal failed; retrying");
+                    compio::time::sleep(
+                        RETRY.min(confirmed_until.saturating_duration_since(Instant::now())),
+                    )
+                    .await;
+                }
+                // Out of time: the top of the loop steps down.
+                Err(_) => {}
             }
         }
         self.step_down_from(lease_id);

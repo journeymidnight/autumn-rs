@@ -68,15 +68,17 @@ crate::params! {
         /// A partition server silent this long (no heartbeat) is evicted and
         /// its partitions reassigned. The PS heartbeats every 2 s.
         ps_dead_timeout_secs: u64 = 10, [4, 3600];
-        /// TTL of the leader lease: an upper bound on failover time. Kept
-        /// alive every 2 s, so it must leave room for a few missed beats.
+        /// TTL of the leader lease: an upper bound on failover time. Renewed
+        /// every TTL/5, each renewal step bounded at TTL/5, so a renewal has
+        /// about four tries (and other etcd members) before the lease runs out.
         leader_lease_ttl_secs: u64 = 10, [6, 600];
         /// How long a leaderless ex-leader that has not seen a successor keeps
         /// answering routing reads.
         routable_stale_ttl_secs: u64 = 900, [0, DAY];
         /// Connect timeout of the manager's connections to nodes and servers.
         connect_timeout_ms: u64 = 5000, [500, 600_000];
-        /// Timeout of one etcd request (also bounds its reconnect).
+        /// Timeout of one etcd request, and of the first connect to each
+        /// `--etcd` member.
         etcd_request_timeout_ms: u64 = 10_000, [1000, 600_000];
 
         // ── In-flight markers and sweeps ─────────────────────────────────

@@ -122,9 +122,10 @@ impl AutumnManager {
             return;
         };
         loop {
-            if let Ok(keeper) = etcd.client.lease_keep_alive(self.presence_lease.get()).await {
+            let period = crate::renew_period(PRESENCE_TTL_SECS as u64);
+            if let Ok(keeper) = etcd.client.lease_keep_alive(self.presence_lease.get(), period).await {
                 loop {
-                    compio::time::sleep(Duration::from_secs(2)).await;
+                    compio::time::sleep(period).await;
                     match keeper.keep_alive().await {
                         Ok(r) if r.ttl > 0 => {}
                         _ => break,

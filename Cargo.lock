@@ -228,6 +228,7 @@ dependencies = [
  "crc32c",
  "ed25519-dalek",
  "futures",
+ "prost",
  "rand 0.8.5",
  "rkyv",
  "serde_json",

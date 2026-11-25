@@ -82,7 +82,7 @@ pub async fn start_etcd(
                 break; // lost a port: try fresh ones
             }
             if listens_on(etcd.child.id(), client_port) {
-                if let Ok(c) = EtcdClient::connect_with(config(addr.clone())).await {
+                if let Ok(c) = EtcdClient::connect_with(config(addr.clone()), Duration::from_secs(10)).await {
                     if c.get("health-check").await.is_ok() {
                         return (etcd, addr, c);
                     }

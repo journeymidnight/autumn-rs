@@ -173,15 +173,43 @@ Invariants that came with it:
 
 Preceded by holding `--manager-id` (see "Manager identity and membership").
 
-Lease-based (10 s TTL):
+Lease-based (`--leader-lease-ttl-secs`, default 10 s; renewed every TTL/5 and
+each renewal step bounded at TTL/5 — `renew_period` — so the two scale with
+it and a renewal always has about four tries before the lease runs out):
 1. A standby reads `autumn-rs/stream-manager/leader` once a second. A holder
    other than itself marks it `displaced`; its own id (a stale key from a
    step-down, lease still live) is waited out.
 2. Key gone (the holder's lease expired): grant a lease, CAS-write
    `leader = instance_id` if absent. Losing the CAS = another standby won.
 3. On win: `replay_from_etcd` rebuilds all in-memory state, set `leader = true`,
-   start a keepalive loop (every 2 s).
-4. Lease expiry / keepalive failure → `leader = false` (step down).
+   and start the keepalive loop (every TTL/5) right then, before the rest of the
+   takeover (`imprint_cluster_id` makes etcd calls of up to 10 s each; with the
+   loop started after it, a held imprint let the lease expire under a leader —
+   `tests/leader_lease_renewed_from_the_win.rs`, failpoint on the imprint's
+   write, leader key gone at 13 s before the fix).
+4. The lease can no longer be confirmed → `leader = false` (step down).
+
+The keepalive loop keeps a deadline, `confirmed_until`: the lease's TTL from
+when the grant, then each successful renewal, was SENT (earlier than etcd's
+own count, so it errs safe). A failed or unanswered renewal is retried every
+500 ms until that moment, each step bounded by `renew_period` (TTL/5, 2 s by
+default: connect, send, reconnect to the next member, resend, authenticate;
+a mid-call reconnect caps each member at min(TTL/5, 2 s) in crates/etcd); a renewal that
+lands moves the deadline. At the deadline it steps down: etcd may have
+expired the lease and another manager may lead. etcd answering "lease gone"
+(TTL 0) steps down at once. It does not go on renewing that lease; it is a
+standby again and campaigns with a new one. Like Go clientv3, the deadline is
+on this process's clock: a frozen etcd neither answers nor errors, and a
+reconnect to it even "succeeds" (the kernel completes the handshake).
+`tests/leader_keepalive_half_open.rs`: etcd SIGSTOPped → the leader steps
+down ~10 s later (ablation, no deadline: still leader at 20 s); one of three
+members frozen → it stays leader through 25 s (ablation, a 10 s attempt:
+steps down at 10 s); with auth on, its member dead and the next frozen (5
+members) → it stays leader (red while `reconnect` had one bound over all
+endpoints, see crates/etcd). The two "stays leader" tests also check the leader
+key's lease id is unchanged, so a step-down and re-win between polls cannot
+pass. The presence loop renews its fixed 10 s lease with `renew_period(10)`,
+so a frozen etcd fails its renewal and it reclaims the id.
 
 Polling, not an etcd watch: every step is a bounded unary call (a dead etcd
 member only moves the client to another), and a read cannot miss a delete

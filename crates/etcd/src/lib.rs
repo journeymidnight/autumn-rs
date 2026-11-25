@@ -134,14 +134,47 @@ struct Conn {
 }
 
 impl Conn {
-    async fn open_at(endpoints: Vec<EtcdEndpoint>, idx: usize, dialer: Rc<Dialer>) -> Result<Self> {
-        let channel = GrpcChannel::connect(&endpoints[idx], &dialer).await?;
+    /// Connect (TCP, TLS, h2, authenticate) within `timeout`: a frozen etcd
+    /// still completes the TCP handshake, then never answers.
+    async fn open_at(
+        endpoints: Vec<EtcdEndpoint>,
+        idx: usize,
+        dialer: Rc<Dialer>,
+        timeout: Duration,
+    ) -> Result<Self> {
+        let ep = &endpoints[idx];
+        let channel = within(timeout, GrpcChannel::connect(ep, &dialer))
+            .await
+            .ok_or_else(|| anyhow::anyhow!("connect to etcd {} timed out after {timeout:?}", ep.addr))??;
         Ok(Self {
             channel: RefCell::new(channel),
             endpoints,
             current_ep: Cell::new(idx),
             dialer,
         })
+    }
+
+    /// The first endpoint that connects, trying each once from `start`.
+    async fn open_any(
+        endpoints: Vec<EtcdEndpoint>,
+        start: usize,
+        dialer: Rc<Dialer>,
+        timeout: Duration,
+    ) -> Result<Self> {
+        let n = endpoints.len();
+        let mut errors = Vec::new();
+        for i in 0..n {
+            let idx = (start + i) % n;
+            match Self::open_at(endpoints.clone(), idx, dialer.clone(), timeout).await {
+                Ok(conn) => return Ok(conn),
+                Err(e) => {
+                    let addr = &endpoints[idx].addr;
+                    tracing::warn!(endpoint = %addr, error = %e, "etcd connect failed, trying next");
+                    errors.push(format!("{addr}: {e:#}"));
+                }
+            }
+        }
+        bail!("failed to connect to any etcd endpoint: {}", errors.join("; "))
     }
 
     /// `resend`: whether a request whose first attempt failed or timed out is
@@ -152,7 +185,7 @@ impl Conn {
         &self,
         path: &str,
         body: Bytes,
-        timeout: Option<Duration>,
+        timeout: Duration,
         resend: bool,
     ) -> Result<Bytes> {
         // clone the call handle out of the RefCell, then drop the borrow
@@ -186,11 +219,9 @@ impl Conn {
             }
         };
 
-        // Reconnect: try each endpoint once (round-robin from the next one).
-        // (1A): also bounded — a hung connect must not wedge the loop.
-        within(timeout, Box::pin(self.reconnect()))
-            .await
-            .ok_or_else(|| anyhow::anyhow!("etcd reconnect timed out after {timeout:?}"))??;
+        // Reconnect: try each endpoint once (round-robin from the next one),
+        // each within `timeout`.
+        Box::pin(self.reconnect(timeout)).await?;
         if !resend {
             return Err(UncertainOutcome { path: path.to_string(), cause }.into());
         }
@@ -205,14 +236,21 @@ impl Conn {
         }
     }
 
-    async fn reconnect(&self) -> Result<()> {
+    /// Each endpoint is bounded on its own: with TLS or auth, a connect to a
+    /// frozen member hangs after TCP, and one bound over all of them never
+    /// reached the members after it.
+    async fn reconnect(&self, timeout: Duration) -> Result<()> {
         let n = self.endpoints.len();
         let start = self.current_ep.get();
         let mut errors = Vec::new();
         for i in 1..=n {
             let idx = (start + i) % n;
             let ep = &self.endpoints[idx];
-            match GrpcChannel::connect(ep, &self.dialer).await {
+            let bound = timeout.min(CONNECT_TIMEOUT);
+            let connected = within(bound, GrpcChannel::connect(ep, &self.dialer))
+                .await
+                .unwrap_or_else(|| Err(anyhow::anyhow!("connect timed out after {bound:?}")));
+            match connected {
                 Ok(new_channel) => {
                     *self.channel.borrow_mut() = new_channel;
                     self.current_ep.set(idx);
@@ -238,7 +276,7 @@ async fn reauth_and_resend(
     creds: &Credentials,
     path: &str,
     body: Bytes,
-    timeout: Option<Duration>,
+    timeout: Duration,
     resend: bool,
 ) -> Result<Bytes> {
     match within(timeout, transport::authenticate(&mut call, creds)).await {
@@ -253,7 +291,7 @@ async fn reauth_and_resend(
 /// (`!resend`), only a token refused again proves it did not apply.
 fn resend_outcome(
     path: &str,
-    timeout: Option<Duration>,
+    timeout: Duration,
     resend: bool,
     outcome: Option<Result<Bytes>>,
 ) -> Result<Bytes> {
@@ -270,12 +308,10 @@ fn resend_outcome(
     }
 }
 
-/// `fut` bounded by `timeout` when there is one; `None` = timed out.
-async fn within<F: Future>(timeout: Option<Duration>, fut: F) -> Option<F::Output> {
-    match timeout {
-        Some(t) => compio::time::timeout(t, fut).await.ok(),
-        None => Some(fut.await),
-    }
+/// `fut` bounded by `timeout`; `None` = timed out. Every etcd call goes
+/// through here: nothing awaits etcd without a deadline.
+async fn within<F: Future>(timeout: Duration, fut: F) -> Option<F::Output> {
+    compio::time::timeout(timeout, fut).await.ok()
 }
 
 /// Minimal etcd v3 client for compio runtime (single-threaded, Rc-based).
@@ -290,13 +326,19 @@ async fn within<F: Future>(timeout: Option<Duration>, fut: F) -> Option<F::Outpu
 /// holds a borrow across `.await`.
 pub struct EtcdClient {
     conn: Conn,
-    /// Bound on every unary call (and on its reconnect). etcd over HTTP/2 has
+    /// Bound on every unary call and on the first connect. etcd over HTTP/2 has
     /// no request deadline of its own, so a half-open connection would hang
     /// the caller forever; a timeout turns it into the reconnect-and-retry path.
     request_timeout: Duration,
 }
 
 const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Cap on one endpoint's connect (TCP, TLS, h2, authenticate) in a mid-call
+/// reconnect: milliseconds on the LAN etcd sits on (a bcrypt check is
+/// ~100 ms). Without it a round over n members cost n request timeouts. The
+/// first connect is not capped: with auth it waits for an etcd leader.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
 impl EtcdClient {
     /// Connect to an etcd endpoint (plaintext HTTP/2, h2c).
@@ -307,6 +349,7 @@ impl EtcdClient {
             vec![EtcdEndpoint::new(endpoint)],
             0,
             Rc::new(Dialer { tls: None, credentials: None }),
+            DEFAULT_REQUEST_TIMEOUT,
         )
         .await?;
         Ok(Self { conn, request_timeout: DEFAULT_REQUEST_TIMEOUT })
@@ -314,34 +357,20 @@ impl EtcdClient {
 
     /// [`connect_with`](Self::connect_with) over cleartext, no authentication.
     pub async fn connect_many(endpoints: &[String]) -> Result<Self> {
-        Self::connect_with(EtcdConfig::plain(endpoints)).await
+        Self::connect_with(EtcdConfig::plain(endpoints), DEFAULT_REQUEST_TIMEOUT).await
     }
 
     /// Connect to the first endpoint that accepts (TLS handshake and
     /// authentication included). On connection failure during operation,
     /// automatically reconnects to the next endpoint in round-robin order.
-    pub async fn connect_with(config: EtcdConfig) -> Result<Self> {
+    /// `request_timeout` bounds each endpoint's first connect and every call.
+    pub async fn connect_with(config: EtcdConfig, request_timeout: Duration) -> Result<Self> {
         let dialer = Rc::new(Dialer {
             tls: config.tls.map(|t| compio::tls::TlsConnector::from(t.0)),
             credentials: config.credentials,
         });
-        let mut errors = Vec::new();
-        for i in 0..config.endpoints.len() {
-            match Conn::open_at(config.endpoints.clone(), i, dialer.clone()).await {
-                Ok(conn) => return Ok(Self { conn, request_timeout: DEFAULT_REQUEST_TIMEOUT }),
-                Err(e) => {
-                    let addr = &config.endpoints[i].addr;
-                    tracing::warn!(endpoint = %addr, error = %e, "etcd connect failed, trying next");
-                    errors.push(format!("{addr}: {e:#}"));
-                }
-            }
-        }
-        bail!("failed to connect to any etcd endpoint: {}", errors.join("; "))
-    }
-
-    pub fn with_request_timeout(mut self, timeout: Duration) -> Self {
-        self.request_timeout = timeout;
-        self
+        let conn = Conn::open_any(config.endpoints, 0, dialer, request_timeout).await?;
+        Ok(Self { conn, request_timeout })
     }
 
     // ── KV: Get ──────────────────────────────────────────────────────────
@@ -444,18 +473,20 @@ impl EtcdClient {
             .await
     }
 
-    /// A keeper that renews the lease.
-    /// Returns a `LeaseKeeper` with its **own** dedicated connection to avoid
-    /// `RefCell` borrow conflicts with concurrent `EtcdClient` calls.
-    pub async fn lease_keep_alive(&self, lease_id: i64) -> Result<LeaseKeeper> {
-        // Open a dedicated connection for keepalive (same endpoint as current).
-        let conn = Conn::open_at(
+    /// A keeper that renews the lease on its **own** connection (the client's
+    /// endpoint first, then the others). Opening it and every renewal step (send,
+    /// reconnect, resend, authenticate) are each bounded by `attempt_timeout`,
+    /// which should stay well under the lease TTL so a renewal can fail over
+    /// to another member before the lease runs out.
+    pub async fn lease_keep_alive(&self, lease_id: i64, attempt_timeout: Duration) -> Result<LeaseKeeper> {
+        let conn = Conn::open_any(
             self.conn.endpoints.clone(),
             self.conn.current_ep.get(),
             self.conn.dialer.clone(),
+            attempt_timeout,
         )
         .await?;
-        Ok(LeaseKeeper { conn, lease_id })
+        Ok(LeaseKeeper { conn, lease_id, attempt_timeout })
     }
 
     /// Revoke a lease, releasing all keys attached to it.
@@ -498,7 +529,7 @@ impl EtcdClient {
     ) -> Result<Resp> {
         let resp = self
             .conn
-            .call(path, grpc_encode(req), Some(self.request_timeout), resend)
+            .call(path, grpc_encode(req), self.request_timeout, resend)
             .await?;
         grpc_decode::<Resp>(&resp)
     }
@@ -512,6 +543,7 @@ impl EtcdClient {
 pub struct LeaseKeeper {
     conn: Conn,
     lease_id: i64,
+    attempt_timeout: Duration,
 }
 
 impl LeaseKeeper {
@@ -521,7 +553,7 @@ impl LeaseKeeper {
         let req = LeaseKeepAliveRequest { id: self.lease_id };
         let resp = self
             .conn
-            .call("/etcdserverpb.Lease/LeaseKeepAlive", grpc_encode(&req), None, true)
+            .call("/etcdserverpb.Lease/LeaseKeepAlive", grpc_encode(&req), self.attempt_timeout, true)
             .await?;
         grpc_decode::<LeaseKeepAliveResponse>(&resp)
     }
@@ -723,10 +755,11 @@ mod tests {
         let uncertain = |r: Result<Bytes>| {
             r.err().expect("an error").downcast_ref::<UncertainOutcome>().is_some()
         };
-        let txn = |outcome| resend_outcome("txn", None, false, outcome);
+        let txn = |outcome| resend_outcome("txn", Duration::from_secs(1), false, outcome);
         assert!(uncertain(txn(status(14, "etcdserver: request timed out"))));
         assert!(uncertain(txn(None)));
         assert!(!uncertain(txn(status(16, "etcdserver: invalid auth token"))));
-        assert!(!uncertain(resend_outcome("get", None, true, status(14, "timed out"))));
+        let get = resend_outcome("get", Duration::from_secs(1), true, status(14, "timed out"));
+        assert!(!uncertain(get));
     }
 }

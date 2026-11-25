@@ -32,7 +32,7 @@ compio::net::TcpStream
 // Connect
 let client = EtcdClient::connect("127.0.0.1:2379").await?;
 let client = EtcdClient::connect_many(&["ep1:2379".into(), "ep2:2379".into()]).await?;
-let client = EtcdClient::connect_with(EtcdConfig { endpoints, tls: Some(tls), credentials: Some(creds) }).await?;
+let client = EtcdClient::connect_with(EtcdConfig { endpoints, tls: Some(tls), credentials: Some(creds) }, Duration::from_secs(10)).await?;
 
 // KV
 client.get(b"key").await?;                     // single key
@@ -50,7 +50,7 @@ client.txn(TxnRequest {
 
 // Lease
 let grant = client.lease_grant(10).await?;     // 10-second TTL
-let keeper = client.lease_keep_alive(grant.id).await?;
+let keeper = client.lease_keep_alive(grant.id, Duration::from_secs(2)).await?;  // per-step bound
 let resp = keeper.keep_alive().await?;         // send one keepalive, get response
 client.lease_revoke(grant.id).await?;          // revoke lease
 
@@ -91,7 +91,7 @@ Single-threaded compio (`Conn { channel: RefCell<GrpcChannel>, .. }`, shared by 
 
 **INVARIANT — callers hold `Rc<EtcdClient>`, not `Rc<RefCell<EtcdClient>>`.** `EtcdClient` is all-`&self`, constructed once, never replaced, and self-reconnects internally — so a manager RPC is just `self.client.method().await` with no borrow held across the await. Do not wrap `EtcdClient` in an outer `RefCell`.
 
-**INVARIANT — every unary RPC is timeout-bounded.** `Conn::call` (under `unary_call`) wraps both `call_with_sender` awaits AND `reconnect` in `compio::time::timeout` (`request_timeout`, set by the caller through `with_request_timeout` — the manager's `--etcd-request-timeout-ms` — default 10 s). etcd-over-h2c has no built-in per-request deadline, so an unbounded call on a half-open TCP hangs the caller forever — and every manager background loop ultimately awaits an etcd call. On timeout it falls through to the bounded reconnect path (identical to a connection error) and, for an idempotent call (reads, puts, deletes, leases), re-sends once on the new connection; a second failure returns `Err`. Any new path MUST go through `unary_call` — never add a bare unbounded `call_with_sender`. (A `LeaseKeeper`'s calls are not bounded.)
+**INVARIANT — every etcd call is timeout-bounded, by type.** `within` and `Conn::call` take a `Duration`, not an `Option`: there is no way to say "no deadline". `Conn::call` bounds each `call_with_sender` await, the re-authentication, and each endpoint `reconnect` tries; `Conn::open_at` bounds the whole connect (TCP, TLS, h2, authenticate) — a frozen etcd still completes the TCP handshake (the kernel does it), and with TLS or auth the connect then hangs. The bound is per endpoint, not one over the whole round: one bound let a frozen member eat it, so the members after it were never tried and `current_ep` never moved (`leader_reconnects_past_a_frozen_member`: 5 members with auth, the current one dead and the next frozen — the leader stepped down at 10 s with a quorum alive). `connect_with` and `lease_keep_alive` open through `Conn::open_any` (each endpoint once, from the first / from the client's current one). `connect_with(config, request_timeout)` takes the bound of its first connect (per endpoint) and of every unary call (the manager's `--etcd-request-timeout-ms`, default 10 s; `connect`/`connect_many` use 10 s). A `LeaseKeeper` uses the `attempt_timeout` given to `lease_keep_alive` for its connect and every renewal step (the manager passes TTL/5, so a renewal moves to another member in time). Only the mid-call `reconnect` caps each endpoint at `CONNECT_TIMEOUT` (2 s; milliseconds on a LAN): without the cap a round over the members cost n request timeouts. The first connect is not capped — with auth, `Authenticate` is a linearizable read and waits for an etcd leader (an election takes seconds), and a failed startup connect exits the manager. Worst case of one call with timeout T over n endpoints: max(2T + n·min(T, 2 s), 3T) (send, reconnect round, resend; or send, re-authenticate, resend) — 30 s for the main client (T = 10 s) on 3 members. The keeper once passed no timeout: a frozen etcd hung the leader's renewal forever and it kept answering as the leader (`crates/manager/tests/leader_keepalive_half_open.rs`). etcd-over-h2c has no built-in per-request deadline, so an unbounded call on a half-open TCP hangs the caller forever — and every manager background loop ultimately awaits an etcd call. On timeout it falls through to the bounded reconnect path (identical to a connection error) and, for an idempotent call (reads, puts, deletes, leases), re-sends once on the new connection; a second failure returns `Err`. Any new path MUST go through `Conn::call` — never add a bare `call_with_sender`.
 
 **INVARIANT — a txn is never re-sent.** `txn` reconnects after a failure or timeout but returns `UncertainOutcome` (a typed error the caller can `downcast_ref`) instead of sending the request again: the first copy may already have committed — or may still commit when its connection drains — and a compare-and-set sent twice refuses its own first write. Deciding is the caller's (the manager's `fenced_txn`: it moves its fence, reads the written keys back, and re-sends only a txn that provably did not land). Do not add a retry here for "just this one" txn.
 

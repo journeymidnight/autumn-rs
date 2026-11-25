@@ -7,6 +7,8 @@ mod common;
 
 use std::time::Duration;
 
+const TIMEOUT: Duration = Duration::from_secs(10);
+
 use autumn_etcd::proto::{TxnRequest, TxnResponse};
 use autumn_etcd::{Cmp, Credentials, EtcdClient, EtcdConfig, EtcdEndpoint, Op, TlsConfig};
 
@@ -52,13 +54,13 @@ async fn tls_and_password_auth_carry_every_call() {
     common::enable_auth(&admin, PASSWORD).await;
 
     // Auth is on: without a token the request is refused.
-    let anon = EtcdClient::connect_with(tls_config(&certs, &addr, "localhost", None))
+    let anon = EtcdClient::connect_with(tls_config(&certs, &addr, "localhost", None), TIMEOUT)
         .await
         .expect("TLS connect without a user");
     assert!(anon.put("k", "v").await.is_err(), "auth is not enforced");
 
     // Certificate checked against the IP SAN this time.
-    let client = EtcdClient::connect_with(tls_config(&certs, &addr, "127.0.0.1", root()))
+    let client = EtcdClient::connect_with(tls_config(&certs, &addr, "127.0.0.1", root()), TIMEOUT)
         .await
         .expect("connect as root");
     client.put("k", "v").await.expect("put");
@@ -68,7 +70,7 @@ async fn tls_and_password_auth_carry_every_call() {
 
     let lease = client.lease_grant(10).await.expect("lease grant").id;
     client.put_with_lease("leased", "x", lease).await.expect("put with lease");
-    let keeper = client.lease_keep_alive(lease).await.expect("keeper");
+    let keeper = client.lease_keep_alive(lease, Duration::from_secs(2)).await.expect("keeper");
     assert!(keeper.keep_alive().await.expect("keep alive").ttl > 0);
 
     client.lease_revoke(lease).await.expect("lease revoke");
@@ -85,7 +87,7 @@ async fn wrong_password_or_certificate_fails_the_connect() {
     common::enable_auth(&admin, PASSWORD).await;
 
     let wrong = Some(Credentials { user: "root".into(), password: "nope".into() });
-    let err = EtcdClient::connect_with(tls_config(&certs, &addr, "localhost", wrong))
+    let err = EtcdClient::connect_with(tls_config(&certs, &addr, "localhost", wrong), TIMEOUT)
         .await
         .err()
         .expect("wrong password connected");
@@ -93,10 +95,10 @@ async fn wrong_password_or_certificate_fails_the_connect() {
 
     let mut other = tls_config(&certs, &addr, "localhost", root());
     other.tls = Some(TlsConfig::from_pem_files(&certs.other_ca, None).expect("other ca"));
-    let err = EtcdClient::connect_with(other).await.err().expect("untrusted server connected");
+    let err = EtcdClient::connect_with(other, TIMEOUT).await.err().expect("untrusted server connected");
     assert!(format!("{err:#}").contains("tls handshake"), "{err:#}");
 
-    let err = EtcdClient::connect_with(tls_config(&certs, &addr, "etcd.example", root()))
+    let err = EtcdClient::connect_with(tls_config(&certs, &addr, "etcd.example", root()), TIMEOUT)
         .await
         .err()
         .expect("certificate accepted for another name");
@@ -115,10 +117,10 @@ async fn expired_token_is_replaced() {
 
     let mut config = EtcdConfig::plain(&[addr]);
     config.credentials = root();
-    let client = EtcdClient::connect_with(config).await.expect("connect as root");
+    let client = EtcdClient::connect_with(config, TIMEOUT).await.expect("connect as root");
     client.put("k", "v").await.expect("put");
     let lease = client.lease_grant(30).await.expect("lease grant").id;
-    let keeper = client.lease_keep_alive(lease).await.expect("keeper");
+    let keeper = client.lease_keep_alive(lease, Duration::from_secs(2)).await.expect("keeper");
 
     let idle = || compio::time::sleep(Duration::from_secs(3));
     idle().await;

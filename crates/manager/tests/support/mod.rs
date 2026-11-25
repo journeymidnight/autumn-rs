@@ -1041,6 +1041,13 @@ pub struct EtcdGuard {
     _data_dir: tempfile::TempDir,
 }
 
+impl EtcdGuard {
+    /// The etcd process, for tests that freeze it.
+    pub fn pid(&self) -> u32 {
+        self.child.as_ref().expect("etcd child").id()
+    }
+}
+
 impl Drop for EtcdGuard {
     fn drop(&mut self) {
         if let Some(mut child) = self.child.take() {
@@ -1134,6 +1141,90 @@ pub async fn start_etcd() -> (EtcdGuard, String) {
         }
     }
     panic!("etcd lost its ports to other processes five times");
+}
+
+/// An `n`-member etcd cluster on loopback; client URLs in member order.
+pub async fn start_etcd_cluster(n: usize) -> (Vec<EtcdGuard>, Vec<String>) {
+    let etcd_bin = std::env::var("AUTUMN_TEST_ETCD_BIN").unwrap_or_else(|_| "etcd".to_string());
+    'attempt: for _ in 0..5 {
+        let clients: Vec<SocketAddr> = (0..n).map(|_| pick_addr()).collect();
+        let peers: Vec<String> = (0..n).map(|_| format!("http://{}", pick_addr())).collect();
+        let initial: Vec<String> = (0..n).map(|i| format!("m{i}={}", peers[i])).collect();
+        let mut guards = Vec::new();
+        for i in 0..n {
+            let data_dir = tempfile::tempdir().expect("etcd tempdir");
+            let client_url = format!("http://{}", clients[i]);
+            let child = std::process::Command::new(&etcd_bin)
+                .args(["--name", &format!("m{i}")])
+                .arg("--data-dir")
+                .arg(data_dir.path().join("etcd-data"))
+                .args([
+                    "--listen-client-urls",
+                    &client_url,
+                    "--advertise-client-urls",
+                    &client_url,
+                ])
+                .args([
+                    "--listen-peer-urls",
+                    &peers[i],
+                    "--initial-advertise-peer-urls",
+                    &peers[i],
+                ])
+                .args([
+                    "--initial-cluster",
+                    &initial.join(","),
+                    "--initial-cluster-state",
+                    "new",
+                ])
+                .args(["--log-level", "error"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap_or_else(|e| panic!("spawn etcd binary `{etcd_bin}`: {e}"));
+            guards.push(EtcdGuard {
+                child: Some(child),
+                _data_dir: data_dir,
+            });
+        }
+        let urls: Vec<String> = clients.iter().map(|a| format!("http://{a}")).collect();
+        let start = std::time::Instant::now();
+        loop {
+            for g in guards.iter_mut() {
+                if g.child
+                    .as_mut()
+                    .expect("held")
+                    .try_wait()
+                    .expect("etcd child status")
+                    .is_some()
+                {
+                    continue 'attempt; // lost a port: try fresh ones
+                }
+            }
+            let listening = guards
+                .iter()
+                .zip(&clients)
+                .all(|(g, a)| listens_on(g.pid(), a.port()));
+            if listening {
+                let mut healthy = true;
+                for url in &urls {
+                    let ok = match autumn_etcd::EtcdClient::connect(url).await {
+                        Ok(c) => c.get("health-check").await.is_ok(),
+                        Err(_) => false,
+                    };
+                    healthy &= ok;
+                }
+                if healthy {
+                    return (guards, urls);
+                }
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(30),
+                "etcd cluster not ready within 30 s"
+            );
+            compio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+    panic!("etcd cluster lost its ports to other processes five times");
 }
 
 // ── Embedded toxiproxy ────────────────────────────────────────────────
