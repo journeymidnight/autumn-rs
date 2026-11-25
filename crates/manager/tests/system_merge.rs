@@ -246,10 +246,9 @@ fn merge_preserves_value_pointer_resolution() {
     });
 }
 
-/// Roll a stream tail from an independent client. The caller waits for all
-/// writes before each roll; this is only used to create a real multi-extent
-/// source shape for recovery coverage.
-async fn roll_stream_tail(mgr_addr: std::net::SocketAddr, stream_id: u64) {
+/// Roll a stream tail through its partition; only used to create a real
+/// multi-extent source shape for recovery coverage.
+async fn roll_stream_tail(router: &PsRouter, mgr_addr: std::net::SocketAddr, part_id: u64, stream_id: u64) {
     let sc = StreamClient::connect(
         &mgr_addr.to_string(),
         "auto-merge-multi-extent".to_string(),
@@ -257,15 +256,13 @@ async fn roll_stream_tail(mgr_addr: std::net::SocketAddr, stream_id: u64) {
         Rc::new(ConnPool::new()),
     )
     .await
-    .expect("stream client");
+    .expect("stream client (reads stream info only)");
     let before = sc
         .get_stream_info(stream_id)
         .await
         .expect("stream info before roll")
         .extent_ids;
-    sc.seal_and_roll_tail(stream_id)
-        .await
-        .expect("roll stream tail");
+    psr_roll_tail(router, part_id, stream_id, *before.last().expect("tail")).await;
     let after = sc
         .get_stream_info(stream_id)
         .await
@@ -382,9 +379,8 @@ fn auto_dispatch_merge_orchestrates_full_flow() {
         }
         assert!(s != 0 && v != 0 && s_log != 0 && v_log != 0);
 
-        // Create two complete post-split WAL extents per child. Each put is
-        // acknowledged before the external roll and no maintenance/GC is
-        // dispatched during these loops.
+        // Create two complete post-split WAL extents per child, each rolled by
+        // its partition. No maintenance/GC is dispatched during these loops.
         for round in 0..2usize {
             for i in 0..128usize {
                 psr_put(
@@ -402,8 +398,8 @@ fn auto_dispatch_merge_orchestrates_full_flow() {
                 )
                 .await;
             }
-            roll_stream_tail(mgr_addr, s_log).await;
-            roll_stream_tail(mgr_addr, v_log).await;
+            roll_stream_tail(&router, mgr_addr, s, s_log).await;
+            roll_stream_tail(&router, mgr_addr, v, v_log).await;
         }
 
         // Split children carry overlapping CoW tables and merge refuses that

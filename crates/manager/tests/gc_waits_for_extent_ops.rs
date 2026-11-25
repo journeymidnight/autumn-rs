@@ -49,6 +49,13 @@ fn start_manager_with_markers(addr: SocketAddr) -> mpsc::Sender<Marker> {
     tx
 }
 
+/// The log tail's length, read without fencing the partition that owns it
+/// (a to-end read sizes an open extent with the fence-free probe).
+async fn tail_len(sc: &StreamClient, log: u64) -> u64 {
+    let tail = *sc.get_stream_info(log).await.expect("log info").extent_ids.last().expect("tail");
+    sc.read_bytes_from_extent(tail, 0, 0).await.expect("read tail").0.len() as u64
+}
+
 fn large_value(i: u32, gen: u8) -> Vec<u8> {
     // > 4 KiB: the value lives in the log stream behind a ValuePointer.
     let mut v = format!("v{gen}-{i:03}-").into_bytes();
@@ -137,7 +144,7 @@ fn gc_skips_an_extent_with_an_op_in_flight() {
         // An EC conversion is in flight on the extent: GC must not touch it.
         markers.send(Marker::Ec { extent: first, node: idle.node_id }).unwrap();
         compio::time::sleep(Duration::from_millis(100)).await;
-        let before = sc.commit_length(log).await.expect("tail commit length");
+        let before = tail_len(&sc, log).await;
         force_gc(&ps, 801, vec![first]).await;
         compio::time::sleep(Duration::from_millis(2000)).await;
         assert!(
@@ -145,7 +152,7 @@ fn gc_skips_an_extent_with_an_op_in_flight() {
             "the extent stays while its op is in flight"
         );
         assert_eq!(
-            sc.commit_length(log).await.expect("tail commit length"),
+            tail_len(&sc, log).await,
             before,
             "nothing was relocated off an extent GC could not punch"
         );

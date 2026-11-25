@@ -233,11 +233,12 @@ async fn stream_client(mgr_addr: SocketAddr) -> Rc<StreamClient> {
     .expect("stream client")
 }
 
-/// Seal the log tail and start an empty one; returns the new tail. No append
-/// is in flight: every put above was awaited and the writer is idle.
-async fn roll_log_tail(mgr_addr: SocketAddr, log: u64) -> u64 {
+/// Seal the log tail and start an empty one, through the partition that owns
+/// it; returns the new tail.
+async fn roll_log_tail(router: &PsRouter, mgr_addr: SocketAddr, part: u64, log: u64) -> u64 {
     let sc = stream_client(mgr_addr).await;
-    sc.seal_and_roll_tail(log).await.expect("roll log tail");
+    let tail = *sc.get_stream_info(log).await.expect("log info").extent_ids.last().expect("log tail");
+    psr_roll_tail(router, part, log, tail).await;
     *sc.get_stream_info(log)
         .await
         .expect("log info")
@@ -333,8 +334,8 @@ fn a_merged_open_with_no_resolvable_cursor_loses_nothing() {
         let mut want = Expected::new();
         write_sources(&router, &mut want).await;
         // Each drain then publishes its cursor at `(empty tail, 0)`.
-        let survivor_tail = roll_log_tail(c.mgr_addr, c.survivor_log).await;
-        let victim_tail = roll_log_tail(c.mgr_addr, c.victim_log).await;
+        let survivor_tail = roll_log_tail(&router, c.mgr_addr, SURVIVOR, c.survivor_log).await;
+        let victim_tail = roll_log_tail(&router, c.mgr_addr, VICTIM, c.victim_log).await;
 
         let r = merge(c.mgr_addr).await;
         assert_eq!(r.code, partition_rpc::CODE_OK, "merge: {}", r.message);

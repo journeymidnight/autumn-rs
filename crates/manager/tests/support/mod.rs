@@ -889,6 +889,27 @@ pub async fn psr_flush(router: &PsRouter, part_id: u64) {
     ps_flush(&c, part_id).await;
 }
 
+/// Roll `stream_id`'s tail `tail` through its partition (`MSG_ROLL_TAILS`), so
+/// the partition's own stream client seals it. A roll from another owner would
+/// fence the live partition out of its tail.
+pub async fn psr_roll_tail(router: &PsRouter, part_id: u64, stream_id: u64, tail: u64) {
+    let c = router.client_for(part_id).await;
+    let resp = c
+        .call(
+            partition_rpc::MSG_ROLL_TAILS,
+            partition_rpc::rkyv_encode(&partition_rpc::RollTailsReq {
+                part_id,
+                entries: vec![(stream_id, tail)],
+            }),
+        )
+        .await
+        .expect("roll_tails rpc");
+    let resp: partition_rpc::RollTailsResp =
+        partition_rpc::rkyv_decode(&resp).expect("decode RollTailsResp");
+    assert_eq!(resp.code, partition_rpc::CODE_OK, "roll_tails: {}", resp.message);
+    assert_eq!(resp.rolled, 1, "the tail must roll");
+}
+
 /// Routed `ps_compact` — partition-aware.
 pub async fn psr_compact(router: &PsRouter, part_id: u64) {
     let c = router.client_for(part_id).await;

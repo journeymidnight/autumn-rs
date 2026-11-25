@@ -54,8 +54,8 @@ pub const MSG_DELETE_EXTENT: u8 = 11;
 ///     where no PS-owner context is available).
 /// External (non-manager) callers MUST NOT use this RPC for
 /// seal/consensus reads — those go through `MSG_COMMIT_LENGTH`
-/// with a real owner_epoch so the EN's fence handover side-effect
-/// fires (see `extent_node.rs::handle_commit_length`).
+/// with a real owner_epoch, which fences the replica it measures
+/// (see `extent_node.rs::handle_commit_length`).
 pub const MSG_PROBE_EXTENT: u8 = 14;
 // 15 = MSG_READ_BYTES_BULK — the exact value read, replaced by `MSG_READ`
 //      (`READ_EXACT`) in wire 79.
@@ -391,36 +391,23 @@ impl ReadResp {
 /// CommitLengthRequest: 16 bytes.
 /// [extent_id: u64 LE][owner_epoch: i64 LE]
 ///
-/// **Wire contract on `owner_epoch`:**
+/// `owner_epoch` MUST be `> 0` on the wire: it is the caller's owner-lock
+/// epoch (`CODE_INVALID_ARGUMENT` otherwise; a caller without an owner uses
+/// `MSG_PROBE_EXTENT`). The extent node's `handle_commit_length`:
+///   - `owner_epoch < stored` → `CODE_LOCKED_BY_OTHER` (stale owner);
+///   - on an OPEN extent, raises the fence to `owner_epoch` durably (as
+///     `MSG_FENCE_EXTENT` does) and answers only after every append queued
+///     before it on that extent has finished, so the length counts every
+///     append this replica will acknowledge to an older owner;
+///   - on a sealed extent, answers the sealed length and touches nothing.
 ///
-/// `owner_epoch` is an i64 but MUST be `> 0` on the wire — it carries the
-/// caller's owner-lock claim. The EN's `handle_commit_length`:
-///   - returns `CODE_INVALID_ARGUMENT` if `owner_epoch <= 0` (no
-///     "probe sentinel" path — that escape hatch existed earlier
-///     and broke fence semantics; see `MSG_PROBE_EXTENT` instead);
-///   - returns `CODE_LOCKED_BY_OTHER` if `owner_epoch < entry.owner_epoch`
-///     (caller is a stale owner; reject);
-///   - if `owner_epoch >= entry.owner_epoch`, returns the length WITHOUT
-///     mutating `owner_epoch` (CHECK-ONLY; the three-concepts rule).
-///
-/// commit_length is a length PROBE + stale-owner fence CHECK. It does NOT
-/// perform fence handover — write-ownership is established EXCLUSIVELY by
-/// the APPEND path (`append_burst_frames` bumps `owner_epoch` when a
-/// higher-owner_epoch owner writes). The old "owner_epoch > owner_epoch →
-/// bump + persist .meta" handover has been removed: the manager's
-/// control-plane probes (`admin-merge:<v>:<s>` lock in
-/// `handle_merge_partitions`, the seal in `handle_stream_alloc_extent`)
-/// carry a high global owner-owner_epoch counter that does NOT represent a
-/// new PS write-owner; bumping `owner_epoch` on such a probe fenced out
-/// the LIVE PS (which never re-reads the climbing counter) → poison.
-///
-/// This RPC is the canonical seal-consensus primitive. Manager's
-/// `commit_length_on_node(addr, eid, owner_epoch)` helper forwards the
-/// caller's validated `req.owner_epoch` through `handle_check_commit_length`
-/// and `handle_stream_alloc_extent`. Manager probes WITHOUT an owner
-/// context (recovery liveness, `autumn-client info` display) use
-/// `MSG_PROBE_EXTENT` instead — that RPC returns the same `(code, length)`
-/// shape but skips the fence CHECK entirely.
+/// It is the seal-consensus primitive: the manager's `commit_length_on_node`
+/// sends the caller's validated `owner_epoch` from `handle_check_commit_length`,
+/// `handle_seal_tail` and `handle_stream_alloc_extent`; the stream client sends
+/// its own at load. Every caller in the tree is the stream's current owner, so
+/// the raise never fences out the live writer. That is a convention of the
+/// callers: the manager checks the epoch against the named `ownerLocks/` key
+/// (an empty key passes), not that the key owns the stream.
 pub struct CommitLengthReq {
     pub extent_id: u64,
     pub owner_epoch: i64,

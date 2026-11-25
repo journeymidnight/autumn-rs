@@ -2874,6 +2874,31 @@ EN; after the manager flips it to `Suspected` (`autumn-op info` /
 extent has a replica on the dead node is served by a healthy replica instead of
 stalling for the per-RPC timeout on every read.
 
+## A takeover's seal and the previous owner's appends
+
+When a partition opens on a new owner, it seals each stream's open tail at the
+minimum length the replicas report. Each replica's report is also its fence:
+it raises the replica's owner floor to the new owner's epoch and answers only
+after the appends it already accepted have reached disk. An append of the
+previous owner (still running: paused, partitioned) is then either counted in
+the sealed length or refused, so it can no longer be acknowledged past the
+seal. A probe waits for the append bursts queued before it on that replica. If
+the previous owner had a large append in flight (an SST, up to 1 GiB), a replica
+can miss the manager's 5 s probe timeout and is left out of that seal; with no
+replica answering, the open logs `tail seal failed, retrying in 5s` and the
+takeover waits for that append to finish.
+
+**Verify:**
+
+```bash
+cargo nextest run -p autumn-stream --lib takeover_probe ec3_fence
+#   a_probe_counts_the_old_owners_append_in_flight_and_fences_its_next   PASS
+#   commit_length_fences_an_open_extent_not_a_sealed_one                 PASS
+```
+
+The extent node, the PS and the manager must run the same wire version (90);
+an older extent node is refused at the version handshake.
+
 ## Stale owner-epoch fence self-heal
 
 A PS partition whose stream client holds a stale per-partition `owner_epoch`

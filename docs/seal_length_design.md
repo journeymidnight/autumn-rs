@@ -44,12 +44,31 @@ does. The seal comes after the takeover fence, so the previous owner cannot
 append past it.
 
 Every open tail is sealed, even when every replica answers with the same
-length. Agreement at the probe proves nothing about the next moment: an append
-from the previous owner that passed an extent node's fence check before the
-fence landed still writes its bytes (only its acknowledgement is refused), so
-a replica can grow right after answering. A sealed length is immune — readers
+length. A sealed length is immune to what happens after the probe — readers
 clamp to it. The cost is one extent per stream per open after writes; a tail
 left sealed by an earlier open (no writes since) is reused as it is.
+
+### The probe fences each replica it measures
+
+The previous owner may still be running (paused, partitioned), with an append
+past the replicas' fence check and waiting for its fsync. A length read beside
+that append can miss it, and the append is then acknowledged on every replica
+anyway. So the probe is the fence: `MSG_COMMIT_LENGTH` on an open extent raises
+the replica's floor to the caller's epoch (durably) and answers only after every
+append queued before it in the extent's owner mailbox has finished. An append of
+the previous owner either passed its fence check first, and is written and
+fsynced before the replica answers, or it meets the raised floor and is refused.
+A probe waits for the bursts queued before it (an append of the previous owner
+can be a whole SST, up to 1 GiB); one that does not answer within the manager's
+5 s probe timeout is left out, and a partition open retries its seal until a
+replica answers. Each replica in the minimum is measured that way, so an append acknowledged to
+the previous owner — which needs every replica — is inside the minimum; a
+replica that did not answer is not in the minimum, and the ones that did refuse
+the previous owner from then on. Every caller probes with the stream's current
+owner's epoch, so the raise never fences out the live writer. That rests on the
+callers: the manager checks the epoch against the `ownerLocks/` key the request
+names, not that this key owns the stream.
+Regression: `takeover_probe_tests` in `crates/stream/src/extent_node.rs`.
 
 ### Why the probe does not wait for every replica
 

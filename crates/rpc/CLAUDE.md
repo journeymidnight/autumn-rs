@@ -783,7 +783,7 @@ overflows the frame.
 
 ## Wire version, and the two checks over it
 
-`WIRE_VERSION` (currently **89**: `MergeFreezeResp` carries the freeze checkpoint's meta position) is the schema this binary speaks.
+`WIRE_VERSION` (currently **90**: the extent node's `MSG_COMMIT_LENGTH` fences and drains) is the schema this binary speaks.
 `MIN_CLIENT_WIRE_VERSION` (**87**: that change was made in place, so every client is rebuilt — chosen
 over a second form of each write; `client_surface_freeze.rs` re-recorded those two forms)
 is the oldest CLIENT it serves. Both are maintained
@@ -811,7 +811,7 @@ is routine rather than exotic — a client built from newer sources often runs
 ahead of a cluster nobody has upgraded yet. The refusal says which way round it is,
 because the fix differs (deploy the cluster vs rebuild the client).
 
-**The window is `[87, 88]`.** It was open from 43 to 78, widened by raising
+**The window is `[87, 90]`.** It was open from 43 to 78, widened by raising
 the CEILING; wire 79 replaced the read messages every older client sends
 (`GET_BULK`, `GET_REDIRECT`, `GET_REDIRECT_MANY`, `BATCH_GET_BULK`, the extent
 node's `READ_BYTES_BULK`) with `MSG_GET`, `MSG_BATCH_GET` and `MSG_READ`, and
@@ -1137,6 +1137,15 @@ the bytes of the bulk forms they replace (`client_surface_freeze.rs` records
 `CompareWriteReq` and `BatchPutReq` with the bytes of `CompareWriteBulkReq` and
 `BatchPutBulkReq`), so only names changed on them; the floor rose because a
 wire-80 client sends the deleted forms for small values.
+
+## `MSG_COMMIT_LENGTH` fences the replica it measures (wire 90)
+
+On an open extent the extent node raises the floor to the request's `owner_epoch` (durably) and answers
+only after the appends queued before it on that extent finished, so the
+manager's probe seal counts every append a replica acknowledges to an older
+owner (stream CLAUDE.md, "A length probe fences the replica it measures").
+Bumped so an extent node without it cannot join a cluster that relies on it.
+Manager, PS and EN only; the client floor stays 87.
 
 ## `MergeFreezeResp` carries the meta position (wire 89)
 

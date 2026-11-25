@@ -1495,7 +1495,9 @@ Three sites — `handle_stream_alloc_extent` failover seal, `handle_seal_tail`
 no new tail allocated; etcd value-CAS on the extent plus the owner lock's revision) and
 `handle_check_commit_length` (reports the length, seals nothing) — all exclude catching-up members
 (`recovering_nodes_for_extent`, a re-replication target holds a partial replica and
-must never lower the `min`), probe committed members, and feed the shared pure
+must never lower the `min`), probe committed members (each probe fences the
+replica it asks at the caller's epoch and waits for the appends queued before
+it: stream CLAUDE.md, "A length probe fences the replica it measures"), and feed the shared pure
 `compute_commit_seal(members, recovering, responses)`. We wish every committed member
 would answer, but ONE is enough: whichever answers holds all the acked data (perhaps
 more), and after the seal a committed member shorter than the min still holds all of

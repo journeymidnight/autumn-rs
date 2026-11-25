@@ -4019,10 +4019,9 @@ impl StreamClient {
                 extent_id: tail.extent.extent_id,
                 owner_epoch,
             };
-            // 5 s — commit_length is a tiny in-memory probe on EN.
-            // Per-replica timeout: a paged-out replica counts as a
-            // miss for the quorum tally rather than wedging the
-            // whole call.
+            // 5 s per replica. The EN answers after the appends queued
+            // before the probe; a replica that does not answer in time
+            // counts as a miss rather than wedging the whole call.
             let result = self
                 .pool
                 .call_timeout(
@@ -4464,10 +4463,9 @@ impl StreamClient {
     /// CALLER CONTRACT (Layer-C guard): `owner_epoch` MUST be the partition's own
     /// freshly-acquired `partition/{part_id}` owner-lock revision (E_new from
     /// `acquire_partition_owner_epoch`). NEVER pass a `ps-<id>` server_revision, an
-    /// `admin-merge:` epoch, or any other lock's revision — feeding a foreign
-    /// revision into a floor-RAISING op is exactly the hazard the check-only
-    /// `handle_commit_length` postmortem ("CHECK ONLY, NEVER handover") records:
-    /// a stray higher revision would poison the LIVE owner's own fence floor.
+    /// `admin-merge:` epoch, or any other lock's revision — a stray higher
+    /// revision fed into a floor-RAISING op (this, and `MSG_COMMIT_LENGTH` on an
+    /// open extent) would poison the LIVE owner's own fence floor.
     pub async fn fence_tail(&self, stream_id: u64, owner_epoch: i64) -> Result<()> {
         let stream = self.get_stream_info(stream_id).await?;
         let Some(&tail_id) = stream.extent_ids.last() else {

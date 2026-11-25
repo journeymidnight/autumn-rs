@@ -306,6 +306,10 @@ impl DiskProbeError {
 thread_local! {
     // One-shot fsync fault: 0 parks forever; a positive errno fails sync.
     static DISK_PROBE_SYNC_ERROR: Cell<Option<i32>> = const { Cell::new(None) };
+    // One-shot hold of the next append burst between its write and its fsync:
+    // sets the flag when parked, resumes when the receiver fires.
+    static APPEND_SYNC_HOLD: RefCell<Option<(Rc<Cell<bool>>, futures::channel::oneshot::Receiver<()>)>> =
+        const { RefCell::new(None) };
 }
 
 struct DiskFS {
@@ -2938,6 +2942,9 @@ pub(crate) enum ExtentMsg {
         /// When it entered the owner's mailbox (append summary: queue wait).
         queued_at: Instant,
     },
+    /// Answered once every append queued before it has finished (written and
+    /// fsynced, or refused): a length read after it counts all of them.
+    Drained { done: futures::channel::oneshot::Sender<()> },
     // Later steps add: Truncate, Seal, FencePersist (the interleaving set that
     // must move together with Append), plus the SHORT commit messages of the
     // staged long ops (ReAvaliCommit / ConvertCommit / EcShardCommit / Delete /
@@ -3301,10 +3308,7 @@ async fn owner_loop(node: ExtentNode, extent: std::rc::Rc<ExtentEntry>) {
         // extent.len / owner_epoch. Single-writer pipelining is single-epoch +
         // contiguous ⇒ ONE run ⇒ zero hot-path cost. This splitter is now the home
         // of the "first slot governs the batch" invariant the prologue relies on.
-        let mut runs: Vec<(
-            Vec<AppendSlot>,
-            Vec<futures::channel::oneshot::Sender<Bytes>>,
-        )> = Vec::new();
+        let mut runs: Vec<OwnerStep> = Vec::new();
         let mut prev_epoch_end: Option<(i64, u64)> = None; // (owner_epoch, commit + payload.len())
         let mut queue_ns = 0u64;
         let mut queued = 0u64;
@@ -3318,12 +3322,18 @@ async fn owner_loop(node: ExtentNode, extent: std::rc::Rc<ExtentEntry>) {
                         Some((pe, pend)) if pe == req.owner_epoch && pend == req.commit
                     );
                     if !contiguous {
-                        runs.push((Vec::new(), Vec::new()));
+                        runs.push(OwnerStep::Run(Vec::new(), Vec::new()));
                     }
                     prev_epoch_end = Some((req.owner_epoch, req.commit + req.payload.len() as u64));
-                    let run = runs.last_mut().expect("a run was just pushed");
-                    run.0.push(AppendSlot { req, req_id, pieces });
-                    run.1.push(resp);
+                    let Some(OwnerStep::Run(slots, resps)) = runs.last_mut() else {
+                        unreachable!("a run was just pushed or continued")
+                    };
+                    slots.push(AppendSlot { req, req_id, pieces });
+                    resps.push(resp);
+                }
+                ExtentMsg::Drained { done } => {
+                    runs.push(OwnerStep::Drained(done));
+                    prev_epoch_end = None;
                 }
             }
         }
@@ -3332,7 +3342,14 @@ async fn owner_loop(node: ExtentNode, extent: std::rc::Rc<ExtentEntry>) {
         // synchronously, then the returned future does pwrite+fsync). Runs run
         // SEQUENTIALLY so a later run's fence/commit prologue observes the prior
         // run's durable extent.len / owner_epoch.
-        for (slots, resps) in runs {
+        for step in runs {
+            let (slots, resps) = match step {
+                OwnerStep::Run(slots, resps) => (slots, resps),
+                OwnerStep::Drained(done) => {
+                    let _ = done.send(());
+                    continue;
+                }
+            };
             let frames = append_burst_frames(node.clone(), std::rc::Rc::clone(&extent), slots)
                 .await
                 .await;
@@ -3345,6 +3362,12 @@ async fn owner_loop(node: ExtentNode, extent: std::rc::Rc<ExtentEntry>) {
             node.write_open_ck(&extent).await;
         }
     }
+}
+
+/// What `owner_loop` runs from one drained burst, in mailbox order.
+enum OwnerStep {
+    Run(Vec<AppendSlot>, Vec<futures::channel::oneshot::Sender<Bytes>>),
+    Drained(futures::channel::oneshot::Sender<()>),
 }
 
 async fn append_burst_frames(
@@ -3636,6 +3659,11 @@ async fn append_burst_frames(
         // gated by fd_evictable) AFTER, so an evict-check during the fsync window
         // sees pending > last_synced and won't evict. On error: mark the disk +
         // reject the whole burst, never advance last_synced.
+        #[cfg(test)]
+        if let Some((parked, release)) = APPEND_SYNC_HOLD.with(|h| h.borrow_mut().take()) {
+            parked.set(true);
+            let _ = release.await;
+        }
         extent_for_io
             .coalescer
             .pending_fsync
@@ -8589,6 +8617,16 @@ impl ExtentNode {
         Ok(frame.payload)
     }
 
+    /// A length probe by the extent's owner, and on an open extent its fence:
+    /// the floor is raised to the caller's epoch (durably, as `FENCE_EXTENT`
+    /// does) and the reply waits until every append queued before it has
+    /// finished. A length the manager seals at therefore counts every append
+    /// this replica will ever acknowledge to an older owner: one that passed
+    /// its fence check before the probe is written and fsynced first, one that
+    /// did not is refused. Every caller in the tree is the stream's current
+    /// owner, so raising the floor never fences out the live writer; nothing
+    /// checks that (the manager compares the epoch with the named
+    /// `ownerLocks/` key, not that the key owns the stream).
     async fn handle_commit_length(&self, payload: Bytes) -> HandlerResult {
         let req = CommitLengthReq::decode(payload)
             .map_err(|e| (StatusCode::InvalidArgument, e.to_string()))?;
@@ -8598,12 +8636,17 @@ impl ExtentNode {
             return Err(self.wrong_shard_err(req.extent_id));
         }
 
-        let entry = self.extents.get(&req.extent_id).ok_or_else(|| {
-            (
-                StatusCode::NotFound,
-                format!("extent {} not found", req.extent_id),
-            )
-        })?;
+        // Cloned out of the map: the fence persist and the drain await.
+        let entry = self
+            .extents
+            .get(&req.extent_id)
+            .map(|v| Rc::clone(v.value()))
+            .ok_or_else(|| {
+                (
+                    StatusCode::NotFound,
+                    format!("extent {} not found", req.extent_id),
+                )
+            })?;
 
         // META-FAILCLOSED: a quarantined extent (corrupt `.meta` at load) has
         // an untrusted length/fence — never feed it into the manager's seal
@@ -8618,36 +8661,8 @@ impl ExtentNode {
             .encode());
         }
 
-        // `req.owner_epoch <= 0` is a
-        // protocol error, not a sentinel. The earlier "owner_epoch == 0
-        // bypasses the fence" escape hatch tangled three call sites
-        // (seal probe, recovery liveness, autumn-client info) onto one
-        // RPC and forced ad-hoc fence skipping; closing that escape hatch
-        // broke the seal+recovery paths; the redesign splits
-        // probe-without-fence onto `MSG_PROBE_EXTENT` and tightens THIS
-        // RPC into a clean fence-enforcing primitive. Callers that
-        // legitimately don't have an owner (manager recovery liveness,
-        // `autumn-client info` display) now use `handle_probe_extent`.
-        //
-        // Fence semantics on the surviving (owner_epoch > 0) path — CHECK ONLY,
-        // NEVER handover (the three-concepts rule):
-        //   owner_epoch < owner_epoch → CODE_LOCKED_BY_OTHER (stale owner)
-        //   owner_epoch >= owner_epoch → no-op, return length
-        //
-        // commit_length is a length PROBE; write-ownership is established
-        // EXCLUSIVELY by the APPEND path (`append_burst_frames` bumps owner_epoch
-        // when a higher-owner_epoch owner writes). A probe must NOT steal the
-        // write-fence. The old "owner_epoch > owner_epoch → bump + persist
-        // .meta handover" was the Layer-C poison bug: the manager's
-        // control-plane probes (the `admin-merge:<v>:<s>` owner-lock in
-        // `handle_merge_partitions`, the seal in `handle_stream_alloc_extent`)
-        // carry a high global owner-owner_epoch counter that does NOT represent a
-        // new PS write-owner. Bumping owner_epoch on such a probe fenced out
-        // the LIVE PS (which holds its acquire-time owner_epoch and never re-reads
-        // the climbing counter) → CODE_LOCKED_BY_OTHER on its next append →
-        // partition self-poison. New-owner takeover is unaffected: the new
-        // owner's first APPEND advances the fence and fences the old owner
-        // (see `system_locked_by_other` — sc2 fences sc1 via append, not probe).
+        // `owner_epoch <= 0` is a protocol error, not a sentinel: a caller
+        // without an owner uses `MSG_PROBE_EXTENT`.
         if req.owner_epoch <= 0 {
             return Err((
                 StatusCode::InvalidArgument,
@@ -8658,40 +8673,61 @@ impl ExtentNode {
                 ),
             ));
         }
-        let owner_epoch = entry.owner_epoch.load(Ordering::SeqCst);
-        if req.owner_epoch < owner_epoch {
-            return Ok(CommitLengthResp {
+        let locked = || {
+            Ok(CommitLengthResp {
                 code: CODE_LOCKED_BY_OTHER,
                 length: 0,
             }
-            .encode());
+            .encode())
+        };
+        let stored = entry.owner_epoch.load(Ordering::SeqCst);
+        if req.owner_epoch < stored {
+            return locked();
         }
-        // for sealed extents, return the LOGICAL sealed length
-        // (the original payload length, agreed with the manager). For
-        // open extents, return the durable
-        // high-water (`coalescer.last_synced`), NOT `entry.len`.
-        //
-        // This previously returned `entry.len`, which is set to
-        // `total_end` BEFORE the pwrite + fsync future is even returned
-        // (see `append_burst_frames` step 7). A concurrent peer (e.g.
-        // EC convert peer-copy gap fill, or manager seal) querying
-        // commit_length during the pwrite-to-fsync window would read
-        // the reservation and treat it as committed. Manager would
-        // then seal at a non-durable value; on this replica's crash
-        // before fsync, the file shrinks back below sealed_length →
-        // permanent inconsistency in etcd.
-        //
-        // The per-extent coalescer maintains `last_synced` =
-        // post-fsync durable high-water. Returning it gives the strict
-        // "what's actually on disk" guarantee that seal needs.
-        // Trade-off: bytes between `last_synced` and `entry.len` (in
-        // flight pwrites) are temporarily invisible to commit_length;
-        // they reappear on the next coalescer tick (1-5 ms later).
-        // For the original post-EC-conversion shard-size concern,
-        // `last_synced` is also bounded above by
-        // `sealed_length` for sealed extents (set in
-        // `apply_extent_meta_durable`), so the EC-shard-size confusion
-        // doesn't recur.
+        let sealed = entry.sealed.load(Ordering::SeqCst)
+            || entry.sealed_length.load(Ordering::SeqCst) > 0
+            || entry.avali.load(Ordering::SeqCst) > 0;
+        if !sealed {
+            // Raised before the drain is queued, so every append behind the
+            // drain in the mailbox meets the new floor.
+            if req.owner_epoch > stored {
+                entry.owner_epoch.fetch_max(req.owner_epoch, Ordering::SeqCst);
+            }
+            if let Err(e) = self
+                .ensure_fence_durable(req.extent_id, &entry, req.owner_epoch)
+                .await
+            {
+                self.mark_disk_error_for_extent(req.extent_id, &e.to_string())
+                    .await;
+                tracing::error!(
+                    extent_id = req.extent_id,
+                    error = %e,
+                    "handle_commit_length: durable fence persist failed — refusing (fail-closed)"
+                );
+                return Ok(CommitLengthResp {
+                    code: CODE_PRECONDITION,
+                    length: 0,
+                }
+                .encode());
+            }
+            let (done, drained) = futures::channel::oneshot::channel();
+            send_to_owner(self, &entry, ExtentMsg::Drained { done });
+            if drained.await.is_err() {
+                // The owner dropped the drain unanswered: the appends before it
+                // are not known to be finished, so this length cannot be given.
+                return Ok(CommitLengthResp {
+                    code: CODE_PRECONDITION,
+                    length: 0,
+                }
+                .encode());
+            }
+            if req.owner_epoch < entry.owner_epoch.load(Ordering::SeqCst) {
+                return locked();
+            }
+        }
+        // Sealed: the logical sealed length. Open: the fsynced high-water
+        // (`last_synced`), never the reservation `len`, which runs ahead of
+        // the fsync.
         let length = committed_length_value(&entry);
         Ok(CommitLengthResp {
             code: CODE_OK,
@@ -12681,16 +12717,22 @@ mod wire_fence_tests {
 
 #[cfg(test)]
 mod ec3_fence_handover_tests {
-    //! #3: proves `commit_length` is CHECK-ONLY (never bumps owner_epoch), so
-    //! the manager's `push_fence_handover_to_targets` (which sent a higher
-    //! owner_epoch via commit_length expecting a "handover" bump) was DEAD —
-    //! the bump never happened, the ghost ex-coordinator was never fenced out.
-    //! Guards the three-concepts rule against anyone re-adding handover here.
+    //! `commit_length` fences an OPEN extent at the caller's epoch (the
+    //! manager's seal probe is the new owner's fence) and leaves a SEALED one
+    //! alone; a lower epoch is refused either way.
     use super::*;
     use std::sync::atomic::Ordering::SeqCst;
 
+    async fn probe(node: &ExtentNode, eid: u64, owner_epoch: i64) -> u8 {
+        let resp = node
+            .handle_commit_length(CommitLengthReq { extent_id: eid, owner_epoch }.encode())
+            .await
+            .unwrap();
+        CommitLengthResp::decode(resp).unwrap().code
+    }
+
     #[compio::test]
-    async fn commit_length_is_check_only_never_handover() {
+    async fn commit_length_fences_an_open_extent_not_a_sealed_one() {
         let dir = tempfile::tempdir().unwrap();
         let node = ExtentNode::new(ExtentNodeConfig::new(dir.path().to_path_buf(), 1))
             .await
@@ -12700,46 +12742,91 @@ mod ec3_fence_handover_tests {
         entry.owner_epoch.store(5, SeqCst);
         entry.durable_owner_epoch.store(5, SeqCst);
 
-        // commit_length with a HIGHER owner_epoch — exactly the shape the dead
-        // fence-handover push sent. Expectation: no-op (returns length), and
-        // owner_epoch is UNCHANGED (no handover — that's why the push was dead).
-        let resp = node
-            .handle_commit_length(
-                CommitLengthReq {
-                    extent_id: eid,
-                    owner_epoch: 10,
-                }
-                .encode(),
-            )
+        assert_eq!(probe(&node, eid, 10).await, CODE_OK);
+        assert_eq!(entry.owner_epoch.load(SeqCst), 10, "an open extent is fenced at the probe's epoch");
+        assert_eq!(entry.durable_owner_epoch.load(SeqCst), 10, "and the fence is durable");
+        assert_eq!(probe(&node, eid, 5).await, CODE_LOCKED_BY_OTHER, "a lower epoch is refused");
+
+        entry.sealed.store(true, SeqCst);
+        entry.sealed_length.store(1, SeqCst);
+        assert_eq!(probe(&node, eid, 20).await, CODE_OK);
+        assert_eq!(entry.owner_epoch.load(SeqCst), 10, "a sealed extent keeps its floor");
+    }
+}
+
+#[cfg(test)]
+mod takeover_probe_tests {
+    //! A new owner's length probe (what the manager's seal takes the min of)
+    //! against an append of the previous owner that already passed the fence
+    //! check and is waiting for its fsync.
+    use super::*;
+
+    fn append_code(r: HandlerResult) -> (u8, u64) {
+        let resp = AppendResp::decode(r.expect("append reply")).expect("append resp");
+        (resp.code, resp.end)
+    }
+
+    #[compio::test]
+    async fn a_probe_counts_the_old_owners_append_in_flight_and_fences_its_next() {
+        let dir = tempfile::tempdir().unwrap();
+        let node = ExtentNode::new(ExtentNodeConfig::new(dir.path().to_path_buf(), 1))
             .await
             .unwrap();
-        let decoded = CommitLengthResp::decode(resp).unwrap();
-        assert_eq!(
-            decoded.code, CODE_OK,
-            "higher owner_epoch → no-op OK, not LOCKED"
-        );
-        assert_eq!(
-            entry.owner_epoch.load(SeqCst),
-            5,
-            "commit_length MUST NOT bump owner_epoch — write-fence is append-only"
+        let eid = 7101u64;
+        node.handle_alloc_extent(rkyv_encode(&AllocExtentReq { extent_id: eid }))
+            .await
+            .expect("alloc");
+
+        // The old owner (epoch 1) appends Y; it parks between write and fsync.
+        let parked = Rc::new(Cell::new(false));
+        let (release, hold) = futures::channel::oneshot::channel::<()>();
+        APPEND_SYNC_HOLD.with(|h| *h.borrow_mut() = Some((parked.clone(), hold)));
+        let n = node.clone();
+        let y = compio::runtime::spawn(async move {
+            n.append_via_owner(AppendReq {
+                extent_id: eid,
+                eversion: 1,
+                commit: 0,
+                owner_epoch: 1,
+                payload: Bytes::from(vec![7u8; 4096]).into(),
+            })
+            .await
+        });
+        while !parked.get() {
+            compio::time::sleep(Duration::from_millis(1)).await;
+        }
+
+        // The new owner (epoch 2) probes while Y is in flight.
+        let n = node.clone();
+        let probe = compio::runtime::spawn(async move {
+            n.handle_commit_length(CommitLengthReq { extent_id: eid, owner_epoch: 2 }.encode())
+                .await
+        });
+        compio::time::sleep(Duration::from_millis(50)).await;
+        release.send(()).unwrap();
+
+        let (y_code, y_end) = append_code(y.await.expect("append task"));
+        let probed = CommitLengthResp::decode(probe.await.expect("probe task").expect("probe"))
+            .expect("probe resp");
+        assert_eq!(probed.code, CODE_OK);
+        assert!(
+            y_code != CODE_OK || probed.length >= y_end,
+            "the old owner's append was acked to {y_end} but the probe reported {}",
+            probed.length
         );
 
-        // And a LOWER owner_epoch is still rejected (the check half is live).
-        let resp = node
-            .handle_commit_length(
-                CommitLengthReq {
-                    extent_id: eid,
-                    owner_epoch: 3,
-                }
-                .encode(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            CommitLengthResp::decode(resp).unwrap().code,
-            CODE_LOCKED_BY_OTHER,
-            "stale (lower) owner_epoch is rejected"
+        // After the probe the old owner may not append any more.
+        let (z_code, _) = append_code(
+            node.append_via_owner(AppendReq {
+                extent_id: eid,
+                eversion: 1,
+                commit: probed.length,
+                owner_epoch: 1,
+                payload: Bytes::from(vec![8u8; 4096]).into(),
+            })
+            .await,
         );
+        assert_eq!(z_code, CODE_LOCKED_BY_OTHER, "the old owner appended after the new owner's probe");
     }
 }
 

@@ -4735,14 +4735,12 @@ impl AutumnManager {
         Ok(r.disk_id)
     }
 
-    /// Seal-consensus probe: query an EN's `commit_length` for one extent
-    /// under the caller's validated owner-lock owner_epoch. This path
-    /// plumbs the PS-validated owner_epoch through (was: hardcoded
-    /// `0` + EN-side escape hatch) so the EN's fence-handover side-effect
-    /// (`if req.owner_epoch > last { bump + persist .meta }`) actually fires
-    /// when a new owner first contacts an EN. A caller without an owner
-    /// context must not use it: `MSG_PROBE_EXTENT` is the fence-free length
-    /// query.
+    /// Seal-consensus probe: an EN's `commit_length` for one extent under the
+    /// caller's validated owner epoch. On an open extent the EN fences itself
+    /// at that epoch and waits for the appends queued before the probe, so
+    /// the length counts every append it will acknowledge to an older owner
+    /// (docs/seal_length_design.md §2). A caller without an owner context
+    /// must not use it: `MSG_PROBE_EXTENT` is the fence-free length query.
     pub(crate) async fn commit_length_on_node(
         &self,
         addr: &str,
@@ -4760,9 +4758,9 @@ impl AutumnManager {
             extent_id,
             owner_epoch,
         };
-        // 5 s — commit_length is a tiny in-memory read on EN (atomic
-        // load of `entry.len`). Generous bound so a hiccupping EN
-        // doesn't hang split / commit-len consensus paths.
+        // 5 s. The EN answers after the bursts queued before the probe
+        // (possibly a large SST append); a slower replica is left out of the
+        // seal, which the partition open retries.
         let resp = self
             .conn_pool
             .call_timeout(

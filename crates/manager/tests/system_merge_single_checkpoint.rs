@@ -128,27 +128,11 @@ async fn stream_extent_ids(mgr_addr: SocketAddr, stream_id: u64) -> Vec<u64> {
 }
 
 /// Force a real WAL extent boundary without weakening the production 1-GiB
-/// minimum accepted by `--max-extent-size-bytes`. Every preceding put is
-/// awaited and this test has one sequential writer; no P-log append is in
-/// flight when the independent stream client rolls the tail. Background GC is
-/// never dispatched in this test.
-async fn roll_log_tail(mgr_addr: SocketAddr, log_stream_id: u64) {
-    let sc = StreamClient::connect(
-        &mgr_addr.to_string(),
-        "merge-checkpoint-roll".to_string(),
-        128 * 1024 * 1024,
-        Rc::new(ConnPool::new()),
-    )
-    .await
-    .expect("stream client");
-    let before = sc
-        .get_stream_info(log_stream_id)
-        .await
-        .expect("stream info before roll")
-        .extent_ids;
-    sc.seal_and_roll_tail(log_stream_id)
-        .await
-        .expect("roll log tail");
+/// minimum accepted by `--max-extent-size-bytes`: the partition rolls its own
+/// log tail. Background GC is never dispatched in this test.
+async fn roll_log_tail(router: &PsRouter, mgr_addr: SocketAddr, part_id: u64, log_stream_id: u64) {
+    let before = stream_extent_ids(mgr_addr, log_stream_id).await;
+    psr_roll_tail(router, part_id, log_stream_id, *before.last().expect("log tail")).await;
     let after = stream_extent_ids(mgr_addr, log_stream_id).await;
     assert_eq!(after.len(), before.len() + 1, "roll must add one extent");
     assert_eq!(&after[..before.len()], before.as_slice());
@@ -208,14 +192,14 @@ fn a_merge_survivor_holds_one_checkpoint_and_restarts_without_replay() {
         for i in 0..SURVIVOR_KEYS {
             psr_put(&router, SURVIVOR, survivor_key(i).as_bytes(), &vec![b's'; VALUE]).await;
             if i == 299 || i == 599 {
-                roll_log_tail(mgr_addr, survivor_log).await;
+                roll_log_tail(&router, mgr_addr, SURVIVOR, survivor_log).await;
             }
         }
         psr_flush(&router, SURVIVOR).await;
         for i in 0..VICTIM_KEYS {
             psr_put(&router, VICTIM, victim_key(i).as_bytes(), &vec![b'v'; VALUE]).await;
             if i == 999 || i == 1999 {
-                roll_log_tail(mgr_addr, victim_log).await;
+                roll_log_tail(&router, mgr_addr, VICTIM, victim_log).await;
             }
         }
 
@@ -371,14 +355,14 @@ fn a_compaction_after_a_merge_keeps_the_checkpoint_cursor() {
         for i in 0..SURVIVOR_KEYS {
             psr_put(&router, SURVIVOR, survivor_key(i).as_bytes(), &vec![b's'; VALUE]).await;
             if i == 499 {
-                roll_log_tail(mgr_addr, survivor_log).await;
+                roll_log_tail(&router, mgr_addr, SURVIVOR, survivor_log).await;
             }
         }
         psr_flush(&router, SURVIVOR).await;
         for i in 0..VICTIM_KEYS {
             psr_put(&router, VICTIM, victim_key(i).as_bytes(), &vec![b'v'; VALUE]).await;
             if i == 1499 {
-                roll_log_tail(mgr_addr, victim_log).await;
+                roll_log_tail(&router, mgr_addr, VICTIM, victim_log).await;
             }
         }
         let mgr = RpcClient::connect_as(mgr_addr, autumn_rpc::version_hello::Role::Admin, None)
