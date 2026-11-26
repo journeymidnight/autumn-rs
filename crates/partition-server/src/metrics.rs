@@ -217,6 +217,10 @@ pub struct PartitionMetrics {
     /// heartbeat so the manager's op-ledger learns the state + error string that
     /// would otherwise die in a PS `tracing::error!`.
     pub maintenance_outcomes: parking_lot::Mutex<VecDeque<manager_rpc::MaintenanceOutcome>>,
+    /// Outcomes ever pushed into the ring, and how many of them a load report
+    /// the manager answered carried (`outcome_reported`).
+    pub outcomes_pushed: AtomicU64,
+    pub outcomes_reported: AtomicU64,
     /// Tables in the SST list, memtable bytes (active + queued immutables) and
     /// queued immutables. Set by `PartitionData::publish_lsm_gauges` wherever
     /// one of them changes.
@@ -290,12 +294,19 @@ impl PartitionMetrics {
     }
 
     /// Record a terminal maintenance outcome for the next heartbeat (bounded).
-    pub fn push_maintenance_outcome(&self, o: manager_rpc::MaintenanceOutcome) {
+    /// Returns its number, for `outcome_reported`.
+    pub fn push_maintenance_outcome(&self, o: manager_rpc::MaintenanceOutcome) -> u64 {
         let mut r = self.maintenance_outcomes.lock();
         r.push_back(o);
         while r.len() > MAINT_OUTCOME_RING_CAP {
             r.pop_front();
         }
+        self.outcomes_pushed.fetch_add(1, Relaxed) + 1
+    }
+
+    /// Whether outcome number `n` has reached the manager on a load report.
+    pub fn outcome_reported(&self, n: u64) -> bool {
+        self.outcomes_reported.load(Relaxed) >= n
     }
     /// Publish how far the currently-running maintenance op has got. Called
     /// from the op's own loop, so the cost must stay trivial — one short lock,
@@ -355,6 +366,25 @@ impl PartitionMetrics {
     /// retransmit covers a dropped report.
     pub fn snapshot_maintenance_outcomes(&self) -> Vec<manager_rpc::MaintenanceOutcome> {
         self.maintenance_outcomes.lock().iter().cloned().collect()
+    }
+
+    /// The ring as `snapshot_maintenance_outcomes`, and the number of the last
+    /// outcome in it (pass to `mark_outcomes_reported` once the manager has it).
+    pub fn snapshot_maintenance_outcomes_numbered(&self) -> (Vec<manager_rpc::MaintenanceOutcome>, u64) {
+        let r = self.maintenance_outcomes.lock();
+        (r.iter().cloned().collect(), self.outcomes_pushed.load(Relaxed))
+    }
+
+    /// The ring's outcomes no answered load report has carried yet.
+    pub fn unreported_maintenance_outcomes(&self) -> Vec<manager_rpc::MaintenanceOutcome> {
+        let r = self.maintenance_outcomes.lock();
+        let pushed = self.outcomes_pushed.load(Relaxed);
+        let unreported = pushed.saturating_sub(self.outcomes_reported.load(Relaxed)) as usize;
+        r.iter().skip(r.len().saturating_sub(unreported)).cloned().collect()
+    }
+
+    pub fn mark_outcomes_reported(&self, through: u64) {
+        self.outcomes_reported.fetch_max(through, Relaxed);
     }
 }
 

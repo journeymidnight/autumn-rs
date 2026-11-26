@@ -4,7 +4,9 @@
 //! cancels nothing: the split can still commit. Such an op stays RUNNING in
 //! `unknown_splits` until a fact ends it:
 //! - the commit (`handle_multi_modify_split` names the op) → SUCCEEDED;
-//! - the PS's failure on the load report (`reconcile_outcome`) → FAILED;
+//! - the PS's failure on the load report (`reconcile_outcome`) → FAILED; one
+//!   that arrived while a commit was in flight (the reply, or a report the
+//!   handler held back) ends the op with the PS's reason once no commit is;
 //! - the partition reopened (its owner epoch moved), so the split can no
 //!   longer pass `ensure_owner_epoch` → FAILED;
 //! - no load report has named the op for `SPLIT_SILENCE_SECS` (the request
@@ -38,6 +40,9 @@ pub(crate) struct UnknownSplit {
     /// `partition/<id>` epoch when the split was dispatched; `None` = no owner.
     pub owner_epoch: Option<i64>,
     pub last_heard_s: i64,
+    /// The PS's own failure, held while a commit for the partition was in
+    /// flight.
+    pub ps_failure: Option<String>,
 }
 
 pub(crate) fn owner_epoch_of(state: &crate::store::MetadataState, part_id: u64) -> Option<i64> {
@@ -57,23 +62,43 @@ impl AutumnManager {
         part_id: u64,
         owner_epoch: Option<i64>,
         why: &str,
+        ps_failure: Option<String>,
         now_s: i64,
     ) -> Option<String> {
         if !self.ops.borrow().is_active_op(op_id) {
             return None;
         }
+        // A failure the PS reported first (`hold_split_failure`) is kept.
+        let held = self.unknown_splits.borrow_mut().remove(&op_id).and_then(|u| u.ps_failure);
         self.unknown_splits.borrow_mut().insert(
             op_id,
             UnknownSplit {
                 part_id,
                 owner_epoch,
                 last_heard_s: now_s,
+                ps_failure: ps_failure.or(held),
             },
         );
         Some(format!(
             "outcome unknown ({why}); waiting for the split to commit, fail, or go \
              unreported for {SPLIT_SILENCE_SECS} s"
         ))
+    }
+
+    /// The PS reported `op_id` (on `part_id`) failed while a commit for the
+    /// partition was in flight; the op ends with `error` once none is. The
+    /// report can come before the manager stops waiting for the reply, so the
+    /// op becomes an unknown split here if it is not one yet.
+    pub(crate) fn hold_split_failure(&self, op_id: u64, part_id: u64, error: String, now_s: i64) {
+        if !self.ops.borrow().is_active_op(op_id) {
+            return;
+        }
+        let owner_epoch = owner_epoch_of(&self.store.inner.borrow(), part_id);
+        self.unknown_splits
+            .borrow_mut()
+            .entry(op_id)
+            .or_insert(UnknownSplit { part_id, owner_epoch, last_heard_s: now_s, ps_failure: None })
+            .ps_failure = Some(error);
     }
 
     /// A load report named the op (its phase or its outcome).
@@ -119,6 +144,8 @@ impl AutumnManager {
                 if !ops.is_active_op(op_id) {
                     ended.push((op_id, None));
                 } else if committing.contains(&u.part_id) {
+                } else if let Some(f) = &u.ps_failure {
+                    ended.push((op_id, Some(f.clone())));
                 } else if owner_epoch_of(&state, u.part_id) != u.owner_epoch {
                     ended.push((
                         op_id,
@@ -214,7 +241,7 @@ mod tests {
             .submit(OP_KIND_SPLIT, part_id, 0, vec![], "test".into(), 0, 0);
         m.ops.borrow_mut().set_running(op_id, now);
         assert!(m
-            .split_outcome_unknown(op_id, part_id, Some(epoch), "RPC timed out", now)
+            .split_outcome_unknown(op_id, part_id, Some(epoch), "RPC timed out", None, now)
             .is_some());
         op_id
     }
@@ -305,5 +332,73 @@ mod tests {
         m.split_inflight.borrow_mut().remove(&5);
         run(m.handle_report_partition_load(report())).unwrap();
         assert_eq!(state(&m, op), OP_STATE_FAILED);
+    }
+
+    /// The PS reported the failure once, while the commit was in flight, and
+    /// then reopened the partition: the op ends with the PS's reason.
+    #[test]
+    fn a_split_failure_held_behind_a_commit_ends_the_op_with_the_ps_reason() {
+        let m = AutumnManager::new();
+        let op = unknown_split(&m, 5, 7, 100);
+        m.split_inflight.borrow_mut().insert(5);
+        run(m.handle_report_partition_load(rkyv_encode(&ReportPartitionLoadReq {
+            ps_id: 1,
+            partitions: vec![PartitionLoad {
+                part_id: 5,
+                maintenance_outcomes: vec![MaintenanceOutcome {
+                    op_id: op,
+                    kind: OP_KIND_SPLIT,
+                    state: OP_STATE_FAILED,
+                    error: "gave up waiting on the commit".into(),
+                    message: String::new(),
+                    finished_at: 0,
+                }],
+                ..Default::default()
+            }],
+        })))
+        .unwrap();
+        m.store
+            .inner
+            .borrow_mut()
+            .owner_epochs
+            .insert("partition/5".into(), 8);
+        m.split_inflight.borrow_mut().remove(&5);
+        run(m.reconcile_unknown_splits(101));
+        let rec = m.ops.borrow().record(op).unwrap();
+        assert_eq!(rec.state, OP_STATE_FAILED);
+        assert_eq!(rec.error, "gave up waiting on the commit");
+    }
+
+    /// The failure report came while the manager still waited for the reply;
+    /// the reply then timed out. The op still ends with the PS's reason.
+    #[test]
+    fn a_split_failure_reported_before_the_reply_timed_out_keeps_the_ps_reason() {
+        let m = AutumnManager::new();
+        m.store.inner.borrow_mut().owner_epochs.insert("partition/5".into(), 7);
+        let (op, _) = m.ops.borrow_mut().submit(OP_KIND_SPLIT, 5, 0, vec![], "test".into(), 0, 0);
+        m.ops.borrow_mut().set_running(op, 100);
+        m.split_inflight.borrow_mut().insert(5);
+        m.hold_split_failure(op, 5, "gave up waiting on the commit".into(), 100);
+        assert!(m.split_outcome_unknown(op, 5, Some(7), "RPC timed out", None, 101).is_some());
+        m.store.inner.borrow_mut().owner_epochs.insert("partition/5".into(), 8);
+        m.split_inflight.borrow_mut().remove(&5);
+        run(m.reconcile_unknown_splits(102));
+        let rec = m.ops.borrow().record(op).unwrap();
+        assert_eq!(rec.state, OP_STATE_FAILED);
+        assert_eq!(rec.error, "gave up waiting on the commit");
+    }
+
+    /// A load report reaches only the leader's op ledger.
+    #[test]
+    fn a_load_report_to_a_standby_is_refused() {
+        let m = AutumnManager::new();
+        m.leader.set(false);
+        let resp = run(m.handle_report_partition_load(rkyv_encode(&ReportPartitionLoadReq {
+            ps_id: 1,
+            partitions: vec![],
+        })))
+        .unwrap();
+        let r: CodeResp = rkyv_decode(&resp).unwrap();
+        assert_eq!(r.code, autumn_rpc::manager_rpc::CODE_NOT_LEADER);
     }
 }

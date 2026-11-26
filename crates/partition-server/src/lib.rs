@@ -733,7 +733,9 @@ const OP_PUT: u8 = 1;
 /// Record op of a delete (the low bits; `OP_VALUE_POINTER` is a flag above).
 const OP_TOMBSTONE: u8 = 2;
 
-/// backstop TTL for a merge freeze's write halt. The manager's
+/// backstop TTL for a freeze's write halt. A split freeze held this long (a
+/// wedged split handler) poisons the partition (`check_freeze_ttls`). For a
+/// merge freeze: the manager's
 /// merge orchestrator (`handle_merge_partitions`) commits in <1 s on the
 /// happy path and explicitly unfreezes on rollback. This TTL fires only
 /// when the orchestrator crashed mid-flow before either committing the
@@ -1295,8 +1297,9 @@ pub(crate) struct PartitionData {
     /// past sealed_length and were invisible on recovery.
     pub(crate) frozen_for_split: Cell<Option<std::time::Instant>>,
     /// A split handler is running on this partition, from its first line to
-    /// its return. A second split is refused at once instead of queueing on
-    /// the maintenance gate and cutting the partition again after the first.
+    /// its return, or a split failed and the partition awaits its poison. A
+    /// second split is refused at once instead of queueing on the maintenance
+    /// gate and cutting the partition again after the first.
     pub(crate) split_pending: Cell<bool>,
     /// internal oneshot signal from `partition_loop` to
     /// the spawned `handle_split_part` task — fired after drain completes.
@@ -1816,7 +1819,7 @@ pub(crate) struct RowAppendReq {
 ///
 /// Step (c) is BEFORE the manager seal (step d) so a barrier failure
 /// (send timeout / ACK timeout / dropped channel) is cleanly abortable —
-/// the manager has not yet committed, so unfreezing + returning Err
+/// the manager has not yet committed, so poisoning + returning Err
 /// leaves the cluster in a coherent pre-split state. Putting the
 /// barrier AFTER the seal would create an unrecoverable window: manager
 /// committed + local state not converged + freeze about to be cleared.
@@ -2656,6 +2659,11 @@ pub struct PartitionServer {
     /// until `retry_after` (exponential backoff, capped); cleared on a
     /// successful open and pruned for partitions no longer assigned.
     open_backoff: Rc<RefCell<HashMap<u64, OpenBackoff>>>,
+    /// Maintenance outcomes no load report had carried when the partition's
+    /// handle was dropped for a reload (a poisoned split whose manager did not
+    /// answer, a region change), handed to its next open so the next report
+    /// carries them; pruned with `open_backoff`.
+    carried_outcomes: Rc<RefCell<HashMap<u64, Vec<manager_rpc::MaintenanceOutcome>>>>,
     /// SST block cache for every partition this PS opens. Per-PS, not
     /// process-global: its keys `(extent_id, offset)` are unique only within
     /// one cluster, and one PS serves exactly one cluster.
@@ -3589,6 +3597,7 @@ impl PartitionServer {
                             plog_load: plog_load.clone(),
                             authz: std::sync::Arc::new(crate::authz::AuthzState::new()),
                             open_backoff: Rc::new(RefCell::new(HashMap::new())),
+                            carried_outcomes: Rc::new(RefCell::new(HashMap::new())),
                             block_cache: block_cache.clone(),
                             mem_tier: mem_tier.clone(),
                             metrics: std::sync::Arc::new(metrics::PsMetrics::new(
@@ -3926,6 +3935,9 @@ impl PartitionServer {
         let mut last_bytes: HashMap<u64, (u64, u64)> = HashMap::new();
         loop {
             ticker.tick().await;
+            // Each partition's metrics and the number of the last outcome the
+            // report carries, marked reported once the manager answers.
+            let mut carried: Vec<(std::sync::Arc<PartitionMetrics>, u64)> = Vec::new();
             let snapshots: Vec<manager_rpc::PartitionLoad> = {
                 let parts = self.partitions.borrow();
                 last_bytes.retain(|id, _| parts.contains_key(id));
@@ -3942,6 +3954,9 @@ impl PartitionServer {
                         let since = |now: u64, prev: u64| if now >= prev { now - prev } else { now };
                         let write_bytes = since(now_bytes.0, prev.0);
                         let read_bytes = since(now_bytes.1, prev.1);
+                        let (maintenance_outcomes, outcomes_through) =
+                            handle.metrics.snapshot_maintenance_outcomes_numbered();
+                        carried.push((handle.metrics.clone(), outcomes_through));
                         let imm_full = handle.metrics.imm_full_count.swap(0, Relaxed);
                         let size_bytes = handle.metrics.size_bytes.load(Relaxed);
                         // maintenance debt + inflight + last-run timestamps.
@@ -3998,9 +4013,7 @@ impl PartitionServer {
                             open_tail_dead_bytes,
                             has_overlap,
                             unsettled_deletes,
-                            maintenance_outcomes: handle
-                                .metrics
-                                .snapshot_maintenance_outcomes(),
+                            maintenance_outcomes,
                             active_maintenance: handle
                                 .metrics
                                 .snapshot_maintenance_progress(),
@@ -4019,7 +4032,7 @@ impl PartitionServer {
             // hung manager doesn't keep the report task alive past
             // the next interval; missed report is benign (manager
             // policy degrades gracefully on stale data).
-            if let Err(e) = self
+            match self
                 .pool
                 .call_timeout(
                     self.manager_addr(),
@@ -4029,7 +4042,20 @@ impl PartitionServer {
                 )
                 .await
             {
-                tracing::debug!("report_load failed: {e}");
+                Ok(resp) => match manager_rpc::rkyv_decode::<manager_rpc::CodeResp>(&resp) {
+                    Ok(r) if r.code == manager_rpc::CODE_OK => {
+                        for (metrics, through) in carried {
+                            metrics.mark_outcomes_reported(through);
+                        }
+                    }
+                    // Not the leader: the heartbeat loop finds the leader, and
+                    // the next report goes there. Rotating here too would move
+                    // the shared pointer off the one manager still routing
+                    // during an etcd outage.
+                    Ok(r) => tracing::debug!("report_load refused: {}", r.message),
+                    Err(e) => tracing::debug!("report_load reply: {e}"),
+                },
+                Err(e) => tracing::debug!("report_load failed: {e}"),
             }
         }
     }
@@ -4286,7 +4312,13 @@ impl PartitionServer {
                     "PS {} reloading partition {part_id} due to region change",
                     self.ps_id
                 );
-                self.partitions.borrow_mut().remove(&part_id);
+                let dropped = self.partitions.borrow_mut().remove(&part_id);
+                if let Some(h) = dropped {
+                    let outcomes = h.metrics.unreported_maintenance_outcomes();
+                    if !outcomes.is_empty() {
+                        self.carried_outcomes.borrow_mut().insert(part_id, outcomes);
+                    }
+                }
             }
         }
 
@@ -4377,6 +4409,9 @@ impl PartitionServer {
                 match result {
                     Ok(handle) => {
                         tracing::info!("PS {} partition {part_id} opened", self.ps_id);
+                        for o in self.carried_outcomes.borrow_mut().remove(&part_id).unwrap_or_default() {
+                            handle.metrics.push_maintenance_outcome(o);
+                        }
                         self.partitions.borrow_mut().insert(part_id, handle);
                         // Open succeeded — clear any backoff state.
                         self.open_backoff.borrow_mut().remove(&part_id);
@@ -4408,6 +4443,20 @@ impl PartitionServer {
         self.open_backoff
             .borrow_mut()
             .retain(|pid, _| wanted_ids.contains(pid));
+        self.carried_outcomes.borrow_mut().retain(|pid, outcomes| {
+            let keep = wanted_ids.contains(pid);
+            if !keep {
+                for o in outcomes.iter() {
+                    tracing::warn!(
+                        part_id = pid,
+                        op_id = o.op_id,
+                        error = %o.error,
+                        "partition left this PS before its maintenance outcome was reported"
+                    );
+                }
+            }
+            keep
+        });
 
         // part_addr self-heal: the manager's `part_addrs` map is
         // in-memory only — a manager restart loses it, and an
@@ -7677,9 +7726,9 @@ async fn partition_loop(
             }
         }
 
-        // TTL backstops for merge/split freeze (orchestrator
-        // crash / wedged split handler): auto-unfreeze past FREEZE_TTL.
-        check_freeze_ttls(&part, part_id);
+        // TTL backstops for merge/split freeze (orchestrator crash / wedged
+        // split handler): a merge freeze ends, a split freeze poisons.
+        check_freeze_ttls(&part, part_id, &poisoned);
     }
 
     // Shutdown: drain in-flight batches, flush residual pending, then (if the
@@ -8207,9 +8256,11 @@ fn split_blocks_merge_freeze(frozen_for_split: bool, split_drain_pending: bool) 
 
 /// freeze TTL backstops (extracted from `partition_loop`). If a
 /// merge/split freeze has been held past `FREEZE_TTL` (orchestrator crashed or
-/// the split handler wedged), auto-unfreeze and fail any parked ack so the
-/// partition resumes serving writes.
-fn check_freeze_ttls(part: &Rc<RefCell<PartitionData>>, part_id: u64) {
+/// the split handler wedged): a merge freeze ends and the partition serves
+/// again; a split freeze fails any parked drain ack and poisons the partition,
+/// which stays frozen — the split may still commit at the manager, and writes
+/// on the tails it sealed would be lost.
+fn check_freeze_ttls(part: &Rc<RefCell<PartitionData>>, part_id: u64, poisoned: &Rc<Cell<bool>>) {
     if let Some(at) = part.borrow().merge_freeze.halted_since() {
         if at.elapsed() >= FREEZE_TTL {
             part.borrow().merge_freeze.end();
@@ -8220,18 +8271,14 @@ fn check_freeze_ttls(part: &Rc<RefCell<PartitionData>>, part_id: u64) {
             );
         }
     }
-    if let Some(at) = part.borrow().frozen_for_split.get() {
-        if at.elapsed() >= FREEZE_TTL {
-            let p = part.borrow();
-            p.frozen_for_split.set(None);
-            if let Some(ack) = p.split_drain_ack.borrow_mut().take() {
-                let _ = ack.send(Err("split freeze TTL expired (handler wedged)".to_string()));
+    let split_frozen_at = part.borrow().frozen_for_split.get();
+    if let Some(at) = split_frozen_at {
+        if at.elapsed() >= FREEZE_TTL && !poisoned.get() {
+            if let Some(ack) = part.borrow().split_drain_ack.borrow_mut().take() {
+                let _ = ack.send(Err("split freeze TTL expired".to_string()));
             }
-            tracing::warn!(
-                part_id,
-                ttl_secs = FREEZE_TTL.as_secs(),
-                "split freeze TTL expired — auto-unfreeze"
-            );
+            tracing::warn!(part_id, ttl_secs = FREEZE_TTL.as_secs(), "split freeze TTL expired");
+            poison_partition(part, poisoned, "split freeze TTL expired");
         }
     }
 }
@@ -8663,12 +8710,28 @@ async fn handle_incoming_req(
         MSG_SPLIT_PART => {
             let part_c = part.clone();
             let part_sc_c = routing.part_sc.clone();
+            let poisoned_c = poisoned.clone();
             let payload = req.payload;
             let resp_tx = req.resp_tx;
             compio::runtime::spawn(async move {
-                let result =
+                let (result, after) =
                     crate::rpc_handlers::handle_split_part(payload, &part_c, &part_sc_c).await;
                 let _ = resp_tx.send(result);
+                if after.poison {
+                    // Still frozen. The poison waits until a load report carried
+                    // the failure: a partition exiting at once takes its reason
+                    // along, and the manager then records only that it reopened.
+                    if let Some(n) = after.outcome {
+                        let metrics = part_c.borrow().metrics.clone();
+                        let deadline = Instant::now() + SPLIT_OUTCOME_REPORT_WAIT;
+                        while !metrics.outcome_reported(n) && Instant::now() < deadline {
+                            compio::time::sleep(Duration::from_millis(100)).await;
+                        }
+                    }
+                    if !poisoned_c.get() {
+                        poison_partition(&part_c, &poisoned_c, "a split that froze writes failed");
+                    }
+                }
             })
             .detach();
         }
@@ -11268,6 +11331,28 @@ fn flush_retry_backoff() -> Duration {
 /// evidence lives in the client's socket queue — so it reports itself.
 const STUCK_INFLIGHT_REPORT_EVERY: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// A load report every 5 s, answered within its 10 s timeout.
+const SPLIT_OUTCOME_REPORT_WAIT: Duration = Duration::from_secs(15);
+
+/// Poison the partition: `partition_loop` exits at its next iteration and
+/// region sync reopens it from the manager's region map. Fires both wake
+/// channels: the imm-full park listens on imm_drained_rx, the fully idle
+/// select only on req_rx / split_wake_rx / drain_rx.
+fn poison_partition(part: &Rc<RefCell<PartitionData>>, poisoned: &Rc<Cell<bool>>, why: &str) {
+    tracing::error!("{why} — poisoning partition for a reopen");
+    set_poisoned(part, poisoned);
+}
+
+fn set_poisoned(part: &Rc<RefCell<PartitionData>>, poisoned: &Rc<Cell<bool>>) {
+    poisoned.set(true);
+    let (imm_tx, wake_tx) = {
+        let p = part.borrow();
+        (p.imm_drained_tx.clone(), p.split_wake_tx.clone())
+    };
+    let _ = imm_tx.unbounded_send(());
+    let _ = wake_tx.unbounded_send(());
+}
+
 /// poison the partition after a FENCE rejection (LockedByOther) in the
 /// flush path, and WAKE the (possibly imm-full-parked) `partition_loop` via
 /// the imm-drained channel so it observes the flag and exits — a parked loop
@@ -11283,19 +11368,7 @@ fn poison_for_fence(
     site: &str,
 ) {
     tracing::error!("{site} fenced (LockedByOther) — poisoning partition for fresh-epoch reopen");
-    poisoned.set(true);
-    // Fire BOTH wake channels: the imm-full park listens on
-    // imm_drained_rx, but the fully-idle select listens only on
-    // req_rx / split_wake_rx / drain_rx — without the split-wake an idle
-    // partition would sleep through the poison until the next request.
-    // Every loop iteration re-checks `poisoned` at the top, so
-    // either wake suffices once it lands in the right state.
-    let (imm_tx, wake_tx) = {
-        let p = part.borrow();
-        (p.imm_drained_tx.clone(), p.split_wake_tx.clone())
-    };
-    let _ = imm_tx.unbounded_send(());
-    let _ = wake_tx.unbounded_send(());
+    set_poisoned(part, poisoned);
 }
 
 async fn background_flush_loop(

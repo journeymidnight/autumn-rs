@@ -6479,10 +6479,9 @@ impl StreamClient {
             op_id,
         });
         // Per-call timeout is caller-chosen (#6): the PS split path bounds it
-        // SHORT so the whole freeze critical section stays under FREEZE_TTL —
-        // a split that committed AFTER the freeze lapsed would seal the
-        // log_stream at a stale commit_length and lose the writes that resumed
-        // post-unfreeze. The manager runs the split's atomic etcd txn (alloc 4
+        // SHORT so the whole freeze critical section stays under FREEZE_TTL,
+        // past which the PS poisons the partition. The manager runs the
+        // split's atomic etcd txn (alloc 4
         // ids + duplicate 3 streams + create partition + update regions +
         // last_op_at sidecar).
         let resp_data = self

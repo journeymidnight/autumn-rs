@@ -999,9 +999,27 @@ split while it runs:
 "${AO[@]}" ops status <ID>                   # succeeded once the conversion lands
 ```
 If an EC conversion or rebuild still starts after the wait, the split's PS
-aborts its commit at once and unfreezes (`failed … ec conversion in flight on
-extent N; retry split`) instead of holding writes frozen for ~20 s. The
-automated form is `cargo test -p autumn-manager --test topology_waits_for_extent_ops`.
+aborts its commit at once (`failed … ec conversion in flight on extent N; retry
+split`) instead of holding writes frozen for ~20 s; the partition reopens, as
+after any failed split (below). The automated form is `cargo test -p
+autumn-manager --test topology_waits_for_extent_ops`.
+
+**A failed split reopens its partition.** Once a split has frozen writes, any
+failure — the manager refusing it, its reply lost or late, a drain or barrier
+failure, the freeze held past its 30 s TTL — keeps the partition frozen until
+the PS's load report has carried the failure to the manager (at most 15 s), then
+closes it (PS log `... — poisoning partition for a reopen`, then `partition
+poisoned, shutting down for a reopen`); the next region sync (~2 s) reopens it
+from the manager's layout, split or not. Meanwhile writes to it fail (refused
+while frozen, then the connection closes) and clients retry. `autumn-op ops
+status` shows the PS's reason. Verify:
+
+```bash
+cargo nextest run -p autumn-manager --test split_lost_reply_unfreeze --test split_op_outcome
+#   writes_acked_after_a_split_whose_reply_was_lost_survive_a_reopen  PASS
+#   the_ps_reopens_a_partition_whose_split_reply_was_lost              PASS
+#   a_split_failing_after_its_reply_timeout_reports_the_ps_reason     PASS
+```
 
 Samples arrive on the 5 s heartbeat, so a split that finishes in under ~5 s may
 show no intermediate phase at all — that is not a fault.

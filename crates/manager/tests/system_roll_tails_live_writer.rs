@@ -387,19 +387,31 @@ fn in_flight_roll_racing_split_commit_child_still_opens() {
             Err(_) => false,
         };
         if !first_committed {
-            let resp = ps
-                .call(
-                    partition_rpc::MSG_SPLIT_PART,
-                    partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq {
-                        part_id,
-                        at_key: Some(b"m".to_vec()),
-                        op_id: 0,
-                    }),
-                )
-                .await
-                .expect("split retry rpc");
-            let sr: partition_rpc::SplitPartResp =
-                partition_rpc::rkyv_decode(&resp).expect("decode SplitPartResp");
+            // The refused split poisoned the partition; retry once it reopened.
+            let router = PsRouter::new(mgr_addr, ps_addr);
+            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            let sr = loop {
+                let attempt = match router.try_client_for(part_id).await {
+                    Ok(c) => c
+                        .call(
+                            partition_rpc::MSG_SPLIT_PART,
+                            partition_rpc::rkyv_encode(&partition_rpc::SplitPartReq {
+                                part_id,
+                                at_key: Some(b"m".to_vec()),
+                                op_id: 0,
+                            }),
+                        )
+                        .await
+                        .ok(),
+                    Err(_) => None,
+                };
+                if let Some(resp) = attempt {
+                    break partition_rpc::rkyv_decode::<partition_rpc::SplitPartResp>(&resp)
+                        .expect("decode SplitPartResp");
+                }
+                assert!(std::time::Instant::now() < deadline, "the partition never reopened for the split retry");
+                compio::time::sleep(Duration::from_millis(250)).await;
+            };
             assert_eq!(
                 sr.code,
                 partition_rpc::CODE_OK,

@@ -580,8 +580,9 @@ split or merge of a held partition is refused at once. Holding recovery is
 what lets the wait end; the cap bounds how long repairs wait.
 
 A marker acquired across its etcd await can still slip in: a split's commit
-then refuses `... in flight on extent N`, which the PS treats as final and
-unfreezes at once; a merge's single commit attempt rolls back. Tests:
+then refuses `... in flight on extent N`, which ends the PS's split at once
+(the partition reopens, as after any failed split: partition-server
+CLAUDE.md, "Partition Split"); a merge's single commit attempt rolls back. Tests:
 `topology_gate::tests`, `force_ec_target_tests::a_split_being_dispatched_holds_the_conversion_back`,
 `tests/topology_waits_for_extent_ops.rs` (split and merge wait with writes
 flowing; a marker at commit ends the split within 5 s; ablations: no wait, no
@@ -2073,12 +2074,23 @@ failure reason the fire-and-forget maintenance ops used to drop.
   `split_inflight` holds the partition — a PS that gave up waiting on a slow
   commit reports FAILED (and its reply says so) while that commit may still
   land, so the actuation treats such a reply as unknown and the heartbeat
-  defers the report until the commit attempt is over. Whoever ends the op
+  holds the report back; either way the PS's failure is kept on the unknown
+  split (`ps_failure`, `hold_split_failure`) and ends the op with the PS's
+  reason once no commit is in flight, ahead of the owner-epoch verdict (the
+  PS reports a failed split once, then reopens the partition, which moves the
+  epoch). A load report reaches only the leader: a standby answers it
+  `CODE_NOT_LEADER` (the PS's heartbeat loop moves it to the leader), so an
+  outcome is not marked reported on a ledger that will not keep it. A failure
+  reported before the manager stopped waiting for the reply makes the op an
+  unknown split there and then; the reply's timeout keeps it. Whoever ends the op
   audits it (`finish` returns whether this call ended it). Leader-local like
   the ledger: after a failover the id is unknown and a late commit is accepted.
   Tests: `tests/split_op_outcome.rs` (commit after the timeout → SUCCEEDED and
   a retry attaches; failure after the timeout → the PS's reason; second split
-  refused at entry) and `split_op::tests`.
+  refused at entry) and `split_op::tests`
+  (`a_split_failure_held_behind_a_commit_ends_the_op_with_the_ps_reason`,
+  `a_split_failure_reported_before_the_reply_timed_out_keeps_the_ps_reason`,
+  `a_load_report_to_a_standby_is_refused`).
 - **`--wait`** is a pure client-side poll over `MSG_OP_QUERY` — one execution
   path, no divergent sync/async behavior. `MSG_OP_SUBMIT` is leader- + admin-gated
   (`is_admin_mgr_msg`); `MSG_OP_QUERY` is leader-gated (a follower's ledger is

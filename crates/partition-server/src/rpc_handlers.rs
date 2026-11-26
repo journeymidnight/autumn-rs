@@ -6,7 +6,7 @@
 //! low-frequency control ops (SPLIT_PART, MAINTENANCE) are handled here.
 
 use autumn_stream::client::ReadDescriptor;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -1437,16 +1437,14 @@ const SPLIT_PHASES: u64 = 6;
 
 /// #6: per-attempt timeout for `multi_modify_split` in the split path. SHORT
 /// (vs the StreamClient default) so the freeze critical section stays under
-/// FREEZE_TTL — a split that COMMITS after the freeze lapsed seals the
-/// log_stream at a stale commit_length and loses the writes that resumed
-/// post-unfreeze.
+/// FREEZE_TTL, past which the partition is poisoned and the split fails.
 const SPLIT_CALL_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// #6: stop launching split attempts once the freeze has been held this long.
 /// A call launched at the deadline still completes/commits within
 /// `deadline + SPLIT_CALL_TIMEOUT` < FREEZE_TTL (2 s margin), so any in-flight
-/// manager commit lands while the partition is STILL frozen — never after the
-/// freeze could have lapsed. Pure for unit-testing the budget invariant.
+/// manager commit lands before FREEZE_TTL poisons the partition. Pure for
+/// unit-testing the budget invariant.
 fn split_freeze_deadline(freeze_ttl: Duration, call_timeout: Duration) -> Duration {
     freeze_ttl
         .saturating_sub(call_timeout)
@@ -1464,13 +1462,25 @@ fn hex_str(bytes: &[u8]) -> String {
     s
 }
 
+/// What a split leaves behind besides its reply: whether it froze the
+/// partition and did not finish (so it must be poisoned), and the number of
+/// the failure outcome it pushed for the load report.
+#[derive(Default)]
+pub(crate) struct SplitAftermath {
+    pub poison: bool,
+    pub outcome: Option<u64>,
+}
+
 pub(crate) async fn handle_split_part(
     payload: Bytes,
     part: &Rc<RefCell<PartitionData>>,
     part_sc: &Rc<StreamClient>,
-) -> HandlerResult {
-    let req: SplitPartReq =
-        partition_rpc::rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+) -> (HandlerResult, SplitAftermath) {
+    let req: SplitPartReq = match partition_rpc::rkyv_decode(&payload) {
+        Ok(r) => r,
+        Err(e) => return (Err((StatusCode::InvalidArgument, e)), SplitAftermath::default()),
+    };
+    let poison = Cell::new(false);
     // Refused here, not on the maintenance gate: a queued second split would
     // run after the first committed and cut the partition again.
     let result = if part.borrow().split_pending.replace(true) {
@@ -1479,15 +1489,19 @@ pub(crate) async fn handle_split_part(
             "split already in progress on this partition".to_string(),
         ))
     } else {
-        let r = split_part(&req, part, part_sc).await;
-        part.borrow().split_pending.set(false);
+        let r = split_part(&req, part, part_sc, &poison).await;
+        // A partition about to be poisoned takes no second split.
+        if !poison.get() {
+            part.borrow().split_pending.set(false);
+        }
         r
     };
     // A submitted split's failure also travels on the load report: the
     // manager may have stopped waiting for this reply. Success needs no
     // report — the manager closes the op when it commits the split.
+    let mut outcome = None;
     if let (Err((_, error)), true) = (&result, req.op_id != 0) {
-        part.borrow()
+        outcome = Some(part.borrow()
             .metrics
             .push_maintenance_outcome(manager_rpc::MaintenanceOutcome {
                 op_id: req.op_id,
@@ -1499,15 +1513,21 @@ pub(crate) async fn handle_split_part(
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs() as i64)
                     .unwrap_or(0),
-            });
+            }));
     }
-    result
+    (result, SplitAftermath { poison: poison.get(), outcome })
 }
 
+/// `poisoned` is set by every exit after the freeze except success: the
+/// partition stays frozen and is poisoned once the reply and the outcome are
+/// out (`SplitAftermath`), and region sync reopens it from the manager's
+/// layout, split or not. Unfrozen, it would keep serving the old range on
+/// tails a split that did commit has already sealed.
 async fn split_part(
     req: &SplitPartReq,
     part: &Rc<RefCell<PartitionData>>,
     part_sc: &Rc<StreamClient>,
+    poisoned: &Cell<bool>,
 ) -> HandlerResult {
     if part.borrow().has_overlap.get() != 0 {
         return Err((
@@ -1537,7 +1557,7 @@ async fn split_part(
             p.maintenance_gate.clone(),
             p.concurrency_ctrl.clone(),
             // Owns an Arc and clears the slot on drop, so every exit below —
-            // the three `?` through `unfreeze_on_err`, both barrier timeouts,
+            // the three `?` through `poison_on_err`, both barrier timeouts,
             // the TTL aborts — is covered without a list that goes stale.
             crate::MaintenancePhaseGuard::new(p.metrics.clone(), req.op_id),
         )
@@ -1683,6 +1703,7 @@ async fn split_part(
     // A second split on this partition was refused at entry
     // (`split_pending`), so only a merge freeze can be in the way here.
     let (drain_tx, drain_rx) = futures::channel::oneshot::channel::<Result<(), String>>();
+    let freeze_at = std::time::Instant::now();
     {
         let p = part.borrow();
         // A merge freeze still waiting for the gate counts too: it is next.
@@ -1695,7 +1716,7 @@ async fn split_part(
         // Writes stop on this line and do not resume until the end of the
         // function — the window an operator most needs narrated.
         phase.set(manager_rpc::OP_KIND_SPLIT, 2, SPLIT_PHASES);
-        p.frozen_for_split.set(Some(std::time::Instant::now()));
+        p.frozen_for_split.set(Some(freeze_at));
         *p.split_drain_ack.borrow_mut() = Some(drain_tx);
         // fix — wake partition_loop so its idle-path
         // select observes that split_drain_ack just transitioned to
@@ -1707,8 +1728,8 @@ async fn split_part(
     }
 
     // Await drain. On TTL-driven backstop, drain_rx receives
-    // Err(message). On flush failure, same Err path. Either way we
-    // unfreeze and propagate.
+    // Err(message). On flush failure, same Err path. Either way the
+    // partition is poisoned and the error propagated.
     let drain_outcome = drain_rx.await;
     match drain_outcome {
         Ok(Ok(())) => {
@@ -1718,14 +1739,14 @@ async fn split_part(
             phase.set(manager_rpc::OP_KIND_SPLIT, 3, SPLIT_PHASES);
         }
         Ok(Err(msg)) => {
-            // Drain hit a flush failure or TTL. Clean up.
-            part.borrow().frozen_for_split.set(None);
+            // Drain hit a flush failure or the TTL.
+            poisoned.set(true);
             return Err((StatusCode::Internal, format!("split drain failed: {msg}")));
         }
         Err(_) => {
             // Sender dropped without sending — shouldn't happen under
             // single-threaded compio, but defensive.
-            part.borrow().frozen_for_split.set(None);
+            poisoned.set(true);
             return Err((
                 StatusCode::Internal,
                 "split drain ack sender dropped without signaling".to_string(),
@@ -1751,10 +1772,9 @@ async fn split_part(
     //
     // Returning `FailedPrecondition` lets the client retry the split
     // once the cluster is healthy enough that all-replica commit_length
-    // succeeds. The split path already unfreezes on the error return below, so
-    // the partition resumes serving writes during the retry gap.
-    let unfreeze_on_err = |e: anyhow::Error, what: &str| {
-        part.borrow().frozen_for_split.set(None);
+    // succeeds; the partition is poisoned and reopens meanwhile.
+    let poison_on_err = |e: anyhow::Error, what: &str| {
+        poisoned.set(true);
         (
             StatusCode::FailedPrecondition,
             format!("split aborted: {what} commit_length failed: {e}"),
@@ -1782,15 +1802,15 @@ async fn split_part(
     let (log_end, log_tail_eid) = part_sc
         .commit_length_with_tail(log_stream_id)
         .await
-        .map_err(|e| unfreeze_on_err(e, "log_stream"))?;
+        .map_err(|e| poison_on_err(e, "log_stream"))?;
     let (row_end, row_tail_eid) = part_sc
         .commit_length_with_tail(row_stream_id)
         .await
-        .map_err(|e| unfreeze_on_err(e, "row_stream"))?;
+        .map_err(|e| poison_on_err(e, "row_stream"))?;
     let (meta_end, meta_tail_eid) = part_sc
         .commit_length_with_tail(meta_stream_id)
         .await
-        .map_err(|e| unfreeze_on_err(e, "meta_stream"))?;
+        .map_err(|e| poison_on_err(e, "meta_stream"))?;
     phase.set(manager_rpc::OP_KIND_SPLIT, 4, SPLIT_PHASES);
     {
         let p = part.borrow();
@@ -1816,8 +1836,8 @@ async fn split_part(
 
     // synchronous P-log → P-sst barrier. Sent BEFORE
     // `multi_modify_split` so that any failure here is cleanly abortable:
-    // the manager has not yet sealed the row_stream tail, so unfreezing
-    // and returning Err leaves the cluster in a coherent pre-split state.
+    // the manager has not yet sealed the row_stream tail, so poisoning and
+    // returning Err leaves the cluster in a coherent pre-split state.
     // Putting the barrier AFTER `multi_modify_split` would create an
     // unrecoverable window — manager-committed seal + local state not
     // converged + freeze cleared.
@@ -1843,16 +1863,10 @@ async fn split_part(
         seal_and_roll: false, // split: manager seals the tail itself; only invalidate here
         resp_tx: inv_resp_tx,
     };
-    // BOTH the send and the ACK await are bounded. `FREEZE_TTL`
-    // (30 s, lib.rs) is the partition's unconditional "the handler is
-    // wedged, unfreeze and resume writes" backstop (see
-    // `check_freeze_ttls`). If EITHER step were unbounded, a wedged
-    // P-sst could block the await past the TTL; `check_freeze_ttls`
-    // would unfreeze, new writes would resume + extend the row_stream
-    // tail past the already-captured `commit_length`, and the eventual
-    // continuation would call `multi_modify_split` with the STALE
-    // `row_end` — manager seals at the pre-TTL length, post-TTL writes
-    // end up above sealed_length, invisible on recovery. The SEND can block independently of the ACK:
+    // BOTH the send and the ACK await are bounded, so the split finishes
+    // inside `FREEZE_TTL` (30 s, lib.rs), past which `check_freeze_ttls`
+    // poisons the partition; a wedged P-sst would otherwise turn every split
+    // into a reopen. The SEND can block independently of the ACK:
     // `row_invalidate_tx` is capacity 1 (shared with major compaction
     // and tail rolls), so a still-queued barrier whose P-sst
     // processing never completed (e.g. permanently-down replica on
@@ -1871,14 +1885,14 @@ async fn split_part(
         match futures::future::select(send_fut, send_timer).await {
             futures::future::Either::Left((Ok(()), _)) => {}
             futures::future::Either::Left((Err(_), _)) => {
-                part.borrow().frozen_for_split.set(None);
+                poisoned.set(true);
                 return Err((
                     StatusCode::Internal,
                     "split: P-sst row_invalidate channel closed".to_string(),
                 ));
             }
             futures::future::Either::Right(_elapsed) => {
-                part.borrow().frozen_for_split.set(None);
+                poisoned.set(true);
                 return Err((
                     StatusCode::FailedPrecondition,
                     format!(
@@ -1895,21 +1909,21 @@ async fn split_part(
     match futures::future::select(inv_resp_rx, ack_timer).await {
         futures::future::Either::Left((Ok(Ok(())), _)) => {}
         futures::future::Either::Left((Ok(Err(e)), _)) => {
-            part.borrow().frozen_for_split.set(None);
+            poisoned.set(true);
             return Err((
                 StatusCode::Internal,
                 format!("split: row barrier failed: {e:#}"),
             ));
         }
         futures::future::Either::Left((Err(_canceled), _)) => {
-            part.borrow().frozen_for_split.set(None);
+            poisoned.set(true);
             return Err((
                 StatusCode::Internal,
                 "split: P-sst row_invalidate ACK dropped (bulk thread aborted)".to_string(),
             ));
         }
         futures::future::Either::Right(_elapsed) => {
-            part.borrow().frozen_for_split.set(None);
+            poisoned.set(true);
             return Err((
                 StatusCode::FailedPrecondition,
                 format!(
@@ -1932,30 +1946,12 @@ async fn split_part(
         }
     }
 
-    // Call multi_modify_split on the manager. #6: the freeze only guarantees a
-    // STABLE commit_length while it is HELD. If `check_freeze_ttls` auto-
-    // unfreezes (this handler exceeded FREEZE_TTL) and a split then commits, it
-    // seals the log_stream at the now-stale `log_end` while writes have resumed
-    // past it → those writes land above sealed_length and are LOST on recovery.
-    // Pre-#6 this looped `for _ in 0..8` with a 30 s per-call timeout (up to ~4
-    // min), trivially blowing past the 30 s TTL. Now: SHORT per-call timeout and
-    // STOP launching once less than one call's budget remains before the TTL, so
-    // any in-flight commit still lands while frozen. Out of budget → ABORT
-    // cleanly (unfreeze + Err); the client retries the whole split when the
-    // cluster is healthier. We NEVER let a split SUCCEED after the freeze could
-    // have lapsed.
-    let freeze_at = match part.borrow().frozen_for_split.get() {
-        Some(t) => t,
-        None => {
-            // check_freeze_ttls already fired (or someone cleared it) before we
-            // reached the commit phase — abort; the captured commit_length is no
-            // longer protected.
-            return Err((
-                StatusCode::FailedPrecondition,
-                "split: freeze lapsed before commit phase; retry".to_string(),
-            ));
-        }
-    };
+    // Call multi_modify_split on the manager, with a SHORT per-call timeout,
+    // and STOP launching once less than one call's budget remains before
+    // FREEZE_TTL (past which `check_freeze_ttls` poisons the partition). Out
+    // of budget → ABORT (poison + Err); the client retries the whole split.
+    // The freeze is never lifted under an unfinished split, so no write is
+    // acked on a tail a late commit sealed.
     let split_deadline = split_freeze_deadline(crate::FREEZE_TTL, SPLIT_CALL_TIMEOUT);
     let mut split_ok = false;
     let mut split_err =
@@ -1963,7 +1959,7 @@ async fn split_part(
     let mut backoff = Duration::from_millis(100);
     loop {
         if freeze_at.elapsed() >= split_deadline {
-            break; // out of freeze budget → abort below (no stale-seal commit)
+            break; // out of freeze budget → abort below
         }
         match part_sc
             .multi_modify_split(
@@ -2017,50 +2013,14 @@ async fn split_part(
     );
 
     if !split_ok {
-        // unfreeze on multi_modify_split failure so the partition
-        // resumes serving writes (client will retry split). Without this
-        // the partition stays frozen until FREEZE_TTL backstop fires.
-        part.borrow().frozen_for_split.set(None);
+        // Any commit-phase failure, a refusal included: an earlier attempt's
+        // reply may have been lost after it committed, and a later refusal
+        // ("already ended", "captured tail moved") does not prove otherwise.
+        // The reopen reads what the manager holds.
+        poisoned.set(true);
         return Err((StatusCode::FailedPrecondition, split_err));
     }
     phase.set(manager_rpc::OP_KIND_SPLIT, 5, SPLIT_PHASES);
-
-    // #6 belt-and-braces behind the deadline-bound prevention: re-verify the
-    // freeze HELD continuously through the commit. If `check_freeze_ttls`
-    // cleared it anyway, the captured commit_length may be stale + writes
-    // resumed → do NOT apply the split locally; surface loudly. region_sync
-    // reconciles the manager's committed split; the client retries.
-    if part.borrow().frozen_for_split.get().is_none() {
-        return Err((
-            StatusCode::FailedPrecondition,
-            "split: freeze TTL lapsed during multi_modify_split — possible stale seal; \
-             aborting local apply, retry"
-                .to_string(),
-        ));
-    }
-    // The stale-seal SILENT write-loss is
-    // STRUCTURALLY PRECLUDED, not merely unreproduced. The loss requires the
-    // manager's `multi_modify_split` etcd commit to LAND (succeed) at a wall-
-    // clock time AFTER this PS auto-unfroze (>= split_deadline = 20 s) and acked
-    // writes past the captured commit_length. But between the PS capturing
-    // commit_length (the call's send) and the manager's commit,
-    // `handle_multi_modify_split` has ONLY bounded awaits, each with a kill-
-    // timeout that turns slowness into FAILURE (Err -> no commit -> no stale
-    // seal), never late success: the main put_msgs_txn (etcd
-    // request_timeout 10 s); Phase-1 compute before it is fully synchronous.
-    // No code path sleeps there — the only way to land a SUCCESSFUL commit after
-    // the freeze window is an injected sleep, which models a stall that no real
-    // component can both incur AND survive (a real stall = timeout = Err =
-    // abort). Attempts to reproduce it instead surfaced a DIFFERENT real bug — a PS retry storm against a slow manager
-    // committing a SEPARATE split per retry (1->6 CASCADE) — now fixed MANAGER-
-    // side by the per-partition split-inflight guard. Residual tail (documented,
-    // NOT fixed): if all three bounded awaits sit at ~9 s and ALL succeed, the
-    // commit could land at ~27 s > 20 s — three consecutive near-timeout-but-
-    // healthy ops, not naturally reproducible; the only true close (manager re-
-    // validate freeze/commit right before the commit) is revert-prone hot-split
-    // mechanism and is deferred per reproduce-first. The freeze-held re-check
-    // above stays as the belt-and-braces detector for the case the PS DOES
-    // receive the Ok.
 
     // The manager sealed all 3 stream tails as part of the split. The
     // P-log stream workers still cache the old (now-sealed) tails and
@@ -2405,10 +2365,9 @@ mod split_freeze_budget_tests {
     use std::time::Duration;
 
     /// #6 invariant: a split attempt launched at the deadline must finish
-    /// (commit on the manager) BEFORE FREEZE_TTL fires, so any in-flight commit
-    /// lands while the partition is still frozen. If this fails, a stale-seal
-    /// write-loss window has reopened (someone shrank FREEZE_TTL or grew the
-    /// per-call timeout past the budget).
+    /// (commit on the manager) BEFORE FREEZE_TTL fires; past it the partition
+    /// is poisoned and the split always fails (someone shrank FREEZE_TTL or
+    /// grew the per-call timeout past the budget).
     #[test]
     fn deadline_leaves_room_for_one_call_before_ttl() {
         let ttl = crate::FREEZE_TTL;

@@ -2370,11 +2370,15 @@ impl AutumnManager {
                         if e.is::<crate::split_op::SplitReplyLost>()
                             || self.split_inflight.borrow().contains(&spec.part_id) =>
                     {
+                        // A status answer is the PS's own failure.
+                        let ps_failure = (!e.is::<crate::split_op::SplitReplyLost>())
+                            .then(|| format!("{e:#}"));
                         let message = self.split_outcome_unknown(
                             op_id,
                             spec.part_id,
                             owner_epoch,
                             &format!("{e:#}"),
+                            ps_failure,
                             Self::now_s_ms().0,
                         );
                         ActuationResult::Dispatched {

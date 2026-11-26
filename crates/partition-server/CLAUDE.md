@@ -2438,6 +2438,48 @@ handler's first line and cleared at its return; a second split is answered
 retry of a split whose reply was lost became a second split
 (`split_op_outcome.rs`, `a_second_split_on_a_partition_with_one_pending_is_refused`).
 
+**A split that froze and did not finish poisons its partition; it never
+unfreezes.** Every exit of `split_part` after `frozen_for_split` is set, except
+the success reply, sets its `poisoned` cell, and `check_freeze_ttls` does the
+same for a freeze held past `FREEZE_TTL` (a wedged handler). The partition
+stays frozen (writes refused) and `split_pending` stays set (no second split
+on a partition about to reopen); the split task sends its reply, waits until a
+load report the leader accepted (`CODE_OK`; a standby answers
+`CODE_NOT_LEADER`, and the report goes to the leader once the heartbeat loop
+has found it) has carried the failure outcome
+(`PartitionMetrics::outcome_reported`, at most `SPLIT_OUTCOME_REPORT_WAIT`,
+15 s, and no longer than the freeze TTL, which poisons first; no wait for an
+untracked split), then `poison_partition`: the loop exits
+and region sync reopens the partition from the manager's layout, split or not
+(fresh owner epoch, takeover fence and seal, so nothing is acked on a tail the
+manager sealed). That covers the drain, `commit_length` capture and P-sst
+barrier failures, every commit-phase failure — a lost reply or timeout, a
+refusal such as `already ended` or `captured tail moved`, the freeze budget
+running out. A refusal after an
+attempt whose reply was lost proves nothing: that attempt may have committed,
+and an unfrozen partition then served the old range on the sealed tails, every
+write it acked there gone at the next open. The cost is the partition's
+unavailability for the wait and the reopen on a failed split.
+
+The wait is what gets the PS's reason into the op: a partition that exits at
+once takes its reply and outcome along, and the manager, finding the
+partition's owner epoch moved, ends the op with only "partition N was reopened
+... before the split committed" — on any PS's next report, before the reopened
+partition's own. When the split did commit, region sync sees the new layout
+and reloads the partition within ~2 s, so it is unavailable only that long
+(the split task's wait runs on to its bound and poisons the old, dropped
+cell); the op has already succeeded. Outcomes no accepted report carried by the time
+`sync_regions_once` drops a handle go to the partition's next open
+(`carried_outcomes`; pruned, with a warning, if the partition left this PS).
+That is best effort: the manager usually settles the op on the owner-epoch
+move before the reopened partition's first report.
+
+Regressions: `crates/manager/tests/split_lost_reply_unfreeze.rs` (the split
+reply dropped by a proxy; 40 of 40 writes acked over 20 s afterwards lost when
+the failure path unfreezes; and the PS reopening the partition itself, both
+halves served), `split_op_outcome::a_split_failing_after_its_reply_timeout_reports_the_ps_reason`
+(the op's error is the PS's).
+
 **A submitted split reports its failure on the load heartbeat.**
 `SplitPartReq.op_id` (0 = untracked) rides into `multi_modify_split`, where the
 manager closes the op on commit. Every `Err` of a tracked split is also pushed
@@ -2455,7 +2497,7 @@ phases; see the manager guide for why they are phases and not bytes). Two things
 about it are load-bearing:
 
 - The guard clears the slot **on drop**, not at each exit. This function has a
-  dozen ways out — three `?` through `unfreeze_on_err`, two barrier timeouts,
+  dozen ways out — three `?` through `poison_on_err`, two barrier timeouts,
   the TTL aborts — and a list of clear-sites goes stale the first time somebody
   adds an early return. A missed one is worse than no reporting: the slot rides
   every later heartbeat, and the NEXT split on this partition spends its whole
@@ -3442,12 +3484,10 @@ Three fixes bound the restart replay window (worst case per partition =
        first, then `acquire_compact`.
     8. BOTH the barrier `send().await` AND the ACK `recv().await` MUST be bounded by
        separate timers (5 s send + 10 s ACK). The total (15 s) MUST stay well under
-       `FREEZE_TTL` (30 s) — a wedged P-sst blocking past FREEZE_TTL would let
-       `check_freeze_ttls` unfreeze, new writes extend the row_stream tail past the
-       already-captured `commit_length`, and `multi_modify_split` would commit a STALE
-       `row_end` → post-TTL writes above sealed_length, invisible on recovery. Both
-       timeouts unfreeze + return `FailedPrecondition`. If tuning changes either, `send +
-       ack < FREEZE_TTL` MUST hold.
+       `FREEZE_TTL` (30 s), past which `check_freeze_ttls` poisons the partition and
+       the split fails: a wedged P-sst would turn every split into a reopen. Both
+       timeouts poison the partition + return `FailedPrecondition`. If tuning changes
+       either, `send + ack < FREEZE_TTL` MUST hold.
 
     P-sst readiness handshake: `spawn_sst_thread` returns `(JoinHandle,
     oneshot::Receiver<Result<()>>)` and sends `Ok(())` only AFTER compio `build`,

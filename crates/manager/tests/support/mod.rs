@@ -1593,8 +1593,19 @@ pub fn start_partition_server_killable(
     mgr_addr: SocketAddr,
     ps_addr: SocketAddr,
 ) -> KillablePs {
+    start_partition_server_killable_with(ps_id, mgr_addr, ps_addr, &[])
+}
+
+/// `start_partition_server_killable` with extra `autumn-ps` flags.
+pub fn start_partition_server_killable_with(
+    ps_id: u64,
+    mgr_addr: SocketAddr,
+    ps_addr: SocketAddr,
+    extra: &[&str],
+) -> KillablePs {
     let bin = support_binary_path("autumn-ps");
     let child = std::process::Command::new(bin)
+        .args(extra)
         .arg("--cluster-secret-file")
         .arg(cluster_secret_file())
         .arg("--psid")

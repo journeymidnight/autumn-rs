@@ -5177,6 +5177,11 @@ impl AutumnManager {
     pub(crate) async fn handle_report_partition_load(&self, payload: Bytes) -> HandlerResult {
         let req: ReportPartitionLoadReq =
             rkyv_decode(&payload).map_err(|e| (StatusCode::InvalidArgument, e))?;
+        // Outcomes and progress feed the leader's op ledger; a standby would
+        // take them and drop them. NOT_LEADER sends the PS on.
+        if let Err(err) = self.ensure_leader() {
+            return Self::code_resp(Self::err_to_code(&err), err.to_string());
+        }
         let now = Self::epoch_seconds();
         // Collect PS-reported maintenance outcomes before the loop consumes
         // `req.partitions`; reconciled into the op-ledger after the metrics
@@ -5239,8 +5244,13 @@ impl AutumnManager {
         for (part_id, o) in outcomes {
             self.note_split_heard(o.op_id, now);
             // A split the PS gave up on while its commit is still in flight
-            // here may yet commit; the PS re-sends the outcome next report.
+            // here may yet commit: the failure is held, and ends the op once
+            // no commit is (`reconcile_unknown_splits`).
             if o.kind == OP_KIND_SPLIT && self.split_inflight.borrow().contains(&part_id) {
+                if o.state != OP_STATE_SUCCEEDED {
+                    let error = if o.error.is_empty() { o.message.clone() } else { o.error.clone() };
+                    self.hold_split_failure(o.op_id, part_id, error, now);
+                }
                 continue;
             }
             let transitioned = self.ops.borrow_mut().reconcile_outcome(
